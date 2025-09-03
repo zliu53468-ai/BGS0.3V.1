@@ -1,25 +1,28 @@
 # app.py
 # =========================================================
-# BGS AI（Flask + LINE）— 牌路辨識 + 投票（XGB/LGBM/RNN）
-# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM / MLP 已不納入）
-# - 加入「震盪偵測」＋「加權投票」＋「溫度校正」
-# - 所有模型皆為可選載入；若皆不存在則回退規則法
-# - 需要的檔案（有就載入，沒有就跳過）：
+# BGS AI（Flask + LINE）— 專注大路辨識 + 投票（XGB/LGBM/RNN）
+# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM / MLP 不納入）
+# - 大路 ROI：FOCUS_ROI="x,y,w,h"（0~1 比例）；否則自動定位下半部最大紅/藍區
+# - 欄→列 讀取：同色往下、變色右移；紅/藍圈內水平線視為和
+# - 單跳偵測：交替率 + 連續單跳長度；趨勢/震盪兩組權重 + 溫度校正
+#
+# 需要檔案（有就載入，沒有就跳過）：
 #   models/
-#     ├─ scaler.pkl              # (可選) sklearn 標準化器，fit 在 build_features 的輸入
-#     ├─ xgb_model.pkl/json/ubj  # (可選) XGBoost（sklearn or Booster）
-#     ├─ lgbm_model.pkl/txt/json # (可選) LightGBM（sklearn or Booster）
-#     └─ rnn_weights.npz         # (可選) numpy 權重：Wxh, Whh, bh, Why, bo
+#     ├─ scaler.pkl                 # (可選) sklearn 標準化器（對應 build_features）
+#     ├─ xgb_model.pkl/json/ubj     # (可選) XGBoost（sklearn 或 Booster）
+#     ├─ lgbm_model.pkl/txt/json    # (可選) LightGBM（sklearn 或 Booster）
+#     └─ rnn_weights.npz            # (可選) numpy 權重：Wxh, Whh, bh, Why, bo
 #
-# 可調參數（環境變數）：
-#   ENSEMBLE_WEIGHTS="xgb:0.40,lgb:0.30,rnn:0.30"
-#   TEMP="0.95"      # softmax 溫度（<1 降低自信度；>1 更銳利）
-#   MIN_SEQ="18"     # 序列過短時，改用規則法（或降低倉位）
-#   ALT_WINDOW="20"  # 震盪偵測視窗長度
-#   ALT_THRESH="0.70"# 震盪率門檻（交替次數/(N-1)）
-#
-# LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET 需在環境變數提供。
-# DEBUG_VISION=1 可印出解析細節。
+# 可調 ENV：
+#   FOCUS_ROI="x,y,w,h"  # 0~1 比例的手動 ROI
+#   ENSEMBLE_WEIGHTS_TREND="xgb:0.45,lgb:0.35,rnn:0.20"
+#   ENSEMBLE_WEIGHTS_CHOP ="xgb:0.20,lgb:0.25,rnn:0.55"
+#   TEMP="0.95"      # softmax 溫度
+#   MIN_SEQ="18"     # 序列過短回退規則
+#   ALT_WINDOW="20"  # 交替率視窗
+#   ALT_THRESH="0.70"# 交替率門檻
+#   ALT_STRICT_STREAK="5" # 連續單跳幾顆視為嚴重，直接觀望
+#   DEBUG_VISION=1   # 影像偵錯 log
 # =========================================================
 
 import os, io, time, math, logging
@@ -67,7 +70,6 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
-# --- Vision tuning (可由環境變數調) ---
 DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
 HSV = {
@@ -80,8 +82,7 @@ HSV = {
     "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
     "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH","255"))),
 }
-
-HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))  # ROI 寬度比例
+HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))
 HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
 CANNY1 = int(os.getenv("CANNY1", "60"))
 CANNY2 = int(os.getenv("CANNY2", "180"))
@@ -141,7 +142,6 @@ def load_models():
                 bundle["lgbm_booster"] = booster
                 logger.info("[models] loaded lgbm booster (json)")
 
-        # RNN 權重（純 numpy 前向）
         if _safe_exists(RNN_WTS):
             try:
                 w = np.load(RNN_WTS)
@@ -153,7 +153,6 @@ def load_models():
             except Exception as e:
                 logger.warning(f"Failed to load RNN weights: {e}")
 
-        # 有任一模型即視為 loaded（僅考慮 xgb/lgb/rnn）
         bundle["loaded"] = any(k in bundle for k in (
             "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster", "rnn_weights"
         ))
@@ -167,7 +166,7 @@ def load_models():
 load_models()
 
 # =========================================================
-# 圖像→序列（紅=莊, 藍=閒；紅/藍圈內「橫線」=和；綠=和（若平台））
+# 影像→序列（大路專注）
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -175,21 +174,17 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
     """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）。"""
     if roi_bgr is None or roi_bgr.size == 0:
         return False
-
     lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
     l = clahe.apply(l)
     lab = cv2.merge([l, a, b])
     enh = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
     gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
     gray = cv2.medianBlur(gray, 3)
-
     thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                 cv2.THRESH_BINARY_INV, 11, 2)
     edges = cv2.Canny(thr, CANNY1, CANNY2)
-
     h, w = edges.shape[:2]
     min_len = max(int(w * HOUGH_MIN_LEN_RATIO), 12)
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
@@ -202,26 +197,80 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
     return False
 
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
-    """回傳序列（最多 240 手）：'B', 'P', 'T'"""
+    """
+    專注讀「大路」區域，回傳序列：'B', 'P', 'T'
+    - ROI 來源：FOCUS_ROI（優先）→ 自動定位下半部最大紅/藍區 → 下半部保底
+    - 大路規則：欄為單位，同色往下，變色右移；欄內由上到下讀
+    """
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = np.array(img)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        H, W = img.shape[:2]
 
-        h0, w0 = img.shape[:2]
+        # 輕度放大以穩定偵測
         target = 1400.0
-        scale = target / max(h0, w0) if max(h0, w0) < target else 1.0
+        scale = target / max(H, W) if max(H, W) < target else 1.0
         if scale > 1.0:
-            img = cv2.resize(img, (int(w0*scale), int(h0*scale)), interpolation=cv2.INTER_CUBIC)
+            img = cv2.resize(img, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_CUBIC)
+        H, W = img.shape[:2]
 
-        blur = cv2.GaussianBlur(img, (3,3), 0)
-        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        # 初步遮罩
+        blur0 = cv2.GaussianBlur(img, (3,3), 0)
+        hsv0  = cv2.cvtColor(blur0, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv0, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
+        red2 = cv2.inRange(hsv0, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
+        red0  = cv2.bitwise_or(red1, red2)
+        blue0 = cv2.inRange(hsv0, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
 
+        # --------- ROI：先讀 FOCUS_ROI（比例），否則自動找下半部最大紅/藍區 ----------
+        roi_env = os.getenv("FOCUS_ROI", "")
+        rx, ry, rw, rh = 0, 0, W, H
+        manual_roi_ok = False
+        if roi_env:
+            try:
+                sx, sy, sw, sh = [float(t) for t in roi_env.split(",")]
+                rx = int(max(0, min(1, sx)) * W)
+                ry = int(max(0, min(1, sy)) * H)
+                rw = int(max(0, min(1, sw)) * W)
+                rh = int(max(0, min(1, sh)) * H)
+                rx, ry = max(0, rx), max(0, ry)
+                rw, rh = max(1, rw), max(1, rh)
+                if rx+rw <= W and ry+rh <= H:
+                    manual_roi_ok = True
+            except Exception:
+                manual_roi_ok = False
+
+        if not manual_roi_ok:
+            y0 = int(H * 0.45)  # 下半部為主
+            combo = cv2.bitwise_or(red0, blue0)
+            mask_bottom = np.zeros_like(combo)
+            mask_bottom[y0:H, :] = combo[y0:H, :]
+            kernel = np.ones((5,5), np.uint8)
+            m = cv2.morphologyEx(mask_bottom, cv2.MORPH_CLOSE, kernel, iterations=2)
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel, iterations=1)
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                cnt = max(cnts, key=cv2.contourArea)
+                x,y,w,h = cv2.boundingRect(cnt)
+                padx = max(6, int(w*0.03)); pady = max(6, int(h*0.08))
+                rx = max(0, x-padx); ry = max(0, y-pady)
+                rw = min(W-rx, w+2*padx); rh = min(H-ry, h+2*pady)
+            else:
+                rx, ry, rw, rh = 0, y0, W, H-y0
+
+        roi = img[ry:ry+rh, rx:rx+rw]
+        if roi.size == 0:
+            roi = img
+
+        # ROI 內重新遮罩（更準）
+        blur = cv2.GaussianBlur(roi, (3,3), 0)
+        hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
         red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
         red  = cv2.bitwise_or(red1, red2)
         blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-        green= cv2.inRange(hsv, HSV["GREEN_LOW"],  HSV["GREEN_HIGH"])
+        green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
 
         kernel3 = np.ones((3,3), np.uint8)
         def clean(m):
@@ -231,32 +280,17 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         red, blue, green = clean(red), clean(blue), clean(green)
 
         def cc_blobs(mask, label):
-            n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             items = []
             areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
             area_med = np.median(areas) if areas else 0
-            min_area = max(80, int(area_med * 0.35))
+            min_area = max(70, int(area_med * 0.35))
             max_area = int(area_med * 8) if area_med > 0 else 999999
-
             for i in range(1, n):
                 x, y, w, h, a = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
-                if a < min_area or a > max_area:
-                    continue
+                if a < min_area or a > max_area: continue
                 aspect = w / (h + 1e-6)
-                if not (0.5 <= aspect <= 2.0):
-                    continue
-                c = (labels == i).astype(np.uint8) * 255
-                cnts, _ = cv2.findContours(c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not cnts:
-                    continue
-                cnt = max(cnts, key=cv2.contourArea)
-                per = cv2.arcLength(cnt, True)
-                area = cv2.contourArea(cnt)
-                if per <= 0 or area <= 0:
-                    continue
-                circularity = 4 * math.pi * area / (per * per)
-                if circularity < 0.3:
-                    continue
+                if not (0.5 <= aspect <= 2.0): continue
                 cx = x + w / 2.0
                 items.append((x, y, w, h, cx, label))
             return items
@@ -265,38 +299,57 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         items += cc_blobs(red,  "B")
         items += cc_blobs(blue, "P")
         items += cc_blobs(green,"T")
-
         if not items:
             return []
 
-        items.sort(key=lambda z: z[4])
-        widths = [w for _,_,w,_,_,_ in items]
-        med_w  = np.median(widths) if widths else 12
-        min_gap = max(med_w * 0.6, 10)
+        # ---- 欄→列 讀取（大路規則）----
+        items.sort(key=lambda z: z[4])  # 依 cx
+        widths  = [w for _,_,w,_,_,_ in items]
+        heights = [h for _,_,_,h,_,_ in items]
+        med_w   = np.median(widths)  if widths  else 12
+        med_h   = np.median(heights) if heights else 12
+        col_thresh = max(med_w * 0.8, 8)   # 同欄 cx 門檻
+        row_thresh = max(med_h * 0.5, 6)   # 欄內 y 去重門檻
+
+        columns: List[List[tuple]] = []
+        for it in items:
+            if not columns:
+                columns.append([it])
+            else:
+                last_cx = columns[-1][-1][4]
+                if abs(it[4] - last_cx) <= col_thresh:
+                    columns[-1].append(it)
+                else:
+                    columns.append([it])
 
         seq: List[str] = []
-        last_cx = -1e9
+        for col in columns:
+            col.sort(key=lambda z: z[1])  # 欄內由上到下
+            dedup = []
+            last_y = -1e9
+            for it in col:
+                y = it[1]
+                if abs(y - last_y) < row_thresh:
+                    continue
+                dedup.append(it); last_y = y
 
-        for x,y,w0,h0,cx,label in items:
-            if abs(cx - last_cx) < min_gap:
-                continue
-
-            if label in {"B","P"}:
-                pad_x = max(2, int(w0 * 0.18))
-                pad_y = max(2, int(h0 * 0.28))
-                x1 = max(0, int(x + pad_x)); x2 = min(img.shape[1], int(x + w0 - pad_x))
-                y1 = max(0, int(y + pad_y)); y2 = min(img.shape[0], int(y + h0 - pad_y))
-                roi = img[y1:y2, x1:x2]
-                if _has_horizontal_line(roi):
-                    seq.append("T")
+            for x,y,w0,h0,cx,label in dedup:
+                if label in {"B","P"}:
+                    pad_x = max(2, int(w0 * 0.18))
+                    pad_y = max(2, int(h0 * 0.28))
+                    x1 = max(0, int(x + pad_x)); x2 = min(roi.shape[1], int(x + w0 - pad_x))
+                    y1 = max(0, int(y + pad_y)); y2 = min(roi.shape[0], int(y + h0 - pad_y))
+                    sub = roi[y1:y2, x1:x2]
+                    if _has_horizontal_line(sub):
+                        seq.append("T")
+                    else:
+                        seq.append(label)
                 else:
-                    seq.append(label)
-            else:
-                seq.append("T")
-            last_cx = cx
+                    seq.append("T")
 
         if DEBUG_VISION:
-            logger.info(f"[VISION] items={len(items)} widths_med={med_w:.1f} min_gap={min_gap:.1f} seq_len={len(seq)}")
+            logger.info(f"[VISION] ROI=({rx},{ry},{rw},{rh}) cols={len(columns)} seq_len={len(seq)} "
+                        f"col_thr={col_thresh:.1f} row_thr={row_thresh:.1f}")
 
         return seq[-240:]
     except Exception as e:
@@ -361,6 +414,44 @@ def _oscillation_rate(seq: List[str], win: int) -> float:
     alt = sum(1 for a,b in zip(s, s[1:]) if a != b)
     return alt / (len(s)-1)
 
+def _alt_streak_suffix(seq: List[str]) -> int:
+    """近端連續單跳長度（只看 B/P），例：...B P B P B → 5"""
+    s = [c for c in seq if c in ("B","P")]
+    if len(s) < 2: return 0
+    k = 1
+    for i in range(len(s)-2, -1, -1):
+        if s[i] != s[i+1]:
+            k += 1
+        else:
+            break
+    return k
+
+def _parse_weights_env_pair() -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    讀兩組投票權重：
+      ENSEMBLE_WEIGHTS_TREND="xgb:0.45,lgb:0.35,rnn:0.20"
+      ENSEMBLE_WEIGHTS_CHOP ="xgb:0.20,lgb:0.25,rnn:0.55"
+    """
+    def _parse(s: str, default: Dict[str,float]) -> Dict[str,float]:
+        out = default.copy()
+        try:
+            for kv in s.split(","):
+                k,v = kv.split(":")
+                k = k.strip().lower()
+                v = float(v)
+                if k in out: out[k] = max(0.0, v)
+        except Exception:
+            pass
+        ss = sum(out.values()) or 1.0
+        for k in out: out[k] /= ss
+        return out
+
+    trend_def = {"xgb":0.45,"lgb":0.35,"rnn":0.20}
+    chop_def  = {"xgb":0.20,"lgb":0.25,"rnn":0.55}
+    w_trend = _parse(os.getenv("ENSEMBLE_WEIGHTS_TREND",""), trend_def)
+    w_chop  = _parse(os.getenv("ENSEMBLE_WEIGHTS_CHOP",""),  chop_def)
+    return w_trend, w_chop
+
 def _proba_from_xgb(feat: np.ndarray) -> Dict[str,float] | None:
     if "xgb_sklearn" in model_bundle:
         proba = model_bundle["xgb_sklearn"].predict_proba(feat)[0]
@@ -381,7 +472,6 @@ def _proba_from_lgb(feat: np.ndarray) -> Dict[str,float] | None:
             return {"banker": float(proba[0]), "player": float(proba[1]), "tie": float(proba[2])}
     return None
 
-# 簡易 RNN（純 numpy 前向）：one-hot 輸入 → 隱藏狀態 → 線性輸出 → softmax 機率
 def _proba_from_rnn(seq: List[str]) -> Dict[str,float] | None:
     w = model_bundle.get("rnn_weights")
     if w is None or not seq:
@@ -401,38 +491,30 @@ def _proba_from_rnn(seq: List[str]) -> Dict[str,float] | None:
         logger.warning(f"Error using RNN weights: {e}")
         return None
 
-def _parse_weights_env() -> Dict[str, float]:
-    s = os.getenv("ENSEMBLE_WEIGHTS", "xgb:0.40,lgb:0.30,rnn:0.30")
-    out = {"xgb":0.40,"lgb":0.30,"rnn":0.30}
-    try:
-        for kv in s.split(","):
-            k,v = kv.split(":")
-            k = k.strip().lower()
-            v = float(v)
-            if k in out:
-                out[k] = max(0.0, v)
-    except Exception:
-        pass
-    ss = sum(out.values()) or 1.0
-    for k in out: out[k] /= ss
-    return out
-
 def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[str,Any]]:
-    """回傳 (機率, 附加資訊)；只用 XGB/LGB/RNN；加入溫度校正與震盪偵測。"""
-    info = {"used":["xgb","lgb","rnn"], "oscillating": False, "alt_rate": 0.0}
+    """
+    只用 XGB/LGB/RNN；加入：
+      - 單跳偵測：alt_rate + alt_streak_suffix
+      - Regime 權重：Trend / Chop 兩組
+      - 溫度校正 + Chop 降自信（再 normalize）
+    """
+    info = {"used":["xgb","lgb","rnn"], "oscillating": False, "alt_rate": 0.0, "alt_streak": 0}
     if not seq: return None, info
 
-    # 震盪偵測
     ALT_WINDOW = int(os.getenv("ALT_WINDOW","20"))
     ALT_THRESH = float(os.getenv("ALT_THRESH","0.70"))
-    alt_rate = _oscillation_rate(seq, ALT_WINDOW)
-    info["alt_rate"] = round(alt_rate,3)
-    info["oscillating"] = alt_rate >= ALT_THRESH
+    ALT_STRICT = int(os.getenv("ALT_STRICT_STREAK","5"))
 
-    # 序列過短判斷
+    alt_rate   = _oscillation_rate(seq, ALT_WINDOW)
+    alt_streak = _alt_streak_suffix(seq)
+    info["alt_rate"]   = round(alt_rate,3)
+    info["alt_streak"] = int(alt_streak)
+    is_chop = (alt_rate >= ALT_THRESH) or (alt_streak >= ALT_STRICT)
+    info["oscillating"] = is_chop
+
     MIN_SEQ = int(os.getenv("MIN_SEQ","18"))
     if len([c for c in seq if c in ("B","P")]) < MIN_SEQ:
-        return None, info  # 交給規則回退
+        return None, info
 
     feat = build_features(seq)
     if "scaler" in model_bundle:
@@ -441,42 +523,33 @@ def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[st
         except Exception as e:
             logger.warning(f"scaler.transform error: {e}")
 
-    weights = _parse_weights_env()
+    w_trend, w_chop = _parse_weights_env_pair()
+    weights = w_chop if is_chop else w_trend
     TEMP = float(os.getenv("TEMP","0.95"))
 
-    # 個別模型機率
     preds = {}
     px = _proba_from_xgb(feat);  preds["xgb"]=px if px else None
     pl = _proba_from_lgb(feat);  preds["lgb"]=pl if pl else None
     pr = _proba_from_rnn(seq);   preds["rnn"]=pr if pr else None
-
-    # 沒任何模型輸出→回退
     if not any(preds.values()):
         return None, info
 
-    # 加權投票
     agg = {"banker":0.0,"player":0.0,"tie":0.0}
     wsum = 0.0
     for name,p in preds.items():
         if not p: continue
         w = weights.get(name, 0.0)
         wsum += w
-        for k in agg:
-            agg[k] += w * max(1e-9, float(p[k]))
+        for k in agg: agg[k] += w * max(1e-9, float(p[k]))
     if wsum <= 0:
         return None, info
 
-    # 溫度校正（對 B/P/T 同步縮放）
     vec = np.array([agg["banker"], agg["player"], agg["tie"]], dtype=np.float64)
     vec = _softmax(vec, temp=TEMP)
+    if is_chop:
+        vec = 0.88 * vec + 0.12 * np.array([1/3,1/3,1/3], dtype=np.float64)
     out = {"banker": float(vec[0]), "player": float(vec[1]), "tie": float(vec[2])}
-
-    # 震盪期：壓低勝率敘述（讓 betting_plan 產出更保守的倉位）
-    if info["oscillating"]:
-        for k in out:
-            out[k] = float(0.85 * out[k])  # 整體降 15%，再由 betting_plan 判斷觀望/縮倉
-        out = _normalize(out)
-    return out, info
+    return _normalize(out), info
 
 # ------------------- 規則回退 -------------------
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
@@ -491,7 +564,7 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
         if seq[i]==seq[-1]: tail+=1
         else: break
     if seq[-1] in {"B","P"}:
-        boost = min(0.08, 0.025*(tail-1))  # 稍微保守
+        boost = min(0.08, 0.025*(tail-1))
         if seq[-1]=="B": pb+=boost
         else: pp+=boost
 
@@ -499,22 +572,24 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
 
-def betting_plan(pb: float, pp: float, oscillating: bool) -> Dict[str, Any]:
+def betting_plan(pb: float, pp: float, oscillating: bool, alt_streak: int=0) -> Dict[str, Any]:
     diff = abs(pb-pp)
     side = "莊" if pb >= pp else "閒"
     side_prob = max(pb, pp)
 
-    # 震盪期更保守
+    ALT_STRICT = int(os.getenv("ALT_STRICT_STREAK","5"))
+    if oscillating and alt_streak >= ALT_STRICT:
+        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "單跳震盪期觀望"}
+
     if oscillating:
-        if diff < 0.10: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震盪期觀望"}
-        if diff < 0.15: pct = 0.02
-        elif diff < 0.20: pct = 0.04
+        if diff < 0.12: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震盪期風險高"}
+        if diff < 0.18: pct = 0.02
+        elif diff < 0.24: pct = 0.04
         else: pct = 0.08
         return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震盪期降倉"}
 
-    # 非震盪：一般分層
     if diff < 0.05:
-        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "差距不足 5%，風險高"}
+        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "差距不足 5%"}
     if diff < 0.08: pct = 0.02
     elif diff < 0.12: pct = 0.04
     elif diff < 0.18: pct = 0.08
@@ -524,12 +599,13 @@ def betting_plan(pb: float, pp: float, oscillating: bool) -> Dict[str, Any]:
 def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: Dict[str,Any] | None=None) -> str:
     b, p, t = probs["banker"], probs["player"], probs["tie"]
     oscillating = bool(info.get("oscillating")) if info else False
-    plan = betting_plan(b, p, oscillating)
+    alt_streak = int(info.get("alt_streak", 0)) if info else 0
+    plan = betting_plan(b, p, oscillating, alt_streak)
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
     bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
-    osc_txt = f"\n震盪率：{info.get('alt_rate'):.2f}" if info and "alt_rate" in info else ""
+    osc_txt = f"\n震盪率：{info.get('alt_rate'):.2f}｜連跳：{alt_streak}" if info and "alt_rate" in info else ""
     used_txt = f"\n投票模型：{', '.join(info.get('used', []))}" if info else ""
     return (
         f"{tag} 已解析 {len(seq)} 手{osc_txt}{used_txt}\n"
