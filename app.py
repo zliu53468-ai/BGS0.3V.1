@@ -1,4 +1,20 @@
 # app.py
+# =========================================================
+# BGS AI（Flask + LINE）— 牌路辨識 + 多模型投票（XGB/LGBM/HMM/MLP/RNN）
+# - 模型皆為「可選載入」，不存在也不會報錯；若皆不存在則回退規則法
+# - 需要的檔案（有就載入，沒有就跳過）：
+#   models/
+#     ├─ scaler.pkl              # (可選) sklearn 標準化器，fit 在 build_features 的輸入
+#     ├─ xgb_model.pkl/json/ubj  # (可選) XGBoost（sklearn or Booster）
+#     ├─ lgbm_model.pkl/txt/json # (可選) LightGBM（sklearn or Booster）
+#     ├─ hmm_model.pkl           # (可選) MultinomialHMM（n_components=3）
+#     ├─ mlp_model.pkl           # (可選) sklearn.neural_network.MLPClassifier
+#     └─ rnn_weights.npz         # (可選) 內含 Wxh, Whh, bh, Why, bo 之 numpy 權重
+#
+# LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET 需在環境變數提供。
+# DEBUG_VISION=1 可印出解析細節。
+# =========================================================
+
 import os, io, time, math, logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -36,6 +52,12 @@ try:
 except Exception:
     MultinomialHMM = None
 
+# （可選）若你要使用 sklearn 的 MLPClassifier，需安裝 scikit-learn
+try:
+    from sklearn.neural_network import MLPClassifier  # 僅為類型提示；缺少也不影響運行
+except Exception:
+    MLPClassifier = None  # type: ignore
+
 app = Flask(__name__)
 
 # ---------- Logging ----------
@@ -60,7 +82,7 @@ HSV = {
     "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW",  "90")), int(os.getenv("HSV_BLUE_S_LOW",  "50")), int(os.getenv("HSV_BLUE_V_LOW",  "50"))),
     "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "135")),int(os.getenv("HSV_BLUE_S_HIGH", "255")),int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
     "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
-    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH", "255"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH","255"))),
 }
 
 HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))  # ROI 寬度比例
@@ -81,6 +103,8 @@ LGBM_PKL    = MODELS_DIR / "lgbm_model.pkl"
 LGBM_TXT    = MODELS_DIR / "lgbm_model.txt"
 LGBM_JSON   = MODELS_DIR / "lgbm_model.json"
 HMM_PKL     = MODELS_DIR / "hmm_model.pkl"
+MLP_PKL     = MODELS_DIR / "mlp_model.pkl"      # sklearn MLPClassifier
+RNN_WTS     = MODELS_DIR / "rnn_weights.npz"    # numpy 權重：Wxh, Whh, bh, Why, bo
 
 model_bundle: Dict[str, Any] = {"loaded": False, "note": "no model"}
 
@@ -96,33 +120,65 @@ def load_models():
     try:
         if joblib and _safe_exists(SCALER_PATH):
             bundle["scaler"] = joblib.load(SCALER_PATH)
+            logger.info("[models] loaded scaler")
 
         if xgb:
             if _safe_exists(XGB_PKL) and joblib:
                 bundle["xgb_sklearn"] = joblib.load(XGB_PKL)
+                logger.info("[models] loaded xgb (sklearn)")
             elif _safe_exists(XGB_JSON):
                 bst = xgb.Booster(); bst.load_model(str(XGB_JSON))
                 bundle["xgb_booster"] = bst
+                logger.info("[models] loaded xgb booster (json)")
             elif _safe_exists(XGB_UBJ):
                 bst = xgb.Booster(); bst.load_model(str(XGB_UBJ))
                 bundle["xgb_booster"] = bst
+                logger.info("[models] loaded xgb booster (ubj)")
 
         if lgb:
             if _safe_exists(LGBM_PKL) and joblib:
                 bundle["lgbm_sklearn"] = joblib.load(LGBM_PKL)
+                logger.info("[models] loaded lgbm (sklearn)")
             elif _safe_exists(LGBM_TXT):
                 bundle["lgbm_booster"] = lgb.Booster(model_file=str(LGBM_TXT))
+                logger.info("[models] loaded lgbm booster (txt)")
             elif _safe_exists(LGBM_JSON):
                 booster = lgb.Booster(model_str=LGBM_JSON.read_text(encoding="utf-8"))
                 bundle["lgbm_booster"] = booster
+                logger.info("[models] loaded lgbm booster (json)")
 
         if MultinomialHMM and joblib and _safe_exists(HMM_PKL):
             hmm = joblib.load(HMM_PKL)
             if hasattr(hmm, "n_components") and hmm.n_components == 3:
                 bundle["hmm"] = hmm
+                logger.info("[models] loaded HMM (n_components=3)")
 
+        # MLP：sklearn.neural_network.MLPClassifier（predict_proba）
+        if joblib and _safe_exists(MLP_PKL):
+            try:
+                mlp_model = joblib.load(MLP_PKL)
+                if hasattr(mlp_model, "predict_proba"):
+                    bundle["mlp_model"] = mlp_model
+                    logger.info("[models] loaded MLP classifier")
+            except Exception as e:
+                logger.warning(f"Failed to load MLP model: {e}")
+
+        # RNN 權重（純 numpy 前向，適合輕量環境）
+        if _safe_exists(RNN_WTS):
+            try:
+                w = np.load(RNN_WTS)
+                for key in ("Wxh", "Whh", "bh", "Why", "bo"):
+                    if key not in w:
+                        raise ValueError(f"missing {key}")
+                bundle["rnn_weights"] = {k: w[k] for k in ("Wxh","Whh","bh","Why","bo")}
+                logger.info("[models] loaded RNN weights")
+            except Exception as e:
+                logger.warning(f"Failed to load RNN weights: {e}")
+
+        # 有任一模型即視為 loaded
         bundle["loaded"] = any(k in bundle for k in (
-            "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster", "hmm"
+            "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster",
+            "hmm", "mlp_model", "rnn_weights"
         ))
         bundle["note"] = "at least one model loaded" if bundle["loaded"] else "no model file found"
         model_bundle = bundle
@@ -134,7 +190,7 @@ def load_models():
 load_models()
 
 # =========================================================
-# 圖像→序列（支援：紅=莊, 藍=閒；紅/藍圈內"橫線"=和）
+# 圖像→序列（支援：紅=莊, 藍=閒；紅/藍圈內「橫線」=和；綠=和（若平台））
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -333,6 +389,8 @@ def build_features(seq: List[str]) -> np.ndarray:
     return feat
 
 def _normalize(p: Dict[str,float]) -> Dict[str,float]:
+    # safety clip + normalize，避免極端 0/負值
+    p = {k: max(1e-9, float(v)) for k,v in p.items()}
     s = p["banker"]+p["player"]+p["tie"]
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {k: round(v/s,4) for k,v in p.items()}
@@ -374,28 +432,91 @@ def _proba_from_hmm(seq: List[str]) -> Dict[str,float] | None:
     prob = exps/(exps.sum()+1e-12)
     return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
 
+# Deep learning model probability (MLP).  The MLP expects the same scaled
+# feature vector as the other models.  It must expose predict_proba().
+def _proba_from_mlp(feat: np.ndarray) -> Dict[str,float] | None:
+    mlp = model_bundle.get("mlp_model")
+    if mlp is None:
+        return None
+    try:
+        proba = mlp.predict_proba(feat)[0]
+        # 檢查類別順序，確保對應 B/P/T
+        classes = getattr(mlp, "classes_", np.array([0,1,2]))
+        # 建立 idx->proba 的 mapping
+        mp = {int(classes[i]): float(proba[i]) for i in range(len(classes))}
+        p_b = mp.get(IDX["B"], 1e-9)
+        p_p = mp.get(IDX["P"], 1e-9)
+        p_t = mp.get(IDX["T"], 1e-9)
+        return {"banker": p_b, "player": p_p, "tie": p_t}
+    except Exception as e:
+        logger.warning(f"Error using MLP model: {e}")
+        return None
+
+# 簡易 RNN（純 numpy 前向）：one-hot 輸入 → 隱藏狀態 → 線性輸出 → softmax 機率
+def _proba_from_rnn(seq: List[str]) -> Dict[str,float] | None:
+    w = model_bundle.get("rnn_weights")
+    if w is None or not seq:
+        return None
+    try:
+        Wxh = np.array(w["Wxh"]); Whh = np.array(w["Whh"]); bh = np.array(w["bh"])
+        Why = np.array(w["Why"]); bo = np.array(w["bo"])
+        # hidden state
+        h = np.zeros((Whh.shape[0],), dtype=np.float32)
+        # 簡單 RNN 前向（tanh）
+        for s in seq:
+            x = np.zeros((3,), dtype=np.float32)
+            x[IDX.get(s, 2)] = 1.0
+            h = np.tanh(x @ Wxh + h @ Whh + bh)
+        o = h @ Why + bo  # (3,)
+        # softmax
+        m = float(np.max(o))
+        exp = np.exp(o - m)
+        prob = exp / (float(np.sum(exp)) + 1e-12)
+        return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
+    except Exception as e:
+        logger.warning(f"Error using RNN weights: {e}")
+        return None
+
 def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
     feat = build_features(seq)
     if "scaler" in model_bundle:
-        feat = model_bundle["scaler"].transform(feat)
+        try:
+            feat = model_bundle["scaler"].transform(feat)
+        except Exception as e:
+            logger.warning(f"scaler.transform error: {e}")
+
     votes=[]
     p=_proba_from_xgb(feat);  votes.append(p) if p else None
     p=_proba_from_lgb(feat);  votes.append(p) if p else None
     p=_proba_from_hmm(seq);   votes.append(p) if p else None
-    if not votes: return None
+    p=_proba_from_mlp(feat);  votes.append(p) if p else None
+    p=_proba_from_rnn(seq);   votes.append(p) if p else None
+
+    if not votes:
+        return None
+
+    # 票數平均；若某模型出現 nan/0 也先 clip
     avg={"banker":0.0,"player":0.0,"tie":0.0}
+    cnt=0
     for v in votes:
-        for k in avg: avg[k]+=v[k]
-    for k in avg: avg[k]/=len(votes)
+        if not v: continue
+        cnt+=1
+        for k in avg:
+            avg[k]+=max(1e-9, float(v[k]))
+    if cnt==0:
+        return None
+    for k in avg: avg[k]/=cnt
     return _normalize(avg)
 
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
+    # 輕量回退法：分佈 + 尾端連續 boost；避免「只看誰多打誰」→ tie 加最小值 + 正規化
     n=len(seq)
     if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
     pb = seq.count("B")/n
     pp = seq.count("P")/n
-    pt = max(0.02, seq.count("T")/n*0.6)
-    # 尾端連續加權
+    pt = max(0.02, seq.count("T")/n*0.6)  # 最低和局先給一點權重
+
+    # 尾端連續加權（最多 +10%）
     tail=1
     for i in range(n-2,-1,-1):
         if seq[i]==seq[-1]: tail+=1
@@ -404,11 +525,13 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
         boost = min(0.10, 0.03*(tail-1))
         if seq[-1]=="B": pb+=boost
         else: pp+=boost
+
     s=pb+pp+pt
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
 
 def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
+    # 以莊/閒差距決定倉位上限（<=12%）
     diff = abs(pb-pp)
     side = "莊" if pb >= pp else "閒"
     side_prob = max(pb, pp)
@@ -420,36 +543,19 @@ def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     else: pct = 0.12
     return {"side": side, "percent": pct, "side_prob": side_prob}
 
-# ============（這裡是你要的唯一邏輯變更）============
 def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
-    """
-    顯示規則：
-      - 將「資金建議」與「下注建議」合併為同一行
-      - 若 percent == 0 → 顯示「觀望」
-      - 若 0 < percent < 0.12 → 只在『顯示』上把莊/閒顛倒（資金數值不變；模型不變）
-      - 若 percent >= 0.12 → 照模型方向顯示（不顛倒）
-    """
     b, p, t = probs["banker"], probs["player"], probs["tie"]
     plan = betting_plan(b, p)
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
-
-    if plan["percent"] == 0.0:
-        advise_text = "觀望"
-    else:
-        if plan["percent"] < 0.12:
-            show_side = "閒" if plan["side"] == "莊" else "莊"
-        else:
-            show_side = plan["side"]
-        advise_text = f"於「{show_side}」下注 {int(plan['percent']*100)}%"
-
+    bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
     return (
         f"{tag} 已解析 {len(seq)} 手\n"
-        f"建議（資金+方向）：{advise_text}（勝率 {win_txt}）{note}\n"
-        f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}"
+        f"建議下注：{plan['side']}（勝率 {win_txt}）{note}\n"
+        f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}\n"
+        f"資金建議：{bet_text}"
     )
-# =========================================================
 
 # =========================================================
 # API（可自測）
@@ -460,9 +566,22 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","ts":int(time.time()),
-                    "models_loaded": model_bundle.get("loaded", False),
-                    "note": model_bundle.get("note","")})
+    return jsonify({
+        "status":"ok",
+        "ts":int(time.time()),
+        "models_loaded": model_bundle.get("loaded", False),
+        "have": {
+            "xgb_sklearn": "xgb_sklearn" in model_bundle,
+            "xgb_booster": "xgb_booster" in model_bundle,
+            "lgbm_sklearn":"lgbm_sklearn" in model_bundle,
+            "lgbm_booster":"lgbm_booster" in model_bundle,
+            "hmm":"hmm" in model_bundle,
+            "mlp_model":"mlp_model" in model_bundle,
+            "rnn_weights":"rnn_weights" in model_bundle,
+            "scaler":"scaler" in model_bundle
+        },
+        "note": model_bundle.get("note","")
+    })
 
 # =========================================================
 # LINE Webhook
@@ -492,7 +611,7 @@ if line_handler and line_bot_api:
     def on_follow(event: FollowEvent):
         welcome = (
             "歡迎加入BGS AI 助手 🎉\n\n"
-            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議（資金+方向）。"
+            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議下注：莊 / 閒（勝率 xx%）。"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
 
@@ -502,7 +621,7 @@ if line_handler and line_bot_api:
         txt = (event.message.text or "").strip()
         if txt in {"開始分析", "開始", "START", "分析"}:
             user_mode[uid] = True
-            msg = "已進入分析模式 ✅\n請上傳牌路截圖，我會回覆「建議（資金+方向）」與機率。"
+            msg = "已進入分析模式 ✅\n請上傳牌路截圖：我會嘗試自動辨識並回覆「建議下注：莊 / 閒（勝率 xx%）」"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
         # 非「開始分析」指令
