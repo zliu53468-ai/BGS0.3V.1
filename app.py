@@ -1,5 +1,5 @@
 # app.py
-import os, io, time, math
+import os, io, time, math, logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -38,12 +38,35 @@ except Exception:
 
 app = Flask(__name__)
 
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("bgs-bot")
+
 # ---------- ENV ----------
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+
+# --- Vision tuning (可由環境變數調) ---
+DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
+
+HSV = {
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW",  "0")),  int(os.getenv("HSV_RED1_S_LOW",  "50")), int(os.getenv("HSV_RED1_V_LOW",  "50"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "12")), int(os.getenv("HSV_RED1_S_HIGH", "255")),int(os.getenv("HSV_RED1_V_HIGH", "255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW",  "170")),int(os.getenv("HSV_RED2_S_LOW",  "50")), int(os.getenv("HSV_RED2_V_LOW",  "50"))),
+    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")),int(os.getenv("HSV_RED2_S_HIGH", "255")),int(os.getenv("HSV_RED2_V_HIGH", "255"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW",  "90")), int(os.getenv("HSV_BLUE_S_LOW",  "50")), int(os.getenv("HSV_BLUE_V_LOW",  "50"))),
+    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "135")),int(os.getenv("HSV_BLUE_S_HIGH", "255")),int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH","255"))),
+}
+
+HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))  # ROI 寬度比例
+HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
+CANNY1 = int(os.getenv("CANNY1", "60"))
+CANNY2 = int(os.getenv("CANNY2", "180"))
 
 # ---------- User session: 是否進入分析模式 ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
@@ -103,8 +126,10 @@ def load_models():
         ))
         bundle["note"] = "at least one model loaded" if bundle["loaded"] else "no model file found"
         model_bundle = bundle
+        logger.info(f"[models] loaded={bundle['loaded']} note={bundle['note']}")
     except Exception as e:
         model_bundle = {"loaded": False, "note": f"load error: {e}"}
+        logger.exception(f"[models] load error: {e}")
 
 load_models()
 
@@ -117,18 +142,32 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
     """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）。"""
     if roi_bgr is None or roi_bgr.size == 0:
         return False
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
-    edges = cv2.Canny(gray, 60, 180)
+
+    # 對比增強 + 去噪
+    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    enh = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 3)
+
+    # 二值化 + 邊緣
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, 11, 2)
+    edges = cv2.Canny(thr, CANNY1, CANNY2)
+
     h, w = edges.shape[:2]
-    min_len = max(int(w * 0.45), 12)
+    min_len = max(int(w * HOUGH_MIN_LEN_RATIO), 12)
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
-                            minLineLength=min_len, maxLineGap=6)
+                            minLineLength=min_len, maxLineGap=HOUGH_GAP)
     if lines is None:
         return False
-    # 近水平：|dy| 小於 15% 高度
-    for x1, y1, x2, y2 in lines[:,0,:]:
-        if abs(y2 - y1) <= max(2, int(h * 0.15)):
+    # 近水平：|dy| 小於 12% 高度（更嚴格）
+    for x1, y1, x2, y2 in lines[:, 0, :]:
+        if abs(y2 - y1) <= max(2, int(h * 0.12)):
             return True
     return False
 
@@ -137,7 +176,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
     回傳序列（最多 240 手）：'B', 'P', 'T'
     規則：
       - 紅=莊(B), 藍=閒(P)
-      - 若紅/藍圈 ROI 內偵測到水平直線 → 視為和(T)（忽略底色）
+      - 若紅/藍圈 ROI 內偵測到水平直線 → 視為和(T)
       - 綠色（若有）也當 T
     """
     try:
@@ -145,41 +184,71 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         img = np.array(img)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        # 規一化大小
-        h, w = img.shape[:2]
-        scale = 1200.0 / max(h, w)
-        if scale < 1.5:
-            img = cv2.resize(img, (int(w*scale), int(h*scale)))
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # 規一化（小圖放大，避免圈太小）
+        h0, w0 = img.shape[:2]
+        target = 1400.0
+        scale = target / max(h0, w0) if max(h0, w0) < target else 1.0
+        if scale > 1.0:
+            img = cv2.resize(img, (int(w0*scale), int(h0*scale)), interpolation=cv2.INTER_CUBIC)
 
-        # 顏色遮罩
-        red1 = cv2.inRange(hsv, (0, 70, 60), (10, 255, 255))
-        red2 = cv2.inRange(hsv, (170, 70, 60), (180, 255, 255))
+        # 降噪 + 顏色空間
+        blur = cv2.GaussianBlur(img, (3,3), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+
+        # 顏色遮罩（可由環境變數調）
+        red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
+        red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
         red  = cv2.bitwise_or(red1, red2)
-        blue = cv2.inRange(hsv, (90, 70, 60), (130, 255, 255))
-        green= cv2.inRange(hsv, (40, 50, 60), (80, 255, 255))
+        blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
+        green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
 
-        kernel = np.ones((5,5), np.uint8)
-        red   = cv2.morphologyEx(red,   cv2.MORPH_OPEN, kernel)
-        blue  = cv2.morphologyEx(blue,  cv2.MORPH_OPEN, kernel)
-        green = cv2.morphologyEx(green, cv2.MORPH_OPEN, kernel)
+        # 形態學：先 close 補洞，再 open 去雜訊
+        kernel3 = np.ones((3,3), np.uint8)
+        def clean(m):
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel3, iterations=1)
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel3, iterations=1)
+            return m
+        red, blue, green = clean(red), clean(blue), clean(green)
 
-        def blobs(mask, label):
-            cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 以 connected components 取得穩定 blob
+        def cc_blobs(mask, label):
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
             items = []
-            for c in cs:
-                area = cv2.contourArea(c)
-                if area < 60:  # 過小雜訊
+            # 統計平均面積來自適應過小/過大濾除
+            areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
+            area_med = np.median(areas) if areas else 0
+            min_area = max(80, int(area_med * 0.35))  # 自適應門檻
+            max_area = int(area_med * 8) if area_med > 0 else 999999
+
+            for i in range(1, n):
+                x, y, w, h, a = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
+                if a < min_area or a > max_area:
                     continue
-                x,y,w,h = cv2.boundingRect(c)
-                cx = x + w/2
-                items.append((x,y,w,h,cx,label))
+                # 圓度/長寬比過濾，避免長條噪聲
+                aspect = w / (h + 1e-6)
+                if not (0.5 <= aspect <= 2.0):
+                    continue
+                c = (labels == i).astype(np.uint8) * 255
+                cnts, _ = cv2.findContours(c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    continue
+                cnt = max(cnts, key=cv2.contourArea)
+                per = cv2.arcLength(cnt, True)
+                area = cv2.contourArea(cnt)
+                if per <= 0 or area <= 0:
+                    continue
+                circularity = 4 * math.pi * area / (per * per)
+                if circularity < 0.3:  # 太不圓的過濾
+                    continue
+
+                cx = x + w / 2.0
+                items.append((x, y, w, h, cx, label))
             return items
 
         items = []
-        items += blobs(red,  "B")
-        items += blobs(blue, "P")
-        items += blobs(green,"T")  # 若平台用綠色單獨標和
+        items += cc_blobs(red,  "B")
+        items += cc_blobs(blue, "P")
+        items += cc_blobs(green,"T")  # 若平台用綠色單獨標和
 
         if not items:
             return []
@@ -187,21 +256,24 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         # 依 x 中心排序 → 大路由左至右
         items.sort(key=lambda z: z[4])
 
+        # 動態間距：用 blob 寬度中位數
+        widths = [w for _,_,w,_,_,_ in items]
+        med_w  = np.median(widths) if widths else 12
+        min_gap = max(med_w * 0.6, 10)
+
         seq: List[str] = []
         last_cx = -1e9
-        min_gap = max(img.shape[1] * 0.015, 8)
 
         for x,y,w0,h0,cx,label in items:
             if abs(cx - last_cx) < min_gap:
-                # 與上一顆太靠近，視為同一格，跳過
                 continue
 
             if label in {"B","P"}:
                 # 取較小的內部 ROI 檢線，避免邊界干擾
-                pad_x = max(2, int(w0 * 0.15))
-                pad_y = max(2, int(h0 * 0.25))
-                x1 = max(0, x + pad_x); x2 = min(img.shape[1], x + w0 - pad_x)
-                y1 = max(0, y + pad_y); y2 = min(img.shape[0], y + h0 - pad_y)
+                pad_x = max(2, int(w0 * 0.18))
+                pad_y = max(2, int(h0 * 0.28))
+                x1 = max(0, int(x + pad_x)); x2 = min(img.shape[1], int(x + w0 - pad_x))
+                y1 = max(0, int(y + pad_y)); y2 = min(img.shape[0], int(y + h0 - pad_y))
                 roi = img[y1:y2, x1:x2]
                 if _has_horizontal_line(roi):
                     seq.append("T")   # 橫線視為和
@@ -213,8 +285,13 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
 
             last_cx = cx
 
+        if DEBUG_VISION:
+            logger.info(f"[VISION] items={len(items)} widths_med={med_w:.1f} min_gap={min_gap:.1f} seq_len={len(seq)}")
+
         return seq[-240:]
-    except Exception:
+    except Exception as e:
+        if DEBUG_VISION:
+            logger.exception(f"[VISION][ERR] {e}")
         return []
 
 # =========================================================
@@ -231,7 +308,8 @@ def _streak_tail(seq: List[str]) -> int:
 def _transitions(seq: List[str]) -> np.ndarray:
     m = np.zeros((3,3), dtype=np.float32)
     for a,b in zip(seq, seq[1:]):
-        m[IDX[a], IDX[b]] += 1
+        if a in IDX and b in IDX:
+            m[IDX[a], IDX[b]] += 1
     if m.sum()>0: m = m/(m.sum()+1e-6)
     return m.flatten()
 
@@ -348,7 +426,6 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
-    # 🔧 修正：避免巢狀 f-string 導致的引號衝突
     bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
     return (
         f"{tag} 已解析 {len(seq)} 手\n"
@@ -360,6 +437,10 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
 # =========================================================
 # API（可自測）
 # =========================================================
+@app.route("/")
+def index():
+    return "BGS AI 助手正在運行 ✅ /line-webhook 已就緒", 200
+
 @app.route("/health")
 def health():
     return jsonify({"status":"ok","ts":int(time.time()),
@@ -372,13 +453,20 @@ def health():
 @app.route("/line-webhook", methods=['POST'])
 def line_webhook():
     if not (line_bot_api and line_handler):
+        logger.error("LINE creds missing: ACCESS_TOKEN or SECRET not set")
         abort(403)
-    signature = request.headers.get('X-Line-Signature')
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    logger.info(f"/line-webhook called, sig_len={len(signature)}, body_len={len(body)}")
     try:
         line_handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+    except InvalidSignatureError as e:
+        logger.exception(f"InvalidSignatureError: {e}. "
+                         f"==> 通常是 LINE_CHANNEL_SECRET 不對 或 用錯 Channel 的 Secret/Token")
+        return "Invalid signature", 200
+    except Exception as e:
+        logger.exception(f"Unhandled error while handling webhook: {e}")
+        return "Error", 200
     return "OK"
 
 if line_handler and line_bot_api:
