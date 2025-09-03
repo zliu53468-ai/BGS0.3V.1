@@ -1,19 +1,14 @@
 # app.py
-import os, io, logging
+import os, io, time, math, logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from flask import Flask, request, jsonify, abort
 from PIL import Image
 import numpy as np
+import cv2
 
-# ===== Optional CV (若需做圖片解析可用到) =====
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
-# ===== LINE SDK（允許沒設 Token 也能啟動） =====
+# ===== LINE SDK =====
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -41,29 +36,42 @@ try:
 except Exception:
     MultinomialHMM = None
 
-
-# -----------------------------------------
-# Flask & Logging
-# -----------------------------------------
 app = Flask(__name__)
+
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-bot")
 
-
-# -----------------------------------------
-# ENV（允許本地與雲端）
-# -----------------------------------------
+# ---------- ENV ----------
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-# 沒有 Token 也能啟動（方便本地測試/API 模擬）
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
-line_handler = WebhookHandler(LINE_CHANNEL_SECRET if LINE_CHANNEL_SECRET else "DUMMY_SECRET")
+line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
+# --- Vision tuning (可由環境變數調) ---
+DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
-# -----------------------------------------
-# 模型載入（存在就用，不存在走規則機）
-# -----------------------------------------
+HSV = {
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW",  "0")),  int(os.getenv("HSV_RED1_S_LOW",  "50")), int(os.getenv("HSV_RED1_V_LOW",  "50"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "12")), int(os.getenv("HSV_RED1_S_HIGH", "255")),int(os.getenv("HSV_RED1_V_HIGH", "255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW",  "170")),int(os.getenv("HSV_RED2_S_LOW",  "50")), int(os.getenv("HSV_RED2_V_LOW",  "50"))),
+    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")),int(os.getenv("HSV_RED2_S_HIGH", "255")),int(os.getenv("HSV_RED2_V_HIGH", "255"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW",  "90")), int(os.getenv("HSV_BLUE_S_LOW",  "50")), int(os.getenv("HSV_BLUE_V_LOW",  "50"))),
+    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "135")),int(os.getenv("HSV_BLUE_S_HIGH", "255")),int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH", "255"))),
+}
+
+HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))  # ROI 寬度比例
+HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
+CANNY1 = int(os.getenv("CANNY1", "60"))
+CANNY2 = int(os.getenv("CANNY2", "180"))
+
+# ---------- User session: 是否進入分析模式 ----------
+user_mode: Dict[str, bool] = {}   # user_id -> True/False
+
+# ---------- 模型載入 ----------
 MODELS_DIR = Path("models")
 SCALER_PATH = MODELS_DIR / "scaler.pkl"
 XGB_PKL     = MODELS_DIR / "xgb_model.pkl"
@@ -74,7 +82,7 @@ LGBM_TXT    = MODELS_DIR / "lgbm_model.txt"
 LGBM_JSON   = MODELS_DIR / "lgbm_model.json"
 HMM_PKL     = MODELS_DIR / "hmm_model.pkl"
 
-model_bundle: Dict[str, Any] = {}
+model_bundle: Dict[str, Any] = {"loaded": False, "note": "no model"}
 
 def _safe_exists(p: Path) -> bool:
     try:
@@ -89,31 +97,29 @@ def load_models():
         if joblib and _safe_exists(SCALER_PATH):
             bundle["scaler"] = joblib.load(SCALER_PATH)
 
-        # XGB
         if xgb:
             if _safe_exists(XGB_PKL) and joblib:
                 bundle["xgb_sklearn"] = joblib.load(XGB_PKL)
             elif _safe_exists(XGB_JSON):
-                booster = xgb.Booster()
-                booster.load_model(str(XGB_JSON))
-                bundle["xgb_booster"] = booster
+                bst = xgb.Booster(); bst.load_model(str(XGB_JSON))
+                bundle["xgb_booster"] = bst
             elif _safe_exists(XGB_UBJ):
-                booster = xgb.Booster()
-                booster.load_model(str(XGB_UBJ))
-                bundle["xgb_booster"] = booster
+                bst = xgb.Booster(); bst.load_model(str(XGB_UBJ))
+                bundle["xgb_booster"] = bst
 
-        # LGBM
         if lgb:
             if _safe_exists(LGBM_PKL) and joblib:
                 bundle["lgbm_sklearn"] = joblib.load(LGBM_PKL)
             elif _safe_exists(LGBM_TXT):
                 bundle["lgbm_booster"] = lgb.Booster(model_file=str(LGBM_TXT))
             elif _safe_exists(LGBM_JSON):
-                bundle["lgbm_booster"] = lgb.Booster(model_file=str(LGBM_JSON))
+                booster = lgb.Booster(model_str=LGBM_JSON.read_text(encoding="utf-8"))
+                bundle["lgbm_booster"] = booster
 
-        # HMM
-        if MultinomialHMM and _safe_exists(HMM_PKL) and joblib:
-            bundle["hmm"] = joblib.load(HMM_PKL)
+        if MultinomialHMM and joblib and _safe_exists(HMM_PKL):
+            hmm = joblib.load(HMM_PKL)
+            if hasattr(hmm, "n_components") and hmm.n_components == 3:
+                bundle["hmm"] = hmm
 
         bundle["loaded"] = any(k in bundle for k in (
             "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster", "hmm"
@@ -127,123 +133,281 @@ def load_models():
 
 load_models()
 
+# =========================================================
+# 圖像→序列（支援：紅=莊, 藍=閒；紅/藍圈內"橫線"=和）
+# =========================================================
+IDX = {"B":0,"P":1,"T":2}
 
-# -----------------------------------------
-# 工具：解析 B/P/T（支援中文、逗號、大小寫）
-# -----------------------------------------
-def parse_seq_from_text(text: str) -> List[str]:
-    if not text:
-        return []
+def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
+    """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）。"""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return False
+
+    # 對比增強 + 去噪
+    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    enh = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 3)
+
+    # 二值化 + 邊緣
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, 11, 2)
+    edges = cv2.Canny(thr, CANNY1, CANNY2)
+
+    h, w = edges.shape[:2]
+    min_len = max(int(w * HOUGH_MIN_LEN_RATIO), 12)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
+                            minLineLength=min_len, maxLineGap=HOUGH_GAP)
+    if lines is None:
+        return False
+    # 近水平：|dy| 小於 12% 高度（更嚴格）
+    for x1, y1, x2, y2 in lines[:, 0, :]:
+        if abs(y2 - y1) <= max(2, int(h * 0.12)):
+            return True
+    return False
+
+def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
+    """
+    回傳序列（最多 240 手）：'B', 'P', 'T'
+    規則：
+      - 紅=莊(B), 藍=閒(P)
+      - 若紅/藍圈 ROI 內偵測到水平直線 → 視為和(T)
+      - 綠色（若有）也當 T
+    """
     try:
-        import unicodedata
-        text = unicodedata.normalize("NFKC", text)
-    except Exception:
-        pass
-    t = text.upper().replace(",", " ").replace("，", " ").replace("|", " ").replace("/", " ")
-    mapping = {
-        "莊": "B", "莊家": "B", "BANKER": "B", "Z": "B",
-        "閒": "P", "閒家": "P", "PLAYER": "P", "X": "P",
-        "和": "T", "和局": "T", "TIE": "T", "H": "T"
-    }
-    tokens: List[str] = []
-    for raw in t.split():
-        if raw in ("B", "P", "T"):
-            tokens.append(raw)
-        else:
-            r = "".join(ch for ch in raw if ch.isalnum() or ch in ("B", "P", "T"))
-            if r in ("B", "P", "T"):
-                tokens.append(r)
-            elif raw in mapping:
-                tokens.append(mapping[raw])
-    return tokens
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = np.array(img)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-def clean(seq: List[str]) -> List[str]:
-    return [s for s in seq if s in ("B","P","T")]
+        # 規一化（小圖放大，避免圈太小）
+        h0, w0 = img.shape[:2]
+        target = 1400.0
+        scale = target / max(h0, w0) if max(h0, w0) < target else 1.0
+        if scale > 1.0:
+            img = cv2.resize(img, (int(w0*scale), int(h0*scale)), interpolation=cv2.INTER_CUBIC)
 
-def _streak_tail(seq: List[str], target: str) -> int:
-    t = 0
-    for s in reversed(seq):
-        if s == target:
-            t += 1
-        else:
-            break
-    return t
+        # 降噪 + 顏色空間
+        blur = cv2.GaussianBlur(img, (3,3), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-def _transitions(seq: List[str]) -> Dict[str,int]:
-    c = {"BB":0,"BP":0,"PP":0,"PB":0}
-    for a,b in zip(seq, seq[1:]):
-        if a in "BP" and b in "BP":
-            c[a+b]+=1
+        # 顏色遮罩（可由環境變數調）
+        red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
+        red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
+        red  = cv2.bitwise_or(red1, red2)
+        blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
+        green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
+
+        # 形態學：先 close 補洞，再 open 去雜訊
+        kernel3 = np.ones((3,3), np.uint8)
+        def clean(m):
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel3, iterations=1)
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel3, iterations=1)
+            return m
+        red, blue, green = clean(red), clean(blue), clean(green)
+
+        # 以 connected components 取得穩定 blob
+        def cc_blobs(mask, label):
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            items = []
+            # 統計平均面積來自適應過小/過大濾除
+            areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
+            area_med = np.median(areas) if areas else 0
+            min_area = max(80, int(area_med * 0.35))  # 自適應門檻
+            max_area = int(area_med * 8) if area_med > 0 else 999999
+
+            for i in range(1, n):
+                x, y, w, h, a = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
+                if a < min_area or a > max_area:
+                    continue
+                # 圓度/長寬比過濾，避免長條噪聲
+                aspect = w / (h + 1e-6)
+                if not (0.5 <= aspect <= 2.0):
+                    continue
+                c = (labels == i).astype(np.uint8) * 255
+                cnts, _ = cv2.findContours(c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    continue
+                cnt = max(cnts, key=cv2.contourArea)
+                per = cv2.arcLength(cnt, True)
+                area = cv2.contourArea(cnt)
+                if per <= 0 or area <= 0:
+                    continue
+                circularity = 4 * math.pi * area / (per * per)
+                if circularity < 0.3:  # 太不圓的過濾
+                    continue
+
+                cx = x + w / 2.0
+                items.append((x, y, w, h, cx, label))
+            return items
+
+        items = []
+        items += cc_blobs(red,  "B")
+        items += cc_blobs(blue, "P")
+        items += cc_blobs(green,"T")  # 若平台用綠色單獨標和
+
+        if not items:
+            return []
+
+        # 依 x 中心排序 → 大路由左至右
+        items.sort(key=lambda z: z[4])
+
+        # 動態間距：用 blob 寬度中位數
+        widths = [w for _,_,w,_,_,_ in items]
+        med_w  = np.median(widths) if widths else 12
+        min_gap = max(med_w * 0.6, 10)
+
+        seq: List[str] = []
+        last_cx = -1e9
+
+        for x,y,w0,h0,cx,label in items:
+            if abs(cx - last_cx) < min_gap:
+                continue
+
+            if label in {"B","P"}:
+                # 取較小的內部 ROI 檢線，避免邊界干擾
+                pad_x = max(2, int(w0 * 0.18))
+                pad_y = max(2, int(h0 * 0.28))
+                x1 = max(0, int(x + pad_x)); x2 = min(img.shape[1], int(x + w0 - pad_x))
+                y1 = max(0, int(y + pad_y)); y2 = min(img.shape[0], int(y + h0 - pad_y))
+                roi = img[y1:y2, x1:x2]
+                if _has_horizontal_line(roi):
+                    seq.append("T")   # 橫線視為和
+                else:
+                    seq.append(label)
+            else:
+                # 綠色（若平台有）直接視為和
+                seq.append("T")
+
+            last_cx = cx
+
+        if DEBUG_VISION:
+            logger.info(f"[VISION] items={len(items)} widths_med={med_w:.1f} min_gap={min_gap:.1f} seq_len={len(seq)}")
+
+        return seq[-240:]
+    except Exception as e:
+        if DEBUG_VISION:
+            logger.exception(f"[VISION][ERR] {e}")
+        return []
+
+# =========================================================
+# 特徵工程 & 模型推理 & 規則回退
+# =========================================================
+def _streak_tail(seq: List[str]) -> int:
+    if not seq: return 0
+    t, c = seq[-1], 1
+    for i in range(len(seq)-2, -1, -1):
+        if seq[i]==t: c+=1
+        else: break
     return c
 
-def _ratio_lastN(seq: List[str], target: str, N: int=20) -> float:
-    last = seq[-N:] if len(seq)>N else seq
-    n = sum(1 for s in last if s==target)
-    d = sum(1 for s in last if s in "BP")
-    return (n/d) if d else 0.5
+def _transitions(seq: List[str]) -> np.ndarray:
+    m = np.zeros((3,3), dtype=np.float32)
+    for a,b in zip(seq, seq[1:]):
+        if a in IDX and b in IDX:
+            m[IDX[a], IDX[b]] += 1
+    if m.sum()>0: m = m/(m.sum()+1e-6)
+    return m.flatten()
+
+def _ratio_lastN(seq: List[str], N: int) -> Tuple[float,float,float]:
+    s = seq[-N:] if len(seq)>=N else seq
+    if not s: return (0.33,0.33,0.34)
+    n = len(s); return (s.count("B")/n, s.count("P")/n, s.count("T")/n)
 
 def build_features(seq: List[str]) -> np.ndarray:
-    seq = clean(seq)
-    arr = np.array([
-        _streak_tail(seq,"B"),
-        _streak_tail(seq,"P"),
-        _ratio_lastN(seq,"B",20),
-        _ratio_lastN(seq,"P",20),
-        _transitions(seq)["BB"],
-        _transitions(seq)["PP"],
-        _transitions(seq)["BP"],
-        _transitions(seq)["PB"],
-    ], dtype=float).reshape(1,-1)
-    return arr
+    n = len(seq)
+    pb, pp, pt = _ratio_lastN(seq, n)
+    b10,p10,t10 = _ratio_lastN(seq,10)
+    b20,p20,t20 = _ratio_lastN(seq,20)
+    streak = _streak_tail(seq)
+    last = np.zeros(3); last[IDX[seq[-1]]] = 1.0
+    trans = _transitions(seq)
+    entropy = 0.0
+    for v in [pb,pp,pt]:
+        if v>1e-9: entropy -= v*math.log(v+1e-9)
+    feat = np.array([n,pb,pp,pt,b10,p10,t10,b20,p20,t20,streak,entropy,*last,*trans], dtype=np.float32).reshape(1,-1)
+    return feat
 
-def _normalize(p: np.ndarray) -> np.ndarray:
-    s = p.sum()
-    return (p/s) if s>0 else np.array([1/3,1/3,1/3])
+def _normalize(p: Dict[str,float]) -> Dict[str,float]:
+    s = p["banker"]+p["player"]+p["tie"]
+    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
+    return {k: round(v/s,4) for k,v in p.items()}
 
-def _proba_from_xgb(X: np.ndarray) -> np.ndarray:
-    # 依你的模型實作；此處先給 placeholder
-    return np.array([0.34,0.33,0.33])
+def _proba_from_xgb(feat: np.ndarray) -> Dict[str,float] | None:
+    if "xgb_sklearn" in model_bundle:
+        proba = model_bundle["xgb_sklearn"].predict_proba(feat)[0]
+        return {"banker": float(proba[IDX["B"]]), "player": float(proba[IDX["P"]]), "tie": float(proba[IDX["T"]])}
+    if "xgb_booster" in model_bundle and xgb:
+        d = xgb.DMatrix(feat); proba = model_bundle["xgb_booster"].predict(d)[0]
+        if len(proba)==3:
+            return {"banker": float(proba[0]), "player": float(proba[1]), "tie": float(proba[2])}
+    return None
 
-def _proba_from_lgb(X: np.ndarray) -> np.ndarray:
-    return np.array([0.34,0.33,0.33])
+def _proba_from_lgb(feat: np.ndarray) -> Dict[str,float] | None:
+    if "lgbm_sklearn" in model_bundle:
+        proba = model_bundle["lgbm_sklearn"].predict_proba(feat)[0]
+        return {"banker": float(proba[IDX["B"]]), "player": float(proba[IDX["P"]]), "tie": float(proba[IDX["T"]])}
+    if "lgbm_booster" in model_bundle and lgb:
+        proba = model_bundle["lgbm_booster"].predict(feat)[0]
+        if isinstance(proba,(list,np.ndarray)) and len(proba)==3:
+            return {"banker": float(proba[0]), "player": float(proba[1]), "tie": float(proba[2])}
+    return None
 
-def _proba_from_hmm(seq: List[str]) -> np.ndarray:
-    return np.array([0.34,0.33,0.33])
+def _proba_from_hmm(seq: List[str]) -> Dict[str,float] | None:
+    hmm = model_bundle.get("hmm")
+    if not hmm or not seq: return None
+    sym = {"B":0,"P":1,"T":2}
+    base = np.array([[sym[s]] for s in seq], dtype=np.int32)
+    scores=[]
+    for cand in ["B","P","T"]:
+        test = np.vstack([base, [[sym[cand]]]])
+        try:
+            logp = hmm.score(test, lengths=[len(test)])
+        except Exception:
+            logp = -1e9
+        scores.append(logp)
+    m = max(scores); exps = np.exp(np.array(scores)-m)
+    prob = exps/(exps.sum()+1e-12)
+    return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
 
-def predict_with_models(seq: List[str]) -> Dict[str,float]:
-    X = build_features(seq)
-    ps = []
-    if model_bundle.get("xgb_sklearn") or model_bundle.get("xgb_booster"):
-        ps.append(_proba_from_xgb(X))
-    if model_bundle.get("lgbm_sklearn") or model_bundle.get("lgbm_booster"):
-        ps.append(_proba_from_lgb(X))
-    if model_bundle.get("hmm"):
-        ps.append(_proba_from_hmm(seq))
-    if not ps:
-        ps = [np.array([0.34,0.33,0.33])]
-    mean = _normalize(np.mean(ps, axis=0))
-    return {"banker": float(mean[0]), "player": float(mean[1]), "tie": float(mean[2])}
+def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
+    feat = build_features(seq)
+    if "scaler" in model_bundle:
+        feat = model_bundle["scaler"].transform(feat)
+    votes=[]
+    p=_proba_from_xgb(feat);  votes.append(p) if p else None
+    p=_proba_from_lgb(feat);  votes.append(p) if p else None
+    p=_proba_from_hmm(seq);   votes.append(p) if p else None
+    if not votes: return None
+    avg={"banker":0.0,"player":0.0,"tie":0.0}
+    for v in votes:
+        for k in avg: avg[k]+=v[k]
+    for k in avg: avg[k]/=len(votes)
+    return _normalize(avg)
 
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
-    # 備援規則機（無模型時）
-    b = 0.5 + 0.1 * (_ratio_lastN(seq,"B",12) - 0.5)
-    p = 1 - b
-    t = 0.02
-    s = b + p + t
-    return {"banker": b/s, "player": p/s, "tie": t/s}
+    n=len(seq)
+    if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
+    pb = seq.count("B")/n
+    pp = seq.count("P")/n
+    pt = max(0.02, seq.count("T")/n*0.6)
+    # 尾端連續加權
+    tail=1
+    for i in range(n-2,-1,-1):
+        if seq[i]==seq[-1]: tail+=1
+        else: break
+    if seq[-1] in {"B","P"}:
+        boost = min(0.10, 0.03*(tail-1))
+        if seq[-1]=="B": pb+=boost
+        else: pp+=boost
+    s=pb+pp+pt
+    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
+    return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
 
-
-# -----------------------------------------
-# 影像→序列（佔位：回傳 []；之後接上你的 CV 管線）
-# -----------------------------------------
-def extract_sequence_from_image(img: Image.Image) -> List[str]:
-    # TODO: 接上你的牌路 OCR/色塊/線段偵測，輸出 ["B","P","B","T",...]
-    return []
-
-
-# -----------------------------------------
-# 資金分配（維持你的檔位：0/2/4/8/12%）
-# -----------------------------------------
 def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     diff = abs(pb-pp)
     side = "莊" if pb >= pp else "閒"
@@ -256,18 +420,21 @@ def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     else: pct = 0.12
     return {"side": side, "percent": pct, "side_prob": side_prob}
 
-
-# -----------------------------------------
-# 顯示整合（資金＋方向；<12% 顛倒顯示）
-# -----------------------------------------
+# ============（這裡是你要的唯一邏輯變更）============
 def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
+    """
+    顯示規則：
+      - 將「資金建議」與「下注建議」合併為同一行
+      - 若 percent == 0 → 顯示「觀望」
+      - 若 0 < percent < 0.12 → 只在『顯示』上把莊/閒顛倒（資金數值不變；模型不變）
+      - 若 percent >= 0.12 → 照模型方向顯示（不顛倒）
+    """
     b, p, t = probs["banker"], probs["player"], probs["tie"]
     plan = betting_plan(b, p)
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
 
-    # percent == 0 → 觀望； 0<percent<0.12 → 顯示方向顛倒； >=0.12 → 不顛倒
     if plan["percent"] == 0.0:
         advise_text = "觀望"
     else:
@@ -282,106 +449,96 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
         f"建議（資金+方向）：{advise_text}（勝率 {win_txt}）{note}\n"
         f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}"
     )
+# =========================================================
 
-
-# -----------------------------------------
-# Flask Routes
-# -----------------------------------------
+# =========================================================
+# API（可自測）
+# =========================================================
 @app.route("/")
 def index():
-    return "BGS AI 助手正在運行 ✅ /health /api/simulate /line-webhook"
+    return "BGS AI 助手正在運行 ✅ /line-webhook 已就緒", 200
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "models": model_bundle.get("note","")})
+    return jsonify({"status":"ok","ts":int(time.time()),
+                    "models_loaded": model_bundle.get("loaded", False),
+                    "note": model_bundle.get("note","")})
 
-# 方便本地 / 雲端無 LINE 時自測
-@app.route("/api/simulate", methods=["POST"])
-def simulate():
-    data = request.get_json(force=True, silent=True) or {}
-    text = (data.get("text") or "").strip()
-    seq = parse_seq_from_text(text)
-    if not seq:
-        return jsonify({"error":"請提供序列，例如：'B P P B T' 或 '莊 閒 閒 莊 和'"}), 400
-    probs = predict_with_models(seq) if model_bundle.get("loaded") else predict_probs_from_seq_rule(seq)
-    reply = render_reply(seq, probs, by_model=model_bundle.get("loaded", False))
-    return jsonify({"reply": reply, "seq": seq, "probs": probs})
-
-
-# ============ LINE Webhook ============
-@app.route("/line-webhook", methods=["POST"])
+# =========================================================
+# LINE Webhook
+# =========================================================
+@app.route("/line-webhook", methods=['POST'])
 def line_webhook():
-    signature = request.headers.get("X-Line-Signature", "")
+    if not (line_bot_api and line_handler):
+        logger.error("LINE creds missing: ACCESS_TOKEN or SECRET not set")
+        abort(403)
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    logger.info(f"/line-webhook called, sig_len={len(signature)}, body_len={len(body)}")
     try:
         line_handler.handle(body, signature)
-    except InvalidSignatureError:
-        # 沒設定正確 secret 時，這裡可能報錯
-        abort(400, "Invalid signature")
+    except InvalidSignatureError as e:
+        logger.exception(f"InvalidSignatureError: {e}. "
+                         f"==> 通常是 LINE_CHANNEL_SECRET 不對 或 用錯 Channel 的 Secret/Token")
+        return "Invalid signature", 200
+    except Exception as e:
+        logger.exception(f"Unhandled error while handling webhook: {e}")
+        return "Error", 200
     return "OK"
 
-@line_handler.add(FollowEvent)
-def on_follow(event: FollowEvent):
-    if line_bot_api:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage("歡迎加入！\n- 貼文字：B/P/T 或 莊/閒/和（可用逗號或空白分隔）\n- 貼圖片：可解析大路/下三路（清晰、完整）")
+if line_handler and line_bot_api:
+
+    @line_handler.add(FollowEvent)
+    def on_follow(event: FollowEvent):
+        welcome = (
+            "歡迎加入BGS AI 助手 🎉\n\n"
+            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議（資金+方向）。"
         )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
 
-@line_handler.add(MessageEvent, message=TextMessage)
-def on_text(event: MessageEvent):
-    text = (event.message.text or "").strip()
-    seq = parse_seq_from_text(text)
-    if not seq:
-        msg = (
-            "格式小抄：請貼 B P T 序列（支援中文：莊/閒/和；可用逗號或空白分隔）\n"
-            "例：B P P B T B、或：莊 閒 閒 莊 和 莊"
-        )
-        if line_bot_api:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(msg))
-        return
+    @line_handler.add(MessageEvent, message=TextMessage)
+    def on_text(event: MessageEvent):
+        uid = getattr(event.source, "user_id", "unknown")
+        txt = (event.message.text or "").strip()
+        if txt in {"開始分析", "開始", "START", "分析"}:
+            user_mode[uid] = True
+            msg = "已進入分析模式 ✅\n請上傳牌路截圖，我會回覆「建議（資金+方向）」與機率。"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            return
+        # 非「開始分析」指令
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="請先輸入「開始分析」，再上傳牌路截圖。"
+        ))
 
-    probs = predict_with_models(seq) if model_bundle.get("loaded") else predict_probs_from_seq_rule(seq)
-    reply = render_reply(seq, probs, by_model=model_bundle.get("loaded", False))
-    if line_bot_api:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(reply))
+    @line_handler.add(MessageEvent, message=ImageMessage)
+    def on_image(event: MessageEvent):
+        uid = getattr(event.source, "user_id", "unknown")
+        if not user_mode.get(uid):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳牌路截圖。"
+            ))
+            return
 
-@line_handler.add(MessageEvent, message=ImageMessage)
-def on_image(event: MessageEvent):
-    # 從 LINE 拉回影像 bytes
-    seq: List[str] = []
-    try:
-        if not line_bot_api:
-            raise RuntimeError("LINE config missing")
+        # 下載圖片 → 解析序列 → 推理 → 回覆
         content = line_bot_api.get_message_content(event.message.id)
-        b = io.BytesIO()
-        for chunk in content.iter_content():
-            b.write(chunk)
-        b.seek(0)
-        img = Image.open(b).convert("RGB")
-        seq = extract_sequence_from_image(img)  # TODO: 接上你的影像管線
-    except Exception as e:
-        logger.exception(f"[image] fetch/parse error: {e}")
+        img_bytes = b"".join(chunk for chunk in content.iter_content())
+        seq = extract_sequence_from_image(img_bytes)
+        if not seq:
+            tip = (
+                "辨識失敗 😥\n"
+                "請確保截圖清楚包含大路，並避免過度縮放或模糊。"
+            )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
-    if not seq:
-        msg = (
-            "圖片未能解析出牌路 😵‍💫\n"
-            "請確保：截圖包含完整大路/下三路、畫質清晰、避免壓縮/反光。\n"
-            "也可先改貼文字序列（支援：B/P/T 與 莊/閒/和）。"
-        )
-        if line_bot_api:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(msg))
-        return
+        if model_bundle.get("loaded"):
+            probs = predict_with_models(seq); by_model = probs is not None
+            if not by_model: probs = predict_probs_from_seq_rule(seq)
+        else:
+            probs = predict_probs_from_seq_rule(seq); by_model = False
 
-    probs = predict_with_models(seq) if model_bundle.get("loaded") else predict_probs_from_seq_rule(seq)
-    reply = render_reply(seq, probs, by_model=model_bundle.get("loaded", False))
-    if line_bot_api:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(reply))
+        msg = render_reply(seq, probs, by_model)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
-
-# -----------------------------------------
-# Entrypoint
-# -----------------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
