@@ -1,5 +1,5 @@
 # app.py
-import os, io, time, json, math
+import os, io, time, math
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -44,6 +44,9 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+
+# ---------- User session: 是否進入分析模式 ----------
+user_mode: Dict[str, bool] = {}   # user_id -> True/False
 
 # ---------- 模型載入 ----------
 MODELS_DIR = Path("models")
@@ -106,40 +109,56 @@ def load_models():
 load_models()
 
 # =========================================================
-# 解析序列（文字/圖片）
+# 圖像→序列（支援：紅=莊, 藍=閒；紅/藍圈內"橫線"=和）
 # =========================================================
-MAP_CH = {"莊":"B", "閒":"P", "和":"T"}
 IDX = {"B":0,"P":1,"T":2}
 
-def parse_text_sequence(text: str) -> List[str]:
-    s = (text or "").upper()
-    s = s.replace(",", " ").replace("，", " ").replace("/", " ").replace("|", " ")
-    tokens: List[str] = []
-    for ch in s:
-        if ch in {"B","P","T"}:
-            tokens.append(ch)
-        elif ch in MAP_CH:
-            tokens.append(MAP_CH[ch])
-    for word in s.split():
-        if word in {"B","P","T"}:
-            tokens.append(word)
-        elif word in {"莊","閒","和"}:
-            tokens.append(MAP_CH[word])
-    return tokens[-240:] if tokens else []
+def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
+    """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）。"""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return False
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    edges = cv2.Canny(gray, 60, 180)
+    h, w = edges.shape[:2]
+    min_len = max(int(w * 0.45), 12)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
+                            minLineLength=min_len, maxLineGap=6)
+    if lines is None:
+        return False
+    # 近水平：|dy| 小於 15% 高度
+    for x1, y1, x2, y2 in lines[:,0,:]:
+        if abs(y2 - y1) <= max(2, int(h * 0.15)):
+            return True
+    return False
 
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
+    """
+    回傳序列（最多 240 手）：'B', 'P', 'T'
+    規則：
+      - 紅=莊(B), 藍=閒(P)
+      - 若紅/藍圈 ROI 內偵測到水平直線 → 視為和(T)（忽略底色）
+      - 綠色（若有）也當 T
+    """
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(img); img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = np.array(img)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        # 規一化大小
         h, w = img.shape[:2]
         scale = 1200.0 / max(h, w)
-        if scale < 1.5: img = cv2.resize(img, (int(w*scale), int(h*scale)))
+        if scale < 1.5:
+            img = cv2.resize(img, (int(w*scale), int(h*scale)))
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+        # 顏色遮罩
         red1 = cv2.inRange(hsv, (0, 70, 60), (10, 255, 255))
         red2 = cv2.inRange(hsv, (170, 70, 60), (180, 255, 255))
         red  = cv2.bitwise_or(red1, red2)
         blue = cv2.inRange(hsv, (90, 70, 60), (130, 255, 255))
         green= cv2.inRange(hsv, (40, 50, 60), (80, 255, 255))
+
         kernel = np.ones((5,5), np.uint8)
         red   = cv2.morphologyEx(red,   cv2.MORPH_OPEN, kernel)
         blue  = cv2.morphologyEx(blue,  cv2.MORPH_OPEN, kernel)
@@ -149,25 +168,57 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
             cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             items = []
             for c in cs:
-                if cv2.contourArea(c) < 50: continue
+                area = cv2.contourArea(c)
+                if area < 60:  # 過小雜訊
+                    continue
                 x,y,w,h = cv2.boundingRect(c)
                 cx = x + w/2
-                items.append((cx, label))
+                items.append((x,y,w,h,cx,label))
             return items
 
-        items = blobs(red,"B")+blobs(blue,"P")+blobs(green,"T")
-        if not items: return []
-        items.sort(key=lambda z: z[0])
-        seq = []; last_x = -1e9; min_gap = max(img.shape[1]*0.015, 8)
-        for cx, label in items:
-            if abs(cx-last_x) < min_gap: continue
-            seq.append(label); last_x = cx
+        items = []
+        items += blobs(red,  "B")
+        items += blobs(blue, "P")
+        items += blobs(green,"T")  # 若平台用綠色單獨標和
+
+        if not items:
+            return []
+
+        # 依 x 中心排序 → 大路由左至右
+        items.sort(key=lambda z: z[4])
+
+        seq: List[str] = []
+        last_cx = -1e9
+        min_gap = max(img.shape[1] * 0.015, 8)
+
+        for x,y,w0,h0,cx,label in items:
+            if abs(cx - last_cx) < min_gap:
+                # 與上一顆太靠近，視為同一格，跳過
+                continue
+
+            if label in {"B","P"}:
+                # 取較小的內部 ROI 檢線，避免邊界干擾
+                pad_x = max(2, int(w0 * 0.15))
+                pad_y = max(2, int(h0 * 0.25))
+                x1 = max(0, x + pad_x); x2 = min(img.shape[1], x + w0 - pad_x)
+                y1 = max(0, y + pad_y); y2 = min(img.shape[0], y + h0 - pad_y)
+                roi = img[y1:y2, x1:x2]
+                if _has_horizontal_line(roi):
+                    seq.append("T")   # 橫線視為和
+                else:
+                    seq.append(label)
+            else:
+                # 綠色（若平台有）直接視為和
+                seq.append("T")
+
+            last_cx = cx
+
         return seq[-240:]
     except Exception:
         return []
 
 # =========================================================
-# 特徵 & 模型推理
+# 特徵工程 & 模型推理 & 規則回退
 # =========================================================
 def _streak_tail(seq: List[str]) -> int:
     if not seq: return 0
@@ -203,13 +254,17 @@ def build_features(seq: List[str]) -> np.ndarray:
     feat = np.array([n,pb,pp,pt,b10,p10,t10,b20,p20,t20,streak,entropy,*last,*trans], dtype=np.float32).reshape(1,-1)
     return feat
 
+def _normalize(p: Dict[str,float]) -> Dict[str,float]:
+    s = p["banker"]+p["player"]+p["tie"]
+    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
+    return {k: round(v/s,4) for k,v in p.items()}
+
 def _proba_from_xgb(feat: np.ndarray) -> Dict[str,float] | None:
     if "xgb_sklearn" in model_bundle:
         proba = model_bundle["xgb_sklearn"].predict_proba(feat)[0]
         return {"banker": float(proba[IDX["B"]]), "player": float(proba[IDX["P"]]), "tie": float(proba[IDX["T"]])}
     if "xgb_booster" in model_bundle and xgb:
-        d = xgb.DMatrix(feat)
-        proba = model_bundle["xgb_booster"].predict(d)[0]
+        d = xgb.DMatrix(feat); proba = model_bundle["xgb_booster"].predict(d)[0]
         if len(proba)==3:
             return {"banker": float(proba[0]), "player": float(proba[1]), "tie": float(proba[2])}
     return None
@@ -241,11 +296,6 @@ def _proba_from_hmm(seq: List[str]) -> Dict[str,float] | None:
     prob = exps/(exps.sum()+1e-12)
     return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
 
-def _normalize(p: Dict[str,float]) -> Dict[str,float]:
-    s = p["banker"]+p["player"]+p["tie"]
-    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
-    return {k: round(v/s,4) for k,v in p.items()}
-
 def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
     feat = build_features(seq)
     if "scaler" in model_bundle:
@@ -261,13 +311,13 @@ def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
     for k in avg: avg[k]/=len(votes)
     return _normalize(avg)
 
-# 規則回退
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     n=len(seq)
     if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
     pb = seq.count("B")/n
     pp = seq.count("P")/n
     pt = max(0.02, seq.count("T")/n*0.6)
+    # 尾端連續加權
     tail=1
     for i in range(n-2,-1,-1):
         if seq[i]==seq[-1]: tail+=1
@@ -280,7 +330,6 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
 
-# 下注比例 + 額外「建議預測：莊/閒 XX%」
 def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     diff = abs(pb-pp)
     side = "莊" if pb >= pp else "閒"
@@ -293,21 +342,21 @@ def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     else: pct = 0.12
     return {"side": side, "percent": pct, "side_prob": side_prob}
 
-def render_prediction_msg(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
+def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
     b, p, t = probs["banker"], probs["player"], probs["tie"]
     plan = betting_plan(b, p)
     tag = "（模型）" if by_model else "（規則）"
-    percent_txt = f"{plan['side_prob']*100:.1f}%"
-    suffix = f"｜{plan.get('note')}" if plan.get("note") else ""
+    win_txt = f"{plan['side_prob']*100:.1f}%"
+    note = f"｜{plan['note']}" if plan.get("note") else ""
     return (
-        f"{tag} 已讀取 {len(seq)} 手走勢\n"
-        f"機率 → 莊:{b:.2f}  閒:{p:.2f}  和:{t:.2f}\n"
-        f"建議預測：{plan['side']} {percent_txt}{suffix}\n"
-        f"下注建議：{'觀望' if plan['percent']==0 else f'資金 {plan['percent']*100:.0f}% 於「{plan['side']}」'}"
+        f"{tag} 已解析 {len(seq)} 手\n"
+        f"建議下注：{plan['side']}（勝率 {win_txt}）{note}\n"
+        f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}\n"
+        f"資金建議：{'觀望' if plan['percent']==0 else f'下 {plan['percent']*100:.0f}% 於「{plan['side']}」'}"
     )
 
 # =========================================================
-# API
+# API（可自測）
 # =========================================================
 @app.route("/health")
 def health():
@@ -315,31 +364,13 @@ def health():
                     "models_loaded": model_bundle.get("loaded", False),
                     "note": model_bundle.get("note","")})
 
-@app.route("/api/predict-from-seq", methods=["POST"])
-def api_predict_from_seq():
-    data = request.get_json(silent=True) or {}
-    seq_text = str(data.get("sequence", "")).strip()
-    seq = parse_text_sequence(seq_text)
-    if not seq:
-        return jsonify({"ok": False, "msg": "無法解析序列，請提供 B/P/T 或 莊/閒/和"}), 400
-    if model_bundle.get("loaded"):
-        probs = predict_with_models(seq)
-        by_model = probs is not None
-        if not by_model:
-            probs = predict_probs_from_seq_rule(seq)
-    else:
-        probs = predict_probs_from_seq_rule(seq)
-        by_model = False
-    bp = betting_plan(probs["banker"], probs["player"])
-    return jsonify({"ok": True, "sequence": seq, "probs": probs,
-                    "betting": bp, "by_model": by_model})
-
 # =========================================================
 # LINE Webhook
 # =========================================================
 @app.route("/line-webhook", methods=['POST'])
 def line_webhook():
-    if not (line_bot_api and line_handler): abort(403)
+    if not (line_bot_api and line_handler):
+        abort(403)
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     try:
@@ -354,44 +385,41 @@ if line_handler and line_bot_api:
     def on_follow(event: FollowEvent):
         welcome = (
             "歡迎加入BGS AI 助手 🎉\n\n"
-            "請提供當前牌靴走勢：\n"
-            "1）貼文字：B P P B T 或 莊閒閒莊和\n"
-            "2）上傳牌路截圖：我會嘗試自動辨識\n\n"
-            "我將回覆「建議預測：莊/閒 + 百分比」與下注比例。"
+            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議下注：莊 / 閒（勝率 xx%）。"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
 
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event: MessageEvent):
-        text = (event.message.text or "").strip()
-        seq = parse_text_sequence(text)
-        if not seq:
-            tip = (
-                "看不出走勢序列 😿\n"
-                "請用 B/P/T 或 莊/閒/和 的形式提供，例如：\n"
-                "B P B P T P 或  莊閒莊閒和閒\n"
-                "也可直接上傳牌路截圖，我會嘗試辨識。"
-            )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
-
-        if model_bundle.get("loaded"):
-            probs = predict_with_models(seq); by_model = probs is not None
-            if not by_model: probs = predict_probs_from_seq_rule(seq)
-        else:
-            probs = predict_probs_from_seq_rule(seq); by_model = False
-
-        msg = render_prediction_msg(seq, probs, by_model)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        uid = getattr(event.source, "user_id", "unknown")
+        txt = (event.message.text or "").strip()
+        if txt in {"開始分析", "開始", "START", "分析"}:
+            user_mode[uid] = True
+            msg = "已進入分析模式 ✅\n請上傳牌路截圖：我會嘗試自動辨識並回覆「建議下注：莊 / 閒（勝率 xx%）」"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            return
+        # 非「開始分析」指令
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="請先輸入「開始分析」，再上傳牌路截圖。"
+        ))
 
     @line_handler.add(MessageEvent, message=ImageMessage)
     def on_image(event: MessageEvent):
+        uid = getattr(event.source, "user_id", "unknown")
+        if not user_mode.get(uid):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳牌路截圖。"
+            ))
+            return
+
+        # 下載圖片 → 解析序列 → 推理 → 回覆
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_sequence_from_image(img_bytes)
         if not seq:
             tip = (
-                "圖片辨識失敗 😥\n"
-                "請改用文字提供 B/P/T 或 莊/閒/和 的走勢序列。"
+                "辨識失敗 😥\n"
+                "請確保截圖清楚包含大路，並避免過度縮放或模糊。"
             )
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
@@ -401,7 +429,7 @@ if line_handler and line_bot_api:
         else:
             probs = predict_probs_from_seq_rule(seq); by_model = False
 
-        msg = "（由截圖解析）\n" + render_prediction_msg(seq, probs, by_model)
+        msg = render_reply(seq, probs, by_model)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 if __name__ == "__main__":
