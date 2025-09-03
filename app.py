@@ -1,15 +1,22 @@
 # app.py
 # =========================================================
-# BGS AI（Flask + LINE）— 牌路辨識 + 多模型投票（XGB/LGBM/HMM/MLP/RNN）
-# - 模型皆為「可選載入」，不存在也不會報錯；若皆不存在則回退規則法
+# BGS AI（Flask + LINE）— 牌路辨識 + 投票（XGB/LGBM/RNN）
+# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM / MLP 已不納入）
+# - 加入「震盪偵測」＋「加權投票」＋「溫度校正」
+# - 所有模型皆為可選載入；若皆不存在則回退規則法
 # - 需要的檔案（有就載入，沒有就跳過）：
 #   models/
 #     ├─ scaler.pkl              # (可選) sklearn 標準化器，fit 在 build_features 的輸入
 #     ├─ xgb_model.pkl/json/ubj  # (可選) XGBoost（sklearn or Booster）
 #     ├─ lgbm_model.pkl/txt/json # (可選) LightGBM（sklearn or Booster）
-#     ├─ hmm_model.pkl           # (可選) MultinomialHMM（n_components=3）
-#     ├─ mlp_model.pkl           # (可選) sklearn.neural_network.MLPClassifier
-#     └─ rnn_weights.npz         # (可選) 內含 Wxh, Whh, bh, Why, bo 之 numpy 權重
+#     └─ rnn_weights.npz         # (可選) numpy 權重：Wxh, Whh, bh, Why, bo
+#
+# 可調參數（環境變數）：
+#   ENSEMBLE_WEIGHTS="xgb:0.40,lgb:0.30,rnn:0.30"
+#   TEMP="0.95"      # softmax 溫度（<1 降低自信度；>1 更銳利）
+#   MIN_SEQ="18"     # 序列過短時，改用規則法（或降低倉位）
+#   ALT_WINDOW="20"  # 震盪偵測視窗長度
+#   ALT_THRESH="0.70"# 震盪率門檻（交替次數/(N-1)）
 #
 # LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET 需在環境變數提供。
 # DEBUG_VISION=1 可印出解析細節。
@@ -47,17 +54,6 @@ try:
 except Exception:
     lgb = None
 
-try:
-    from hmmlearn.hmm import MultinomialHMM
-except Exception:
-    MultinomialHMM = None
-
-# （可選）若你要使用 sklearn 的 MLPClassifier，需安裝 scikit-learn
-try:
-    from sklearn.neural_network import MLPClassifier  # 僅為類型提示；缺少也不影響運行
-except Exception:
-    MLPClassifier = None  # type: ignore
-
 app = Flask(__name__)
 
 # ---------- Logging ----------
@@ -90,7 +86,7 @@ HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
 CANNY1 = int(os.getenv("CANNY1", "60"))
 CANNY2 = int(os.getenv("CANNY2", "180"))
 
-# ---------- User session: 是否進入分析模式 ----------
+# ---------- User session ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
 
 # ---------- 模型載入 ----------
@@ -102,8 +98,6 @@ XGB_UBJ     = MODELS_DIR / "xgb_model.ubj"
 LGBM_PKL    = MODELS_DIR / "lgbm_model.pkl"
 LGBM_TXT    = MODELS_DIR / "lgbm_model.txt"
 LGBM_JSON   = MODELS_DIR / "lgbm_model.json"
-HMM_PKL     = MODELS_DIR / "hmm_model.pkl"
-MLP_PKL     = MODELS_DIR / "mlp_model.pkl"      # sklearn MLPClassifier
 RNN_WTS     = MODELS_DIR / "rnn_weights.npz"    # numpy 權重：Wxh, Whh, bh, Why, bo
 
 model_bundle: Dict[str, Any] = {"loaded": False, "note": "no model"}
@@ -147,23 +141,7 @@ def load_models():
                 bundle["lgbm_booster"] = booster
                 logger.info("[models] loaded lgbm booster (json)")
 
-        if MultinomialHMM and joblib and _safe_exists(HMM_PKL):
-            hmm = joblib.load(HMM_PKL)
-            if hasattr(hmm, "n_components") and hmm.n_components == 3:
-                bundle["hmm"] = hmm
-                logger.info("[models] loaded HMM (n_components=3)")
-
-        # MLP：sklearn.neural_network.MLPClassifier（predict_proba）
-        if joblib and _safe_exists(MLP_PKL):
-            try:
-                mlp_model = joblib.load(MLP_PKL)
-                if hasattr(mlp_model, "predict_proba"):
-                    bundle["mlp_model"] = mlp_model
-                    logger.info("[models] loaded MLP classifier")
-            except Exception as e:
-                logger.warning(f"Failed to load MLP model: {e}")
-
-        # RNN 權重（純 numpy 前向，適合輕量環境）
+        # RNN 權重（純 numpy 前向）
         if _safe_exists(RNN_WTS):
             try:
                 w = np.load(RNN_WTS)
@@ -175,10 +153,9 @@ def load_models():
             except Exception as e:
                 logger.warning(f"Failed to load RNN weights: {e}")
 
-        # 有任一模型即視為 loaded
+        # 有任一模型即視為 loaded（僅考慮 xgb/lgb/rnn）
         bundle["loaded"] = any(k in bundle for k in (
-            "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster",
-            "hmm", "mlp_model", "rnn_weights"
+            "xgb_sklearn", "xgb_booster", "lgbm_sklearn", "lgbm_booster", "rnn_weights"
         ))
         bundle["note"] = "at least one model loaded" if bundle["loaded"] else "no model file found"
         model_bundle = bundle
@@ -190,7 +167,7 @@ def load_models():
 load_models()
 
 # =========================================================
-# 圖像→序列（支援：紅=莊, 藍=閒；紅/藍圈內「橫線」=和；綠=和（若平台））
+# 圖像→序列（紅=莊, 藍=閒；紅/藍圈內「橫線」=和；綠=和（若平台））
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -199,7 +176,6 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
     if roi_bgr is None or roi_bgr.size == 0:
         return False
 
-    # 對比增強 + 去噪
     lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
@@ -210,7 +186,6 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
     gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
     gray = cv2.medianBlur(gray, 3)
 
-    # 二值化 + 邊緣
     thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                 cv2.THRESH_BINARY_INV, 11, 2)
     edges = cv2.Canny(thr, CANNY1, CANNY2)
@@ -221,44 +196,33 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
                             minLineLength=min_len, maxLineGap=HOUGH_GAP)
     if lines is None:
         return False
-    # 近水平：|dy| 小於 12% 高度（更嚴格）
     for x1, y1, x2, y2 in lines[:, 0, :]:
         if abs(y2 - y1) <= max(2, int(h * 0.12)):
             return True
     return False
 
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
-    """
-    回傳序列（最多 240 手）：'B', 'P', 'T'
-    規則：
-      - 紅=莊(B), 藍=閒(P)
-      - 若紅/藍圈 ROI 內偵測到水平直線 → 視為和(T)
-      - 綠色（若有）也當 T
-    """
+    """回傳序列（最多 240 手）：'B', 'P', 'T'"""
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img = np.array(img)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        # 規一化（小圖放大，避免圈太小）
         h0, w0 = img.shape[:2]
         target = 1400.0
         scale = target / max(h0, w0) if max(h0, w0) < target else 1.0
         if scale > 1.0:
             img = cv2.resize(img, (int(w0*scale), int(h0*scale)), interpolation=cv2.INTER_CUBIC)
 
-        # 降噪 + 顏色空間
         blur = cv2.GaussianBlur(img, (3,3), 0)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
 
-        # 顏色遮罩（可由環境變數調）
         red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
         red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
         red  = cv2.bitwise_or(red1, red2)
         blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-        green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
+        green= cv2.inRange(hsv, HSV["GREEN_LOW"],  HSV["GREEN_HIGH"])
 
-        # 形態學：先 close 補洞，再 open 去雜訊
         kernel3 = np.ones((3,3), np.uint8)
         def clean(m):
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel3, iterations=1)
@@ -266,21 +230,18 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
             return m
         red, blue, green = clean(red), clean(blue), clean(green)
 
-        # 以 connected components 取得穩定 blob
         def cc_blobs(mask, label):
             n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
             items = []
-            # 統計平均面積來自適應過小/過大濾除
             areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
             area_med = np.median(areas) if areas else 0
-            min_area = max(80, int(area_med * 0.35))  # 自適應門檻
+            min_area = max(80, int(area_med * 0.35))
             max_area = int(area_med * 8) if area_med > 0 else 999999
 
             for i in range(1, n):
                 x, y, w, h, a = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
                 if a < min_area or a > max_area:
                     continue
-                # 圓度/長寬比過濾，避免長條噪聲
                 aspect = w / (h + 1e-6)
                 if not (0.5 <= aspect <= 2.0):
                     continue
@@ -294,9 +255,8 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 if per <= 0 or area <= 0:
                     continue
                 circularity = 4 * math.pi * area / (per * per)
-                if circularity < 0.3:  # 太不圓的過濾
+                if circularity < 0.3:
                     continue
-
                 cx = x + w / 2.0
                 items.append((x, y, w, h, cx, label))
             return items
@@ -304,15 +264,12 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         items = []
         items += cc_blobs(red,  "B")
         items += cc_blobs(blue, "P")
-        items += cc_blobs(green,"T")  # 若平台用綠色單獨標和
+        items += cc_blobs(green,"T")
 
         if not items:
             return []
 
-        # 依 x 中心排序 → 大路由左至右
         items.sort(key=lambda z: z[4])
-
-        # 動態間距：用 blob 寬度中位數
         widths = [w for _,_,w,_,_,_ in items]
         med_w  = np.median(widths) if widths else 12
         min_gap = max(med_w * 0.6, 10)
@@ -325,20 +282,17 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 continue
 
             if label in {"B","P"}:
-                # 取較小的內部 ROI 檢線，避免邊界干擾
                 pad_x = max(2, int(w0 * 0.18))
                 pad_y = max(2, int(h0 * 0.28))
                 x1 = max(0, int(x + pad_x)); x2 = min(img.shape[1], int(x + w0 - pad_x))
                 y1 = max(0, int(y + pad_y)); y2 = min(img.shape[0], int(y + h0 - pad_y))
                 roi = img[y1:y2, x1:x2]
                 if _has_horizontal_line(roi):
-                    seq.append("T")   # 橫線視為和
+                    seq.append("T")
                 else:
                     seq.append(label)
             else:
-                # 綠色（若平台有）直接視為和
                 seq.append("T")
-
             last_cx = cx
 
         if DEBUG_VISION:
@@ -351,7 +305,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         return []
 
 # =========================================================
-# 特徵工程 & 模型推理 & 規則回退
+# 特徵工程 / 震盪偵測 / 投票
 # =========================================================
 def _streak_tail(seq: List[str]) -> int:
     if not seq: return 0
@@ -389,11 +343,23 @@ def build_features(seq: List[str]) -> np.ndarray:
     return feat
 
 def _normalize(p: Dict[str,float]) -> Dict[str,float]:
-    # safety clip + normalize，避免極端 0/負值
     p = {k: max(1e-9, float(v)) for k,v in p.items()}
     s = p["banker"]+p["player"]+p["tie"]
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {k: round(v/s,4) for k,v in p.items()}
+
+def _softmax(x: np.ndarray, temp: float=1.0) -> np.ndarray:
+    x = x.astype(np.float64) / max(1e-9, temp)
+    m = np.max(x)
+    e = np.exp(x - m)
+    return e / (np.sum(e) + 1e-12)
+
+def _oscillation_rate(seq: List[str], win: int) -> float:
+    """交替率：近 win 手，莊/閒交錯的比例（不含和）。"""
+    s = [c for c in seq[-win:] if c in ("B","P")]
+    if len(s) < 2: return 0.0
+    alt = sum(1 for a,b in zip(s, s[1:]) if a != b)
+    return alt / (len(s)-1)
 
 def _proba_from_xgb(feat: np.ndarray) -> Dict[str,float] | None:
     if "xgb_sklearn" in model_bundle:
@@ -415,43 +381,6 @@ def _proba_from_lgb(feat: np.ndarray) -> Dict[str,float] | None:
             return {"banker": float(proba[0]), "player": float(proba[1]), "tie": float(proba[2])}
     return None
 
-def _proba_from_hmm(seq: List[str]) -> Dict[str,float] | None:
-    hmm = model_bundle.get("hmm")
-    if not hmm or not seq: return None
-    sym = {"B":0,"P":1,"T":2}
-    base = np.array([[sym[s]] for s in seq], dtype=np.int32)
-    scores=[]
-    for cand in ["B","P","T"]:
-        test = np.vstack([base, [[sym[cand]]]])
-        try:
-            logp = hmm.score(test, lengths=[len(test)])
-        except Exception:
-            logp = -1e9
-        scores.append(logp)
-    m = max(scores); exps = np.exp(np.array(scores)-m)
-    prob = exps/(exps.sum()+1e-12)
-    return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
-
-# Deep learning model probability (MLP).  The MLP expects the same scaled
-# feature vector as the other models.  It must expose predict_proba().
-def _proba_from_mlp(feat: np.ndarray) -> Dict[str,float] | None:
-    mlp = model_bundle.get("mlp_model")
-    if mlp is None:
-        return None
-    try:
-        proba = mlp.predict_proba(feat)[0]
-        # 檢查類別順序，確保對應 B/P/T
-        classes = getattr(mlp, "classes_", np.array([0,1,2]))
-        # 建立 idx->proba 的 mapping
-        mp = {int(classes[i]): float(proba[i]) for i in range(len(classes))}
-        p_b = mp.get(IDX["B"], 1e-9)
-        p_p = mp.get(IDX["P"], 1e-9)
-        p_t = mp.get(IDX["T"], 1e-9)
-        return {"banker": p_b, "player": p_p, "tie": p_t}
-    except Exception as e:
-        logger.warning(f"Error using MLP model: {e}")
-        return None
-
 # 簡易 RNN（純 numpy 前向）：one-hot 輸入 → 隱藏狀態 → 線性輸出 → softmax 機率
 def _proba_from_rnn(seq: List[str]) -> Dict[str,float] | None:
     w = model_bundle.get("rnn_weights")
@@ -460,24 +389,51 @@ def _proba_from_rnn(seq: List[str]) -> Dict[str,float] | None:
     try:
         Wxh = np.array(w["Wxh"]); Whh = np.array(w["Whh"]); bh = np.array(w["bh"])
         Why = np.array(w["Why"]); bo = np.array(w["bo"])
-        # hidden state
         h = np.zeros((Whh.shape[0],), dtype=np.float32)
-        # 簡單 RNN 前向（tanh）
         for s in seq:
             x = np.zeros((3,), dtype=np.float32)
             x[IDX.get(s, 2)] = 1.0
             h = np.tanh(x @ Wxh + h @ Whh + bh)
         o = h @ Why + bo  # (3,)
-        # softmax
-        m = float(np.max(o))
-        exp = np.exp(o - m)
-        prob = exp / (float(np.sum(exp)) + 1e-12)
+        prob = _softmax(o, temp=1.0)
         return {"banker": float(prob[0]), "player": float(prob[1]), "tie": float(prob[2])}
     except Exception as e:
         logger.warning(f"Error using RNN weights: {e}")
         return None
 
-def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
+def _parse_weights_env() -> Dict[str, float]:
+    s = os.getenv("ENSEMBLE_WEIGHTS", "xgb:0.40,lgb:0.30,rnn:0.30")
+    out = {"xgb":0.40,"lgb":0.30,"rnn":0.30}
+    try:
+        for kv in s.split(","):
+            k,v = kv.split(":")
+            k = k.strip().lower()
+            v = float(v)
+            if k in out:
+                out[k] = max(0.0, v)
+    except Exception:
+        pass
+    ss = sum(out.values()) or 1.0
+    for k in out: out[k] /= ss
+    return out
+
+def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[str,Any]]:
+    """回傳 (機率, 附加資訊)；只用 XGB/LGB/RNN；加入溫度校正與震盪偵測。"""
+    info = {"used":["xgb","lgb","rnn"], "oscillating": False, "alt_rate": 0.0}
+    if not seq: return None, info
+
+    # 震盪偵測
+    ALT_WINDOW = int(os.getenv("ALT_WINDOW","20"))
+    ALT_THRESH = float(os.getenv("ALT_THRESH","0.70"))
+    alt_rate = _oscillation_rate(seq, ALT_WINDOW)
+    info["alt_rate"] = round(alt_rate,3)
+    info["oscillating"] = alt_rate >= ALT_THRESH
+
+    # 序列過短判斷
+    MIN_SEQ = int(os.getenv("MIN_SEQ","18"))
+    if len([c for c in seq if c in ("B","P")]) < MIN_SEQ:
+        return None, info  # 交給規則回退
+
     feat = build_features(seq)
     if "scaler" in model_bundle:
         try:
@@ -485,44 +441,57 @@ def predict_with_models(seq: List[str]) -> Dict[str,float] | None:
         except Exception as e:
             logger.warning(f"scaler.transform error: {e}")
 
-    votes=[]
-    p=_proba_from_xgb(feat);  votes.append(p) if p else None
-    p=_proba_from_lgb(feat);  votes.append(p) if p else None
-    p=_proba_from_hmm(seq);   votes.append(p) if p else None
-    p=_proba_from_mlp(feat);  votes.append(p) if p else None
-    p=_proba_from_rnn(seq);   votes.append(p) if p else None
+    weights = _parse_weights_env()
+    TEMP = float(os.getenv("TEMP","0.95"))
 
-    if not votes:
-        return None
+    # 個別模型機率
+    preds = {}
+    px = _proba_from_xgb(feat);  preds["xgb"]=px if px else None
+    pl = _proba_from_lgb(feat);  preds["lgb"]=pl if pl else None
+    pr = _proba_from_rnn(seq);   preds["rnn"]=pr if pr else None
 
-    # 票數平均；若某模型出現 nan/0 也先 clip
-    avg={"banker":0.0,"player":0.0,"tie":0.0}
-    cnt=0
-    for v in votes:
-        if not v: continue
-        cnt+=1
-        for k in avg:
-            avg[k]+=max(1e-9, float(v[k]))
-    if cnt==0:
-        return None
-    for k in avg: avg[k]/=cnt
-    return _normalize(avg)
+    # 沒任何模型輸出→回退
+    if not any(preds.values()):
+        return None, info
 
+    # 加權投票
+    agg = {"banker":0.0,"player":0.0,"tie":0.0}
+    wsum = 0.0
+    for name,p in preds.items():
+        if not p: continue
+        w = weights.get(name, 0.0)
+        wsum += w
+        for k in agg:
+            agg[k] += w * max(1e-9, float(p[k]))
+    if wsum <= 0:
+        return None, info
+
+    # 溫度校正（對 B/P/T 同步縮放）
+    vec = np.array([agg["banker"], agg["player"], agg["tie"]], dtype=np.float64)
+    vec = _softmax(vec, temp=TEMP)
+    out = {"banker": float(vec[0]), "player": float(vec[1]), "tie": float(vec[2])}
+
+    # 震盪期：壓低勝率敘述（讓 betting_plan 產出更保守的倉位）
+    if info["oscillating"]:
+        for k in out:
+            out[k] = float(0.85 * out[k])  # 整體降 15%，再由 betting_plan 判斷觀望/縮倉
+        out = _normalize(out)
+    return out, info
+
+# ------------------- 規則回退 -------------------
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
-    # 輕量回退法：分佈 + 尾端連續 boost；避免「只看誰多打誰」→ tie 加最小值 + 正規化
     n=len(seq)
     if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
     pb = seq.count("B")/n
     pp = seq.count("P")/n
-    pt = max(0.02, seq.count("T")/n*0.6)  # 最低和局先給一點權重
+    pt = max(0.02, seq.count("T")/n*0.6)
 
-    # 尾端連續加權（最多 +10%）
     tail=1
     for i in range(n-2,-1,-1):
         if seq[i]==seq[-1]: tail+=1
         else: break
     if seq[-1] in {"B","P"}:
-        boost = min(0.10, 0.03*(tail-1))
+        boost = min(0.08, 0.025*(tail-1))  # 稍微保守
         if seq[-1]=="B": pb+=boost
         else: pp+=boost
 
@@ -530,11 +499,20 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
 
-def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
-    # 以莊/閒差距決定倉位上限（<=12%）
+def betting_plan(pb: float, pp: float, oscillating: bool) -> Dict[str, Any]:
     diff = abs(pb-pp)
     side = "莊" if pb >= pp else "閒"
     side_prob = max(pb, pp)
+
+    # 震盪期更保守
+    if oscillating:
+        if diff < 0.10: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震盪期觀望"}
+        if diff < 0.15: pct = 0.02
+        elif diff < 0.20: pct = 0.04
+        else: pct = 0.08
+        return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震盪期降倉"}
+
+    # 非震盪：一般分層
     if diff < 0.05:
         return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "差距不足 5%，風險高"}
     if diff < 0.08: pct = 0.02
@@ -543,15 +521,18 @@ def betting_plan(pb: float, pp: float) -> Dict[str, Any]:
     else: pct = 0.12
     return {"side": side, "percent": pct, "side_prob": side_prob}
 
-def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
+def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: Dict[str,Any] | None=None) -> str:
     b, p, t = probs["banker"], probs["player"], probs["tie"]
-    plan = betting_plan(b, p)
+    oscillating = bool(info.get("oscillating")) if info else False
+    plan = betting_plan(b, p, oscillating)
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
     bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
+    osc_txt = f"\n震盪率：{info.get('alt_rate'):.2f}" if info and "alt_rate" in info else ""
+    used_txt = f"\n投票模型：{', '.join(info.get('used', []))}" if info else ""
     return (
-        f"{tag} 已解析 {len(seq)} 手\n"
+        f"{tag} 已解析 {len(seq)} 手{osc_txt}{used_txt}\n"
         f"建議下注：{plan['side']}（勝率 {win_txt}）{note}\n"
         f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}\n"
         f"資金建議：{bet_text}"
@@ -575,8 +556,6 @@ def health():
             "xgb_booster": "xgb_booster" in model_bundle,
             "lgbm_sklearn":"lgbm_sklearn" in model_bundle,
             "lgbm_booster":"lgbm_booster" in model_bundle,
-            "hmm":"hmm" in model_bundle,
-            "mlp_model":"mlp_model" in model_bundle,
             "rnn_weights":"rnn_weights" in model_bundle,
             "scaler":"scaler" in model_bundle
         },
@@ -624,7 +603,6 @@ if line_handler and line_bot_api:
             msg = "已進入分析模式 ✅\n請上傳牌路截圖：我會嘗試自動辨識並回覆「建議下注：莊 / 閒（勝率 xx%）」"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
-        # 非「開始分析」指令
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="請先輸入「開始分析」，再上傳牌路截圖。"
         ))
@@ -638,24 +616,22 @@ if line_handler and line_bot_api:
             ))
             return
 
-        # 下載圖片 → 解析序列 → 推理 → 回覆
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_sequence_from_image(img_bytes)
         if not seq:
-            tip = (
-                "辨識失敗 😥\n"
-                "請確保截圖清楚包含大路，並避免過度縮放或模糊。"
-            )
+            tip = "辨識失敗 😥\n請確保截圖清楚包含大路，並避免過度縮放或模糊。"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
         if model_bundle.get("loaded"):
-            probs = predict_with_models(seq); by_model = probs is not None
-            if not by_model: probs = predict_probs_from_seq_rule(seq)
+            probs, info = predict_with_models(seq)
+            by_model = probs is not None
+            if not by_model:
+                probs = predict_probs_from_seq_rule(seq); info = {}
         else:
-            probs = predict_probs_from_seq_rule(seq); by_model = False
+            probs = predict_probs_from_seq_rule(seq); by_model=False; info = {}
 
-        msg = render_reply(seq, probs, by_model)
+        msg = render_reply(seq, probs, by_model, info)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 if __name__ == "__main__":
