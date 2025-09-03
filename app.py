@@ -348,11 +348,13 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool) -> str:
     tag = "（模型）" if by_model else "（規則）"
     win_txt = f"{plan['side_prob']*100:.1f}%"
     note = f"｜{plan['note']}" if plan.get("note") else ""
+    # 🔧 修正：避免巢狀 f-string 導致的引號衝突
+    bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
     return (
         f"{tag} 已解析 {len(seq)} 手\n"
         f"建議下注：{plan['side']}（勝率 {win_txt}）{note}\n"
         f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}\n"
-        f"資金建議：{'觀望' if plan['percent']==0 else f'下 {plan['percent']*100:.0f}% 於「{plan['side']}」'}"
+        f"資金建議：{bet_text}"
     )
 
 # =========================================================
