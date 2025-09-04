@@ -1,6 +1,17 @@
 # app.py
 # =========================================================
 # BGS AI（Flask + LINE）— 大路/珠盤路 可切換的辨識 + 投票（XGB/LGBM/RNN）
+# 這版強化：
+# - 珠盤路：放寬彩色珠偵測（空心圈/有數字也能抓）、格線太淡時用珠心自建格線、
+#          吸附到最近格心（欄→列輸出），避免只解析到 1 手的離譜情況
+# - 大路：保留格線對齊流程（可用 FOCUS_ROI + BIGROAD_FRAC）
+# - 投票：XGB + LGBM + RNN（無 HMM/MLP），震盪偵測與觀望邏輯
+# 環境變數重點：
+#   ROAD_MODE=bead|bigroad（預設 bigroad）
+#   FOCUS_BEAD_ROI="0,0,1,1"（當上傳圖就是珠盤路裁圖，強烈建議這樣設）
+#   FOCUS_ROI="x,y,w,h"（大路手動 ROI，0~1）
+#   BIGROAD_FRAC=0.70（大路只取 ROI 上方比例）
+#   DEBUG_VISION=1（看詳細 log）
 # =========================================================
 import os, io, time, math, logging
 from pathlib import Path
@@ -136,7 +147,7 @@ def load_models():
 load_models()
 
 # =========================================================
-# 影像：共用小工具
+# 影像：共用小工具（含強化版）
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -174,27 +185,34 @@ def _has_dense_strokes(roi_bgr: np.ndarray) -> bool:
         if aspect >= 2.8: strokes += 1
     return strokes >= 2
 
+# ---- 強化：格線（白線淡也能抓），抓不到時交由珠心自建格 ----
 def _grid_from_roi(roi: np.ndarray) -> Tuple[List[int], List[int]]:
-    """偵測格線，回傳欄/列線位置（像素 index）。"""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray,5,50,50)
-    _, bw = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    vh = max(1, roi.shape[0]//28)
-    vw = max(1, roi.shape[1]//40)
+    gray = cv2.bilateralFilter(gray,5,60,60)
+    _, bw1 = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)  # 降門檻（原 200）
+    edges = cv2.Canny(gray, 40, 120)
+    bw = cv2.bitwise_or(bw1, edges)
+
+    vh = max(1, roi.shape[0]//30)
+    vw = max(1, roi.shape[1]//42)
     vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(1,vh))
     hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(vw,1))
     vlines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vert_kernel, iterations=1)
     hlines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hori_kernel, iterations=1)
+
     vx = np.clip(vlines.sum(axis=0),0,255*roi.shape[0]).astype(np.float32)
     hy = np.clip(hlines.sum(axis=1),0,255*roi.shape[1]).astype(np.float32)
-    def _peaks(arr, min_gap):
+
+    def _peaks(arr, min_gap, thr):
         idx=[]; last=-1e9
         for i,v in enumerate(arr):
-            if v>255*3:
+            if v>thr:
                 if i-last>min_gap: idx.append(i); last=i
         return idx
-    col_idx = _peaks(vx, max(3,roi.shape[1]//90))
-    row_idx = _peaks(hy, max(3,roi.shape[0]//60))
+
+    col_idx = _peaks(vx, max(3,roi.shape[1]//95), thr=255*2.0)
+    row_idx = _peaks(hy, max(3,roi.shape[0]//65), thr=255*2.0)
+
     def _regularize(idxs):
         if len(idxs)<4: return []
         diffs=[idxs[i+1]-idxs[i] for i in range(len(idxs)-1)]
@@ -203,11 +221,13 @@ def _grid_from_roi(roi: np.ndarray) -> Tuple[List[int], List[int]]:
         while start+i*step < (idxs[-1]+step//2):
             out.append(int(start+i*step)); i+=1
         return out
+
     cols = _regularize(col_idx)
     rows = _regularize(row_idx)
-    if rows and len(rows)>7: rows = rows[:7]  # 大路/珠盤路皆用 6 列區（7 條線）
+    if rows and len(rows)>7: rows = rows[:7]
     return cols, rows
 
+# ---- 強化：彩色珠（放寬空心圈/數字） ----
 def _color_masks(bgr: np.ndarray):
     blur = cv2.GaussianBlur(bgr,(3,3),0)
     hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
@@ -226,27 +246,58 @@ def _color_masks(bgr: np.ndarray):
 def _blobs(roi: np.ndarray):
     red, blue, green = _color_masks(roi)
     def cc(mask,label):
+        # 膨脹讓空心圈閉合
+        k = np.ones((2,2), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, iterations=1)
+
         n, _, stats, _ = cv2.connectedComponentsWithStats(mask,8)
         out=[]
         areas=[stats[i, cv2.CC_STAT_AREA] for i in range(1,n)]
         med=np.median(areas) if areas else 0
-        minA=max(60,int(med*0.35)); maxA=int(med*8) if med>0 else 999999
+        minA=max(40, int(med*0.25))              # 放寬
+        maxA=int(med*10) if med>0 else 999999
         for i in range(1,n):
             x,y,w,h,a = stats[i,0],stats[i,1],stats[i,2],stats[i,3],stats[i,4]
             if a<minA or a>maxA: continue
-            # 圓度過濾
             peri = 2*(w+h); circ = 4*np.pi*a/(peri*peri+1e-6)
-            if circ < 0.55: continue
+            if circ < 0.40: continue             # 放寬圓度
             cx = x+w/2.0; cy = y+h/2.0
             out.append((x,y,w,h,cx,cy,label))
         return out
     items=[]; items+=cc(red,"B"); items+=cc(blue,"P"); items+=cc(green,"T")
     return items
 
+# ---- 失敗備援：用珠心自建格線 ----
+def _grid_from_beads(items: List[tuple], roi_w: int, roi_h: int) -> Tuple[List[int], List[int]]:
+    if not items: return [], []
+    cxs = sorted([it[4] for it in items])
+    cys = sorted([it[5] for it in items])
+
+    def median_gap(vals):
+        gaps=[vals[i+1]-vals[i] for i in range(len(vals)-1) if vals[i+1]-vals[i]>3]
+        return np.median(gaps) if gaps else (roi_w/12)
+
+    step_x = int(max(8, median_gap(cxs)))
+    step_y = int(max(8, median_gap(cys)))
+
+    start_x = max(0, int(min(cxs)-step_x*0.8))
+    start_y = max(0, int(min(cys)-step_y*0.8))
+
+    cols=[start_x]
+    while cols[-1]+step_x < roi_w-2:
+        cols.append(cols[-1]+step_x)
+    rows=[start_y]
+    while len(rows)<7 and rows[-1]+step_y < roi_h-2:
+        rows.append(rows[-1]+step_y)
+    return cols, rows
+
 def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items: List[tuple]) -> List[str]:
-    """格線對齊：將彩色珠吸附到最近格心 → 欄→列輸出序列"""
+    # 若格線抓不到，但有珠 → 用珠心估格
+    if (not cols or not rows or len(rows)<2) and items:
+        cols, rows = _grid_from_beads(items, roi.shape[1], roi.shape[0])
+
     if not cols or not rows or len(rows)<2:
-        # 回退：欄群組 + 欄內 y 去重
+        # 回退：欄群組 + 欄內去重
         items.sort(key=lambda z: z[4])
         cxs=[it[4] for it in items]
         gaps=[cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
@@ -276,19 +327,18 @@ def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items:
                 seq.append(lab)
         return seq
 
+    # 正常：格線吸附（欄→列）
     row_centers = [int((rows[i]+rows[i+1])//2) for i in range(min(6,len(rows)-1))]
     col_centers = [int((cols[i]+cols[i+1])//2) for i in range(len(cols)-1)]
     grid = [[None for _ in range(len(col_centers))] for _ in range(len(row_centers))]
-
     for x,y,w,h,cx,cy,label in items:
         j = int(np.argmin([abs(cy-rc) for rc in row_centers]))
         i = int(np.argmin([abs(cx-cc) for cc in col_centers]))
         if 0<=j<len(row_centers) and 0<=i<len(col_centers):
-            prev = grid[j][i]
             score = abs(cy-row_centers[j])+abs(cx-col_centers[i])
+            prev = grid[j][i]
             if prev is None or score < prev[0]:
                 grid[j][i] = (score, label, (x,y,w,h))
-
     seq=[]
     for i in range(len(col_centers)):
         for j in range(len(row_centers)):
@@ -300,12 +350,7 @@ def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items:
             y1=max(0,int(y+pad_y)); y2=min(roi.shape[0],int(y+h-pad_y))
             sub=roi[y1:y2, x1:x2]
             if label in {"B","P"}:
-                if _has_horizontal_line(sub):
-                    seq.append("T")
-                else:
-                    # 文字輔助：若筆畫很密，顏色仍視為有效（不改 label）
-                    _ = _has_dense_strokes(sub)
-                    seq.append(label)
+                seq.append("T" if _has_horizontal_line(sub) else label)
             else:
                 seq.append("T")
     return seq
@@ -316,7 +361,7 @@ def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items:
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
     """
     bigroad：FOCUS_ROI（優先）→ 自動找紅/藍最大塊 → 下半部保底 → 取上方 BIGROAD_FRAC → 格線對齊
-    bead   ：FOCUS_BEAD_ROI（優先）→ 自動找左下紅/藍密集區 → 格線對齊
+    bead   ：FOCUS_BEAD_ROI（優先）→ 自動找左下紅/藍密集區 → 格線對齊 / 自建格
     皆輸出欄→列順序的序列（'B','P','T'）
     """
     try:
@@ -370,7 +415,6 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         # ---------- 大路 ----------
         def _locate_bigroad_roi(base_bgr: np.ndarray) -> np.ndarray:
             HH, WW = base_bgr.shape[:2]
-            # 手動 ROI
             roi_env=os.getenv("FOCUS_ROI","")
             if roi_env:
                 try:
@@ -380,7 +424,6 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                     sub=base_bgr[ry:ry+rh, rx:rx+rw]
                     if sub.size: return sub
                 except: pass
-            # 自動找下半部最大紅/藍塊
             red, blue, _ = _color_masks(base_bgr)
             combo = cv2.bitwise_or(red, blue)
             y0=int(HH*0.45)
@@ -722,7 +765,7 @@ if line_handler and line_bot_api:
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_sequence_from_image(img_bytes)
         if not seq:
-            tip = ("辨識失敗 😥\n若讀珠盤路：可設 FOCUS_BEAD_ROI；\n"
+            tip = ("辨識失敗 😥\n若讀珠盤路：可設 ROAD_MODE=bead 並設 FOCUS_BEAD_ROI=\"0,0,1,1\"；\n"
                    "若讀大路：可設 FOCUS_ROI 與調整 BIGROAD_FRAC（0.66~0.75）。")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
