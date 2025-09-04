@@ -75,9 +75,7 @@ def train_rnn_model():
     
     # 创建模型
     model = Sequential([
-        LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=True),
-        Dropout(0.2),
-        LSTM(32),
+        LSTM(32, input_shape=(X.shape[1], X.shape[2])),
         Dropout(0.2),
         Dense(16, activation='relu'),
         Dense(3, activation='softmax')
