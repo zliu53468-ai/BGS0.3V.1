@@ -16,6 +16,10 @@ xgboost==1.7.6
 lightgbm==4.3.0
 hmmlearn==0.3.0
 
+# 深度學習
+tensorflow==2.13.0
+keras==2.13.1
+
 # OCR 文字识别
 pytesseract==0.3.10
 
