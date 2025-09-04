@@ -294,39 +294,68 @@ def _grid_from_beads(items: List[tuple], roi_w: int, roi_h: int) -> Tuple[List[i
 
 def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items: List[tuple]) -> List[str]:
     # 若格線抓不到，但有珠 → 用珠心估格
-    if (not cols or not rows or len(rows)<2) and items:
-        cols, rows = _grid_from_beads(items, roi.shape[1], roi.shape[0])
+    # 先簡單檢查：
+    # 1. 完全沒有抓到列/欄 → 改用珠心推算格線
+    # 2. 偵測到的格子數太少或容量明顯不足以容納所有珠子 → 改用珠心推算格線
+    #    容量 = len(rows) * len(cols)；若 items 數遠大於容量，代表格線偵測失敗
+    if items:
+        need_bead_grid = False
+        if not cols or not rows or len(rows) < 2:
+            need_bead_grid = True
+        else:
+            # 如果偵測的欄/列太少，或實際珠子數大於格容量的 120%，則判定失敗
+            max_cells = len(cols) * len(rows)
+            if len(cols) < 3:
+                # 欄位太少通常表示格線偵測失敗
+                need_bead_grid = True
+            elif max_cells > 0 and len(items) > max_cells * 1.2:
+                # 珠子數明顯多於可容納的格子，代表格線失準
+                need_bead_grid = True
+        if need_bead_grid:
+            cols, rows = _grid_from_beads(items, roi.shape[1], roi.shape[0])
 
-    if not cols or not rows or len(rows)<2:
+    # 如果經過上面處理後仍然沒有可靠的列/欄資訊，則執行欄群組回退（僅當非 STRICT_GRID）
+    if not cols or not rows or len(rows) < 2:
         # 回退：欄群組 + 欄內去重（僅在非 STRICT_GRID 情況使用）
         if STRICT_GRID:
             return []
+        # 依 X 座標分組
         items.sort(key=lambda z: z[4])
-        cxs=[it[4] for it in items]
-        gaps=[cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
-        gaps=[g for g in gaps if g>3]
-        med_gap = np.median(gaps) if gaps else np.median([it[2] for it in items]) if items else 10
-        col_bin = max(6.0, 0.6*float(med_gap))
-        columns=[]
+        cxs = [it[4] for it in items]
+        gaps = [cxs[i+1] - cxs[i] for i in range(len(cxs) - 1)]
+        gaps = [g for g in gaps if g > 3]
+        med_gap = np.median(gaps) if gaps else (np.median([it[2] for it in items]) if items else 10)
+        col_bin = max(6.0, 0.6 * float(med_gap))
+        columns = []
         for it in items:
-            if not columns or abs(it[4]-columns[-1][-1][4])>col_bin: columns.append([it])
-            else: columns[-1].append(it)
-        heights=[h for (_,_,_,h,_,_,_) in items]
-        med_h=np.median(heights) if heights else 12
-        row_thr=max(6.0,0.5*float(med_h))
-        seq=[]
+            if not columns or abs(it[4] - columns[-1][-1][4]) > col_bin:
+                columns.append([it])
+            else:
+                columns[-1].append(it)
+        heights = [h for (_, _, _, h, _, _, _) in items]
+        med_h = np.median(heights) if heights else 12
+        row_thr = max(6.0, 0.5 * float(med_h))
+        seq = []
         for col in columns:
             col.sort(key=lambda z: z[5])
-            last=-1e9
+            last = -1e9
             for it in col:
-                if abs(it[5]-last)<row_thr: continue
-                last=it[5]
-                x,y,w,h,cx,cy,label=it
-                pad_x=max(2,int(w*0.18)); pad_y=max(2,int(h*0.28))
-                x1=max(0,int(x+pad_x)); x2=min(roi.shape[1],int(x+w-pad_x))
-                y1=max(0,int(y+pad_y)); y2=min(roi.shape[0],int(y+h-pad_y))
-                sub=roi[y1:y2, x1:x2]
-                lab = "T" if (label in {"B","P"} and _has_horizontal_line(sub)) else ("T" if label=="T" else label)
+                if abs(it[5] - last) < row_thr:
+                    continue
+                last = it[5]
+                x, y, w, h, cx, cy, label = it
+                pad_x = max(2, int(w * 0.18))
+                pad_y = max(2, int(h * 0.28))
+                x1 = max(0, int(x + pad_x))
+                x2 = min(roi.shape[1], int(x + w - pad_x))
+                y1 = max(0, int(y + pad_y))
+                y2 = min(roi.shape[0], int(y + h - pad_y))
+                sub = roi[y1:y2, x1:x2]
+                # 仍然根據橫線判斷『和』
+                if label in {"B", "P"}:
+                    lab = "T" if _has_horizontal_line(sub) else label
+                else:
+                    lab = "T"
                 seq.append(lab)
         return seq
 
