@@ -1,10 +1,10 @@
 # app.py
 # =========================================================
 # BGS AI（Flask + LINE）— 專注大路辨識 + 投票（XGB/LGBM/RNN）
-# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM / MLP 不納入）
-# - 大路 ROI：FOCUS_ROI="x,y,w,h"（0~1 比例）；否則自動定位下半部最大紅/藍區
-# - 欄→列 讀取：同色往下、變色右移；紅/藍圈內水平線視為和
-# - 單跳偵測：交替率 + 連續單跳長度；趨勢/震盪兩組權重 + 溫度校正
+# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM/MLP 不納入）
+# - 嚴格「只讀大路」：FOCUS_ROI 手動鎖定或自動定位，下再裁上方 BIGROAD_FRAC 區
+# - 大路規則：欄→列（同色往下、變色右移），欄內由上到下讀；紅/藍圈內水平線視為和
+# - 單跳偵測（交替率+連續單跳長度），趨勢/震盪兩組權重，溫度校正，震盪期降自信/觀望
 #
 # 需要檔案（有就載入，沒有就跳過）：
 #   models/
@@ -14,15 +14,16 @@
 #     └─ rnn_weights.npz            # (可選) numpy 權重：Wxh, Whh, bh, Why, bo
 #
 # 可調 ENV：
-#   FOCUS_ROI="x,y,w,h"  # 0~1 比例的手動 ROI
+#   FOCUS_ROI="x,y,w,h"      # 0~1 比例手動 ROI（優先）
+#   BIGROAD_FRAC="0.70"      # 只取 ROI 上方 70% 當大路區（切掉小路/問路）
 #   ENSEMBLE_WEIGHTS_TREND="xgb:0.45,lgb:0.35,rnn:0.20"
 #   ENSEMBLE_WEIGHTS_CHOP ="xgb:0.20,lgb:0.25,rnn:0.55"
-#   TEMP="0.95"      # softmax 溫度
-#   MIN_SEQ="18"     # 序列過短回退規則
-#   ALT_WINDOW="20"  # 交替率視窗
-#   ALT_THRESH="0.70"# 交替率門檻
-#   ALT_STRICT_STREAK="5" # 連續單跳幾顆視為嚴重，直接觀望
-#   DEBUG_VISION=1   # 影像偵錯 log
+#   TEMP="0.95"              # softmax 溫度
+#   MIN_SEQ="18"             # 序列過短回退規則
+#   ALT_WINDOW="20"          # 交替率視窗
+#   ALT_THRESH="0.70"        # 交替率門檻
+#   ALT_STRICT_STREAK="5"    # 連續單跳幾顆視為嚴重，直接觀望
+#   DEBUG_VISION=1           # 影像偵錯 log
 # =========================================================
 
 import os, io, time, math, logging
@@ -166,7 +167,7 @@ def load_models():
 load_models()
 
 # =========================================================
-# 影像→序列（大路專注）
+# 影像→序列（嚴格只讀大路）
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -198,24 +199,24 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
 
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
     """
-    專注讀「大路」區域，回傳序列：'B', 'P', 'T'
-    - ROI 來源：FOCUS_ROI（優先）→ 自動定位下半部最大紅/藍區 → 下半部保底
-    - 大路規則：欄為單位，同色往下，變色右移；欄內由上到下讀
+    專注讀「大路」：先鎖 ROI → 只保留 ROI 上方 BIGROAD_FRAC → 欄分箱 → 欄內上到下
+    ENV:
+      FOCUS_ROI="x,y,w,h"  (0~1 比例，手動ROI，優先)
+      BIGROAD_FRAC="0.70"  (只取 ROI 上方 70% 當大路區)
     """
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(img)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = np.array(img); img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         H, W = img.shape[:2]
 
-        # 輕度放大以穩定偵測
+        # 輕微放大
         target = 1400.0
         scale = target / max(H, W) if max(H, W) < target else 1.0
         if scale > 1.0:
             img = cv2.resize(img, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_CUBIC)
         H, W = img.shape[:2]
 
-        # 初步遮罩
+        # 初步遮罩（用來找 ROI）
         blur0 = cv2.GaussianBlur(img, (3,3), 0)
         hsv0  = cv2.cvtColor(blur0, cv2.COLOR_BGR2HSV)
         red1 = cv2.inRange(hsv0, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
@@ -223,7 +224,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         red0  = cv2.bitwise_or(red1, red2)
         blue0 = cv2.inRange(hsv0, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
 
-        # --------- ROI：先讀 FOCUS_ROI（比例），否則自動找下半部最大紅/藍區 ----------
+        # 1) ROI：FOCUS_ROI -> 自動找下半部最大紅/藍區 -> 下半部保底
         roi_env = os.getenv("FOCUS_ROI", "")
         rx, ry, rw, rh = 0, 0, W, H
         manual_roi_ok = False
@@ -242,17 +243,15 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 manual_roi_ok = False
 
         if not manual_roi_ok:
-            y0 = int(H * 0.45)  # 下半部為主
+            y0 = int(H * 0.45)
             combo = cv2.bitwise_or(red0, blue0)
-            mask_bottom = np.zeros_like(combo)
-            mask_bottom[y0:H, :] = combo[y0:H, :]
+            mask_bottom = np.zeros_like(combo); mask_bottom[y0:H, :] = combo[y0:H, :]
             kernel = np.ones((5,5), np.uint8)
             m = cv2.morphologyEx(mask_bottom, cv2.MORPH_CLOSE, kernel, iterations=2)
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel, iterations=1)
             cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if cnts:
-                cnt = max(cnts, key=cv2.contourArea)
-                x,y,w,h = cv2.boundingRect(cnt)
+                x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
                 padx = max(6, int(w*0.03)); pady = max(6, int(h*0.08))
                 rx = max(0, x-padx); ry = max(0, y-pady)
                 rw = min(W-rx, w+2*padx); rh = min(H-ry, h+2*pady)
@@ -260,10 +259,13 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 rx, ry, rw, rh = 0, y0, W, H-y0
 
         roi = img[ry:ry+rh, rx:rx+rw]
-        if roi.size == 0:
-            roi = img
+        if roi.size == 0: roi = img
+        # 2) 只保留 ROI 上方的大路區（切掉小路/問路）
+        BIGROAD_FRAC = float(os.getenv("BIGROAD_FRAC", "0.70"))
+        rh_big = max(1, int(roi.shape[0] * max(0.5, min(0.95, BIGROAD_FRAC))))
+        roi = roi[:rh_big, :]
 
-        # ROI 內重新遮罩（更準）
+        # ROI 內遮罩
         blur = cv2.GaussianBlur(roi, (3,3), 0)
         hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
@@ -271,7 +273,6 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         red  = cv2.bitwise_or(red1, red2)
         blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
         green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
-
         kernel3 = np.ones((3,3), np.uint8)
         def clean(m):
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel3, iterations=1)
@@ -279,6 +280,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
             return m
         red, blue, green = clean(red), clean(blue), clean(green)
 
+        # 取穩定 blob
         def cc_blobs(mask, label):
             n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             items = []
@@ -299,32 +301,34 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         items += cc_blobs(red,  "B")
         items += cc_blobs(blue, "P")
         items += cc_blobs(green,"T")
-        if not items:
-            return []
+        if not items: return []
 
-        # ---- 欄→列 讀取（大路規則）----
-        items.sort(key=lambda z: z[4])  # 依 cx
-        widths  = [w for _,_,w,_,_,_ in items]
-        heights = [h for _,_,_,h,_,_ in items]
-        med_w   = np.median(widths)  if widths  else 12
-        med_h   = np.median(heights) if heights else 12
-        col_thresh = max(med_w * 0.8, 8)   # 同欄 cx 門檻
-        row_thresh = max(med_h * 0.5, 6)   # 欄內 y 去重門檻
+        # 3) 嚴格欄位量化（用 cx 間距做分箱）
+        items.sort(key=lambda z: z[4])
+        cxs = [it[4] for it in items]
+        gaps = [cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
+        gaps = [g for g in gaps if g > 3]
+        med_gap = np.median(gaps) if gaps else np.median([it[2] for it in items])
+        col_bin = max(6.0, 0.6 * float(med_gap))  # 分欄閾值
 
         columns: List[List[tuple]] = []
         for it in items:
             if not columns:
                 columns.append([it])
             else:
-                last_cx = columns[-1][-1][4]
-                if abs(it[4] - last_cx) <= col_thresh:
+                if abs(it[4] - columns[-1][-1][4]) <= col_bin:
                     columns[-1].append(it)
                 else:
                     columns.append([it])
 
+        # 4) 欄內由上到下 + y 去重
+        heights = [h for (_,_,_,h,_,_) in items]
+        med_h = np.median(heights) if heights else 12
+        row_thresh = max(6.0, 0.5 * float(med_h))
+
         seq: List[str] = []
         for col in columns:
-            col.sort(key=lambda z: z[1])  # 欄內由上到下
+            col.sort(key=lambda z: z[1])
             dedup = []
             last_y = -1e9
             for it in col:
@@ -340,16 +344,14 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                     x1 = max(0, int(x + pad_x)); x2 = min(roi.shape[1], int(x + w0 - pad_x))
                     y1 = max(0, int(y + pad_y)); y2 = min(roi.shape[0], int(y + h0 - pad_y))
                     sub = roi[y1:y2, x1:x2]
-                    if _has_horizontal_line(sub):
-                        seq.append("T")
-                    else:
-                        seq.append(label)
+                    if _has_horizontal_line(sub): seq.append("T")
+                    else:                           seq.append(label)
                 else:
                     seq.append("T")
 
         if DEBUG_VISION:
-            logger.info(f"[VISION] ROI=({rx},{ry},{rw},{rh}) cols={len(columns)} seq_len={len(seq)} "
-                        f"col_thr={col_thresh:.1f} row_thr={row_thresh:.1f}")
+            logger.info(f"[VISION] ROI=({rx},{ry},{rw},{rh}) big_h={rh_big} cols={len(columns)} "
+                        f"seq_len={len(seq)} col_bin={col_bin:.1f} row_thr={row_thresh:.1f}")
 
         return seq[-240:]
     except Exception as e:
