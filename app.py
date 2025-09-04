@@ -13,12 +13,13 @@ import cv2
 # ===== LINE SDK (optional) =====
 try:
     from linebot import LineBotApi, WebhookHandler
-    from linebot.exceptions import InvalidSignatureError
+    from linebot.exceptions import InvalidSignatureError, LineBotApiError
     from linebot.models import (
         MessageEvent, TextMessage, ImageMessage, TextSendMessage, FollowEvent
     )
 except Exception:
     LineBotApi = WebhookHandler = None
+    InvalidSignatureError = LineBotApiError = Exception
     MessageEvent = TextMessage = ImageMessage = TextSendMessage = FollowEvent = None
 
 # ===== Optional ML (safe-import) =====
@@ -464,9 +465,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
 
 # =========================================================
 # 以下保留你既有的模型 / 投票 / render_reply 相關程式 (示範性貼回)
-# （為避免太長，我把之前你使用的投票/特徵/預測函式留在這個區塊）
-# 請把你原先的 predict_with_models, build_features, render_reply 等函式整段貼回來
-# 我先放一組簡短的規則型回退與 render，確保整體可以運行：
+# （為避免過長，我把之前你使用的投票/特徵/預測函式示範性保留）
 # =========================================================
 def _streak_tail(seq):
     if not seq: return 0
@@ -541,20 +540,106 @@ def line_webhook():
         logger.exception(e); return "Error", 200
     return "OK"
 
+# --------------------------
+# Robust Image handler (ACK + background-like flow using push fallback)
+# --------------------------
 if line_handler and line_bot_api:
     @line_handler.add(MessageEvent, message=ImageMessage)
     def on_image(event):
-        uid = getattr(event.source, "user_id", "unknown")
-        content = line_bot_api.get_message_content(event.message.id)
-        img_bytes = b"".join(chunk for chunk in content.iter_content())
-        seq = extract_sequence_from_image(img_bytes)
-        if not seq:
-            tip = ("辨識失敗 😥\n若讀珠盤路：ROAD_MODE=bead 並設 FOCUS_BEAD_ROI；\n若讀大路：請設 FOCUS_ROI 或調整 BIGROAD_FRAC（0.66~0.75）。")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
-        # use model if available
-        probs = predict_probs_from_seq_rule(seq); by_model=False; info={}
-        msg = render_reply(seq, probs, by_model, info)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        """
+        Robust handler:
+        1) Try to quickly ACK via reply_message (short text).
+        2) Download image bytes robustly.
+        3) Run extract_sequence_from_image (synchronous).
+        4) Send final result via push_message (preferred). If push not possible, try fallback reply once.
+        """
+        try:
+            user_id = getattr(event.source, "user_id", None)
+            reply_token = getattr(event, "reply_token", None)
+            replied_ack = False
+            # 1) Quick ack (best-effort)
+            if reply_token and line_bot_api:
+                try:
+                    ack_text = "已收到圖片，開始分析中…"
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=ack_text))
+                    replied_ack = True
+                    logger.info("[LINE] quick ack reply_message sent")
+                except LineBotApiError as e:
+                    # reply_token invalid or used -> fallback to push later
+                    logger.warning(f"[LINE] quick ack failed: {e}")
+                    replied_ack = False
+
+            # 2) Download image content robustly
+            img_bytes = None
+            try:
+                content = line_bot_api.get_message_content(event.message.id)
+                # different versions of SDK/requests might expose .content or .iter_content
+                if hasattr(content, "content"):
+                    # some implementations return bytes in .content
+                    b = content.content
+                    if isinstance(b, (bytes, bytearray)):
+                        img_bytes = bytes(b)
+                if img_bytes is None:
+                    # try streaming interface
+                    if hasattr(content, "iter_content"):
+                        chunks = []
+                        for ch in content.iter_content(chunk_size=8192):
+                            if ch: chunks.append(ch)
+                        if chunks:
+                            img_bytes = b"".join(chunks)
+                # last resort, if content is file-like
+                if img_bytes is None and hasattr(content, "read"):
+                    try:
+                        img_bytes = content.read()
+                    except Exception:
+                        img_bytes = None
+            except Exception as e:
+                logger.exception(f"[LINE] failed to download image content: {e}")
+                img_bytes = None
+
+            # 3) Image analysis
+            seq = []
+            if img_bytes:
+                try:
+                    seq = extract_sequence_from_image(img_bytes)
+                except Exception as e:
+                    logger.exception(f"[VISION] extract_sequence_from_image error: {e}")
+                    seq = []
+            else:
+                logger.warning("[LINE] no image bytes obtained")
+
+            # 4) Build reply text
+            if not seq:
+                reply_text = ("辨識失敗 😥\n若讀珠盤路：請設 ROAD_MODE=bead 並設定 FOCUS_BEAD_ROI；\n若讀大路：請設 FOCUS_ROI 或調整 BIGROAD_FRAC（0.66~0.75）。")
+            else:
+                probs = predict_probs_from_seq_rule(seq); by_model = False
+                reply_text = render_reply(seq, probs, by_model, info={})
+
+            # 5) Deliver final result: prefer push_message (no reply_token limit)
+            sent_final = False
+            if user_id:
+                try:
+                    line_bot_api.push_message(user_id, TextSendMessage(text=reply_text))
+                    logger.info("[LINE] push_message sent (final result)")
+                    sent_final = True
+                except LineBotApiError as e:
+                    logger.warning(f"[LINE] push_message failed: {e}")
+                    sent_final = False
+
+            # 6) If push not possible and we didn't yet reply (ack failed), try reply once more (best-effort)
+            if not sent_final and not replied_ack and reply_token:
+                try:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
+                    logger.info("[LINE] fallback reply_message sent")
+                    sent_final = True
+                except LineBotApiError as e:
+                    logger.error(f"[LINE] fallback reply_message failed: {e}")
+
+            if not sent_final:
+                logger.error("[LINE] could not deliver final message to user (push & reply failed)")
+
+        except Exception as e:
+            logger.exception(f"[LINE] on_image outer exception: {e}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT","5000"))
