@@ -1,4 +1,4 @@
-import os, io, time, math, logging
+import os, io, time, math, logging, re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -40,150 +40,134 @@ DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
 
 # =========================================================
-# 6×6表格識別
+# 博彩游戏结果识别
 # =========================================================
-def detect_table_structure(image):
-    """檢測6×6表格結構"""
-    # 轉換為灰度圖
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # 使用自適應閾值進行二值化
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                  cv2.THRESH_BINARY_INV, 11, 2)
-    
-    # 檢測水平和垂直線條
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    
-    # 應用形態學操作
-    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
-    
-    # 合併線條
-    table_mask = cv2.add(horizontal_lines, vertical_lines)
-    
-    # 查找輪廓
-    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 找到最大的矩形輪廓（表格）
-    table_contour = None
-    max_area = 0
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > max_area:
-            max_area = area
-            table_contour = contour
-    
-    return table_contour
-
-def extract_table_cells(image, table_contour):
-    """提取表格中的單元格"""
-    # 獲取表格邊界
-    x, y, w, h = cv2.boundingRect(table_contour)
-    table_roi = image[y:y+h, x:x+w]
-    
-    # 轉換為灰度圖
-    gray = cv2.cvtColor(table_roi, cv2.COLOR_BGR2GRAY)
-    
-    # 使用自適應閾值進行二值化
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                  cv2.THRESH_BINARY_INV, 11, 2)
-    
-    # 檢測水平和垂直線條
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    
-    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
-    
-    # 合併線條
-    lines = cv2.add(horizontal_lines, vertical_lines)
-    
-    # 查找線條的交點以確定單元格
-    contours, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 提取單元格
-    cells = []
-    for contour in contours:
-        x_c, y_c, w_c, h_c = cv2.boundingRect(contour)
-        if w_c > 20 and h_c > 20:  # 過濾太小的區域
-            cells.append((x + x_c, y + y_c, w_c, h_c))
-    
-    return cells
-
-def recognize_table_content(image, cells):
-    """識別表格內容"""
-    results = []
-    
-    # 按位置排序單元格（從左到右，從上到下）
-    cells.sort(key=lambda cell: (cell[1] // 50, cell[0] // 50))
-    
-    for i, (x, y, w, h) in enumerate(cells):
-        # 提取單元格區域
-        cell_roi = image[y:y+h, x:x+w]
-        
-        # 預處理以優化OCR
-        gray = cv2.cvtColor(cell_roi, cv2.COLOR_BGR2GRAY)
-        processed = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                        cv2.THRESH_BINARY, 11, 2)
-        
-        # 設置Tesseract參數（支持簡體和繁體中文）
-        custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=庄闲和莊閒閑'
-        
-        # 進行OCR識別
-        text = pytesseract.image_to_string(processed, config=custom_config, lang='chi_sim+chi_tra')
-        text = text.strip()
-        
-        # 映射到對應的代碼
-        if text in ['莊', '庄']:
-            results.append('B')
-        elif text in ['閒', '閑', '闲']:
-            results.append('P')
-        elif text == '和':
-            results.append('T')
-        else:
-            results.append('?')  # 無法識別
-            
-        logger.info(f"單元格 {i+1}: 位置({x},{y}), 識別結果: '{text}' -> {results[-1]}")
-    
-    return results
-
-def extract_6x6_table(img_bytes: bytes) -> List[str]:
-    """專門用於識別6×6表格的函數"""
+def extract_gaming_result(img_bytes: bytes) -> List[str]:
+    """专门用于识别博彩游戏结果的函数"""
     try:
         if pytesseract is None:
             logger.error("pytesseract is not installed")
             return []
         
-        # 圖像預處理
+        # 图像预处理
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(img)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img_np = np.array(img)
         
-        # 檢測表格結構
-        table_contour = detect_table_structure(img)
-        if table_contour is None:
-            logger.warning("未檢測到表格結構")
-            return []
+        # 转换为OpenCV格式
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         
-        # 提取表格單元格
-        cells = extract_table_cells(img, table_contour)
-        if len(cells) != 36:  # 6x6=36個單元格
-            logger.warning(f"檢測到 {len(cells)} 個單元格，預期為36個")
-            # 仍然繼續處理，但記錄警告
+        # 调整图像大小以提高OCR精度
+        height, width = img_cv.shape[:2]
+        scale = 2.0  # 放大倍数
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        resized_img = cv2.resize(img_cv, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
         
-        # 識別表格內容
-        sequence = recognize_table_content(img, cells)
+        # 转换为灰度图
+        gray = cv2.cvtColor(resized_img, cv2.COLOR_BGR2GRAY)
         
-        logger.info(f"表格識別完成: {len(sequence)}個單元格")
-        return sequence
+        # 使用自适应阈值进行二值化
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY, 11, 2)
+        
+        # 设置Tesseract参数（支持简体中文和繁体中文）
+        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=庄闲和莊閒閑田0123456789对总'
+        
+        # 进行OCR识别
+        text = pytesseract.image_to_string(binary, config=custom_config, lang='chi_sim+chi_tra')
+        
+        logger.info(f"OCR识别结果: {text}")
+        
+        # 解析结果
+        return parse_gaming_text(text)
         
     except Exception as e:
-        logger.error(f"表格識別錯誤: {e}")
+        logger.error(f"博彩结果识别错误: {e}")
         return []
 
+def parse_gaming_text(text: str) -> List[str]:
+    """解析博彩游戏结果文本"""
+    # 查找"最新好路"或类似关键词
+    lines = text.split('\n')
+    gaming_line = None
+    
+    for line in lines:
+        if '最新好路' in line or '好路' in line:
+            gaming_line = line
+            break
+    
+    if not gaming_line:
+        # 如果没有找到关键词，尝试查找包含数字和庄闲字符的行
+        for line in lines:
+            if any(char in line for char in ['庄', '閒', '閑', '闲', '和', '田']) and any(char.isdigit() for char in line):
+                gaming_line = line
+                break
+    
+    if not gaming_line:
+        return []
+    
+    logger.info(f"找到游戏结果行: {gaming_line}")
+    
+    # 提取庄、闲、和的数量
+    banker_count = 0
+    player_count = 0
+    tie_count = 0
+    
+    # 使用正则表达式提取数字
+    patterns = [
+        r'田\s*(\d+)',    # 田 15
+        r'莊\s*(\d+)',    # 莊 15
+        r'庄\s*(\d+)',    # 庄 15
+        r'閒\s*(\d+)',    # 閒 17
+        r'閑\s*(\d+)',    # 閑 17
+        r'闲\s*(\d+)',    # 闲 17
+        r'和\s*(\d+)',    # 和 1
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, gaming_line)
+        if match:
+            count = int(match.group(1))
+            if '田' in pattern or '莊' in pattern or '庄' in pattern:
+                banker_count = count
+            elif '閒' in pattern or '閑' in pattern or '闲' in pattern:
+                player_count = count
+            elif '和' in pattern:
+                tie_count = count
+    
+    # 如果正则没有匹配到，尝试更简单的方法
+    if banker_count == 0 and player_count == 0 and tie_count == 0:
+        parts = gaming_line.split()
+        for i, part in enumerate(parts):
+            if part in ['田', '莊', '庄'] and i+1 < len(parts) and parts[i+1].isdigit():
+                banker_count = int(parts[i+1])
+            elif part in ['閒', '閑', '闲'] and i+1 < len(parts) and parts[i+1].isdigit():
+                player_count = int(parts[i+1])
+            elif part == '和' and i+1 < len(parts) and parts[i+1].isdigit():
+                tie_count = int(parts[i+1])
+    
+    logger.info(f"解析结果: 庄={banker_count}, 闲={player_count}, 和={tie_count}")
+    
+    # 生成序列 (假设最后几局的结果)
+    sequence = []
+    
+    # 添加庄的结果
+    for _ in range(banker_count):
+        sequence.append('B')
+    
+    # 添加闲的结果
+    for _ in range(player_count):
+        sequence.append('P')
+    
+    # 添加和的结果
+    for _ in range(tie_count):
+        sequence.append('T')
+    
+    # 只返回最后36个结果（假设这是最近的结果）
+    return sequence[-36:] if len(sequence) > 36 else sequence
+
 # =========================================================
-# 特徵工程 / 預測（保持不變）
+# 特征工程 / 预测
 # =========================================================
 IDX = {"B":0,"P":1,"T":2}
 
@@ -249,14 +233,14 @@ def betting_plan(pb: float, pp: float, oscillating: bool, alt_streak: int=0) -> 
 
     ALT_STRICT = int(os.getenv("ALT_STRICT_STREAK","5"))
     if oscillating and alt_streak >= ALT_STRICT:
-        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "單跳震盪期觀望"}
+        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "单跳震荡期观望"}
 
     if oscillating:
-        if diff < 0.12: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震盪期風險高"}
+        if diff < 0.12: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震荡期风险高"}
         if diff < 0.18: pct = 0.02
         elif diff < 0.24: pct = 0.04
         else: pct = 0.08
-        return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震盪期降倉"}
+        return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震荡期降仓"}
 
     if diff < 0.05:
         return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "差距不足 5%"}
@@ -272,29 +256,29 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
     alt_streak = int(info.get("alt_streak", 0)) if info else 0
     plan = betting_plan(b, p, oscillating, alt_streak)
     
-    side = "莊" if plan["side"] == "banker" else "閒"
+    side = "庄" if plan["side"] == "banker" else "闲"
     win_rate = plan["side_prob"] * 100
     
-    reply = f"推薦預測：{side}（勝率{win_rate:.1f}%）\n\n"
-    reply += f"解析路數：{len(seq)}手\n"
-    reply += f"莊勝率：{b*100:.1f}% | 閒勝率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
+    reply = f"推荐预测：{side}（胜率{win_rate:.1f}%）\n\n"
+    reply += f"解析路数：{len(seq)}手\n"
+    reply += f"庄胜率：{b*100:.1f}% | 闲胜率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
     
     if plan["percent"] > 0:
-        reply += f"建議下注：{plan['percent']*100:.0f}%資金於{side}"
+        reply += f"建议下注：{plan['percent']*100:.0f}%资金于{side}"
     else:
-        reply += "建議：觀望不下注"
+        reply += "建议：观望不下注"
     
     if info and info.get("oscillating"):
-        reply += f"\n當前牌路震盪中（交替率：{info.get('alt_rate', 0):.2f}）"
+        reply += f"\n当前牌路震荡中（交替率：{info.get('alt_rate', 0):.2f}）"
     
     return reply
 
 # =========================================================
-# API（可自測）
+# API
 # =========================================================
 @app.route("/")
 def index():
-    return "BGS AI 助手正在運行 ✅ /line-webhook 已就緒", 200
+    return "BGS AI 助手正在运行 ✅ /line-webhook 已就绪", 200
 
 @app.route("/health")
 def health():
@@ -319,7 +303,7 @@ def line_webhook():
         line_handler.handle(body, signature)
     except InvalidSignatureError as e:
         logger.exception(f"InvalidSignatureError: {e}. "
-                         f"==> 通常是 LINE_CHANNEL_SECRET 不對 或 用錯 Channel 的 Secret/Token")
+                         f"==> 通常是 LINE_CHANNEL_SECRET 不对 或 用错 Channel 的 Secret/Token")
         return "Invalid signature", 200
     except Exception as e:
         logger.exception(f"Unhandled error while handling webhook: {e}")
@@ -331,8 +315,8 @@ if line_handler and line_bot_api:
     @line_handler.add(FollowEvent)
     def on_follow(event: FollowEvent):
         welcome = (
-            "歡迎加入BGS AI 助手 🎉\n\n"
-            "輸入「開始分析」後，上傳6×6表格截圖，我會使用表格識別技術自動辨識並回傳建議下注。"
+            "欢迎加入BGS AI 助手 🎉\n\n"
+            "输入「开始分析」后，上传博彩游戏截图，我会使用OCR技术自动辨识并回传建议下注。"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
 
@@ -340,16 +324,16 @@ if line_handler and line_bot_api:
     def on_text(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
         txt = (event.message.text or "").strip()
-        if txt in {"開始分析", "開始", "START", "分析"}:
+        if txt in {"开始分析", "开始", "START", "分析"}:
             user_mode[uid] = True
             if pytesseract is None:
-                msg = "系統錯誤：OCR功能未啟用，請聯繫管理員安裝Tesseract OCR"
+                msg = "系统错误：OCR功能未启用，请联系管理员安装Tesseract OCR"
             else:
-                msg = "已進入分析模式 ✅\n請上傳6×6表格截圖：我會使用表格識別技術自動辨識並回覆預測建議"
+                msg = "已进入分析模式 ✅\n请上传博彩游戏截图：我会使用OCR技术自动辨识并回复预测建议"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="請先輸入「開始分析」，再上傳表格截圖。"
+            text="请先输入「开始分析」，再上传游戏截图。"
         ))
 
     @line_handler.add(MessageEvent, message=ImageMessage)
@@ -357,22 +341,22 @@ if line_handler and line_bot_api:
         uid = getattr(event.source, "user_id", "unknown")
         if not user_mode.get(uid):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳表格截圖。"
+                text="尚未启用分析模式。\n请先输入「开始分析」，再上传游戏截图。"
             ))
             return
             
         if pytesseract is None:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="系統錯誤：OCR功能未啟用，請聯繫管理員安裝Tesseract OCR"
+                text="系统错误：OCR功能未启用，请联系管理员安装Tesseract OCR"
             ))
             return
 
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
-        seq = extract_6x6_table(img_bytes)
+        seq = extract_gaming_result(img_bytes)
         
-        if not seq or len(seq) < 12:  # 至少需要識別12個單元格
-            tip = f"表格識別結果不理想 😥 只識別到 {len(seq)} 個單元格\n請確保截圖清晰，表格完整可見。"
+        if not seq or len(seq) < 5:  # 至少需要识别5个结果
+            tip = f"识别结果不理想 😥 只识别到 {len(seq)} 个结果\n请确保截图清晰，包含'最新好路'区域。"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip))
             return
 
