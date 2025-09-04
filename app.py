@@ -45,22 +45,17 @@ line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else N
 
 DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
-# 颜色检测参数
+# 颜色检测参数 - 更宽松的设置
 HSV = {
-    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW", "0")),   int(os.getenv("HSV_RED1_S_LOW", "100")), int(os.getenv("HSV_RED1_V_LOW", "50"))),
-    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "10")), int(os.getenv("HSV_RED1_S_HIGH", "255")), int(os.getenv("HSV_RED1_V_HIGH", "255"))),
-    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW", "170")), int(os.getenv("HSV_RED2_S_LOW", "100")), int(os.getenv("HSV_RED2_V_LOW", "50"))),
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW", "0")),   int(os.getenv("HSV_RED1_S_LOW", "50")), int(os.getenv("HSV_RED1_V_LOW", "50"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "20")), int(os.getenv("HSV_RED1_S_HIGH", "255")), int(os.getenv("HSV_RED1_V_HIGH", "255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW", "160")), int(os.getenv("HSV_RED2_S_LOW", "50")), int(os.getenv("HSV_RED2_V_LOW", "50"))),
     "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")), int(os.getenv("HSV_RED2_S_HIGH", "255")), int(os.getenv("HSV_RED2_V_HIGH", "255"))),
-    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW", "100")), int(os.getenv("HSV_BLUE_S_LOW", "100")), int(os.getenv("HSV_BLUE_V_LOW", "50"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW", "90")), int(os.getenv("HSV_BLUE_S_LOW", "50")), int(os.getenv("HSV_BLUE_V_LOW", "50"))),
     "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "140")), int(os.getenv("HSV_BLUE_S_HIGH", "255")), int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
-    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "60")),  int(os.getenv("HSV_GREEN_S_LOW", "50")),  int(os.getenv("HSV_GREEN_V_LOW", "50"))),
-    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH", "90")), int(os.getenv("HSV_GREEN_S_HIGH", "255")), int(os.getenv("HSV_GREEN_V_HIGH", "200"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "50")),  int(os.getenv("HSV_GREEN_S_LOW", "30")),  int(os.getenv("HSV_GREEN_V_LOW", "30"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH", "90")), int(os.getenv("HSV_GREEN_S_HIGH", "255")), int(os.getenv("HSV_GREEN_V_HIGH", "255"))),
 }
-
-HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))
-HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
-CANNY1 = int(os.getenv("CANNY1", "60"))
-CANNY2 = int(os.getenv("CANNY2", "180"))
 
 # ---------- User session ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
@@ -74,7 +69,7 @@ XGB_UBJ     = MODELS_DIR / "xgb_model.ubj"
 LGBM_PKL    = MODELS_DIR / "lgbm_model.pkl"
 LGBM_TXT    = MODELS_DIR / "lgbm_model.txt"
 LGBM_JSON   = MODELS_DIR / "lgbm_model.json"
-RNN_WTS     = MODELS_DIR / "rnn_weights.npz"    # numpy 權重：Wxh, Whh, bh, Why, bo
+RNN_WTS     = MODELS_DIR / "rnn_weights.npz"
 
 model_bundle: Dict[str, Any] = {"loaded": False, "note": "no model"}
 
@@ -207,7 +202,9 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 rw = int(sw * W)
                 rh = int(sh * H)
                 roi = img[ry:ry+rh, rx:rx+rw]
-            except:
+                logger.info(f"Using manual ROI: {rx},{ry},{rw},{rh}")
+            except Exception as e:
+                logger.error(f"Error parsing FOCUS_ROI: {e}")
                 roi = img
         else:
             # 自動檢測紅藍密集區域
@@ -227,14 +224,16 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 largest_contour = max(contours, key=cv2.contourArea)
                 x, y, w, h = cv2.boundingRect(largest_contour)
                 # 擴大一點邊界
-                padding = 10
+                padding = 20
                 x = max(0, x - padding)
                 y = max(0, y - padding)
                 w = min(W - x, w + 2 * padding)
                 h = min(H - y, h + 2 * padding)
                 roi = img[y:y+h, x:x+w]
+                logger.info(f"Using auto-detected ROI: {x},{y},{w},{h}")
             else:
                 roi = img
+                logger.info("Using full image as ROI")
         
         # 在ROI中精確識別紅藍綠
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -251,36 +250,56 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, kernel)
         
         # 查找輪廓
-        def find_colored_circles(mask, color):
+        def find_colored_circles(mask, color, min_area=50):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             circles = []
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 100:  # 過濾太小的區域
-                    continue
-                perimeter = cv2.arcLength(cnt, True)
-                if perimeter == 0:
-                    continue
-                circularity = 4 * np.pi * area / (perimeter * perimeter)
-                # 圓度通常在0.7到1.2之間認為是圓形
-                if circularity < 0.7 or circularity > 1.2:
+                if area < min_area:  # 降低面積限制
                     continue
                 (x, y), radius = cv2.minEnclosingCircle(cnt)
-                circles.append((int(x), int(y), int(radius), color))
+                # 降低圓形度要求
+                circularity = 4 * np.pi * area / (cv2.arcLength(cnt, True) ** 2) if cv2.arcLength(cnt, True) > 0 else 0
+                if circularity < 0.5:  # 降低圓形度要求
+                    continue
+                circles.append((int(x), int(y), int(radius), color, area))
             return circles
 
-        red_circles = find_colored_circles(red, "B")
-        blue_circles = find_colored_circles(blue, "P")
-        green_circles = find_colored_circles(green, "T")
+        red_circles = find_colored_circles(red, "B", min_area=30)
+        blue_circles = find_colored_circles(blue, "P", min_area=30)
+        green_circles = find_colored_circles(green, "T", min_area=30)
         
         all_circles = red_circles + blue_circles + green_circles
         
+        logger.info(f"Detected circles - Red: {len(red_circles)}, Blue: {len(blue_circles)}, Green: {len(green_circles)}")
+        
         # 按位置排序（從左到右，從上到下）
-        all_circles.sort(key=lambda c: (c[0] // 50, c[1] // 50))  # 假設每個單元格大約50像素
+        if all_circles:
+            # 計算平均間距
+            xs = [c[0] for c in all_circles]
+            xs.sort()
+            if len(xs) > 1:
+                x_gaps = [xs[i+1] - xs[i] for i in range(len(xs)-1)]
+                avg_x_gap = np.median(x_gaps) if x_gaps else 50
+            else:
+                avg_x_gap = 50
+                
+            ys = [c[1] for c in all_circles]
+            ys.sort()
+            if len(ys) > 1:
+                y_gaps = [ys[i+1] - ys[i] for i in range(len(ys)-1)]
+                avg_y_gap = np.median(y_gaps) if y_gaps else 50
+            else:
+                avg_y_gap = 50
+                
+            # 按網格位置排序
+            all_circles.sort(key=lambda c: (c[0] // avg_x_gap, c[1] // avg_y_gap))
+        else:
+            all_circles.sort(key=lambda c: (c[0] // 50, c[1] // 50))
         
         # 轉換為序列
         sequence = []
-        for x, y, radius, label in all_circles:
+        for x, y, radius, label, area in all_circles:
             if label in {"B","P"}:
                 pad_x = max(2, int(radius * 0.5))
                 pad_y = max(2, int(radius * 0.5))
@@ -294,6 +313,7 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
             else:
                 sequence.append("T")
         
+        logger.info(f"Final sequence length: {len(sequence)}")
         return sequence[-120:]  # 返回最近120個結果
         
     except Exception as e:
@@ -345,7 +365,7 @@ def _normalize(p: Dict[str,float]) -> Dict[str,float]:
     return {k: round(v/s,4) for k,v in p.items()}
 
 def _softmax(x: np.ndarray, temp: float=1.0) -> np.ndarray:
-    x = x.ast(np.float64) / max(1e-9, temp)
+    x = x.astype(np.float64) / max(1e-9, temp)
     m = np.max(x)
     e = np.exp(x - m)
     return e / (np.sum(e) + 1e-12)
@@ -455,7 +475,7 @@ def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[st
     is_chop = (alt_rate >= ALT_THRESH) or (alt_streak >= ALT_STRICT)
     info["oscillating"] = is_chop
 
-    MIN_SEQ = int(os.getenv("MIN_SEQ","18"))
+    MIN_SEQ = int(os.getenv("MIN_SEQ","5"))  # 降低最小序列長度要求
     if len([c for c in seq if c in ("B","P")]) < MIN_SEQ:
         return None, info
 
@@ -644,8 +664,8 @@ if line_handler and line_bot_api:
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_sequence_from_image(img_bytes)
-        if not seq:
-            tip = "辨識失敗 😥\n請確保截圖清楚包含大路，並避免過度縮放或模糊。"
+        if not seq or len(seq) < 5:  # 如果識別的手數太少
+            tip = f"辨識失敗 😥 只識別到 {len(seq)} 手\n請確保截圖清楚包含大路，背景單純，避免過度縮放或模糊。\n建議嘗試：\n1. 確保光線充足\n2. 對準牌路區域\n3. 避免反光"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
         if model_bundle.get("loaded"):
