@@ -17,9 +17,6 @@ services:
         value: "1"
       - key: TESSERACT_CMD
         value: "/usr/bin/tesseract"
-      - key: FOCUS_ROI
-        value: "0.2,0.3,0.6,0.5"
-      # 以下是可选的机器学习相关环境变量
       - key: MIN_SEQ
         value: "5"
       - key: ALT_WINDOW
@@ -30,8 +27,4 @@ services:
         value: "5"
       - key: TEMP
         value: "0.95"
-      - key: ENSEMBLE_WEIGHTS_TREND
-        value: "xgb:0.45,lgb:0.35,rnn:0.20"
-      - key: ENSEMBLE_WEIGHTS_CHOP
-        value: "xgb:0.20,lgb:0.25,rnn:0.55"
     healthCheckPath: /health
