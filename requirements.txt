@@ -16,5 +16,8 @@ xgboost==1.7.6
 lightgbm==4.3.0
 hmmlearn==0.3.0
 
+# OCR 文字识别
+pytesseract==0.3.10
+
 # (若 monitor.py 需要)
 requests==2.31.0
