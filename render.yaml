@@ -1,4 +1,3 @@
-# render.yaml
 services:
   - type: web
     name: bgs-ai-bot
@@ -15,5 +14,5 @@ services:
       - key: LINE_CHANNEL_SECRET
         sync: false
       - key: DEBUG_VISION
-        value: "1"  # 啟用調試模式以獲取更多日誌
+        value: "1"
     healthCheckPath: /health
