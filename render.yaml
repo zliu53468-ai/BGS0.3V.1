@@ -6,7 +6,7 @@ services:
     buildCommand: |
       sudo apt-get update
       sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra
-      pip install -r requirements.txt
+      pip install --no-cache-dir -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
     envVars:
       - key: LINE_CHANNEL_ACCESS_TOKEN
@@ -29,4 +29,8 @@ services:
         value: "0.95"
       - key: ENSEMBLE_WEIGHTS
         value: "rule:0.7,rnn:0.3"
+      - key: PYTHONPATH
+        value: "/opt/render/project/src"
+      - key: PIP_NO_CACHE_DIR
+        value: "yes"
     healthCheckPath: /health
