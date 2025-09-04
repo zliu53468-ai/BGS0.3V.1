@@ -1,31 +1,3 @@
-# app.py
-# =========================================================
-# BGS AI（Flask + LINE）— 專注大路辨識 + 投票（XGB/LGBM/RNN）
-# - 僅使用 XGBoost、LightGBM、RNN 參與投票（HMM/MLP 不納入）
-# - 嚴格「只讀大路」：FOCUS_ROI 手動鎖定或自動定位，下再裁上方 BIGROAD_FRAC 區
-# - 大路規則：欄→列（同色往下、變色右移），欄內由上到下讀；紅/藍圈內水平線視為和
-# - 單跳偵測（交替率+連續單跳長度），趨勢/震盪兩組權重，溫度校正，震盪期降自信/觀望
-#
-# 需要檔案（有就載入，沒有就跳過）：
-#   models/
-#     ├─ scaler.pkl                 # (可選) sklearn 標準化器（對應 build_features）
-#     ├─ xgb_model.pkl/json/ubj     # (可選) XGBoost（sklearn 或 Booster）
-#     ├─ lgbm_model.pkl/txt/json    # (可選) LightGBM（sklearn 或 Booster）
-#     └─ rnn_weights.npz            # (可選) numpy 權重：Wxh, Whh, bh, Why, bo
-#
-# 可調 ENV：
-#   FOCUS_ROI="x,y,w,h"      # 0~1 比例手動 ROI（優先）
-#   BIGROAD_FRAC="0.70"      # 只取 ROI 上方 70% 當大路區（切掉小路/問路）
-#   ENSEMBLE_WEIGHTS_TREND="xgb:0.45,lgb:0.35,rnn:0.20"
-#   ENSEMBLE_WEIGHTS_CHOP ="xgb:0.20,lgb:0.25,rnn:0.55"
-#   TEMP="0.95"              # softmax 溫度
-#   MIN_SEQ="18"             # 序列過短回退規則
-#   ALT_WINDOW="20"          # 交替率視窗
-#   ALT_THRESH="0.70"        # 交替率門檻
-#   ALT_STRICT_STREAK="5"    # 連續單跳幾顆視為嚴重，直接觀望
-#   DEBUG_VISION=1           # 影像偵錯 log
-# =========================================================
-
 import os, io, time, math, logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
@@ -73,16 +45,18 @@ line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else N
 
 DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
+# 颜色检测参数
 HSV = {
-    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW",  "0")),  int(os.getenv("HSV_RED1_S_LOW",  "50")), int(os.getenv("HSV_RED1_V_LOW",  "50"))),
-    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "12")), int(os.getenv("HSV_RED1_S_HIGH", "255")),int(os.getenv("HSV_RED1_V_HIGH", "255"))),
-    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW",  "170")),int(os.getenv("HSV_RED2_S_LOW",  "50")), int(os.getenv("HSV_RED2_V_LOW",  "50"))),
-    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")),int(os.getenv("HSV_RED2_S_HIGH", "255")),int(os.getenv("HSV_RED2_V_HIGH", "255"))),
-    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW",  "90")), int(os.getenv("HSV_BLUE_S_LOW",  "50")), int(os.getenv("HSV_BLUE_V_LOW",  "50"))),
-    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "135")),int(os.getenv("HSV_BLUE_S_HIGH", "255")),int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
-    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
-    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH","255"))),
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW", "0")),   int(os.getenv("HSV_RED1_S_LOW", "100")), int(os.getenv("HSV_RED1_V_LOW", "50"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "10")), int(os.getenv("HSV_RED1_S_HIGH", "255")), int(os.getenv("HSV_RED1_V_HIGH", "255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW", "170")), int(os.getenv("HSV_RED2_S_LOW", "100")), int(os.getenv("HSV_RED2_V_LOW", "50"))),
+    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")), int(os.getenv("HSV_RED2_S_HIGH", "255")), int(os.getenv("HSV_RED2_V_HIGH", "255"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW", "100")), int(os.getenv("HSV_BLUE_S_LOW", "100")), int(os.getenv("HSV_BLUE_V_LOW", "50"))),
+    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "140")), int(os.getenv("HSV_BLUE_S_HIGH", "255")), int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "60")),  int(os.getenv("HSV_GREEN_S_LOW", "50")),  int(os.getenv("HSV_GREEN_V_LOW", "50"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH", "90")), int(os.getenv("HSV_GREEN_S_HIGH", "255")), int(os.getenv("HSV_GREEN_V_HIGH", "200"))),
 }
+
 HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))
 HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
 CANNY1 = int(os.getenv("CANNY1", "60"))
@@ -172,191 +146,138 @@ load_models()
 IDX = {"B":0,"P":1,"T":2}
 
 def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
-    """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）。"""
+    """在紅/藍圈 ROI 內檢測是否有近水平直線（判定為和局）"""
     if roi_bgr is None or roi_bgr.size == 0:
         return False
-    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
-    l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    enh = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 3)
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                cv2.THRESH_BINARY_INV, 11, 2)
-    edges = cv2.Canny(thr, CANNY1, CANNY2)
-    h, w = edges.shape[:2]
-    min_len = max(int(w * HOUGH_MIN_LEN_RATIO), 12)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20,
-                            minLineLength=min_len, maxLineGap=HOUGH_GAP)
+    
+    # 轉換為灰度圖並增強對比度
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    
+    # 使用自適應閾值
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # 形態學操作增強線條
+    kernel = np.ones((3, 3), np.uint8)
+    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
+    
+    # Hough變換檢測直線
+    h, w = thr.shape[:2]
+    min_len = max(int(w * 0.4), 15)
+    lines = cv2.HoughLinesP(thr, 1, np.pi/180, threshold=25,
+                           minLineLength=min_len, maxLineGap=4)
+    
     if lines is None:
         return False
-    for x1, y1, x2, y2 in lines[:, 0, :]:
-        if abs(y2 - y1) <= max(2, int(h * 0.12)):
+    
+    # 檢查是否有接近水平的線
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
+        if (angle < 15 or angle > 165) and abs(y2-y1) < h*0.2:
             return True
+    
     return False
 
 def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
-    """
-    專注讀「大路」：先鎖 ROI → 只保留 ROI 上方 BIGROAD_FRAC → 欄分箱 → 欄內上到下
-    ENV:
-      FOCUS_ROI="x,y,w,h"  (0~1 比例，手動ROI，優先)
-      BIGROAD_FRAC="0.70"  (只取 ROI 上方 70% 當大路區)
-    """
+    """專注於分析紅藍區域，精確識別莊閒和"""
     try:
+        # 圖像預處理
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(img); img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = np.array(img)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         H, W = img.shape[:2]
-
-        # 輕微放大
-        target = 1400.0
-        scale = target / max(H, W) if max(H, W) < target else 1.0
-        if scale > 1.0:
-            img = cv2.resize(img, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_CUBIC)
-        H, W = img.shape[:2]
-
-        # 初步遮罩（用來找 ROI）
-        blur0 = cv2.GaussianBlur(img, (3,3), 0)
-        hsv0  = cv2.cvtColor(blur0, cv2.COLOR_BGR2HSV)
-        red1 = cv2.inRange(hsv0, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
-        red2 = cv2.inRange(hsv0, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
-        red0  = cv2.bitwise_or(red1, red2)
-        blue0 = cv2.inRange(hsv0, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-
-        # 1) ROI：FOCUS_ROI -> 自動找下半部最大紅/藍區 -> 下半部保底
+        
+        # 圖像增強
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l, a, b])
+        img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # 使用手動ROI或自動檢測
         roi_env = os.getenv("FOCUS_ROI", "")
-        rx, ry, rw, rh = 0, 0, W, H
-        manual_roi_ok = False
         if roi_env:
             try:
                 sx, sy, sw, sh = [float(t) for t in roi_env.split(",")]
-                rx = int(max(0, min(1, sx)) * W)
-                ry = int(max(0, min(1, sy)) * H)
-                rw = int(max(0, min(1, sw)) * W)
-                rh = int(max(0, min(1, sh)) * H)
-                rx, ry = max(0, rx), max(0, ry)
-                rw, rh = max(1, rw), max(1, rh)
-                if rx+rw <= W and ry+rh <= H:
-                    manual_roi_ok = True
-            except Exception:
-                manual_roi_ok = False
-
-        if not manual_roi_ok:
-            y0 = int(H * 0.45)
-            combo = cv2.bitwise_or(red0, blue0)
-            mask_bottom = np.zeros_like(combo); mask_bottom[y0:H, :] = combo[y0:H, :]
-            kernel = np.ones((5,5), np.uint8)
-            m = cv2.morphologyEx(mask_bottom, cv2.MORPH_CLOSE, kernel, iterations=2)
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel, iterations=1)
-            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
-                padx = max(6, int(w*0.03)); pady = max(6, int(h*0.08))
-                rx = max(0, x-padx); ry = max(0, y-pady)
-                rw = min(W-rx, w+2*padx); rh = min(H-ry, h+2*pady)
+                rx = int(sx * W)
+                ry = int(sy * H)
+                rw = int(sw * W)
+                rh = int(sh * H)
+                roi = img[ry:ry+rh, rx:rx+rw]
+            except:
+                roi = img
+        else:
+            # 自動檢測紅藍密集區域
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            red1 = cv2.inRange(hsv, HSV["RED1_LOW"], HSV["RED1_HIGH"])
+            red2 = cv2.inRange(hsv, HSV["RED2_LOW"], HSV["RED2_HIGH"])
+            red = cv2.bitwise_or(red1, red2)
+            blue = cv2.inRange(hsv, HSV["BLUE_LOW"], HSV["BLUE_HIGH"])
+            
+            combined = cv2.bitwise_or(red, blue)
+            kernel = np.ones((15, 15), np.uint8)
+            combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+            
+            # 找到最大輪廓
+            contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                # 擴大一點邊界
+                padding = 10
+                x = max(0, x - padding)
+                y = max(0, y - padding)
+                w = min(W - x, w + 2 * padding)
+                h = min(H - y, h + 2 * padding)
+                roi = img[y:y+h, x:x+w]
             else:
-                rx, ry, rw, rh = 0, y0, W, H-y0
-
-        roi = img[ry:ry+rh, rx:rx+rw]
-        if roi.size == 0: roi = img
-        # 2) 只保留 ROI 上方的大路區（切掉小路/問路）
-        BIGROAD_FRAC = float(os.getenv("BIGROAD_FRAC", "0.70"))
-        rh_big = max(1, int(roi.shape[0] * max(0.5, min(0.95, BIGROAD_FRAC))))
-        roi = roi[:rh_big, :]
-
-        # ROI 內遮罩
-        blur = cv2.GaussianBlur(roi, (3,3), 0)
-        hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-        red1 = cv2.inRange(hsv, HSV["RED1_LOW"],  HSV["RED1_HIGH"])
-        red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
-        red  = cv2.bitwise_or(red1, red2)
-        blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-        green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
-        kernel3 = np.ones((3,3), np.uint8)
-        def clean(m):
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel3, iterations=1)
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel3, iterations=1)
-            return m
-        red, blue, green = clean(red), clean(blue), clean(green)
-
-        # 取穩定 blob
-        def cc_blobs(mask, label):
-            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-            items = []
-            areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]
-            area_med = np.median(areas) if areas else 0
-            min_area = max(70, int(area_med * 0.35))
-            max_area = int(area_med * 8) if area_med > 0 else 999999
-            for i in range(1, n):
-                x, y, w, h, a = stats[i, 0], stats[i, 1], stats[i, 2], stats[i, 3], stats[i, 4]
-                if a < min_area or a > max_area: continue
-                aspect = w / (h + 1e-6)
-                if not (0.5 <= aspect <= 2.0): continue
-                cx = x + w / 2.0
-                items.append((x, y, w, h, cx, label))
-            return items
-
-        items = []
-        items += cc_blobs(red,  "B")
-        items += cc_blobs(blue, "P")
-        items += cc_blobs(green,"T")
-        if not items: return []
-
-        # 3) 嚴格欄位量化（用 cx 間距做分箱）
-        items.sort(key=lambda z: z[4])
-        cxs = [it[4] for it in items]
-        gaps = [cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
-        gaps = [g for g in gaps if g > 3]
-        med_gap = np.median(gaps) if gaps else np.median([it[2] for it in items])
-        col_bin = max(6.0, 0.6 * float(med_gap))  # 分欄閾值
-
-        columns: List[List[tuple]] = []
-        for it in items:
-            if not columns:
-                columns.append([it])
-            else:
-                if abs(it[4] - columns[-1][-1][4]) <= col_bin:
-                    columns[-1].append(it)
-                else:
-                    columns.append([it])
-
-        # 4) 欄內由上到下 + y 去重
-        heights = [h for (_,_,_,h,_,_) in items]
-        med_h = np.median(heights) if heights else 12
-        row_thresh = max(6.0, 0.5 * float(med_h))
-
-        seq: List[str] = []
-        for col in columns:
-            col.sort(key=lambda z: z[1])
-            dedup = []
-            last_y = -1e9
-            for it in col:
-                y = it[1]
-                if abs(y - last_y) < row_thresh:
+                roi = img
+        
+        # 在ROI中精確識別紅藍綠
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv_roi, HSV["RED1_LOW"], HSV["RED1_HIGH"])
+        red2 = cv2.inRange(hsv_roi, HSV["RED2_LOW"], HSV["RED2_HIGH"])
+        red = cv2.bitwise_or(red1, red2)
+        blue = cv2.inRange(hsv_roi, HSV["BLUE_LOW"], HSV["BLUE_HIGH"])
+        green = cv2.inRange(hsv_roi, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
+        
+        # 形態學處理
+        kernel = np.ones((5, 5), np.uint8)
+        red = cv2.morphologyEx(red, cv2.MORPH_CLOSE, kernel)
+        blue = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, kernel)
+        green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, kernel)
+        
+        # 查找輪廓
+        def find_colored_circles(mask, color):
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            circles = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 100:  # 過濾太小的區域
                     continue
-                dedup.append(it); last_y = y
-
-            for x,y,w0,h0,cx,label in dedup:
-                if label in {"B","P"}:
-                    pad_x = max(2, int(w0 * 0.18))
-                    pad_y = max(2, int(h0 * 0.28))
-                    x1 = max(0, int(x + pad_x)); x2 = min(roi.shape[1], int(x + w0 - pad_x))
-                    y1 = max(0, int(y + pad_y)); y2 = min(roi.shape[0], int(y + h0 - pad_y))
-                    sub = roi[y1:y2, x1:x2]
-                    if _has_horizontal_line(sub): seq.append("T")
-                    else:                           seq.append(label)
-                else:
-                    seq.append("T")
-
-        if DEBUG_VISION:
-            logger.info(f"[VISION] ROI=({rx},{ry},{rw},{rh}) big_h={rh_big} cols={len(columns)} "
-                        f"seq_len={len(seq)} col_bin={col_bin:.1f} row_thr={row_thresh:.1f}")
-
-        return seq[-240:]
+                (x, y), radius = cv2.minEnclosingCircle(cnt)
+                circles.append((int(x), int(y), int(radius), color))
+            return circles
+        
+        red_circles = find_colored_circles(red, "B")
+        blue_circles = find_colored_circles(blue, "P")
+        green_circles = find_colored_circles(green, "T")
+        
+        all_circles = red_circles + blue_circles + green_circles
+        
+        # 按位置排序（從左到右，從上到下）
+        all_circles.sort(key=lambda c: (c[0] // 50, c[1] // 50))  # 假設每個單元格大約50像素
+        
+        # 轉換為序列
+        sequence = [circle[3] for circle in all_circles]
+        
+        return sequence[-120:]  # 返回最近120個結果
+        
     except Exception as e:
-        if DEBUG_VISION:
-            logger.exception(f"[VISION][ERR] {e}")
+        logger.error(f"圖像處理錯誤: {e}")
         return []
 
 # =========================================================
@@ -576,7 +497,7 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
 
 def betting_plan(pb: float, pp: float, oscillating: bool, alt_streak: int=0) -> Dict[str, Any]:
     diff = abs(pb-pp)
-    side = "莊" if pb >= pp else "閒"
+    side = "banker" if pb >= pp else "player"
     side_prob = max(pb, pp)
 
     ALT_STRICT = int(os.getenv("ALT_STRICT_STREAK","5"))
@@ -603,18 +524,24 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
     oscillating = bool(info.get("oscillating")) if info else False
     alt_streak = int(info.get("alt_streak", 0)) if info else 0
     plan = betting_plan(b, p, oscillating, alt_streak)
-    tag = "（模型）" if by_model else "（規則）"
-    win_txt = f"{plan['side_prob']*100:.1f}%"
-    note = f"｜{plan['note']}" if plan.get("note") else ""
-    bet_text = "觀望" if plan["percent"] == 0 else f"下 {plan['percent']*100:.0f}% 於「{plan['side']}」"
-    osc_txt = f"\n震盪率：{info.get('alt_rate'):.2f}｜連跳：{alt_streak}" if info and "alt_rate" in info else ""
-    used_txt = f"\n投票模型：{', '.join(info.get('used', []))}" if info else ""
-    return (
-        f"{tag} 已解析 {len(seq)} 手{osc_txt}{used_txt}\n"
-        f"建議下注：{plan['side']}（勝率 {win_txt}）{note}\n"
-        f"機率：莊 {b:.2f}｜閒 {p:.2f}｜和 {t:.2f}\n"
-        f"資金建議：{bet_text}"
-    )
+    
+    # 按照您要求的格式
+    side = "莊" if plan["side"] == "banker" else "閒"
+    win_rate = plan["side_prob"] * 100
+    
+    reply = f"推薦預測：{side}（勝率{win_rate:.1f}%）\n\n"
+    reply += f"解析路數：{len(seq)}手\n"
+    reply += f"莊勝率：{b*100:.1f}% | 閒勝率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
+    
+    if plan["percent"] > 0:
+        reply += f"建議下注：{plan['percent']*100:.0f}%資金於{side}"
+    else:
+        reply += "建議：觀望不下注"
+    
+    if info and info.get("oscillating"):
+        reply += f"\n當前牌路震盪中（交替率：{info.get('alt_rate', 0):.2f}）"
+    
+    return reply
 
 # =========================================================
 # API（可自測）
@@ -678,7 +605,7 @@ if line_handler and line_bot_api:
         txt = (event.message.text or "").strip()
         if txt in {"開始分析", "開始", "START", "分析"}:
             user_mode[uid] = True
-            msg = "已進入分析模式 ✅\n請上傳牌路截圖：我會嘗試自動辨識並回覆「建議下注：莊 / 閒（勝率 xx%）」"
+            msg = "已進入分析模式 ✅\n請上傳牌路截圖：我會嘗試自動辨識並回覆「推薦預測：莊 / 閒（勝率 xx%）」"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
