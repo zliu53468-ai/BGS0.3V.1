@@ -1,37 +1,27 @@
 # app.py
-# =========================================================
-# BGS AI（Flask + LINE）— 大路/珠盤路 可切換的辨識 + 投票（XGB/LGBM/RNN）
-# 強化點：
-# - 珠盤路：放寬彩色珠偵測、格線太淡時用珠心自建格線、格心吸附
-# - 大路：保留格線對齊（FOCUS_ROI + BIGROAD_FRAC）
-# - 投票：XGB + LGBM + RNN（去除 HMM/MLP）、震盪偵測與觀望
-# - 嚴格格線：STRICT_GRID=1 時，cols/rows/items 不足「直接拒絕」，避免誤回退只解析 1 手
-# ENV 重點：
-#   ROAD_MODE=bead|bigroad（預設 bigroad）
-#   FOCUS_BEAD_ROI="0,0,1,1"（珠盤路裁圖時強烈建議）
-#   FOCUS_ROI="x,y,w,h"（大路 ROI，0~1）
-#   BIGROAD_FRAC=0.70
-#   STRICT_GRID=1（嚴格格線檢查，預設開）
-#   MIN_COLS=6  MIN_ITEMS=8
-#   DEBUG_VISION=1
-# =========================================================
-import os, io, time, math, logging
+# BGS AI（Flask + LINE）— 珠盤路/大路辨識（嚴格參數可調）+ 投票（XGB/LGBM/RNN）
+import os, io, time, math, json, logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
-
 from flask import Flask, request, jsonify, abort
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import cv2
 
-# ===== LINE SDK =====
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, TextMessage, ImageMessage, TextSendMessage, FollowEvent
-)
+# LINE SDK (若沒用就會跳過 webhook)
+try:
+    from linebot import LineBotApi, WebhookHandler
+    from linebot.exceptions import InvalidSignatureError
+    from linebot.models import (
+        MessageEvent, TextMessage, ImageMessage, TextSendMessage, FollowEvent
+    )
+except Exception:
+    LineBotApi = None
+    WebhookHandler = None
+    MessageEvent = TextMessage = ImageMessage = TextSendMessage = FollowEvent = None
+    InvalidSignatureError = Exception
 
-# ===== Optional ML =====
+# Optional ML
 try:
     import joblib
 except Exception:
@@ -49,56 +39,60 @@ except Exception:
 
 app = Flask(__name__)
 
-# ---------- Logging ----------
+# logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-bot")
 
-# ---------- ENV ----------
+# LINE env
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
-line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN and LineBotApi else None
+line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET and WebhookHandler else None
 
-DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
+# Debug flag
+DEBUG_VISION = os.getenv("DEBUG_VISION", "1") == "1"   # 開發階段預設打開
 
-# 顏色範圍（HSV，可由 ENV 微調）
+# HSV color ranges (可用環境變數微調)
 HSV = {
-    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW",  "0")),  int(os.getenv("HSV_RED1_S_LOW",  "50")), int(os.getenv("HSV_RED1_V_LOW",  "50"))),
-    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "12")), int(os.getenv("HSV_RED1_S_HIGH", "255")),int(os.getenv("HSV_RED1_V_HIGH", "255"))),
-    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW",  "170")),int(os.getenv("HSV_RED2_S_LOW",  "50")), int(os.getenv("HSV_RED2_V_LOW",  "50"))),
-    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")),int(os.getenv("HSV_RED2_S_HIGH", "255")),int(os.getenv("HSV_RED2_V_HIGH", "255"))),
-    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW",  "90")), int(os.getenv("HSV_BLUE_S_LOW",  "50")), int(os.getenv("HSV_BLUE_V_LOW",  "50"))),
-    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "135")),int(os.getenv("HSV_BLUE_S_HIGH", "255")),int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
-    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "40")), int(os.getenv("HSV_GREEN_S_LOW", "40")), int(os.getenv("HSV_GREEN_V_LOW", "40"))),
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW","0")),  int(os.getenv("HSV_RED1_S_LOW","50")), int(os.getenv("HSV_RED1_V_LOW","50"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH","12")), int(os.getenv("HSV_RED1_S_HIGH","255")),int(os.getenv("HSV_RED1_V_HIGH","255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW","170")),int(os.getenv("HSV_RED2_S_LOW","50")), int(os.getenv("HSV_RED2_V_LOW","50"))),
+    "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH","180")),int(os.getenv("HSV_RED2_S_HIGH","255")),int(os.getenv("HSV_RED2_V_HIGH","255"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW","90")), int(os.getenv("HSV_BLUE_S_LOW","50")), int(os.getenv("HSV_BLUE_V_LOW","50"))),
+    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH","135")),int(os.getenv("HSV_BLUE_S_HIGH","255")),int(os.getenv("HSV_BLUE_V_HIGH","255"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW","40")), int(os.getenv("HSV_GREEN_S_LOW","40")), int(os.getenv("HSV_GREEN_V_LOW","40"))),
     "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH","85")), int(os.getenv("HSV_GREEN_S_HIGH","255")),int(os.getenv("HSV_GREEN_V_HIGH","255"))),
 }
+
+# Canny / Hough params
 HOUGH_MIN_LEN_RATIO = float(os.getenv("HOUGH_MIN_LEN_RATIO", "0.45"))
 HOUGH_GAP = int(os.getenv("HOUGH_GAP", "6"))
 CANNY1 = int(os.getenv("CANNY1", "60"))
 CANNY2 = int(os.getenv("CANNY2", "180"))
 
-# 影像模式
-ROAD_MODE = os.getenv("ROAD_MODE", "bigroad").strip().lower()  # "bigroad" 或 "bead"
+# Road mode: bigroad / bead
+ROAD_MODE = os.getenv("ROAD_MODE", "bigroad").strip().lower()
 
-# 嚴格格線
+# Strict grid and detection thresholds (你要微調就改 ENV)
 STRICT_GRID = os.getenv("STRICT_GRID", "1") == "1"
 MIN_COLS = int(os.getenv("MIN_COLS", "6"))
 MIN_ITEMS = int(os.getenv("MIN_ITEMS", "8"))
 
-# ---------- User session ----------
-user_mode: Dict[str, bool] = {}   # user_id -> True/False
+# New detection tuning params (for strict filtering)
+MIN_AREA = int(os.getenv("MIN_AREA","200"))         # 最小 blob 面積（嚴格模式）
+CIRC_THRESH = float(os.getenv("CIRC_THRESH","0.44"))  # 圓度閾值（嚴格模式）
+MIN_VOTE_RATIO = float(os.getenv("MIN_VOTE_RATIO","0.55"))  # 顏色投票比（label 決勝）
 
-# ---------- 模型載入 ----------
+# ML model paths (同先前)
 MODELS_DIR = Path("models")
 SCALER_PATH = MODELS_DIR / "scaler.pkl"
 XGB_PKL     = MODELS_DIR / "xgb_model.pkl"
 XGB_JSON    = MODELS_DIR / "xgb_model.json"
-XGB_UBJ     = MODELS_DIR / "xgb_model.ubj"
 LGBM_PKL    = MODELS_DIR / "lgbm_model.pkl"
 LGBM_TXT    = MODELS_DIR / "lgbm_model.txt"
 LGBM_JSON   = MODELS_DIR / "lgbm_model.json"
-RNN_WTS     = MODELS_DIR / "rnn_weights.npz"    # numpy 權重：Wxh, Whh, bh, Why, bo
+RNN_WTS     = MODELS_DIR / "rnn_weights.npz"
 
 model_bundle: Dict[str, Any] = {"loaded": False, "note": "no model"}
 
@@ -119,18 +113,12 @@ def load_models():
             elif _safe_exists(XGB_JSON):
                 bst = xgb.Booster(); bst.load_model(str(XGB_JSON))
                 bundle["xgb_booster"] = bst
-            elif _safe_exists(XGB_UBJ):
-                bst = xgb.Booster(); bst.load_model(str(XGB_UBJ))
-                bundle["xgb_booster"] = bst
 
         if lgb:
             if _safe_exists(LGBM_PKL) and joblib:
                 bundle["lgbm_sklearn"] = joblib.load(LGBM_PKL)
             elif _safe_exists(LGBM_TXT):
                 bundle["lgbm_booster"] = lgb.Booster(model_file=str(LGBM_TXT))
-            elif _safe_exists(LGBM_JSON):
-                booster = lgb.Booster(model_str=LGBM_JSON.read_text(encoding="utf-8"))
-                bundle["lgbm_booster"] = booster
 
         if _safe_exists(RNN_WTS):
             try:
@@ -153,9 +141,7 @@ def load_models():
 
 load_models()
 
-# =========================================================
-# 影像：共用小工具（含強化版）
-# =========================================================
+# Utility / vision helpers
 IDX = {"B":0,"P":1,"T":2}
 
 def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
@@ -177,26 +163,10 @@ def _has_horizontal_line(roi_bgr: np.ndarray) -> bool:
         if abs(y2-y1) <= max(2,int(h*0.12)): return True
     return False
 
-def _has_dense_strokes(roi_bgr: np.ndarray) -> bool:
-    """白色筆畫密度：不裝 OCR 的輕量文字輔助（珠盤路字體）。"""
-    if roi_bgr is None or roi_bgr.size == 0: return False
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray,(3,3),0)
-    _, bw = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)  # 偏高：抓白筆畫
-    n, _, stats, _ = cv2.connectedComponentsWithStats(bw, 8)
-    strokes = 0
-    for i in range(1,n):
-        w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]; a = stats[i, cv2.CC_STAT_AREA]
-        if a < 6: continue
-        aspect = max(w,h)/(min(w,h)+1e-6)
-        if aspect >= 2.8: strokes += 1
-    return strokes >= 2
-
-# ---- 強化：格線（白線淡也能抓），抓不到時交由珠心自建格 ----
 def _grid_from_roi(roi: np.ndarray) -> Tuple[List[int], List[int]]:
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray,5,60,60)
-    _, bw1 = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)  # 降門檻（原 200）
+    _, bw1 = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)
     edges = cv2.Canny(gray, 40, 120)
     bw = cv2.bitwise_or(bw1, edges)
 
@@ -234,7 +204,6 @@ def _grid_from_roi(roi: np.ndarray) -> Tuple[List[int], List[int]]:
     if rows and len(rows)>7: rows = rows[:7]
     return cols, rows
 
-# ---- 強化：彩色珠（放寬空心圈/數字） ----
 def _color_masks(bgr: np.ndarray):
     blur = cv2.GaussianBlur(bgr,(3,3),0)
     hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
@@ -242,7 +211,7 @@ def _color_masks(bgr: np.ndarray):
     red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
     red  = cv2.bitwise_or(red1, red2)
     blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-    green= cv2.inRange(hsv, HSV["GREEN_LOW"],  HSV["GREEN_HIGH"])
+    green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
     k = np.ones((3,3), np.uint8)
     def clean(m):
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
@@ -250,46 +219,81 @@ def _color_masks(bgr: np.ndarray):
         return m
     return clean(red), clean(blue), clean(green)
 
-def _blobs(roi: np.ndarray):
-    red, blue, green = _color_masks(roi)
-    def cc(mask,label):
-        # 膨脹讓空心圈閉合
-        k = np.ones((2,2), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, k, iterations=1)
+def _blobs(roi: np.ndarray) -> List[Dict[str,Any]]:
+    """
+    回傳每個 blob 的 dict：
+    {x,y,w,h,area,circ,cx,cy, vote_red, vote_blue, vote_green, label_candidate}
+    - label_candidate 是顏色投票結果 'B'/'P'/'T' 或 None (若票數不足)
+    - 嚴格模式會過濾 area / circ
+    """
+    red_mask, blue_mask, green_mask = _color_masks(roi)
+    # combine masks to find candidates
+    combo = cv2.bitwise_or(cv2.bitwise_or(red_mask, blue_mask), green_mask)
+    # 膨脹讓空心圈閉合
+    kernel = np.ones((3,3), np.uint8)
+    combo = cv2.morphologyEx(combo, cv2.MORPH_CLOSE, kernel, iterations=2)
+    combo = cv2.morphologyEx(combo, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        n, _, stats, _ = cv2.connectedComponentsWithStats(mask,8)
-        out=[]
-        areas=[stats[i, cv2.CC_STAT_AREA] for i in range(1,n)]
-        med=np.median(areas) if areas else 0
-        minA=max(40, int(med*0.25))              # 放寬
-        maxA=int(med*10) if med>0 else 999999
-        for i in range(1,n):
-            x,y,w,h,a = stats[i,0],stats[i,1],stats[i,2],stats[i,3],stats[i,4]
-            if a<minA or a>maxA: continue
-            peri = 2*(w+h); circ = 4*np.pi*a/(peri*peri+1e-6)
-            if circ < 0.40: continue             # 放寬圓度
-            cx = x+w/2.0; cy = y+h/2.0
-            out.append((x,y,w,h,cx,cy,label))
-        return out
-    items=[]; items+=cc(red,"B"); items+=cc(blue,"P"); items+=cc(green,"T")
+    n, _, stats, centroids = cv2.connectedComponentsWithStats(combo, 8)
+    items = []
+    hR,wR = roi.shape[:2]
+    for i in range(1, n):
+        x,y,w,h,a = int(stats[i,0]),int(stats[i,1]),int(stats[i,2]),int(stats[i,3]),int(stats[i,4])
+        if a <= 6: continue  # 太小直接忽略基礎噪聲
+        cx,cy = float(centroids[i][0]), float(centroids[i][1])
+        peri = 2*(w+h)
+        circ = 4.0*math.pi*a/(peri*peri+1e-9)
+        # bounding clipping
+        x1,x2 = max(0,x), min(wR, x+w)
+        y1,y2 = max(0,y), min(hR, y+h)
+        if x2<=x1 or y2<=y1: continue
+        sub_r = red_mask[y1:y2, x1:x2]
+        sub_b = blue_mask[y1:y2, x1:x2]
+        sub_g = green_mask[y1:y2, x1:x2]
+        # 投票：每個 mask 在 bbox 內的像素比例
+        area_bbox = float((x2-x1)*(y2-y1))
+        vote_r = float(np.count_nonzero(sub_r))/area_bbox
+        vote_b = float(np.count_nonzero(sub_b))/area_bbox
+        vote_g = float(np.count_nonzero(sub_g))/area_bbox
+        # 決定候選 label（需超過 MIN_VOTE_RATIO）
+        label = None
+        maxv = max(vote_r, vote_b, vote_g)
+        if maxv >= MIN_VOTE_RATIO:
+            if maxv == vote_r: label = "B"   # Banker (紅)
+            elif maxv == vote_b: label = "P" # Player (藍)
+            else: label = "T"                # Tie / 和 (綠)
+        items.append({
+            "x": x, "y": y, "w": w, "h": h, "area": int(a), "circ": float(circ),
+            "cx": float(cx), "cy": float(cy),
+            "vote_r": float(vote_r), "vote_b": float(vote_b), "vote_g": float(vote_g),
+            "label_candidate": label
+        })
+
+    # 嚴格模式先過濾掉面積或圓度不符合的
+    if STRICT_GRID:
+        filtered = []
+        for it in items:
+            if it["area"] >= MIN_AREA and it["circ"] >= CIRC_THRESH and it["label_candidate"] is not None:
+                filtered.append(it)
+        if DEBUG_VISION:
+            logger.info(f"[BLOBS][STRICT] candidates={len(items)} filtered={len(filtered)} MIN_AREA={MIN_AREA} CIRC={CIRC_THRESH} MIN_VOTE={MIN_VOTE_RATIO}")
+        items = filtered
+
+    # 最後排序（從左到右）便於後面欄群組
+    items.sort(key=lambda z: z["cx"])
     return items
 
-# ---- 失敗備援：用珠心自建格線 ----
-def _grid_from_beads(items: List[tuple], roi_w: int, roi_h: int) -> Tuple[List[int], List[int]]:
+def _grid_from_beads(items: List[Dict[str,Any]], roi_w: int, roi_h: int) -> Tuple[List[int], List[int]]:
     if not items: return [], []
-    cxs = sorted([it[4] for it in items])
-    cys = sorted([it[5] for it in items])
-
+    cxs = sorted([it["cx"] for it in items])
+    cys = sorted([it["cy"] for it in items])
     def median_gap(vals):
         gaps=[vals[i+1]-vals[i] for i in range(len(vals)-1) if vals[i+1]-vals[i]>3]
         return np.median(gaps) if gaps else (roi_w/12)
-
     step_x = int(max(8, median_gap(cxs)))
     step_y = int(max(8, median_gap(cys)))
-
     start_x = max(0, int(min(cxs)-step_x*0.8))
     start_y = max(0, int(min(cys)-step_y*0.8))
-
     cols=[start_x]
     while cols[-1]+step_x < roi_w-2:
         cols.append(cols[-1]+step_x)
@@ -298,93 +302,81 @@ def _grid_from_beads(items: List[tuple], roi_w: int, roi_h: int) -> Tuple[List[i
         rows.append(rows[-1]+step_y)
     return cols, rows
 
-def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items: List[tuple]) -> List[str]:
-    # 若格線抓不到，但有珠 → 用珠心估格
+def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items: List[Dict[str,Any]]) -> List[str]:
+    # 若格線抓不到但有珠 → 用珠心估格
     if (not cols or not rows or len(rows)<2) and items:
         cols, rows = _grid_from_beads(items, roi.shape[1], roi.shape[0])
-
+    # 若仍抓不到且嚴格模式 -> 回傳空 (避免只抓到 1 手的離譜情況)
+    if (not cols or not rows or len(rows)<2) and STRICT_GRID:
+        if DEBUG_VISION: logger.info("[SNAP] strict grid fail -> return []")
+        return []
     if not cols or not rows or len(rows)<2:
-        # 回退：欄群組 + 欄內去重（僅在非 STRICT_GRID 情況使用）
-        if STRICT_GRID:
-            return []
-        items.sort(key=lambda z: z[4])
-        cxs=[it[4] for it in items]
-        gaps=[cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
-        gaps=[g for g in gaps if g>3]
-        med_gap = np.median(gaps) if gaps else np.median([it[2] for it in items]) if items else 10
+        # fallback: group columns by cx
+        items_sorted = sorted(items, key=lambda z: z["cx"])
+        if not items_sorted: return []
+        cxs = [it["cx"] for it in items_sorted]
+        med_gap = np.median([cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]) if len(cxs)>1 else 10
         col_bin = max(6.0, 0.6*float(med_gap))
-        columns=[]
-        for it in items:
-            if not columns or abs(it[4]-columns[-1][-1][4])>col_bin: columns.append([it])
-            else: columns[-1].append(it)
-        heights=[h for (_,_,_,h,_,_,_) in items]
-        med_h=np.median(heights) if heights else 12
-        row_thr=max(6.0,0.5*float(med_h))
+        columns = []
+        for it in items_sorted:
+            if not columns or abs(it["cx"]-columns[-1][-1]["cx"])>col_bin:
+                columns.append([it])
+            else:
+                columns[-1].append(it)
+        # column-wise, top->down
         seq=[]
         for col in columns:
-            col.sort(key=lambda z: z[5])
-            last=-1e9
+            col.sort(key=lambda z: z["cy"])
+            last = -1e9; row_thr = max(6.0, 0.5*float(np.median([c["h"] for c in col]) if col else 12))
             for it in col:
-                if abs(it[5]-last)<row_thr: continue
-                last=it[5]
-                x,y,w,h,cx,cy,label=it
-                pad_x=max(2,int(w*0.18)); pad_y=max(2,int(h*0.28))
-                x1=max(0,int(x+pad_x)); x2=min(roi.shape[1],int(x+w-pad_x))
-                y1=max(0,int(y+pad_y)); y2=min(roi.shape[0],int(y+h-pad_y))
-                sub=roi[y1:y2, x1:x2]
-                lab = "T" if (label in {"B","P"} and _has_horizontal_line(sub)) else ("T" if label=="T" else label)
+                if abs(it["cy"]-last) < row_thr: continue
+                last = it["cy"]
+                lab = it["label_candidate"] or "T"
                 seq.append(lab)
         return seq
 
-    # 正常：格線吸附（欄→列）
+    # 正常格線吸附（欄→列）
     row_centers = [int((rows[i]+rows[i+1])//2) for i in range(min(6,len(rows)-1))]
     col_centers = [int((cols[i]+cols[i+1])//2) for i in range(len(cols)-1)]
     grid = [[None for _ in range(len(col_centers))] for _ in range(len(row_centers))]
-    for x,y,w,h,cx,cy,label in items:
+    for it in items:
+        cx,cy = it["cx"], it["cy"]
         j = int(np.argmin([abs(cy-rc) for rc in row_centers]))
         i = int(np.argmin([abs(cx-cc) for cc in col_centers]))
         if 0<=j<len(row_centers) and 0<=i<len(col_centers):
             score = abs(cy-row_centers[j])+abs(cx-col_centers[i])
             prev = grid[j][i]
             if prev is None or score < prev[0]:
-                grid[j][i] = (score, label, (x,y,w,h))
+                grid[j][i] = (score, it)
     seq=[]
     for i in range(len(col_centers)):
         for j in range(len(row_centers)):
             cell = grid[j][i]
             if cell is None: continue
-            _, label, (x,y,w,h) = cell
-            pad_x=max(2,int(w*0.18)); pad_y=max(2,int(h*0.28))
-            x1=max(0,int(x+pad_x)); x2=min(roi.shape[1],int(x+w-pad_x))
-            y1=max(0,int(y+pad_y)); y2=min(roi.shape[0],int(y+h-pad_y))
-            sub=roi[y1:y2, x1:x2]
-            if label in {"B","P"}:
-                seq.append("T" if _has_horizontal_line(sub) else label)
-            else:
-                seq.append("T")
+            it = cell[1]
+            lab = it["label_candidate"] or "T"
+            seq.append(lab)
     return seq
 
-# =========================================================
-# 影像主流程（bigroad / bead）
-# =========================================================
-def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
+def extract_sequence_from_image(img_bytes: bytes) -> Tuple[List[str], Dict[str,Any]]:
     """
-    bigroad：FOCUS_ROI（優先）→ 自動找紅/藍最大塊 → 下半部保底 → 取上方 BIGROAD_FRAC → 格線對齊
-    bead   ：FOCUS_BEAD_ROI（優先）→ 自動找左下紅/藍密集區 → 格線對齊 / 自建格
-    皆輸出欄→列順序的序列（'B','P','T'）
+    回傳 (seq, debug_info)
+    seq: ['B','P','T'...]
+    debug_info: 包含 items, cols, rows, debug_image_path, json_path (若有)
     """
+    debug_info = {"items":[],"cols":0,"rows":0,"seq_len":0,"debug_img":None,"json":None}
     try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = np.array(img); img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        H,W = img.shape[:2]
-        target = 1400.0
-        scale = target/max(H,W) if max(H,W)<target else 1.0
-        if scale>1.0:
-            img = cv2.resize(img,(int(W*scale),int(H*scale)),interpolation=cv2.INTER_CUBIC)
-
+        pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = np.array(pil); img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        H,W = img_bgr.shape[:2]
+        # scale down/up to reasonable processing size if huge
+        max_side = 1400.0
+        scale = max_side / max(H,W) if max(H,W) > max_side else 1.0
+        if scale != 1.0:
+            img_bgr = cv2.resize(img_bgr, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
         mode = os.getenv("ROAD_MODE", ROAD_MODE).strip().lower()
 
-        # ---------- helper: 嚴格格線判斷 ----------
+        # helper strict check
         def _strict_fail(cols, rows, items, tag):
             if not STRICT_GRID: return False
             bad = (len(rows) < 2) or (len(cols) < MIN_COLS) or (len(items) < MIN_ITEMS)
@@ -392,22 +384,24 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 logger.info(f"[STRICT][{tag}] fail cols={len(cols)} rows={len(rows)} items={len(items)}")
             return bad
 
-        # ---------- 珠盤路 ----------
+        # BEAD mode
         if mode == "bead":
-            def _locate_bead_roi(base_bgr: np.ndarray) -> np.ndarray:
-                HH, WW = base_bgr.shape[:2]
-                roi_env = os.getenv("FOCUS_BEAD_ROI","")
-                if roi_env:
-                    try:
-                        sx,sy,sw,sh = [float(t) for t in roi_env.split(",")]
-                        rx=int(max(0,min(1,sx))*WW); ry=int(max(0,min(1,sy))*HH)
-                        rw=int(max(0,min(1,sw))*WW); rh=int(max(0,min(1,sh))*HH)
-                        sub = base_bgr[ry:ry+rh, rx:rx+rw]
-                        if sub.size: return sub
-                    except: pass
-                red, blue, _ = _color_masks(base_bgr)
+            HH, WW = img_bgr.shape[:2]
+            # try FOCUS_BEAD_ROI first
+            roi_env = os.getenv("FOCUS_BEAD_ROI","")
+            if roi_env:
+                try:
+                    sx,sy,sw,sh = [float(t) for t in roi_env.split(",")]
+                    rx=int(max(0,min(1,sx))*WW); ry=int(max(0,min(1,sy))*HH)
+                    rw=int(max(0,min(1,sw))*WW); rh=int(max(0,min(1,sh))*HH)
+                    roi = img_bgr[ry:ry+rh, rx:rx+rw]
+                except Exception:
+                    roi = img_bgr[int(HH*0.55):HH, 0:int(WW*0.55)]
+            else:
+                # auto-locate left-bottom density
+                red, blue, _ = _color_masks(img_bgr)
                 combo = cv2.bitwise_or(red, blue)
-                y0=int(HH*0.55); x0=0; x1=int(WW*0.55)  # 左下半部
+                y0=int(HH*0.55); x0=0; x1=int(WW*0.55)
                 mask=np.zeros_like(combo); mask[y0:HH, x0:x1]=combo[y0:HH, x0:x1]
                 kernel=np.ones((5,5),np.uint8)
                 m=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel,iterations=2)
@@ -418,32 +412,37 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                     pad=max(6,int(min(w,h)*0.06))
                     rx=max(0,x-pad); ry=max(0,y-pad)
                     rw=min(WW-rx,w+2*pad); rh=min(HH-ry,h+2*pad)
-                    return base_bgr[ry:ry+rh, rx:rx+rw]
-                return base_bgr[y0:HH, x0:x1]
-
-            roi = _locate_bead_roi(img)
+                    roi = img_bgr[ry:ry+rh, rx:rx+rw]
+                else:
+                    roi = img_bgr[y0:HH, x0:x1]
             cols, rows = _grid_from_roi(roi)
             items = _blobs(roi)
+            debug_info["cols"], debug_info["rows"] = len(cols), len(rows)
+            debug_info["items"] = items
             if _strict_fail(cols, rows, items, "BEAD"):
-                return []
+                return [], debug_info
             seq = _snap_and_sequence(roi, cols, rows, items)
+            debug_info["seq_len"] = len(seq)
+            # debug outputs
             if DEBUG_VISION:
-                logger.info(f"[VISION][BEAD] cols={len(cols)} rows={len(rows)} items={len(items)} seq_len={len(seq)}")
-            return seq[-240:]
+                _dump_debug_outputs(roi, cols, rows, items, seq, tag="bead")
+                debug_info["debug_img"] = "/mnt/data/debug_bead_strict_out.png"
+                debug_info["json"] = "/mnt/data/debug_bead_strict.json"
+            return seq[-240:], debug_info
 
-        # ---------- 大路 ----------
-        def _locate_bigroad_roi(base_bgr: np.ndarray) -> np.ndarray:
-            HH, WW = base_bgr.shape[:2]
-            roi_env=os.getenv("FOCUS_ROI","")
-            if roi_env:
-                try:
-                    sx,sy,sw,sh = [float(t) for t in roi_env.split(",")]
-                    rx=int(max(0,min(1,sx))*WW); ry=int(max(0,min(1,sy))*HH)
-                    rw=int(max(0,min(1,sw))*WW); rh=int(max(0,min(1,sh))*HH)
-                    sub=base_bgr[ry:ry+rh, rx:rx+rw]
-                    if sub.size: return sub
-                except: pass
-            red, blue, _ = _color_masks(base_bgr)
+        # BIGROAD mode
+        HH, WW = img_bgr.shape[:2]
+        roi_env = os.getenv("FOCUS_ROI","")
+        if roi_env:
+            try:
+                sx,sy,sw,sh = [float(t) for t in roi_env.split(",")]
+                rx=int(max(0,min(1,sx))*WW); ry=int(max(0,min(1,sy))*HH)
+                rw=int(max(0,min(1,sw))*WW); rh=int(max(0,min(1,sh))*HH)
+                roi0 = img_bgr[ry:ry+rh, rx:rx+rw]
+            except Exception:
+                roi0 = img_bgr[int(HH*0.45):HH, :]
+        else:
+            red, blue, _ = _color_masks(img_bgr)
             combo = cv2.bitwise_or(red, blue)
             y0=int(HH*0.45)
             mask=np.zeros_like(combo); mask[y0:HH,:]=combo[y0:HH,:]
@@ -456,48 +455,77 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 padx=max(6,int(w*0.03)); pady=max(6,int(h*0.08))
                 rx=max(0,x-padx); ry=max(0,y-pady)
                 rw=min(WW-rx,w+2*padx); rh=min(HH-ry,h+2*pady)
-                return base_bgr[ry:ry+rh, rx:rx+rw]
-            return base_bgr[y0:HH, :]
-
+                roi0 = img_bgr[ry:ry+rh, rx:rx+rw]
+            else:
+                roi0 = img_bgr[y0:HH, :]
         BIGROAD_FRAC = float(os.getenv("BIGROAD_FRAC","0.70"))
         MIN_BEADS = int(os.getenv("MIN_BEADS","12"))
 
-        def _run_bigroad(frac: float) -> Tuple[List[str], Tuple[int,int,int]]:
-            roi0 = _locate_bigroad_roi(img)
+        def _run_bigroad(frac: float):
             rh_big = max(1, int(roi0.shape[0]*max(0.5, min(0.95, frac))))
             roi = roi0[:rh_big, :]
             cols, rows = _grid_from_roi(roi)
             items = _blobs(roi)
-            if _strict_fail(cols, rows, items, "BIG"):
-                return [], (len(cols), len(rows), len(items))
-            seq = _snap_and_sequence(roi, cols, rows, items)
-            return seq, (len(cols), len(rows), len(items))
+            return roi, cols, rows, items
 
-        seq, stat = _run_bigroad(BIGROAD_FRAC)
-        if not seq:
-            # 若嚴格模式失敗，直接回傳空；讓上層提示調 ROI
+        roi, cols, rows, items = _run_bigroad(BIGROAD_FRAC)
+        debug_info["cols"], debug_info["rows"] = len(cols), len(rows)
+        debug_info["items"] = items
+        if _strict_fail(cols, rows, items, "BIG"):
             if STRICT_GRID:
-                if DEBUG_VISION:
-                    logger.info(f"[VISION][BIG][STRICT_FAIL] cols={stat[0]} rows={stat[1]} items={stat[2]}")
-                return []
-            # 非嚴格：再嘗試較大比例
-            seq2, _ = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
-            seq = seq2
-        if len(seq) < MIN_BEADS and not STRICT_GRID:
-            seq2, _ = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
-            seq = seq2 if seq2 else seq
-
+                return [], debug_info
+            else:
+                roi2, cols2, rows2, items2 = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
+                roi, cols, rows, items = roi2, cols2, rows2, items2
+        seq = _snap_and_sequence(roi, cols, rows, items)
+        debug_info["seq_len"] = len(seq)
         if DEBUG_VISION:
-            logger.info(f"[VISION][BIG] final_len={len(seq)}")
-        return seq[-240:]
+            _dump_debug_outputs(roi, cols, rows, items, seq, tag="big")
+            debug_info["debug_img"] = "/mnt/data/debug_bead_strict_out.png"
+            debug_info["json"] = "/mnt/data/debug_bead_strict.json"
+        return seq[-240:], debug_info
 
     except Exception as e:
         if DEBUG_VISION: logger.exception(f"[VISION][ERR] {e}")
-        return []
+        return [], debug_info
 
-# =========================================================
-# 特徵工程 / 震盪偵測 / 投票
-# =========================================================
+# Debug dump: image + JSON
+def _dump_debug_outputs(roi, cols, rows, items, seq, tag="dbg"):
+    try:
+        H,W = roi.shape[:2]
+        vis = roi.copy()
+        # draw grid
+        if cols and len(cols)>1:
+            for c in cols:
+                cv2.line(vis, (c,0),(c,H-1),(160,160,160),1)
+        if rows and len(rows)>1:
+            for r in rows:
+                cv2.line(vis, (0,r),(W-1,r),(160,160,160),1)
+        # draw items
+        for i,it in enumerate(items):
+            x,y,w,h = int(it["x"]),int(it["y"]),int(it["w"]),int(it["h"])
+            label = it.get("label_candidate") or "?"
+            color = (0,0,255) if label=="B" else ((255,0,0) if label=="P" else (0,255,0))
+            cv2.rectangle(vis, (x,y),(x+w,y+h), color, 2)
+            cv2.putText(vis, f'{label}:{int(it["area"])}',{x,y-6}, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,1)
+        # save image
+        out_img_path = "/mnt/data/debug_bead_strict_out.png"
+        cv2.imwrite(out_img_path, vis)
+        # save json
+        json_path = "/mnt/data/debug_bead_strict.json"
+        small = [{"x":int(it["x"]), "y":int(it["y"]), "w":int(it["w"]), "h":int(it["h"]),
+                  "area":int(it["area"]), "circ":round(it["circ"],3),
+                  "vote_r":round(it["vote_r"],3), "vote_b":round(it["vote_b"],3),
+                  "vote_g":round(it["vote_g"],3), "label": it.get("label_candidate")}
+                 for it in items]
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump({"items": small, "cols": len(cols), "rows": len(rows), "seq": seq}, f, ensure_ascii=False, indent=2)
+        logger.info(f"[DEBUG] dumped {out_img_path} and {json_path}")
+    except Exception as e:
+        logger.exception(f"debug dump err: {e}")
+
+# ========== 以下為特徵工程 / 模型 / 回傳（與之前邏輯相同） ==========
+
 def _streak_tail(seq: List[str]) -> int:
     if not seq: return 0
     t, c = seq[-1], 1
@@ -534,32 +562,11 @@ def build_features(seq: List[str]) -> np.ndarray:
                     dtype=np.float32).reshape(1,-1)
     return feat
 
-def _normalize(p: Dict[str,float]) -> Dict[str,float]:
-    p = {k: max(1e-9, float(v)) for k,v in p.items()}
-    s = p["banker"]+p["player"]+p["tie"]
-    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
-    return {k: round(v/s,4) for k,v in p.items()}
-
 def _softmax(x: np.ndarray, temp: float=1.0) -> np.ndarray:
     x = x.astype(np.float64)/max(1e-9,temp)
     m = np.max(x)
     e = np.exp(x-m)
     return e/(np.sum(e)+1e-12)
-
-def _oscillation_rate(seq: List[str], win: int) -> float:
-    s = [c for c in seq[-win:] if c in ("B","P")]
-    if len(s) < 2: return 0.0
-    alt = sum(1 for a,b in zip(s,s[1:]) if a!=b)
-    return alt/(len(s)-1)
-
-def _alt_streak_suffix(seq: List[str]) -> int:
-    s = [c for c in seq if c in ("B","P")]
-    if len(s) < 2: return 0
-    k=1
-    for i in range(len(s)-2,-1,-1):
-        if s[i]!=s[i+1]: k+=1
-        else: break
-    return k
 
 def _parse_weights_env_pair() -> Tuple[Dict[str, float], Dict[str, float]]:
     def _parse(s: str, default: Dict[str,float]) -> Dict[str,float]:
@@ -656,7 +663,27 @@ def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[st
     out={"banker":float(vec[0]),"player":float(vec[1]),"tie":float(vec[2])}
     return _normalize(out), info
 
-# 規則回退
+def _oscillation_rate(seq: List[str], win: int) -> float:
+    s = [c for c in seq[-win:] if c in ("B","P")]
+    if len(s) < 2: return 0.0
+    alt = sum(1 for a,b in zip(s,s[1:]) if a!=b)
+    return alt/(len(s)-1)
+
+def _alt_streak_suffix(seq: List[str]) -> int:
+    s = [c for c in seq if c in ("B","P")]
+    if len(s) < 2: return 0
+    k=1
+    for i in range(len(s)-2,-1,-1):
+        if s[i]!=s[i+1]: k+=1
+        else: break
+    return k
+
+def _normalize(p: Dict[str,float]) -> Dict[str,float]:
+    p = {k: max(1e-9, float(v)) for k,v in p.items()}
+    s = p["banker"]+p["player"]+p["tie"]
+    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
+    return {k: round(v/s,4) for k,v in p.items()}
+
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     n=len(seq)
     if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
@@ -714,9 +741,7 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
         f"資金建議：{bet_text}"
     )
 
-# =========================================================
-# API
-# =========================================================
+# ========== API / LINE webhook ==========
 @app.route("/")
 def index():
     return f"BGS AI 助手運行中 ✅ 模式：{os.getenv('ROAD_MODE', ROAD_MODE)} /line-webhook 就緒", 200
@@ -728,20 +753,9 @@ def health():
         "ts":int(time.time()),
         "mode": os.getenv("ROAD_MODE", ROAD_MODE),
         "models_loaded": model_bundle.get("loaded", False),
-        "have": {
-            "xgb_sklearn": "xgb_sklearn" in model_bundle,
-            "xgb_booster": "xgb_booster" in model_bundle,
-            "lgbm_sklearn":"lgbm_sklearn" in model_bundle,
-            "lgbm_booster":"lgbm_booster" in model_bundle,
-            "rnn_weights":"rnn_weights" in model_bundle,
-            "scaler":"scaler" in model_bundle
-        },
         "note": model_bundle.get("note","")
     })
 
-# =========================================================
-# LINE Webhook
-# =========================================================
 @app.route("/line-webhook", methods=['POST'])
 def line_webhook():
     if not (line_bot_api and line_handler):
@@ -753,7 +767,7 @@ def line_webhook():
     try:
         line_handler.handle(body, signature)
     except InvalidSignatureError as e:
-        logger.exception(f"InvalidSignatureError: {e}. 可能是 SECRET/TOKEN 不對")
+        logger.exception(f"InvalidSignatureError: {e}")
         return "Invalid signature", 200
     except Exception as e:
         logger.exception(f"Unhandled error: {e}")
@@ -761,12 +775,11 @@ def line_webhook():
     return "OK"
 
 if line_handler and line_bot_api:
-
     @line_handler.add(FollowEvent)
     def on_follow(event: FollowEvent):
         welcome = (
             "歡迎加入BGS AI 助手 🎉\n\n"
-            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議下注：莊 / 閒（勝率 xx%）。\n"
+            "輸入「開始分析」後，上傳牌路截圖，我會自動辨識並回傳建議下注。\n"
             f"目前模式：{os.getenv('ROAD_MODE', ROAD_MODE)}（可設為 bead 讀珠盤路）"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
@@ -776,9 +789,11 @@ if line_handler and line_bot_api:
         uid = getattr(event.source, "user_id", "unknown")
         txt = (event.message.text or "").strip()
         if txt in {"開始分析", "開始", "START", "分析"}:
+            # use session toggle pattern
+            user_mode = getattr(on_text, "user_mode", {})
             user_mode[uid] = True
-            msg = "已進入分析模式 ✅\n上傳牌路截圖即可（支援大路/珠盤路）。"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            setattr(on_text, "user_mode", user_mode)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已進入分析模式 ✅\n上傳牌路截圖即可（支援大路/珠盤路）。"))
             return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="請先輸入「開始分析」，再上傳牌路截圖。"
@@ -787,21 +802,20 @@ if line_handler and line_bot_api:
     @line_handler.add(MessageEvent, message=ImageMessage)
     def on_image(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
+        user_mode = getattr(on_text, "user_mode", {})
         if not user_mode.get(uid):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳牌路截圖。"
             ))
             return
-
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
-        seq = extract_sequence_from_image(img_bytes)
+        seq, debug_info = extract_sequence_from_image(img_bytes)
         if not seq:
-            tip = ("辨識失敗 😥\n若讀珠盤路：ROAD_MODE=bead 並設 FOCUS_BEAD_ROI=\"0,0,1,1\"；\n"
-                   "若讀大路：請設 FOCUS_ROI 或調整 BIGROAD_FRAC（0.66~0.75）。\n"
-                   "（已開嚴格格線：請確認 ROI 沒被遮、欄/列完整）")
+            tip = ("辨識失敗 😥\n若讀珠盤路：請設 ROAD_MODE=bead 並設定 FOCUS_BEAD_ROI；\n"
+                   "若讀大路：請設定 FOCUS_ROI 或調整 BIGROAD_FRAC（0.66~0.75）。\n"
+                   "你也可以把珠盤那一塊裁圖後再上傳。")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
-
         if model_bundle.get("loaded"):
             probs, info = predict_with_models(seq)
             by_model = probs is not None
@@ -809,8 +823,10 @@ if line_handler and line_bot_api:
                 probs = predict_probs_from_seq_rule(seq); info = {}
         else:
             probs = predict_probs_from_seq_rule(seq); by_model=False; info = {}
-
         msg = render_reply(seq, probs, by_model, info)
+        # attach debug note if available
+        if DEBUG_VISION and debug_info.get("debug_img"):
+            msg += f"\n(DEBUG) 標註圖: {debug_info.get('debug_img')}\n(JSON): {debug_info.get('json')}"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 if __name__ == "__main__":
