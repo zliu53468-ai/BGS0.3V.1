@@ -1,61 +1,19 @@
-envVars:
-  # 颜色检测参数 - 红色1
-  - key: HSV_RED1_H_LOW
-    value: "0"
-  - key: HSV_RED1_S_LOW
-    value: "50"
-  - key: HSV_RED1_V_LOW
-    value: "50"
-  - key: HSV_RED1_H_HIGH
-    value: "20"
-  - key: HSV_RED1_S_HIGH
-    value: "255"
-  - key: HSV_RED1_V_HIGH
-    value: "255"
-  # 颜色检测参数 - 红色2
-  - key: HSV_RED2_H_LOW
-    value: "160"
-  - key: HSV_RED2_S_LOW
-    value: "50"
-  - key: HSV_RED2_V_LOW
-    value: "50"
-  - key: HSV_RED2_H_HIGH
-    value: "180"
-  - key: HSV_RED2_S_HIGH
-    value: "255"
-  - key: HSV_RED2_V_HIGH
-    value: "255"
-  # 颜色检测参数 - 蓝色
-  - key: HSV_BLUE_H_LOW
-    value: "90"
-  - key: HSV_BLUE_S_LOW
-    value: "50"
-  - key: HSV_BLUE_V_LOW
-    value: "50"
-  - key: HSV_BLUE_H_HIGH
-    value: "140"
-  - key: HSV_BLUE_S_HIGH
-    value: "255"
-  - key: HSV_BLUE_V_HIGH
-    value: "255"
-  # 颜色检测参数 - 绿色
-  - key: HSV_GREEN_H_LOW
-    value: "50"
-  - key: HSV_GREEN_S_LOW
-    value: "30"
-  - key: HSV_GREEN_V_LOW
-    value: "30"
-  - key: HSV_GREEN_H_HIGH
-    value: "90"
-  - key: HSV_GREEN_S_HIGH
-    value: "255"
-  - key: HSV_GREEN_V_HIGH
-    value: "255"
-  # ROI设置
-  - key: FOCUS_ROI
-    value: "0.2,0.3,0.6,0.5"
-  # 其他设置
-  - key: DEBUG_VISION
-    value: "1"
-  - key: MIN_SEQ
-    value: "5"
+# render.yaml
+services:
+  - type: web
+    name: bgs-ai-bot
+    env: python
+    plan: free
+    buildCommand: |
+      sudo apt-get update
+      sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    envVars:
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: DEBUG_VISION
+        value: "1"  # 啟用調試模式以獲取更多日誌
+    healthCheckPath: /health
