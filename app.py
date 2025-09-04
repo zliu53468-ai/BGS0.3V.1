@@ -21,6 +21,18 @@ try:
 except ImportError:
     pytesseract = None
 
+# ===== 机器学习库 =====
+try:
+    from sklearn.preprocessing import LabelEncoder
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.utils import to_categorical
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("机器学习库未安装，将使用规则预测")
+
 app = Flask(__name__)
 
 # ---------- Logging ----------
@@ -38,6 +50,56 @@ DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
 # ---------- User session ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
+
+# ---------- RNN模型相关 ----------
+rnn_model = None
+label_encoder = None
+
+def init_rnn_model():
+    """初始化RNN模型"""
+    global rnn_model, label_encoder
+    
+    if not ML_AVAILABLE:
+        logger.warning("机器学习库不可用，无法初始化RNN模型")
+        return
+    
+    try:
+        # 创建标签编码器
+        label_encoder = LabelEncoder()
+        label_encoder.fit(['B', 'P', 'T'])
+        
+        # 创建简单的RNN模型
+        rnn_model = Sequential([
+            LSTM(64, input_shape=(10, 3), return_sequences=True),
+            Dropout(0.2),
+            LSTM(32),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dense(3, activation='softmax')
+        ])
+        
+        rnn_model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        logger.info("RNN模型初始化成功")
+        
+        # 尝试加载预训练模型
+        model_path = os.path.join(os.path.dirname(__file__), 'models', 'rnn_model.h5')
+        if os.path.exists(model_path):
+            rnn_model = load_model(model_path)
+            logger.info("预训练RNN模型加载成功")
+        else:
+            logger.info("未找到预训练模型，将使用初始化的模型")
+            
+    except Exception as e:
+        logger.error(f"RNN模型初始化失败: {e}")
+        rnn_model = None
+
+# 初始化RNN模型
+init_rnn_model()
 
 # =========================================================
 # 博彩游戏结果识别
@@ -115,13 +177,13 @@ def parse_gaming_text(text: str) -> List[str]:
     
     # 使用正则表达式提取数字
     patterns = [
-        r'田\s*(\d+)',    # 田 15
-        r'莊\s*(\d+)',    # 莊 15
-        r'庄\s*(\d+)',    # 庄 15
-        r'閒\s*(\d+)',    # 閒 17
-        r'閑\s*(\d+)',    # 閑 17
-        r'闲\s*(\d+)',    # 闲 17
-        r'和\s*(\d+)',    # 和 1
+        r'田\s*(\d+)',    # 田 23
+        r'莊\s*(\d+)',    # 莊 23
+        r'庄\s*(\d+)',    # 庄 23
+        r'閒\s*(\d+)',    # 閒 15
+        r'閑\s*(\d+)',    # 閑 15
+        r'闲\s*(\d+)',    # 闲 15
+        r'和\s*(\d+)',    # 和 3
     ]
     
     for pattern in patterns:
@@ -206,6 +268,44 @@ def build_features(seq: List[str]) -> np.ndarray:
     feat = np.array([n,pb,pp,pt,b10,p10,t10,b20,p20,t20,streak,entropy,*last,*trans], dtype=np.float32).reshape(1,-1)
     return feat
 
+def prepare_rnn_data(seq: List[str], seq_length=10):
+    """准备RNN输入数据"""
+    if not seq or len(seq) < seq_length:
+        return None
+    
+    # 将序列转换为one-hot编码
+    encoded = label_encoder.transform(seq)
+    one_hot = to_categorical(encoded, num_classes=3)
+    
+    # 创建滑动窗口数据
+    X = []
+    for i in range(len(one_hot) - seq_length):
+        X.append(one_hot[i:i+seq_length])
+    
+    return np.array(X)
+
+def predict_with_rnn(seq: List[str]) -> Dict[str, float]:
+    """使用RNN模型进行预测"""
+    if not ML_AVAILABLE or rnn_model is None:
+        logger.warning("RNN模型不可用，使用规则预测")
+        return predict_probs_from_seq_rule(seq)
+    
+    # 准备数据
+    X = prepare_rnn_data(seq)
+    if X is None or len(X) == 0:
+        logger.warning("数据不足，使用规则预测")
+        return predict_probs_from_seq_rule(seq)
+    
+    # 使用RNN预测
+    predictions = rnn_model.predict(X[-1:])  # 只预测最后一个窗口
+    probs = predictions[0]
+    
+    return {
+        "banker": float(probs[0]),
+        "player": float(probs[1]),
+        "tie": float(probs[2])
+    }
+
 def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     n=len(seq)
     if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
@@ -225,6 +325,80 @@ def predict_probs_from_seq_rule(seq: List[str]) -> Dict[str,float]:
     s=pb+pp+pt
     if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
     return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
+
+def predict_probs_with_tie_adjustment(seq: List[str]) -> Dict[str,float]:
+    """考虑和局变数的预测函数"""
+    n=len(seq)
+    if n==0: return {"banker":0.33,"player":0.33,"tie":0.34}
+    
+    # 计算基本概率
+    pb = seq.count("B")/n
+    pp = seq.count("P")/n
+    pt = seq.count("T")/n
+    
+    # 考虑和局的影响 - 和局后通常会有趋势延续
+    tie_indices = [i for i, result in enumerate(seq) if result == "T"]
+    post_tie_results = []
+    
+    for idx in tie_indices:
+        if idx + 1 < len(seq):
+            post_tie_results.append(seq[idx + 1])
+    
+    if post_tie_results:
+        post_tie_b = post_tie_results.count("B") / len(post_tie_results)
+        post_tie_p = post_tie_results.count("P") / len(post_tie_results)
+        
+        # 调整概率，考虑和局后的趋势
+        pb = (pb * 0.7) + (post_tie_b * 0.3)
+        pp = (pp * 0.7) + (post_tie_p * 0.3)
+    
+    # 考虑连庄/连闲的影响
+    tail=1
+    for i in range(n-2,-1,-1):
+        if seq[i]==seq[-1]: tail+=1
+        else: break
+    
+    if seq[-1] in {"B","P"}:
+        boost = min(0.10, 0.03*(tail-1))
+        if seq[-1]=="B": pb+=boost
+        else: pp+=boost
+    
+    # 确保概率合理
+    pt = max(0.02, min(0.15, pt))  # 和局概率限制在2%-15%之间
+    
+    # 归一化
+    s=pb+pp+pt
+    if s<=0: return {"banker":0.34,"player":0.34,"tie":0.32}
+    return {"banker":round(pb/s,4),"player":round(pp/s,4),"tie":round(pt/s,4)}
+
+def ensemble_prediction(seq: List[str]) -> Dict[str, float]:
+    """集成预测：结合规则和RNN模型"""
+    # 获取规则预测
+    rule_probs = predict_probs_with_tie_adjustment(seq)
+    
+    # 获取RNN预测
+    rnn_probs = predict_with_rnn(seq)
+    
+    # 获取权重配置
+    weights_str = os.getenv("ENSEMBLE_WEIGHTS", "rule:0.7,rnn:0.3")
+    weights = {}
+    for part in weights_str.split(','):
+        name, weight = part.split(':')
+        weights[name] = float(weight)
+    
+    # 计算加权平均
+    ensemble_probs = {
+        "banker": weights.get("rule", 0.7) * rule_probs["banker"] + weights.get("rnn", 0.3) * rnn_probs["banker"],
+        "player": weights.get("rule", 0.7) * rule_probs["player"] + weights.get("rnn", 0.3) * rnn_probs["player"],
+        "tie": weights.get("rule", 0.7) * rule_probs["tie"] + weights.get("rnn", 0.3) * rnn_probs["tie"]
+    }
+    
+    # 归一化
+    total = sum(ensemble_probs.values())
+    for key in ensemble_probs:
+        ensemble_probs[key] /= total
+    
+    return ensemble_probs
 
 def betting_plan(pb: float, pp: float, oscillating: bool, alt_streak: int=0) -> Dict[str, Any]:
     diff = abs(pb-pp)
@@ -263,6 +437,11 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
     reply += f"解析路数：{len(seq)}手\n"
     reply += f"庄胜率：{b*100:.1f}% | 闲胜率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
     
+    if by_model:
+        reply += "预测方法：RNN深度学习模型\n"
+    else:
+        reply += "预测方法：规则引擎\n"
+    
     if plan["percent"] > 0:
         reply += f"建议下注：{plan['percent']*100:.0f}%资金于{side}"
     else:
@@ -285,7 +464,9 @@ def health():
     return jsonify({
         "status":"ok",
         "ts":int(time.time()),
-        "ocr_available": pytesseract is not None
+        "ocr_available": pytesseract is not None,
+        "ml_available": ML_AVAILABLE,
+        "rnn_available": rnn_model is not None
     })
 
 # =========================================================
@@ -360,8 +541,11 @@ if line_handler and line_bot_api:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip))
             return
 
-        probs = predict_probs_from_seq_rule(seq)
-        msg = render_reply(seq, probs, False, {})
+        # 使用集成预测（结合规则和RNN）
+        probs = ensemble_prediction(seq)
+        # 检查是否使用了RNN模型
+        using_rnn = ML_AVAILABLE and rnn_model is not None and len(seq) >= 10
+        msg = render_reply(seq, probs, using_rnn, {})
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
 if __name__ == "__main__":
