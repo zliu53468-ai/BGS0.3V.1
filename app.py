@@ -45,16 +45,16 @@ line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else N
 
 DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
-# 颜色检测参数 - 更宽松的设置
+# 颜色检测参数 - 优化版
 HSV = {
-    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW", "0")),   int(os.getenv("HSV_RED1_S_LOW", "50")), int(os.getenv("HSV_RED1_V_LOW", "50"))),
-    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "20")), int(os.getenv("HSV_RED1_S_HIGH", "255")), int(os.getenv("HSV_RED1_V_HIGH", "255"))),
-    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW", "160")), int(os.getenv("HSV_RED2_S_LOW", "50")), int(os.getenv("HSV_RED2_V_LOW", "50"))),
+    "RED1_LOW":  (int(os.getenv("HSV_RED1_H_LOW", "0")),   int(os.getenv("HSV_RED1_S_LOW", "70")), int(os.getenv("HSV_RED1_V_LOW", "70"))),
+    "RED1_HIGH": (int(os.getenv("HSV_RED1_H_HIGH", "15")), int(os.getenv("HSV_RED1_S_HIGH", "255")), int(os.getenv("HSV_RED1_V_HIGH", "255"))),
+    "RED2_LOW":  (int(os.getenv("HSV_RED2_H_LOW", "160")), int(os.getenv("HSV_RED2_S_LOW", "70")), int(os.getenv("HSV_RED2_V_LOW", "70"))),
     "RED2_HIGH": (int(os.getenv("HSV_RED2_H_HIGH", "180")), int(os.getenv("HSV_RED2_S_HIGH", "255")), int(os.getenv("HSV_RED2_V_HIGH", "255"))),
-    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW", "90")), int(os.getenv("HSV_BLUE_S_LOW", "50")), int(os.getenv("HSV_BLUE_V_LOW", "50"))),
-    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "140")), int(os.getenv("HSV_BLUE_S_HIGH", "255")), int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
-    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "50")),  int(os.getenv("HSV_GREEN_S_LOW", "30")),  int(os.getenv("HSV_GREEN_V_LOW", "30"))),
-    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH", "90")), int(os.getenv("HSV_GREEN_S_HIGH", "255")), int(os.getenv("HSV_GREEN_V_HIGH", "255"))),
+    "BLUE_LOW":  (int(os.getenv("HSV_BLUE_H_LOW", "95")), int(os.getenv("HSV_BLUE_S_LOW", "70")), int(os.getenv("HSV_BLUE_V_LOW", "70"))),
+    "BLUE_HIGH": (int(os.getenv("HSV_BLUE_H_HIGH", "130")), int(os.getenv("HSV_BLUE_S_HIGH", "255")), int(os.getenv("HSV_BLUE_V_HIGH", "255"))),
+    "GREEN_LOW": (int(os.getenv("HSV_GREEN_H_LOW", "55")),  int(os.getenv("HSV_GREEN_S_LOW", "40")),  int(os.getenv("HSV_GREEN_V_LOW", "40"))),
+    "GREEN_HIGH":(int(os.getenv("HSV_GREEN_H_HIGH", "85")), int(os.getenv("HSV_GREEN_S_HIGH", "255")), int(os.getenv("HSV_GREEN_V_HIGH", "255"))),
 }
 
 # ---------- User session ----------
@@ -494,6 +494,23 @@ def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[st
     px = _proba_from_xgb(feat);  preds["xgb"]=px if px else None
     pl = _proba_from_lgb(feat);  preds["lgb"]=pl if pl else None
     pr = _proba_from_rnn(seq);   preds["rnn"]=pr if pr else None
+    
+    # 如果所有模型都可用，調整權重以獲得更好的預測
+    if all([px, pl, pr]):
+        # 計算各模型的置信度
+        xgb_conf = max(px.values()) - min(px.values())
+        lgb_conf = max(pl.values()) - min(pl.values())
+        rnn_conf = max(pr.values()) - min(pr.values())
+        
+        # 根據置信度動態調整權重
+        total_conf = xgb_conf + lgb_conf + rnn_conf
+        if total_conf > 0:
+            weights = {
+                "xgb": xgb_conf / total_conf,
+                "lgb": lgb_conf / total_conf,
+                "rnn": rnn_conf / total_conf
+            }
+    
     if not any(preds.values()):
         return None, info
 
@@ -509,8 +526,18 @@ def predict_with_models(seq: List[str]) -> Tuple[Dict[str,float] | None, Dict[st
 
     vec = np.array([agg["banker"], agg["player"], agg["tie"]], dtype=np.float64)
     vec = _softmax(vec, temp=TEMP)
+    
+    # 根據序列長度調整置信度
+    seq_len = len([c for c in seq if c in ("B","P")])
+    confidence_factor = min(1.0, seq_len / 30.0)  # 序列越長，置信度越高
+    
     if is_chop:
-        vec = 0.88 * vec + 0.12 * np.array([1/3,1/3,1/3], dtype=np.float64)
+        # 震盪期降低置信度
+        vec = confidence_factor * 0.7 * vec + (1 - confidence_factor * 0.7) * np.array([1/3,1/3,1/3], dtype=np.float64)
+    else:
+        # 趨勢期保持較高置信度
+        vec = confidence_factor * vec + (1 - confidence_factor) * np.array([1/3,1/3,1/3], dtype=np.float64)
+    
     out = {"banker": float(vec[0]), "player": float(vec[1]), "tie": float(vec[2])}
     return _normalize(out), info
 
