@@ -22,16 +22,33 @@ except ImportError:
     pytesseract = None
 
 # ===== 机器学习库 =====
+ML_AVAILABLE = False
+DEEP_LEARNING_AVAILABLE = False
+rnn_model = None
+label_encoder = None
+
 try:
     from sklearn.preprocessing import LabelEncoder
-    from tensorflow.keras.models import Sequential, load_model
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.utils import to_categorical
     ML_AVAILABLE = True
+    
+    # 尝试导入 TensorFlow
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential, load_model
+        from tensorflow.keras.layers import LSTM, Dense, Dropout
+        from tensorflow.keras.optimizers import Adam
+        from tensorflow.keras.utils import to_categorical
+        DEEP_LEARNING_AVAILABLE = True
+    except ImportError as e:
+        # 如果 TensorFlow 不可用，尝试使用 ONNX Runtime 作为备选
+        try:
+            import onnxruntime as ort
+            DEEP_LEARNING_AVAILABLE = True
+        except ImportError:
+            pass
+            
 except ImportError:
-    ML_AVAILABLE = False
-    print("机器学习库未安装，将使用规则预测")
+    pass
 
 app = Flask(__name__)
 
@@ -52,15 +69,12 @@ DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
 
 # ---------- RNN模型相关 ----------
-rnn_model = None
-label_encoder = None
-
 def init_rnn_model():
     """初始化RNN模型"""
     global rnn_model, label_encoder
     
-    if not ML_AVAILABLE:
-        logger.warning("机器学习库不可用，无法初始化RNN模型")
+    if not DEEP_LEARNING_AVAILABLE:
+        logger.warning("深度学习库不可用，无法初始化RNN模型")
         return
     
     try:
@@ -70,9 +84,7 @@ def init_rnn_model():
         
         # 创建简单的RNN模型
         rnn_model = Sequential([
-            LSTM(64, input_shape=(10, 3), return_sequences=True),
-            Dropout(0.2),
-            LSTM(32),
+            LSTM(32, input_shape=(10, 3)),  # 减少层大小以节省内存
             Dropout(0.2),
             Dense(16, activation='relu'),
             Dense(3, activation='softmax')
@@ -87,12 +99,13 @@ def init_rnn_model():
         logger.info("RNN模型初始化成功")
         
         # 尝试加载预训练模型
-        model_path = os.path.join(os.path.dirname(__file__), 'models', 'rnn_model.h5')
-        if os.path.exists(model_path):
-            rnn_model = load_model(model_path)
-            logger.info("预训练RNN模型加载成功")
-        else:
-            logger.info("未找到预训练模型，将使用初始化的模型")
+        try:
+            model_path = os.path.join(os.path.dirname(__file__), 'models', 'rnn_model.h5')
+            if os.path.exists(model_path):
+                rnn_model = load_model(model_path)
+                logger.info("预训练RNN模型加载成功")
+        except Exception as e:
+            logger.warning(f"预训练模型加载失败: {e}")
             
     except Exception as e:
         logger.error(f"RNN模型初始化失败: {e}")
@@ -286,7 +299,7 @@ def prepare_rnn_data(seq: List[str], seq_length=10):
 
 def predict_with_rnn(seq: List[str]) -> Dict[str, float]:
     """使用RNN模型进行预测"""
-    if not ML_AVAILABLE or rnn_model is None:
+    if not DEEP_LEARNING_AVAILABLE or rnn_model is None:
         logger.warning("RNN模型不可用，使用规则预测")
         return predict_probs_from_seq_rule(seq)
     
@@ -544,7 +557,7 @@ if line_handler and line_bot_api:
         # 使用集成预测（结合规则和RNN）
         probs = ensemble_prediction(seq)
         # 检查是否使用了RNN模型
-        using_rnn = ML_AVAILABLE and rnn_model is not None and len(seq) >= 10
+        using_rnn = DEEP_LEARNING_AVAILABLE and rnn_model is not None and len(seq) >= 10
         msg = render_reply(seq, probs, using_rnn, {})
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
