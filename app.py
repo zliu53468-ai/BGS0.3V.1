@@ -258,10 +258,17 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
                 area = cv2.contourArea(cnt)
                 if area < 100:  # 過濾太小的區域
                     continue
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0:
+                    continue
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                # 圓度通常在0.7到1.2之間認為是圓形
+                if circularity < 0.7 or circularity > 1.2:
+                    continue
                 (x, y), radius = cv2.minEnclosingCircle(cnt)
                 circles.append((int(x), int(y), int(radius), color))
             return circles
-        
+
         red_circles = find_colored_circles(red, "B")
         blue_circles = find_colored_circles(blue, "P")
         green_circles = find_colored_circles(green, "T")
@@ -272,7 +279,20 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         all_circles.sort(key=lambda c: (c[0] // 50, c[1] // 50))  # 假設每個單元格大約50像素
         
         # 轉換為序列
-        sequence = [circle[3] for circle in all_circles]
+        sequence = []
+        for x, y, radius, label in all_circles:
+            if label in {"B","P"}:
+                pad_x = max(2, int(radius * 0.5))
+                pad_y = max(2, int(radius * 0.5))
+                x1 = max(0, x - pad_x); x2 = min(roi.shape[1], x + pad_x)
+                y1 = max(0, y - pad_y); y2 = min(roi.shape[0], y + pad_y)
+                sub = roi[y1:y2, x1:x2]
+                if _has_horizontal_line(sub): 
+                    sequence.append("T")
+                else:
+                    sequence.append(label)
+            else:
+                sequence.append("T")
         
         return sequence[-120:]  # 返回最近120個結果
         
@@ -325,7 +345,7 @@ def _normalize(p: Dict[str,float]) -> Dict[str,float]:
     return {k: round(v/s,4) for k,v in p.items()}
 
 def _softmax(x: np.ndarray, temp: float=1.0) -> np.ndarray:
-    x = x.astype(np.float64) / max(1e-9, temp)
+    x = x.ast(np.float64) / max(1e-9, temp)
     m = np.max(x)
     e = np.exp(x - m)
     return e / (np.sum(e) + 1e-12)
