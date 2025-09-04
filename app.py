@@ -1,17 +1,19 @@
 # app.py
 # =========================================================
 # BGS AI（Flask + LINE）— 大路/珠盤路 可切換的辨識 + 投票（XGB/LGBM/RNN）
-# 這版強化：
-# - 珠盤路：放寬彩色珠偵測（空心圈/有數字也能抓）、格線太淡時用珠心自建格線、
-#          吸附到最近格心（欄→列輸出），避免只解析到 1 手的離譜情況
-# - 大路：保留格線對齊流程（可用 FOCUS_ROI + BIGROAD_FRAC）
-# - 投票：XGB + LGBM + RNN（無 HMM/MLP），震盪偵測與觀望邏輯
-# 環境變數重點：
+# 強化點：
+# - 珠盤路：放寬彩色珠偵測、格線太淡時用珠心自建格線、格心吸附
+# - 大路：保留格線對齊（FOCUS_ROI + BIGROAD_FRAC）
+# - 投票：XGB + LGBM + RNN（去除 HMM/MLP）、震盪偵測與觀望
+# - 嚴格格線：STRICT_GRID=1 時，cols/rows/items 不足「直接拒絕」，避免誤回退只解析 1 手
+# ENV 重點：
 #   ROAD_MODE=bead|bigroad（預設 bigroad）
-#   FOCUS_BEAD_ROI="0,0,1,1"（當上傳圖就是珠盤路裁圖，強烈建議這樣設）
-#   FOCUS_ROI="x,y,w,h"（大路手動 ROI，0~1）
-#   BIGROAD_FRAC=0.70（大路只取 ROI 上方比例）
-#   DEBUG_VISION=1（看詳細 log）
+#   FOCUS_BEAD_ROI="0,0,1,1"（珠盤路裁圖時強烈建議）
+#   FOCUS_ROI="x,y,w,h"（大路 ROI，0~1）
+#   BIGROAD_FRAC=0.70
+#   STRICT_GRID=1（嚴格格線檢查，預設開）
+#   MIN_COLS=6  MIN_ITEMS=8
+#   DEBUG_VISION=1
 # =========================================================
 import os, io, time, math, logging
 from pathlib import Path
@@ -78,6 +80,11 @@ CANNY2 = int(os.getenv("CANNY2", "180"))
 
 # 影像模式
 ROAD_MODE = os.getenv("ROAD_MODE", "bigroad").strip().lower()  # "bigroad" 或 "bead"
+
+# 嚴格格線
+STRICT_GRID = os.getenv("STRICT_GRID", "1") == "1"
+MIN_COLS = int(os.getenv("MIN_COLS", "6"))
+MIN_ITEMS = int(os.getenv("MIN_ITEMS", "8"))
 
 # ---------- User session ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
@@ -235,7 +242,7 @@ def _color_masks(bgr: np.ndarray):
     red2 = cv2.inRange(hsv, HSV["RED2_LOW"],  HSV["RED2_HIGH"])
     red  = cv2.bitwise_or(red1, red2)
     blue = cv2.inRange(hsv, HSV["BLUE_LOW"],  HSV["BLUE_HIGH"])
-    green= cv2.inRange(hsv, HSV["GREEN_LOW"], HSV["GREEN_HIGH"])
+    green= cv2.inRange(hsv, HSV["GREEN_LOW"],  HSV["GREEN_HIGH"])
     k = np.ones((3,3), np.uint8)
     def clean(m):
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
@@ -297,7 +304,9 @@ def _snap_and_sequence(roi: np.ndarray, cols: List[int], rows: List[int], items:
         cols, rows = _grid_from_beads(items, roi.shape[1], roi.shape[0])
 
     if not cols or not rows or len(rows)<2:
-        # 回退：欄群組 + 欄內去重
+        # 回退：欄群組 + 欄內去重（僅在非 STRICT_GRID 情況使用）
+        if STRICT_GRID:
+            return []
         items.sort(key=lambda z: z[4])
         cxs=[it[4] for it in items]
         gaps=[cxs[i+1]-cxs[i] for i in range(len(cxs)-1)]
@@ -375,6 +384,14 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
 
         mode = os.getenv("ROAD_MODE", ROAD_MODE).strip().lower()
 
+        # ---------- helper: 嚴格格線判斷 ----------
+        def _strict_fail(cols, rows, items, tag):
+            if not STRICT_GRID: return False
+            bad = (len(rows) < 2) or (len(cols) < MIN_COLS) or (len(items) < MIN_ITEMS)
+            if bad and DEBUG_VISION:
+                logger.info(f"[STRICT][{tag}] fail cols={len(cols)} rows={len(rows)} items={len(items)}")
+            return bad
+
         # ---------- 珠盤路 ----------
         if mode == "bead":
             def _locate_bead_roi(base_bgr: np.ndarray) -> np.ndarray:
@@ -407,6 +424,8 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
             roi = _locate_bead_roi(img)
             cols, rows = _grid_from_roi(roi)
             items = _blobs(roi)
+            if _strict_fail(cols, rows, items, "BEAD"):
+                return []
             seq = _snap_and_sequence(roi, cols, rows, items)
             if DEBUG_VISION:
                 logger.info(f"[VISION][BEAD] cols={len(cols)} rows={len(rows)} items={len(items)} seq_len={len(seq)}")
@@ -443,20 +462,33 @@ def extract_sequence_from_image(img_bytes: bytes) -> List[str]:
         BIGROAD_FRAC = float(os.getenv("BIGROAD_FRAC","0.70"))
         MIN_BEADS = int(os.getenv("MIN_BEADS","12"))
 
-        def _run_bigroad(frac: float) -> List[str]:
+        def _run_bigroad(frac: float) -> Tuple[List[str], Tuple[int,int,int]]:
             roi0 = _locate_bigroad_roi(img)
             rh_big = max(1, int(roi0.shape[0]*max(0.5, min(0.95, frac))))
             roi = roi0[:rh_big, :]
             cols, rows = _grid_from_roi(roi)
             items = _blobs(roi)
+            if _strict_fail(cols, rows, items, "BIG"):
+                return [], (len(cols), len(rows), len(items))
             seq = _snap_and_sequence(roi, cols, rows, items)
-            if DEBUG_VISION:
-                logger.info(f"[VISION][BIG] frac={frac:.2f} cols={len(cols)} rows={len(rows)} items={len(items)} seq_len={len(seq)}")
-            return seq
+            return seq, (len(cols), len(rows), len(items))
 
-        seq = _run_bigroad(BIGROAD_FRAC)
-        if len(seq) < MIN_BEADS:
-            seq = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
+        seq, stat = _run_bigroad(BIGROAD_FRAC)
+        if not seq:
+            # 若嚴格模式失敗，直接回傳空；讓上層提示調 ROI
+            if STRICT_GRID:
+                if DEBUG_VISION:
+                    logger.info(f"[VISION][BIG][STRICT_FAIL] cols={stat[0]} rows={stat[1]} items={stat[2]}")
+                return []
+            # 非嚴格：再嘗試較大比例
+            seq2, _ = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
+            seq = seq2
+        if len(seq) < MIN_BEADS and not STRICT_GRID:
+            seq2, _ = _run_bigroad(min(0.80, BIGROAD_FRAC+0.05))
+            seq = seq2 if seq2 else seq
+
+        if DEBUG_VISION:
+            logger.info(f"[VISION][BIG] final_len={len(seq)}")
         return seq[-240:]
 
     except Exception as e:
@@ -765,8 +797,9 @@ if line_handler and line_bot_api:
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_sequence_from_image(img_bytes)
         if not seq:
-            tip = ("辨識失敗 😥\n若讀珠盤路：可設 ROAD_MODE=bead 並設 FOCUS_BEAD_ROI=\"0,0,1,1\"；\n"
-                   "若讀大路：可設 FOCUS_ROI 與調整 BIGROAD_FRAC（0.66~0.75）。")
+            tip = ("辨識失敗 😥\n若讀珠盤路：ROAD_MODE=bead 並設 FOCUS_BEAD_ROI=\"0,0,1,1\"；\n"
+                   "若讀大路：請設 FOCUS_ROI 或調整 BIGROAD_FRAC（0.66~0.75）。\n"
+                   "（已開嚴格格線：請確認 ROI 沒被遮、欄/列完整）")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip)); return
 
         if model_bundle.get("loaded"):
