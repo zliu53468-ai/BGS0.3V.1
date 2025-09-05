@@ -11,7 +11,18 @@ import cv2
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, TextMessage, ImageMessage, TextSendMessage, FollowEvent
+    MessageEvent,
+    TextMessage,
+    ImageMessage,
+    TextSendMessage,
+    FollowEvent,
+    PostbackEvent,
+    PostbackAction,
+    FlexSendMessage,
+    BubbleContainer,
+    BoxComponent,
+    ButtonComponent,
+    TextComponent,
 )
 
 # ===== OCR =====
@@ -113,6 +124,62 @@ def init_rnn_model():
 
 # 初始化RNN模型
 init_rnn_model()
+
+def make_baccarat_buttons() -> FlexSendMessage:
+    """
+    產生一個包含莊、閒、和按鈕的 Flex 訊息。每個按鈕使用不同顏色以便識別：
+    - 莊（紅色）
+    - 閒（藍色）
+    - 和（綠色）
+
+    回傳值是 FlexSendMessage，可用於 push 或 reply。
+    """
+    # 建立按鈕：使用 primary 風格並指定顏色
+    buttons = [
+        ButtonComponent(
+            action=PostbackAction(label="莊", data="choice=banker"),
+            style="primary",
+            color="#E53935",  # 紅色
+            height="sm",
+            flex=1,
+        ),
+        ButtonComponent(
+            action=PostbackAction(label="閒", data="choice=player"),
+            style="primary",
+            color="#1E88E5",  # 藍色
+            height="sm",
+            flex=1,
+        ),
+        ButtonComponent(
+            action=PostbackAction(label="和", data="choice=tie"),
+            style="primary",
+            color="#43A047",  # 綠色
+            height="sm",
+            flex=1,
+        ),
+    ]
+
+    bubble = BubbleContainer(
+        size="mega",
+        header=BoxComponent(
+            layout="vertical",
+            contents=[
+                TextComponent(text="下注選擇", weight="bold", size="lg", align="center")
+            ],
+        ),
+        body=BoxComponent(
+            layout="vertical",
+            contents=[
+                TextComponent(text="請選擇莊、閒或和：", size="md")
+            ],
+        ),
+        footer=BoxComponent(
+            layout="horizontal",
+            spacing="sm",
+            contents=buttons,
+        ),
+    )
+    return FlexSendMessage(alt_text="下注選擇", contents=bubble)
 
 # =========================================================
 # 博彩游戏结果识别 - 改进版本
@@ -438,14 +505,14 @@ def betting_plan(pb: float, pp: float, oscillating: bool, alt_streak: int=0) -> 
 
     ALT_STRICT = int(os.getenv("ALT_STRICT_STREAK","5"))
     if oscillating and alt_streak >= ALT_STRICT:
-        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "单跳震荡期观望"}
+        return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "單跳震盪期觀望"}
 
     if oscillating:
-        if diff < 0.12: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震荡期风险高"}
+        if diff < 0.12: return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "震盪期風險高"}
         if diff < 0.18: pct = 0.02
         elif diff < 0.24: pct = 0.04
         else: pct = 0.08
-        return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震荡期降仓"}
+        return {"side": side, "percent": pct, "side_prob": side_prob, "note": "震盪期降倉"}
 
     if diff < 0.05:
         return {"side": side, "percent": 0.0, "side_prob": side_prob, "note": "差距不足 5%"}
@@ -461,26 +528,27 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
     alt_streak = int(info.get("alt_streak", 0)) if info else 0
     plan = betting_plan(b, p, oscillating, alt_streak)
     
-    side = "庄" if plan["side"] == "banker" else "闲"
+    # 將輸出文字轉換為繁體中文
+    side = "莊" if plan["side"] == "banker" else "閒"
     win_rate = plan["side_prob"] * 100
-    
-    reply = f"推荐预测：{side}（胜率{win_rate:.1f}%）\n\n"
-    reply += f"解析路数：{len(seq)}手\n"
-    reply += f"庄胜率：{b*100:.1f}% | 闲胜率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
-    
+
+    reply = f"推薦預測：{side}（勝率{win_rate:.1f}%）\n\n"
+    reply += f"解析路數：{len(seq)}手\n"
+    reply += f"莊勝率：{b*100:.1f}% | 閒勝率：{p*100:.1f}% | 和局率：{t*100:.1f}%\n"
+
     if by_model:
-        reply += "预测方法：RNN深度学习模型\n"
+        reply += "預測方法：RNN深度學習模型\n"
     else:
-        reply += "预测方法：规则引擎\n"
-    
+        reply += "預測方法：規則引擎\n"
+
     if plan["percent"] > 0:
-        reply += f"建议下注：{plan['percent']*100:.0f}%资金于{side}"
+        reply += f"建議下注：{plan['percent']*100:.0f}%資金於{side}"
     else:
-        reply += "建议：观望不下注"
-    
+        reply += "建議：觀望不下注"
+
     if info and info.get("oscillating"):
-        reply += f"\n当前牌路震荡中（交替率：{info.get('alt_rate', 0):.2f}）"
-    
+        reply += f"\n當前牌路震盪中（交替率：{info.get('alt_rate', 0):.2f}）"
+
     return reply
 
 # =========================================================
@@ -545,7 +613,8 @@ def debug_ocr():
 # =========================================================
 @app.route("/")
 def index():
-    return "BGS AI 助手正在运行 ✅ /line-webhook 已就绪", 200
+    # 返回健康提示，使用繁體中文
+    return "BGS AI 助手正在運行 ✅ /line-webhook 已就緒", 200
 
 @app.route("/health")
 def health():
@@ -571,8 +640,11 @@ def line_webhook():
     try:
         line_handler.handle(body, signature)
     except InvalidSignatureError as e:
-        logger.exception(f"InvalidSignatureError: {e}. "
-                         f"==> 通常是 LINE_CHANNEL_SECRET 不对 或 用错 Channel 的 Secret/Token")
+        # 中文提示使用繁體字
+        logger.exception(
+            f"InvalidSignatureError: {e}. "
+            f"==> 通常是 LINE_CHANNEL_SECRET 不對 或 用錯 Channel 的 Secret/Token"
+        )
         return "Invalid signature", 200
     except Exception as e:
         logger.exception(f"Unhandled error while handling webhook: {e}")
@@ -584,8 +656,8 @@ if line_handler and line_bot_api:
     @line_handler.add(FollowEvent)
     def on_follow(event: FollowEvent):
         welcome = (
-            "欢迎加入BGS AI 助手 🎉\n\n"
-            "输入「开始分析」后，上传博彩游戏截图，我会使用OCR技术自动辨识并回传建议下注。"
+            "歡迎加入BGS AI 助手 🎉\n\n"
+            "輸入「開始分析」後，上傳博彩遊戲截圖，我會使用OCR技術自動辨識並回傳建議下注。"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
 
@@ -593,48 +665,109 @@ if line_handler and line_bot_api:
     def on_text(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
         txt = (event.message.text or "").strip()
-        if txt in {"开始分析", "开始", "START", "分析"}:
+        # 支援簡繁體關鍵字："開始分析"、"开始分析"、"開始"、"开始"、"START"、"分析"
+        if txt in {"開始分析", "开始分析", "開始", "开始", "START", "分析"}:
             user_mode[uid] = True
             if pytesseract is None:
-                msg = "系统错误：OCR功能未启用，请联系管理员安装Tesseract OCR"
+                msg = "系統錯誤：OCR功能未啟用，請聯繫管理員安裝Tesseract OCR"
             else:
-                msg = "已进入分析模式 ✅\n请上传博彩游戏截图：我会使用OCR技术自动辨识并回复预测建议"
+                msg = "已進入分析模式 ✅\n請上傳博彩遊戲截圖：我會使用OCR技術自動辨識並回覆預測建議"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="请先输入「开始分析」，再上传游戏截图。"
+            text="請先輸入「開始分析」，再上傳遊戲截圖。"
         ))
 
     @line_handler.add(MessageEvent, message=ImageMessage)
     def on_image(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
         if not user_mode.get(uid):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="尚未启用分析模式。\n请先输入「开始分析」，再上传游戏截图。"
-            ))
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳遊戲截圖。"
+                ),
+            )
             return
             
         if pytesseract is None:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="系统错误：OCR功能未启用，请联系管理员安装Tesseract OCR"
-            ))
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text="系統錯誤：OCR功能未啟用，請聯繫管理員安裝Tesseract OCR"
+                ),
+            )
             return
 
         content = line_bot_api.get_message_content(event.message.id)
         img_bytes = b"".join(chunk for chunk in content.iter_content())
         seq = extract_gaming_result(img_bytes)
         
-        if not seq or len(seq) < 5:  # 至少需要识别5个结果
-            tip = f"识别结果不理想 😥 只识别到 {len(seq)} 个结果\n请确保截图清晰，包含'最新好路'区域。"
+        if not seq or len(seq) < 5:  # 至少需要識別5個結果
+            tip = (
+                f"識別結果不理想 😥 只識別到 {len(seq)} 個結果\n"
+                f"請確保截圖清晰，包含「最新好路」區域。"
+            )
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=tip))
             return
 
-        # 使用集成预测（结合规则和RNN）
+        # 使用集成預測（結合規則和 RNN）
         probs = ensemble_prediction(seq)
-        # 检查是否使用了RNN模型
+        # 判斷是否使用 RNN 模型
         using_rnn = DEEP_LEARNING_AVAILABLE and rnn_model is not None and len(seq) >= 10
+        # 生成回覆訊息（繁體中文）
         msg = render_reply(seq, probs, using_rnn, {})
+        # 回覆分析結果文字
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        # 之後推送下注按鈕給用戶
+        try:
+            flex_msg = make_baccarat_buttons()
+            line_bot_api.push_message(uid, flex_msg)
+        except Exception as e:
+            logger.exception(f"無法發送下注按鈕: {e}")
+
+    @line_handler.add(PostbackEvent)
+    def handle_postback(event: PostbackEvent):
+        """
+        監聽使用者按下 Flex 按鈕後送出的回傳事件。
+
+        按鈕的 data 格式為 'choice=banker'、'choice=player' 或 'choice=tie'。根據這些鍵值
+        轉換為相應的單字序列，並使用簡單的規則引擎進行一次預測回覆。
+        """
+        try:
+            data = event.postback.data or ""
+            # 將回傳資料解析為字典
+            params = {}
+            for part in data.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    params[k] = v
+            choice = params.get("choice")
+            # 映射選擇為序列字元
+            choice_map = {"banker": "B", "player": "P", "tie": "T"}
+            if choice and choice in choice_map:
+                seq_char = choice_map[choice]
+                seq = [seq_char]
+                # 使用規則引擎進行單步預測
+                probs = predict_probs_with_tie_adjustment(seq)
+                # 產生回覆訊息
+                msg = render_reply(seq, probs, False, {})
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            else:
+                # 未知或缺失的回傳資料
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="收到未知操作，請重新選擇。"),
+                )
+        except Exception as e:
+            logger.exception(f"處理回傳事件時發生錯誤: {e}")
+            try:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="處理您的操作時發生錯誤，請稍後再試。"),
+                )
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
