@@ -4,8 +4,6 @@ services:
     env: python
     plan: free
     buildCommand: |
-      sudo apt-get update
-      sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra
       pip install --no-cache-dir -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
     envVars:
@@ -13,24 +11,28 @@ services:
         sync: false
       - key: LINE_CHANNEL_SECRET
         sync: false
-      - key: DEBUG_VISION
-        value: "1"
-      - key: TESSERACT_CMD
-        value: "/usr/bin/tesseract"
-      - key: MIN_SEQ
-        value: "5"
-      - key: ALT_WINDOW
+      - key: RNN_PATH
+        value: "models/rnn_model.h5"
+      - key: XGB_PATH
+        value: "models/xgb_model.pkl"
+      - key: LGBM_PATH
+        value: "models/lgbm_model.pkl"
+      - key: RNN_MIN_SEQ
+        value: "10"
+      - key: XGB_MIN_SEQ
+        value: "6"
+      - key: LGBM_MIN_SEQ
+        value: "6"
+      - key: RULE_W
+        value: "0.5"
+      - key: RNN_W
+        value: "0.3"
+      - key: XGB_W
+        value: "0.15"
+      - key: LGBM_W
+        value: "0.05"
+      - key: FEAT_WIN
         value: "20"
-      - key: ALT_THRESH
-        value: "0.70"
-      - key: ALT_STRICT_STREAK
-        value: "5"
-      - key: TEMP
-        value: "0.95"
-      - key: ENSEMBLE_WEIGHTS
-        value: "rule:0.7,rnn:0.3"
-      - key: PYTHONPATH
-        value: "/opt/render/project/src"
-      - key: PIP_NO_CACHE_DIR
-        value: "yes"
+      - key: CLASS_ORDER
+        value: "B,P,T"
     healthCheckPath: /health
