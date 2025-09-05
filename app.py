@@ -78,6 +78,10 @@ DEBUG_VISION = os.getenv("DEBUG_VISION", "0") == "1"
 
 # ---------- User session ----------
 user_mode: Dict[str, bool] = {}   # user_id -> True/False
+# 手動輸入模式狀態：記錄各用戶是否處於手動輸入歷史數據模式
+manual_mode: Dict[str, bool] = {}
+# 存儲用戶手動輸入的歷史結果序列
+user_history_seq: Dict[str, List[str]] = {}
 
 # ---------- RNN模型相关 ----------
 def init_rnn_model():
@@ -125,14 +129,20 @@ def init_rnn_model():
 # 初始化RNN模型
 init_rnn_model()
 
-def make_baccarat_buttons() -> FlexSendMessage:
+def make_baccarat_buttons(prompt_text: str = "請選擇莊、閒或和：",
+                          title_text: str = "下注選擇") -> FlexSendMessage:
     """
     產生一個包含莊、閒、和按鈕的 Flex 訊息。每個按鈕使用不同顏色以便識別：
     - 莊（紅色）
     - 閒（藍色）
     - 和（綠色）
 
-    回傳值是 FlexSendMessage，可用於 push 或 reply。
+    參數：
+        prompt_text: 按鈕上方提示文字，預設為「請選擇莊、閒或和：」
+        title_text: Flex 氣泡的標題文字，預設為「下注選擇」
+
+    回傳值：
+        FlexSendMessage，可用於 push 或 reply。
     """
     # 建立按鈕：使用 primary 風格並指定顏色
     buttons = [
@@ -164,13 +174,13 @@ def make_baccarat_buttons() -> FlexSendMessage:
         header=BoxComponent(
             layout="vertical",
             contents=[
-                TextComponent(text="下注選擇", weight="bold", size="lg", align="center")
+                TextComponent(text=title_text, weight="bold", size="lg", align="center")
             ],
         ),
         body=BoxComponent(
             layout="vertical",
             contents=[
-                TextComponent(text="請選擇莊、閒或和：", size="md")
+                TextComponent(text=prompt_text, size="md")
             ],
         ),
         footer=BoxComponent(
@@ -179,7 +189,36 @@ def make_baccarat_buttons() -> FlexSendMessage:
             contents=buttons,
         ),
     )
-    return FlexSendMessage(alt_text="下注選擇", contents=bubble)
+    return FlexSendMessage(alt_text=title_text, contents=bubble)
+
+def send_manual_prompt(uid: str, reply_token: str | None = None) -> None:
+    """
+    發送手動輸入歷史數據的提示訊息與按鈕。
+    此函式會將使用者的 manual_mode 設為 True，並清空其歷史序列。
+
+    參數：
+        uid: 使用者 ID
+        reply_token: 若提供，使用 reply_message 回覆；否則使用 push_message
+    """
+    # 啟用手動模式並重置歷史序列
+    manual_mode[uid] = True
+    user_history_seq[uid] = []
+
+    # 建立提示氣泡
+    flex_msg = make_baccarat_buttons(
+        prompt_text="請點擊下方按鈕依序輸入過往莊/閒/和結果：",
+        title_text="🤖請開始輸入歷史數據"
+    )
+
+    try:
+        if reply_token:
+            # 使用 reply_message 回覆
+            line_bot_api.reply_message(reply_token, [flex_msg])
+        else:
+            # 使用 push_message 發送
+            line_bot_api.push_message(uid, flex_msg)
+    except Exception as e:
+        logger.exception(f"發送手動輸入提示時發生錯誤: {e}")
 
 # =========================================================
 # 博彩游戏结果识别 - 改进版本
@@ -655,37 +694,105 @@ if line_handler and line_bot_api:
 
     @line_handler.add(FollowEvent)
     def on_follow(event: FollowEvent):
+        """處理使用者加入好友的事件。顯示歡迎訊息並引導輸入歷史數據。"""
+        uid = getattr(event.source, "user_id", "unknown")
+        # 歡迎文字
         welcome = (
             "歡迎加入BGS AI 助手 🎉\n\n"
-            "輸入「開始分析」後，上傳博彩遊戲截圖，我會使用OCR技術自動辨識並回傳建議下注。"
+            "請先依序輸入過往莊/閒/和結果，我會在收到一定數量後開始給出下注建議。\n"
+            "如果要上傳截圖進行分析，可輸入「開始分析」。\n"
+            "完成本輪分析後，可輸入「結束分析」重置資料並重新開始。"
         )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=welcome))
+        # 啟動手動模式並清空歷史
+        manual_mode[uid] = True
+        user_history_seq[uid] = []
+        # 建立輸入按鈕
+        flex_msg = make_baccarat_buttons(
+            prompt_text="請點擊下方按鈕依序輸入過往莊/閒/和結果：",
+            title_text="🤖請開始輸入歷史數據"
+        )
+        # 同時回覆歡迎文字與 Flex 訊息
+        line_bot_api.reply_message(event.reply_token, [TextSendMessage(text=welcome), flex_msg])
 
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
         txt = (event.message.text or "").strip()
+        # 若使用者輸入結束分析 / 結束分析
+        if txt in {"結束分析", "结束分析"}:
+            # 如果處於手動輸入模式，清空資料並重新提示
+            if manual_mode.get(uid):
+                # 清除歷史數據
+                manual_mode[uid] = False
+                user_history_seq[uid] = []
+                # 發送提示
+                msg = TextSendMessage(text="已結束本輪分析。所有歷史數據已刪除。請使用下方按鈕重新輸入歷史數據。")
+                flex_msg = make_baccarat_buttons(
+                    prompt_text="請點擊下方按鈕依序輸入過往莊/閒/和結果：",
+                    title_text="🤖請開始輸入歷史數據"
+                )
+                # 重啟手動模式
+                manual_mode[uid] = True
+                user_history_seq[uid] = []
+                line_bot_api.reply_message(event.reply_token, [msg, flex_msg])
+                return
+            else:
+                # 非手動模式僅提示
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="當前未處於分析模式。若要重新開始，請輸入「開始分析」或使用按鈕輸入歷史數據。")
+                )
+                return
+
         # 支援簡繁體關鍵字："開始分析"、"开始分析"、"開始"、"开始"、"START"、"分析"
         if txt in {"開始分析", "开始分析", "開始", "开始", "START", "分析"}:
+            # 啟動截圖分析模式
             user_mode[uid] = True
+            # 關閉手動輸入模式
+            manual_mode[uid] = False
             if pytesseract is None:
                 msg = "系統錯誤：OCR功能未啟用，請聯繫管理員安裝Tesseract OCR"
             else:
-                msg = "已進入分析模式 ✅\n請上傳博彩遊戲截圖：我會使用OCR技術自動辨識並回覆預測建議"
+                msg = "已進入截圖分析模式 ✅\n請上傳博彩遊戲截圖：我會使用OCR技術自動辨識並回覆預測建議"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             return
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="請先輸入「開始分析」，再上傳遊戲截圖。"
-        ))
+
+        # 其他文字處理
+        if manual_mode.get(uid):
+            # 手動模式下，提示使用按鈕
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text="請使用下方按鈕輸入莊/閒/和，或輸入「結束分析」結束本輪分析。"
+                ),
+            )
+            return
+        # 如果不是手動模式，提示開始或上傳
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="請輸入「開始分析」進入截圖模式，或使用按鈕輸入歷史數據開始分析。"
+            ),
+        )
 
     @line_handler.add(MessageEvent, message=ImageMessage)
     def on_image(event: MessageEvent):
         uid = getattr(event.source, "user_id", "unknown")
+        # 若目前處於手動模式，提醒使用按鈕
+        if manual_mode.get(uid):
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text="您目前處於手動輸入模式，請使用下方按鈕輸入莊/閒/和，或輸入「結束分析」結束本輪分析。"
+                ),
+            )
+            return
+
         if not user_mode.get(uid):
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(
-                    text="尚未啟用分析模式。\n請先輸入「開始分析」，再上傳遊戲截圖。"
+                    text="尚未啟用截圖分析模式。\n請輸入「開始分析」後再上傳遊戲截圖。"
                 ),
             )
             return
@@ -719,7 +826,7 @@ if line_handler and line_bot_api:
         msg = render_reply(seq, probs, using_rnn, {})
         # 回覆分析結果文字
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        # 之後推送下注按鈕給用戶
+        # 之後推送下注按鈕給用戶（預設標題及提示）
         try:
             flex_msg = make_baccarat_buttons()
             line_bot_api.push_message(uid, flex_msg)
@@ -735,6 +842,7 @@ if line_handler and line_bot_api:
         轉換為相應的單字序列，並使用簡單的規則引擎進行一次預測回覆。
         """
         try:
+            uid = getattr(event.source, "user_id", "unknown")
             data = event.postback.data or ""
             # 將回傳資料解析為字典
             params = {}
@@ -747,12 +855,25 @@ if line_handler and line_bot_api:
             choice_map = {"banker": "B", "player": "P", "tie": "T"}
             if choice and choice in choice_map:
                 seq_char = choice_map[choice]
-                seq = [seq_char]
-                # 使用規則引擎進行單步預測
-                probs = predict_probs_with_tie_adjustment(seq)
-                # 產生回覆訊息
-                msg = render_reply(seq, probs, False, {})
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+                # 如果處於手動輸入模式，累計序列並回覆預測
+                if manual_mode.get(uid):
+                    # 初始化列表
+                    history = user_history_seq.get(uid, [])
+                    history.append(seq_char)
+                    user_history_seq[uid] = history
+                    # 使用集成預測
+                    probs = ensemble_prediction(history)
+                    # 是否使用RNN
+                    using_rnn = DEEP_LEARNING_AVAILABLE and rnn_model is not None and len(history) >= 10
+                    msg = render_reply(history, probs, using_rnn, {})
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+                else:
+                    # 非手動模式，單步預測
+                    seq = [seq_char]
+                    # 使用規則引擎進行單步預測
+                    probs = predict_probs_with_tie_adjustment(seq)
+                    msg = render_reply(seq, probs, False, {})
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
             else:
                 # 未知或缺失的回傳資料
                 line_bot_api.reply_message(
