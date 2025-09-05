@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — Buttons only + Ensemble (Full-history) + Regime Gating + PH Drift
+BGS LINE Bot backend — Ensemble(Full-history) + Regime Gating + PH Drift
++ CSV資料落地 + /export 匯出 + /reload 熱重載
 Routes:
 - /, /health, /healthz
 - /predict
-- /line-webhook (莊/閒/和/開始分析/結束分析)
+- /export?n=1000   下載最近 n 筆資料 (CSV)
+- /reload          重新載入模型(POST，需 RELOAD_TOKEN)
+- /line-webhook    (莊/閒/和/開始分析/結束分析)
 """
-
-import os, logging
+import os, csv, time, logging
 from typing import Any, Dict, List, Optional, Tuple
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-backend")
+
+# ========= 環境參數 & 路徑 =========
+DATA_CSV_PATH = os.getenv("DATA_LOG_PATH", "/mnt/data/logs/rounds.csv")
+os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
+
+RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")  # /reload 用
+RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
+XGB_PATH = os.getenv("XGB_PATH", "")
+LGBM_PATH = os.getenv("LGBM_PATH", "")
 
 # ========= 基礎常數 =========
 CLASS_ORDER = ("B", "P", "T")
@@ -65,42 +76,53 @@ if tnn is not None:
 else:
     TinyRNN = None  # type: ignore
 
-# ========= 載入模型檔（若提供） =========
+# ========= 模型載入/重載 =========
 RNN_MODEL: Optional[Any] = None
-if TinyRNN is not None and torch is not None:
-    p = os.getenv("RNN_PATH", "")
-    if p and os.path.exists(p):
+XGB_MODEL: Optional[Any] = None
+LGBM_MODEL: Optional[Any] = None
+
+def load_models() -> None:
+    global RNN_MODEL, XGB_MODEL, LGBM_MODEL
+    # RNN
+    if TinyRNN is not None and torch is not None and RNN_PATH and os.path.exists(RNN_PATH):
         try:
             _m = TinyRNN()
-            _m.load_state_dict(torch.load(p, map_location="cpu"))
+            _m.load_state_dict(torch.load(RNN_PATH, map_location="cpu"))
             _m.eval()
             RNN_MODEL = _m
-            logger.info("Loaded RNN from %s", p)
+            logger.info("Loaded RNN from %s", RNN_PATH)
         except Exception as e:
             logger.warning("Load RNN failed: %s", e)
+            RNN_MODEL = None
+    else:
+        RNN_MODEL = None
 
-XGB_MODEL = None
-if xgb is not None:
-    p = os.getenv("XGB_PATH", "")
-    if p and os.path.exists(p):
+    # XGB
+    if xgb is not None and XGB_PATH and os.path.exists(XGB_PATH):
         try:
             booster = xgb.Booster()
-            booster.load_model(p)
+            booster.load_model(XGB_PATH)
             XGB_MODEL = booster
-            logger.info("Loaded XGB from %s", p)
+            logger.info("Loaded XGB from %s", XGB_PATH)
         except Exception as e:
             logger.warning("Load XGB failed: %s", e)
+            XGB_MODEL = None
+    else:
+        XGB_MODEL = None
 
-LGBM_MODEL = None
-if lgb is not None:
-    p = os.getenv("LGBM_PATH", "")
-    if p and os.path.exists(p):
+    # LGBM
+    if lgb is not None and LGBM_PATH and os.path.exists(LGBM_PATH):
         try:
-            booster = lgb.Booster(model_file=p)
+            booster = lgb.Booster(model_file=LGBM_PATH)
             LGBM_MODEL = booster
-            logger.info("Loaded LGBM from %s", p)
+            logger.info("Loaded LGBM from %s", LGBM_PATH)
         except Exception as e:
             logger.warning("Load LGBM failed: %s", e)
+            LGBM_MODEL = None
+    else:
+        LGBM_MODEL = None
+
+load_models()
 
 # ========= 單模型推論 =========
 def rnn_predict(seq: List[str]) -> Optional[List[float]]:
@@ -118,7 +140,6 @@ def rnn_predict(seq: List[str]) -> Optional[List[float]]:
 
 # ---- Tie 機率估計（全歷史 EW） + 二分類 → 三類重建 ----
 def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
-    """整段歷史的指數衰減加權頻率（全盤考量）"""
     if not seq:
         return [1/3, 1/3, 1/3]
     if gamma is None:
@@ -136,17 +157,15 @@ def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
     return [wB/S, wP/S, wT/S]
 
 def _estimate_tie_prob(seq: List[str]) -> float:
-    """T 的機率：先驗 0.096 與整段 EW 長期頻率融合，並夾在 [T_MIN, T_MAX]"""
     prior_T = THEORETICAL_PROBS["T"]  # 0.096
     long_T  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))[2]
-    w       = float(os.getenv("T_BLEND", "0.5"))  # 先驗:長期 = 0.5:0.5（可調）
+    w       = float(os.getenv("T_BLEND", "0.5"))  # 先驗:長期 = 0.5:0.5
     floor_T = float(os.getenv("T_MIN", "0.03"))
     cap_T   = float(os.getenv("T_MAX", "0.18"))
     pT = (1 - w) * prior_T + w * long_T
     return max(floor_T, min(cap_T, pT))
 
 def _merge_bp_with_t(bp: List[float], pT: float) -> List[float]:
-    """把 (B,P) 轉為 (B,P,T)：抽出 T，再按比例分配餘量給 B/P"""
     b, p = float(bp[0]), float(bp[1])
     s = max(1e-12, b + p)
     b, p = b / s, p / s
@@ -264,7 +283,7 @@ def shape_2room1hall(seq: List[str], win: int = 18) -> bool:
 def regime_boosts(seq: List[str]) -> List[float]:
     if not seq:
         return [1.0, 1.0, 1.0]
-    b = [1.0, 1.0, 1.0]  # 對應 [B,P,T]
+    b = [1.0, 1.0, 1.0]  # [B,P,T]
     last, rlen = last_run(seq)
     DRAGON_TH    = int(os.getenv("BOOST_DRAGON_LEN", "4"))
     BOOST_DRAGON = float(os.getenv("BOOST_DRAGON", "1.12"))
@@ -303,7 +322,6 @@ def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[floa
 
 # ========= PH 變化點偵測（Page-Hinkley / CUSUM 風格） =========
 def js_divergence(p: List[float], q: List[float]) -> float:
-    """Jensen-Shannon divergence，值域[0, ln2]；數值穩定小修正"""
     import math
     eps = 1e-12
     m = [(p[i]+q[i])/2.0 for i in range(3)]
@@ -311,9 +329,7 @@ def js_divergence(p: List[float], q: List[float]) -> float:
         return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
     return 0.5*_kl(p, m) + 0.5*_kl(q, m)
 
-# 每位用戶各自維護 PH 狀態
 USER_DRIFT: Dict[str, Dict[str, float]] = {}  # keys: 'cum','min','cooldown'
-
 def _get_drift_state(uid: str) -> Dict[str, float]:
     st = USER_DRIFT.get(uid)
     if st is None:
@@ -322,24 +338,17 @@ def _get_drift_state(uid: str) -> Dict[str, float]:
     return st
 
 def update_ph_state(uid: str, seq: List[str]) -> bool:
-    """
-    以「短期 vs 長期」的分佈差異 D_t 當成觀測值，跑 Page-Hinkley：
-      cum_t = cum_{t-1} + (D_t - PH_DELTA)
-      m_t   = min(m_{t-1}, cum_t)
-      如果 (cum_t - m_t) > PH_LAMBDA → 漂移觸發，cooldown = DRIFT_STEPS
-    回傳是否觸發漂移。
-    """
     if not seq:
         return False
     st = _get_drift_state(uid)
     REC_WIN = int(os.getenv("REC_WIN_FOR_PH", "12"))
     p_short = recent_freq(seq, REC_WIN)
     p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
-    D_t     = js_divergence(p_short, p_long)  # 單一標量觀測
+    D_t     = js_divergence(p_short, p_long)
 
-    PH_DELTA   = float(os.getenv("PH_DELTA", "0.005"))   # 允許的日常擾動
-    PH_LAMBDA  = float(os.getenv("PH_LAMBDA", "0.08"))   # 觸發門檻（約 0.08~0.15 合理）
-    DRIFT_STEPS= float(os.getenv("DRIFT_STEPS", "5"))    # 漂移後強化短期的持續手數
+    PH_DELTA   = float(os.getenv("PH_DELTA", "0.005"))
+    PH_LAMBDA  = float(os.getenv("PH_LAMBDA", "0.08"))
+    DRIFT_STEPS= float(os.getenv("DRIFT_STEPS", "5"))
 
     st['cum'] += (D_t - PH_DELTA)
     st['min']  = min(st['min'], st['cum'])
@@ -435,7 +444,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     MKV_W   = float(os.getenv("MKV_W",  "0.25"))
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
 
-    # 覆蓋（PH 漂移時會用）
     if weight_overrides:
         REC_W  = weight_overrides.get("REC_W",  REC_W)
         LONG_W = weight_overrides.get("LONG_W", LONG_W)
@@ -462,7 +470,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     # 6) Regime gating（路型乘法微調）
     boosts = regime_boosts(seq)
     probs  = _apply_boosts_and_norm(probs, boosts)
-
     return norm(probs)
 
 def recommend_from_probs(probs: List[float]) -> str:
@@ -473,7 +480,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v4-ensemble-regime-ph")
+def health(): return jsonify(status="healthy", version="v5-ensemble-regime-ph+io")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -491,7 +498,47 @@ def predict():
         "recommendation": rec
     })
 
-# ========= LINE Webhook（按鈕互動流程 + PH 漂移自動加權） =========
+# ========= Data I/O：CSV 追加 & 匯出 =========
+def append_round_csv(user_id: str, history_before: str, label: str) -> None:
+    try:
+        with open(DATA_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([user_id, int(time.time()), history_before, label])
+    except Exception as e:
+        logger.warning("append_round_csv failed: %s", e)
+
+@app.route("/export", methods=["GET"])
+def export_csv():
+    """下載最近 n 筆資料（預設 1000）"""
+    n = int(request.args.get("n", "1000"))
+    rows: List[List[str]] = []
+    try:
+        if os.path.exists(DATA_CSV_PATH):
+            with open(DATA_CSV_PATH, "r", encoding="utf-8") as f:
+                data = list(csv.reader(f))
+                rows = data[-n:] if n > 0 else data
+    except Exception as e:
+        logger.warning("export read failed: %s", e)
+        rows = []
+    # 包含表頭
+    output = "user_id,ts,history_before,label\n" + "\n".join(
+        [",".join(r) for r in rows]
+    )
+    return Response(
+        output,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=rounds.csv"},
+    )
+
+@app.route("/reload", methods=["POST"])
+def reload_models():
+    token = request.headers.get("X-Reload-Token", "") or request.args.get("token", "")
+    if not RELOAD_TOKEN or token != RELOAD_TOKEN:
+        return jsonify(ok=False, error="unauthorized"), 401
+    load_models()
+    return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
+
+# ========= LINE Webhook（按鈕互動流程 + PH 漂移自動加權 + CSV落地） =========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 
@@ -518,8 +565,9 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
+USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT  # 同一 dict
 
-def flex_buttons_card() -> FlexSendMessage:
+def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
         "type": "bubble",
         "body": {
@@ -541,9 +589,11 @@ def flex_buttons_card() -> FlexSendMessage:
             ]
         }
     }
+    from linebot.models import FlexSendMessage  # type: ignore
     return FlexSendMessage(alt_text="請開始輸入歷史數據", contents=contents)
 
-def quick_reply_bar() -> QuickReply:
+def quick_reply_bar():
+    from linebot.models import QuickReply, QuickReplyButton, PostbackAction  # type: ignore
     return QuickReply(items=[
         QuickReplyButton(action=PostbackAction(label="莊", data="B")),
         QuickReplyButton(action=PostbackAction(label="閒", data="P")),
@@ -567,6 +617,7 @@ def line_webhook():
     return "ok", 200
 
 if USE_LINE and handler is not None:
+    from linebot.models import MessageEvent, TextMessage, TextSendMessage, PostbackEvent  # type: ignore
     @handler.add(MessageEvent, message=TextMessage)
     def handle_text(event):
         uid = event.source.user_id
@@ -614,8 +665,10 @@ if USE_LINE and handler is not None:
             )
             return
 
-        # 累積牌路
+        # ===== 累積牌路 & CSV 落地 =====
+        history_before = "".join(seq)  # 追加前的完整歷史
         seq.append(data); USER_HISTORY[uid] = seq
+        append_round_csv(uid, history_before, data)
 
         # 尚未開始分析：只提示進度
         if not ready:
@@ -636,17 +689,14 @@ if USE_LINE and handler is not None:
         # === 漂移期間的動態調權 ===
         overrides = None
         if active:
-            # 讓短期更重、長期與 Markov 更輕
             REC_W   = float(os.getenv("REC_W", "0.25"))
             LONG_W  = float(os.getenv("LONG_W", "0.35"))
             MKV_W   = float(os.getenv("MKV_W", "0.25"))
             PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
-
-            SHORT_BOOST = float(os.getenv("PH_SHORT_BOOST", "0.30"))  # +30% 給短期
-            LONG_CUT    = float(os.getenv("PH_LONG_CUT",   "0.40"))  # -40% 長期
-            MKV_CUT     = float(os.getenv("PH_MKV_CUT",    "0.40"))  # -40% Markov
-            PRIOR_KEEP  = float(os.getenv("PH_PRIOR_KEEP", "1.00"))  # 先驗不變/微降
-
+            SHORT_BOOST = float(os.getenv("PH_SHORT_BOOST", "0.30"))
+            LONG_CUT    = float(os.getenv("PH_LONG_CUT",   "0.40"))
+            MKV_CUT     = float(os.getenv("PH_MKV_CUT",    "0.40"))
+            PRIOR_KEEP  = float(os.getenv("PH_PRIOR_KEEP", "1.00"))
             overrides = {
                 "REC_W":   REC_W * (1.0 + SHORT_BOOST),
                 "LONG_W":  max(0.0, LONG_W * (1.0 - LONG_CUT)),
@@ -654,7 +704,7 @@ if USE_LINE and handler is not None:
                 "PRIOR_W": PRIOR_W * PRIOR_KEEP
             }
 
-        # 已開始分析：做集成（全盤考量 + Regime + PH 調權）
+        # 已開始分析：做集成
         probs = ensemble_with_anti_stuck(seq, overrides)
         rec   = recommend_from_probs(probs)
         suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
