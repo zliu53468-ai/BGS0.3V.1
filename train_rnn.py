@@ -1,105 +1,156 @@
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import LabelEncoder
-from tensorflow.keras.models import Sequential, load_model, save_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.utils import to_categorical
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Train TinyRNN (3-class: B/P/T) from CSV logged by server.py
 
-# 创建示例训练数据（实际应用中应该使用真实历史数据）
-def create_sample_data():
-    # 这是一个简单的示例，实际应该使用真实的历史数据
-    sequences = []
-    
-    # 创建一些示例序列
-    for i in range(1000):
-        # 随机生成序列，但有一定模式
-        seq_length = np.random.randint(20, 50)
-        seq = []
-        
-        # 添加一些模式
-        current = np.random.choice(['B', 'P'])
-        streak = 0
-        max_streak = np.random.randint(3, 8)
-        
-        for j in range(seq_length):
-            if streak >= max_streak or np.random.random() < 0.2:
-                current = 'P' if current == 'B' else 'B'
-                streak = 0
-                max_streak = np.random.randint(3, 8)
-            
-            seq.append(current)
-            streak += 1
-            
-            # 随机添加和局
-            if np.random.random() < 0.05:
-                seq.append('T')
-        
-        sequences.append(seq)
-    
-    return sequences
+Input CSV format (by /line-webhook auto logging):
+user_id,ts,history_before,label
+Uxxx,  1693900000, BPPB,  B
 
-def prepare_data(sequences, seq_length=10):
-    """准备训练数据"""
-    X = []
-    y = []
-    
-    label_encoder = LabelEncoder()
-    label_encoder.fit(['B', 'P', 'T'])
-    
-    for seq in sequences:
-        if len(seq) < seq_length + 1:
-            continue
-            
-        # 将序列转换为one-hot编码
-        encoded = label_encoder.transform(seq)
-        one_hot = to_categorical(encoded, num_classes=3)
-        
-        # 创建滑动窗口数据
-        for i in range(len(one_hot) - seq_length):
-            X.append(one_hot[i:i+seq_length])
-            y.append(one_hot[i+seq_length])
-    
-    return np.array(X), np.array(y), label_encoder
+Env:
+- TRAIN_DATA_PATH  (default /mnt/data/logs/rounds.csv)
+- RNN_OUT_PATH     (default /opt/models/rnn.pt)  # 與 server.py 的 RNN_PATH 一致
+- EPOCHS=20, BATCH=64, HIDDEN=32, MAXLEN=60, LR=0.001, WEIGHT_T=2.5
+- VAL_SPLIT=0.15 (time-based split)
+"""
+import os, csv, math, random
+from typing import List, Tuple
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-def train_rnn_model():
-    """训练RNN模型"""
-    print("生成训练数据...")
-    sequences = create_sample_data()
-    
-    print("准备训练数据...")
-    X, y, label_encoder = prepare_data(sequences)
-    
-    print(f"训练数据形状: X={X.shape}, y={y.shape}")
-    
-    # 创建模型
-    model = Sequential([
-        LSTM(32, input_shape=(X.shape[1], X.shape[2])),
-        Dropout(0.2),
-        Dense(16, activation='relu'),
-        Dense(3, activation='softmax')
-    ])
-    
-    model.compile(
-        optimizer=Adam(learning_rate=0.001),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    print("开始训练模型...")
-    history = model.fit(X, y, epochs=50, batch_size=32, validation_split=0.2, verbose=1)
-    
-    # 保存模型
-    os.makedirs('models', exist_ok=True)
-    model.save('models/rnn_model.h5')
-    
-    print("模型训练完成并已保存")
-    
-    # 保存标签编码器
-    np.save('models/label_encoder_classes.npy', label_encoder.classes_)
-    
-    return model, label_encoder
+TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/mnt/data/logs/rounds.csv")
+RNN_OUT_PATH    = os.getenv("RNN_OUT_PATH", "/opt/models/rnn.pt")
+os.makedirs(os.path.dirname(RNN_OUT_PATH), exist_ok=True)
+
+EPOCHS  = int(os.getenv("EPOCHS", "20"))
+BATCH   = int(os.getenv("BATCH", "64"))
+HIDDEN  = int(os.getenv("HIDDEN", "32"))
+MAXLEN  = int(os.getenv("MAXLEN", "60"))
+LR      = float(os.getenv("LR", "0.001"))
+VAL_SPLIT = float(os.getenv("VAL_SPLIT", "0.15"))
+WEIGHT_T  = float(os.getenv("WEIGHT_T", "2.5"))  # T 類別加權，處理不平衡
+
+LUT = {'B':0,'P':1,'T':2}
+INV = {0:'B',1:'P',2:'T'}
+
+def load_rows(path: str) -> List[Tuple[int,str,str]]:
+    """回傳 list[(ts, history_before, label)]，按 ts 排序"""
+    rows = []
+    if not os.path.exists(path):
+        print(f"[WARN] data file not found: {path}")
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        r = csv.reader(f)
+        for line in r:
+            if not line or len(line) < 4: continue
+            user_id, ts, hist, lab = line[0], line[1], line[2], line[3]
+            if not lab or lab.upper() not in LUT: continue
+            rows.append( (int(ts), hist.strip().upper(), lab.strip().upper()) )
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+def seq_to_onehot(seq: str, maxlen: int) -> torch.Tensor:
+    """
+    將 'BPTBP' -> [T, maxlen, 3] one-hot（左側補零），長度不足補零
+    """
+    arr = []
+    for ch in seq[-maxlen:]:  # 只截取最後 maxlen
+        v = [0.0,0.0,0.0]
+        if ch in LUT:
+            v[LUT[ch]] = 1.0
+        arr.append(v)
+    # 左側補零到 maxlen
+    while len(arr) < maxlen:
+        arr = [[0.0,0.0,0.0]] + arr
+    return torch.tensor(arr, dtype=torch.float32)
+
+class Roadset(Dataset):
+    def __init__(self, rows: List[Tuple[int,str,str]], maxlen:int):
+        self.samples = rows
+        self.maxlen = maxlen
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        ts, hist, lab = self.samples[idx]
+        x = seq_to_onehot(hist, self.maxlen)  # [maxlen,3]
+        y = LUT[lab]
+        return x, y
+
+class TinyRNN(nn.Module):
+    def __init__(self, in_dim=3, hidden=HIDDEN, out_dim=3):
+        super().__init__()
+        self.rnn = nn.GRU(in_dim, hidden, batch_first=True)
+        self.fc  = nn.Linear(hidden, out_dim)
+    def forward(self, x):
+        # x: [B,T,3]
+        out, _ = self.rnn(x)
+        logit = self.fc(out[:, -1, :])  # 取最後時刻
+        return logit
+
+def time_split(rows, val_ratio=0.15):
+    n = len(rows)
+    k = max(1, int(n*(1.0-val_ratio)))
+    return rows[:k], rows[k:]
+
+def main():
+    rows = load_rows(TRAIN_DATA_PATH)
+    if len(rows) < 100:
+        print(f"[WARN] too few rows: {len(rows)} (need >=100).")
+    train_rows, val_rows = time_split(rows, VAL_SPLIT)
+    train_ds = Roadset(train_rows, MAXLEN)
+    val_ds   = Roadset(val_rows,   MAXLEN)
+    train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True, drop_last=False)
+    val_dl   = DataLoader(val_ds,   batch_size=BATCH, shuffle=False, drop_last=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TinyRNN().to(device)
+    # 類別權重：對 T 加重，降低不平衡影響
+    class_weights = torch.tensor([1.0, 1.0, WEIGHT_T], dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optim = torch.optim.Adam(model.parameters(), lr=LR)
+
+    best_val = float("inf")
+    patience = max(3, int(EPOCHS/5))
+    bad = 0
+
+    for ep in range(1, EPOCHS+1):
+        model.train()
+        total, n = 0.0, 0
+        for x, y in train_dl:
+            x = x.to(device)  # [B,T,3]
+            y = y.to(device)  # [B]
+            optim.zero_grad()
+            logit = model(x)
+            loss = criterion(logit, y)
+            loss.backward()
+            optim.step()
+            total += float(loss.item()) * x.size(0); n += x.size(0)
+        train_loss = total / max(1,n)
+
+        # val
+        model.eval()
+        vtotal, vn = 0.0, 0
+        with torch.no_grad():
+            for x, y in val_dl:
+                x = x.to(device); y = y.to(device)
+                logit = model(x)
+                loss = criterion(logit, y)
+                vtotal += float(loss.item()) * x.size(0); vn += x.size(0)
+        val_loss = vtotal / max(1,vn)
+        print(f"[{ep:02d}/{EPOCHS}] train={train_loss:.4f} val={val_loss:.4f}")
+
+        if val_loss + 1e-6 < best_val:
+            best_val = val_loss
+            bad = 0
+            torch.save(model.state_dict(), RNN_OUT_PATH)
+            print(f"  -> saved to {RNN_OUT_PATH}")
+        else:
+            bad += 1
+            if bad >= patience:
+                print("Early stopping.")
+                break
+
+    print("Done.")
 
 if __name__ == "__main__":
-    train_rnn_model()
+    main()
