@@ -115,10 +115,10 @@ def init_rnn_model():
 init_rnn_model()
 
 # =========================================================
-# 博彩游戏结果识别
+# 博彩游戏结果识别 - 改进版本
 # =========================================================
 def extract_gaming_result(img_bytes: bytes) -> List[str]:
-    """专门用于识别博彩游戏结果的函数"""
+    """专门用于识别博彩游戏结果的函数 - 改进版本"""
     try:
         if pytesseract is None:
             logger.error("pytesseract is not installed")
@@ -141,44 +141,66 @@ def extract_gaming_result(img_bytes: bytes) -> List[str]:
         # 转换为灰度图
         gray = cv2.cvtColor(resized_img, cv2.COLOR_BGR2GRAY)
         
+        # 增强对比度
+        gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+        
         # 使用自适应阈值进行二值化
         binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                      cv2.THRESH_BINARY, 11, 2)
         
-        # 设置Tesseract参数（支持简体中文和繁体中文）
-        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=庄闲和莊閒閑田0123456789对总'
+        # 尝试多种PSM模式
+        results = []
+        for psm in [6, 7, 8, 13]:
+            custom_config = f'--oem 3 --psm {psm} -c tessedit_char_whitelist=庄闲和莊閒閑田0123456789对总'
+            text = pytesseract.image_to_string(binary, config=custom_config, lang='chi_sim+chi_tra')
+            if text.strip():
+                results.append(text)
+                logger.info(f"PSM {psm} 识别结果: {text}")
         
-        # 进行OCR识别
-        text = pytesseract.image_to_string(binary, config=custom_config, lang='chi_sim+chi_tra')
+        # 选择最可能的结果
+        best_text = ""
+        for text in results:
+            if "最新好路" in text or "好路" in text:
+                best_text = text
+                break
+            if any(keyword in text for keyword in ["田", "莊", "庄", "閒", "閑", "闲", "和"]):
+                best_text = text
+                break
         
-        logger.info(f"OCR识别结果: {text}")
+        if not best_text and results:
+            best_text = results[0]
+        
+        logger.info(f"最终OCR识别结果: {best_text}")
         
         # 解析结果
-        return parse_gaming_text(text)
+        return parse_gaming_text(best_text)
         
     except Exception as e:
         logger.error(f"博彩结果识别错误: {e}")
         return []
 
 def parse_gaming_text(text: str) -> List[str]:
-    """解析博彩游戏结果文本"""
+    """解析博彩游戏结果文本 - 改进版本"""
     # 查找"最新好路"或类似关键词
     lines = text.split('\n')
     gaming_line = None
     
+    # 首先查找包含"最新好路"的行
     for line in lines:
-        if '最新好路' in line or '好路' in line:
+        if '最新好路' in line:
             gaming_line = line
             break
     
+    # 如果没有找到，查找包含数字和庄闲字符的行
     if not gaming_line:
-        # 如果没有找到关键词，尝试查找包含数字和庄闲字符的行
         for line in lines:
-            if any(char in line for char in ['庄', '閒', '閑', '闲', '和', '田']) and any(char.isdigit() for char in line):
+            if (any(char in line for char in ['庄', '閒', '閑', '闲', '和', '田']) and 
+                any(char.isdigit() for char in line)):
                 gaming_line = line
                 break
     
     if not gaming_line:
+        logger.warning("未找到游戏结果行")
         return []
     
     logger.info(f"找到游戏结果行: {gaming_line}")
@@ -188,31 +210,27 @@ def parse_gaming_text(text: str) -> List[str]:
     player_count = 0
     tie_count = 0
     
-    # 使用正则表达式提取数字
+    # 使用正则表达式提取数字 - 更灵活的模式
     patterns = [
-        r'田\s*(\d+)',    # 田 23
-        r'莊\s*(\d+)',    # 莊 23
-        r'庄\s*(\d+)',    # 庄 23
-        r'閒\s*(\d+)',    # 閒 15
-        r'閑\s*(\d+)',    # 閑 15
-        r'闲\s*(\d+)',    # 闲 15
-        r'和\s*(\d+)',    # 和 3
+        r'(田|莊|庄)[^\d]*(\d+)',    # 田 15 或 庄15
+        r'(閒|閑|闲)[^\d]*(\d+)',    # 閒 17 或 闲17
+        r'(和)[^\d]*(\d+)',          # 和 1
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, gaming_line)
-        if match:
-            count = int(match.group(1))
-            if '田' in pattern or '莊' in pattern or '庄' in pattern:
+        matches = re.findall(pattern, gaming_line)
+        for match in matches:
+            count = int(match[1])
+            if match[0] in ['田', '莊', '庄']:
                 banker_count = count
-            elif '閒' in pattern or '閑' in pattern or '闲' in pattern:
+            elif match[0] in ['閒', '閑', '闲']:
                 player_count = count
-            elif '和' in pattern:
+            elif match[0] == '和':
                 tie_count = count
     
     # 如果正则没有匹配到，尝试更简单的方法
     if banker_count == 0 and player_count == 0 and tie_count == 0:
-        parts = gaming_line.split()
+        parts = re.split(r'\s+', gaming_line)
         for i, part in enumerate(parts):
             if part in ['田', '莊', '庄'] and i+1 < len(parts) and parts[i+1].isdigit():
                 banker_count = int(parts[i+1])
@@ -464,6 +482,63 @@ def render_reply(seq: List[str], probs: Dict[str,float], by_model: bool, info: D
         reply += f"\n当前牌路震荡中（交替率：{info.get('alt_rate', 0):.2f}）"
     
     return reply
+
+# =========================================================
+# 调试API
+# =========================================================
+@app.route("/debug-ocr", methods=['POST'])
+def debug_ocr():
+    """调试OCR识别"""
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image provided"}), 400
+        
+        file = request.files['image']
+        img_bytes = file.read()
+        
+        # 图像预处理
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img_np = np.array(img)
+        
+        # 转换为OpenCV格式
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        
+        # 调整图像大小以提高OCR精度
+        height, width = img_cv.shape[:2]
+        scale = 2.0  # 放大倍数
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        resized_img = cv2.resize(img_cv, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        
+        # 转换为灰度图
+        gray = cv2.cvtColor(resized_img, cv2.COLOR_BGR2GRAY)
+        
+        # 增强对比度
+        gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+        
+        # 使用自适应阈值进行二值化
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY, 11, 2)
+        
+        # 尝试多种PSM模式
+        results = {}
+        for psm in [6, 7, 8, 13]:
+            custom_config = f'--oem 3 --psm {psm} -c tessedit_char_whitelist=庄闲和莊閒閑田0123456789对总'
+            text = pytesseract.image_to_string(binary, config=custom_config, lang='chi_sim+chi_tra')
+            results[f"psm_{psm}"] = text
+        
+        # 解析结果
+        parsed_results = {}
+        for psm, text in results.items():
+            parsed_results[psm] = parse_gaming_text(text)
+        
+        return jsonify({
+            "original_results": results,
+            "parsed_results": parsed_results
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # =========================================================
 # API
