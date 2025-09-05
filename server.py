@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — v8 (Oscillation-Enhanced)
-Full-history Ensemble + Regime Gating + PH Drift
-+ Oscillation Experts（Alt / PairAlt / RunLen）+ Dynamic Gating
-+ 2nd/3rd-Order Markov + Momentum
-+ Anti one-sided（抑制同向、B/P 回正、可選觀望）
-+ CSV落地 + /export + /reload + LINE 按鈕
+BGS LINE Bot backend — v9 (Short-Dragon & Oscillation Fix)
+在 v8 基礎上新增：
+1) Short-Dragon Breaker Expert（2–5 顆短龍→翻邊）
+2) n-gram 3/4 階條件統計（忽略 T）
+3) Oscillation Flip Bias（高震盪期對翻邊做偏置）
+並保留：全盤集成 + Markov(1/2/3) + Regime/Momentum + PH 漂移 + 防單邊 + LINE 按鈕
 """
+
 import os, csv, time, logging, math
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, Response
@@ -16,7 +17,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-backend")
 
-# ========= 路徑（含 /tmp fallback） =========
+# ========= 寫入路徑（Render 免費只能寫 /tmp；自動 fallback） =========
 def _ensure_parent(p: str) -> str:
     d = os.path.dirname(p) or "."
     try:
@@ -61,6 +62,10 @@ def parse_history(payload) -> List[str]:
             up = ch.upper()
             if up in CLASS_ORDER: seq.append(up)
     return seq
+
+def clean_bp(seq: List[str]) -> List[str]:
+    """移除 T，僅保留 B/P 以做交錯/短龍結構判定與 n-gram 統計"""
+    return [x for x in seq if x in ("B","P")]
 
 # ========= 可選模型 =========
 try:
@@ -115,20 +120,19 @@ def load_models() -> None:
             logger.warning("Load LGBM failed: %s", e); LGBM_MODEL=None
 load_models()
 
-# ========= 單模型推論 =========
-def rnn_predict(seq: List[str]) -> Optional[List[float]]:
-    if RNN_MODEL is None or torch is None or not seq: return None
-    try:
-        def onehot(label: str): return [1 if label == lab else 0 for lab in CLASS_ORDER]
-        inp = torch.tensor([[onehot(ch) for ch in seq]], dtype=torch.float32)
-        with torch.no_grad():
-            logits = RNN_MODEL(inp)
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
-        return [float(p) for p in probs]
-    except Exception as e:
-        logger.warning("RNN inference failed: %s", e); return None
+# ========= 通用工具 =========
+def norm(v: List[float]) -> List[float]:
+    s = sum(v);  s = s if s > 1e-12 else 1.0
+    return [max(0.0, x)/s for x in v]
 
-# ---- Tie 補正 + 二/三類重建 ----
+def blend(a: List[float], b: List[float], w: float) -> List[float]:
+    return [ (1-w)*a[i] + w*b[i] for i in range(3) ]
+
+def temperature_scale(p: List[float], tau: float) -> List[float]:
+    if tau <= 1e-6: return p
+    ex = [pow(max(pi,1e-9), 1.0/tau) for pi in p]; s=sum(ex); return [e/s for e in ex]
+
+# ========= 頻率/先驗 =========
 def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
     if not seq: return [1/3, 1/3, 1/3]
     if gamma is None: gamma = float(os.getenv("EW_GAMMA", "0.96"))
@@ -152,50 +156,15 @@ def _estimate_tie_prob(seq: List[str]) -> float:
     pT = (1 - w) * prior_T + w * long_T
     return max(floor_T, min(cap_T, pT))
 
-def _merge_bp_with_t(bp: List[float], pT: float) -> List[float]:
-    b, p = float(bp[0]), float(bp[1]); s = max(1e-12, b + p)
-    b, p = b / s, p / s; scale = 1.0 - pT
-    return [b * scale, p * scale, pT]
+def recent_freq(seq: List[str], win: int) -> List[float]:
+    if not seq: return [1/3,1/3,1/3]
+    cut = seq[-win:] if win>0 else seq
+    alpha = float(os.getenv("LAPLACE", "0.5"))
+    nB = cut.count("B") + alpha; nP = cut.count("P") + alpha; nT = cut.count("T") + alpha
+    tot = max(1, len(cut)) + 3*alpha
+    return [nB/tot, nP/tot, nT/tot]
 
-def _vec_from_seq(seq: List[str], K:int) -> List[float]:
-    vec: List[float] = []
-    for label in seq[-K:]:
-        vec.extend([1.0 if label == lab else 0.0 for lab in CLASS_ORDER])
-    pad = K*3 - len(vec)
-    if pad > 0: vec = [0.0]*pad + vec
-    return vec
-
-def xgb_predict(seq: List[str]) -> Optional[List[float]]:
-    if XGB_MODEL is None or not seq: return None
-    try:
-        import numpy as np
-        K = int(os.getenv("FEAT_WIN", "20"))
-        dmatrix = xgb.DMatrix(np.array([_vec_from_seq(seq, K)], dtype=float))
-        prob = XGB_MODEL.predict(dmatrix)[0]
-        if isinstance(prob, (list, tuple)) and len(prob) == 3:
-            return [float(prob[0]), float(prob[1]), float(prob[2])]
-        if isinstance(prob, (list, tuple)) and len(prob) == 2:
-            pT = _estimate_tie_prob(seq)
-            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
-        return None
-    except Exception as e:
-        logger.warning("XGB inference failed: %s", e); return None
-
-def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
-    if LGBM_MODEL is None or not seq: return None
-    try:
-        K = int(os.getenv("FEAT_WIN", "20"))
-        prob = LGBM_MODEL.predict([_vec_from_seq(seq, K)])[0]
-        if isinstance(prob, (list, tuple)) and len(prob) == 3:
-            return [float(prob[0]), float(prob[1]), float(prob[2])]
-        if isinstance(prob, (list, tuple)) and len(prob) == 2:
-            pT = _estimate_tie_prob(seq)
-            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
-        return None
-    except Exception as e:
-        logger.warning("LGBM inference failed: %s", e); return None
-
-# ========= 路型/統計 =========
+# ========= Run/交錯量測 =========
 def last_run(seq: List[str]) -> Tuple[str, int]:
     if not seq: return ("", 0)
     ch = seq[-1]; i = len(seq) - 2; n = 1
@@ -212,148 +181,23 @@ def run_lengths(seq: List[str], win: int = 14) -> List[int]:
     lens.append(cur); return lens
 
 def alt_ratio(seq: List[str], win:int=12) -> float:
-    s = seq[-win:] if len(seq) >= win else seq
+    s = clean_bp(seq[-win:] if len(seq)>=win else seq)
     if len(s) < 2: return 0.0
     diff = sum(1 for i in range(1,len(s)) if s[i]!=s[i-1])
     return diff/(len(s)-1)
 
 def period2_score(seq: List[str], win:int=12) -> float:
-    """量化 2 期交錯結構（簡化的自相關/二元交替）"""
-    s = seq[-win:] if len(seq)>=win else seq
+    s = clean_bp(seq[-win:] if len(seq)>=win else seq)
     if len(s) < 4: return 0.0
-    pairs = [s[i:i+2] for i in range(0, len(s)-1, 1)]
-    ok = 0; total = 0
-    for i in range(1, len(pairs)):
-        a, b = pairs[i-1], pairs[i]
-        if len(a)==2 and len(b)==2 and a[0]==a[1] and b[0]==b[1] and a[0]!=b[0]:
-            ok += 1
-        total += 1
+    ok=0; total=0
+    # 找到 ..AA, ..BB 的對對換結構
+    for i in range(3, len(s)):
+        a1,a2,b1,b2 = s[i-3],s[i-2],s[i-1],s[i]
+        if a1==a2 and b1==b2 and a2!=b1: ok+=1
+        total+=1
     return ok/max(1,total)
 
-def is_qijiao(seq: List[str], win: int = 20, tol: float = 0.1) -> bool:
-    s = seq[-win:] if len(seq) >= win else seq
-    if not s: return False
-    b = s.count("B"); p = s.count("P"); t = s.count("T")
-    tot_bp = max(1, b+p)
-    ratio = b / tot_bp
-    return (abs(ratio - 0.5) <= tol) and (t <= max(1, int(0.15*len(s))))
-
-def is_oscillating(seq: List[str], win: int = 12) -> bool:
-    lens = run_lengths(seq, win)
-    if not lens: return False
-    avg = sum(lens)/len(lens)
-    return 1.0 <= avg <= 2.1
-
-def shape_1room2hall(seq: List[str], win: int = 18) -> bool:
-    lens = run_lengths(seq, win)
-    if len(lens) < 6: return False
-    if not all(1 <= x <= 2 for x in lens[-6:]): return False
-    alt = all((lens[i]%2) != (lens[i-1]%2) for i in range(1, min(len(lens), 10)))
-    return alt
-
-def shape_2room1hall(seq: List[str], win: int = 18) -> bool:
-    lens = run_lengths(seq, win)
-    if len(lens) < 5: return False
-    last = lens[-6:] if len(lens)>=6 else lens
-    cnt_1 = sum(1 for x in last if x==1)
-    cnt_2 = sum(1 for x in last if x==2)
-    return (cnt_1 + cnt_2) >= max(4, int(0.7*len(last))) and cnt_2 >= cnt_1
-
-# ========= Regime gating（含 Momentum）=========
-def regime_boosts(seq: List[str]) -> List[float]:
-    if not seq: return [1.0, 1.0, 1.0]
-    b = [1.0, 1.0, 1.0]
-    last, rlen = last_run(seq)
-    DRAGON_TH    = int(os.getenv("BOOST_DRAGON_LEN", "4"))
-    BOOST_DRAGON = float(os.getenv("BOOST_DRAGON", "1.12"))
-    BOOST_ALT    = float(os.getenv("BOOST_ALT", "1.08"))
-    BOOST_QJ     = float(os.getenv("BOOST_QIJIAO", "1.05"))
-    BOOST_ROOM   = float(os.getenv("BOOST_ROOM", "1.06"))
-    BOOST_T      = float(os.getenv("BOOST_T", "1.03"))
-    if rlen >= DRAGON_TH:
-        if last == "B": b[0] *= BOOST_DRAGON
-        elif last == "P": b[1] *= BOOST_DRAGON
-        else: b[2] *= BOOST_DRAGON
-    if is_oscillating(seq, win=12) or shape_1room2hall(seq):
-        if seq[-1] == "B": b[1] *= BOOST_ALT
-        elif seq[-1] == "P": b[0] *= BOOST_ALT
-    if shape_2room1hall(seq):
-        s = seq[-10:] if len(seq)>=10 else seq
-        if s.count("B") > s.count("P"): b[0] *= BOOST_ROOM
-        elif s.count("P") > s.count("B"): b[1] *= BOOST_ROOM
-    if is_qijiao(seq): b[0] *= BOOST_QJ; b[1] *= BOOST_QJ
-    ew = exp_decay_freq(seq)
-    if ew[2] > THEORETICAL_PROBS["T"] * 1.15: b[2] *= BOOST_T
-    return b
-
-# Momentum 追龍
-MOM_WIN          = int(os.getenv("MOM_WIN", "8"))
-MOM_MAX_BOOST    = float(os.getenv("MOM_MAX_BOOST", "1.15"))
-MOM_BASE_BOOST   = float(os.getenv("MOM_BASE_BOOST", "1.03"))
-MOM_RLEN_THRESH  = int(os.getenv("MOM_RLEN_THRESH", "3"))
-MOM_ALIGN_THRESH = float(os.getenv("MOM_ALIGN_THRESH", "0.58"))
-def momentum_boost(seq: List[str]) -> List[float]:
-    if not seq: return [1.0, 1.0, 1.0]
-    last, rlen = last_run(seq)
-    s = seq[-MOM_WIN:] if len(seq) >= MOM_WIN else seq
-    b = s.count("B"); p = s.count("P"); t = s.count("T")
-    tot = max(1, b+p+t)
-    rb, rp = b/tot, p/tot
-    boosts = [1.0,1.0,1.0]
-    if last == "B" and rlen >= MOM_RLEN_THRESH and rb >= MOM_ALIGN_THRESH:
-        k = min(1.0, (rlen - MOM_RLEN_THRESH + 1)/5.0) * min(1.0, (rb - MOM_ALIGN_THRESH)/(1.0 - MOM_ALIGN_THRESH + 1e-9))
-        boosts[0] *= MOM_BASE_BOOST + (MOM_MAX_BOOST - MOM_BASE_BOOST)*k
-    if last == "P" and rlen >= MOM_RLEN_THRESH and rp >= MOM_ALIGN_THRESH:
-        k = min(1.0, (rlen - MOM_RLEN_THRESH + 1)/5.0) * min(1.0, (rp - MOM_ALIGN_THRESH)/(1.0 - MOM_ALIGN_THRESH + 1e-9))
-        boosts[1] *= MOM_BASE_BOOST + (MOM_MAX_BOOST - MOM_BASE_BOOST)*k
-    return boosts
-
-def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
-    p = [max(1e-12, probs[i] * boosts[i]) for i in range(3)]
-    s = sum(p);  return [x / s for x in p]
-
-# ========= PH 漂移（Page-Hinkley）=========
-def js_divergence(p: List[float], q: List[float]) -> float:
-    eps = 1e-12
-    m = [(p[i]+q[i])/2.0 for i in range(3)]
-    def _kl(a, b): return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
-    return 0.5*_kl(p, m) + 0.5*_kl(q, m)
-
-USER_DRIFT: Dict[str, Dict[str, float]] = {}
-def _get_drift_state(uid: str) -> Dict[str, float]:
-    st = USER_DRIFT.get(uid)
-    if st is None: st = {'cum': 0.0, 'min': 0.0, 'cooldown': 0.0}; USER_DRIFT[uid] = st
-    return st
-def recent_freq(seq: List[str], win: int) -> List[float]:
-    if not seq: return [1/3, 1/3, 1/3]
-    cut = seq[-win:] if win>0 else seq
-    alpha = float(os.getenv("LAPLACE", "0.5"))
-    nB = cut.count("B") + alpha; nP = cut.count("P") + alpha; nT = cut.count("T") + alpha
-    tot = max(1, len(cut)) + 3*alpha
-    return [nB/tot, nP/tot, nT/tot]
-def update_ph_state(uid: str, seq: List[str]) -> bool:
-    if not seq: return False
-    st = _get_drift_state(uid)
-    REC_WIN = int(os.getenv("REC_WIN_FOR_PH", "12"))
-    p_short = recent_freq(seq, REC_WIN)
-    p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
-    D_t     = js_divergence(p_short, p_long)
-    PH_DELTA   = float(os.getenv("PH_DELTA", "0.005"))
-    PH_LAMBDA  = float(os.getenv("PH_LAMBDA", "0.08"))
-    DRIFT_STEPS= float(os.getenv("DRIFT_STEPS", "5"))
-    st['cum'] += (D_t - PH_DELTA); st['min'] = min(st['min'], st['cum'])
-    if (st['cum'] - st['min']) > PH_LAMBDA:
-        st['cum']=0.0; st['min']=0.0; st['cooldown']=DRIFT_STEPS
-        logger.info(f"[PH] drift triggered for {uid}"); return True
-    return False
-def consume_cooldown(uid: str) -> bool:
-    st=_get_drift_state(uid)
-    if st['cooldown']>0: st['cooldown']=max(0.0, st['cooldown']-1.0); return True
-    return False
-def in_drift(uid: str) -> bool:
-    return _get_drift_state(uid)['cooldown'] > 0.0
-
-# ========= Markov（1/2/3 階）=========
+# ========= Markov（1/2/3） =========
 def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
     if len(seq) < 2: return [1/3,1/3,1/3]
     if decay is None: decay = float(os.getenv("MKV_DECAY", "0.98"))
@@ -389,57 +233,168 @@ def markov3_next_prob(seq: List[str], decay: float = None) -> List[float]:
     flow=C[key]; alpha=float(os.getenv("MKV3_LAPLACE","0.5"))
     flow=[x+alpha for x in flow]; S=sum(flow); return [x/S for x in flow]
 
-# ========= Oscillation Experts =========
-def alt_expert(seq: List[str]) -> List[float]:
-    """單手交錯：預期翻邊（忽略 T）"""
-    if not seq: return [1/3,1/3,1/3]
-    last = seq[-1]
-    p = [1e-6,1e-6,_estimate_tie_prob(seq)]
-    if last == "B": p[1] = 1.0
-    elif last == "P": p[0] = 1.0
+# ========= 新：n-gram Expert（忽略 T 的 3/4 階） =========
+def ngram_expert(seq: List[str]) -> List[float]:
+    bp = clean_bp(seq)
+    if len(bp) < 3: return [1/3,1/3,1/3]
+    from collections import defaultdict
+    decay3 = float(os.getenv("NGRAM3_DECAY","0.985"))
+    decay4 = float(os.getenv("NGRAM4_DECAY","0.99"))
+    lap    = float(os.getenv("NGRAM_LAPLACE","0.5"))
+    w=1.0
+    C3 = defaultdict(lambda:[0.0,0.0])  # B,P
+    for a,b,c in zip(bp[:-2], bp[1:-1], bp[2:]):
+        C3[(a,b)][0 if c=="B" else 1] += w; w*=decay3
+    p3=[0.5,0.5]
+    key3=(bp[-2], bp[-1])
+    if key3 in C3:
+        f = [C3[key3][0]+lap, C3[key3][1]+lap]; S=sum(f); p3=[f[0]/S, f[1]/S]
+    if len(bp) < 4:
+        pB,pP = p3[0], p3[1]
     else:
-        for x in reversed(seq[:-1]):
-            if x != "T": last=x; break
-        if last == "B": p[1]=1.0
-        elif last == "P": p[0]=1.0
-        else: p[0]=p[1]=0.5
-    S=sum(p); return [x/S for x in p]
+        w=1.0; C4 = defaultdict(lambda:[0.0,0.0])
+        for a,b,c,d in zip(bp[:-3], bp[1:-2], bp[2:-1], bp[3:]):
+            C4[(a,b,c)][0 if d=="B" else 1] += w; w*=decay4
+        p4=[0.5,0.5]; key4=(bp[-3],bp[-2],bp[-1])
+        if key4 in C4:
+            f = [C4[key4][0]+lap, C4[key4][1]+lap]; S=sum(f); p4=[f[0]/S, f[1]/S]
+        alpha = float(os.getenv("NGRAM_BLEND","0.6"))
+        pB = alpha*p4[0] + (1-alpha)*p3[0]
+        pP = alpha*p4[1] + (1-alpha)*p3[1]
+    pT = _estimate_tie_prob(seq)
+    scale = 1.0 - pT
+    return [pB*scale, pP*scale, pT]
 
-def pair_alt_expert(seq: List[str]) -> List[float]:
-    """兩手一換：若末兩手相同，預期翻邊；若末兩手不同，預期本手再湊對"""
-    if len(seq) < 2: return [1/3,1/3,1/3]
-    last2 = [x for x in seq if x in ("B","P")]
-    if len(last2) < 2: return [1/3,1/3,1/3]
-    a, b = last2[-2], last2[-1]
-    p = [1e-6,1e-6,_estimate_tie_prob(seq)]
-    if a == b:
-        if b == "B": p[1]=1.0
-        else: p[0]=1.0
-    else:
-        if b == "B": p[0]=1.0
-        else: p[1]=1.0
-    S=sum(p); return [x/S for x in p]
+# ========= 新：短龍轉折專家 =========
+def short_dragon_break_expert(seq: List[str]) -> List[float]:
+    bp = clean_bp(seq)
+    if not bp: return [1/3,1/3,1/3]
+    # 末段 run 長度
+    ch = bp[-1]; i=len(bp)-2; rlen=1
+    while i>=0 and bp[i]==ch: rlen+=1; i-=1
+    # 前段交錯徵兆
+    altR = alt_ratio(seq, win=max(6, int(os.getenv("SDB_WIN","12"))))
+    # 條件：2~5 顆的短龍 + 有交錯徵兆 → 預期翻邊
+    if 2 <= rlen <= 5 and altR >= float(os.getenv("SDB_ALT_TH","0.5")):
+        pT=_estimate_tie_prob(seq)
+        if ch=="B":
+            base=[0.0,1.0,pT]
+        else:
+            base=[1.0,0.0,pT]
+        S=sum(base); return [x/S for x in base]
+    return [1/3,1/3,1/3]
 
-def runlen_expert(seq: List[str], win:int=12) -> List[float]:
-    """依 run-length 均值/方差：均值小→震盪偏翻，均值大→偏續龍"""
-    s = seq[-win:] if len(seq)>=win else seq
-    lens = run_lengths(s, win=len(s))
-    if not lens: return [1/3,1/3,1/3]
-    mean = sum(lens)/len(lens)
-    var  = sum((x-mean)**2 for x in lens)/len(lens)
+# ========= Regime / Momentum（沿用 v8） =========
+def is_qijiao(seq: List[str], win: int = 20, tol: float = 0.1) -> bool:
+    s = seq[-win:] if len(seq) >= win else seq
+    if not s: return False
+    b = s.count("B"); p = s.count("P"); t = s.count("T")
+    tot_bp = max(1, b+p)
+    ratio = b / tot_bp
+    return (abs(ratio - 0.5) <= tol) and (t <= max(1, int(0.15*len(s))))
+
+def is_oscillating(seq: List[str], win: int = 12) -> bool:
+    lens = run_lengths(seq, win)
+    if not lens: return False
+    avg = sum(lens)/len(lens)
+    return 1.0 <= avg <= 2.1
+
+def shape_1room2hall(seq: List[str], win: int = 18) -> bool:
+    lens = run_lengths(seq, win)
+    if len(lens) < 6: return False
+    if not all(1 <= x <= 2 for x in lens[-6:]): return False
+    alt = all((lens[i]%2) != (lens[i-1]%2) for i in range(1, min(len(lens), 10)))
+    return alt
+
+def shape_2room1hall(seq: List[str], win: int = 18) -> bool:
+    lens = run_lengths(seq, win)
+    if len(lens) < 5: return False
+    last = lens[-6:] if len(lens)>=6 else lens
+    cnt_1 = sum(1 for x in last if x==1)
+    cnt_2 = sum(1 for x in last if x==2)
+    return (cnt_1 + cnt_2) >= max(4, int(0.7*len(last))) and cnt_2 >= cnt_1
+
+def regime_boosts(seq: List[str]) -> List[float]:
+    if not seq: return [1.0, 1.0, 1.0]
+    b = [1.0, 1.0, 1.0]
     last, rlen = last_run(seq)
-    base = [1e-6,1e-6,_estimate_tie_prob(seq)]
-    if mean <= 1.6 and var <= 0.6:  # 高震盪
-        if last == "B": base[1]=1.0
-        elif last == "P": base[0]=1.0
-        else: base[0]=base[1]=0.5
-    else:
-        if last == "B": base[0]=1.0 if rlen>=2 else 0.7; base[1]=1.0-base[0]-base[2]
-        elif last == "P": base[1]=1.0 if rlen>=2 else 0.7; base[0]=1.0-base[1]-base[2]
-        else: base[0]=base[1]=0.5
-    S=sum(base); return [x/S for x in base]
+    DRAGON_TH    = int(os.getenv("BOOST_DRAGON_LEN", "4"))
+    BOOST_DRAGON = float(os.getenv("BOOST_DRAGON", "1.12"))
+    BOOST_ALT    = float(os.getenv("BOOST_ALT", "1.08"))
+    BOOST_QJ     = float(os.getenv("BOOST_QIJIAO", "1.05"))
+    BOOST_ROOM   = float(os.getenv("BOOST_ROOM", "1.06"))
+    BOOST_T      = float(os.getenv("BOOST_T", "1.03"))
+    if rlen >= DRAGON_TH:
+        if last == "B": b[0] *= BOOST_DRAGON
+        elif last == "P": b[1] *= BOOST_DRAGON
+        else: b[2] *= BOOST_DRAGON
+    if is_oscillating(seq, win=12) or shape_1room2hall(seq):
+        if seq[-1] == "B": b[1] *= BOOST_ALT
+        elif seq[-1] == "P": b[0] *= BOOST_ALT
+    if shape_2room1hall(seq):
+        s = seq[-10:] if len(seq)>=10 else seq
+        if s.count("B") > s.count("P"): b[0] *= BOOST_ROOM
+        elif s.count("P") > s.count("B"): b[1] *= BOOST_ROOM
+    if is_qijiao(seq): b[0] *= BOOST_QJ; b[1] *= BOOST_QJ
+    ew = exp_decay_freq(seq)
+    if ew[2] > THEORETICAL_PROBS["T"] * 1.15: b[2] *= BOOST_T
+    return b
 
-# ========= 防單邊 =========
+MOM_WIN          = int(os.getenv("MOM_WIN", "8"))
+MOM_MAX_BOOST    = float(os.getenv("MOM_MAX_BOOST", "1.15"))
+MOM_BASE_BOOST   = float(os.getenv("MOM_BASE_BOOST", "1.03"))
+MOM_RLEN_THRESH  = int(os.getenv("MOM_RLEN_THRESH", "3"))
+MOM_ALIGN_THRESH = float(os.getenv("MOM_ALIGN_THRESH", "0.58"))
+def momentum_boost(seq: List[str]) -> List[float]:
+    if not seq: return [1.0, 1.0, 1.0]
+    last, rlen = last_run(seq)
+    s = seq[-MOM_WIN:] if len(seq) >= MOM_WIN else seq
+    b = s.count("B"); p = s.count("P"); t = s.count("T")
+    tot = max(1, b+p+t)
+    rb, rp = b/tot, p/tot
+    boosts = [1.0,1.0,1.0]
+    if last == "B" and rlen >= MOM_RLEN_THRESH and rb >= MOM_ALIGN_THRESH:
+        k = min(1.0, (rlen - MOM_RLEN_THRESH + 1)/5.0) * min(1.0, (rb - MOM_ALIGN_THRESH)/(1.0 - MOM_ALIGN_THRESH + 1e-9))
+        boosts[0] *= MOM_BASE_BOOST + (MOM_MAX_BOOST - MOM_BASE_BOOST)*k
+    if last == "P" and rlen >= MOM_RLEN_THRESH and rp >= MOM_ALIGN_THRESH:
+        k = min(1.0, (rlen - MOM_RLEN_THRESH + 1)/5.0) * min(1.0, (rp - MOM_ALIGN_THRESH)/(1.0 - MOM_ALIGN_THRESH + 1e-9))
+        boosts[1] *= MOM_BASE_BOOST + (MOM_MAX_BOOST - MOM_BASE_BOOST)*k
+    return boosts
+
+def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
+    p = [max(1e-12, probs[i] * boosts[i]) for i in range(3)]
+    s = sum(p);  return [x / s for x in p]
+
+# ========= PH 漂移（沿用 v8） =========
+def js_divergence(p: List[float], q: List[float]) -> float:
+    eps = 1e-12
+    m = [(p[i]+q[i])/2.0 for i in range(3)]
+    def _kl(a, b): return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
+    return 0.5*_kl(p, m) + 0.5*_kl(q, m)
+USER_DRIFT: Dict[str, Dict[str, float]] = {}
+def _get_drift_state(uid: str) -> Dict[str, float]:
+    st = USER_DRIFT.get(uid)
+    if st is None: st = {'cum': 0.0, 'min': 0.0, 'cooldown': 0.0}; USER_DRIFT[uid] = st
+    return st
+def update_ph_state(uid: str, seq: List[str]) -> Tuple[bool,bool]:
+    if not seq: return (False, False)
+    st = _get_drift_state(uid)
+    REC_WIN = int(os.getenv("REC_WIN_FOR_PH", "12"))
+    p_short = recent_freq(seq, REC_WIN)
+    p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+    D_t     = js_divergence(p_short, p_long)
+    PH_DELTA   = float(os.getenv("PH_DELTA", "0.005"))
+    PH_LAMBDA  = float(os.getenv("PH_LAMBDA", "0.08"))
+    st['cum'] += (D_t - PH_DELTA)
+    st['min']  = min(st['min'], st['cum'])
+    drift_now = False
+    if (st['cum'] - st['min']) > PH_LAMBDA:
+        st['cum'] = 0.0; st['min'] = 0.0; st['cooldown'] = float(os.getenv("DRIFT_STEPS","5")); drift_now=True
+    active = st['cooldown'] > 0.0
+    if active: st['cooldown'] = max(0.0, st['cooldown'] - 1.0)
+    return (drift_now, active)
+
+# ========= 防單邊/回正 =========
 USER_RECS: Dict[str, List[str]] = {}
 def _apply_bp_balance_regularizer(seq: List[str], probs: List[float]) -> List[float]:
     if not seq: return probs
@@ -473,24 +428,70 @@ def _maybe_no_bet(probs: List[float]) -> Optional[str]:
     a = sorted(probs, reverse=True)
     return 'N' if a[0] - a[1] < MIN_GAP else None
 
-# ========= 集成主體（震盪強化版）=========
-def norm(v: List[float]) -> List[float]:
-    s = sum(v);  s = s if s > 1e-12 else 1.0
-    return [max(0.0, x)/s for x in v]
-def blend(a: List[float], b: List[float], w: float) -> List[float]:
-    return [ (1-w)*a[i] + w*b[i] for i in range(3) ]
-def temperature_scale(p: List[float], tau: float) -> List[float]:
-    if tau <= 1e-6: return p
-    ex = [pow(max(pi,1e-9), 1.0/tau) for pi in p]; s=sum(ex); return [e/s for e in ex]
+# ========= 單模型推論 =========
+def rnn_predict(seq: List[str]) -> Optional[List[float]]:
+    if RNN_MODEL is None or torch is None or not seq: return None
+    try:
+        def onehot(label: str): return [1 if label == lab else 0 for lab in CLASS_ORDER]
+        inp = torch.tensor([[onehot(ch) for ch in seq]], dtype=torch.float32)
+        with torch.no_grad():
+            logits = RNN_MODEL(inp)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
+        return [float(p) for p in probs]
+    except Exception as e:
+        logger.warning("RNN inference failed: %s", e); return None
 
+def _vec_from_seq(seq: List[str], K:int) -> List[float]:
+    vec: List[float] = []
+    for label in seq[-K:]:
+        vec.extend([1.0 if label == lab else 0.0 for lab in CLASS_ORDER])
+    pad = K*3 - len(vec)
+    if pad > 0: vec = [0.0]*pad + vec
+    return vec
+
+def xgb_predict(seq: List[str]) -> Optional[List[float]]:
+    if XGB_MODEL is None or not seq: return None
+    try:
+        import numpy as np
+        K = int(os.getenv("FEAT_WIN", "20"))
+        dmatrix = xgb.DMatrix(np.array([_vec_from_seq(seq, K)], dtype=float))
+        prob = XGB_MODEL.predict(dmatrix)[0]
+        if isinstance(prob, (list, tuple)) and len(prob) == 3:
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
+        if isinstance(prob, (list, tuple)) and len(prob) == 2:
+            pT = _estimate_tie_prob(seq)
+            b, p = float(prob[0]), float(prob[1]); s=max(1e-12, b+p); b/=s; p/=s
+            sc=1.0-pT; return [b*sc, p*sc, pT]
+        return None
+    except Exception as e:
+        logger.warning("XGB inference failed: %s", e); return None
+
+def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
+    if LGBM_MODEL is None or not seq: return None
+    try:
+        K = int(os.getenv("FEAT_WIN", "20"))
+        prob = LGBM_MODEL.predict([_vec_from_seq(seq, K)])[0]
+        if isinstance(prob, (list, tuple)) and len(prob) == 3:
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
+        if isinstance(prob, (list, tuple)) and len(prob) == 2:
+            pT = _estimate_tie_prob(seq)
+            b, p = float(prob[0]), float(prob[1]); s=max(1e-12, b+p); b/=s; p/=s
+            sc=1.0-pT; return [b*sc, p*sc, pT]
+        return None
+    except Exception as e:
+        logger.warning("LGBM inference failed: %s", e); return None
+
+# ========= 集成主體（v9） =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str, float]] = None) -> List[float]:
-    # 基底：理論 + RNN/XGB/LGBM
+    # 0) 基底
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq); pr_xgb = xgb_predict(seq); pr_lgb = lgbm_predict(seq)
-    w_rule = float(os.getenv("RULE_W", "0.30"))
+
+    w_rule = float(os.getenv("RULE_W", "0.28"))
     w_rnn  = float(os.getenv("RNN_W",  "0.22"))
     w_xgb  = float(os.getenv("XGB_W",  "0.22"))
-    w_lgb  = float(os.getenv("LGBM_W", "0.26"))
+    w_lgb  = float(os.getenv("LGBM_W", "0.28"))
+
     total = w_rule + (w_rnn if pr_rnn else 0) + (w_xgb if pr_xgb else 0) + (w_lgb if pr_lgb else 0)
     base = [w_rule*rule[i] for i in range(3)]
     if pr_rnn: base = [base[i] + w_rnn*pr_rnn[i] for i in range(3)]
@@ -498,7 +499,7 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     if pr_lgb: base = [base[i] + w_lgb*pr_lgb[i] for i in range(3)]
     probs = [b / max(total, 1e-9) for b in base]
 
-    # 多來源訊號（傳統）
+    # 1) 傳統輔助
     REC_WIN = int(os.getenv("REC_WIN", "16"))
     p_rec  = recent_freq(seq, REC_WIN)
     p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
@@ -506,36 +507,33 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     p_mkv2 = markov2_next_prob(seq, float(os.getenv("MKV2_DECAY","0.985")))
     p_mkv3 = markov3_next_prob(seq, float(os.getenv("MKV3_DECAY","0.99")))
 
-    # 震盪專家
-    p_alt   = alt_expert(seq)
-    p_pair  = pair_alt_expert(seq)
-    p_rl    = runlen_expert(seq, win=max(10, REC_WIN))
+    # 2) 新專家
+    p_ng   = ngram_expert(seq)
+    p_sdb  = short_dragon_break_expert(seq)
 
-    # 震盪強度量測
+    # 3) 震盪量測
     altR = alt_ratio(seq, win=max(8, REC_WIN))
     per2 = period2_score(seq, win=max(8, REC_WIN))
     lens = run_lengths(seq, win=max(8, REC_WIN))
     rvar = 0.0 if not lens else sum((x-(sum(lens)/len(lens)))**2 for x in lens)/len(lens)
 
-    # 自適應權重（越震盪→越信專家與 Markov；越平順→長期/Momentum）
-    REC_W   = float(os.getenv("REC_W",  "0.20"))
-    LONG_W  = float(os.getenv("LONG_W", "0.22"))
-    MKV1_W  = float(os.getenv("MKV_W",  "0.16"))
-    MKV2_W  = float(os.getenv("MKV2_W", "0.14"))
+    # 4) 權重（自適應 + 可覆寫）
+    REC_W   = float(os.getenv("REC_W",  "0.18"))
+    LONG_W  = float(os.getenv("LONG_W", "0.20"))
+    MKV1_W  = float(os.getenv("MKV_W",  "0.14"))
+    MKV2_W  = float(os.getenv("MKV2_W", "0.12"))
     MKV3_W  = float(os.getenv("MKV3_W", "0.08"))
-    ALT_W   = float(os.getenv("ALT_W",  "0.12"))
-    PAIR_W  = float(os.getenv("PAIR_W", "0.12"))
-    RL_W    = float(os.getenv("RL_W",   "0.12"))
+    NGRAM_W = float(os.getenv("NGRAM_W","0.16"))
+    SDB_W   = float(os.getenv("SDB_W",  "0.14"))
     PRIOR_W = float(os.getenv("PRIOR_W","0.08"))
 
-    osc = min(1.0, 0.6*altR + 0.4*per2)
-    mkv_amp = 1.0 + 0.6*osc
-    exp_amp = 1.0 + 0.8*osc
-    long_cut = max(0.5, 1.0 - 0.7*osc)
-    REC_W   *= (1.0 + 0.3*osc)
-    LONG_W  *= long_cut
-    MKV1_W  *= mkv_amp; MKV2_W *= mkv_amp; MKV3_W *= (mkv_amp*0.9)
-    ALT_W   *= exp_amp; PAIR_W *= exp_amp; RL_W *= (exp_amp*0.9)
+    osc = min(1.0, 0.6*altR + 0.4*per2)  # 0~1
+    # 震盪越高 → 提高 n-gram/SDB/Markov；降低長期
+    scale = 1.0 + 0.7*osc
+    REC_W  *= (1.0 + 0.2*osc)
+    LONG_W *= max(0.5, 1.0 - 0.6*osc)
+    MKV1_W *= scale; MKV2_W *= scale; MKV3_W *= (scale*0.9)
+    NGRAM_W*= (scale*1.1); SDB_W *= (scale*1.1)
 
     if weight_overrides:
         REC_W   = weight_overrides.get("REC_W",  REC_W)
@@ -543,30 +541,44 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
         MKV1_W  = weight_overrides.get("MKV_W",  MKV1_W)
         PRIOR_W = weight_overrides.get("PRIOR_W",PRIOR_W)
 
-    # 融合
-    def blend(p, q, w): return [(1-w)*p[i] + w*q[i] for i in range(3)]
-    probs = blend(probs, p_rec,  REC_W)
-    probs = blend(probs, p_long, LONG_W)
-    probs = blend(probs, p_mkv1, MKV1_W)
-    probs = blend(probs, p_mkv2, MKV2_W)
-    probs = blend(probs, p_mkv3, MKV3_W)
-    probs = blend(probs, p_alt,  ALT_W)
-    probs = blend(probs, p_pair, PAIR_W)
-    probs = blend(probs, p_rl,   RL_W)
-    probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
+    # 5) 融合
+    def B(p,q,w): return [(1-w)*p[i] + w*q[i] for i in range(3)]
+    probs = B(probs, p_rec,  REC_W)
+    probs = B(probs, p_long, LONG_W)
+    probs = B(probs, p_mkv1, MKV1_W)
+    probs = B(probs, p_mkv2, MKV2_W)
+    probs = B(probs, p_mkv3, MKV3_W)
+    probs = B(probs, p_ng,   NGRAM_W)
+    probs = B(probs, p_sdb,  SDB_W)
+    probs = B(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
 
-    # 安全處理
+    # 6) Oscillation Flip Bias（防“複誦上一手”）
+    if len(seq) >= 2 and (altR >= float(os.getenv("FLIP_ALT_TH","0.55")) or per2 >= float(os.getenv("FLIP_PER2_TH","0.35"))):
+        # 找最後一個非 T 的手
+        last = None
+        for x in reversed(seq):
+            if x in ("B","P"): last = x; break
+        if last:
+            flip_boost = float(os.getenv("FLIP_BIAS","0.10")) * (0.6*altR + 0.4*per2)  # 0~0.1+
+            p = probs[:]
+            if last == "B":
+                p[1] += flip_boost; p[0] = max(0.0, p[0]-flip_boost*0.8)
+            else:
+                p[0] += flip_boost; p[1] = max(0.0, p[1]-flip_boost*0.8)
+            s=sum(p); probs=[x/s for x in p]
+
+    # 7) 安全處理
     EPS = float(os.getenv("EPSILON_FLOOR", "0.06"))
     CAP = float(os.getenv("MAX_CAP", "0.88"))
     TAU = float(os.getenv("TEMP", "1.06"))
     probs = [min(CAP, max(EPS, p)) for p in probs]
-    s = sum(probs); probs = [p/s for p in probs]
-    ex = [pow(max(pi,1e-9), 1.0/TAU) for pi in probs]; s = sum(ex); probs = [e/s for e in ex]
+    probs = norm(probs)
+    probs = temperature_scale(probs, TAU)
 
-    # Regime + Momentum
+    # 8) Regime + Momentum
     probs = _apply_boosts_and_norm(probs, regime_boosts(seq))
     probs = _apply_boosts_and_norm(probs, momentum_boost(seq))
-    s = sum(probs); return [p/s for p in probs]
+    return norm(probs)
 
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
@@ -575,7 +587,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 @app.route("/", methods=["GET"])
 def index(): return "ok"
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v8-oscillation-experts")
+def health(): return jsonify(status="healthy", version="v9-short-dragon-fix")
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
 @app.route("/predict", methods=["POST"])
@@ -593,7 +605,7 @@ def predict():
         "recommendation": rec
     })
 
-# ========= Data I/O =========
+# ========= CSV I/O =========
 def append_round_csv(user_id: str, history_before: str, label: str) -> None:
     try:
         with open(DATA_CSV_PATH, "a", newline="", encoding="utf-8") as f:
@@ -646,8 +658,6 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
-USER_DRIFT:   Dict[str, Dict[str, float]] = {}  # 讓 PH state 也有
-
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
         "type": "bubble",
@@ -697,7 +707,6 @@ if USE_LINE and handler is not None:
     def handle_text(event):
         uid = event.source.user_id
         USER_HISTORY.setdefault(uid, []); USER_READY.setdefault(uid, False)
-        USER_RECS.setdefault(uid, []); USER_DRIFT.setdefault(uid, {'cum':0.0,'min':0.0,'cooldown':0.0})
         msg = "請使用下方按鈕輸入：莊/閒/和；按「開始分析」後才會給出下注建議。"
         line_bot_api.reply_message(event.reply_token,
             [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
@@ -708,7 +717,6 @@ if USE_LINE and handler is not None:
         data = (event.postback.data or "").upper()
         seq  = USER_HISTORY.get(uid, [])
         ready= USER_READY.get(uid, False)
-        USER_RECS.setdefault(uid, [])
 
         if data == "START":
             USER_READY[uid] = True
@@ -717,7 +725,7 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
         if data == "END":
-            USER_HISTORY[uid]=[]; USER_READY[uid]=False; USER_RECS[uid]=[]; USER_DRIFT[uid]={'cum':0.0,'min':0.0,'cooldown':0.0}
+            USER_HISTORY[uid]=[]; USER_READY[uid]=False
             line_bot_api.reply_message(event.reply_token,
                 [TextSendMessage(text="✅ 已結束分析，紀錄已清空。", quick_reply=quick_reply_bar()),
                  flex_buttons_card()])
@@ -741,29 +749,12 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
 
-        # PH 偵測
-        def _get(uid):
-            st = USER_DRIFT.get(uid)
-            if st is None: st={'cum':0.0,'min':0.0,'cooldown':0.0}; USER_DRIFT[uid]=st
-            return st
-        st = _get(uid)
-        # 更新 PH 狀態
-        REC_WIN_PH = int(os.getenv("REC_WIN_FOR_PH", "12"))
-        p_short = recent_freq(seq, REC_WIN_PH)
-        p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
-        D_t = js_divergence(p_short, p_long)
-        PH_DELTA=float(os.getenv("PH_DELTA","0.005")); PH_LAMBDA=float(os.getenv("PH_LAMBDA","0.08"))
-        st['cum'] += (D_t - PH_DELTA); st['min'] = min(st['min'], st['cum'])
-        drift_now=False
-        if (st['cum'] - st['min']) > PH_LAMBDA:
-            st['cum']=0.0; st['min']=0.0; st['cooldown']=float(os.getenv("DRIFT_STEPS","5")); drift_now=True
-        active = st['cooldown'] > 0.0
-        if active: st['cooldown'] = max(0.0, st['cooldown']-1.0)
-
+        # PH / 漂移
+        _, active = update_ph_state(uid, seq)
         overrides = None
         if active:
-            REC_W=float(os.getenv("REC_W","0.20")); LONG_W=float(os.getenv("LONG_W","0.22"))
-            MKV_W=float(os.getenv("MKV_W","0.16")); PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
+            REC_W=float(os.getenv("REC_W","0.18")); LONG_W=float(os.getenv("LONG_W","0.20"))
+            MKV_W=float(os.getenv("MKV_W","0.14")); PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
             SHORT_BOOST=float(os.getenv("PH_SHORT_BOOST","0.30"))
             LONG_CUT=float(os.getenv("PH_LONG_CUT","0.40")); MKV_CUT=float(os.getenv("PH_MKV_CUT","0.40"))
             PRIOR_KEEP=float(os.getenv("PH_PRIOR_KEEP","1.00"))
@@ -774,6 +765,7 @@ if USE_LINE and handler is not None:
         probs = ensemble_with_anti_stuck(seq, overrides)
         probs = _apply_bp_balance_regularizer(seq, probs)
         probs = _apply_side_repeat_penalty(uid, probs)
+
         nb = _maybe_no_bet(probs)
         if nb == 'N':
             msg = (f"已解析 {len(seq)} 手\n"
@@ -783,9 +775,10 @@ if USE_LINE and handler is not None:
                 [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
             return
 
-        rec = CLASS_ORDER[probs.index(max(probs))]
-        USER_RECS[uid].append(rec)
+        rec = recommend_from_probs(probs)
+        USER_RECS.setdefault(uid, []).append(rec)
         if len(USER_RECS[uid])>200: USER_RECS[uid]=USER_RECS[uid][-100:]
+
         suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
         msg = (f"已解析 {len(seq)} 手\n"
                f"機率：莊 {probs[0]:.3f}｜閒 {probs[1]:.3f}｜和 {probs[2]:.3f}\n"
