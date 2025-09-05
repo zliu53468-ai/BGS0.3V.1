@@ -221,7 +221,6 @@ def period2_score(seq: List[str], win:int=12) -> float:
     """量化 2 期交錯結構（簡化的自相關/二元交替）"""
     s = seq[-win:] if len(seq)>=win else seq
     if len(s) < 4: return 0.0
-    # 若連續的 pair 多為 '11' '22' 交替，視為高分
     pairs = [s[i:i+2] for i in range(0, len(s)-1, 1)]
     ok = 0; total = 0
     for i in range(1, len(pairs)):
@@ -399,7 +398,6 @@ def alt_expert(seq: List[str]) -> List[float]:
     if last == "B": p[1] = 1.0
     elif last == "P": p[0] = 1.0
     else:
-        # 上一手 T → 取最近非 T
         for x in reversed(seq[:-1]):
             if x != "T": last=x; break
         if last == "B": p[1]=1.0
@@ -414,10 +412,10 @@ def pair_alt_expert(seq: List[str]) -> List[float]:
     if len(last2) < 2: return [1/3,1/3,1/3]
     a, b = last2[-2], last2[-1]
     p = [1e-6,1e-6,_estimate_tie_prob(seq)]
-    if a == b:   # e.g., BB，預期轉向到 P
+    if a == b:
         if b == "B": p[1]=1.0
         else: p[0]=1.0
-    else:        # e.g., BP，預期本手補成 PP
+    else:
         if b == "B": p[0]=1.0
         else: p[1]=1.0
     S=sum(p); return [x/S for x in p]
@@ -432,12 +430,10 @@ def runlen_expert(seq: List[str], win:int=12) -> List[float]:
     last, rlen = last_run(seq)
     base = [1e-6,1e-6,_estimate_tie_prob(seq)]
     if mean <= 1.6 and var <= 0.6:  # 高震盪
-        # 偏翻邊
         if last == "B": base[1]=1.0
         elif last == "P": base[0]=1.0
         else: base[0]=base[1]=0.5
     else:
-        # 偏續龍（若 rlen >=2 更強）
         if last == "B": base[0]=1.0 if rlen>=2 else 0.7; base[1]=1.0-base[0]-base[2]
         elif last == "P": base[1]=1.0 if rlen>=2 else 0.7; base[0]=1.0-base[1]-base[2]
         else: base[0]=base[1]=0.5
@@ -532,11 +528,10 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     RL_W    = float(os.getenv("RL_W",   "0.12"))
     PRIOR_W = float(os.getenv("PRIOR_W","0.08"))
 
-    # 放大因子：交錯強、period2 強 → 專家加權提升
-    osc = min(1.0, 0.6*altR + 0.4*per2)  # 0~1
+    osc = min(1.0, 0.6*altR + 0.4*per2)
     mkv_amp = 1.0 + 0.6*osc
     exp_amp = 1.0 + 0.8*osc
-    long_cut = max(0.5, 1.0 - 0.7*osc)   # 震盪越強，長期越縮
+    long_cut = max(0.5, 1.0 - 0.7*osc)
     REC_W   *= (1.0 + 0.3*osc)
     LONG_W  *= long_cut
     MKV1_W  *= mkv_amp; MKV2_W *= mkv_amp; MKV3_W *= (mkv_amp*0.9)
@@ -549,6 +544,7 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
         PRIOR_W = weight_overrides.get("PRIOR_W",PRIOR_W)
 
     # 融合
+    def blend(p, q, w): return [(1-w)*p[i] + w*q[i] for i in range(3)]
     probs = blend(probs, p_rec,  REC_W)
     probs = blend(probs, p_long, LONG_W)
     probs = blend(probs, p_mkv1, MKV1_W)
@@ -557,19 +553,20 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs = blend(probs, p_alt,  ALT_W)
     probs = blend(probs, p_pair, PAIR_W)
     probs = blend(probs, p_rl,   RL_W)
-    probs = blend(probs, rule,   PRIOR_W)
+    probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
 
     # 安全處理
     EPS = float(os.getenv("EPSILON_FLOOR", "0.06"))
     CAP = float(os.getenv("MAX_CAP", "0.88"))
     TAU = float(os.getenv("TEMP", "1.06"))
     probs = [min(CAP, max(EPS, p)) for p in probs]
-    probs = norm(probs); probs = temperature_scale(probs, TAU)
+    s = sum(probs); probs = [p/s for p in probs]
+    ex = [pow(max(pi,1e-9), 1.0/TAU) for pi in probs]; s = sum(ex); probs = [e/s for e in ex]
 
     # Regime + Momentum
     probs = _apply_boosts_and_norm(probs, regime_boosts(seq))
     probs = _apply_boosts_and_norm(probs, momentum_boost(seq))
-    return norm(probs)
+    s = sum(probs); return [p/s for p in probs]
 
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
@@ -649,6 +646,7 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
+USER_DRIFT:   Dict[str, Dict[str, float]] = {}  # 讓 PH state 也有
 
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
@@ -657,7 +655,8 @@ def flex_buttons_card() -> 'FlexSendMessage':
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
                 {"type": "text", "text": "🤖 請開始輸入歷史數據", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "先輸入莊/閒/和；按「開始分析」後才會給出下注建議。", "wrap": True, "size": "sm", "color": "#555"},
+                {"type": "text", "text": "先輸入莊/閒/和；按「開始分析」後才會給出下注建議。", 
+                 "wrap": True, "size": "sm", "color": "#555555"},
                 {"type": "box", "layout": "horizontal", "spacing": "sm",
                  "contents": [
                     {"type":"button","style":"primary","color":"#E74C3C","action":{"type":"postback","label":"莊","data":"B"}},
@@ -698,7 +697,7 @@ if USE_LINE and handler is not None:
     def handle_text(event):
         uid = event.source.user_id
         USER_HISTORY.setdefault(uid, []); USER_READY.setdefault(uid, False)
-        USER_RECS.setdefault(uid, []); _get_drift_state(uid)
+        USER_RECS.setdefault(uid, []); USER_DRIFT.setdefault(uid, {'cum':0.0,'min':0.0,'cooldown':0.0})
         msg = "請使用下方按鈕輸入：莊/閒/和；按「開始分析」後才會給出下注建議。"
         line_bot_api.reply_message(event.reply_token,
             [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
@@ -732,7 +731,8 @@ if USE_LINE and handler is not None:
         # 追加資料 & 落地
         history_before = "".join(seq)
         seq.append(data); USER_HISTORY[uid] = seq
-        append_round_csv(uid, history_before, data)
+        try: append_round_csv(uid, history_before, data)
+        except Exception as e: logger.warning("csv log failed: %s", e)
 
         if not ready:
             s = "".join(seq[-20:])
@@ -741,8 +741,25 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
 
-        drift_now = update_ph_state(uid, seq); active = in_drift(uid)
-        if active: consume_cooldown(uid)
+        # PH 偵測
+        def _get(uid):
+            st = USER_DRIFT.get(uid)
+            if st is None: st={'cum':0.0,'min':0.0,'cooldown':0.0}; USER_DRIFT[uid]=st
+            return st
+        st = _get(uid)
+        # 更新 PH 狀態
+        REC_WIN_PH = int(os.getenv("REC_WIN_FOR_PH", "12"))
+        p_short = recent_freq(seq, REC_WIN_PH)
+        p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+        D_t = js_divergence(p_short, p_long)
+        PH_DELTA=float(os.getenv("PH_DELTA","0.005")); PH_LAMBDA=float(os.getenv("PH_LAMBDA","0.08"))
+        st['cum'] += (D_t - PH_DELTA); st['min'] = min(st['min'], st['cum'])
+        drift_now=False
+        if (st['cum'] - st['min']) > PH_LAMBDA:
+            st['cum']=0.0; st['min']=0.0; st['cooldown']=float(os.getenv("DRIFT_STEPS","5")); drift_now=True
+        active = st['cooldown'] > 0.0
+        if active: st['cooldown'] = max(0.0, st['cooldown']-1.0)
+
         overrides = None
         if active:
             REC_W=float(os.getenv("REC_W","0.20")); LONG_W=float(os.getenv("LONG_W","0.22"))
@@ -753,6 +770,7 @@ if USE_LINE and handler is not None:
             overrides={"REC_W":REC_W*(1.0+SHORT_BOOST),"LONG_W":max(0.0,LONG_W*(1.0-LONG_CUT)),
                        "MKV_W":max(0.0,MKV_W*(1.0-MKV_CUT)),"PRIOR_W":PRIOR_W*PRIOR_KEEP}
 
+        # 推論
         probs = ensemble_with_anti_stuck(seq, overrides)
         probs = _apply_bp_balance_regularizer(seq, probs)
         probs = _apply_side_repeat_penalty(uid, probs)
