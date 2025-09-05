@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — Ensemble(Full-history) + Regime Gating + PH Drift
+BGS LINE Bot backend — v6
+Ensemble(Full-history) + Regime Gating + PH Drift
++ Anti one-sided recommendations（連續同向抑制 + B/P 回正 + 可選觀望）
 + CSV資料落地 + /export 匯出 + /reload 熱重載
+
 Routes:
 - /, /health, /healthz
 - /predict
-- /export?n=1000   下載最近 n 筆資料 (CSV)
-- /reload          重新載入模型(POST，需 RELOAD_TOKEN)
-- /line-webhook    (莊/閒/和/開始分析/結束分析)
+- /export?n=1000
+- /reload           (POST，需 X-Reload-Token)
+- /line-webhook     (莊/閒/和/開始分析/結束分析)
 """
 import os, csv, time, logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,8 +27,17 @@ os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
 
 RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")  # /reload 用
 RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
-XGB_PATH = os.getenv("XGB_PATH", "")
-LGBM_PATH = os.getenv("LGBM_PATH", "")
+XGB_PATH = os.getenv("XGB_PATH", "/opt/models/xgb.json")
+LGBM_PATH = os.getenv("LGBM_PATH", "/opt/models/lgbm.txt")
+
+# 防單邊建議（可調）
+SIDE_REPEAT_TH   = int(os.getenv("SIDE_REPEAT_TH", "3"))
+SIDE_REPEAT_PEN  = float(os.getenv("SIDE_REPEAT_PEN", "0.15"))
+SIDE_REPEAT_MAX  = int(os.getenv("SIDE_REPEAT_MAX", "3"))
+BP_BAL_WIN       = int(os.getenv("BP_BAL_WIN", "30"))
+BP_BAL_STRENGTH  = float(os.getenv("BP_BAL_STRENGTH", "0.20"))
+ALLOW_NO_BET     = os.getenv("ALLOW_NO_BET", "false").lower() == "true"
+MIN_GAP          = float(os.getenv("MIN_GAP", "0.06"))
 
 # ========= 基礎常數 =========
 CLASS_ORDER = ("B", "P", "T")
@@ -46,7 +58,7 @@ def parse_history(payload) -> List[str]:
             if up in CLASS_ORDER: seq.append(up)
     return seq
 
-# ========= 可選模型：安全匯入（沒裝也能啟動） =========
+# ========= 可選模型：安全匯入 =========
 try:
     import torch  # type: ignore
     import torch.nn as tnn  # type: ignore
@@ -96,7 +108,6 @@ def load_models() -> None:
             RNN_MODEL = None
     else:
         RNN_MODEL = None
-
     # XGB
     if xgb is not None and XGB_PATH and os.path.exists(XGB_PATH):
         try:
@@ -109,7 +120,6 @@ def load_models() -> None:
             XGB_MODEL = None
     else:
         XGB_MODEL = None
-
     # LGBM
     if lgb is not None and LGBM_PATH and os.path.exists(LGBM_PATH):
         try:
@@ -146,7 +156,7 @@ def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
         gamma = float(os.getenv("EW_GAMMA", "0.96"))
     wB = wP = wT = 0.0
     w   = 1.0
-    for r in reversed(seq):  # 由近到遠，遠期乘上 gamma
+    for r in reversed(seq):
         if r == "B": wB += w
         elif r == "P": wP += w
         else: wT += w
@@ -184,7 +194,6 @@ def xgb_predict(seq: List[str]) -> Optional[List[float]]:
         if pad > 0: vec = [0.0]*pad + vec
         dmatrix = xgb.DMatrix(np.array([vec], dtype=float))
         prob = XGB_MODEL.predict(dmatrix)[0]
-
         if isinstance(prob, (list, tuple)) and len(prob) == 3:
             return [float(prob[0]), float(prob[1]), float(prob[2])]
         if isinstance(prob, (list, tuple)) and len(prob) == 2:
@@ -205,7 +214,6 @@ def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
         pad = K*3 - len(vec)
         if pad > 0: vec = [0.0]*pad + vec
         prob = LGBM_MODEL.predict([vec])[0]
-
         if isinstance(prob, (list, tuple)) and len(prob) == 3:
             return [float(prob[0]), float(prob[1]), float(prob[2])]
         if isinstance(prob, (list, tuple)) and len(prob) == 2:
@@ -337,6 +345,17 @@ def _get_drift_state(uid: str) -> Dict[str, float]:
         USER_DRIFT[uid] = st
     return st
 
+def recent_freq(seq: List[str], win: int) -> List[float]:
+    if not seq:
+        return [1/3, 1/3, 1/3]
+    cut = seq[-win:] if win>0 else seq
+    alpha = float(os.getenv("LAPLACE", "0.5"))
+    nB = cut.count("B") + alpha
+    nP = cut.count("P") + alpha
+    nT = cut.count("T") + alpha
+    tot = max(1, len(cut)) + 3*alpha
+    return [nB/tot, nP/tot, nT/tot]
+
 def update_ph_state(uid: str, seq: List[str]) -> bool:
     if not seq:
         return False
@@ -357,7 +376,7 @@ def update_ph_state(uid: str, seq: List[str]) -> bool:
         st['cum'] = 0.0
         st['min'] = 0.0
         st['cooldown'] = DRIFT_STEPS
-        logger.info(f"[PH] drift triggered for {uid}: D_t={D_t:.4f}")
+        logger.info(f"[PH] drift triggered for {uid}")
         return True
     return False
 
@@ -371,18 +390,7 @@ def consume_cooldown(uid: str) -> bool:
 def in_drift(uid: str) -> bool:
     return _get_drift_state(uid)['cooldown'] > 0.0
 
-# ========= 短期/Markov/工具 =========
-def recent_freq(seq: List[str], win: int) -> List[float]:
-    if not seq:
-        return [1/3, 1/3, 1/3]
-    cut = seq[-win:] if win>0 else seq
-    alpha = float(os.getenv("LAPLACE", "0.5"))
-    nB = cut.count("B") + alpha
-    nP = cut.count("P") + alpha
-    nT = cut.count("T") + alpha
-    tot = max(1, len(cut)) + 3*alpha
-    return [nB/tot, nP/tot, nT/tot]
-
+# ========= Markov 與工具 =========
 def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
     if not seq or len(seq) < 2:
         return [1/3, 1/3, 1/3]
@@ -415,21 +423,63 @@ def temperature_scale(p: List[float], tau: float) -> List[float]:
     s  = sum(ex)
     return [e/s for e in ex]
 
-# ========= 集成（全盤考量）+ Anti-Stuck + Regime/PH 調權 =========
+# ========= 防單邊：B/P 回正 + 連續同向抑制 + 觀望 =========
+USER_RECS: Dict[str, List[str]] = {}
+
+def _apply_bp_balance_regularizer(seq: List[str], probs: List[float]) -> List[float]:
+    if not seq: return probs
+    s = seq[-BP_BAL_WIN:] if len(seq) >= BP_BAL_WIN else seq
+    bp = [ch for ch in s if ch in ("B","P")]
+    if not bp or len(bp) < max(6, BP_BAL_WIN//3):
+        return probs
+    b = bp.count("B"); p = bp.count("P")
+    tot = b + p
+    rb = b / tot; rp = p / tot
+    thr = 0.62
+    strength = BP_BAL_STRENGTH
+    p2 = probs[:]
+    if rb > thr and probs[0] >= probs[1]:
+        scale = min(1.0, (rb - 0.5) / 0.5)
+        p2[0] *= (1.0 - strength * scale)
+    if rp > thr and probs[1] >= probs[0]:
+        scale = min(1.0, (rp - 0.5) / 0.5)
+        p2[1] *= (1.0 - strength * scale)
+    return norm(p2)
+
+def _apply_side_repeat_penalty(uid: str, probs: List[float]) -> List[float]:
+    recs = USER_RECS.get(uid, [])
+    if not recs: return probs
+    last = recs[-1]; k = 1; i = len(recs) - 2
+    while i >= 0 and recs[i] == last:
+        k += 1; i -= 1
+    if k >= SIDE_REPEAT_TH:
+        over = min(SIDE_REPEAT_MAX, k - SIDE_REPEAT_TH + 1)
+        factor = (1.0 - SIDE_REPEAT_PEN) ** over
+        p = probs[:]
+        if last == "B": p[0] *= factor
+        elif last == "P": p[1] *= factor
+        else: p[2] *= factor
+        return norm(p)
+    return probs
+
+def _maybe_no_bet(probs: List[float]) -> Optional[str]:
+    if not ALLOW_NO_BET:
+        return None
+    a = sorted(probs, reverse=True)
+    return 'N' if a[0] - a[1] < MIN_GAP else None
+
+# ========= 集成（全盤考量） =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str, float]] = None) -> List[float]:
-    # 1) 個別模型
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq)
     pr_xgb = xgb_predict(seq)
     pr_lgb = lgbm_predict(seq)
 
-    # 2) 模型權重
     w_rule = float(os.getenv("RULE_W", "0.40"))
     w_rnn  = float(os.getenv("RNN_W",  "0.25"))
     w_xgb  = float(os.getenv("XGB_W",  "0.20"))
     w_lgb  = float(os.getenv("LGBM_W", "0.15"))
 
-    # 3) 初步融合
     total = w_rule + (w_rnn if pr_rnn else 0) + (w_xgb if pr_xgb else 0) + (w_lgb if pr_lgb else 0)
     base = [w_rule*rule[i] for i in range(3)]
     if pr_rnn: base = [base[i] + w_rnn*pr_rnn[i] for i in range(3)]
@@ -437,13 +487,11 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     if pr_lgb: base = [base[i] + w_lgb*pr_lgb[i] for i in range(3)]
     probs = [b / max(total, 1e-9) for b in base]
 
-    # 4) 全盤訊號融合：短期 + 長期EW + Markov + 先驗回拉
     REC_WIN = int(os.getenv("REC_WIN", "16"))
     REC_W   = float(os.getenv("REC_W", "0.25"))
     LONG_W  = float(os.getenv("LONG_W", "0.35"))
     MKV_W   = float(os.getenv("MKV_W",  "0.25"))
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
-
     if weight_overrides:
         REC_W  = weight_overrides.get("REC_W",  REC_W)
         LONG_W = weight_overrides.get("LONG_W", LONG_W)
@@ -459,7 +507,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs = blend(probs, p_mkv,  MKV_W)
     probs = blend(probs, rule,   PRIOR_W)
 
-    # 5) 安全處理
     EPS   = float(os.getenv("EPSILON_FLOOR", "0.06"))
     CAP   = float(os.getenv("MAX_CAP", "0.88"))
     TAU   = float(os.getenv("TEMP", "1.10"))
@@ -467,7 +514,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs = norm(probs)
     probs = temperature_scale(probs, TAU)
 
-    # 6) Regime gating（路型乘法微調）
     boosts = regime_boosts(seq)
     probs  = _apply_boosts_and_norm(probs, boosts)
     return norm(probs)
@@ -480,7 +526,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v5-ensemble-regime-ph+io")
+def health(): return jsonify(status="healthy", version="v6-anti-one-sided")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -490,7 +536,9 @@ def predict():
     data: Dict[str, Any] = request.get_json(silent=True) or {}
     seq = parse_history(data.get("history"))
     probs = ensemble_with_anti_stuck(seq)
-    rec   = recommend_from_probs(probs)
+    probs = _apply_bp_balance_regularizer(seq, probs)   # 新增：回正
+    nb = _maybe_no_bet(probs)
+    rec = 'N' if nb == 'N' else recommend_from_probs(probs)
     labels = list(CLASS_ORDER)
     return jsonify({
         "history_len": len(seq),
@@ -509,7 +557,6 @@ def append_round_csv(user_id: str, history_before: str, label: str) -> None:
 
 @app.route("/export", methods=["GET"])
 def export_csv():
-    """下載最近 n 筆資料（預設 1000）"""
     n = int(request.args.get("n", "1000"))
     rows: List[List[str]] = []
     try:
@@ -520,10 +567,7 @@ def export_csv():
     except Exception as e:
         logger.warning("export read failed: %s", e)
         rows = []
-    # 包含表頭
-    output = "user_id,ts,history_before,label\n" + "\n".join(
-        [",".join(r) for r in rows]
-    )
+    output = "user_id,ts,history_before,label\n" + "\n".join([",".join(r) for r in rows])
     return Response(
         output,
         mimetype="text/csv",
@@ -538,7 +582,7 @@ def reload_models():
     load_models()
     return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
 
-# ========= LINE Webhook（按鈕互動流程 + PH 漂移自動加權 + CSV落地） =========
+# ========= LINE Webhook =========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 
@@ -565,7 +609,6 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
-USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT  # 同一 dict
 
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
@@ -618,11 +661,13 @@ def line_webhook():
 
 if USE_LINE and handler is not None:
     from linebot.models import MessageEvent, TextMessage, TextSendMessage, PostbackEvent  # type: ignore
+
     @handler.add(MessageEvent, message=TextMessage)
     def handle_text(event):
         uid = event.source.user_id
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
+        USER_RECS.setdefault(uid, [])
         _get_drift_state(uid)  # 初始化 PH 狀態
         msg = "請使用下方按鈕輸入：莊/閒/和；按「開始分析」後才會給出下注建議。"
         line_bot_api.reply_message(
@@ -636,6 +681,7 @@ if USE_LINE and handler is not None:
         data = (event.postback.data or "").upper()
         seq  = USER_HISTORY.get(uid, [])
         ready= USER_READY.get(uid, False)
+        USER_RECS.setdefault(uid, [])
 
         if data == "START":
             USER_READY[uid] = True
@@ -649,6 +695,7 @@ if USE_LINE and handler is not None:
         if data == "END":
             USER_HISTORY[uid] = []
             USER_READY[uid]   = False
+            USER_RECS[uid]    = []
             USER_DRIFT[uid]   = {'cum':0.0,'min':0.0,'cooldown':0.0}
             line_bot_api.reply_message(
                 event.reply_token,
@@ -666,7 +713,7 @@ if USE_LINE and handler is not None:
             return
 
         # ===== 累積牌路 & CSV 落地 =====
-        history_before = "".join(seq)  # 追加前的完整歷史
+        history_before = "".join(seq)
         seq.append(data); USER_HISTORY[uid] = seq
         append_round_csv(uid, history_before, data)
 
@@ -680,7 +727,7 @@ if USE_LINE and handler is not None:
             )
             return
 
-        # === 變化點偵測（PH）：更新狀態，必要時啟動 cooldown ===
+        # === 變化點偵測（PH） ===
         drift_now = update_ph_state(uid, seq)
         active = in_drift(uid)
         if active:
@@ -704,9 +751,32 @@ if USE_LINE and handler is not None:
                 "PRIOR_W": PRIOR_W * PRIOR_KEEP
             }
 
-        # 已開始分析：做集成
+        # === 集成 ===
         probs = ensemble_with_anti_stuck(seq, overrides)
-        rec   = recommend_from_probs(probs)
+        # === 防單邊：B/P 回正 + 連續同向抑制 ===
+        probs = _apply_bp_balance_regularizer(seq, probs)
+        probs = _apply_side_repeat_penalty(uid, probs)
+        # === 可選觀望 ===
+        nb = _maybe_no_bet(probs)
+        if nb == 'N':
+            msg = (
+                f"已解析 {len(seq)} 手\n"
+                f"機率：莊 {probs[0]:.3f}｜閒 {probs[1]:.3f}｜和 {probs[2]:.3f}\n"
+                f"建議：觀望"
+            )
+            line_bot_api.reply_message(
+                event.reply_token,
+                [TextSendMessage(text=msg, quick_reply=quick_reply_bar()),
+                 flex_buttons_card()]
+            )
+            return
+
+        # === 產生建議 & 記錄建議序列 ===
+        rec = recommend_from_probs(probs)
+        USER_RECS[uid].append(rec)
+        if len(USER_RECS[uid]) > 200:
+            USER_RECS[uid] = USER_RECS[uid][-100:]
+
         suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
         msg = (
             f"已解析 {len(seq)} 手\n"
