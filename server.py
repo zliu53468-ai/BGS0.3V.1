@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — Buttons only + Ensemble voting (Full-history) + Anti-stuck
+BGS LINE Bot backend — Buttons only + Ensemble (Full-history) + Regime Gating + PH Drift
 Routes:
 - /, /health, /healthz
 - /predict
@@ -9,7 +9,7 @@ Routes:
 """
 
 import os, logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -19,8 +19,6 @@ logger = logging.getLogger("bgs-backend")
 # ========= 基礎常數 =========
 CLASS_ORDER = ("B", "P", "T")
 LAB_ZH = {"B": "莊", "P": "閒", "T": "和"}
-
-# 標準八副牌理論機率
 THEORETICAL_PROBS: Dict[str, float] = {"B": 0.458, "P": 0.446, "T": 0.096}
 
 # ========= 解析工具 =========
@@ -42,18 +40,18 @@ try:
     import torch  # type: ignore
     import torch.nn as tnn  # type: ignore
 except Exception:
-    torch = None  # type: ignore
-    tnn   = None  # type: ignore
+    torch = None
+    tnn   = None
 
 try:
     import xgboost as xgb  # type: ignore
 except Exception:
-    xgb = None  # type: ignore
+    xgb = None
 
 try:
     import lightgbm as lgb  # type: ignore
 except Exception:
-    lgb = None  # type: ignore
+    lgb = None
 
 if tnn is not None:
     class TinyRNN(tnn.Module):  # type: ignore
@@ -199,9 +197,173 @@ def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
         logger.warning("LGBM inference failed: %s", e)
         return None
 
-# ========= 頻率/Markov/工具 =========
+# ========= 路型偵測（Regime gating） =========
+def last_run(seq: List[str]) -> Tuple[str, int]:
+    if not seq: return ("", 0)
+    ch = seq[-1]
+    i = len(seq) - 2
+    n = 1
+    while i >= 0 and seq[i] == ch:
+        n += 1; i -= 1
+    return (ch, n)
+
+def run_lengths(seq: List[str], win: int = 14) -> List[int]:
+    if not seq: return []
+    s = seq[-win:] if win>0 else seq[:]
+    lens = []
+    cur = 1
+    for i in range(1, len(s)):
+        if s[i] == s[i-1]:
+            cur += 1
+        else:
+            lens.append(cur); cur = 1
+    lens.append(cur)
+    return lens
+
+def is_zigzag(seq: List[str], k: int = 6) -> bool:
+    s = seq[-k:] if len(seq) >= k else seq
+    if len(s) < 4: return False
+    alt = all(s[i] != s[i-1] for i in range(1, len(s)))
+    if alt: return True
+    if len(s) % 2 == 0:
+        pairs = [s[i:i+2] for i in range(0, len(s), 2)]
+        if all(len(p)==2 and p[0]==p[1] for p in pairs):
+            if all(pairs[i][0] != pairs[i-1][0] for i in range(1, len(pairs))):
+                return True
+    return False
+
+def is_qijiao(seq: List[str], win: int = 20, tol: float = 0.1) -> bool:
+    s = seq[-win:] if len(seq) >= win else seq
+    if not s: return False
+    b = s.count("B"); p = s.count("P"); t = s.count("T")
+    tot_bp = max(1, b+p)
+    ratio = b / tot_bp
+    return (abs(ratio - 0.5) <= tol) and (t <= max(1, int(0.15*len(s))))
+
+def is_oscillating(seq: List[str], win: int = 12) -> bool:
+    lens = run_lengths(seq, win)
+    if not lens: return False
+    avg = sum(lens)/len(lens)
+    return 1.0 <= avg <= 2.1
+
+def shape_1room2hall(seq: List[str], win: int = 18) -> bool:
+    lens = run_lengths(seq, win)
+    if len(lens) < 6: return False
+    if not all(1 <= x <= 2 for x in lens[-6:]): return False
+    alt = all((lens[i]%2) != (lens[i-1]%2) for i in range(1, min(len(lens), 10)))
+    return alt
+
+def shape_2room1hall(seq: List[str], win: int = 18) -> bool:
+    lens = run_lengths(seq, win)
+    if len(lens) < 5: return False
+    last = lens[-6:] if len(lens)>=6 else lens
+    cnt_1 = sum(1 for x in last if x==1)
+    cnt_2 = sum(1 for x in last if x==2)
+    return (cnt_1 + cnt_2) >= max(4, int(0.7*len(last))) and cnt_2 >= cnt_1
+
+def regime_boosts(seq: List[str]) -> List[float]:
+    if not seq:
+        return [1.0, 1.0, 1.0]
+    b = [1.0, 1.0, 1.0]  # 對應 [B,P,T]
+    last, rlen = last_run(seq)
+    DRAGON_TH    = int(os.getenv("BOOST_DRAGON_LEN", "4"))
+    BOOST_DRAGON = float(os.getenv("BOOST_DRAGON", "1.12"))
+    BOOST_ALT    = float(os.getenv("BOOST_ALT", "1.08"))
+    BOOST_QJ     = float(os.getenv("BOOST_QIJIAO", "1.05"))
+    BOOST_ROOM   = float(os.getenv("BOOST_ROOM", "1.06"))
+    BOOST_T      = float(os.getenv("BOOST_T", "1.03"))
+
+    if rlen >= DRAGON_TH:
+        if last == "B": b[0] *= BOOST_DRAGON
+        elif last == "P": b[1] *= BOOST_DRAGON
+        else: b[2] *= BOOST_DRAGON
+
+    if is_zigzag(seq, k=6) or is_oscillating(seq, win=12) or shape_1room2hall(seq):
+        if seq[-1] == "B": b[1] *= BOOST_ALT
+        elif seq[-1] == "P": b[0] *= BOOST_ALT
+
+    if shape_2room1hall(seq):
+        s = seq[-10:] if len(seq)>=10 else seq
+        if s.count("B") > s.count("P"): b[0] *= BOOST_ROOM
+        elif s.count("P") > s.count("B"): b[1] *= BOOST_ROOM
+
+    if is_qijiao(seq):
+        b[0] *= BOOST_QJ; b[1] *= BOOST_QJ
+
+    ew = exp_decay_freq(seq)
+    if ew[2] > THEORETICAL_PROBS["T"] * 1.15:
+        b[2] *= BOOST_T
+
+    return b
+
+def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
+    p = [max(1e-12, probs[i] * boosts[i]) for i in range(3)]
+    s = sum(p)
+    return [x / s for x in p]
+
+# ========= PH 變化點偵測（Page-Hinkley / CUSUM 風格） =========
+def js_divergence(p: List[float], q: List[float]) -> float:
+    """Jensen-Shannon divergence，值域[0, ln2]；數值穩定小修正"""
+    import math
+    eps = 1e-12
+    m = [(p[i]+q[i])/2.0 for i in range(3)]
+    def _kl(a, b):
+        return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
+    return 0.5*_kl(p, m) + 0.5*_kl(q, m)
+
+# 每位用戶各自維護 PH 狀態
+USER_DRIFT: Dict[str, Dict[str, float]] = {}  # keys: 'cum','min','cooldown'
+
+def _get_drift_state(uid: str) -> Dict[str, float]:
+    st = USER_DRIFT.get(uid)
+    if st is None:
+        st = {'cum': 0.0, 'min': 0.0, 'cooldown': 0.0}
+        USER_DRIFT[uid] = st
+    return st
+
+def update_ph_state(uid: str, seq: List[str]) -> bool:
+    """
+    以「短期 vs 長期」的分佈差異 D_t 當成觀測值，跑 Page-Hinkley：
+      cum_t = cum_{t-1} + (D_t - PH_DELTA)
+      m_t   = min(m_{t-1}, cum_t)
+      如果 (cum_t - m_t) > PH_LAMBDA → 漂移觸發，cooldown = DRIFT_STEPS
+    回傳是否觸發漂移。
+    """
+    if not seq:
+        return False
+    st = _get_drift_state(uid)
+    REC_WIN = int(os.getenv("REC_WIN_FOR_PH", "12"))
+    p_short = recent_freq(seq, REC_WIN)
+    p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+    D_t     = js_divergence(p_short, p_long)  # 單一標量觀測
+
+    PH_DELTA   = float(os.getenv("PH_DELTA", "0.005"))   # 允許的日常擾動
+    PH_LAMBDA  = float(os.getenv("PH_LAMBDA", "0.08"))   # 觸發門檻（約 0.08~0.15 合理）
+    DRIFT_STEPS= float(os.getenv("DRIFT_STEPS", "5"))    # 漂移後強化短期的持續手數
+
+    st['cum'] += (D_t - PH_DELTA)
+    st['min']  = min(st['min'], st['cum'])
+
+    if (st['cum'] - st['min']) > PH_LAMBDA:
+        st['cum'] = 0.0
+        st['min'] = 0.0
+        st['cooldown'] = DRIFT_STEPS
+        logger.info(f"[PH] drift triggered for {uid}: D_t={D_t:.4f}")
+        return True
+    return False
+
+def consume_cooldown(uid: str) -> bool:
+    st = _get_drift_state(uid)
+    if st['cooldown'] > 0:
+        st['cooldown'] = max(0.0, st['cooldown'] - 1.0)
+        return True
+    return False
+
+def in_drift(uid: str) -> bool:
+    return _get_drift_state(uid)['cooldown'] > 0.0
+
+# ========= 短期/Markov/工具 =========
 def recent_freq(seq: List[str], win: int) -> List[float]:
-    """短期頻率（近 win 手 + Laplace）"""
     if not seq:
         return [1/3, 1/3, 1/3]
     cut = seq[-win:] if win>0 else seq
@@ -213,9 +375,6 @@ def recent_freq(seq: List[str], win: int) -> List[float]:
     return [nB/tot, nP/tot, nT/tot]
 
 def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
-    """
-    整段歷史的轉移矩陣（指數衰減加權），P(next=j) ∝ Σ_i C[i->j]
-    """
     if not seq or len(seq) < 2:
         return [1/3, 1/3, 1/3]
     if decay is None:
@@ -239,7 +398,6 @@ def norm(v: List[float]) -> List[float]:
     return [max(0.0, x)/s for x in v]
 
 def blend(a: List[float], b: List[float], w: float) -> List[float]:
-    # w: 權重給 b（0~1）
     return [ (1-w)*a[i] + w*b[i] for i in range(3) ]
 
 def temperature_scale(p: List[float], tau: float) -> List[float]:
@@ -248,21 +406,21 @@ def temperature_scale(p: List[float], tau: float) -> List[float]:
     s  = sum(ex)
     return [e/s for e in ex]
 
-# ========= 集成（全盤考量）+ Anti-Stuck =========
-def ensemble_with_anti_stuck(seq: List[str]) -> List[float]:
+# ========= 集成（全盤考量）+ Anti-Stuck + Regime/PH 調權 =========
+def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str, float]] = None) -> List[float]:
     # 1) 個別模型
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq)
     pr_xgb = xgb_predict(seq)
     pr_lgb = lgbm_predict(seq)
 
-    # 2) 權重（模型）
+    # 2) 模型權重
     w_rule = float(os.getenv("RULE_W", "0.40"))
     w_rnn  = float(os.getenv("RNN_W",  "0.25"))
     w_xgb  = float(os.getenv("XGB_W",  "0.20"))
     w_lgb  = float(os.getenv("LGBM_W", "0.15"))
 
-    # 3) 初步融合（缺模型自動跳過）
+    # 3) 初步融合
     total = w_rule + (w_rnn if pr_rnn else 0) + (w_xgb if pr_xgb else 0) + (w_lgb if pr_lgb else 0)
     base = [w_rule*rule[i] for i in range(3)]
     if pr_rnn: base = [base[i] + w_rnn*pr_rnn[i] for i in range(3)]
@@ -271,11 +429,18 @@ def ensemble_with_anti_stuck(seq: List[str]) -> List[float]:
     probs = [b / max(total, 1e-9) for b in base]
 
     # 4) 全盤訊號融合：短期 + 長期EW + Markov + 先驗回拉
-    REC_WIN = int(os.getenv("REC_WIN", "16"))            # 短期視窗
-    REC_W   = float(os.getenv("REC_W", "0.25"))          # 與短期頻率融合
-    LONG_W  = float(os.getenv("LONG_W", "0.35"))         # 與整段EW融合
-    MKV_W   = float(os.getenv("MKV_W",  "0.25"))         # 與整段Markov融合
-    PRIOR_W = float(os.getenv("PRIOR_W","0.15"))         # 與理論回拉
+    REC_WIN = int(os.getenv("REC_WIN", "16"))
+    REC_W   = float(os.getenv("REC_W", "0.25"))
+    LONG_W  = float(os.getenv("LONG_W", "0.35"))
+    MKV_W   = float(os.getenv("MKV_W",  "0.25"))
+    PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
+
+    # 覆蓋（PH 漂移時會用）
+    if weight_overrides:
+        REC_W  = weight_overrides.get("REC_W",  REC_W)
+        LONG_W = weight_overrides.get("LONG_W", LONG_W)
+        MKV_W  = weight_overrides.get("MKV_W",  MKV_W)
+        PRIOR_W= weight_overrides.get("PRIOR_W",PRIOR_W)
 
     p_rec  = recent_freq(seq, REC_WIN)
     p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
@@ -293,11 +458,14 @@ def ensemble_with_anti_stuck(seq: List[str]) -> List[float]:
     probs = [min(CAP, max(EPS, p)) for p in probs]
     probs = norm(probs)
     probs = temperature_scale(probs, TAU)
+
+    # 6) Regime gating（路型乘法微調）
+    boosts = regime_boosts(seq)
+    probs  = _apply_boosts_and_norm(probs, boosts)
+
     return norm(probs)
 
 def recommend_from_probs(probs: List[float]) -> str:
-    # 若你要觀望可改：若 max-2nd < MIN_GAP → 'N'
-    # 這裡維持必出建議（B/P/T）
     return CLASS_ORDER[probs.index(max(probs))]
 
 # ========= Health & Predict =========
@@ -305,7 +473,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v3-ensemble-fullhistory")
+def health(): return jsonify(status="healthy", version="v4-ensemble-regime-ph")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -323,7 +491,7 @@ def predict():
         "recommendation": rec
     })
 
-# ========= LINE Webhook（按鈕互動流程） =========
+# ========= LINE Webhook（按鈕互動流程 + PH 漂移自動加權） =========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 
@@ -404,6 +572,7 @@ if USE_LINE and handler is not None:
         uid = event.source.user_id
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
+        _get_drift_state(uid)  # 初始化 PH 狀態
         msg = "請使用下方按鈕輸入：莊/閒/和；按「開始分析」後才會給出下注建議。"
         line_bot_api.reply_message(
             event.reply_token,
@@ -429,6 +598,7 @@ if USE_LINE and handler is not None:
         if data == "END":
             USER_HISTORY[uid] = []
             USER_READY[uid]   = False
+            USER_DRIFT[uid]   = {'cum':0.0,'min':0.0,'cooldown':0.0}
             line_bot_api.reply_message(
                 event.reply_token,
                 [TextSendMessage(text="✅ 已結束分析，紀錄已清空。", quick_reply=quick_reply_bar()),
@@ -449,7 +619,7 @@ if USE_LINE and handler is not None:
 
         # 尚未開始分析：只提示進度
         if not ready:
-            s = "".join(seq[-20:])  # 顯示末20手
+            s = "".join(seq[-20:])
             line_bot_api.reply_message(
                 event.reply_token,
                 [TextSendMessage(text=f"已記錄 {len(seq)} 手：{s}\n按「開始分析」後才會給出下注建議。", quick_reply=quick_reply_bar()),
@@ -457,13 +627,41 @@ if USE_LINE and handler is not None:
             )
             return
 
-        # 已開始分析：做集成（全盤考量）+ Anti-stuck
-        probs = ensemble_with_anti_stuck(seq)
+        # === 變化點偵測（PH）：更新狀態，必要時啟動 cooldown ===
+        drift_now = update_ph_state(uid, seq)
+        active = in_drift(uid)
+        if active:
+            consume_cooldown(uid)
+
+        # === 漂移期間的動態調權 ===
+        overrides = None
+        if active:
+            # 讓短期更重、長期與 Markov 更輕
+            REC_W   = float(os.getenv("REC_W", "0.25"))
+            LONG_W  = float(os.getenv("LONG_W", "0.35"))
+            MKV_W   = float(os.getenv("MKV_W", "0.25"))
+            PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
+
+            SHORT_BOOST = float(os.getenv("PH_SHORT_BOOST", "0.30"))  # +30% 給短期
+            LONG_CUT    = float(os.getenv("PH_LONG_CUT",   "0.40"))  # -40% 長期
+            MKV_CUT     = float(os.getenv("PH_MKV_CUT",    "0.40"))  # -40% Markov
+            PRIOR_KEEP  = float(os.getenv("PH_PRIOR_KEEP", "1.00"))  # 先驗不變/微降
+
+            overrides = {
+                "REC_W":   REC_W * (1.0 + SHORT_BOOST),
+                "LONG_W":  max(0.0, LONG_W * (1.0 - LONG_CUT)),
+                "MKV_W":   max(0.0, MKV_W  * (1.0 - MKV_CUT)),
+                "PRIOR_W": PRIOR_W * PRIOR_KEEP
+            }
+
+        # 已開始分析：做集成（全盤考量 + Regime + PH 調權）
+        probs = ensemble_with_anti_stuck(seq, overrides)
         rec   = recommend_from_probs(probs)
+        suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
         msg = (
             f"已解析 {len(seq)} 手\n"
             f"機率：莊 {probs[0]:.3f}｜閒 {probs[1]:.3f}｜和 {probs[2]:.3f}\n"
-            f"建議：{LAB_ZH[rec]}"
+            f"建議：{LAB_ZH[rec]} {suffix}"
         )
         line_bot_api.reply_message(
             event.reply_token,
