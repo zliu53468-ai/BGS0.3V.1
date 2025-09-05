@@ -6,7 +6,7 @@ python-dotenv==1.0.1
 # 影像處理
 opencv-python-headless==4.9.0.80
 Pillow==10.3.0
-numpy==1.24.3  # 降低版本以兼容 TensorFlow
+numpy==1.24.3
 
 # OCR 文字识别
 pytesseract==0.3.10
@@ -18,6 +18,3 @@ joblib==1.3.2
 # 深度學習 (使用兼容版本)
 tensorflow==2.13.0
 keras==2.13.1
-
-# 轻量级替代方案 (备选)
-# onnxruntime==1.16.3  # 如果 TensorFlow 仍然有问题，可以使用这个
