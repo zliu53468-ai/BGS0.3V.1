@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot — v12 Late/Early Dragon Slope + Quiet Prestart (B/P/T 摘要)
+BGS LINE Bot — v12.2 Slope+Quiet + Ladder & Break-n-Hold Experts
 - 未開始分析：只記錄；每 N 手回覆一次 B/P/T 摘要（PRESTART_EVERY_N）
-- 強化：早龍/晚龍/形成中龍加速、短龍斷點、n-gram、Markov(1/2/3)、震盪翻邊偏置、PH 漂移、動態權重
+- 強化：早/晚龍、形成中龍加速、短龍斷點、n-gram、Markov(1/2/3)、震盪翻邊偏置、
+       PH 漂移、動態權重、Ladder 斜坡震盪、Break-n-Hold 斷龍確認
 - Flex 按鈕：莊=紅、閒=藍、和=綠
 Routes: /, /health,/healthz,/predict,/export,/reload,/line-webhook
 """
@@ -52,7 +53,7 @@ BP_BAL_WIN     = int(os.getenv("BP_BAL_WIN","30"))
 BP_BAL_STRENGTH= float(os.getenv("BP_BAL_STRENGTH","0.20"))
 
 # 早/晚 龍控制
-HZ_BASE   = float(os.getenv("HZ_BASE","0.68"))   # 調高一點，加速早龍
+HZ_BASE   = float(os.getenv("HZ_BASE","0.68"))
 HZ_DECAY  = float(os.getenv("HZ_DECAY","0.90"))
 EARLY_ALT_MAX = float(os.getenv("EARLY_ALT_MAX","0.48"))
 EARLY_W_MULT  = float(os.getenv("EARLY_W_MULT","1.35"))
@@ -105,7 +106,8 @@ def run_lengths(seq: List[str], win:int=14) -> List[int]:
     lens=[]; cur=1
     for i in range(1,len(s)):
         if s[i]==s[i-1]: cur+=1
-        else: lens.append(cur); cur=1
+        else:
+            lens.append(cur); cur=1
     lens.append(cur); return lens
 
 # ---------- 頻率 ----------
@@ -212,7 +214,7 @@ def ngram_expert(seq: List[str]) -> List[float]:
     pT=_estimate_tie_prob(seq); sc=1.0-pT
     return [pB*sc,pP*sc,pT]
 
-# ---------- 短龍斷點 ----------
+# ---------- 早/晚/形成中龍/短龍斷點 ----------
 def short_dragon_break_expert(seq: List[str]) -> List[float]:
     bp=clean_bp(seq)
     if not bp: return [1/3,1/3,1/3]
@@ -226,7 +228,6 @@ def short_dragon_break_expert(seq: List[str]) -> List[float]:
         S=sum(base); return [x/S for x in base]
     return [1/3,1/3,1/3]
 
-# ---------- 早龍 / 晚龍 / 形成中龍加速 ----------
 def hazard_continue_prob(rlen:int) -> float:
     return max(0.0, min(0.99, HZ_BASE * (HZ_DECAY ** max(0, rlen-1))))
 
@@ -246,10 +247,10 @@ def late_dragon_accel_expert(seq: List[str]) -> List[float]:
     if len(bp)<LATE_RUN_TH: return [1/3,1/3,1/3]
     last=bp[-1]; i=len(bp)-2; rlen=1
     while i>=0 and bp[i]==last: rlen+=1; i-=1
-    win=LATE_WIN; s=bp[-win:] if len(bp)>=win else bp
-    altR=alt_ratio(seq, max(8,win))
+    win=LATE_WIN; altR=alt_ratio(seq, max(8,win))
     if rlen>=LATE_RUN_TH and altR<=LATE_ALT_MAX:
         pT=_estimate_tie_prob(seq)
+        s=bp[-win:] if len(bp)>=win else bp
         dom=max(s.count("B"),s.count("P"))/max(1,len(s))
         cont=min(0.93, 0.62 + 0.10*(rlen-LATE_RUN_TH) + 0.25*dom)*(1.0-0.25*altR)
         stay=cont*(1-pT); flip=(1-cont)*(1-pT)
@@ -257,15 +258,81 @@ def late_dragon_accel_expert(seq: List[str]) -> List[float]:
     return [1/3,1/3,1/3]
 
 def forming_streak_slope_expert(seq: List[str]) -> List[float]:
-    """偵測『剛開始牽』：最後兩手相同、再往前不同，且近窗交錯低"""
     bp=clean_bp(seq)
     if len(bp)<3: return [1/3,1/3,1/3]
     a,b,c = bp[-3], bp[-2], bp[-1]
     if b==c and a!=b and alt_ratio(seq, win=8)<=0.4:
         pT=_estimate_tie_prob(seq)
-        cont=0.60  # 勇敢一點
+        cont=0.60
         stay=cont*(1-pT); flip=(1-cont)*(1-pT)
         return [stay,flip,pT] if c=="B" else [flip,stay,pT]
+    return [1/3,1/3,1/3]
+
+# ---------- 你新提的兩種牌路：Ladder & Break-n-Hold ----------
+def ladder_slope_expert(seq: List[str]) -> List[float]:
+    """偵測 1-2-2-3 / 1-2-3 的『階梯震盪』，偏向順勢延續最後一手"""
+    bp = clean_bp(seq)
+    if len(bp) < 6: return [1/3,1/3,1/3]
+    # 近 10 手 run-length
+    rl = []
+    cur = 1
+    s = bp[-10:]
+    for i in range(1, len(s)):
+        if s[i] == s[i-1]: cur += 1
+        else:
+            rl.append(cur); cur = 1
+    rl.append(cur)
+    pat = rl[-4:] if len(rl) >= 4 else rl
+    ok = False
+    # 遞增或微遞增（允許重複一個 2）
+    if len(pat) >= 3:
+        inc = all(pat[i] >= pat[i-1] for i in range(1, len(pat)))
+        near = (pat[0] in (1,2)) and (max(pat)-min(pat) <= 2)
+        ok = inc and near
+    if not ok: return [1/3,1/3,1/3]
+    last = bp[-1]
+    pT = _estimate_tie_prob(seq)
+    cont = 0.58  # 比 forming_slope 稍保守
+    stay = cont*(1-pT); flip=(1-cont)*(1-pT)
+    return [stay,flip,pT] if last=="B" else [flip,stay,pT]
+
+def break_n_hold_expert(seq: List[str]) -> List[float]:
+    """
+    長龍後連續兩手反向（或反向+T），且交錯率升高 => 視為『已反向站穩』
+    偏向續反。
+    """
+    bp = clean_bp(seq)
+    if len(bp) < 6: return [1/3,1/3,1/3]
+    # 找最後一段長龍
+    last = bp[-1]; i = len(bp)-2; r = 1
+    while i>=0 and bp[i]==last: r+=1; i-=1
+    # 如果最後是 run=1，往前看上一段
+    j = len(bp)-1
+    # 取倒數兩段 run 長度
+    runs = []
+    cur = 1
+    for k in range(1, len(bp)):
+        if bp[k]==bp[k-1]: cur+=1
+        else:
+            runs.append((bp[k-1], cur)); cur=1
+    runs.append((bp[-1],cur))
+    # 倒數兩段
+    if len(runs) < 2: return [1/3,1/3,1/3]
+    last_seg = runs[-1]
+    prev_seg = runs[-2]
+    # 條件：上一段夠長（>=4），之後連續兩手以上反向（或反向+T），且交錯率上升
+    altR_now = alt_ratio(seq, 8)
+    cond_len = prev_seg[1] >= 4
+    cond_flip2 = (last_seg[0] != prev_seg[0] and last_seg[1] >= 2)
+    cond_alt = altR_now >= 0.45
+    if cond_len and cond_flip2 and cond_alt:
+        # 偏向續反
+        pT = _estimate_tie_prob(seq)
+        if last_seg[0] == "B":
+            base = [0.62*(1-pT), 0.38*(1-pT), pT]
+        else:
+            base = [0.38*(1-pT), 0.62*(1-pT), pT]
+        S = sum(base); return [x/S for x in base]
     return [1/3,1/3,1/3]
 
 # ---------- Regime / Momentum ----------
@@ -533,6 +600,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     p_early=early_dragon_expert(seq)
     p_late =late_dragon_accel_expert(seq)
     p_slope=forming_streak_slope_expert(seq)
+    p_ladder=ladder_slope_expert(seq)
+    p_bnh =break_n_hold_expert(seq)
 
     altR=alt_ratio(seq, max(8,REC_WIN))
     per2=period2_score(seq, max(8,REC_WIN))
@@ -548,6 +617,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     EARLY_W=float(os.getenv("EARLY_W","0.14"))
     LATE_W =float(os.getenv("LATE_W" ,"0.16"))
     SLOPE_W=float(os.getenv("SLOPE_W","0.12"))
+    LADDER_W=float(os.getenv("LADDER_W","0.12"))
+    BNH_W   =float(os.getenv("BNH_W"   ,"0.12"))
     PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
 
     # 震盪加權
@@ -557,6 +628,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     LONG_W *= max(0.5, 1.0 - 0.6*osc)
     MKV1_W *= scale; MKV2_W *= scale; MKV3_W *= scale*0.9
     NGRAM_W*= scale*1.1; SDB_W *= scale*1.1
+    LADDER_W*= 1.1*scale  # 階梯期更重
+    BNH_W   *= 1.05       # 斷龍確認略重
 
     # 早/晚/形成中龍
     bp=clean_bp(seq); last_bp_run=0
@@ -585,6 +658,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs=B(probs,p_early,EARLY_W)
     probs=B(probs,p_late ,LATE_W)
     probs=B(probs,p_slope,SLOPE_W)
+    probs=B(probs,p_ladder,LADDER_W)
+    probs=B(probs,p_bnh, BNH_W)
     probs=B(probs,[THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]],PRIOR_W)
 
     # 交錯期翻邊偏置
@@ -616,7 +691,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 @app.route("/", methods=["GET"])
 def index(): return "ok"
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v12-slope-quiet")
+def health(): return jsonify(status="healthy", version="v12.2-ladder-bnh")
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
 @app.route("/predict", methods=["POST"])
@@ -659,7 +734,7 @@ def reload_models():
     load_models()
     return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
 
-# ---------- LINE（彩色按鈕 + 未開始顯示 B/P/T 摘要(節流)） ----------
+# ---------- LINE（彩色按鈕 + 未開始：B/P/T 摘要(節流)） ----------
 LINE_CHANNEL_ACCESS_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_CHANNEL_SECRET      =os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -761,7 +836,6 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
 
-        # 記錄 & 落地
         history_before="".join(seq)
         seq.append(data); USER_HISTORY[uid]=seq
         try: append_round_csv(uid, history_before, data)
