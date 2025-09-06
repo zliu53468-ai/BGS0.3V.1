@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot — v12.3 T-aware (三模型 Tie 強化)
-- 加入 Tie 動態校正器（先驗 + EW 長期率 + 間隔模型 + 簇集偵測）
-- 新增 Tie 專家：tie_burst_expert / tie_gap_expert，融入集成
-- 若 XGB/LGBM 輸出 3 類，直接使用；若只輸出 2 類（B/P），自動升維含 T
-- 其他功能延續 v12.2（早/晚龍、形成中龍、短龍斷點、n-gram、Markov、PH、Regime、Momentum）
-- 未開始分析：僅記錄，每 PRESTART_EVERY_N 手回一次摘要（0=完全不回）
+BGS LINE Bot — v13 BigRoad Grid (6x20) + T-aware + PH drift + Regime/Momentum
+- 6行×20列大路格盤：相同結果在「同一列」往下畫；不同結果「換到下一列」
+  若該列已到底(第6行)仍延續，則溢出（next col 繼續同色）──簡化為 BigRoad 常見規則
+- 以大路格盤特徵提供 BigRoad Expert 並併入集成
+- 未開始分析：只紀錄；每 PRESTART_EVERY_N 手才摘要回覆（0=完全不回）
+- 對「和 T」使用先驗+長短期+間隔與簇集動態校正；當 XGB/LGB 只有 B/P 二類時自動升維含 T
+- Render 可寫路徑：/tmp
 """
-import os, csv, time, logging, math
+import os, csv, time, math, logging
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, Response
 
@@ -16,12 +17,12 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-backend")
 
-# ---------- 路徑（Render 免費盤請寫 /tmp） ----------
+# ========= 路徑處理（Render 免費盤安全寫入） =========
 def _ensure_parent(p: str) -> str:
     d = os.path.dirname(p) or "."
     try:
         os.makedirs(d, exist_ok=True)
-        testf = os.path.join(d, ".wtest"); open(testf, "w").write("ok"); os.remove(testf)
+        tf = os.path.join(d, ".wtest"); open(tf, "w").write("ok"); os.remove(tf)
         return p
     except Exception:
         alt = os.path.join("/tmp", os.path.relpath(p, "/"))
@@ -35,22 +36,30 @@ RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
 XGB_PATH = os.getenv("XGB_PATH", "/opt/models/xgb.json")
 LGBM_PATH = os.getenv("LGBM_PATH", "/opt/models/lgbm.txt")
 
-# ---------- 參數 ----------
+# ========= 常數/環境 =========
 CLASS_ORDER = ("B","P","T")
 LAB_ZH = {"B":"莊","P":"閒","T":"和"}
 THEORETICAL_PROBS = {"B":0.458,"P":0.446,"T":0.096}
 
-PRESTART_EVERY_N = int(os.getenv("PRESTART_EVERY_N", "3"))
-ALLOW_NO_BET   = os.getenv("ALLOW_NO_BET","false").lower()=="true"
-MIN_GAP        = float(os.getenv("MIN_GAP","0.06"))
-SIDE_REPEAT_TH = int(os.getenv("SIDE_REPEAT_TH","3"))
-SIDE_REPEAT_PEN= float(os.getenv("SIDE_REPEAT_PEN","0.15"))
-SIDE_REPEAT_MAX= int(os.getenv("SIDE_REPEAT_MAX","3"))
-BP_BAL_WIN     = int(os.getenv("BP_BAL_WIN","30"))
-BP_BAL_STRENGTH= float(os.getenv("BP_BAL_STRENGTH","0.20"))
+# LINE 前置控制
+PRESTART_EVERY_N = int(os.getenv("PRESTART_EVERY_N","3"))  # 未開始分析：每N手才回摘要（0=不回）
 
-HZ_BASE   = float(os.getenv("HZ_BASE","0.68"))
-HZ_DECAY  = float(os.getenv("HZ_DECAY","0.90"))
+# 「觀望」開關
+ALLOW_NO_BET = os.getenv("ALLOW_NO_BET","false").lower()=="true"
+MIN_GAP      = float(os.getenv("MIN_GAP","0.06"))
+
+# 防重複同邊連推（人性保護）
+SIDE_REPEAT_TH  = int(os.getenv("SIDE_REPEAT_TH","3"))
+SIDE_REPEAT_PEN = float(os.getenv("SIDE_REPEAT_PEN","0.15"))
+SIDE_REPEAT_MAX = int(os.getenv("SIDE_REPEAT_MAX","3"))
+
+# 偏置正規器（避免長期單邊）
+BP_BAL_WIN      = int(os.getenv("BP_BAL_WIN","30"))
+BP_BAL_STRENGTH = float(os.getenv("BP_BAL_STRENGTH","0.20"))
+
+# 早/晚龍參數
+HZ_BASE = float(os.getenv("HZ_BASE","0.68"))
+HZ_DECAY= float(os.getenv("HZ_DECAY","0.90"))
 EARLY_ALT_MAX = float(os.getenv("EARLY_ALT_MAX","0.48"))
 EARLY_W_MULT  = float(os.getenv("EARLY_W_MULT","1.35"))
 LATE_RUN_TH   = int(os.getenv("LATE_RUN_TH","3"))
@@ -58,17 +67,16 @@ LATE_ALT_MAX  = float(os.getenv("LATE_ALT_MAX","0.45"))
 LATE_WIN      = int(os.getenv("LATE_WIN","10"))
 LATE_W_MULT   = float(os.getenv("LATE_W_MULT","1.45"))
 
-# ---------- 工具 ----------
+# ========= 小工具 =========
 def parse_history(payload) -> List[str]:
     if payload is None: return []
     seq: List[str] = []
     if isinstance(payload, list):
         for s in payload:
-            if isinstance(s,str) and s.strip().upper() in CLASS_ORDER:
-                seq.append(s.strip().upper())
-    elif isinstance(payload,str):
+            if isinstance(s,str) and s.strip().upper() in CLASS_ORDER: seq.append(s.strip().upper())
+    elif isinstance(payload, str):
         for ch in payload:
-            up=ch.upper()
+            up = ch.upper()
             if up in CLASS_ORDER: seq.append(up)
     return seq
 
@@ -79,7 +87,7 @@ def bpt_counts(seq: List[str]) -> Tuple[int,int,int]:
     return (seq.count("B"), seq.count("P"), seq.count("T"))
 
 def norm(v: List[float]) -> List[float]:
-    s=sum(v); s=s if s>1e-12 else 1.0
+    s = sum(v); s = s if s>1e-12 else 1.0
     return [max(0.0,x)/s for x in v]
 
 def blend(a: List[float], b: List[float], w: float) -> List[float]:
@@ -101,11 +109,10 @@ def run_lengths(seq: List[str], win:int=14) -> List[int]:
     lens=[]; cur=1
     for i in range(1,len(s)):
         if s[i]==s[i-1]: cur+=1
-        else:
-            lens.append(cur); cur=1
+        else: lens.append(cur); cur=1
     lens.append(cur); return lens
 
-# ---------- 頻率與 T 校正 ----------
+# ========= 頻率與 T 校正 =========
 def exp_decay_freq(seq: List[str], gamma: float=None) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     if gamma is None: gamma=float(os.getenv("EW_GAMMA","0.96"))
@@ -135,37 +142,34 @@ def _distance_since_last_T(seq: List[str]) -> int:
     return d
 
 def _estimate_tie_prob(seq: List[str]) -> float:
-    """T 動態校正：先驗 + EW 長期率 + 間隔模型 + 簇集偵測"""
-    prior_T = THEORETICAL_PROBS["T"]               # 0.096
+    prior_T = THEORETICAL_PROBS["T"]
     long_T  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))[2]
     short_T = recent_freq(seq, int(os.getenv("T_REC_WIN","20")))[2]
     w_long  = float(os.getenv("T_W_LONG","0.4"))
     w_short = float(os.getenv("T_W_SHORT","0.3"))
     base = (1 - w_long - w_short)*prior_T + w_long*long_T + w_short*short_T
 
-    # 間隔/風險模型（越久沒出 T，機率略上升）
     gap = _distance_since_last_T(seq)
-    lam = float(os.getenv("T_GAP_LAMBDA","0.06"))   # gap hazard slope
+    lam = float(os.getenv("T_GAP_LAMBDA","0.06"))
     gap_adj = 1.0 + (1 - math.exp(-lam*max(0,gap-6))) * float(os.getenv("T_GAP_GAIN","0.35"))
     p = base * gap_adj
 
-    # T 簇集偵測（近 8 手有 2+ 個 T）
     wnd = int(os.getenv("T_CLUSTER_WIN","8"))
     cluster = seq[-wnd:] if len(seq)>=wnd else seq
     if cluster.count("T") >= int(os.getenv("T_CLUSTER_K","2")):
         p *= (1.0 + float(os.getenv("T_CLUSTER_BOOST","0.25")))
 
     floor=float(os.getenv("T_MIN","0.03"))
-    cap  =float(os.getenv("T_MAX","0.22"))  # 上限略放寬，交錯期更靈敏
+    cap  =float(os.getenv("T_MAX","0.22"))
     return max(floor, min(cap, p))
 
 def _merge_bp_with_t(bp: List[float], pT: float) -> List[float]:
-    b, p = float(bp[0]), float(bp[1])
-    s = max(1e-12, b + p); b /= s; p /= s
-    scale = 1.0 - pT
-    return [b * scale, p * scale, pT]
+    b,p = float(bp[0]), float(bp[1])
+    s = max(1e-12, b+p); b/=s; p/=s
+    sc = 1.0 - pT
+    return [b*sc, p*sc, pT]
 
-# ---------- 交錯特徵 ----------
+# ========= 交錯量化 =========
 def alt_ratio(seq: List[str], win:int=12) -> float:
     s=clean_bp(seq[-win:] if len(seq)>=win else seq)
     if len(s)<2: return 0.0
@@ -182,7 +186,7 @@ def period2_score(seq: List[str], win:int=12) -> float:
         tot+=1
     return ok/max(1,tot)
 
-# ---------- Markov 1/2/3 ----------
+# ========= Markov（1/2/3 阶） =========
 def markov_next_prob(seq: List[str], decay: float=None) -> List[float]:
     if len(seq)<2: return [1/3,1/3,1/3]
     if decay is None: decay=float(os.getenv("MKV_DECAY","0.98"))
@@ -199,14 +203,16 @@ def markov2_next_prob(seq: List[str], decay: float=None) -> List[float]:
     idx={"B":0,"P":1,"T":2}; C=[[[0.0]*3 for _ in range(3)] for __ in range(3)]; w=1.0
     for a,b,c in zip(seq[:-2],seq[1:-1],seq[2:]):
         C[idx[a]][idx[b]][idx[c]]+=w; w*=decay
-    a=idx[seq[-2]]; b=idx[seq[-1]]; flow=[C[a][b][0],C[a][b][1],C[a][b][2]]
+    a=idx[seq[-2]]; b=idx[seq[-1]]
+    flow=[C[a][b][0],C[a][b][1],C[a][b][2]]
     lap=float(os.getenv("MKV2_LAPLACE","0.5")); flow=[x+lap for x in flow]
     S=sum(flow); return [x/S for x in flow]
 
 def markov3_next_prob(seq: List[str], decay: float=None) -> List[float]:
     if len(seq)<4: return [1/3,1/3,1/3]
     if decay is None: decay=float(os.getenv("MKV3_DECAY","0.99"))
-    idx={"B":0,"P":1,"T":2}; from collections import defaultdict
+    idx={"B":0,"P":1,"T":2}
+    from collections import defaultdict
     C=defaultdict(lambda:[0.0,0.0,0.0]); w=1.0
     for a,b,c,d in zip(seq[:-3],seq[1:-2],seq[2:-1],seq[3:]):
         C[(idx[a],idx[b],idx[c])][idx[d]]+=w; w*=decay
@@ -214,7 +220,7 @@ def markov3_next_prob(seq: List[str], decay: float=None) -> List[float]:
     flow=C[key]; lap=float(os.getenv("MKV3_LAPLACE","0.5")); flow=[x+lap for x in flow]
     S=sum(flow); return [x/S for x in flow]
 
-# ---------- n-gram（忽略T） ----------
+# ========= n-gram（忽略 T） =========
 def ngram_expert(seq: List[str]) -> List[float]:
     bp=clean_bp(seq)
     if len(bp)<3: return [1/3,1/3,1/3]
@@ -240,7 +246,7 @@ def ngram_expert(seq: List[str]) -> List[float]:
     pT=_estimate_tie_prob(seq); sc=1.0-pT
     return [pB*sc,pP*sc,pT]
 
-# ---------- 早/晚/形成中龍/短龍斷點 ----------
+# ========= 早/晚龍、形成中龍、短龍斷點 =========
 def hazard_continue_prob(rlen:int) -> float:
     return max(0.0, min(0.99, HZ_BASE * (HZ_DECAY ** max(0, rlen-1))))
 
@@ -273,10 +279,9 @@ def late_dragon_accel_expert(seq: List[str]) -> List[float]:
 def forming_streak_slope_expert(seq: List[str]) -> List[float]:
     bp=clean_bp(seq)
     if len(bp)<3: return [1/3,1/3,1/3]
-    a,b,c = bp[-3], bp[-2], bp[-1]
-    if b==c and a!=b and alt_ratio(seq, win=8)<=0.4:
-        pT=_estimate_tie_prob(seq)
-        cont=0.60
+    a,b,c = bp[-3],bp[-2],bp[-1]
+    if b==c and a!=b and alt_ratio(seq,8)<=0.4:
+        pT=_estimate_tie_prob(seq); cont=0.60
         stay=cont*(1-pT); flip=(1-cont)*(1-pT)
         return [stay,flip,pT] if c=="B" else [flip,stay,pT]
     return [1/3,1/3,1/3]
@@ -294,30 +299,129 @@ def short_dragon_break_expert(seq: List[str]) -> List[float]:
         S=sum(base); return [x/S for x in base]
     return [1/3,1/3,1/3]
 
-# ---------- 你要求的 T 專家 ----------
-def tie_burst_expert(seq: List[str]) -> List[float]:
-    """近窗出現多個 T → 拉高 T"""
-    if not seq: return [1/3,1/3,1/3]
-    win=int(os.getenv("T_BURST_WIN","10"))
-    k  =int(os.getenv("T_BURST_K","2"))
-    s=seq[-win:] if len(seq)>=win else seq
-    cnt=s.count("T")
-    if cnt>=k:
-        base=_estimate_tie_prob(seq)* (1.0 + 0.15*(cnt-k+1))
-        pT=min(float(os.getenv("T_MAX","0.22")), base)
-        sc=1.0-pT; return [0.5*sc,0.5*sc,pT]
-    return [1/3,1/3,1/3]
+# ========= 大路格盤（6行×20列）與專家 =========
+def bigroad_grid(seq: List[str], rows:int=6, cols:int=20) -> List[List[Optional[str]]]:
+    """
+    依「大路」規則把 B/P 序列填到 rows×cols 的格盤（T 忽略）
+    - 相同結果延續：在同一「列」往下填（row+1）
+    - 異色：換到「下一列」第1行（row=1, col+1）
+    - 若當前列已到底（row==rows）仍延續：視為溢出，移到下一列第1行繼續同色（簡化處理）
+    回傳 grid[row][col]，0-based，元素為 'B'/'P'/None
+    """
+    bp = clean_bp(seq)
+    grid: List[List[Optional[str]]] = [[None for _ in range(cols)] for __ in range(rows)]
+    if not bp: return grid
+    col = 0; row = 0
+    grid[row][col] = bp[0]
+    for cur in bp[1:]:
+        if cur == grid[row][col]:  # 延續
+            if row < rows-1 and grid[row+1][col] is None:
+                row += 1
+            else:
+                # 到底或下一格被占，用簡化規則：往下一列第一行延續
+                if col < cols-1:
+                    col += 1; row = 0
+                grid[row][col] = cur
+        else:  # 換色 -> 下一列第一行
+            if col < cols-1:
+                col += 1
+            row = 0
+            grid[row][col] = cur
+    return grid
 
-def tie_gap_expert(seq: List[str]) -> List[float]:
-    """與上一次 T 的距離越大，T 風險上升"""
-    if not seq: return [1/3,1/3,1/3]
-    gap=_distance_since_last_T(seq)
-    if gap<=0: return [1/3,1/3,1/3]
-    pT=_estimate_tie_prob(seq) * (1.0 + min(0.4, 0.04*max(0,gap-6)))
-    pT=min(float(os.getenv("T_MAX","0.22")), pT)
-    sc=1.0-pT; return [0.5*sc,0.5*sc,pT]
+def bigroad_state(seq: List[str]) -> Dict[str, Any]:
+    grid = bigroad_grid(seq, rows=6, cols=20)
+    # 找最後一個非空位置
+    last = None
+    for c in range(19, -1, -1):
+        for r in range(5, -1, -1):
+            if grid[r][c] is not None:
+                last=(r,c); break
+        if last: break
+    if not last:
+        return {"grid":grid,"last_color":"","last_height":0,"col_filled":False,"col_index":0}
+    r,c = last
+    color = grid[r][c]
+    # 計算該列高度（自上往下連續非空）
+    h=0
+    for rr in range(0,6):
+        if grid[rr][c] is not None: h+=1
+        else: break
+    col_filled = (h==6)
+    return {"grid":grid,"last_color":color,"last_height":h,"col_filled":col_filled,"col_index":c}
 
-# ---------- Regime / Momentum ----------
+def bigroad_expert(seq: List[str]) -> List[float]:
+    """
+    以 6x20 大路格盤特徵推估「續列 vs 轉列」，再映射到 B/P/T
+    核心：
+      - last_height 越大 → 續列傾向越強
+      - 若該列已滿（col_filled）但仍延續，視為“溢出續列”，續列仍偏高
+      - 最近列高度的形狀（梯形/齊腳）影響續列；高轉列密度/單雙跳增加轉列傾向
+    """
+    st = bigroad_state(seq)
+    color = st["last_color"]; h = st["last_height"]; filled = st["col_filled"]
+    if not color:
+        return [1/3,1/3,1/3]
+
+    # 取列高度序列（由 grid 反推）
+    grid = st["grid"]; cols = []
+    for c in range(20):
+        hh=0
+        for r in range(6):
+            if grid[r][c] is not None: hh+=1
+            else: break
+        if hh>0:
+            # 列顏色取頂部顏色
+            cols.append((grid[0][c], hh))
+    last3 = [hh for _,hh in cols[-3:]]
+    mean3 = sum(last3)/len(last3) if last3 else 0.0
+    std3  = 0.0
+    if len(last3)>=2:
+        m=mean3; std3 = (sum((x-m)**2 for x in last3)/len(last3))**0.5
+
+    # 近列的轉列密度
+    K = int(os.getenv("BIGR_K","8"))
+    sub = cols[-K:] if len(cols)>=K else cols
+    turn_rate = min(1.0, len(sub)/max(1, sum(hh for _,hh in sub)))
+    single_rate = sum(1 for _,hh in sub if hh==1) / max(1,len(sub))
+    double_rate = sum(1 for _,hh in sub if hh==2) / max(1,len(sub))
+
+    # 樓梯（最近4列高度單調且差值小）
+    ladder_score = 0.0
+    if len(cols)>=4:
+        last4=[hh for _,hh in cols[-4:]]
+        inc = all(last4[i]>=last4[i-1] for i in range(1,4))
+        dec = all(last4[i]<=last4[i-1] for i in range(1,4))
+        near = (max(last4)-min(last4))<=2
+        if (inc or dec) and near: ladder_score=1.0
+
+    # 續列機率
+    cont = 0.50
+    cont += 0.10 * min(4.0, float(h))             # 成龍高度加分
+    cont += 0.06 * ladder_score                   # 樓梯加分
+    cont -= 0.10 * min(1.0, turn_rate)            # 轉列密度
+    cont -= 0.08 * min(1.0, single_rate*1.2)      # 單跳多
+    cont -= 0.05 * min(1.0, double_rate)          # 雙跳多
+    cont -= 0.06 * min(1.0, std3/3.0)             # 列高震盪
+    if filled:                                     # 列滿但仍續列 → 視為溢出續列
+        cont += 0.04
+
+    # 交錯抑制續列一點
+    try:
+        altR = alt_ratio(seq, win=max(8, int(os.getenv("REC_WIN","16"))))
+    except Exception:
+        altR = 0.0
+    cont *= (1.0 - 0.22 * max(0.0, altR-0.5)*2.0)
+
+    cont = max(0.1, min(0.9, cont))
+    pT = _estimate_tie_prob(seq)
+    stay = cont*(1-pT); flip=(1-cont)*(1-pT)
+    if color=="B":
+        return [stay, flip, pT]
+    else:
+        return [flip, stay, pT]
+
+# ========= Regime / Momentum =========
 def is_oscillating(seq: List[str], win:int=12)->bool:
     lens=run_lengths(seq,win)
     if not lens: return False
@@ -396,7 +500,7 @@ def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[floa
     p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
     s=sum(p); return [x/s for x in p]
 
-# ---------- PH 漂移 ----------
+# ========= PH 變化點偵測 =========
 def js_divergence(p: List[float], q: List[float]) -> float:
     eps=1e-12; m=[(p[i]+q[i])/2.0 for i in range(3)]
     def _kl(a,b): return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
@@ -426,7 +530,7 @@ def update_ph_state(uid: str, seq: List[str]) -> Tuple[bool,bool]:
     if active: st['cooldown']=max(0.0, st['cooldown']-1.0)
     return (drift,active)
 
-# ---------- 防單邊/觀望 ----------
+# ========= 偏置修正/觀望 =========
 USER_RECS: Dict[str, List[str]] = {}
 def _apply_bp_balance_regularizer(seq: List[str], probs: List[float]) -> List[float]:
     if not seq: return probs
@@ -462,7 +566,7 @@ def _maybe_no_bet(probs: List[float]) -> Optional[str]:
     a=sorted(probs, reverse=True)
     return 'N' if a[0]-a[1]<MIN_GAP else None
 
-# ---------- 可選模型 ----------
+# ========= 可選模型載入 =========
 try:
     import torch; import torch.nn as tnn
 except Exception:
@@ -554,7 +658,7 @@ def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
         return None
     except Exception as e: logger.warning("LGBM inference failed: %s", e); return None
 
-# ---------- Ladder / Break-n-Hold（與 v12.2 相同，略） ----------
+# ========= 其他專家（與前版一致） =========
 def ladder_slope_expert(seq: List[str]) -> List[float]:
     bp = clean_bp(seq)
     if len(bp) < 6: return [1/3,1/3,1/3]
@@ -594,7 +698,7 @@ def break_n_hold_expert(seq: List[str]) -> List[float]:
         S=sum(base); return [x/S for x in base]
     return [1/3,1/3,1/3]
 
-# ---------- 集成 ----------
+# ========= 集成 =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str,float]]=None) -> List[float]:
     rule=[THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]]
     pr_rnn=rnn_predict(seq); pr_xgb=xgb_predict(seq); pr_lgb=lgbm_predict(seq)
@@ -624,14 +728,12 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     p_slope=forming_streak_slope_expert(seq)
     p_ladder=ladder_slope_expert(seq)
     p_bnh =break_n_hold_expert(seq)
-
-    # ----- 新增的 T 專家 -----
-    p_tburst = tie_burst_expert(seq)
-    p_tgap   = tie_gap_expert(seq)
+    p_bigr=bigroad_expert(seq)  # 6x20 大路專家
 
     altR=alt_ratio(seq, max(8,REC_WIN))
     per2=period2_score(seq, max(8,REC_WIN))
 
+    # 權重
     REC_W  =float(os.getenv("REC_W","0.16"))
     LONG_W =float(os.getenv("LONG_W","0.18"))
     MKV1_W =float(os.getenv("MKV_W" ,"0.14"))
@@ -645,10 +747,9 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     LADDER_W=float(os.getenv("LADDER_W","0.12"))
     BNH_W   =float(os.getenv("BNH_W"   ,"0.12"))
     PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
-    # Tie 專家權重
-    T_CAL_W =float(os.getenv("T_CAL_W","0.18"))   # tie_burst + tie_gap 合計上限
+    BIGR_W  =float(os.getenv("BIGR_W","0.18"))  # 大路專家
 
-    # 震盪加權
+    # 震盪期自動調整
     osc=min(1.0, 0.6*altR + 0.4*per2)
     scale=1.0 + 0.7*osc
     REC_W  *= (1.0 + 0.2*osc)
@@ -657,20 +758,7 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     NGRAM_W*= scale*1.1; SDB_W *= scale*1.1
     LADDER_W*= 1.1*scale
     BNH_W   *= 1.05
-    # Tie 在交錯/拉鋸時稍微增加
-    T_CAL_W *= (1.0 + 0.5*osc)
-
-    # 早/晚/形成中龍
-    bp=clean_bp(seq); last_bp_run=0
-    if bp:
-        ch=bp[-1]; i=len(bp)-2; last_bp_run=1
-        while i>=0 and bp[i]==ch: last_bp_run+=1; i-=1
-    if 2<=last_bp_run<=3 and altR<=EARLY_ALT_MAX:
-        EARLY_W *= EARLY_W_MULT
-        MKV1_W  *= 1.10; REC_W *= 1.10
-    if last_bp_run>=LATE_RUN_TH and altR<=LATE_ALT_MAX:
-        LATE_W  *= LATE_W_MULT
-        LONG_W  *= 0.8
+    BIGR_W  *= 1.15 if altR>=0.55 else 1.0
 
     if weight_overrides:
         REC_W  =weight_overrides.get("REC_W",REC_W)
@@ -689,12 +777,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs=B(probs,p_slope,SLOPE_W)
     probs=B(probs,p_ladder,LADDER_W)
     probs=B(probs,p_bnh, BNH_W)
-
-    # 融合兩個 T 專家（平均後以 T_CAL_W 併入）
-    tavg=[(p_tburst[i]+p_tgap[i])/2.0 for i in range(3)]
-    probs=B(probs, tavg, T_CAL_W)
-
-    probs=B(probs,[THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]],PRIOR_W)
+    # 6x20 大路融合
+    probs=B(probs,p_bigr,BIGR_W)
 
     # 交錯期翻邊偏置
     if len(seq)>=2 and (altR>=float(os.getenv("FLIP_ALT_TH","0.55")) or per2>=float(os.getenv("FLIP_PER2_TH","0.35"))):
@@ -708,7 +792,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
             else:         p[0]+=flip; p[1]=max(0.0,p[1]-flip*0.8)
             s=sum(p); probs=[x/s for x in p]
 
-    # 安全處理 + Regime + Momentum
     EPS=float(os.getenv("EPSILON_FLOOR","0.06"))
     CAP=float(os.getenv("MAX_CAP","0.88"))
     TAU=float(os.getenv("TEMP","1.06"))
@@ -721,27 +804,40 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
 
-# ---------- 健康/Predict ----------
+# ========= Health & Predict =========
 @app.route("/", methods=["GET"])
 def index(): return "ok"
+
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v12.3-taware")
+def health(): return jsonify(status="healthy", version="v13-bigroad-grid")
+
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    data=request.get_json(silent=True) or {}
-    seq=parse_history(data.get("history"))
-    probs=ensemble_with_anti_stuck(seq)
-    probs=_apply_bp_balance_regularizer(seq, probs)
-    nb=_maybe_no_bet(probs)
-    rec='N' if nb=='N' else recommend_from_probs(probs)
+    data = request.get_json(silent=True) or {}
+    seq = parse_history(data.get("history"))
+    probs = ensemble_with_anti_stuck(seq)
+    probs = _apply_bp_balance_regularizer(seq, probs)
+    nb = _maybe_no_bet(probs)
+    rec = 'N' if nb=='N' else recommend_from_probs(probs)
     labels=list(CLASS_ORDER)
-    return jsonify({"history_len":len(seq),
-                    "probabilities":{labels[i]:probs[i] for i in range(3)},
-                    "recommendation":rec})
+    # 回傳大路格盤快照（可選：前端做顯示）
+    br = bigroad_state(seq)
+    return jsonify({
+        "history_len": len(seq),
+        "probabilities": {labels[i]: probs[i] for i in range(3)},
+        "recommendation": rec,
+        "bigroad": {
+            "last_color": br.get("last_color",""),
+            "last_height": br.get("last_height",0),
+            "col_filled": br.get("col_filled",False),
+            "col_index": br.get("col_index",0)
+        }
+    })
 
-# ---------- CSV I/O / Reload ----------
+# ========= CSV I/O / Reload =========
 def append_round_csv(uid:str, history_before:str, label:str)->None:
     try:
         with open(DATA_CSV_PATH,"a",newline="",encoding="utf-8") as f:
@@ -768,7 +864,7 @@ def reload_models():
     load_models()
     return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
 
-# ---------- LINE（彩色按鈕 & 未開始：摘要節流） ----------
+# ========= LINE（彩色按鈕 & 未開始：只記錄 + 統計摘要） =========
 LINE_CHANNEL_ACCESS_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_CHANNEL_SECRET      =os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -799,7 +895,7 @@ def flex_buttons_card() -> 'FlexSendMessage':
         "body":{
             "type":"box","layout":"vertical","spacing":"md",
             "contents":[
-                {"type":"text","text":"🤖 請先把當前『歷史牌局』輸入完畢，再按【開始分析】！", "wrap":True, "size":"sm"},
+                {"type": "text", "text": "🤖 請先把當前『歷史牌局』輸入完畢，再按【開始分析】！", "wrap": True, "size": "sm"},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
                     {"type":"button","style":"primary","color":"#E74C3C","action":{"type":"postback","label":"莊","data":"B"}},
                     {"type":"button","style":"primary","color":"#2980B9","action":{"type":"postback","label":"閒","data":"P"}},
@@ -875,6 +971,7 @@ if USE_LINE and handler is not None:
         try: append_round_csv(uid, history_before, data)
         except Exception as e: logger.warning("csv log failed: %s", e)
 
+        # 未開始分析：只做摘要（節流）
         if not ready:
             if PRESTART_EVERY_N>0 and (len(seq)%PRESTART_EVERY_N==0):
                 b,p,t=bpt_counts(seq); s="".join(seq[-20:])
@@ -884,6 +981,7 @@ if USE_LINE and handler is not None:
                     [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
             return
 
+        # 漂移狀態更新（短期權重暫時提高）
         _, active = update_ph_state(uid, seq)
         overrides=None
         if active:
@@ -922,7 +1020,7 @@ if USE_LINE and handler is not None:
         line_bot_api.reply_message(event.reply_token,
             [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
 
-# ---------- Entrypoint ----------
+# ========= Entrypoint =========
 if __name__=="__main__":
     port=int(os.environ.get("PORT","8080"))
     app.run(host="0.0.0.0", port=port)
