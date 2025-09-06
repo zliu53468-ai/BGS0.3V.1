@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot — v10 Early-Dragon & Oscillation Upgrade
-重點：更快抓「龍初期(1–3)」+ 轉折；震盪期翻邊偏置；短龍斷點；n-gram；Markov(1/2/3)；
-PH 漂移；動態權重；防單邊；觀望；/tmp 持久化 fallback；LINE 按鈕(無自訂色避免 400)
+BGS LINE Bot — v11 Late-Dragon Accel + Quiet Prestart + Colored Buttons
+- 更快抓龍初期與後段牽勢；震盪期翻邊偏置；短龍斷點；n-gram；Markov(1/2/3)
+- Page-Hinkley 漂移; 動態權重; 防單邊; 可觀望
+- 未開始分析前：只記錄、不回覆(可調 PRESTART_EVERY_N)
+- Flex 按鈕：莊(紅)/閒(藍)/和(綠)
 Routes: /, /health,/healthz,/predict,/export,/reload,/line-webhook
 """
 
@@ -29,6 +31,7 @@ def _ensure_parent(p: str) -> str:
 
 DATA_CSV_PATH = _ensure_parent(os.getenv("DATA_LOG_PATH", "/tmp/logs/rounds.csv"))
 RELOAD_TOKEN  = os.getenv("RELOAD_TOKEN", "")
+
 RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
 XGB_PATH = os.getenv("XGB_PATH", "/opt/models/xgb.json")
 LGBM_PATH = os.getenv("LGBM_PATH", "/opt/models/lgbm.txt")
@@ -37,6 +40,9 @@ LGBM_PATH = os.getenv("LGBM_PATH", "/opt/models/lgbm.txt")
 CLASS_ORDER = ("B", "P", "T")
 LAB_ZH = {"B":"莊","P":"閒","T":"和"}
 THEORETICAL_PROBS = {"B":0.458, "P":0.446, "T":0.096}
+
+# 使用量控制：未開始時每 N 手提示一次(0=完全不回覆)
+PRESTART_EVERY_N = int(os.getenv("PRESTART_EVERY_N", "0"))
 
 # 防單邊/觀望
 SIDE_REPEAT_TH   = int(os.getenv("SIDE_REPEAT_TH", "3"))
@@ -47,11 +53,17 @@ BP_BAL_STRENGTH  = float(os.getenv("BP_BAL_STRENGTH", "0.20"))
 ALLOW_NO_BET     = os.getenv("ALLOW_NO_BET", "false").lower() == "true"
 MIN_GAP          = float(os.getenv("MIN_GAP", "0.06"))
 
-# 早龍偵測（可調）
-HZ_BASE   = float(os.getenv("HZ_BASE", "0.64"))   # 連莊/連閒在 r=1 時續龍基準
-HZ_DECAY  = float(os.getenv("HZ_DECAY","0.90"))   # r 增長時續龍遞減
-EARLY_ALT_MAX = float(os.getenv("EARLY_ALT_MAX","0.48"))  # 交錯度上限(低於此視為非震盪)
-EARLY_W_MULT  = float(os.getenv("EARLY_W_MULT","1.35"))   # 早龍期提升短期/馬可夫比重
+# 早/晚 龍
+HZ_BASE   = float(os.getenv("HZ_BASE", "0.64"))    # 早龍續龍基準
+HZ_DECAY  = float(os.getenv("HZ_DECAY","0.90"))
+EARLY_ALT_MAX = float(os.getenv("EARLY_ALT_MAX","0.48"))
+EARLY_W_MULT  = float(os.getenv("EARLY_W_MULT","1.35"))
+
+LATE_RUN_TH   = int(os.getenv("LATE_RUN_TH","3"))   # 後段啟動 run 門檻
+LATE_RBP_MIN  = float(os.getenv("LATE_RBP_MIN","0.60"))  # 最近窗內同邊占比
+LATE_ALT_MAX  = float(os.getenv("LATE_ALT_MAX","0.45"))  # 震盪上限
+LATE_WIN      = int(os.getenv("LATE_WIN","10"))     # 最近窗
+LATE_W_MULT   = float(os.getenv("LATE_W_MULT","1.40"))
 
 # ========= 解析 =========
 def parse_history(payload) -> List[str]:
@@ -72,8 +84,7 @@ def clean_bp(seq: List[str]) -> List[str]:
 
 # ========= 可選模型 =========
 try:
-    import torch
-    import torch.nn as tnn
+    import torch; import torch.nn as tnn
 except Exception:
     torch=None; tnn=None
 try:
@@ -119,7 +130,7 @@ def load_models() -> None:
         except Exception as e: logger.warning("Load LGBM failed: %s", e); LGBM_MODEL=None
 load_models()
 
-# ========= 常用工具 =========
+# ========= 工具 =========
 def norm(v: List[float]) -> List[float]:
     s=sum(v); s=s if s>1e-12 else 1.0
     return [max(0.0, x)/s for x in v]
@@ -146,7 +157,7 @@ def run_lengths(seq: List[str], win:int=14) -> List[int]:
         else: lens.append(cur); cur=1
     lens.append(cur); return lens
 
-# ========= 頻率類 =========
+# ========= 頻率/震盪 =========
 def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     if gamma is None: gamma=float(os.getenv("EW_GAMMA","0.96"))
@@ -177,7 +188,6 @@ def recent_freq(seq: List[str], win:int) -> List[float]:
     tot=max(1,len(cut))+3*alpha
     return [nB/tot,nP/tot,nT/tot]
 
-# ========= 交錯/震盪量測 =========
 def alt_ratio(seq: List[str], win:int=12) -> float:
     s=clean_bp(seq[-win:] if len(seq)>=win else seq)
     if len(s)<2: return 0.0
@@ -227,7 +237,7 @@ def markov3_next_prob(seq: List[str], decay: float=None) -> List[float]:
     flow=C[key]; alpha=float(os.getenv("MKV3_LAPLACE","0.5"))
     flow=[x+alpha for x in flow]; S=sum(flow); return [x/S for x in flow]
 
-# ========= n-gram（忽略 T，3/4 階） =========
+# ========= n-gram（忽略 T） =========
 def ngram_expert(seq: List[str]) -> List[float]:
     bp=clean_bp(seq)
     if len(bp)<3: return [1/3,1/3,1/3]
@@ -235,14 +245,12 @@ def ngram_expert(seq: List[str]) -> List[float]:
     decay3=float(os.getenv("NGRAM3_DECAY","0.985"))
     decay4=float(os.getenv("NGRAM4_DECAY","0.99"))
     lap=float(os.getenv("NGRAM_LAPLACE","0.5"))
-    # 3-gram
     C3=defaultdict(lambda:[0.0,0.0]); w=1.0
     for a,b,c in zip(bp[:-2],bp[1:-1],bp[2:]):
         C3[(a,b)][0 if c=="B" else 1]+=w; w*=decay3
     p3=[0.5,0.5]; k3=(bp[-2],bp[-1])
     if k3 in C3:
         f=[C3[k3][0]+lap,C3[k3][1]+lap]; S=sum(f); p3=[f[0]/S,f[1]/S]
-    # 4-gram
     if len(bp)<4:
         pB,pP=p3[0],p3[1]
     else:
@@ -257,7 +265,7 @@ def ngram_expert(seq: List[str]) -> List[float]:
     pT=_estimate_tie_prob(seq); sc=1.0-pT
     return [pB*sc,pP*sc,pT]
 
-# ========= 短龍斷點（2–5 反打） =========
+# ========= 短龍斷點 =========
 def short_dragon_break_expert(seq: List[str]) -> List[float]:
     bp=clean_bp(seq)
     if not bp: return [1/3,1/3,1/3]
@@ -266,16 +274,13 @@ def short_dragon_break_expert(seq: List[str]) -> List[float]:
     altR=alt_ratio(seq, win=max(6,int(os.getenv("SDB_WIN","12"))))
     if 2<=rlen<=5 and altR>=float(os.getenv("SDB_ALT_TH","0.5")):
         pT=_estimate_tie_prob(seq)
-        if ch=="B":
-            base=[0.0,1.0,pT]
-        else:
-            base=[1.0,0.0,pT]
+        if ch=="B": base=[0.0,1.0,pT]
+        else:       base=[1.0,0.0,pT]
         S=sum(base); return [x/S for x in base]
     return [1/3,1/3,1/3]
 
-# ========= 早龍專家（1–3 手就跟上） =========
+# ========= 早龍 expert =========
 def hazard_continue_prob(rlen:int) -> float:
-    # 續龍機率隨 rlen 緩降：p(r)=HZ_BASE*(HZ_DECAY**(rlen-1))
     return max(0.0, min(0.99, HZ_BASE * (HZ_DECAY ** max(0, rlen-1))))
 
 def early_dragon_expert(seq: List[str]) -> List[float]:
@@ -283,7 +288,6 @@ def early_dragon_expert(seq: List[str]) -> List[float]:
     if len(bp)<2: return [1/3,1/3,1/3]
     last=bp[-1]; i=len(bp)-2; rlen=1
     while i>=0 and bp[i]==last: rlen+=1; i-=1
-    # 只在 r=2~3 且非震盪時啟用，避免假啟動
     if 2<=rlen<=3 and alt_ratio(seq,8)<=EARLY_ALT_MAX:
         pT=_estimate_tie_prob(seq); cont=hazard_continue_prob(rlen)
         stay=cont*(1-pT); flip=(1-cont)*(1-pT)
@@ -291,7 +295,30 @@ def early_dragon_expert(seq: List[str]) -> List[float]:
         else:         return [flip, stay, pT]
     return [1/3,1/3,1/3]
 
-# ========= Regime & Momentum =========
+# ========= 晚段牽勢加速（你提的「後面最後一列開始牽莊龍」） =========
+def late_dragon_accel_expert(seq: List[str]) -> List[float]:
+    bp=clean_bp(seq)
+    if len(bp)<LATE_RUN_TH: return [1/3,1/3,1/3]
+    # run 長度
+    last=bp[-1]; i=len(bp)-2; rlen=1
+    while i>=0 and bp[i]==last: rlen+=1; i-=1
+    # 最近窗內同邊占比
+    win = LATE_WIN
+    s = bp[-win:] if len(bp)>=win else bp
+    if not s: return [1/3,1/3,1/3]
+    rb = s.count("B")/len(s); rp = s.count("P")/len(s)
+    altR = alt_ratio(seq, max(8, win))
+    if rlen>=LATE_RUN_TH and altR<=LATE_ALT_MAX:
+        pT=_estimate_tie_prob(seq)
+        cont = min(0.92, 0.60 + 0.10*(rlen-LATE_RUN_TH) + 0.25*max(rb,rp))
+        cont *= (1.0 - 0.25*altR)  # 震盪越高越保守
+        stay=cont*(1-pT); flip=(1-cont)*(1-pT)
+        if last=="B": base=[stay, flip, pT]
+        else:          base=[flip, stay, pT]
+        return norm(base)
+    return [1/3,1/3,1/3]
+
+# ========= Regime / Momentum =========
 def is_qijiao(seq: List[str], win:int=20, tol:float=0.1)->bool:
     s=seq[-win:] if len(seq)>=win else seq
     if not s: return False
@@ -481,15 +508,15 @@ def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
         return None
     except Exception as e: logger.warning("LGBM inference failed: %s", e); return None
 
-# ========= 集成（含早龍/震盪動態） =========
+# ========= 集成 =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str,float]]=None) -> List[float]:
     rule=[THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]]
     pr_rnn=rnn_predict(seq); pr_xgb=xgb_predict(seq); pr_lgb=lgbm_predict(seq)
 
-    w_rule=float(os.getenv("RULE_W","0.26"))
+    w_rule=float(os.getenv("RULE_W","0.24"))
     w_rnn =float(os.getenv("RNN_W" ,"0.22"))
     w_xgb =float(os.getenv("XGB_W" ,"0.22"))
-    w_lgb =float(os.getenv("LGBM_W","0.30"))
+    w_lgb =float(os.getenv("LGBM_W","0.32"))
 
     total=w_rule + (w_rnn if pr_rnn else 0) + (w_xgb if pr_xgb else 0) + (w_lgb if pr_lgb else 0)
     base=[w_rule*rule[i] for i in range(3)]
@@ -507,8 +534,8 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     p_ng  =ngram_expert(seq)
     p_sdb =short_dragon_break_expert(seq)
     p_early=early_dragon_expert(seq)
+    p_late =late_dragon_accel_expert(seq)
 
-    # 震盪/早龍因子
     altR=alt_ratio(seq, max(8,REC_WIN))
     per2=period2_score(seq, max(8,REC_WIN))
     bp=clean_bp(seq); last_bp_run=0
@@ -517,17 +544,18 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
         while i>=0 and bp[i]==ch: last_bp_run+=1; i-=1
 
     # 權重
-    REC_W  =float(os.getenv("REC_W","0.18"))
-    LONG_W =float(os.getenv("LONG_W","0.20"))
-    MKV1_W =float(os.getenv("MKV_W","0.14"))
+    REC_W  =float(os.getenv("REC_W","0.16"))
+    LONG_W =float(os.getenv("LONG_W","0.18"))
+    MKV1_W =float(os.getenv("MKV_W" ,"0.14"))
     MKV2_W =float(os.getenv("MKV2_W","0.12"))
     MKV3_W =float(os.getenv("MKV3_W","0.08"))
     NGRAM_W=float(os.getenv("NGRAM_W","0.16"))
-    SDB_W  =float(os.getenv("SDB_W","0.14"))
+    SDB_W  =float(os.getenv("SDB_W"  ,"0.14"))
     EARLY_W=float(os.getenv("EARLY_W","0.14"))
+    LATE_W =float(os.getenv("LATE_W" ,"0.16"))
     PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
 
-    # 震盪越高→短期/n-gram/Markov↑、長期↓
+    # 震盪→短期/n-gram/Markov↑、長期↓
     osc=min(1.0, 0.6*altR + 0.4*per2)
     scale=1.0 + 0.7*osc
     REC_W  *= (1.0 + 0.2*osc)
@@ -535,11 +563,13 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     MKV1_W *= scale; MKV2_W *= scale; MKV3_W *= scale*0.9
     NGRAM_W*= scale*1.1; SDB_W *= scale*1.1
 
-    # 早龍期再加碼（r=2~3 且非震盪）：更快跟上
+    # 早/晚 龍
     if 2<=last_bp_run<=3 and altR<=EARLY_ALT_MAX:
         EARLY_W *= EARLY_W_MULT
-        MKV1_W  *= 1.10
-        REC_W   *= 1.10
+        MKV1_W  *= 1.10; REC_W *= 1.10
+    if last_bp_run>=LATE_RUN_TH and altR<=LATE_ALT_MAX:
+        LATE_W  *= LATE_W_MULT
+        LONG_W  *= 0.8  # 減少拉回
 
     if weight_overrides:
         REC_W  =weight_overrides.get("REC_W",REC_W)
@@ -554,9 +584,10 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs=B(probs,p_ng  ,NGRAM_W)
     probs=B(probs,p_sdb ,SDB_W)
     probs=B(probs,p_early,EARLY_W)
+    probs=B(probs,p_late ,LATE_W)
     probs=B(probs,[THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]],PRIOR_W)
 
-    # 交錯期翻邊偏置（避免複誦上一手）
+    # 交錯期翻邊偏置
     if len(seq)>=2 and (altR>=float(os.getenv("FLIP_ALT_TH","0.55")) or per2>=float(os.getenv("FLIP_PER2_TH","0.35"))):
         last=None
         for x in reversed(seq):
@@ -587,7 +618,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 @app.route("/", methods=["GET"])
 def index(): return "ok"
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v10-early-dragon")
+def health(): return jsonify(status="healthy", version="v11-late-dragon-quiet")
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
 @app.route("/predict", methods=["POST"])
@@ -630,7 +661,7 @@ def reload_models():
     load_models()
     return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
 
-# ========= LINE Webhook（無自訂色，避免 400） =========
+# ========= LINE Webhook（彩色按鈕 + 未開始只記錄） =========
 LINE_CHANNEL_ACCESS_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_CHANNEL_SECRET      =os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -653,6 +684,7 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
+USER_RECS:    Dict[str, List[str]] = USER_RECS  # 同一份
 
 def flex_buttons_card() -> 'FlexSendMessage':
     contents={
@@ -660,13 +692,12 @@ def flex_buttons_card() -> 'FlexSendMessage':
         "body":{
             "type":"box","layout":"vertical","spacing":"md",
             "contents":[
-                {"type":"text","text":"🤖 請開始輸入歷史數據","weight":"bold","size":"lg"},
-                {"type":"text","text":"先輸入莊/閒/和；按「開始分析」後才會給出下注建議。","wrap":True,"size":"sm"},
+                {"type":"text","text":"🤖 請先把當前『歷史牌局』輸入完畢，再按【開始分析】！","wrap":True,"size":"sm"},
                 {"type":"box","layout":"horizontal","spacing":"sm",
                  "contents":[
-                    {"type":"button","style":"primary","action":{"type":"postback","label":"莊","data":"B"}},
-                    {"type":"button","style":"primary","action":{"type":"postback","label":"閒","data":"P"}},
-                    {"type":"button","style":"primary","action":{"type":"postback","label":"和","data":"T"}}
+                    {"type":"button","style":"primary","color":"#E74C3C","action":{"type":"postback","label":"莊","data":"B"}},
+                    {"type":"button","style":"primary","color":"#2980B9","action":{"type":"postback","label":"閒","data":"P"}},
+                    {"type":"button","style":"primary","color":"#27AE60","action":{"type":"postback","label":"和","data":"T"}}
                  ]},
                 {"type":"box","layout":"horizontal","spacing":"sm",
                  "contents":[
@@ -702,7 +733,7 @@ if USE_LINE and handler is not None:
     def handle_text(event):
         uid=event.source.user_id
         USER_HISTORY.setdefault(uid,[]); USER_READY.setdefault(uid,False)
-        msg="請使用下方按鈕輸入：莊/閒/和；按「開始分析」後才會給出下注建議。"
+        msg="請先把『歷史牌局』輸入完畢，再按【開始分析】；未開始前不會回覆結果以節省用量。"
         line_bot_api.reply_message(event.reply_token,
             [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()])
 
@@ -720,7 +751,7 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
         if data=="END":
-            USER_HISTORY[uid]=[]; USER_READY[uid]=False
+            USER_HISTORY[uid]=[]; USER_READY[uid]=False; USER_RECS[uid]=[]
             line_bot_api.reply_message(event.reply_token,
                 [TextSendMessage(text="✅ 已結束分析，紀錄已清空。", quick_reply=quick_reply_bar()),
                  flex_buttons_card()])
@@ -731,25 +762,27 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()])
             return
 
-        # 記錄&落地
+        # 記錄 & 落地
         history_before="".join(seq)
         seq.append(data); USER_HISTORY[uid]=seq
         try: append_round_csv(uid, history_before, data)
         except Exception as e: logger.warning("csv log failed: %s", e)
 
-        # 尚未開始：只顯示進度
+        # 未開始：只記錄，不回覆（或每 N 手提示一次）
         if not ready:
-            s="".join(seq[-20:])
-            line_bot_api.reply_message(event.reply_token,
-                [TextSendMessage(text=f"已記錄 {len(seq)} 手：{s}\n按「開始分析」後才會給出下注建議。", quick_reply=quick_reply_bar()),
-                 flex_buttons_card()])
+            if PRESTART_EVERY_N>0 and (len(seq)%PRESTART_EVERY_N==0):
+                s="".join(seq[-20:])
+                line_bot_api.reply_message(event.reply_token,
+                    [TextSendMessage(text=f"已記錄 {len(seq)} 手：{s}\n👉 歷史輸入完畢後再按【開始分析】", quick_reply=quick_reply_bar()),
+                     flex_buttons_card()])
+            # 否則不回覆以節省用量
             return
 
         # 漂移自適應
         _, active = update_ph_state(uid, seq)
         overrides=None
         if active:
-            REC_W=float(os.getenv("REC_W","0.18")); LONG_W=float(os.getenv("LONG_W","0.20"))
+            REC_W=float(os.getenv("REC_W","0.16")); LONG_W=float(os.getenv("LONG_W","0.18"))
             MKV_W=float(os.getenv("MKV_W","0.14")); PRIOR_W=float(os.getenv("PRIOR_W","0.08"))
             SHORT_BOOST=float(os.getenv("PH_SHORT_BOOST","0.30"))
             LONG_CUT=float(os.getenv("PH_LONG_CUT","0.40"))
