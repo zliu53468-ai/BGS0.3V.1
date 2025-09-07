@@ -3,13 +3,11 @@
 """
 Train LightGBM (3-class: B/P/T) from CSV logged by server.py
 
-CSV format:
-user_id,ts,history_before,label
-
-Env (all optional):
-- TRAIN_DATA_PATH   default /mnt/data/logs/rounds.csv
-- LGBM_OUT_PATH     default /opt/models/lgbm.txt
-- FEAT_WIN          default 20        # must match server.py
+Env (optional):
+- TRAIN_DATA_PATH   default /data/logs/rounds.csv
+- LGBM_OUT_PATH     default {MODEL_DIR}/lgbm.txt
+- MODEL_DIR         default /data/models
+- FEAT_WIN          default 20
 - VAL_SPLIT         default 0.15
 - LGBM_ROUNDS       default 1200
 - LGBM_EARLY        default 100
@@ -17,13 +15,14 @@ Env (all optional):
 """
 
 import os, csv
-from typing import List, Tuple
+from typing import List
 import numpy as np
 import lightgbm as lgb
 
-TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/mnt/data/logs/rounds.csv")
-LGBM_OUT_PATH   = os.getenv("LGBM_OUT_PATH", "/opt/models/lgbm.txt")
-os.makedirs(os.path.dirname(LGBM_OUT_PATH), exist_ok=True)
+TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/data/logs/rounds.csv")
+MODEL_DIR       = os.getenv("MODEL_DIR", "/data/models")
+LGBM_OUT_PATH   = os.getenv("LGBM_OUT_PATH", os.path.join(MODEL_DIR, "lgbm.txt"))
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 FEAT_WIN   = int(os.getenv("FEAT_WIN", "20"))
 VAL_SPLIT  = float(os.getenv("VAL_SPLIT", "0.15"))
@@ -42,9 +41,12 @@ def load_rows(path:str):
         r = csv.reader(f)
         for line in r:
             if not line or len(line) < 4: continue
-            ts = int(line[1])
-            hist = (line[2] or "").strip().upper()
-            lab  = (line[3] or "").strip().upper()
+            try:
+                ts = int(line[1])
+                hist = (line[2] or "").strip().upper()
+                lab  = (line[3] or "").strip().upper()
+            except Exception:
+                continue
             if lab in LUT:
                 rows.append((ts, hist, lab))
     rows.sort(key=lambda x: x[0])
@@ -88,11 +90,11 @@ def main():
         print(f"[WARN] few samples: {len(rows)}; training anyway.")
     tr, va = time_split(rows, VAL_SPLIT)
     Xtr, ytr = build_xy(tr, FEAT_WIN)
-    Xva, yva = build_xy(va, FEAT_WIN)
+    Xva, yva = build_xy(va, FEAT_WIN) if len(va)>0 else (None, None)
 
     wtr = class_weights(ytr)
     ltr = lgb.Dataset(Xtr, label=ytr, weight=wtr, free_raw_data=False)
-    lva = lgb.Dataset(Xva, label=yva, reference=ltr, free_raw_data=False) if len(yva)>0 else None
+    lva = lgb.Dataset(Xva, label=yva, reference=ltr, free_raw_data=False) if Xva is not None else None
 
     params = {
         "objective": "multiclass",
@@ -106,14 +108,11 @@ def main():
         "bagging_freq": 1,
         "max_depth": -1,
         "verbosity": -1,
-        # "device": "gpu"  # 若有 GPU 環境可打開
     }
 
-    valid_sets = [ltr]
-    valid_names= ["train"]
-    if lva is not None and len(yva)>0:
-        valid_sets.append(lva)
-        valid_names.append("valid")
+    valid_sets = [ltr]; valid_names=["train"]
+    if lva is not None:
+        valid_sets.append(lva); valid_names.append("valid")
 
     booster = lgb.train(
         params,
@@ -121,7 +120,7 @@ def main():
         num_boost_round=LGBM_ROUNDS,
         valid_sets=valid_sets,
         valid_names=valid_names,
-        early_stopping_rounds=LGBM_EARLY if lva is not None and len(yva)>0 else None,
+        early_stopping_rounds=LGBM_EARLY if lva is not None else None,
         verbose_eval=50
     )
 
