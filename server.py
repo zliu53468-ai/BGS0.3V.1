@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — v15b (Balanced Anti-Chase)
-- Big-Road(6x20) features: column depth / wall / early-dragon
-- Conditional Markov (P(next|last))
-- Momentum vs Reversion (hazard + wall + swing + mean-revert) arbitration
-- Overheat counter-boost + regime boosts
-- Page–Hinkley drift gating (overrides include MKV_W)
-- Tie(T) calibration unified across paths
-- CSV I/O (/export) + hot reload (/reload)
-- LINE buttons: 莊(紅)/閒(藍)/和(綠)/開始分析/結束分析/返回
-- Before START: 只顯示統計與輸入軌跡；START 後才回覆建議
+BGS LINE Bot backend — v15b (Balanced Anti-Chase) — Render-safe storage
+修正點：
+- 任何檔案寫入路徑改為「可寫目錄自動降級」(try DATA_LOG_PATH → /tmp/bgs → ./data)
+- 初始化時不再硬寫 /data，避免 PermissionError
+- /storage 端點可檢視目前實際使用的資料夾
 """
 
 import os, csv, time, logging
@@ -21,10 +16,52 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-backend")
 
-# ========= Paths / ENV =========
-DATA_CSV_PATH = os.getenv("DATA_LOG_PATH", "/data/logs/rounds.csv")
-os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
+# ========= Writable Path Resolver =========
+def _is_writable_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        testfile = os.path.join(path, ".wtest")
+        with open(testfile, "w") as f:
+            f.write("ok")
+        os.remove(testfile)
+        return True
+    except Exception as e:
+        logger.warning("dir not writable: %s (%s)", path, e)
+        return False
 
+def _resolve_base_dir() -> str:
+    # 1) 使用者指定 (DATA_BASE 或 DATA_LOG_PATH 的父層)
+    user_path = os.getenv("DATA_BASE") or os.path.dirname(os.getenv("DATA_LOG_PATH",""))
+    if user_path and _is_writable_dir(user_path):
+        return user_path
+    # 2) Render 通常可寫：/tmp
+    tmp_path = "/tmp/bgs"
+    if _is_writable_dir(tmp_path):
+        return tmp_path
+    # 3) 專案工作目錄下 data
+    local_path = os.path.join(os.getcwd(), "data")
+    if _is_writable_dir(local_path):
+        return local_path
+    # 4) 實在不行就回傳 /tmp（可能只可讀，但至少不會在 import 時崩）
+    return "/tmp"
+
+DATA_BASE_DIR = _resolve_base_dir()
+
+def _resolve_csv_path() -> str:
+    # 若使用者有指定完整路徑，優先使用；若無或不可寫，落到 DATA_BASE_DIR/logs/rounds.csv
+    env_path = os.getenv("DATA_LOG_PATH", "").strip()
+    if env_path:
+        parent = os.path.dirname(env_path)
+        if parent and _is_writable_dir(parent):
+            return env_path
+        logger.warning("DATA_LOG_PATH not writable, fallback to DATA_BASE_DIR.")
+    logs_dir = os.path.join(DATA_BASE_DIR, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    return os.path.join(logs_dir, "rounds.csv")
+
+DATA_CSV_PATH = _resolve_csv_path()
+
+# 其他模型檔案路徑維持環境變數（只讀即可）
 RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
 RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
 XGB_PATH = os.getenv("XGB_PATH", "/opt/models/xgb.json")
@@ -47,9 +84,17 @@ def parse_history(payload) -> List[str]:
             if isinstance(s, str) and s.strip().upper() in CLASS_ORDER:
                 out.append(s.strip().upper())
     elif isinstance(payload, str):
-        for ch in payload:
-            up = ch.upper()
-            if up in CLASS_ORDER: out.append(up)
+        # 支援以空白/逗號分隔，或連寫字串 "BPTBP..."
+        if any(ch in payload for ch in [" ", ","]):
+            for t in payload.replace(",", " ").split():
+                up = t.strip().upper()
+                if up in CLASS_ORDER:
+                    out.append(up)
+        else:
+            for ch in payload:
+                up = ch.upper()
+                if up in CLASS_ORDER:
+                    out.append(up)
     if len(out) > MAX_HISTORY:
         out = out[-MAX_HISTORY:]
     return out
@@ -436,7 +481,7 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq)
     pr_xgb = xgb_predict(seq)
-    pr_lgb = lgbm_predict(seq)
+    pr_lgb  = lgbm_predict(seq)
 
     w_rule = float(os.getenv("RULE_W","0.28"))
     w_rnn  = float(os.getenv("RNN_W","0.25"))
@@ -495,17 +540,15 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
     REC_W   = float(os.getenv("REC_W","0.20"))
     LONG_W  = float(os.getenv("LONG_W","0.20"))
-    MKV_W   = float(os.getenv("MKV_W","0.20"))   # 讓覆寫能影響到
+    MKV_W   = float(os.getenv("MKV_W","0.20"))
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
 
-    # 覆寫權重（PH 漂移時會傳入）
     if weight_overrides:
         REC_W   = weight_overrides.get("REC_W",  REC_W)
         LONG_W  = weight_overrides.get("LONG_W", LONG_W)
         PRIOR_W = weight_overrides.get("PRIOR_W",PRIOR_W)
         MKV_W   = weight_overrides.get("MKV_W",  MKV_W)
 
-    # 將 MKV 權重顯式混入（避免被忽略）
     probs = blend(probs, p_mix,  REC_W)
     probs = blend(probs, p_long, LONG_W)
     probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
@@ -526,15 +569,19 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
 
-# ========= Health / Predict / Export / Reload =========
+# ========= Health / Predict / Export / Reload / Storage =========
 @app.route("/", methods=["GET"])
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v15b-balanced")
+def health(): return jsonify(status="healthy", version="v15b-balanced+render-safe")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
+
+@app.route("/storage", methods=["GET"])
+def storage_info():
+    return jsonify(base_dir=DATA_BASE_DIR, csv_path=DATA_CSV_PATH)
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -550,8 +597,12 @@ def predict():
     })
 
 def append_round_csv(user_id: str, history_before: str, label: str) -> None:
+    # 允許關閉記錄（例如：EXPORT_LOGS=0）
+    if os.getenv("EXPORT_LOGS", "1") != "1":
+        return
     try:
-        os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
+        parent = os.path.dirname(DATA_CSV_PATH)
+        os.makedirs(parent, exist_ok=True)
         with open(DATA_CSV_PATH, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([user_id, int(time.time()), history_before, label])
     except Exception as e:
@@ -605,7 +656,7 @@ else:
 
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
-USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT
+USER_DRIFT:   Dict[str, Dict[str, float]] = {}  # 同上面的 PH 狀態
 
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
@@ -660,7 +711,9 @@ if USE_LINE and handler is not None:
         uid = event.source.user_id
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
-        _get_drift_state(uid)
+        # 初始化 PH 狀態
+        USER_DRIFT.setdefault(uid, {'cum':0.0,'min':0.0,'cooldown':0.0})
+
         sB = USER_HISTORY[uid].count("B")
         sP = USER_HISTORY[uid].count("P")
         sT = USER_HISTORY[uid].count("T")
@@ -722,7 +775,7 @@ if USE_LINE and handler is not None:
         # Append & log
         history_before = "".join(seq)
         seq.append(data)
-        if len(seq) > MAX_HISTORY:  # 保證與 /predict 一致
+        if len(seq) > MAX_HISTORY:
             seq[:] = seq[-MAX_HISTORY:]
         USER_HISTORY[uid] = seq
         append_round_csv(uid, history_before, data)
@@ -743,13 +796,37 @@ if USE_LINE and handler is not None:
             ); return
 
         # After START: PH drift + ensemble
-        drift_now = update_ph_state(uid, seq)
-        active = in_drift(uid)
-        if active: consume_cooldown(uid)
+        # 這裡重用先前的 PH 函式（簡化存取）
+        def _get(uid_: str): return USER_DRIFT.setdefault(uid_, {'cum':0.0,'min':0.0,'cooldown':0.0})
+        st=_get(uid)
+
+        # 計算 PH
+        def _js(p, q):
+            import math
+            eps=1e-12; m=[(p[i]+q[i])/2.0 for i in range(3)]
+            def _kl(a,b): return sum((ai+eps)*math.log((ai+eps)/(bi+eps)) for ai,bi in zip(a,b))
+            return 0.5*_kl(p,m) + 0.5*_kl(q,m)
+
+        REC_WIN = int(os.getenv("REC_WIN_FOR_PH","12"))
+        p_short = recent_freq(seq, REC_WIN)
+        p_long  = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+        D_t     = _js(p_short, p_long)
+        PH_DELTA   = float(os.getenv("PH_DELTA","0.005"))
+        PH_LAMBDA  = float(os.getenv("PH_LAMBDA","0.08"))
+        DRIFT_STEPS= float(os.getenv("DRIFT_STEPS","5"))
+        st['cum'] = st.get('cum',0.0) + (D_t - PH_DELTA)
+        st['min'] = min(st.get('min',0.0), st['cum'])
+        drift_now=False
+        if (st['cum'] - st['min']) > PH_LAMBDA:
+            st['cum']=0.0; st['min']=0.0; st['cooldown']=DRIFT_STEPS
+            drift_now=True
+
+        active = st.get('cooldown',0.0)>0.0
+        if active:
+            st['cooldown']=max(0.0, st['cooldown']-1.0)
 
         overrides = None
         if active:
-            # 漂移時：強化短期與 Markov，降低長期
             overrides = {"REC_W":0.30, "LONG_W":0.15, "PRIOR_W":0.15, "MKV_W":0.30}
 
         probs = ensemble_with_anti_stuck(seq, overrides)
