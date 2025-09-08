@@ -2,24 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 BGS LINE Bot backend — v15.1
-- Conditional Markov (condition on last outcome)
-- Drift overrides now respect MKV_W
-- Big-Road features dedup via br_features.py
-- History length cap (MAX_HISTORY) for predict & LINE
-- Tie(T) calibration; CSV I/O; /export; /reload
-- LINE buttons: 莊(紅)/閒(藍)/和(綠)/開始分析/結束分析/返回
+- Big-Road(6x20) + Momentum/Reversion 仲裁 + Page-Hinkley 漂移
+- T(和) 校正（全路徑一致）
+- ✅ MAX_HISTORY：裁切歷史避免序列過長
+- ✅ Markov 以「最後結果為條件」的轉移機率
+- ✅ 漂移時可覆蓋 MKV_W 權重
+- CSV I/O (/export) + /reload
+- LINE：莊(紅)/閒(藍)/和(綠)/開始/結束/返回；未開始僅顯示統計
 """
-
 import os, csv, time, logging
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, request, jsonify, Response
 
-# ====== App & Logs ======
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bgs-backend")
 
-# ====== Paths & ENV ======
+# ========= Paths / ENV =========
 DATA_CSV_PATH = os.getenv("DATA_LOG_PATH", "/data/logs/rounds.csv")
 os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
 
@@ -28,164 +27,185 @@ RNN_PATH = os.getenv("RNN_PATH", "/data/models/rnn.pt")
 XGB_PATH = os.getenv("XGB_PATH", "/data/models/xgb.json")
 LGBM_PATH = os.getenv("LGBM_PATH", "/data/models/lgbm.txt")
 
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "360"))  # 強制上限，避免過長序列拖慢
-CLASS_ORDER = ("B","P","T")
-LAB_ZH = {"B":"莊","P":"閒","T":"和"}
-THEORETICAL_PROBS = {"B":0.458,"P":0.446,"T":0.096}
+# 限制歷史長度（避免效能/記憶體爆衝）
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "240"))
 
-def parse_history(payload)->List[str]:
+# ========= Constants =========
+CLASS_ORDER = ("B", "P", "T")
+LAB_ZH = {"B": "莊", "P": "閒", "T": "和"}
+THEORETICAL_PROBS: Dict[str, float] = {"B": 0.458, "P": 0.446, "T": 0.096}
+
+def parse_history(payload) -> List[str]:
+    """解析 + 裁切到 MAX_HISTORY（保留最後 N 手）"""
     if payload is None: return []
-    out=[]
-    if isinstance(payload,list):
+    seq: List[str] = []
+    if isinstance(payload, list):
         for s in payload:
-            if isinstance(s,str) and s.strip().upper() in CLASS_ORDER:
-                out.append(s.strip().upper())
-    elif isinstance(payload,str):
+            if isinstance(s, str) and s.strip().upper() in CLASS_ORDER:
+                seq.append(s.strip().upper())
+    elif isinstance(payload, str):
         for ch in payload:
-            up=ch.upper()
-            if up in CLASS_ORDER: out.append(up)
-    # 長度裁切（只保留最後 MAX_HISTORY 手）
-    if len(out) > MAX_HISTORY:
-        out = out[-MAX_HISTORY:]
-    return out
+            up = ch.upper()
+            if up in CLASS_ORDER: seq.append(up)
+    # 只保留最後 MAX_HISTORY
+    if len(seq) > MAX_HISTORY:
+        seq = seq[-MAX_HISTORY:]
+    return seq
 
-# ====== Optional Models ======
+# ========= Optional Models =========
 try:
     import torch
     import torch.nn as tnn
 except Exception:
-    torch=None; tnn=None
+    torch = None; tnn = None
 try:
     import xgboost as xgb
 except Exception:
-    xgb=None
+    xgb = None
 try:
     import lightgbm as lgb
 except Exception:
-    lgb=None
-
-# Big-Road 共用功能
-from br_features import (
-    map_to_big_road,  # 6x20 繪製與牆/深度/early-dragon 特徵
-    bp_only, run_hist, hazard_from_hist, mean_revert_score,
-    is_zigzag, exp_decay_freq, recent_freq
-)
+    lgb = None
 
 if tnn is not None:
     class TinyRNN(tnn.Module):
-        def __init__(self,in_dim=3,hidden=16,out_dim=3):
+        def __init__(self, in_dim=3, hidden=16, out_dim=3):
             super().__init__()
-            self.rnn=tnn.GRU(in_dim,hidden,batch_first=True)
-            self.fc=tnn.Linear(hidden,out_dim)
-        def forward(self,x):
-            o,_=self.rnn(x)
-            return self.fc(o[:,-1,:])
+            self.rnn = tnn.GRU(in_dim, hidden, batch_first=True)
+            self.fc  = tnn.Linear(hidden, out_dim)
+        def forward(self, x):
+            out, _ = self.rnn(x)
+            return self.fc(out[:, -1, :])
 else:
-    TinyRNN=None
+    TinyRNN = None
 
-# ====== Load / Reload ======
-RNN_MODEL=None; XGB_MODEL=None; LGBM_MODEL=None
+# ========= Load / Reload =========
+RNN_MODEL: Optional[Any] = None
+XGB_MODEL: Optional[Any] = None
+LGBM_MODEL: Optional[Any] = None
 
-def load_models():
+def load_models() -> None:
     global RNN_MODEL, XGB_MODEL, LGBM_MODEL
     # RNN
     if TinyRNN is not None and torch is not None and os.path.exists(RNN_PATH):
         try:
-            m=TinyRNN()
+            m = TinyRNN()
             m.load_state_dict(torch.load(RNN_PATH, map_location="cpu"))
-            m.eval(); RNN_MODEL=m
-            logger.info("Loaded RNN: %s", RNN_PATH)
+            m.eval()
+            RNN_MODEL = m
+            logger.info("Loaded RNN from %s", RNN_PATH)
         except Exception as e:
-            logger.warning("Load RNN fail: %s", e); RNN_MODEL=None
+            logger.warning("Load RNN failed: %s", e); RNN_MODEL = None
     else:
-        RNN_MODEL=None
+        RNN_MODEL = None
     # XGB
     if xgb is not None and os.path.exists(XGB_PATH):
         try:
-            booster=xgb.Booster(); booster.load_model(XGB_PATH)
-            XGB_MODEL=booster; logger.info("Loaded XGB: %s", XGB_PATH)
+            booster = xgb.Booster()
+            booster.load_model(XGB_PATH)
+            XGB_MODEL = booster
+            logger.info("Loaded XGB from %s", XGB_PATH)
         except Exception as e:
-            logger.warning("Load XGB fail: %s", e); XGB_MODEL=None
+            logger.warning("Load XGB failed: %s", e); XGB_MODEL = None
     else:
-        XGB_MODEL=None
+        XGB_MODEL = None
     # LGBM
     if lgb is not None and os.path.exists(LGBM_PATH):
         try:
-            booster=lgb.Booster(model_file=LGBM_PATH)
-            LGBM_MODEL=booster; logger.info("Loaded LGBM: %s", LGBM_PATH)
+            booster = lgb.Booster(model_file=LGBM_PATH)
+            LGBM_MODEL = booster
+            logger.info("Loaded LGBM from %s", LGBM_PATH)
         except Exception as e:
-            logger.warning("Load LGBM fail: %s", e); LGBM_MODEL=None
+            logger.warning("Load LGBM failed: %s", e); LGBM_MODEL = None
     else:
-        LGBM_MODEL=None
+        LGBM_MODEL = None
 
 load_models()
 
-# ====== Tie calibration ======
+# ========= Tie (T) calibration =========
+def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
+    if not seq: return [1/3,1/3,1/3]
+    if gamma is None: gamma = float(os.getenv("EW_GAMMA","0.96"))
+    wB=wP=wT=0.0; w=1.0
+    for r in reversed(seq):
+        if r=="B": wB += w
+        elif r=="P": wP += w
+        else: wT += w
+        w *= gamma
+    alpha = float(os.getenv("LAPLACE","0.5"))
+    wB+=alpha; wP+=alpha; wT+=alpha
+    S = wB+wP+wT
+    return [wB/S, wP/S, wT/S]
+
 def _estimate_tie_prob(seq: List[str]) -> float:
-    prior = THEORETICAL_PROBS["T"]
-    longT = exp_decay_freq(seq)[2]
-    w     = float(os.getenv("T_BLEND","0.5"))
-    floor = float(os.getenv("T_MIN","0.03"))
-    cap   = float(os.getenv("T_MAX","0.18"))
-    p     = (1-w)*prior + w*longT
-    return max(floor, min(cap, p))
+    prior_T = THEORETICAL_PROBS["T"]
+    long_T  = exp_decay_freq(seq)[2]
+    w       = float(os.getenv("T_BLEND","0.5"))
+    floor_T = float(os.getenv("T_MIN","0.03"))
+    cap_T   = float(os.getenv("T_MAX","0.18"))
+    pT = (1-w)*prior_T + w*long_T
+    return max(floor_T, min(cap_T, pT))
 
 def _merge_bp_with_t(bp: List[float], pT: float) -> List[float]:
-    b,p=float(bp[0]), float(bp[1])
-    s=max(1e-12, b+p); b/=s; p/=s
+    b, p = float(bp[0]), float(bp[1])
+    s = max(1e-12, b+p); b/=s; p/=s
     scale = 1.0 - pT
     return [b*scale, p*scale, pT]
 
-# ====== Model inference ======
-def rnn_predict(seq:List[str])->Optional[List[float]]:
+# ========= Single-model inference =========
+def rnn_predict(seq: List[str]) -> Optional[List[float]]:
     if RNN_MODEL is None or torch is None or not seq: return None
     try:
-        def onehot(y): return [1 if y==c else 0 for c in CLASS_ORDER]
-        x=torch.tensor([[onehot(ch) for ch in seq]], dtype=torch.float32)
+        def onehot(label: str): return [1 if label==lab else 0 for lab in CLASS_ORDER]
+        inp = torch.tensor([[onehot(ch) for ch in seq]], dtype=torch.float32)
         with torch.no_grad():
-            logits=RNN_MODEL(x)
-            p=torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
-        return [float(v) for v in p]
+            logits = RNN_MODEL(inp)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
+        return [float(p) for p in probs]
     except Exception as e:
-        logger.warning("RNN infer fail: %s", e); return None
+        logger.warning("RNN inference failed: %s", e); return None
 
-def _vec_from_seq(seq:List[str], K:int)->List[float]:
-    vec=[]
-    for lab in seq[-K:]:
-        vec.extend([1.0 if lab==c else 0.0 for c in CLASS_ORDER])
-    need=K*3 - len(vec)
-    if need>0: vec=[0.0]*need + vec
-    return vec
-
-def xgb_predict(seq:List[str])->Optional[List[float]]:
+def xgb_predict(seq: List[str]) -> Optional[List[float]]:
     if XGB_MODEL is None or not seq: return None
     try:
         import numpy as np
-        K=int(os.getenv("FEAT_WIN","20"))
-        d=xgb.DMatrix(np.array([_vec_from_seq(seq,K)], dtype=float))
-        prob=XGB_MODEL.predict(d)[0]
+        K = int(os.getenv("FEAT_WIN","20"))
+        vec=[]
+        for label in seq[-K:]:
+            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
+        pad = K*3 - len(vec)
+        if pad>0: vec = [0.0]*pad + vec
+        dmatrix = xgb.DMatrix(np.array([vec], dtype=float))
+        prob = XGB_MODEL.predict(dmatrix)[0]
         if isinstance(prob,(list,tuple)) and len(prob)==3:
-            return [float(prob[0]),float(prob[1]),float(prob[2])]
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
         if isinstance(prob,(list,tuple)) and len(prob)==2:
-            return _merge_bp_with_t([float(prob[0]),float(prob[1])], _estimate_tie_prob(seq))
+            pT = _estimate_tie_prob(seq)
+            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
         return None
     except Exception as e:
-        logger.warning("XGB infer fail: %s", e); return None
+        logger.warning("XGB inference failed: %s", e); return None
 
-def lgbm_predict(seq:List[str])->Optional[List[float]]:
+def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
     if LGBM_MODEL is None or not seq: return None
     try:
-        K=int(os.getenv("FEAT_WIN","20"))
-        prob=LGBM_MODEL.predict([_vec_from_seq(seq,K)])[0]
+        K = int(os.getenv("FEAT_WIN","20"))
+        vec=[]
+        for label in seq[-K:]:
+            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
+        pad = K*3 - len(vec)
+        if pad>0: vec = [0.0]*pad + vec
+        prob = LGBM_MODEL.predict([vec])[0]
         if isinstance(prob,(list,tuple)) and len(prob)==3:
-            return [float(prob[0]),float(prob[1]),float(prob[2])]
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
         if isinstance(prob,(list,tuple)) and len(prob)==2:
-            return _merge_bp_with_t([float(prob[0]),float(prob[1])], _estimate_tie_prob(seq))
+            pT = _estimate_tie_prob(seq)
+            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
         return None
     except Exception as e:
-        logger.warning("LGBM infer fail: %s", e); return None
+        logger.warning("LGBM inference failed: %s", e); return None
 
-# ====== Utils ======
+# ========= Utils =========
 def norm(v: List[float]) -> List[float]:
     s=sum(v); s=s if s>1e-12 else 1.0
     return [max(0.0,x)/s for x in v]
@@ -198,39 +218,113 @@ def temperature_scale(p: List[float], tau: float) -> List[float]:
     ex=[pow(max(pi,1e-9), 1.0/tau) for pi in p]; s=sum(ex)
     return [e/s for e in ex]
 
-# ====== Conditional Markov (修正重點) ======
-def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
-    """
-    P(X_{t+1}|X_t=last) 以最後一手為條件的轉移機率；帶時間衰減。
-    """
-    if not seq or len(seq)<2: return [1/3,1/3,1/3]
-    if decay is None: decay = float(os.getenv("MKV_DECAY","0.98"))
-    last = seq[-1]
-    idx  = {"B":0,"P":1,"T":2}
-    # 對「以最後一手為前狀態」的轉移做加權統計
-    out = [0.0,0.0,0.0]  # to B/P/T
-    w = 1.0
-    for a,b in zip(seq[:-1], seq[1:]):
-        if a == last:
-            out[idx[b]] += w
-        w *= decay
-    a = float(os.getenv("MKV_LAPLACE","0.5"))
-    out = [x+a for x in out]
-    S = sum(out)
-    return [x/S for x in out] if S>0 else [1/3,1/3,1/3]
+# ========= Big-Road 6x20 =========
+def features_like_early_dragon(seq: List[str]) -> bool:
+    k=min(6, len(seq))
+    if k<4: return False
+    tail=seq[-k:]
+    most=max(tail.count("B"), tail.count("P"))
+    return (most>=k-1)
 
-# ====== Regime boosts（輕微） ======
+def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[str]], Dict[str,Any]]:
+    """Simplified Big-Road (6x20):
+       - Same result: try go down; if bottom or below occupied, move right (stay same row).
+       - Different result: move right, start from row 0 (top)."""
+    grid=[["" for _ in range(cols)] for _ in range(rows)]
+    if not seq:
+        return grid, {"cur_run":0, "col_depth":0, "blocked":False, "c":0, "r":0, "early_dragon_hint":False}
+
+    r=c=0; last=None
+    for ch in seq:
+        if last is None:
+            grid[r][c]=ch; last=ch; continue
+        if ch==last:
+            if r+1<rows and grid[r+1][c]=="":
+                r+=1
+            else:
+                c=min(cols-1, c+1)
+                while c<cols and grid[r][c]!="":
+                    c=min(cols-1, c+1)
+                if c>=cols: c=cols-1
+        else:
+            last=ch
+            c=min(cols-1, c+1)
+            r=0
+            while c<cols and grid[r][c]!="":
+                c=min(cols-1, c+1)
+            if c>=cols: c=cols-1
+        if grid[r][c]=="": grid[r][c]=ch
+
+    cur_depth=0
+    for rr in range(rows):
+        if grid[rr][c]!="": cur_depth=rr+1
+    blocked = (cur_depth>=rows) or (r==rows-1) or (r+1<rows and grid[r+1][c]!="" and last==grid[r][c])
+    def last_run_len(s: List[str])->int:
+        if not s: return 0
+        ch=s[-1]; i=len(s)-2; n=1
+        while i>=0 and s[i]==ch:
+            n+=1; i-=1
+        return n
+    feats = {
+        "cur_run": last_run_len(seq),
+        "col_depth": cur_depth,
+        "blocked": blocked,
+        "r": r, "c": c,
+        "early_dragon_hint": (cur_depth>=3 and features_like_early_dragon(seq))
+    }
+    return grid, feats
+
+# ========= Short/Mid/Long / Markov =========
+def recent_freq(seq: List[str], win: int) -> List[float]:
+    if not seq: return [1/3,1/3,1/3]
+    cut = seq[-win:] if win>0 else seq
+    a = float(os.getenv("LAPLACE","0.5"))
+    nB=cut.count("B")+a; nP=cut.count("P")+a; nT=cut.count("T")+a
+    tot=max(1,len(cut))+3*a
+    return [nB/tot, nP/tot, nT/tot]
+
+def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
+    """條件 Markov：以『最後一手』為列，取該列轉移分佈；使用時間衰減權重。"""
+    if not seq or len(seq)<2:
+        return [1/3,1/3,1/3]
+    if decay is None: decay = float(os.getenv("MKV_DECAY","0.98"))
+    idx={"B":0,"P":1,"T":2}
+    C=[[0.0]*3 for _ in range(3)]
+    w=1.0
+    for a,b in zip(seq[:-1], seq[1:]):
+        C[idx[a]][idx[b]] += w
+        w *= decay
+    last = seq[-1]
+    row = C[idx[last]]
+    alpha = float(os.getenv("MKV_LAPLACE","0.5"))
+    row = [x+alpha for x in row]
+    S = sum(row)
+    return [x/S for x in row]
+
+# ========= Regime boosts (mild) =========
+def is_zigzag(seq: List[str], k:int=6)->bool:
+    s = seq[-k:] if len(seq)>=k else seq
+    if len(s)<4: return False
+    alt = all(s[i]!=s[i-1] for i in range(1,len(s)))
+    if alt: return True
+    if len(s)%2==0:
+        pairs=[s[i:i+2] for i in range(0,len(s),2)]
+        if all(len(p)==2 and p[0]==p[1] for p in pairs):
+            if all(pairs[i][0]!=pairs[i-1][0] for i in range(1,len(pairs))):
+                return True
+    return False
+
 def regime_boosts(seq: List[str], grid_feat: Dict[str,Any]) -> List[float]:
     if not seq: return [1.0,1.0,1.0]
     b=[1.0,1.0,1.0]
     last=seq[-1]
-    # 最近連長
     rlen=1; i=len(seq)-2
-    while i>=0 and seq[i]==last: rlen+=1; i-=1
+    while i>=0 and seq[i]==last:
+        rlen+=1; i-=1   # 每步 i 會遞減，不會無窮迴圈
     DRAGON_TH    = int(os.getenv("BOOST_DRAGON_LEN","4"))
-    BOOST_DRAGON = float(os.getenv("BOOST_DRAGON","1.06"))
-    BOOST_EARLYD = float(os.getenv("BOOST_EARLY_DRAGON","1.03"))
-    BOOST_ALT    = float(os.getenv("BOOST_ALT","1.04"))
+    BOOST_DRAGON = float(os.getenv("BOOST_DRAGON","1.08"))
+    BOOST_EARLYD = float(os.getenv("BOOST_EARLY_DRAGON","1.04"))
+    BOOST_ALT    = float(os.getenv("BOOST_ALT","1.05"))
     BOOST_T      = float(os.getenv("BOOST_T","1.02"))
 
     if grid_feat.get("early_dragon_hint",False) and not grid_feat.get("blocked",False):
@@ -250,11 +344,38 @@ def regime_boosts(seq: List[str], grid_feat: Dict[str,Any]) -> List[float]:
         b[2]*=BOOST_T
     return b
 
-def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
-    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
-    s=sum(p); return [x/s for x in p]
+# ========= Hazard & Mean-Revert (Reversion engine) =========
+def bp_only(seq: List[str]) -> List[str]:
+    return [x for x in seq if x in ("B","P")]
 
-# ====== Page-Hinkley ======
+def run_hist(seq_bp: List[str]) -> Dict[int,int]:
+    hist: Dict[int,int]={}
+    if not seq_bp: return hist
+    cur=1
+    for i in range(1,len(seq_bp)):
+        if seq_bp[i]==seq_bp[i-1]:
+            cur+=1
+        else:
+            hist[cur]=hist.get(cur,0)+1
+            cur=1
+    hist[cur]=hist.get(cur,0)+1
+    return hist
+
+def hazard_from_hist(L:int, hist:Dict[int,int]) -> float:
+    if L<=0: return 0.0
+    a = float(os.getenv("HZD_ALPHA","0.5"))
+    ge = sum(v for k,v in hist.items() if k>=L)
+    end= hist.get(L, 0)
+    return (end + a) / (ge + a*max(1,len(hist)))
+
+def mean_revert_score(seq: List[str]) -> Tuple[float, str]:
+    b = seq.count("B"); p = seq.count("P")
+    tot = max(1, b+p)
+    diff = (b-p)/tot
+    side = "P" if diff>0 else ("B" if diff<0 else "")
+    return abs(diff), side
+
+# ========= Page-Hinkley =========
 def js_divergence(p: List[float], q: List[float]) -> float:
     import math
     eps=1e-12; m=[(p[i]+q[i])/2.0 for i in range(3)]
@@ -295,8 +416,9 @@ def consume_cooldown(uid: str) -> bool:
 def in_drift(uid: str) -> bool:
     return _get_drift_state(uid)['cooldown']>0.0
 
-# ====== Ensemble with Arbitration ======
+# ========= Ensemble with Arbitration =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str,float]]=None) -> List[float]:
+    # Base models
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq)
     pr_xgb = xgb_predict(seq)
@@ -317,32 +439,34 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     # Phase windows
     W_S = int(os.getenv("WIN_SHORT","6"))
     W_M = int(os.getenv("WIN_MID","12"))
+
+    # Momentum path (short + Markov conditional)
     p_short = blend(recent_freq(seq, W_S), recent_freq(seq, W_M), 0.5)
     p_mkv   = markov_next_prob(seq, float(os.getenv("MKV_DECAY","0.98")))
     p_momentum = blend(p_short, p_mkv, 0.5)
 
     # Reversion path (hazard + wall + mean-revert)
-    grid, feat = map_to_big_road(seq)
+    _, feat = map_to_big_road(seq)
     seq_bp = bp_only(seq)
-    hist   = run_hist(seq_bp)
-    # run 結束風險（以目前 BP 連長為基準）
-    # 取最近連長（排除 T）
-    cur_run=1
-    bp = seq_bp
-    if bp:
-        last=bp[-1]; i=len(bp)-2
-        while i>=0 and bp[i]==last: cur_run+=1; i-=1
-    hz = hazard_from_hist(cur_run, hist)  # 0~1
-    wall = 1.0 if feat.get("blocked", False) else 0.0
-    mr_score, mr_side = mean_revert_score(seq)
+    hist = run_hist(seq_bp)
+    cur_run = feat.get("cur_run", 1)
+    hz = hazard_from_hist(cur_run, hist)                # 連龍在此長度結束的機率
+    wall = 1.0 if feat.get("blocked", False) else 0.0   # 牆阻
+    mr_score, _ = mean_revert_score(seq)                # B/P 失衡度
 
     last = seq[-1] if seq else ""
     opposite = "P" if last=="B" else ("B" if last=="P" else "")
+    eps = 0.02
+    if opposite=="B":
+        p_rev_bp = [1.0-eps, eps]  # [B,P]
+    elif opposite=="P":
+        p_rev_bp = [eps, 1.0-eps]
+    else:
+        p_rev_bp = [0.5, 0.5]
 
-    epsilon=0.02
-    if opposite=="B":   p_rev_bp=[1.0-epsilon, epsilon]
-    elif opposite=="P": p_rev_bp=[epsilon, 1.0-epsilon]
-    else:               p_rev_bp=[0.5, 0.5]
+    pT_est = _estimate_tie_prob(seq)
+    p_mom = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
+    p_rev = _merge_bp_with_t([p_rev_bp[0], p_rev_bp[1]], pT_est)
 
     alpha_hz   = float(os.getenv("W_HAZARD","0.60"))
     alpha_wall = float(os.getenv("W_WALL","0.25"))
@@ -350,9 +474,6 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     rev_strength = (alpha_hz*hz) + (alpha_wall*wall) + (alpha_mr*mr_score)
     rev_strength = max(0.0, min(1.0, rev_strength))
 
-    pT_est = _estimate_tie_prob(seq)
-    p_mom = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
-    p_rev = _merge_bp_with_t([p_rev_bp[0],   p_rev_bp[1]],   pT_est)
     p_mix = blend(p_mom, p_rev, rev_strength)
 
     # Long-term EW & Prior
@@ -360,44 +481,39 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
     LONG_W  = float(os.getenv("LONG_W","0.25"))
     REC_W   = float(os.getenv("REC_W","0.25"))
-    MKV_W   = float(os.getenv("MKV_W","0.25"))  # 允許覆蓋（修正點）
+    MKV_W   = float(os.getenv("MKV_W","0.25"))  # 讓覆蓋可生效
 
-    # 套用 overrides（包含 MKV_W，修正先前忽略問題）
     if weight_overrides:
         REC_W  = weight_overrides.get("REC_W",  REC_W)
         LONG_W = weight_overrides.get("LONG_W", LONG_W)
-        MKV_W  = weight_overrides.get("MKV_W",  MKV_W)
         PRIOR_W= weight_overrides.get("PRIOR_W",PRIOR_W)
+        MKV_W  = weight_overrides.get("MKV_W",  MKV_W)  # ✅ 尊重覆蓋
 
-    # 先把 momentum 中的 Markov 權重反映到融合（方法：p_short 與 p_mkv 再以 MKV_W 比例調合）
-    p_short_only = p_short
-    p_mkv_only   = p_mkv
-    p_momentum_adj = blend(p_short_only, p_mkv_only, MKV_W)
-    p_mom = _merge_bp_with_t([p_momentum_adj[0], p_momentum_adj[1]], pT_est)
-    # 以相同 rev_strength 仲裁
-    p_mix = blend(p_mom, p_rev, rev_strength)
-
-    # 與 base / long / prior 融合
-    probs = blend(probs, p_mix,  REC_W)
+    # 先把 base 與動態路徑融合（其中 MKV 已在 p_momentum 內），再與長期與先驗融合
+    probs = blend(probs, p_mix,  REC_W + MKV_W*0.0)  # MKV_W 已體現在 p_momentum，這裡保留接口
     probs = blend(probs, p_long, LONG_W)
-    probs = blend(probs, [THEORETICAL_PROBS["B"],THEORETICAL_PROBS["P"],THEORETICAL_PROBS["T"]], PRIOR_W)
+    probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
 
-    # 安全
+    # Safety caps + temperature
     EPS = float(os.getenv("EPSILON_FLOOR","0.06"))
     CAP = float(os.getenv("MAX_CAP","0.86"))
     TAU = float(os.getenv("TEMP","1.06"))
     probs=[min(CAP, max(EPS, p)) for p in probs]
     probs=norm(probs); probs=temperature_scale(probs, TAU)
 
-    # 輕微 regime boost
+    # Mild regime boosts
     boosts = regime_boosts(seq, feat)
     probs  = _apply_boosts_and_norm(probs, boosts)
     return norm(probs)
 
+def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
+    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
+    s=sum(p); return [x/s for x in p]
+
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
 
-# ====== Health / Predict / Export / Reload ======
+# ========= Health / Predict / Export / Reload =========
 @app.route("/", methods=["GET"])
 def index(): return "ok"
 
@@ -410,7 +526,8 @@ def healthz(): return jsonify(status="healthy")
 @app.route("/predict", methods=["POST"])
 def predict():
     data: Dict[str, Any] = request.get_json(silent=True) or {}
-    seq = parse_history(data.get("history"))
+    raw = data.get("history")
+    seq = parse_history(raw)                     # ✅ 這裡已裁切到 MAX_HISTORY
     probs = ensemble_with_anti_stuck(seq)
     rec   = recommend_from_probs(probs)
     return jsonify({
@@ -450,7 +567,7 @@ def reload_models():
     load_models()
     return jsonify(ok=True, rnn=bool(RNN_MODEL), xgb=bool(XGB_MODEL), lgbm=bool(LGBM_MODEL))
 
-# ====== LINE Webhook ======
+# ========= LINE Webhook =========
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "")
 
@@ -484,7 +601,7 @@ def flex_buttons_card() -> 'FlexSendMessage':
         "body": {
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
-                {"type": "text", "text": "🤖 請先補齊當前靴歷史，再按「開始分析」", "wrap": True, "size": "sm"},
+                {"type": "text", "text": "🤖 請開始輸入歷史數據（補齊後再按開始分析）", "wrap": True, "size": "sm"},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
                     {"type":"button","style":"primary","color":"#E74C3C","action":{"type":"postback","label":"莊","data":"B"}},
                     {"type":"button","style":"primary","color":"#2980B9","action":{"type":"postback","label":"閒","data":"P"}},
@@ -535,15 +652,13 @@ if USE_LINE and handler is not None:
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
         _get_drift_state(uid)
-        # 長度保護
-        if len(USER_HISTORY[uid]) > MAX_HISTORY:
-            USER_HISTORY[uid] = USER_HISTORY[uid][-MAX_HISTORY:]
-        sB = USER_HISTORY[uid].count("B")
-        sP = USER_HISTORY[uid].count("P")
-        sT = USER_HISTORY[uid].count("T")
+        # 顯示目前統計（已裁切）
+        seq = USER_HISTORY[uid][-MAX_HISTORY:]
+        USER_HISTORY[uid] = seq
+        sB, sP, sT = seq.count("B"), seq.count("P"), seq.count("T")
         msg = (
             "請用按鈕輸入：莊/閒/和。\n"
-            f"目前已輸入：{len(USER_HISTORY[uid])} 手（莊{sB} / 閒{sP} / 和{sT}）。\n"
+            f"目前已輸入：{len(seq)} 手（莊{sB} / 閒{sP} / 和{sT}）。\n"
             "按「開始分析」後才會給出下注建議；如需核對可用「返回」。"
         )
         line_bot_api.reply_message(
@@ -555,7 +670,8 @@ if USE_LINE and handler is not None:
     def handle_postback(event):
         uid  = event.source.user_id
         data = (event.postback.data or "").upper()
-        seq  = USER_HISTORY.get(uid, [])
+        seq  = USER_HISTORY.get(uid, [])[-MAX_HISTORY:]
+        USER_HISTORY[uid] = seq
         ready= USER_READY.get(uid, False)
 
         if data == "START":
@@ -572,7 +688,7 @@ if USE_LINE and handler is not None:
             USER_DRIFT[uid]   = {'cum':0.0,'min':0.0,'cooldown':0.0}
             line_bot_api.reply_message(
                 event.reply_token,
-                [TextSendMessage(text="✅ 已結束分析並清空紀錄。", quick_reply=quick_reply_bar()),
+                [TextSendMessage(text="✅ 已結束分析，紀錄已清空。", quick_reply=quick_reply_bar()),
                  flex_buttons_card()]
             ); return
 
@@ -592,11 +708,11 @@ if USE_LINE and handler is not None:
         if data not in CLASS_ORDER:
             line_bot_api.reply_message(
                 event.reply_token,
-                [TextSendMessage(text="請用按鈕（莊/閒/和/開始/結束/返回）。", quick_reply=quick_reply_bar()),
+                [TextSendMessage(text="請用按鈕輸入（莊/閒/和/開始/結束/返回）。", quick_reply=quick_reply_bar()),
                  flex_buttons_card()]
             ); return
 
-        # Append with cap
+        # Append & log（寫入前的歷史也裁切）
         history_before = "".join(seq)
         seq.append(data)
         if len(seq) > MAX_HISTORY:
@@ -604,6 +720,7 @@ if USE_LINE and handler is not None:
         USER_HISTORY[uid] = seq
         append_round_csv(uid, history_before, data)
 
+        # 未開始：只顯示統計
         if not ready:
             sB = seq.count("B"); sP = seq.count("P"); sT = seq.count("T")
             s_tail = "".join(seq[-20:])
@@ -618,12 +735,14 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        # Drift
+        # 已開始：PH drift + ensemble
         drift_now = update_ph_state(uid, seq)
         active = in_drift(uid)
         if active: consume_cooldown(uid)
+
         overrides = None
         if active:
+            # 漂移期：提高短期/馬可夫影響
             overrides = {"REC_W":0.32, "LONG_W":0.20, "MKV_W":0.33, "PRIOR_W":0.15}
 
         probs = ensemble_with_anti_stuck(seq, overrides)
@@ -640,7 +759,7 @@ if USE_LINE and handler is not None:
              flex_buttons_card()]
         )
 
-# ====== Entrypoint ======
+# ========= Entrypoint =========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
