@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — v12.1
-Ensemble(Full-history) + Regime Gating + Page-Hinkley Drift
-+ Big-Road-like mapping (6x20) for features
+BGS LINE Bot backend — v13
+Ensemble(Full-history) + Phase gating(early/mid/late) + Trend flip & oscillation adapt
++ Big-Road mapping(6x20) as gating features + Early-dragon trigger
++ Page-Hinkley drift + Tie(T) calibration
 + CSV I/O (/export) + hot reload (/reload)
 + LINE buttons: 莊(紅)/閒(藍)/和(綠)/開始分析/結束分析/返回
 """
@@ -198,7 +199,84 @@ def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
     except Exception as e:
         logger.warning("LGBM inference failed: %s", e); return None
 
-# ========= 短期 / Markov / 工具 =========
+# ========= 工具 =========
+def norm(v: List[float]) -> List[float]:
+    s = sum(v); s = s if s>1e-12 else 1.0
+    return [max(0.0,x)/s for x in v]
+
+def blend(a: List[float], b: List[float], w: float) -> List[float]:
+    return [(1-w)*a[i] + w*b[i] for i in range(3)]
+
+def temperature_scale(p: List[float], tau: float) -> List[float]:
+    if tau<=1e-6: return p
+    ex = [pow(max(pi,1e-9), 1.0/tau) for pi in p]
+    s = sum(ex); return [e/s for e in ex]
+
+# ========= Big-Road mapping（6x20） & 衍生特徵 =========
+def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[str]], Dict[str,Any]]:
+    """大路繪製規則（簡化版）：相同結果續行向下，遇到行底或阻擋時右移；不同結果則換列從最上方開始。
+       回傳 (grid, features)；features 用於 gating。"""
+    grid=[["" for _ in range(cols)] for _ in range(rows)]
+    if not seq: 
+        return grid, {"cur_run":0, "col_depth":0, "col_filled":0, "early_dragon_hint":False}
+
+    r=c=0; last=None
+    col_depths=[0]*cols
+    for ch in seq:
+        if ch==last:
+            # 續行
+            if r+1<rows and grid[r+1][c]=="":
+                r+=1
+            else:
+                c = min(cols-1, c+1)
+                # 落不下去就盡量找下一空列
+                while grid[0][c]!="" and c<cols-1:
+                    c+=1
+                r=0
+        else:
+            # 換色
+            last=ch
+            c = min(cols-1, c+1) if grid[0][c]!="" else c
+            while c<cols and grid[0][c]!="":
+                c+=1
+            if c>=cols: c=cols-1
+            r=0
+
+        if grid[r][c]=="":
+            grid[r][c]=ch
+            col_depths[c]=max(col_depths[c], r+1)
+
+    # 目前列深
+    cur_depth = 0
+    for rr in range(rows):
+        if grid[rr][c]!="": cur_depth=rr+1
+
+    # 目前連續 run 長度
+    def last_run_len(s: List[str])->int:
+        if not s: return 0
+        ch=s[-1]; i=len(s)-2; n=1
+        while i>=0 and s[i]==ch:
+            n+=1; i-=1
+        return n
+
+    features = {
+        "cur_run": last_run_len(seq),
+        "col_depth": cur_depth,
+        "col_filled": sum(1 for rr in range(rows) if grid[rr][c]!=""),
+        # 早期龍提示：最近 4~6 手高度一致且 big-road 同一列向下 >2
+        "early_dragon_hint": (cur_depth>=3 and features_like_early_dragon(seq=seq))
+    }
+    return grid, features
+
+def features_like_early_dragon(seq: List[str]) -> bool:
+    k = min(6, len(seq))
+    if k < 4: return False
+    tail = seq[-k:]
+    # 最近 k 手同色比例
+    most = max(tail.count("B"), tail.count("P"))
+    return (most >= k-1)
+
+# ========= 短中長期統計 / Markov =========
 def recent_freq(seq: List[str], win: int) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     cut = seq[-win:] if win>0 else seq
@@ -223,19 +301,7 @@ def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
     S = sum(flow_to)
     return [x/S for x in flow_to]
 
-def norm(v: List[float]) -> List[float]:
-    s = sum(v); s = s if s>1e-12 else 1.0
-    return [max(0.0,x)/s for x in v]
-
-def blend(a: List[float], b: List[float], w: float) -> List[float]:
-    return [(1-w)*a[i] + w*b[i] for i in range(3)]
-
-def temperature_scale(p: List[float], tau: float) -> List[float]:
-    if tau<=1e-6: return p
-    ex = [pow(max(pi,1e-9), 1.0/tau) for pi in p]
-    s = sum(ex); return [e/s for e in ex]
-
-# ========= 路型偵測（Regime gating） =========
+# ========= 路型偵測（Regime gating） & 趨勢翻轉/震盪 =========
 def last_run(seq: List[str]) -> Tuple[str,int]:
     if not seq: return ("",0)
     ch = seq[-1]; i=len(seq)-2; n=1
@@ -291,7 +357,26 @@ def shape_2room1hall(seq: List[str], win:int=18)->bool:
     cnt_2 = sum(1 for x in last if x==2)
     return (cnt_1+cnt_2) >= max(4,int(0.7*len(last))) and cnt_2 >= cnt_1
 
-def regime_boosts(seq: List[str]) -> List[float]:
+def trend_flip_score(seq: List[str], a:int=10, b:int=10) -> Tuple[float, str]:
+    """比較最近 a 與前一段 b 的優勢差，回傳 (差值, 優勢方 'B'/'P'/'')"""
+    if len(seq) < a+b: s = seq[:]
+    else: s = seq[-(a+b):]
+    left  = s[:max(1, len(s)-a)]
+    right = s[-a:]
+    def adv(ss):
+        return 'B' if ss.count('B') > ss.count('P') else ('P' if ss.count('P')>ss.count('B') else '')
+    la = adv(left); ra = adv(right)
+    if not ra: return (0.0,'')
+    # 差值 = 右段對左段的優勢變化（右段比例 - 左段比例）
+    lb = left.count('B'); lp = left.count('P'); rb = right.count('B'); rp = right.count('P')
+    ltot = max(1, lb+lp); rtot = max(1, rb+rp)
+    diffB = (rb/rtot) - (lb/ltot)
+    diffP = (rp/rtot) - (lp/ltot)
+    diff = diffB - diffP  # >0 偏向 B，<0 偏向 P
+    side = 'B' if diff>0 else 'P'
+    return (abs(diff), side)
+
+def regime_boosts(seq: List[str], grid_feat: Dict[str,Any]) -> List[float]:
     if not seq: return [1.0,1.0,1.0]
     b=[1.0,1.0,1.0]  # [B,P,T]
     last,rlen = last_run(seq)
@@ -301,25 +386,32 @@ def regime_boosts(seq: List[str]) -> List[float]:
     BOOST_QJ     = float(os.getenv("BOOST_QIJIAO", "1.05"))
     BOOST_ROOM   = float(os.getenv("BOOST_ROOM", "1.06"))
     BOOST_T      = float(os.getenv("BOOST_T", "1.03"))
+    BOOST_EARLYD = float(os.getenv("BOOST_EARLY_DRAGON","1.05"))
+
+    # 早期龍提示（用大路列深）
+    if grid_feat.get("early_dragon_hint", False) or grid_feat.get("cur_run",0)>=3:
+        if last=="B": b[0]*=BOOST_EARLYD
+        elif last=="P": b[1]*=BOOST_EARLYD
+
     if rlen>=DRAGON_TH:
         if last=="B": b[0]*=BOOST_DRAGON
         elif last=="P": b[1]*=BOOST_DRAGON
         else: b[2]*=BOOST_DRAGON
+
     if is_zigzag(seq,6) or is_oscillating(seq,12) or shape_1room2hall(seq):
         if seq[-1]=="B": b[1]*=BOOST_ALT
         elif seq[-1]=="P": b[0]*=BOOST_ALT
+
     if shape_2room1hall(seq):
         s = seq[-10:] if len(seq)>=10 else seq
         if s.count("B")>s.count("P"): b[0]*=BOOST_ROOM
         elif s.count("P")>s.count("B"): b[1]*=BOOST_ROOM
+
     if is_qijiao(seq): b[0]*=BOOST_QJ; b[1]*=BOOST_QJ
+
     ew = exp_decay_freq(seq)
     if ew[2] > THEORETICAL_PROBS["T"]*1.15: b[2]*=BOOST_T
     return b
-
-def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
-    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
-    s=sum(p); return [x/s for x in p]
 
 # ========= Page-Hinkley 漂移偵測 =========
 def js_divergence(p: List[float], q: List[float]) -> float:
@@ -361,37 +453,19 @@ def consume_cooldown(uid: str) -> bool:
 def in_drift(uid: str) -> bool:
     return _get_drift_state(uid)['cooldown']>0.0
 
-# ========= Big-Road-like mapping（6x20，僅作為特徵參考，不輸出） =========
-def map_to_grid(seq: List[str], rows:int=6, cols:int=20)->List[List[str]]:
-    grid=[["" for _ in range(cols)] for _ in range(rows)]
-    if not seq: return grid
-    r=c=0; last=None
-    for ch in seq:
-        if ch==last:
-            if r+1<rows and grid[r+1][c]=="":
-                r+=1
-            else:
-                c=min(cols-1,c+1)
-        else:
-            last=ch; r=0; c=min(cols-1,c+1) if grid[r][c]!="" else c
-            while c<cols and grid[0][c]!="": c+=1
-            if c>=cols: c=cols-1
-        if grid[r][c]=="": grid[r][c]=ch
-    return grid
-
-# ========= Ensemble（含修正一行 MKV 調用） =========
+# ========= Ensemble（相依大路/相位/翻轉/震盪的加權邏輯） =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str,float]]=None) -> List[float]:
-    # 模型
+    # 個別模型
     rule  = [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]]
     pr_rnn = rnn_predict(seq)
     pr_xgb = xgb_predict(seq)
     pr_lgb = lgbm_predict(seq)
 
-    # 權重
-    w_rule = float(os.getenv("RULE_W","0.40"))
+    # 基礎權重
+    w_rule = float(os.getenv("RULE_W","0.35"))
     w_rnn  = float(os.getenv("RNN_W","0.25"))
     w_xgb  = float(os.getenv("XGB_W","0.20"))
-    w_lgb  = float(os.getenv("LGBM_W","0.15"))
+    w_lgb  = float(os.getenv("LGBM_W","0.20"))
 
     total = w_rule + (w_rnn if pr_rnn else 0) + (w_xgb if pr_xgb else 0) + (w_lgb if pr_lgb else 0)
     base = [w_rule*rule[i] for i in range(3)]
@@ -400,39 +474,69 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     if pr_lgb: base=[base[i]+w_lgb*pr_lgb[i] for i in range(3)]
     probs=[b/max(total,1e-9) for b in base]
 
-    # 全盤訊號
-    REC_WIN = int(os.getenv("REC_WIN","16"))
-    REC_W   = float(os.getenv("REC_W","0.25"))
-    LONG_W  = float(os.getenv("LONG_W","0.35"))
-    MKV_W   = float(os.getenv("MKV_W","0.25"))
-    PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
+    # 相位 gating（早/中/晚期）
+    n = len(seq)
+    # 預設窗口
+    W_S = int(os.getenv("WIN_SHORT","6"))
+    W_M = int(os.getenv("WIN_MID","12"))
+    W_L = int(os.getenv("WIN_LONG","24"))
+    # 相位權重（可用環境變數調）
+    if n < int(os.getenv("PHASE_EARLY_END","20")):
+        REC_W, LONG_W, MKV_W, PRIOR_W = 0.35, 0.20, 0.30, 0.15
+    elif n < int(os.getenv("PHASE_MID_END","40")):
+        REC_W, LONG_W, MKV_W, PRIOR_W = 0.30, 0.30, 0.25, 0.15
+    else:
+        REC_W, LONG_W, MKV_W, PRIOR_W = 0.25, 0.40, 0.20, 0.15
+
+    # 翻轉強化：最近 a=10 vs 之前 b=10
+    flip_diff, flip_side = trend_flip_score(seq, a=int(os.getenv("FLIP_A","10")), b=int(os.getenv("FLIP_B","10")))
+    if flip_diff > float(os.getenv("FLIP_TH","0.18")):
+        # 若偵測到趨勢翻轉，暫時提高 short+Markov，降低 long（讓模型快速切換）
+        REC_W *= 1.20; MKV_W *= 1.20; LONG_W *= 0.80
+
+    # 震盪修正：若 zigzag/oscillating，拉高 short、降低 cap 與溫度
+    TAU = float(os.getenv("TEMP","1.08"))
+    CAP = float(os.getenv("MAX_CAP","0.88"))
+    if is_zigzag(seq, max(6, W_S)) or is_oscillating(seq, max(12, W_M)):
+        REC_W *= 1.25; MKV_W *= 1.10; LONG_W *= 0.85
+        TAU = min(TAU, 1.02)
+        CAP = min(CAP, 0.82)
+
+    # 外部 override（PH 漂移或上層調整）
     if weight_overrides:
-        REC_W  = weight_overrides.get("REC_W",REC_W)
-        LONG_W = weight_overrides.get("LONG_W",LONG_W)
-        MKV_W  = weight_overrides.get("MKV_W",MKV_W)
+        REC_W  = weight_overrides.get("REC_W", REC_W)
+        LONG_W = weight_overrides.get("LONG_W", LONG_W)
+        MKV_W  = weight_overrides.get("MKV_W",  MKV_W)
         PRIOR_W= weight_overrides.get("PRIOR_W",PRIOR_W)
 
-    p_rec  = recent_freq(seq, REC_WIN)
+    # 三種訊號
+    p_recS = recent_freq(seq, W_S)
+    p_recM = recent_freq(seq, W_M)
     p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
-    # ★ 修正一行：正確傳入 (seq, decay)
+    # ★ 修正：正確傳入 (seq, decay)
     p_mkv  = markov_next_prob(seq, float(os.getenv("MKV_DECAY","0.98")))
 
-    probs = blend(probs, p_rec,  REC_W)
-    probs = blend(probs, p_long, LONG_W)
-    probs = blend(probs, p_mkv,  MKV_W)
-    probs = blend(probs, rule,   PRIOR_W)
+    # 先把短中期合成，再與長期/Markov/先驗融合
+    p_short = blend(p_recS, p_recM, 0.5)
+    probs = blend(probs, p_short, REC_W)
+    probs = blend(probs, p_long,  LONG_W)
+    probs = blend(probs, p_mkv,   MKV_W)
+    probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
 
     # 安全處理
     EPS = float(os.getenv("EPSILON_FLOOR","0.06"))
-    CAP = float(os.getenv("MAX_CAP","0.88"))
-    TAU = float(os.getenv("TEMP","1.10"))
     probs=[min(CAP,max(EPS,p)) for p in probs]
     probs=norm(probs); probs=temperature_scale(probs, TAU)
 
-    # Regime gating
-    boosts = regime_boosts(seq)
+    # 大路特徵 + 提前龍增益 / 齊腳加強 / T 校正
+    grid, feat = map_to_big_road(seq)
+    boosts = regime_boosts(seq, feat)
     probs  = _apply_boosts_and_norm(probs, boosts)
     return norm(probs)
+
+def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
+    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
+    s=sum(p); return [x/s for x in p]
 
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
@@ -442,7 +546,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v12.1")
+def health(): return jsonify(status="healthy", version="v13")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -520,7 +624,6 @@ USER_READY:   Dict[str, bool]      = {}
 USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT  # alias
 
 def flex_buttons_card() -> 'FlexSendMessage':
-    # 三個主按鈕用 primary + color；返回/開始/結束用 secondary
     contents = {
         "type": "bubble",
         "body": {
@@ -581,7 +684,11 @@ if USE_LINE and handler is not None:
         sB = USER_HISTORY[uid].count("B")
         sP = USER_HISTORY[uid].count("P")
         sT = USER_HISTORY[uid].count("T")
-        msg = f"請使用下方按鈕輸入：莊/閒/和。\n目前已輸入：{len(USER_HISTORY[uid])} 手（莊{sB} / 閒{sP} / 和{sT}）。\n按「開始分析」後才會給出下注建議。"
+        msg = (
+            "請使用下方按鈕輸入：莊/閒/和。\n"
+            f"目前已輸入：{len(USER_HISTORY[uid])} 手（莊{sB} / 閒{sP} / 和{sT}）。\n"
+            "按「開始分析」後才會給出下注建議；如需核對可用「返回」修改。"
+        )
         line_bot_api.reply_message(
             event.reply_token,
             [TextSendMessage(text=msg, quick_reply=quick_reply_bar()), flex_buttons_card()]
@@ -594,7 +701,6 @@ if USE_LINE and handler is not None:
         seq  = USER_HISTORY.get(uid, [])
         ready= USER_READY.get(uid, False)
 
-        # 控制流程
         if data == "START":
             USER_READY[uid] = True
             line_bot_api.reply_message(
@@ -626,7 +732,6 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        # 僅接受 B/P/T
         if data not in CLASS_ORDER:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -643,7 +748,11 @@ if USE_LINE and handler is not None:
         if not ready:
             sB = seq.count("B"); sP = seq.count("P"); sT = seq.count("T")
             s_tail = "".join(seq[-20:])
-            msg = f"已記錄 {len(seq)} 手：{s_tail}\n目前統計：莊{sB}｜閒{sP}｜和{sT}\n按「開始分析」後才會給出下注建議。"
+            msg = (
+                f"已記錄 {len(seq)} 手：{s_tail}\n"
+                f"目前統計：莊{sB}｜閒{sP}｜和{sT}\n"
+                "按「開始分析」後才會給出下注建議；如需核對可點「返回」。"
+            )
             line_bot_api.reply_message(
                 event.reply_token,
                 [TextSendMessage(text=msg, quick_reply=quick_reply_bar()),
@@ -657,20 +766,8 @@ if USE_LINE and handler is not None:
 
         overrides = None
         if active:
-            REC_W   = float(os.getenv("REC_W","0.25"))
-            LONG_W  = float(os.getenv("LONG_W","0.35"))
-            MKV_W   = float(os.getenv("MKV_W","0.25"))
-            PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
-            SHORT_BOOST = float(os.getenv("PH_SHORT_BOOST","0.30"))
-            LONG_CUT    = float(os.getenv("PH_LONG_CUT","0.40"))
-            MKV_CUT     = float(os.getenv("PH_MKV_CUT","0.40"))
-            PRIOR_KEEP  = float(os.getenv("PH_PRIOR_KEEP","1.00"))
-            overrides = {
-                "REC_W":   REC_W*(1.0+SHORT_BOOST),
-                "LONG_W":  max(0.0, LONG_W*(1.0-LONG_CUT)),
-                "MKV_W":   max(0.0, MKV_W*(1.0-MKV_CUT)),
-                "PRIOR_W": PRIOR_W*PRIOR_KEEP
-            }
+            REC_W   = 0.30; LONG_W  = 0.22; MKV_W  = 0.33; PRIOR_W = 0.15
+            overrides = {"REC_W":REC_W, "LONG_W":LONG_W, "MKV_W":MKV_W, "PRIOR_W":PRIOR_W}
 
         probs = ensemble_with_anti_stuck(seq, overrides)
         rec   = recommend_from_probs(probs)
