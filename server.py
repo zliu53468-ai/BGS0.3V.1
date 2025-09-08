@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — v15.2 (Big-Road + Conditional Markov + Short-Dragon Arbitration)
-- Big-Road(6x20) mapping & features (col depth / wall / early-dragon)
-- Conditional Markov (P(next | last_state))
-- Short-dragon (2~5) break/continue hazard + wall-aware + uncertainty gate
-- Page-Hinkley drift gating (overrides also adjust MKV_W)
-- Tie(T) calibration across all paths
-- History cap (MAX_HISTORY) for predict & LINE
-- CSV I/O (/export) + hot reload (/reload)
-- LINE buttons: 莊(紅)/閒(藍)/和(綠)/開始分析/結束分析/返回
+BGS LINE Bot backend — v15.4 (Comeback+)
+- Big-Road(6x20): 列深/牆位/early-dragon
+- Conditional Markov: P(next | last)
+- 短龍(2~5) 續/斷危險率 + 牆位
+- 趨勢回補：長窗優勢 + 短窗對家急拉 → 反打增強
+- Page-Hinkley 漂移（尊重 MKV_W 覆蓋）
+- T 機率校正；/predict 與 LINE 皆裁切 MAX_HISTORY
+- LINE：莊/閒/和/開始/結束/返回；START 立即回一筆推論
 """
 
 import os, csv, time, logging
@@ -38,10 +37,8 @@ LAB_ZH = {"B": "莊", "P": "閒", "T": "和"}
 THEORETICAL_PROBS: Dict[str, float] = {"B": 0.458, "P": 0.446, "T": 0.096}
 
 def parse_history(payload) -> List[str]:
-    """Parse history and hard-cap length by MAX_HISTORY (keep latest)."""
     seq: List[str] = []
-    if payload is None:
-        return seq
+    if payload is None: return seq
     if isinstance(payload, list):
         for s in payload:
             if isinstance(s, str) and s.strip().upper() in CLASS_ORDER:
@@ -49,8 +46,7 @@ def parse_history(payload) -> List[str]:
     elif isinstance(payload, str):
         for ch in payload:
             up = ch.upper()
-            if up in CLASS_ORDER:
-                seq.append(up)
+            if up in CLASS_ORDER: seq.append(up)
     if len(seq) > MAX_HISTORY:
         seq = seq[-MAX_HISTORY:]
     return seq
@@ -231,9 +227,6 @@ def features_like_early_dragon(seq: List[str]) -> bool:
     return (most>=k-1)
 
 def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[str]], Dict[str,Any]]:
-    """Simplified Big-Road (6x20):
-       - Same result: try go down; if bottom or below occupied, move right (same row).
-       - Different result: move right, start from row 0 (top)."""
     grid=[["" for _ in range(cols)] for _ in range(rows)]
     if not seq:
         return grid, {"cur_run":0, "col_depth":0, "blocked":False, "c":0, "r":0, "early_dragon_hint":False}
@@ -264,14 +257,15 @@ def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[
         if grid[rr][c]!="": cur_depth=rr+1
     blocked = (cur_depth>=rows) or (r==rows-1) or (r+1<rows and grid[r+1][c]!="" and last==grid[r][c])
 
-    def last_run_len(s: List[str])->int:
-        if not s: return 0
-        ch=s[-1]; i=len(s)-2; n=1
-        while i>=0 and s[i]==ch: n+=1; i-=1
+    def last_run_len_bp(s: List[str])->int:
+        bp=[x for x in s if x in ("B","P")]
+        if not bp: return 0
+        ch=bp[-1]; i=len(bp)-2; n=1
+        while i>=0 and bp[i]==ch: n+=1; i-=1
         return n
 
     feats = {
-        "cur_run": last_run_len([x for x in seq if x in ("B","P")]),
+        "cur_run": last_run_len_bp(seq),
         "col_depth": cur_depth,
         "blocked": blocked,
         "r": r, "c": c,
@@ -279,7 +273,7 @@ def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[
     }
     return grid, feats
 
-# ========= Short/Mid/Long / Conditional Markov =========
+# ========= Short/Mid / Conditional Markov =========
 def recent_freq(seq: List[str], win: int) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     cut = seq[-win:] if win>0 else seq
@@ -289,10 +283,6 @@ def recent_freq(seq: List[str], win: int) -> List[float]:
     return [nB/tot, nP/tot, nT/tot]
 
 def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
-    """
-    Conditional Markov: P(next | last_state). 若長度<2 則返回均分。
-    以最後一手為條件，取該列的加權轉移並正規化。
-    """
     if not seq or len(seq)<2: return [1/3,1/3,1/3]
     if decay is None: decay = float(os.getenv("MKV_DECAY","0.98"))
     idx={"B":0,"P":1,"T":2}
@@ -303,14 +293,13 @@ def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
         w *= decay
     last = seq[-1]
     row = C[idx[last]]
-    # Laplace on row
     a=float(os.getenv("MKV_LAPLACE","0.5"))
     row=[x+a for x in row]
     S=sum(row)
     if S<=1e-12: return [1/3,1/3,1/3]
     return [x/S for x in row]
 
-# ========= Regime boosts (mild) =========
+# ========= Regime boosts =========
 def is_zigzag(seq: List[str], k:int=6)->bool:
     s = seq[-k:] if len(seq)>=k else seq
     if len(s)<4: return False
@@ -354,7 +343,7 @@ def regime_boosts(seq: List[str], grid_feat: Dict[str,Any]) -> List[float]:
         b[2]*=BOOST_T
     return b
 
-# ========= Hazard & Mean-Revert (Reversion engine) =========
+# ========= Reversion engine（短龍 + 回補 + 格局）=========
 def bp_only(seq: List[str]) -> List[str]:
     return [x for x in seq if x in ("B","P")]
 
@@ -390,8 +379,8 @@ def current_run_len_bp(seq: List[str]) -> Tuple[str, int]:
 def bayes_continue_prob_from_hist(cur_len: int, hist: Dict[int,int]) -> float:
     if cur_len <= 0 or not hist: return 0.5
     a = float(os.getenv("HZD_ALPHA","0.7"))
-    cp_a = float(os.getenv("CP_A","1.5"))
-    cp_b = float(os.getenv("CP_B","1.5"))
+    cp_a = float(os.getenv("CP_A","1.6"))
+    cp_b = float(os.getenv("CP_B","1.6"))
     ge = sum(v for k,v in hist.items() if k >= cur_len)
     end = hist.get(cur_len, 0)
     hazard = (end + a) / (ge + a * max(1, len(hist)))
@@ -406,6 +395,35 @@ def short_run_uncertainty_gate(cur_len: int, p_cont: float) -> float:
         if abs(p_cont - 0.5) <= band:
             return float(os.getenv("UNCERT_SHRINK","0.45"))
     return 1.0
+
+# ---- 趨勢回補偵測 ----
+def comeback_signal(seq: List[str]) -> Tuple[str, float]:
+    """
+    長窗 L：一方優勢（>DOM_TH）；短窗 S：對家占優（>EDGE_TH）→ 回補方與強度(0~1)
+    """
+    if not seq: return ("", 0.0)
+    L = int(os.getenv("CB_LONG","30"))
+    S = int(os.getenv("CB_SHORT","8"))
+    dom_th  = float(os.getenv("CB_DOM_TH","0.60"))
+    edge_th = float(os.getenv("CB_EDGE_TH","0.67"))
+
+    long = seq[-L:] if len(seq)>=L else seq
+    short= seq[-S:] if len(seq)>=S else seq
+
+    bL = long.count("B"); pL = long.count("P"); Ltot = max(1, bL+pL)
+    bS = short.count("B"); pS = short.count("P"); Stot = max(1, bS+pS)
+
+    cb_side = ""
+    strength = 0.0
+
+    if bL/Ltot > dom_th and pS/Stot > edge_th:
+        cb_side = "P"
+        strength = min(1.0, (bL/Ltot - dom_th) * (pS/Stot - edge_th) * 5)
+    elif pL/Ltot > dom_th and bS/Stot > edge_th:
+        cb_side = "B"
+        strength = min(1.0, (pL/Ltot - dom_th) * (bS/Stot - edge_th) * 5)
+
+    return cb_side, max(0.0, strength)
 
 # ========= Page-Hinkley =========
 def js_divergence(p: List[float], q: List[float]) -> float:
@@ -468,67 +486,93 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     if pr_lgb: base=[base[i]+w_lgb*pr_lgb[i] for i in range(3)]
     probs=[b/max(total,1e-9) for b in base]
 
-    # Phase windows
+    # Momentum path: short + conditional Markov
     W_S = int(os.getenv("WIN_SHORT","6"))
     W_M = int(os.getenv("WIN_MID","12"))
-    # Momentum path (short + Conditional Markov, blend by MKV_W factor)
     p_short = blend(recent_freq(seq, W_S), recent_freq(seq, W_M), 0.5)
     MKV_W = float(os.getenv("MKV_W","0.25"))
     if weight_overrides:
         MKV_W = weight_overrides.get("MKV_W", MKV_W)
     p_mkv   = markov_next_prob(seq, float(os.getenv("MKV_DECAY","0.98")))
-    # 用 MKV_W 作為短線 vs Markov 的混合係數（0~1）
     p_momentum = blend(p_short, p_mkv, max(0.0, min(1.0, MKV_W)))
 
-    # Reversion path（短龍是否斷/續）
+    # Reversion：短龍續/斷 + 牆位 + 均值回歸 + 趨勢回補
     grid, feat = map_to_big_road(seq)
     seq_bp = bp_only(seq)
     hist = run_hist(seq_bp)
-
     last_bp, cur_run = current_run_len_bp(seq)
-    p_cont = bayes_continue_prob_from_hist(cur_run, hist)   # P(續)
-    p_break = 1.0 - p_cont                                  # P(斷)
-    wall_bonus = float(os.getenv("WALL_HAZD_BONUS","0.12"))
-    if feat.get("blocked", False):
-        p_break = min(1.0, p_break + wall_bonus)
+    p_cont = bayes_continue_prob_from_hist(cur_run, hist)
+    # 不確定區：降 reversion 強度，避免 2~5 手鬼打牆
+    uncert_gate = short_run_uncertainty_gate(cur_run, p_cont)
 
+    p_break = 1.0 - p_cont
+    if feat.get("blocked", False):
+        p_break = min(1.0, p_break + float(os.getenv("WALL_HAZD_BONUS","0.12")))
+
+    # 回補偵測
+    cb_side, cb_strength0 = comeback_signal(seq)
+    cb_gain = float(os.getenv("CB_GAIN","0.55"))
+    cb_strength = max(0.0, min(1.0, cb_strength0 * cb_gain))
+
+    # 基礎反打向量（以當前 run 的「對家」為主）
     opposite = "P" if last_bp == "B" else ("B" if last_bp == "P" else "")
     eps = 0.02
     if opposite == "B":
-        p_rev_bp = [max(eps, p_break), max(eps, 1.0 - p_break)]
+        p_rev_bp = [1.0 - eps, eps]  # [B,P]
     elif opposite == "P":
-        p_rev_bp = [max(eps, 1.0 - p_break), max(eps, p_break)]
+        p_rev_bp = [eps, 1.0 - eps]
     else:
         p_rev_bp = [0.5, 0.5]
 
-    uncert_scale = short_run_uncertainty_gate(cur_run, p_cont)
+    # 以「斷龍機率」推 reversion，並和回補方合成
+    # 先把 p_rev_bp 往「斷」方向再拉一點（斷→切對家）
+    if last_bp == "B":
+        p_rev_bp = [p_rev_bp[0]*(1-p_break) + p_rev_bp[1]*p_break,
+                    p_rev_bp[1]*(1-p_break) + (1-p_rev_bp[0])*p_break]
+    elif last_bp == "P":
+        p_rev_bp = [p_rev_bp[0]*(1-p_break) + (1-p_rev_bp[1])*p_break,
+                    p_rev_bp[1]*(1-p_break) + p_rev_bp[0]*p_break]
 
-    # 仲裁強度：斷龍信念 + 均值回歸 + Big-Road 格局（牆/列深）
-    alpha_cont = float(os.getenv("W_CONT","0.65"))
-    alpha_mr   = float(os.getenv("W_MEANREV","0.15"))
-    alpha_grid = float(os.getenv("W_GRID","0.20"))
-    mr_score, _ = mean_revert_score(seq)
-    grid_signal = 1.0 if feat.get("blocked", False) else (feat.get("col_depth",0)/6.0)
+    # 再把「回補方」權重拉高
+    if cb_side == "B":
+        p_rev_bp = [min(1.0, p_rev_bp[0] + cb_strength*(1.0 - p_rev_bp[0])),
+                    max(0.0, p_rev_bp[1] - cb_strength*p_rev_bp[1])]
+    elif cb_side == "P":
+        p_rev_bp = [max(0.0, p_rev_bp[0] - cb_strength*p_rev_bp[0]),
+                    min(1.0, p_rev_bp[1] + cb_strength*(1.0 - p_rev_bp[1]))]
 
-    rev_strength = alpha_cont*p_break + alpha_mr*mr_score + alpha_grid*grid_signal
-    rev_strength = max(0.0, min(1.0, rev_strength)) * uncert_scale
+    # 均值回歸（整體莊閒失衡時再加一點點）
+    mr_score, mr_side = mean_revert_score(seq)
+    if mr_side == "B":
+        p_rev_bp = [min(1.0, p_rev_bp[0] + 0.15*mr_score), max(0.0, p_rev_bp[1] - 0.15*mr_score)]
+    elif mr_side == "P":
+        p_rev_bp = [max(0.0, p_rev_bp[0] - 0.15*mr_score), min(1.0, p_rev_bp[1] + 0.15*mr_score)]
 
     # 注入 T 校正
     pT_est = _estimate_tie_prob(seq)
-    p_mom  = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
-    p_rev  = _merge_bp_with_t([p_rev_bp[0],  p_rev_bp[1]],  pT_est)
+    p_rev = _merge_bp_with_t(p_rev_bp, pT_est)
+    p_mom = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
 
-    # Arbitration: mix between momentum and reversion, then blend with base & long
+    # 仲裁：reversion 強度 = f(斷龍, 牆位, 回補、均值回歸)，再乘不確定門
+    alpha_hz   = float(os.getenv("W_HAZARD","0.55"))
+    alpha_wall = float(os.getenv("W_WALL","0.20"))
+    alpha_cb   = float(os.getenv("W_COMEBACK","0.20"))
+    alpha_mr   = float(os.getenv("W_MEANREV","0.05"))
+    rev_strength = (alpha_hz*(1.0 - p_cont)) + (alpha_wall*(1.0 if feat.get("blocked",False) else 0.0)) \
+                   + (alpha_cb*cb_strength) + (alpha_mr*mr_score)
+    rev_strength = max(0.0, min(float(os.getenv("REV_CAP","0.95")), rev_strength * uncert_gate))
+
     p_mix = blend(p_mom, p_rev, rev_strength)
-    p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
 
+    # Long-term & Prior
+    p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
     LONG_W  = float(os.getenv("LONG_W","0.25"))
     REC_W   = float(os.getenv("REC_W","0.25"))
     if weight_overrides:
-        REC_W  = weight_overrides.get("REC_W",  REC_W)
-        LONG_W = weight_overrides.get("LONG_W", LONG_W)
-        PRIOR_W= weight_overrides.get("PRIOR_W",PRIOR_W)
+        REC_W   = weight_overrides.get("REC_W",  REC_W)
+        LONG_W  = weight_overrides.get("LONG_W", LONG_W)
+        PRIOR_W = weight_overrides.get("PRIOR_W",PRIOR_W)
 
     probs = blend(probs, p_mix,  REC_W)
     probs = blend(probs, p_long, LONG_W)
@@ -541,6 +585,7 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs=[min(CAP, max(EPS, p)) for p in probs]
     probs=norm(probs); probs=temperature_scale(probs, TAU)
 
+    # Mild regime boosts
     boosts = regime_boosts(seq, feat)
     probs  = _apply_boosts_and_norm(probs, boosts)
     return norm(probs)
@@ -557,7 +602,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version="v15.2")
+def health(): return jsonify(status="healthy", version="v15.4")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -575,7 +620,6 @@ def predict():
         "recommendation": rec
     })
 
-# -------- CSV I/O ----------
 def append_round_csv(user_id: str, history_before: str, label: str) -> None:
     try:
         os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
@@ -635,9 +679,6 @@ USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
 USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT
 
-def _counts(seq:List[str])->Tuple[int,int,int]:
-    return seq.count("B"), seq.count("P"), seq.count("T")
-
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
         "type": "bubble",
@@ -645,7 +686,7 @@ def flex_buttons_card() -> 'FlexSendMessage':
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
                 {"type": "text", "text": "🤖 請開始輸入歷史數據", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "先輸入莊/閒/和；按「開始分析」後才會給出下注建議。", "wrap": True, "size": "sm"},
+                {"type": "text", "text": "先輸入莊/閒/和；按「開始分析」後會立即回一筆建議。", "wrap": True, "size": "sm"},
                 {"type":"box","layout":"horizontal","spacing":"sm","contents":[
                     {"type":"button","style":"primary","color":"#E74C3C","action":{"type":"postback","label":"莊","data":"B"}},
                     {"type":"button","style":"primary","color":"#2980B9","action":{"type":"postback","label":"閒","data":"P"}},
@@ -696,16 +737,13 @@ if USE_LINE and handler is not None:
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
         _get_drift_state(uid)
-
-        # 裁切
-        if len(USER_HISTORY[uid]) > MAX_HISTORY:
-            USER_HISTORY[uid] = USER_HISTORY[uid][-MAX_HISTORY:]
-
-        sB, sP, sT = _counts(USER_HISTORY[uid])
+        sB = USER_HISTORY[uid].count("B")
+        sP = USER_HISTORY[uid].count("P")
+        sT = USER_HISTORY[uid].count("T")
         msg = (
             "請使用下方按鈕輸入：莊/閒/和。\n"
             f"目前已輸入：{len(USER_HISTORY[uid])} 手（莊{sB} / 閒{sP} / 和{sT}）。\n"
-            "按「開始分析」後才會給出下注建議；如需核對可用「返回」。"
+            "按「開始分析」後會立即給出一次建議，之後每輸入一手我都會更新。"
         )
         line_bot_api.reply_message(
             event.reply_token,
@@ -719,18 +757,48 @@ if USE_LINE and handler is not None:
         seq  = USER_HISTORY.get(uid, [])
         ready= USER_READY.get(uid, False)
 
-        # 裁切
-        if len(seq) > MAX_HISTORY:
-            seq = seq[-MAX_HISTORY:]
-            USER_HISTORY[uid] = seq
-
+        # START：若已有歷史，立刻推一次建議
         if data == "START":
             USER_READY[uid] = True
-            line_bot_api.reply_message(
-                event.reply_token,
-                [TextSendMessage(text="🔎 已開始分析。請繼續輸入莊/閒/和，我會根據資料給出建議。", quick_reply=quick_reply_bar()),
-                 flex_buttons_card()]
-            ); return
+            if len(seq) > MAX_HISTORY:
+                seq = seq[-MAX_HISTORY:]
+                USER_HISTORY[uid] = seq
+            try:
+                if seq:
+                    drift_now = update_ph_state(uid, seq)
+                    active = in_drift(uid)
+                    if active: consume_cooldown(uid)
+                    overrides = None
+                    if active:
+                        overrides = {
+                            "REC_W": 0.32,
+                            "LONG_W": 0.20,
+                            "PRIOR_W": 0.15,
+                            "MKV_W": float(os.getenv("MKV_W","0.33"))
+                        }
+                    probs = ensemble_with_anti_stuck(seq, overrides)
+                    rec   = recommend_from_probs(probs)
+                    suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
+                    msg = (
+                        f"🔎 已開始分析（已輸入 {len(seq)} 手）\n"
+                        f"機率：莊 {probs[0]:.3f}｜閒 {probs[1]:.3f}｜和 {probs[2]:.3f}\n"
+                        f"建議：{LAB_ZH[rec]} {suffix}"
+                    )
+                else:
+                    msg = "🔎 已開始分析。請先輸入歷史（莊/閒/和），之後我會回覆建議。"
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(text=msg, quick_reply=quick_reply_bar()),
+                     flex_buttons_card()]
+                )
+            except Exception as e:
+                logger.error("START immediate infer error: %s", e)
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    [TextSendMessage(text="啟動分析時發生錯誤，請再輸入一手或稍後重試。", quick_reply=quick_reply_bar()),
+                     flex_buttons_card()]
+                )
+            return
 
         if data == "END":
             USER_HISTORY[uid] = []
@@ -742,12 +810,11 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        if data == "UNDO":
+        if data in ("UNDO", "RETURN"):
             if seq:
                 removed = seq.pop()
                 USER_HISTORY[uid] = seq
-                sB, sP, sT = _counts(seq)
-                msg = f"↩ 已返回一步（移除：{LAB_ZH.get(removed, removed)}）。\n目前 {len(seq)} 手：莊{sB}｜閒{sP}｜和{sT}。"
+                msg = f"↩ 已返回一步（移除：{LAB_ZH.get(removed, removed)}）。\n目前 {len(seq)} 手：莊{seq.count('B')}｜閒{seq.count('P')}｜和{seq.count('T')}。"
             else:
                 msg = "沒有可返回的紀錄。"
             line_bot_api.reply_message(
@@ -763,7 +830,7 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        # Append & log
+        # 追加一手並裁切
         history_before = "".join(seq)
         seq.append(data)
         if len(seq) > MAX_HISTORY:
@@ -771,9 +838,10 @@ if USE_LINE and handler is not None:
         USER_HISTORY[uid] = seq
         append_round_csv(uid, history_before, data)
 
-        # Before START: only show stats
+        # 未開始：只顯示統計
         if not ready:
-            sB, sP, sT = _counts(seq); s_tail = "".join(seq[-20:])
+            sB = seq.count("B"); sP = seq.count("P"); sT = seq.count("T")
+            s_tail = "".join(seq[-20:])
             msg = (
                 f"已記錄 {len(seq)} 手：{s_tail}\n"
                 f"目前統計：莊{sB}｜閒{sP}｜和{sT}\n"
@@ -785,19 +853,19 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        # After START: PH drift + ensemble
+        # 已開始：PH 漂移 + 集成
         drift_now = update_ph_state(uid, seq)
         active = in_drift(uid)
         if active: consume_cooldown(uid)
 
         overrides = None
         if active:
-            # During drift, push toward short/markov (and allow MKV_W override)
-            overrides = {"REC_W":0.32, "LONG_W":0.20, "PRIOR_W":0.15, "MKV_W":0.45}
+            overrides = {"REC_W":0.32, "LONG_W":0.20, "PRIOR_W":0.15,
+                         "MKV_W":float(os.getenv("MKV_W","0.33"))}
 
         probs = ensemble_with_anti_stuck(seq, overrides)
         rec   = recommend_from_probs(probs)
-        suffix = "（⚡偵測到路型變化，已暫時提高短期/馬可夫權重）" if active else ""
+        suffix = "（⚡偵測到路型變化，短期權重已暫時提高）" if active else ""
         msg = (
             f"已解析 {len(seq)} 手\n"
             f"機率：莊 {probs[0]:.3f}｜閒 {probs[1]:.3f}｜和 {probs[2]:.3f}\n"
