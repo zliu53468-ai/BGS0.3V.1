@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BGS LINE Bot backend — v15 (AI full)
-- /, /health, /healthz for Render health
-- Big-Road(6x20) single source of truth
-- Conditional Markov (condition on last result)
-- PH drift gating (REC/LONG/PRIOR/MKV all overridable)
-- MAX_HISTORY cap for performance
-- Tie(T) calibration unified
+BGS LINE Bot backend — v15.2 (Big-Road + Conditional Markov + Short-Dragon Arbitration)
+- Big-Road(6x20) mapping & features (col depth / wall / early-dragon)
+- Conditional Markov (P(next | last_state))
+- Short-dragon (2~5) break/continue hazard + wall-aware + uncertainty gate
+- Page-Hinkley drift gating (overrides also adjust MKV_W)
+- Tie(T) calibration across all paths
+- History cap (MAX_HISTORY) for predict & LINE
 - CSV I/O (/export) + hot reload (/reload)
 - LINE buttons: 莊(紅)/閒(藍)/和(綠)/開始分析/結束分析/返回
-- Before START: only show counts & last-20 trail; after START: show advice
 """
 
 import os, csv, time, logging
@@ -26,20 +25,23 @@ DATA_CSV_PATH = os.getenv("DATA_LOG_PATH", "/data/logs/rounds.csv")
 os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
 
 RELOAD_TOKEN = os.getenv("RELOAD_TOKEN", "")
-RNN_PATH = os.getenv("RNN_PATH", "/data/models/rnn.pt")
-XGB_PATH = os.getenv("XGB_PATH", "/data/models/xgb.json")
-LGBM_PATH = os.getenv("LGBM_PATH", "/data/models/lgbm.txt")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "400"))
+RNN_PATH = os.getenv("RNN_PATH", "/opt/models/rnn.pt")
+XGB_PATH = os.getenv("XGB_PATH", "/opt/models/xgb.json")
+LGBM_PATH = os.getenv("LGBM_PATH", "/opt/models/lgbm.txt")
+
+FEAT_WIN     = int(os.getenv("FEAT_WIN", "120"))
+MAX_HISTORY  = int(os.getenv("MAX_HISTORY", "400"))
 
 # ========= Constants =========
 CLASS_ORDER = ("B", "P", "T")
 LAB_ZH = {"B": "莊", "P": "閒", "T": "和"}
 THEORETICAL_PROBS: Dict[str, float] = {"B": 0.458, "P": 0.446, "T": 0.096}
 
-# ========= Utilities =========
 def parse_history(payload) -> List[str]:
-    if payload is None: return []
+    """Parse history and hard-cap length by MAX_HISTORY (keep latest)."""
     seq: List[str] = []
+    if payload is None:
+        return seq
     if isinstance(payload, list):
         for s in payload:
             if isinstance(s, str) and s.strip().upper() in CLASS_ORDER:
@@ -47,22 +49,11 @@ def parse_history(payload) -> List[str]:
     elif isinstance(payload, str):
         for ch in payload:
             up = ch.upper()
-            if up in CLASS_ORDER: seq.append(up)
-    # cap length
-    return seq[-MAX_HISTORY:] if len(seq) > MAX_HISTORY else seq
-
-def norm(v: List[float]) -> List[float]:
-    s = sum(v); s = s if s > 1e-12 else 1.0
-    return [max(0.0, x)/s for x in v]
-
-def blend(a: List[float], b: List[float], w: float) -> List[float]:
-    return [(1-w)*a[i] + w*b[i] for i in range(3)]
-
-def temperature_scale(p: List[float], tau: float) -> List[float]:
-    if tau <= 1e-6: return p
-    ex = [pow(max(pi,1e-9), 1.0/tau) for pi in p]
-    s = sum(ex)
-    return [e/s for e in ex]
+            if up in CLASS_ORDER:
+                seq.append(up)
+    if len(seq) > MAX_HISTORY:
+        seq = seq[-MAX_HISTORY:]
+    return seq
 
 # ========= Optional Models =========
 try:
@@ -134,7 +125,7 @@ def load_models() -> None:
 
 load_models()
 
-# ========= Tie calibration =========
+# ========= Tie (T) calibration =========
 def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     if gamma is None: gamma = float(os.getenv("EW_GAMMA","0.96"))
@@ -144,8 +135,8 @@ def exp_decay_freq(seq: List[str], gamma: float = None) -> List[float]:
         elif r=="P": wP += w
         else: wT += w
         w *= gamma
-    a = float(os.getenv("LAPLACE","0.5"))
-    wB+=a; wP+=a; wT+=a
+    alpha = float(os.getenv("LAPLACE","0.5"))
+    wB+=alpha; wP+=alpha; wT+=alpha
     S = wB+wP+wT
     return [wB/S, wP/S, wT/S]
 
@@ -164,6 +155,73 @@ def _merge_bp_with_t(bp: List[float], pT: float) -> List[float]:
     scale = 1.0 - pT
     return [b*scale, p*scale, pT]
 
+# ========= Single-model inference =========
+def rnn_predict(seq: List[str]) -> Optional[List[float]]:
+    if RNN_MODEL is None or torch is None or not seq: return None
+    try:
+        def onehot(label: str): return [1 if label==lab else 0 for lab in CLASS_ORDER]
+        hist = seq[-FEAT_WIN:]
+        inp = torch.tensor([[onehot(ch) for ch in hist]], dtype=torch.float32)
+        with torch.no_grad():
+            logits = RNN_MODEL(inp)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
+        return [float(p) for p in probs]
+    except Exception as e:
+        logger.warning("RNN inference failed: %s", e); return None
+
+def xgb_predict(seq: List[str]) -> Optional[List[float]]:
+    if XGB_MODEL is None or not seq: return None
+    try:
+        import numpy as np
+        hist = seq[-FEAT_WIN:]
+        vec=[]
+        for label in hist:
+            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
+        pad = FEAT_WIN*3 - len(vec)
+        if pad>0: vec = [0.0]*pad + vec
+        dmatrix = xgb.DMatrix(np.array([vec], dtype=float))
+        prob = XGB_MODEL.predict(dmatrix)[0]
+        if isinstance(prob,(list,tuple)) and len(prob)==3:
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
+        if isinstance(prob,(list,tuple)) and len(prob)==2:
+            pT = _estimate_tie_prob(seq)
+            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
+        return None
+    except Exception as e:
+        logger.warning("XGB inference failed: %s", e); return None
+
+def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
+    if LGBM_MODEL is None or not seq: return None
+    try:
+        hist = seq[-FEAT_WIN:]
+        vec=[]
+        for label in hist:
+            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
+        pad = FEAT_WIN*3 - len(vec)
+        if pad>0: vec = [0.0]*pad + vec
+        prob = LGBM_MODEL.predict([vec])[0]
+        if isinstance(prob,(list,tuple)) and len(prob)==3:
+            return [float(prob[0]), float(prob[1]), float(prob[2])]
+        if isinstance(prob,(list,tuple)) and len(prob)==2:
+            pT = _estimate_tie_prob(seq)
+            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
+        return None
+    except Exception as e:
+        logger.warning("LGBM inference failed: %s", e); return None
+
+# ========= Utils =========
+def norm(v: List[float]) -> List[float]:
+    s=sum(v); s=s if s>1e-12 else 1.0
+    return [max(0.0,x)/s for x in v]
+
+def blend(a: List[float], b: List[float], w: float) -> List[float]:
+    return [(1-w)*a[i] + w*b[i] for i in range(3)]
+
+def temperature_scale(p: List[float], tau: float) -> List[float]:
+    if tau<=1e-6: return p
+    ex=[pow(max(pi,1e-9), 1.0/tau) for pi in p]; s=sum(ex)
+    return [e/s for e in ex]
+
 # ========= Big-Road 6x20 =========
 def features_like_early_dragon(seq: List[str]) -> bool:
     k=min(6, len(seq))
@@ -174,7 +232,7 @@ def features_like_early_dragon(seq: List[str]) -> bool:
 
 def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[str]], Dict[str,Any]]:
     """Simplified Big-Road (6x20):
-       - Same result: try go down; if bottom or below occupied, move right (stay same row).
+       - Same result: try go down; if bottom or below occupied, move right (same row).
        - Different result: move right, start from row 0 (top)."""
     grid=[["" for _ in range(cols)] for _ in range(rows)]
     if not seq:
@@ -205,13 +263,15 @@ def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[
     for rr in range(rows):
         if grid[rr][c]!="": cur_depth=rr+1
     blocked = (cur_depth>=rows) or (r==rows-1) or (r+1<rows and grid[r+1][c]!="" and last==grid[r][c])
+
     def last_run_len(s: List[str])->int:
         if not s: return 0
         ch=s[-1]; i=len(s)-2; n=1
         while i>=0 and s[i]==ch: n+=1; i-=1
         return n
+
     feats = {
-        "cur_run": last_run_len(seq),
+        "cur_run": last_run_len([x for x in seq if x in ("B","P")]),
         "col_depth": cur_depth,
         "blocked": blocked,
         "r": r, "c": c,
@@ -219,7 +279,7 @@ def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Tuple[List[List[
     }
     return grid, feats
 
-# ========= Short/Mid/Long / Markov =========
+# ========= Short/Mid/Long / Conditional Markov =========
 def recent_freq(seq: List[str], win: int) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
     cut = seq[-win:] if win>0 else seq
@@ -229,9 +289,11 @@ def recent_freq(seq: List[str], win: int) -> List[float]:
     return [nB/tot, nP/tot, nT/tot]
 
 def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
-    """Conditional Markov: P(next | last) with exponential decay on transitions."""
-    if not seq or len(seq)<2:
-        return [1/3,1/3,1/3]
+    """
+    Conditional Markov: P(next | last_state). 若長度<2 則返回均分。
+    以最後一手為條件，取該列的加權轉移並正規化。
+    """
+    if not seq or len(seq)<2: return [1/3,1/3,1/3]
     if decay is None: decay = float(os.getenv("MKV_DECAY","0.98"))
     idx={"B":0,"P":1,"T":2}
     C=[[0.0]*3 for _ in range(3)]
@@ -240,18 +302,12 @@ def markov_next_prob(seq: List[str], decay: float = None) -> List[float]:
         C[idx[a]][idx[b]] += w
         w *= decay
     last = seq[-1]
-    row = [C[idx[last]][0], C[idx[last]][1], C[idx[last]][2]]
-    # laplace smoothing on the row
-    a = float(os.getenv("MKV_LAPLACE","0.5"))
-    row = [x+a for x in row]
-    S = sum(row)
-    if S <= 1e-12:
-        # fallback to marginal flow if row is zero (rare)
-        flow=[C[0][0]+C[1][0]+C[2][0],
-              C[0][1]+C[1][1]+C[2][1],
-              C[0][2]+C[1][2]+C[2][2]]
-        flow=[x+a for x in flow]; S=sum(flow)
-        return [x/S for x in flow]
+    row = C[idx[last]]
+    # Laplace on row
+    a=float(os.getenv("MKV_LAPLACE","0.5"))
+    row=[x+a for x in row]
+    S=sum(row)
+    if S<=1e-12: return [1/3,1/3,1/3]
     return [x/S for x in row]
 
 # ========= Regime boosts (mild) =========
@@ -298,11 +354,60 @@ def regime_boosts(seq: List[str], grid_feat: Dict[str,Any]) -> List[float]:
         b[2]*=BOOST_T
     return b
 
-def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
-    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
-    s=sum(p); return [x/s for x in p]
+# ========= Hazard & Mean-Revert (Reversion engine) =========
+def bp_only(seq: List[str]) -> List[str]:
+    return [x for x in seq if x in ("B","P")]
 
-# ========= PH drift =========
+def run_hist(seq_bp: List[str]) -> Dict[int,int]:
+    hist: Dict[int,int]={}
+    if not seq_bp: return hist
+    cur=1
+    for i in range(1,len(seq_bp)):
+        if seq_bp[i]==seq_bp[i-1]:
+            cur+=1
+        else:
+            hist[cur]=hist.get(cur,0)+1
+            cur=1
+    hist[cur]=hist.get(cur,0)+1
+    return hist
+
+def mean_revert_score(seq: List[str]) -> Tuple[float, str]:
+    b = seq.count("B"); p = seq.count("P")
+    tot = max(1, b+p)
+    diff = (b-p)/tot
+    side = "P" if diff>0 else ("B" if diff<0 else "")
+    return abs(diff), side
+
+def current_run_len_bp(seq: List[str]) -> Tuple[str, int]:
+    s = [x for x in seq if x in ("B","P")]
+    if not s: return ("", 0)
+    last = s[-1]; n = 1
+    i = len(s) - 2
+    while i >= 0 and s[i] == last:
+        n += 1; i -= 1
+    return last, n
+
+def bayes_continue_prob_from_hist(cur_len: int, hist: Dict[int,int]) -> float:
+    if cur_len <= 0 or not hist: return 0.5
+    a = float(os.getenv("HZD_ALPHA","0.7"))
+    cp_a = float(os.getenv("CP_A","1.5"))
+    cp_b = float(os.getenv("CP_B","1.5"))
+    ge = sum(v for k,v in hist.items() if k >= cur_len)
+    end = hist.get(cur_len, 0)
+    hazard = (end + a) / (ge + a * max(1, len(hist)))
+    p_continue_ml = 1.0 - hazard
+    prior = cp_a / (cp_a + cp_b)
+    w = float(os.getenv("CP_W","0.35"))
+    return max(0.0, min(1.0, (1-w)*p_continue_ml + w*prior))
+
+def short_run_uncertainty_gate(cur_len: int, p_cont: float) -> float:
+    if 2 <= cur_len <= 5:
+        band = float(os.getenv("UNCERT_BAND","0.08"))
+        if abs(p_cont - 0.5) <= band:
+            return float(os.getenv("UNCERT_SHRINK","0.45"))
+    return 1.0
+
+# ========= Page-Hinkley =========
 def js_divergence(p: List[float], q: List[float]) -> float:
     import math
     eps=1e-12; m=[(p[i]+q[i])/2.0 for i in range(3)]
@@ -343,59 +448,6 @@ def consume_cooldown(uid: str) -> bool:
 def in_drift(uid: str) -> bool:
     return _get_drift_state(uid)['cooldown']>0.0
 
-# ========= Single-model inference =========
-def rnn_predict(seq: List[str]) -> Optional[List[float]]:
-    if RNN_MODEL is None or torch is None or not seq: return None
-    try:
-        def onehot(label: str): return [1 if label==lab else 0 for lab in CLASS_ORDER]
-        inp = torch.tensor([[onehot(ch) for ch in seq]], dtype=torch.float32)
-        with torch.no_grad():
-            logits = RNN_MODEL(inp)
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0].tolist()
-        return [float(p) for p in probs]
-    except Exception as e:
-        logger.warning("RNN inference failed: %s", e); return None
-
-def xgb_predict(seq: List[str]) -> Optional[List[float]]:
-    if XGB_MODEL is None or not seq: return None
-    try:
-        import numpy as np
-        K = int(os.getenv("FEAT_WIN","20"))
-        vec=[]
-        for label in seq[-K:]:
-            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
-        pad = K*3 - len(vec)
-        if pad>0: vec = [0.0]*pad + vec
-        dmatrix = xgb.DMatrix(np.array([vec], dtype=float))
-        prob = XGB_MODEL.predict(dmatrix)[0]
-        if isinstance(prob,(list,tuple)) and len(prob)==3:
-            return [float(prob[0]), float(prob[1]), float(prob[2])]
-        if isinstance(prob,(list,tuple)) and len(prob)==2:
-            pT = _estimate_tie_prob(seq)
-            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
-        return None
-    except Exception as e:
-        logger.warning("XGB inference failed: %s", e); return None
-
-def lgbm_predict(seq: List[str]) -> Optional[List[float]]:
-    if LGBM_MODEL is None or not seq: return None
-    try:
-        K = int(os.getenv("FEAT_WIN","20"))
-        vec=[]
-        for label in seq[-K:]:
-            vec.extend([1.0 if label==lab else 0.0 for lab in CLASS_ORDER])
-        pad = K*3 - len(vec)
-        if pad>0: vec = [0.0]*pad + vec
-        prob = LGBM_MODEL.predict([vec])[0]
-        if isinstance(prob,(list,tuple)) and len(prob)==3:
-            return [float(prob[0]), float(prob[1]), float(prob[2])]
-        if isinstance(prob,(list,tuple)) and len(prob)==2:
-            pT = _estimate_tie_prob(seq)
-            return _merge_bp_with_t([float(prob[0]), float(prob[1])], pT)
-        return None
-    except Exception as e:
-        logger.warning("LGBM inference failed: %s", e); return None
-
 # ========= Ensemble with Arbitration =========
 def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str,float]]=None) -> List[float]:
     # Base models
@@ -419,90 +471,70 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     # Phase windows
     W_S = int(os.getenv("WIN_SHORT","6"))
     W_M = int(os.getenv("WIN_MID","12"))
-
-    # Momentum path (short + Markov)
+    # Momentum path (short + Conditional Markov, blend by MKV_W factor)
     p_short = blend(recent_freq(seq, W_S), recent_freq(seq, W_M), 0.5)
+    MKV_W = float(os.getenv("MKV_W","0.25"))
+    if weight_overrides:
+        MKV_W = weight_overrides.get("MKV_W", MKV_W)
     p_mkv   = markov_next_prob(seq, float(os.getenv("MKV_DECAY","0.98")))
-    p_momentum = blend(p_short, p_mkv, 0.5)
+    # 用 MKV_W 作為短線 vs Markov 的混合係數（0~1）
+    p_momentum = blend(p_short, p_mkv, max(0.0, min(1.0, MKV_W)))
 
-    # Reversion path (hazard + wall + mean-revert)
+    # Reversion path（短龍是否斷/續）
     grid, feat = map_to_big_road(seq)
-    seq_bp = [x for x in seq if x in ("B","P")]
-    hist: Dict[int,int]={}
-    if seq_bp:
-        cur=1
-        for i in range(1,len(seq_bp)):
-            if seq_bp[i]==seq_bp[i-1]:
-                cur+=1
-            else:
-                hist[cur]=hist.get(cur,0)+1
-                cur=1
-        hist[cur]=hist.get(cur,0)+1
-    def hazard_from_hist(L:int, hist:Dict[int,int]) -> float:
-        if L<=0: return 0.0
-        a = float(os.getenv("HZD_ALPHA","0.5"))
-        ge = sum(v for k,v in hist.items() if k>=L)
-        end= hist.get(L, 0)
-        return (end + a) / (ge + a*max(1,len(hist)))
-    def mean_revert_score(seq: List[str]) -> Tuple[float, str]:
-        b = seq.count("B"); p = seq.count("P"); tot=max(1,b+p)
-        diff=(b-p)/tot
-        side = "P" if diff>0 else ("B" if diff<0 else "")
-        return abs(diff), side
+    seq_bp = bp_only(seq)
+    hist = run_hist(seq_bp)
 
-    cur_run = feat.get("cur_run", 1)
-    hz = hazard_from_hist(cur_run, hist)
-    wall = 1.0 if feat.get("blocked", False) else 0.0
-    mr_score, _ = mean_revert_score(seq)
-    last = seq[-1] if seq else ""
-    opposite = "P" if last=="B" else ("B" if last=="P" else "")
+    last_bp, cur_run = current_run_len_bp(seq)
+    p_cont = bayes_continue_prob_from_hist(cur_run, hist)   # P(續)
+    p_break = 1.0 - p_cont                                  # P(斷)
+    wall_bonus = float(os.getenv("WALL_HAZD_BONUS","0.12"))
+    if feat.get("blocked", False):
+        p_break = min(1.0, p_break + wall_bonus)
 
-    epsilon = 0.02
-    if opposite=="B":
-        p_rev_bp = [1.0-epsilon, epsilon]  # [B,P]
-    elif opposite=="P":
-        p_rev_bp = [epsilon, 1.0-epsilon]
+    opposite = "P" if last_bp == "B" else ("B" if last_bp == "P" else "")
+    eps = 0.02
+    if opposite == "B":
+        p_rev_bp = [max(eps, p_break), max(eps, 1.0 - p_break)]
+    elif opposite == "P":
+        p_rev_bp = [max(eps, 1.0 - p_break), max(eps, p_break)]
     else:
         p_rev_bp = [0.5, 0.5]
 
-    alpha_hz   = float(os.getenv("W_HAZARD","0.60"))
-    alpha_wall = float(os.getenv("W_WALL","0.25"))
+    uncert_scale = short_run_uncertainty_gate(cur_run, p_cont)
+
+    # 仲裁強度：斷龍信念 + 均值回歸 + Big-Road 格局（牆/列深）
+    alpha_cont = float(os.getenv("W_CONT","0.65"))
     alpha_mr   = float(os.getenv("W_MEANREV","0.15"))
-    rev_strength = (alpha_hz*hz) + (alpha_wall*wall) + (alpha_mr*mr_score)
-    rev_strength = max(0.0, min(1.0, rev_strength))
+    alpha_grid = float(os.getenv("W_GRID","0.20"))
+    mr_score, _ = mean_revert_score(seq)
+    grid_signal = 1.0 if feat.get("blocked", False) else (feat.get("col_depth",0)/6.0)
 
+    rev_strength = alpha_cont*p_break + alpha_mr*mr_score + alpha_grid*grid_signal
+    rev_strength = max(0.0, min(1.0, rev_strength)) * uncert_scale
+
+    # 注入 T 校正
     pT_est = _estimate_tie_prob(seq)
-    p_mom = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
-    p_rev = _merge_bp_with_t([p_rev_bp[0], p_rev_bp[1]], pT_est)
-    p_mix = blend(p_mom, p_rev, rev_strength)
+    p_mom  = _merge_bp_with_t([p_momentum[0], p_momentum[1]], pT_est)
+    p_rev  = _merge_bp_with_t([p_rev_bp[0],  p_rev_bp[1]],  pT_est)
 
-    # Long-term & prior
+    # Arbitration: mix between momentum and reversion, then blend with base & long
+    p_mix = blend(p_mom, p_rev, rev_strength)
     p_long = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+
     PRIOR_W = float(os.getenv("PRIOR_W","0.15"))
     LONG_W  = float(os.getenv("LONG_W","0.25"))
     REC_W   = float(os.getenv("REC_W","0.25"))
-    MKV_W   = float(os.getenv("MKV_W","0.25"))  # allow override during drift via caller
-
     if weight_overrides:
         REC_W  = weight_overrides.get("REC_W",  REC_W)
         LONG_W = weight_overrides.get("LONG_W", LONG_W)
         PRIOR_W= weight_overrides.get("PRIOR_W",PRIOR_W)
-        MKV_W  = weight_overrides.get("MKV_W",  MKV_W)  # RESPECT MKV_W OVERRIDE
-
-    # Use MKV_W to tilt p_mix toward Markov or away from it
-    # Interpret MKV_W as additional weight on p_mkv inside momentum path
-    if MKV_W != 0.25:
-        # rebuild momentum with custom tilt
-        w_mkv = max(0.0, min(1.0, MKV_W))
-        p_momentum_tilt = blend(p_short, p_mkv, w_mkv)
-        p_mom = _merge_bp_with_t([p_momentum_tilt[0], p_momentum_tilt[1]], pT_est)
-        # recompute p_mix with same rev_strength
-        p_mix = blend(p_mom, p_rev, rev_strength)
 
     probs = blend(probs, p_mix,  REC_W)
     probs = blend(probs, p_long, LONG_W)
     probs = blend(probs, [THEORETICAL_PROBS["B"], THEORETICAL_PROBS["P"], THEORETICAL_PROBS["T"]], PRIOR_W)
 
+    # Safety caps + temperature
     EPS = float(os.getenv("EPSILON_FLOOR","0.06"))
     CAP = float(os.getenv("MAX_CAP","0.86"))
     TAU = float(os.getenv("TEMP","1.06"))
@@ -513,6 +545,10 @@ def ensemble_with_anti_stuck(seq: List[str], weight_overrides: Optional[Dict[str
     probs  = _apply_boosts_and_norm(probs, boosts)
     return norm(probs)
 
+def _apply_boosts_and_norm(probs: List[float], boosts: List[float]) -> List[float]:
+    p=[max(1e-12, probs[i]*boosts[i]) for i in range(3)]
+    s=sum(p); return [x/s for x in p]
+
 def recommend_from_probs(probs: List[float]) -> str:
     return CLASS_ORDER[probs.index(max(probs))]
 
@@ -521,7 +557,7 @@ def recommend_from_probs(probs: List[float]) -> str:
 def index(): return "ok"
 
 @app.route("/health", methods=["GET"])
-def health(): return jsonify(status="healthy", version=os.getenv("APP_VERSION","v15-ai"))
+def health(): return jsonify(status="healthy", version="v15.2")
 
 @app.route("/healthz", methods=["GET"])
 def healthz(): return jsonify(status="healthy")
@@ -539,6 +575,7 @@ def predict():
         "recommendation": rec
     })
 
+# -------- CSV I/O ----------
 def append_round_csv(user_id: str, history_before: str, label: str) -> None:
     try:
         os.makedirs(os.path.dirname(DATA_CSV_PATH), exist_ok=True)
@@ -563,7 +600,7 @@ def export_csv():
         headers={"Content-Disposition":"attachment; filename=rounds.csv"})
 
 @app.route("/reload", methods=["POST"])
-def reload_models_api():
+def reload_models():
     token = request.headers.get("X-Reload-Token","") or request.args.get("token","")
     if not RELOAD_TOKEN or token != RELOAD_TOKEN:
         return jsonify(ok=False, error="unauthorized"), 401
@@ -597,6 +634,9 @@ else:
 USER_HISTORY: Dict[str, List[str]] = {}
 USER_READY:   Dict[str, bool]      = {}
 USER_DRIFT:   Dict[str, Dict[str, float]] = USER_DRIFT
+
+def _counts(seq:List[str])->Tuple[int,int,int]:
+    return seq.count("B"), seq.count("P"), seq.count("T")
 
 def flex_buttons_card() -> 'FlexSendMessage':
     contents = {
@@ -656,11 +696,15 @@ if USE_LINE and handler is not None:
         USER_HISTORY.setdefault(uid, [])
         USER_READY.setdefault(uid, False)
         _get_drift_state(uid)
-        s = USER_HISTORY[uid][-20:]
+
+        # 裁切
+        if len(USER_HISTORY[uid]) > MAX_HISTORY:
+            USER_HISTORY[uid] = USER_HISTORY[uid][-MAX_HISTORY:]
+
+        sB, sP, sT = _counts(USER_HISTORY[uid])
         msg = (
             "請使用下方按鈕輸入：莊/閒/和。\n"
-            f"目前已輸入：{len(USER_HISTORY[uid])} 手（莊{USER_HISTORY[uid].count('B')} / 閒{USER_HISTORY[uid].count('P')} / 和{USER_HISTORY[uid].count('T')}）。\n"
-            f"最近 20 手：{''.join(s)}\n"
+            f"目前已輸入：{len(USER_HISTORY[uid])} 手（莊{sB} / 閒{sP} / 和{sT}）。\n"
             "按「開始分析」後才會給出下注建議；如需核對可用「返回」。"
         )
         line_bot_api.reply_message(
@@ -674,6 +718,11 @@ if USE_LINE and handler is not None:
         data = (event.postback.data or "").upper()
         seq  = USER_HISTORY.get(uid, [])
         ready= USER_READY.get(uid, False)
+
+        # 裁切
+        if len(seq) > MAX_HISTORY:
+            seq = seq[-MAX_HISTORY:]
+            USER_HISTORY[uid] = seq
 
         if data == "START":
             USER_READY[uid] = True
@@ -696,8 +745,9 @@ if USE_LINE and handler is not None:
         if data == "UNDO":
             if seq:
                 removed = seq.pop()
-                USER_HISTORY[uid] = seq[-MAX_HISTORY:]
-                msg = f"↩ 已返回一步（移除：{LAB_ZH.get(removed, removed)}）。\n目前 {len(seq)} 手：莊{seq.count('B')}｜閒{seq.count('P')}｜和{seq.count('T')}。"
+                USER_HISTORY[uid] = seq
+                sB, sP, sT = _counts(seq)
+                msg = f"↩ 已返回一步（移除：{LAB_ZH.get(removed, removed)}）。\n目前 {len(seq)} 手：莊{sB}｜閒{sP}｜和{sT}。"
             else:
                 msg = "沒有可返回的紀錄。"
             line_bot_api.reply_message(
@@ -713,7 +763,7 @@ if USE_LINE and handler is not None:
                  flex_buttons_card()]
             ); return
 
-        # Append & log (cap history)
+        # Append & log
         history_before = "".join(seq)
         seq.append(data)
         if len(seq) > MAX_HISTORY:
@@ -723,8 +773,7 @@ if USE_LINE and handler is not None:
 
         # Before START: only show stats
         if not ready:
-            sB = seq.count("B"); sP = seq.count("P"); sT = seq.count("T")
-            s_tail = "".join(seq[-20:])
+            sB, sP, sT = _counts(seq); s_tail = "".join(seq[-20:])
             msg = (
                 f"已記錄 {len(seq)} 手：{s_tail}\n"
                 f"目前統計：莊{sB}｜閒{sP}｜和{sT}\n"
@@ -743,10 +792,8 @@ if USE_LINE and handler is not None:
 
         overrides = None
         if active:
-            overrides = {
-                "REC_W":0.32, "LONG_W":0.20, "PRIOR_W":0.15,
-                "MKV_W":0.33  # during drift, increase Markov influence
-            }
+            # During drift, push toward short/markov (and allow MKV_W override)
+            overrides = {"REC_W":0.32, "LONG_W":0.20, "PRIOR_W":0.15, "MKV_W":0.45}
 
         probs = ensemble_with_anti_stuck(seq, overrides)
         rec   = recommend_from_probs(probs)
