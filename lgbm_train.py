@@ -1,143 +1,140 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train LightGBM (3-class: B/P/T) aligned with server v15
-
-CSV schema:
-user_id,ts,history_before,label
-
-ENV (all optional):
-- TRAIN_DATA_PATH   default /data/logs/rounds.csv
-- LGBM_OUT_PATH     default /data/models/lgbm.txt
-- FEAT_WIN          default 20
-- VAL_SPLIT         default 0.15
-- LGBM_ROUNDS       default 1200
-- LGBM_EARLY        default 100
-- LGBM_LR           default 0.05
-- LGBM_NUM_LEAVES   default 63
-- LGBM_MIN_DATA     default 30
-- LGBM_FEAT_FRAC    default 0.9
-- LGBM_BAG_FRAC     default 0.9
-- SEED              default 42
+Train LightGBM (3-class: B/P/T) with Big-Road features
+Env:
+- TRAIN_DATA_PATH  (default /data/logs/rounds.csv)
+- LGBM_OUT_PATH    (default /data/models/lgbm.txt)
+- FEAT_WIN         (default 20)
 """
 
 import os, csv
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import numpy as np
 import lightgbm as lgb
 
 TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/data/logs/rounds.csv")
-LGBM_OUT_PATH   = os.getenv("LGBM_OUT_PATH", "/data/models/lgbm.txt")
+LGBM_OUT_PATH   = os.getenv("LGBM_OUT_PATH",   "/data/models/lgbm.txt")
 os.makedirs(os.path.dirname(LGBM_OUT_PATH), exist_ok=True)
 
-FEAT_WIN      = int(os.getenv("FEAT_WIN", "20"))
-VAL_SPLIT     = float(os.getenv("VAL_SPLIT", "0.15"))
-LGBM_ROUNDS   = int(os.getenv("LGBM_ROUNDS", "1200"))
-LGBM_EARLY    = int(os.getenv("LGBM_EARLY", "100"))
-LGBM_LR       = float(os.getenv("LGBM_LR", "0.05"))
-LGBM_NUM_LEAVES= int(os.getenv("LGBM_NUM_LEAVES", "63"))
-LGBM_MIN_DATA = int(os.getenv("LGBM_MIN_DATA", "30"))
-LGBM_FEAT_FRAC= float(os.getenv("LGBM_FEAT_FRAC", "0.9"))
-LGBM_BAG_FRAC = float(os.getenv("LGBM_BAG_FRAC", "0.9"))
-SEED          = int(os.getenv("SEED", "42"))
+CLASS_ORDER=("B","P","T"); LUT={'B':0,'P':1,'T':2}
+FEAT_WIN=int(os.getenv("FEAT_WIN","20"))
 
-LUT = {'B':0,'P':1,'T':2}
+def map_to_big_road(seq: List[str], rows:int=6, cols:int=20) -> Dict[str,Any]:
+    grid=[["" for _ in range(cols)] for _ in range(rows)]
+    if not seq:
+        return {"cur_run":0,"col_depth":0,"blocked":False,"early_dragon_hint":False}
+    r=c=0; last=None
+    for ch in seq:
+        if last is None:
+            grid[r][c]=ch; last=ch; continue
+        if ch==last:
+            if r+1<rows and grid[r+1][c]=="":
+                r+=1
+            else:
+                c=min(cols-1,c+1)
+                while c<cols and grid[r][c]!="":
+                    c=min(cols-1,c+1)
+                if c>=cols: c=cols-1
+        else:
+            last=ch
+            c=min(cols-1,c+1); r=0
+            while c<cols and grid[r][c]!="":
+                c=min(cols-1,c+1)
+            if c>=cols: c=cols-1
+        if grid[r][c]=="": grid[r][c]=ch
+    cur_depth=0
+    for rr in range(rows):
+        if grid[rr][c]!="": cur_depth=rr+1
+    blocked=(r==rows-1) or (r+1<rows and grid[r+1][c]!="" and last==grid[r][c])
+    def last_run_len(s: List[str])->int:
+        if not s: return 0
+        ch=s[-1]; i=len(s)-2; n=1
+        while i>=0 and s[i]==ch: n+=1; i-=1
+        return n
+    def early_dragon_hint(s: List[str])->bool:
+        k=min(6,len(s))
+        if k<4: return False
+        t=s[-k:]; return max(t.count("B"), t.count("P"))>=k-1
+    return {"cur_run":last_run_len(seq),"col_depth":cur_depth,"blocked":blocked,"early_dragon_hint":early_dragon_hint(seq)}
 
-def load_rows(path:str):
-    rows=[]
+def seq_to_onehot_tail(seq: List[str], K:int)->List[float]:
+    v=[]
+    tail=seq[-K:]
+    for lab in tail:
+        v.extend([1.0 if lab==c else 0.0 for c in CLASS_ORDER])
+    need=K*3 - len(v)
+    if need>0: v=[0.0]*need + v
+    return v
+
+def build_row(history_before:str, label:str)->Tuple[List[float], int]:
+    seq=[ch for ch in (history_before or "").strip().upper() if ch in LUT]
+    v=seq_to_onehot_tail(seq, FEAT_WIN)
+    f=map_to_big_road(seq)
+    v.extend([
+        float(f["cur_run"]), float(f["col_depth"]),
+        1.0 if f["blocked"] else 0.0,
+        1.0 if f["early_dragon_hint"] else 0.0
+    ])
+    return v, LUT[label]
+
+def load_dataset(path:str)->Tuple[np.ndarray,np.ndarray]:
+    X=[];Y=[]
     if not os.path.exists(path):
-        print(f"[ERROR] data file not found: {path}")
-        return rows
+        raise FileNotFoundError(path)
     with open(path,"r",encoding="utf-8") as f:
         r=csv.reader(f)
-        for line in r:
-            if not line or len(line)<4: continue
-            try:
-                ts=int(line[1])
-            except Exception:
-                continue
-            hist=(line[2] or "").strip().upper()
-            lab =(line[3] or "").strip().upper()
-            if lab in LUT:
-                rows.append((ts,hist,lab))
-    rows.sort(key=lambda x:x[0])
-    return rows
+        for row in r:
+            if not row or len(row)<4: continue
+            hist=row[2].strip().upper()
+            lab =(row[3] or "").strip().upper()
+            if lab not in LUT: continue
+            v,y=build_row(hist, lab)
+            X.append(v); Y.append(y)
+    return np.array(X,dtype=np.float32), np.array(Y,dtype=np.int32)
 
-def seq_to_vec(seq:str, K:int):
-    seq=[ch for ch in seq if ch in LUT]
-    take=seq[-K:]
-    vec=[]
-    for ch in take:
-        one=[0.0,0.0,0.0]; one[LUT[ch]]=1.0
-        vec.extend(one)
-    need=K*3-len(vec)
-    if need>0: vec=[0.0]*need+vec
-    return np.array(vec, dtype=np.float32)
-
-def build_xy(rows, K:int):
-    X=[]; y=[]
-    for _,hist,lab in rows:
-        X.append(seq_to_vec(hist,K))
-        y.append(LUT[lab])
-    return np.vstack(X), np.array(y, dtype=np.int32)
-
-def time_split(rows, val_ratio:float):
-    n=len(rows)
-    k=max(1, int(n*(1.0-val_ratio)))
-    return rows[:k], rows[k:]
-
-def class_weights(y: np.ndarray)->np.ndarray:
+def class_weights(y: np.ndarray) -> np.ndarray:
     cnt=np.bincount(y, minlength=3).astype(np.float64)
     cnt[cnt==0]=1.0
     inv=1.0/cnt
-    w=inv[y]
-    w*= (len(w)/w.sum())
+    w=inv[y]; w*= (len(w)/w.sum())
     return w.astype(np.float32)
 
 def main():
-    rows=load_rows(TRAIN_DATA_PATH)
-    if len(rows)<200:
-        print(f"[WARN] few samples: {len(rows)}; training anyway.")
-    tr,va = time_split(rows, VAL_SPLIT)
-    Xtr,ytr = build_xy(tr, FEAT_WIN)
-    Xva,yva = build_xy(va, FEAT_WIN) if len(va)>0 else (None,None)
+    X,Y=load_dataset(TRAIN_DATA_PATH)
+    if len(Y)<200:
+        print(f"[WARN] few samples: {len(Y)}")
+    k=int(len(Y)*0.85)
+    Xtr,Ytr = X[:k], Y[:k]
+    Xva,Yva = X[k:], Y[k:]
+    wtr = class_weights(Ytr)
+    ltr = lgb.Dataset(Xtr, label=Ytr, weight=wtr, free_raw_data=False)
+    lva = lgb.Dataset(Xva, label=Yva, reference=ltr, free_raw_data=False) if len(Yva)>0 else None
 
-    wtr = class_weights(ytr)
-    ltr = lgb.Dataset(Xtr, label=ytr, weight=wtr, free_raw_data=False)
-    lva = lgb.Dataset(Xva, label=yva, reference=ltr, free_raw_data=False) if Xva is not None else None
+    print(f"[INFO] features={Xtr.shape[1]}, train={len(Ytr)}, valid={len(Yva)}")
 
     params = {
-        "objective": "multiclass",
-        "num_class": 3,
-        "metric": "multi_logloss",
-        "learning_rate": LGBM_LR,
-        "num_leaves": LGBM_NUM_LEAVES,
-        "min_data_in_leaf": LGBM_MIN_DATA,
-        "feature_fraction": LGBM_FEAT_FRAC,
-        "bagging_fraction": LGBM_BAG_FRAC,
-        "bagging_freq": 1,
-        "max_depth": -1,
-        "verbosity": -1,
-        "seed": SEED,
-        # "device": "gpu",  # if GPU available
+        "objective":"multiclass",
+        "num_class":3,
+        "learning_rate":0.05,
+        "metric":"multi_logloss",
+        "num_leaves":63,
+        "min_data_in_leaf":30,
+        "feature_fraction":0.9,
+        "bagging_fraction":0.9,
+        "bagging_freq":1,
+        "max_depth":-1,
+        "verbosity":-1,
     }
-
-    valid_sets=[ltr]; valid_names=["train"]
-    if lva is not None:
-        valid_sets.append(lva); valid_names.append("valid")
-
     booster = lgb.train(
-        params,
-        ltr,
-        num_boost_round=LGBM_ROUNDS,
-        valid_sets=valid_sets,
-        valid_names=valid_names,
-        early_stopping_rounds=(LGBM_EARLY if lva is not None else None),
+        params, ltr, num_boost_round=1200,
+        valid_sets=[ltr] + ([lva] if lva is not None else []),
+        valid_names=["train"] + (["valid"] if lva is not None else []),
+        early_stopping_rounds=100 if lva is not None else None,
         verbose_eval=50
     )
-
     booster.save_model(LGBM_OUT_PATH)
-    print(f"[OK] saved LGBM model -> {LGBM_OUT_PATH}")
+    print(f"[OK] saved LGBM -> {LGBM_OUT_PATH}")
 
 if __name__=="__main__":
     main()
