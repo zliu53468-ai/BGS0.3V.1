@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bgs-backend
+    name: bgs-backend-chop
     env: python
     plan: free
 
@@ -17,96 +17,62 @@ services:
     healthCheckPath: /health
 
     envVars:
-      # ---- Runtime ----
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: LOG_LEVEL
-        value: INFO
-      - key: DEBOUNCE_SEC
-        value: 1.2           # 防重按 / 重送；想更嚴可設 1.8
+      # --- runtime / logs ---
+      - key: LOG_LEVEL           ; value: INFO
+      - key: DEBOUNCE_SEC        ; value: 1.2
+      - key: EXPORT_LOGS         ; value: "1"
 
-      # ---- Storage（可寫目錄）----
-      # 若不設定，程式會自動使用 /tmp/bgs；你也可改成專案目錄下 data
-      - key: DATA_BASE
-        value: /tmp/bgs
-      # 匯出逐手紀錄（CSV）開關：1=開啟、0=關
-      - key: EXPORT_LOGS
-        value: "1"
+      # --- writable storage (Render Free 可寫) ---
+      - key: DATA_BASE           ; value: /tmp/bgs
+      - key: DATA_LOG_PATH       ; value: /tmp/bgs/logs/rounds.csv
 
-      # ---- LINE secrets（在 Render 介面填）----
-      - key: LINE_CHANNEL_ACCESS_TOKEN
-        sync: false
-      - key: LINE_CHANNEL_SECRET
-        sync: false
+      # --- windows & memory (CHOP+) ---
+      - key: WIN_SHORT           ; value: "4"
+      - key: WIN_MID             ; value: "10"
+      - key: WIN_LONG            ; value: "20"
+      - key: EW_GAMMA            ; value: "0.94"
+      - key: MKV_DECAY           ; value: "0.960"
 
-      # 你原本帶的變數；若前端會用得到可以保留
-      - key: BACKEND_URL
-        sync: false
+      # --- weights (CHOP+) ---
+      - key: REC_W               ; value: "0.32"
+      - key: LONG_W              ; value: "0.12"
+      - key: MKV_W               ; value: "0.18"
+      - key: PRIOR_W             ; value: "0.18"
 
-      # ---- 推論與安全層（預設：SAFE+ 組合）----
-      - key: WIN_SHORT
-        value: "6"
-      - key: WIN_MID
-        value: "12"
-      - key: WIN_LONG
-        value: "30"
-      - key: EW_GAMMA
-        value: "0.975"
+      # --- reversion / anti-chop ---
+      - key: W_HAZARD            ; value: "0.70"
+      - key: W_WALL              ; value: "0.35"
+      - key: W_SWING             ; value: "0.35"
+      - key: W_MEANREV           ; value: "0.25"
+      - key: BOOST_ALT           ; value: "1.10"
 
-      - key: REC_W
-        value: "0.18"
-      - key: LONG_W
-        value: "0.22"
-      - key: MKV_W
-        value: "0.15"
-      - key: PRIOR_W
-        value: "0.25"
-      - key: MKV_DECAY
-        value: "0.980"
+      # --- tie calibration ---
+      - key: T_BLEND             ; value: "0.55"
+      - key: T_MIN               ; value: "0.05"
+      - key: T_MAX               ; value: "0.18"
+      - key: BOOST_T             ; value: "1.03"
 
-      - key: BOOST_DRAGON_LEN
-        value: "4"
-      - key: BOOST_DRAGON
-        value: "1.04"
-      - key: BOOST_EARLY_DRAGON
-        value: "1.03"
-      - key: BOOST_ALT
-        value: "1.04"
-      - key: OVERHEAT_TH
-        value: "0.65"
-      - key: OVERHEAT_BOOST
-        value: "1.10"
+      # --- safety layer ---
+      - key: EPSILON_FLOOR       ; value: "0.07"
+      - key: MAX_CAP             ; value: "0.80"
+      - key: TEMP                ; value: "1.08"
 
-      - key: W_HAZARD
-        value: "0.55"
-      - key: W_WALL
-        value: "0.25"
-      - key: W_SWING
-        value: "0.22"
-      - key: W_MEANREV
-        value: "0.18"
+      # --- overheat counter ---
+      - key: OVERHEAT_TH         ; value: "0.65"
+      - key: OVERHEAT_BOOST      ; value: "1.10"
 
-      - key: T_BLEND
-        value: "0.55"
-      - key: T_MIN
-        value: "0.05"
-      - key: T_MAX
-        value: "0.18"
-      - key: BOOST_T
-        value: "1.02"
+      # --- regime detection (Page–Hinkley) ---
+      - key: REC_WIN_FOR_PH      ; value: "10"
+      - key: PH_DELTA            ; value: "0.003"
+      - key: PH_LAMBDA           ; value: "0.06"
+      - key: DRIFT_STEPS         ; value: "6"
 
-      - key: EPSILON_FLOOR
-        value: "0.08"
-      - key: MAX_CAP
-        value: "0.80"
-      - key: TEMP
-        value: "1.10"
+      # --- misc ---
+      - key: MAX_HISTORY         ; value: "400"
+      - key: FEAT_WIN            ; value: "120"
 
-      - key: REC_WIN_FOR_PH
-        value: "13"
-      - key: PH_DELTA
-        value: "0.006"
-      - key: PH_LAMBDA
-        value: "0.09"
-      - key: DRIFT_STEPS
-        value: "4"
+      # --- optional models (沒有檔也不影響) ---
+      - key: RNN_PATH            ; value: /opt/models/rnn.pt
+      - key: XGB_PATH            ; value: /opt/models/xgb.json
+      - key: LGBM_PATH           ; value: /opt/models/lgbm.txt
+      - key: RELOAD_TOKEN        ; value: mysecret123
