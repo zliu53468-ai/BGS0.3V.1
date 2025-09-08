@@ -1,103 +1,131 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train XGBoost (3-class B/P/T) with one-hot(seq), plus Big-Road features.
-ENV (optional):
-- TRAIN_DATA_PATH  default /data/logs/rounds.csv
-- XGB_OUT_PATH     default /data/models/xgb.json
-- FEAT_WIN         default 20
-- VAL_SPLIT        default 0.15
+Train XGBoost (3-class: B/P/T) from CSV logged by server.py
+
+CSV format:
+user_id,ts,history_before,label
+
+Env (all optional):
+- TRAIN_DATA_PATH   default /mnt/data/logs/rounds.csv
+- XGB_OUT_PATH      default /opt/models/xgb.json
+- FEAT_WIN          default 20        # must match server.py
+- VAL_SPLIT         default 0.15      # time-based split
+- XGB_ROUNDS        default 600
+- XGB_EARLY         default 50
+- XGB_LR            default 0.08
 """
+
 import os, csv
 from typing import List, Tuple
 import numpy as np
-import xgboost as xgb
-from br_features import map_to_big_road, bp_only, run_hist, hazard_from_hist, exp_decay_freq
 
-TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/data/logs/rounds.csv")
-XGB_OUT_PATH    = os.getenv("XGB_OUT_PATH", "/data/models/xgb.json")
+import xgboost as xgb
+
+TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/mnt/data/logs/rounds.csv")
+XGB_OUT_PATH    = os.getenv("XGB_OUT_PATH", "/opt/models/xgb.json")
 os.makedirs(os.path.dirname(XGB_OUT_PATH), exist_ok=True)
 
-FEAT_WIN  = int(os.getenv("FEAT_WIN","20"))
-VAL_SPLIT = float(os.getenv("VAL_SPLIT","0.15"))
+FEAT_WIN   = int(os.getenv("FEAT_WIN", "20"))
+VAL_SPLIT  = float(os.getenv("VAL_SPLIT", "0.15"))
+XGB_ROUNDS = int(os.getenv("XGB_ROUNDS", "600"))
+XGB_EARLY  = int(os.getenv("XGB_EARLY", "50"))
+XGB_LR     = float(os.getenv("XGB_LR", "0.08"))
+
 LUT = {'B':0,'P':1,'T':2}
 
-def read_rows(path:str):
-    rows=[]
+def load_rows(path:str) -> List[Tuple[int,str,str]]:
+    rows = []
     if not os.path.exists(path):
-        print("[WARN] data not found:", path); return rows
-    with open(path,"r",encoding="utf-8") as f:
-        r=csv.reader(f)
+        print(f"[ERROR] data file not found: {path}")
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        r = csv.reader(f)
         for line in r:
-            if len(line)<4: continue
-            hist=(line[2] or "").strip().upper()
-            lab =(line[3] or "").strip().upper()
+            if not line or len(line) < 4: continue
+            ts = int(line[1])
+            hist = (line[2] or "").strip().upper()
+            lab  = (line[3] or "").strip().upper()
             if lab in LUT:
-                rows.append((hist, lab))
+                rows.append((ts, hist, lab))
+    rows.sort(key=lambda x: x[0])
     return rows
 
-def seq_to_onehot(seq:str, K:int)->List[float]:
-    seq=[ch for ch in seq if ch in LUT]
-    vec=[]
-    for ch in seq[-K:]:
-        one=[0.0,0.0,0.0]; one[LUT[ch]]=1.0
+def seq_to_vec(seq:str, K:int) -> np.ndarray:
+    """最近 K 手 -> one-hot 展平（K*3）"""
+    seq = [ch for ch in seq if ch in LUT]
+    take = seq[-K:]
+    vec = []
+    for ch in take:
+        one = [0.0,0.0,0.0]; one[LUT[ch]] = 1.0
         vec.extend(one)
-    need=K*3-len(vec)
-    if need>0: vec=[0.0]*need + vec
-    return vec
+    # 左側補零
+    need = K*3 - len(vec)
+    if need > 0:
+        vec = [0.0]*need + vec
+    return np.array(vec, dtype=np.float32)
 
-def br_extra_feats(seq: List[str]) -> List[float]:
-    # 取 Big-Road 的列深、牆阻與 early-dragon 指示、BP run hazard 估計等
-    _, feat = map_to_big_road(seq)
-    seq_bp = bp_only(seq)
-    hist   = run_hist(seq_bp)
-    cur_run=1
-    if seq_bp:
-        last=seq_bp[-1]; i=len(seq_bp)-2
-        while i>=0 and seq_bp[i]==last: cur_run+=1; i-=1
-    hz = hazard_from_hist(cur_run, hist)
-    ew = exp_decay_freq(seq)
-    return [
-        float(feat.get("col_depth",0)),
-        1.0 if feat.get("blocked",False) else 0.0,
-        1.0 if feat.get("early_dragon_hint",False) else 0.0,
-        float(hz),
-        float(ew[2])  # long-run T intensity
-    ]
-
-def build_xy(rows)->Tuple[np.ndarray,np.ndarray]:
-    X=[]; y=[]
-    for hist, lab in rows:
-        seq=[c for c in hist if c in LUT]
-        X.append(seq_to_onehot(hist, FEAT_WIN) + br_extra_feats(seq))
+def build_xy(rows, K:int):
+    X, y = [], []
+    for _, hist, lab in rows:
+        X.append(seq_to_vec(hist, K))
         y.append(LUT[lab])
-    return np.array(X,dtype=np.float32), np.array(y,dtype=np.int32)
+    return np.vstack(X), np.array(y, dtype=np.int32)
 
 def time_split(rows, val_ratio:float):
-    n=len(rows); k=max(1, int(n*(1.0-val_ratio)))
+    n = len(rows)
+    k = max(1, int(n*(1.0 - val_ratio)))
     return rows[:k], rows[k:]
 
+def class_weights(y: np.ndarray) -> np.ndarray:
+    """per-sample weights: inverse freq"""
+    counts = np.bincount(y, minlength=3).astype(np.float64)
+    counts[counts==0] = 1.0
+    inv = 1.0 / counts
+    w = inv[y]
+    # normalize to mean 1
+    w *= (len(w) / w.sum())
+    return w.astype(np.float32)
+
 def main():
-    rows=read_rows(TRAIN_DATA_PATH)
-    if len(rows)<100:
-        print(f"[WARN] few samples: {len(rows)}")
-    tr,va=time_split(rows, VAL_SPLIT)
-    Xtr,ytr=build_xy(tr); Xva,yva=build_xy(va) if va else (None,None)
+    rows = load_rows(TRAIN_DATA_PATH)
+    if len(rows) < 200:
+        print(f"[WARN] few samples: {len(rows)}; training anyway.")
+    tr, va = time_split(rows, VAL_SPLIT)
+    Xtr, ytr = build_xy(tr, FEAT_WIN)
+    Xva, yva = build_xy(va, FEAT_WIN)
 
-    dtr=xgb.DMatrix(Xtr, label=ytr)
-    dva=xgb.DMatrix(Xva, label=yva) if Xva is not None else None
+    wtr = class_weights(ytr)
+    dtr = xgb.DMatrix(Xtr, label=ytr, weight=wtr)
+    dva = xgb.DMatrix(Xva, label=yva) if len(yva) > 0 else None
 
-    params=dict(
-        objective="multi:softprob",
-        num_class=3,
-        eval_metric="mlogloss",
-        eta=0.05, max_depth=6, subsample=0.9, colsample_bytree=0.9,
-        min_child_weight=2, reg_lambda=1.0
+    params = {
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "eta": XGB_LR,
+        "max_depth": 6,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 2.0,
+        "eval_metric": "mlogloss",
+        "tree_method": "hist",
+        # "gpu_id": 0, "tree_method": "gpu_hist",  # 如果有 GPU 可改這行
+    }
+
+    evals = [(dtr, "train")]
+    if dva is not None and len(yva) > 0:
+        evals.append((dva, "valid"))
+
+    booster = xgb.train(
+        params,
+        dtr,
+        num_boost_round=XGB_ROUNDS,
+        evals=evals,
+        early_stopping_rounds=XGB_EARLY if dva is not None and len(yva)>0 else None,
+        verbose_eval=50
     )
-    watch=[(dtr,"train")] + ([(dva,"valid")] if dva is not None else [])
-    booster = xgb.train(params, dtr, num_boost_round=800, evals=watch, early_stopping_rounds=80 if dva else None, verbose_eval=50)
     booster.save_model(XGB_OUT_PATH)
-    print("[OK] XGB saved ->", XGB_OUT_PATH)
+    print(f"[OK] saved XGB model -> {XGB_OUT_PATH}")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
