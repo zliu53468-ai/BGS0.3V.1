@@ -1,4 +1,4 @@
-# server.py — Volatility-Adaptive (irregular turbo) + Fast signals
+# server.py — Volatility-Adaptive + Tie-aware Signals (TIE_NEAR/CLUSTER/BREAK_RUN/POST_REV)
 # Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
 # requirements.txt:
 # Flask==3.0.3
@@ -14,7 +14,6 @@ from io import BytesIO
 from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw
 
-# -------------------- Flask / Logging --------------------
 app = Flask(__name__)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -120,6 +119,7 @@ def try_activate(uid: str, text: str) -> bool:
     return False
 
 def _mk_code() -> str:
+    import random, string
     return "".join(random.choices(string.ascii_uppercase, k=5)) + \
            "".join(random.choices(string.digits, k=5))
 
@@ -224,7 +224,7 @@ def recent_freq(seq: List[str], win:int) -> List[float]:
 
 def exp_decay_freq(seq: List[str], gamma: Optional[float]=None) -> List[float]:
     if not seq: return [1/3,1/3,1/3]
-    if gamma is None: gamma=float(os.getenv("EW_GAMMA","0.96"))
+    if gamma is None: gamma=float(os.getenv("EW_GAMMA","0.95"))
     wB=wP=wT=0.0; w=1.0
     for r in reversed(seq):
         if r=="B": wB+=w
@@ -255,10 +255,6 @@ def build_big_road(seq: List[str]) -> List[Dict]:
     keep=int(os.getenv("ROAD_KEEP_COLS","120"))
     return cols[-keep:] if len(cols)>keep else cols
 
-def road_tail(cols: List[Dict], k:int=1):
-    if not cols or k<=0 or k>len(cols): return None,0
-    c=cols[-k]; return c["color"], c["len"]
-
 def _run_length_tail(seq: List[str], k:int=1):
     if not seq: return None,0
     blocks=deque(); cur, cnt = seq[-1],1
@@ -272,14 +268,13 @@ def _run_length_tail(seq: List[str], k:int=1):
 
 # -------------------- Volatility 指標 --------------------
 def _entropy_bp(s: List[str]) -> float:
-    # Shannon entropy on {B,P} ignoring T
     a=[x for x in s if x in ("B","P")]
     if not a: return 0.0
     pB=a.count("B")/len(a); pP=1.0-pB
     ent=0.0
     for p in (pB,pP):
         if p>1e-12: ent -= p*math.log2(p)
-    return ent  # 0~1
+    return ent
 
 def _alt_rate(s: List[str]) -> float:
     a=[x for x in s if x in ("B","P")]
@@ -290,13 +285,23 @@ def _alt_rate(s: List[str]) -> float:
 def _volatility_score(seq: List[str]) -> Tuple[float, dict]:
     win=int(os.getenv("VOL_WIN","8"))
     s=seq[-win:] if len(seq)>=win else seq[:]
-    ent=_entropy_bp(s)           # 0~1
-    alt=_alt_rate(s)             # 0~1
-    # 結合：不規律 = 高熵且高交替
+    ent=_entropy_bp(s)
+    alt=_alt_rate(s)
     vol = max(0.0, min(1.0, 0.6*ent + 0.4*alt))
     return vol, {"window":win, "entropy":ent, "alt_rate":alt, "score":vol}
 
-# -------------------- 快速 signals 引擎 --------------------
+# -------------------- Tie-aware helpers --------------------
+def _last_index(items: List[str], target: str) -> int:
+    for i in range(len(items)-1, -1, -1):
+        if items[i] == target:
+            return i
+    return -1
+
+def _last_k_has(items: List[str], target: str, k:int) -> bool:
+    s = items[-k:] if len(items)>=k else items[:]
+    return target in s
+
+# -------------------- 快速 signals（含 Tie-aware） --------------------
 def _is_alt_dense(seq: List[str], win:int) -> bool:
     if len(seq) < 3: return False
     s = seq[-win:] if len(seq) >= win else seq[:]
@@ -327,7 +332,7 @@ def _cusum_change(seq: List[str], w:int=8) -> int:
     if abs(d) <= 0: return 0
     return 1 if d > 0 else -1
 
-def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
+def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
     mult = {"B":1.0,"P":1.0,"T":1.0}
     dbg  = {}
 
@@ -353,13 +358,22 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
     DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.1"))
 
     # 依波動加成倍率
-    VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))  # vol=1 → 所有 signal 增乘 (1+0.5)=1.5x
+    VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))  # vol=1 → signals *1.5
     vol, volmeta = _volatility_score(seq)
     sig_scale = (1.0 + VOL_SIG_BOOST * vol)
 
+    # ---- Tie-aware 參數 ----
+    T_NEAR_WIN      = int(os.getenv("T_NEAR_WIN","5"))    # 近幾手有 T → 前導
+    T_NEAR_GAIN     = float(os.getenv("T_NEAR_GAIN","1.06"))
+    T_CLUSTER_WIN   = int(os.getenv("T_CLUSTER_WIN","10"))
+    T_CLUSTER_TH    = int(os.getenv("T_CLUSTER_TH","2"))  # 窗內 ≥ TH 個 T
+    T_CLUSTER_GAIN  = float(os.getenv("T_CLUSTER_GAIN","1.10"))
+    T_BREAK_GAIN    = float(os.getenv("T_BREAK_RUN_GAIN","1.10"))  # T 夾龍 → 偏斷
+    T_POST_REV_GAIN = float(os.getenv("T_POST_REV_GAIN","1.08"))   # X–T–Y → 偏向 Y
+
     a, b = seq[-1], seq[-2]
 
-    # ALT
+    # === ALT（交替） ===
     if _is_alt_dense(seq, ALT_WIN):
         opp = "B" if a=="P" else "P" if a=="B" else None
         if opp:
@@ -373,7 +387,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
             mult[opp] *= g
             dbg["ALT"] = {"target": opp, "gain": g, "mode":"lead"}
 
-    # DBL
+    # === DBL（雙跳） ===
     if _is_double_jump(seq):
         opp = "B" if a=="P" else "P" if a=="B" else None
         if opp:
@@ -381,7 +395,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
             mult[opp] *= g
             dbg["DBL"] = {"target": opp, "gain": g}
 
-    # MOMENTUM
+    # === MOMENTUM ===
     if n >= 3:
         s = [x for x in (seq[-MOM_WIN:] if n>=MOM_WIN else seq) if x in ("B","P")]
         if len(s) >= 3:
@@ -392,7 +406,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
                 mult[side] *= gain
                 dbg["MOM"] = {"target": side, "gain": gain, "diff": diff}
 
-    # CHOP
+    # === CHOP（碎切） ===
     if n >= 4:
         s = seq[-CHOP_WIN:] if n>=CHOP_WIN else seq
         alt_cnt = sum(1 for i in range(1,len(s)) if s[i]!=s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"))
@@ -403,7 +417,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
                 mult[opp] *= g
                 dbg["CHOP"] = {"target": opp, "gain": g, "alts": alt_cnt}
 
-    # DRAGON
+    # === DRAGON（跟 / 斷） ===
     sym, run = _run_length_tail(seq,1)
     if sym in ("B","P") and run >= 1:
         follow_gain = 1.0
@@ -418,52 +432,65 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
         break_gain  = max(1.0, min(1.9, break_gain))  * sig_scale
         mult[follow_side] *= pow(follow_gain, DR_FOLLOW_W)
         mult[break_side]  *= pow(break_gain,  DR_BREAK_W)
-        dbg["DRAGON"] = {
-            "run": run, "vol": volmeta,
-            "follow": {"side": follow_side, "gain": follow_gain, "w": DR_FOLLOW_W},
-            "break":  {"side": break_side,  "gain": break_gain,  "w": DR_BREAK_W},
-        }
+        dbg["DRAGON"] = {"run": run, "follow": {"side": follow_side, "gain": follow_gain}, "break": {"side": break_side, "gain": break_gain}}
 
-    # CUSUM change（轉向）
-    chg = _cusum_change(seq, w=int(os.getenv("CHANGE_WIN","8")))
-    CHG_GAIN = float(os.getenv("CHANGE_GAIN","1.06")) * sig_scale
-    if chg != 0:
-        if chg > 0:
-            mult["B"] *= CHG_GAIN
-            dbg["CHANGE"] = {"side":"B", "gain":CHG_GAIN, "vol": volmeta}
-        else:
-            mult["P"] *= CHG_GAIN
-            dbg["CHANGE"] = {"side":"P", "gain":CHG_GAIN, "vol": volmeta}
+    # === TIE-aware signals ===
+    # 1) 近距離有 T → 給 T 前導（群聚性/回補性）
+    if _last_k_has(seq, "T", T_NEAR_WIN):
+        g = (T_NEAR_GAIN * sig_scale)
+        mult["T"] *= g
+        dbg["T_NEAR"] = {"win": T_NEAR_WIN, "gain": g}
+
+    # 2) 短窗 T 密度高 → 再放大 T
+    if T_CLUSTER_WIN > 0:
+        s = seq[-T_CLUSTER_WIN:] if len(seq)>=T_CLUSTER_WIN else seq[:]
+        tcnt = s.count("T")
+        if tcnt >= T_CLUSTER_TH:
+            g = (T_CLUSTER_GAIN * sig_scale)
+            mult["T"] *= g
+            dbg["T_CLUSTER"] = {"win": T_CLUSTER_WIN, "cnt": tcnt, "th": T_CLUSTER_TH, "gain": g}
+
+    # 3) T 夾在龍中（… X X T X …）→ 視為斷龍傾向
+    if n >= 3 and seq[-2] == "T" and seq[-1] in ("B","P"):
+        # 判斷 T 前一段 run 的主色
+        pre_sym, pre_len = _run_length_tail(seq[:-1], 1)  # 不含最後一手
+        if pre_sym in ("B","P") and pre_len >= 2:
+            opp = "B" if pre_sym=="P" else "P"
+            g = (T_BREAK_GAIN * sig_scale)
+            mult[opp] *= g
+            dbg["T_BREAK_RUN"] = {"pre_sym": pre_sym, "pre_len": pre_len, "target": opp, "gain": g}
+
+    # 4) X–T–Y（Y ≠ X）→ 常見為「和後反轉」，偏向 Y（也能處理你提的 B–T–P–B–P–P 類型）
+    if n >= 3 and seq[-2] == "T" and seq[-3] in ("B","P") and seq[-1] in ("B","P") and seq[-3] != seq[-1]:
+        y = seq[-1]
+        g = (T_POST_REV_GAIN * sig_scale)
+        mult[y] *= g
+        dbg["T_POST_REV"] = {"pattern": f"{seq[-3]}-T-{y}", "target": y, "gain": g}
 
     return mult, dbg
 
-# -------------------- 機率估計（Volatility 自適應融合） --------------------
+# -------------------- 機率估計（Volatility + Tie floor/cap） --------------------
 def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     if not seq:
         base=[THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
         return norm(base), {"base":base,"signals":{}}
 
-    # 基礎頻率
     short = recent_freq(seq, int(os.getenv("WIN_SHORT","6")))
     longv = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.95")))
     prior = [THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
 
-    # 讀取靜態權重
     REC_W  = float(os.getenv("REC_W","0.40"))
     LONG_W = float(os.getenv("LONG_W","0.20"))
     PRIOR_W= float(os.getenv("PRIOR_W","0.10"))
 
-    # 波動評分
     vol, volmeta = _volatility_score(seq)
-    # 依波動調權重：波動高 → 更信短窗，降長窗與先驗
-    VOL_REC_BOOST  = float(os.getenv("VOL_REC_BOOST","1.20"))  # vol=1 → REC_W *= (1+1.2)=2.2x
-    VOL_LONG_CUT   = float(os.getenv("VOL_LONG_CUT","0.80"))   # vol=1 → LONG_W *= (1-0.8)=0.2x
-    VOL_PRIOR_CUT  = float(os.getenv("VOL_PRIOR_CUT","0.80"))  # vol=1 → PRIOR_W *= 0.2x
+    VOL_REC_BOOST  = float(os.getenv("VOL_REC_BOOST","1.20"))
+    VOL_LONG_CUT   = float(os.getenv("VOL_LONG_CUT","0.80"))
+    VOL_PRIOR_CUT  = float(os.getenv("VOL_PRIOR_CUT","0.80"))
 
     rec_w  = REC_W  * (1.0 + VOL_REC_BOOST * vol)
     long_w = LONG_W * (1.0 - VOL_LONG_CUT  * vol)
     prior_w= PRIOR_W* (1.0 - VOL_PRIOR_CUT * vol)
-    # 安全夾限
     rec_w  = max(0.05, min(2.5, rec_w))
     long_w = max(0.00, min(1.0, long_w))
     prior_w= max(0.00, min(0.8, prior_w))
@@ -471,10 +498,8 @@ def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     base = [rec_w*short[i] + long_w*longv[i] + prior_w*prior[i] for i in range(3)]
     base = norm(base)
 
-    # 行為 signals（已含波動放大）
     mult, sdbg = signals(seq)
 
-    # 外部偏置
     biasB=float(os.getenv("BIAS_B","1.0"))
     biasP=float(os.getenv("BIAS_P","1.0"))
     biasT=float(os.getenv("BIAS_T","1.0"))
@@ -482,9 +507,14 @@ def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     p=[base[0]*mult["B"]*biasB,
        base[1]*mult["P"]*biasP,
        base[2]*mult["T"]*biasT]
+
+    # T 專屬 floor/cap
+    T_FLOOR = float(os.getenv("T_FLOOR","0.05"))
+    T_CAP   = float(os.getenv("T_CAP","0.40"))
+    p[2] = min(T_CAP, max(T_FLOOR, p[2]))
+
     p=norm(p)
 
-    # 降溫/地板/封頂（輕度）
     p=temperature(p, float(os.getenv("TEMP","1.02")))
     floor=float(os.getenv("EPSILON_FLOOR","0.04"))
     cap=float(os.getenv("MAX_CAP","0.92"))
@@ -495,7 +525,7 @@ def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
         "volatility": volmeta,
         "short":short,"longv":longv,"prior":prior,
         "weights":{"REC_W":rec_w,"LONG_W":long_w,"PRIOR_W":prior_w},
-        "signals":sdbg,"mult":mult
+        "signals":sdbg,"mult":{"B":mult["B"],"P":mult["P"],"T":mult["T"]}
     }
 
 def recommend(p: List[float]) -> str:
@@ -525,6 +555,9 @@ def append_round_csv(uid:str, history_before:str, label:str):
         log.warning("append csv fail: %s", e)
 
 # -------------------- 大路圖像 --------------------
+def build_big_road_cols(seq: List[str]) -> List[Dict]:
+    return build_big_road(seq)
+
 def _layout_big_road_points(cols: List[dict], rows:int=6, max_cols:int=60):
     pts=[]; x=0
     for col in cols:
@@ -541,7 +574,7 @@ def _layout_big_road_points(cols: List[dict], rows:int=6, max_cols:int=60):
     return pts
 
 def render_big_road_png(seq: List[str], cell:int=28, rows:int=6, max_cols:int=60) -> bytes:
-    cols = build_big_road(seq)
+    cols = build_big_road_cols(seq)
     pts = _layout_big_road_points(cols, rows=rows, max_cols=max_cols)
     width = (0 if not pts else (max(p[0] for p in pts)+1)) * cell
     width = max(width, cell)
@@ -606,7 +639,7 @@ def predict_debug():
 def api_road():
     data=request.get_json(silent=True) or {}
     seq=parse_text_seq(str(data.get("history","")))
-    cols=build_big_road(seq)
+    cols=build_big_road_cols(seq)
     return jsonify({"n_cols":len(cols), "cols":cols, "tail":cols[-5:] if len(cols)>5 else cols}), 200
 
 @app.get("/road/image")
