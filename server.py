@@ -1,20 +1,19 @@
-# server.py — BGS Backend (CHOP+ + Pattern Hooks + Flex Menu)
-# - 可寫路徑自動降級：/tmp/bgs
-# - /health /storage /predict API
-# - 機率融合：短窗 + 指數長窗 + 先驗
-# - 路型鉤子：單跳/雙跳/1-2/2-1/提早斷龍（乘法小倍率，可用環境變數調整/關閉）
-# - 安全層：溫度 + 機率上下限 + 去過熱
-# - CSV 記錄（EXPORT_LOGS=1 時）
-# - LINE Webhook（有 token/secret 才啟用），UI 改為 Flex 3×2 彩色按鈕
+# server.py — Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
+# 特性：
+# - 純文字：貼歷史 →「開始分析」→ 每打一手即回下一手預測（含表情）
+# - 首次引導輸入本金；下注建議金額「顯示 本金 × % = 金額」，且 % ∈ [10%, 30%]
+# - 試用 30 分鐘；輸入任一「永久開通碼」解鎖（碼不消耗；池中 30 組；ENV 未填會自動產 30 組寫入 codes.txt）
+# - 大路（Big Road）建構 + /road/image 回大路 PNG；輸入「路圖」回圖
+# - REST：/predict /road /road/image /health
+# 依賴：Flask, gunicorn, line-bot-sdk, Pillow
 
-import os
-import csv
-import time
-import logging
-from collections import deque
+import os, csv, time, logging, random, string, re
 from typing import List, Dict, Tuple, Optional
+from collections import deque
+from io import BytesIO
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
+from PIL import Image, ImageDraw
 
 # -------------------- Flask / Logging --------------------
 app = Flask(__name__)
@@ -22,397 +21,268 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
 )
-log = logging.getLogger("bgs-backend")
+log = logging.getLogger("bgs")
 
-# -------------------- 可寫路徑 --------------------
-def _is_writable_dir(path: str) -> bool:
+# -------------------- Writable paths --------------------
+def _is_writable(p: str) -> bool:
     try:
-        os.makedirs(path, exist_ok=True)
-        test = os.path.join(path, ".wtest")
-        with open(test, "w") as f:
+        os.makedirs(p, exist_ok=True)
+        t = os.path.join(p, ".w")
+        with open(t, "w") as f:
             f.write("ok")
-        os.remove(test)
+        os.remove(t)
         return True
     except Exception as e:
-        log.warning("dir not writable: %s (%s)", path, e)
+        log.warning("not writable %s: %s", p, e)
         return False
 
-def _resolve_base_dir() -> str:
-    user = os.getenv("DATA_BASE", "").strip()
-    if user and _is_writable_dir(user):
-        return user
-    if _is_writable_dir("/tmp/bgs"):
-        return "/tmp/bgs"
+def _base_dir() -> str:
+    user = os.getenv("DATA_BASE","").strip()
+    if user and _is_writable(user): return user
+    if _is_writable("/tmp/bgs"): return "/tmp/bgs"
     local = os.path.join(os.getcwd(), "data")
-    if _is_writable_dir(local):
-        return local
+    if _is_writable(local): return local
     return "/tmp"
 
-DATA_BASE_DIR = _resolve_base_dir()
+BASE = _base_dir()
 
-def _resolve_csv_path() -> str:
-    custom = os.getenv("DATA_LOG_PATH", "").strip()
+def _csv_path() -> str:
+    custom = os.getenv("DATA_LOG_PATH","").strip()
     if custom:
         parent = os.path.dirname(custom)
-        if parent and _is_writable_dir(parent):
-            return custom
-        log.warning("DATA_LOG_PATH not writable, fallback used.")
-    logs_dir = os.path.join(DATA_BASE_DIR, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    return os.path.join(logs_dir, "rounds.csv")
+        if parent and _is_writable(parent): return custom
+        log.warning("DATA_LOG_PATH invalid, fallback used.")
+    lg = os.path.join(BASE, "logs"); os.makedirs(lg, exist_ok=True)
+    return os.path.join(lg, "rounds.csv")
 
-DATA_CSV_PATH = _resolve_csv_path()
+CSV_PATH = _csv_path()
 
-# -------------------- 常數/先驗 --------------------
-CLASS_ORDER = ("B", "P", "T")
-LAB_ZH = {"B": "莊", "P": "閒", "T": "和"}
-THEORETICAL = {"B": 0.458, "P": 0.446, "T": 0.096}
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "400"))
+# -------------------- 常數 / 先驗 --------------------
+CLASS_ORDER = ("B","P","T")
+LAB_ZH = {"B":"莊","P":"閒","T":"和"}
+THEORETICAL = {"B":0.458,"P":0.446,"T":0.096}   # 近似理論機率
+PAYOUT = {"B":0.95, "P":1.0, "T":8.0}           # 淨賠率（b）
+MAX_HISTORY = int(os.getenv("MAX_HISTORY","400"))
 
-# -------------------- 小工具 --------------------
-def parse_history(payload) -> List[str]:
-    out: List[str] = []
-    if payload is None:
-        return out
-    if isinstance(payload, list):
-        for s in payload:
-            if isinstance(s, str) and s.strip().upper() in CLASS_ORDER:
-                out.append(s.strip().upper())
-    elif isinstance(payload, str):
-        if any(ch in payload for ch in [" ", ","]):
-            for t in payload.replace(",", " ").split():
-                up = t.strip().upper()
-                if up in CLASS_ORDER:
-                    out.append(up)
-        else:
-            for ch in payload:
-                up = ch.upper()
-                if up in CLASS_ORDER:
-                    out.append(up)
-    return out[-MAX_HISTORY:] if len(out) > MAX_HISTORY else out
+# Kelly / 配注控制（可由環境變數微調）
+KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.50"))   # Kelly 縮放（0~1）
+MIN_BET_FRAC   = float(os.getenv("MIN_BET_FRAC","0.10"))   # 最低下注比例（≥10%）
+MAX_BET_FRAC   = float(os.getenv("MAX_BET_FRAC","0.30"))   # 最高下注比例（≤30%）
+ROUND_TO       = int(os.getenv("ROUND_TO","10"))           # 金額取整到 10 元
 
-def norm(v: List[float]) -> List[float]:
-    s = sum(v)
-    s = s if s > 1e-12 else 1.0
-    return [max(0.0, x) / s for x in v]
+# 試用與開通碼（永久，可重複使用）
+TRIAL_MINUTES  = int(os.getenv("TRIAL_MINUTES","30"))
+ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")            # 5字母+5數字（大寫）
+GLOBAL_CODES   = set()                                     # 永久可用代碼池（不消耗）
+CODES_FILE     = os.path.join(BASE, "codes.txt")
 
-def temperature(p: List[float], tau: float) -> List[float]:
-    if tau <= 1e-9:
-        return p
-    ex = [pow(max(pi, 1e-12), 1.0 / tau) for pi in p]
-    s = sum(ex)
-    return [e / s for e in ex]
+# -------------------- 使用者狀態 --------------------
+USER_HISTORY:     Dict[str, List[str]] = {}
+USER_READY:       Dict[str, bool]      = {}
+USER_TRIAL_START: Dict[str, float]     = {}
+USER_ACTIVATED:   Dict[str, bool]      = {}
+USER_CODE:        Dict[str, str]       = {}   # 綁定用哪一組代碼解鎖
+USER_BANKROLL:    Dict[str, int]       = {}   # 本金
+_LAST_HIT:        Dict[str, float]     = {}
 
-# -------------------- 頻率估計 --------------------
-def recent_freq(seq: List[str], win: int) -> List[float]:
-    if not seq:
-        return [1/3, 1/3, 1/3]
-    cut = seq[-win:] if win > 0 else seq
-    a = float(os.getenv("LAPLACE", "0.5"))
-    nB = cut.count("B") + a
-    nP = cut.count("P") + a
-    nT = cut.count("T") + a
-    tot = max(1, len(cut)) + 3 * a
-    return [nB/tot, nP/tot, nT/tot]
+# -------------------- 工具 --------------------
+def now_ts() -> float: return time.time()
 
-def exp_decay_freq(seq: List[str], gamma: Optional[float] = None) -> List[float]:
-    if not seq:
-        return [1/3, 1/3, 1/3]
-    if gamma is None:
-        gamma = float(os.getenv("EW_GAMMA", "0.96"))
-    wB = wP = wT = 0.0
-    w = 1.0
-    for r in reversed(seq):
-        if r == "B": wB += w
-        elif r == "P": wP += w
-        else: wT += w
-        w *= gamma
-    a = float(os.getenv("LAPLACE", "0.5"))
-    wB += a; wP += a; wT += a
-    S = wB + wP + wT
-    return [wB/S, wP/S, wT/S]
+def debounce(uid: str, key: str, window: float = 1.2) -> bool:
+    k = f"{uid}:{key}"; last = _LAST_HIT.get(k, 0.0); t = now_ts()
+    if t - last < window: return True
+    _LAST_HIT[k] = t; return False
 
-# -------------------- 路型鉤子（Pattern Hooks） --------------------
-def _run_length_tail(seq: List[str], k: int = 1):
-    if not seq:
-        return None, 0
-    blocks = deque()
-    cur, cnt = seq[-1], 1
-    for x in reversed(seq[:-1]):
-        if x == cur:
-            cnt += 1
-        else:
-            blocks.appendleft((cur, cnt))
-            cur, cnt = x, 1
-    blocks.appendleft((cur, cnt))
-    return blocks[-k] if 0 < k <= len(blocks) else (None, 0)
+def ensure_user(uid: str):
+    USER_HISTORY.setdefault(uid, [])
+    USER_READY.setdefault(uid, False)
+    USER_TRIAL_START.setdefault(uid, now_ts())
+    USER_ACTIVATED.setdefault(uid, False)
+    USER_CODE.setdefault(uid, "")
 
-def pattern_boost(seq: List[str]) -> Dict[str, float]:
-    m = {"B": 1.0, "P": 1.0, "T": 1.0}
-    n = len(seq)
-    if n < 3:
-        return m
+def trial_ok(uid: str) -> bool:
+    if USER_ACTIVATED.get(uid, False): return True
+    start = USER_TRIAL_START.get(uid, now_ts())
+    return (now_ts() - start) / 60.0 <= TRIAL_MINUTES
 
-    alt_boost = float(os.getenv("HOOK_ALT", "1.06"))
-    dbl_boost = float(os.getenv("HOOK_DBLJUMP", "1.04"))
-    cyc_boost = float(os.getenv("HOOK_CYCLE", "1.06"))
-    dlen_th   = int(os.getenv("HOOK_DRAGON_LEN", "3"))
-    dragon_k  = float(os.getenv("HOOK_DRAGON_K", "0.06"))
-
-    a, b = seq[-1], seq[-2]
-
-    # 交替單跳 ..BPBP
-    if a != b and n >= 4 and seq[-3] != seq[-2] and seq[-4] != seq[-3]:
-        if a == "P": m["B"] *= alt_boost
-        if a == "B": m["P"] *= alt_boost
-
-    # 雙跳 ..BBPP / ..PPBB → 多半換邊
-    if n >= 4 and seq[-1] == seq[-2] and seq[-3] != seq[-2] and seq[-3] == seq[-4]:
-        if a == "P": m["B"] *= dbl_boost
-        if a == "B": m["P"] *= dbl_boost
-
-    # 1-2 / 2-1 循環（近 6 手）
-    if n >= 6:
-        last6 = "".join(seq[-6:])
-        if last6 in ("BPPBPP", "PPBPPB", "PBBPBB", "BBPBBP"):
-            if a == "P": m["B"] *= cyc_boost
-            if a == "B": m["P"] *= cyc_boost
-
-    # 提早斷龍：run >= dlen_th
-    sym, run = _run_length_tail(seq, 1)
-    if run >= dlen_th and sym in ("B", "P"):
-        hazard = 1.0 + min(0.25, dragon_k * (run - (dlen_th - 1)))
-        if sym == "B": m["P"] *= hazard
-        if sym == "P": m["B"] *= hazard
-
-    return m
-
-# -------------------- 機率與建議 --------------------
-def estimate_probs(seq: List[str]) -> List[float]:
-    if not seq:
-        base = [THEORETICAL["B"], THEORETICAL["P"], THEORETICAL["T"]]
-        return norm(base)
-
-    W_S = int(os.getenv("WIN_SHORT", "6"))
-    gamma = float(os.getenv("EW_GAMMA", "0.96"))
-
-    short = recent_freq(seq, W_S)
-    longv = exp_decay_freq(seq, gamma)
-    prior = [THEORETICAL["B"], THEORETICAL["P"], THEORETICAL["T"]]
-
-    a = float(os.getenv("REC_W", "0.20"))
-    b = float(os.getenv("LONG_W", "0.20"))
-    c = float(os.getenv("PRIOR_W", "0.20"))
-    p = [a*short[i] + b*longv[i] + c*prior[i] for i in range(3)]
-    p = norm(p)
-
-    hook = pattern_boost(seq)
-    p = [p[0]*hook["B"], p[1]*hook["P"], p[2]*hook["T"]]
-    p = norm(p)
-
-    p = temperature(p, float(os.getenv("TEMP", "1.06")))
-    floor = float(os.getenv("EPSILON_FLOOR", "0.06"))
-    cap   = float(os.getenv("MAX_CAP", "0.86"))
-    p = [min(cap, max(floor, x)) for x in p]
-    return norm(p)
-
-def recommend(p: List[float]) -> str:
-    return CLASS_ORDER[p.index(max(p))]
-
-# -------------------- CSV 記錄 --------------------
-def append_round_csv(uid: str, history_before: str, label: str) -> None:
-    if os.getenv("EXPORT_LOGS", "1") != "1":
-        return
-    try:
-        parent = os.path.dirname(DATA_CSV_PATH)
-        os.makedirs(parent, exist_ok=True)
-        with open(DATA_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([uid, int(time.time()), history_before, label])
-    except Exception as e:
-        log.warning("append_round_csv failed: %s", e)
-
-# -------------------- HTTP 端點 --------------------
-@app.get("/")
-def index():
-    return "ok", 200
-
-@app.get("/health")
-def health():
-    return jsonify(status="healthy", storage=DATA_CSV_PATH), 200
-
-@app.get("/storage")
-def storage():
-    return jsonify(base_dir=DATA_BASE_DIR, csv_path=DATA_CSV_PATH), 200
-
-@app.post("/predict")
-def predict():
-    data = request.get_json(silent=True) or {}
-    seq = parse_history(data.get("history"))
-    p = estimate_probs(seq)
-    return jsonify({
-        "history_len": len(seq),
-        "probabilities": {"B": p[0], "P": p[1], "T": p[2]},
-        "recommendation": recommend(p)
-    }), 200
-
-# -------------------- LINE（可選；有憑證才啟用） --------------------
-LINE_TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-USE_LINE = False
-try:
-    if LINE_TOKEN and LINE_SECRET:
-        from linebot import LineBotApi, WebhookHandler
-        from linebot.models import (
-            MessageEvent, TextMessage, TextSendMessage,
-            PostbackEvent, PostbackAction, QuickReply, QuickReplyButton,
-            FlexSendMessage
-        )
-        USE_LINE = True
-        line_bot_api = LineBotApi(LINE_TOKEN)
-        handler = WebhookHandler(LINE_SECRET)
-    else:
-        line_bot_api = None
-        handler = None
-except Exception as e:
-    log.warning("LINE SDK not ready: %s", e)
-    line_bot_api = None
-    handler = None
-    USE_LINE = False
-
-USER_HISTORY: Dict[str, List[str]] = {}
-USER_READY: Dict[str, bool] = {}
-_LAST_HIT: Dict[str, float] = {}
-
-def debounce_guard(uid: str, key: str, window: float = 1.2) -> bool:
-    now = time.time()
-    k = f"{uid}:{key}"
-    last = _LAST_HIT.get(k, 0.0)
-    if now - last < window:
+def try_activate(uid: str, text: str) -> bool:
+    code = (text or "").strip().upper().replace(" ", "")
+    if not ACCOUNT_REGEX.fullmatch(code):
+        return False
+    if code in GLOBAL_CODES:
+        USER_ACTIVATED[uid] = True
+        USER_CODE[uid] = code
+        log.info("[ACT] uid=%s activated with code=%s (permanent)", uid, code)
         return True
-    _LAST_HIT[k] = now
     return False
 
-# === Flex Menu (3x2 彩色按鈕) — 修正版 ===
-def flex_menu():
-    from linebot.models import FlexSendMessage
-    bubble = {
-      "type": "bubble",
-      "size": "mega",
-      "body": {
-        "type": "box",
-        "layout": "vertical",
-        "spacing": "lg",
-        "contents": [
-          {"type": "text", "text": "🤖 請開始輸入歷史數據", "weight": "bold", "size": "md"},
-          {"type": "text", "text": "先輸入莊/閒/和；按「開始分析」後才會給出下注建議。", "wrap": True, "size": "sm", "color": "#6B7280"},
-          {
-            "type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
-              {"type": "button", "style": "primary", "height": "sm", "color": "#EF4444",
-               "action": {"type": "postback", "label": "莊", "data": "B", "displayText": "莊"}},
-              {"type": "button", "style": "primary", "height": "sm", "color": "#3B82F6",
-               "action": {"type": "postback", "label": "閒", "data": "P", "displayText": "閒"}},
-              {"type": "button", "style": "primary", "height": "sm", "color": "#22C55E",
-               "action": {"type": "postback", "label": "和", "data": "T", "displayText": "和"}}
-            ]
-          },
-          {
-            "type": "box", "layout": "horizontal", "spacing": "sm", "contents": [
-              {"type": "button", "style": "primary", "height": "sm", "color": "#E5E7EB",
-               "action": {"type": "postback", "label": "開始...", "data": "START", "displayText": "開始分析"}},
-              {"type": "button", "style": "primary", "height": "sm", "color": "#E5E7EB",
-               "action": {"type": "postback", "label": "結束...", "data": "END", "displayText": "結束分析"}},
-              {"type": "button", "style": "primary", "height": "sm", "color": "#E5E7EB",
-               "action": {"type": "postback", "label": "返回", "data": "UNDO", "displayText": "返回一步"}}
-            ]
-          }
-        ]
-      }
-    }
-    return FlexSendMessage(alt_text="請開始輸入歷史數據", contents=bubble)
+def _mk_code() -> str:
+    return "".join(random.choices(string.ascii_uppercase, k=5)) + \
+           "".join(random.choices(string.digits, k=5))
 
-def safe_reply_or_push(event, messages):
+def _load_codes_from_file(path: str) -> set:
     try:
-        line_bot_api.reply_message(event.reply_token, messages)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return {
+                    ln.strip().upper()
+                    for ln in f
+                    if ACCOUNT_REGEX.fullmatch(ln.strip().upper())
+                }
     except Exception as e:
-        try:
-            uid = event.source.user_id
-            log.warning("reply failed (%s), fallback to push", e)
-            line_bot_api.push_message(uid, messages)
-        except Exception as e2:
-            log.error("push also failed: %s", e2)
+        log.warning("load codes failed: %s", e)
+    return set()
 
-@app.post("/line-webhook")
-def line_webhook():
-    if not USE_LINE or handler is None:
-        return "ok", 200
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
+def _save_codes_to_file(path: str, codes: set):
     try:
-        handler.handle(body, signature)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for c in sorted(codes):
+                f.write(c + "\n")
     except Exception as e:
-        log.error("LINE handle error: %s", e)
-    return "ok", 200
+        log.warning("save codes failed: %s", e)
 
-if USE_LINE and handler is not None:
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_text(event):
-        uid = event.source.user_id
-        USER_HISTORY.setdefault(uid, [])
-        USER_READY.setdefault(uid, False)
-        safe_reply_or_push(event, flex_menu())
+def init_activation_codes(base_dir: str):
+    """初始化『永久可重複使用』代碼池：ENV > 檔案 > 隨機產 30 組。"""
+    global CODES_FILE, GLOBAL_CODES
+    CODES_FILE = os.path.join(base_dir, "codes.txt")
 
-    @handler.add(PostbackEvent)
-    def handle_postback(event):
-        uid  = event.source.user_id
-        data = (event.postback.data or "").upper()
-        USER_HISTORY.setdefault(uid, [])
-        USER_READY.setdefault(uid, False)
-        seq  = USER_HISTORY[uid]
-        ready= USER_READY[uid]
+    env_codes = os.getenv("ACTIVATION_CODES", "").strip()
+    if env_codes:
+        GLOBAL_CODES.clear()
+        for token in env_codes.replace(" ", ",").replace("，", ",").split(","):
+            t = token.strip().upper()
+            if ACCOUNT_REGEX.fullmatch(t):
+                GLOBAL_CODES.add(t)
+        _save_codes_to_file(CODES_FILE, GLOBAL_CODES)
+        log.info("[ACT] Loaded %d codes from ENV (permanent).", len(GLOBAL_CODES))
+        return
 
-        if debounce_guard(uid, key=data, window=float(os.getenv("DEBOUNCE_SEC","1.2"))):
-            safe_reply_or_push(event, flex_menu())
-            return
+    GLOBAL_CODES = _load_codes_from_file(CODES_FILE)
+    if GLOBAL_CODES:
+        log.info("[ACT] Loaded %d codes from file (permanent).", len(GLOBAL_CODES))
+        return
 
-        if data == "START":
-            USER_READY[uid] = True
-            safe_reply_or_push(event, flex_menu()); return
-        if data == "END":
-            USER_HISTORY[uid] = []
-            USER_READY[uid] = False
-            safe_reply_or_push(event, flex_menu()); return
-        if data == "UNDO":
-            if seq:
-                seq.pop()
-            safe_reply_or_push(event, flex_menu()); return
+    while len(GLOBAL_CODES) < 30:
+        GLOBAL_CODES.add(_mk_code())
+    _save_codes_to_file(CODES_FILE, GLOBAL_CODES)
+    log.info("[ACT] Generated %d activation codes (permanent). See logs.", len(GLOBAL_CODES))
+    for c in sorted(GLOBAL_CODES):
+        log.info("[ACT-CODE] %s", c)
 
-        if data not in CLASS_ORDER:
-            safe_reply_or_push(event, flex_menu()); return
+init_activation_codes(BASE)
 
-        # 記錄 + 匯出
-        history_before = "".join(seq)
-        seq.append(data)
-        if len(seq) > MAX_HISTORY:
-            seq[:] = seq[-MAX_HISTORY:]
-        USER_HISTORY[uid] = seq
-        append_round_csv(uid, history_before, data)
+# -------------------- 解析與常用 --------------------
+def zh_to_bpt(ch: str) -> Optional[str]:
+    if ch in ("莊","B","b"): return "B"
+    if ch in ("閒","P","p"): return "P"
+    if ch in ("和","T","t"): return "T"
+    return None
 
-        if not ready:
-            safe_reply_or_push(event, flex_menu()); return
+def parse_text_seq(text: str) -> List[str]:
+    """從任意文字中抓出 B/P/T/莊/閒/和 的序列（允許貼整串歷史）。"""
+    res=[]
+    for ch in text:
+        v = zh_to_bpt(ch)
+        if v: res.append(v)
+    if not res:
+        for tk in text.replace(",", " ").split():
+            for ch in tk:
+                v = zh_to_bpt(ch)
+                if v: res.append(v)
+    return res[-MAX_HISTORY:] if len(res)>MAX_HISTORY else res
 
-        t0 = time.time()
-        p = estimate_probs(seq)
-        rec = recommend(p)
-        dt = int((time.time() - t0) * 1000)
-        from linebot.models import TextSendMessage
-        result_text = (
-            f"已解析 {len(seq)} 手\n"
-            f"機率：莊 {p[0]:.3f}｜閒 {p[1]:.3f}｜和 {p[2]:.3f}\n"
-            f"建議：{LAB_ZH[rec]}（{dt} ms）"
-        )
-        safe_reply_or_push(event, [TextSendMessage(text=result_text), flex_menu()])
+def parse_bankroll(text: str) -> Optional[int]:
+    """抓取訊息中的金額（整數）。"""
+    nums = re.findall(r"\d+", text.replace(",", ""))
+    if not nums: return None
+    try:
+        val = int(nums[0])
+        return val if val > 0 else None
+    except: return None
 
-# -------------------- Entrypoint --------------------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+def format_money(x: float) -> str:
+    return f"{int(round(x / max(1, ROUND_TO))) * max(1, ROUND_TO):,}"
+
+def format_pct(x: float) -> str:
+    return f"{x*100:.1f}%"
+
+# -------------------- 機率估計（逐手 + 大路） --------------------
+def norm(v: List[float]) -> List[float]:
+    s = sum(v); s = s if s>1e-12 else 1.0
+    return [max(0.0, x)/s for x in v]
+
+def temperature(p: List[float], tau: float) -> List[float]:
+    if tau <= 1e-9: return p
+    ex = [pow(max(pi,1e-12), 1.0/tau) for pi in p]
+    s = sum(ex); return [e/s for e in ex]
+
+def recent_freq(seq: List[str], win:int) -> List[float]:
+    if not seq: return [1/3,1/3,1/3]
+    cut = seq[-win:] if win>0 else seq
+    a = float(os.getenv("LAPLACE","0.5"))
+    nB=cut.count("B")+a; nP=cut.count("P")+a; nT=cut.count("T")+a
+    tot=max(1,len(cut)) + 3*a
+    return [nB/tot, nP/tot, nT/tot]
+
+def exp_decay_freq(seq: List[str], gamma: Optional[float]=None) -> List[float]:
+    if not seq: return [1/3,1/3,1/3]
+    if gamma is None: gamma=float(os.getenv("EW_GAMMA","0.96"))
+    wB=wP=wT=0.0; w=1.0
+    for r in reversed(seq):
+        if r=="B": wB+=w
+        elif r=="P": wP+=w
+        else: wT+=w
+        w*=gamma
+    a=float(os.getenv("LAPLACE","0.5"))
+    wB+=a; wP+=a; wT+=a
+    S=wB+wP+wT
+    return [wB/S, wP/S, wT/S]
+
+# 大路
+def build_big_road(seq: List[str]) -> List[Dict]:
+    cols=[]; cur=None; length=0; ties=0
+    for r in seq:
+        if r=="T":
+            if cur is not None: ties+=1
+            continue
+        if cur is None:
+            cur=r; length=1; ties=0
+        elif r==cur:
+            length+=1
+        else:
+            cols.append({"color":cur,"len":length,"ties":ties})
+            cur=r; length=1; ties=0
+    if cur is not None:
+        cols.append({"color":cur,"len":length,"ties":ties})
+    keep=int(os.getenv("ROAD_KEEP_COLS","120"))
+    return cols[-keep:] if len(cols)>keep else cols
+
+def road_tail(cols: List[Dict], k:int=1):
+    if not cols or k<=0 or k>len(cols): return None,0
+    c=cols[-k]; return c["color"], c["len"]
+
+def _run_length_tail(seq: List[str], k:int=1):
+    if not seq: return None,0
+    blocks=deque(); cur, cnt = seq[-1],1
+    for x in reversed(seq[:-1]):
+        if x==cur: cnt+=1
+        else:
+            blocks.appendleft((cur,cnt))
+            cur, cnt = x,1
+    blocks.appendleft((cur,cnt))
+    return blocks[-k] if 0<k<=len(blocks) else (None,0)
+
+def pattern_boost(seq: List[str]) -> Dict[str,float]:
+    m={"B":1.0,"P":1.0,"T":1.0}
+    n=len(seq)
+    if n<3: return m
+    alt=float(os.getenv("HOOK_ALT","1.06"))
+    dbl=float(os.getenv("HOOK_DBLJUMP","1.04"))
+    cyc=float(os.getenv("HOOK_CYCLE","1.06"))
+    th=int(os.getenv("HOOK_DRAGON_LEN","3"))
+    k=float(os.getenv("HOOK_DRAGON_K","0.06"))
+    a,b = seq[-1], seq[-2]
+    # 交替
+    if a!=b and n>=4 and seq[-3]!=seq[-2] and seq[-4]!=seq[-3]:
+        if a=="P": m["B"]*=alt
