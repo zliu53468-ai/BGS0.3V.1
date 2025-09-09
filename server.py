@@ -1,6 +1,6 @@
-# server.py — Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
-# 依賴：Flask, gunicorn, line-bot-sdk(可選), Pillow
-# requirements.txt 範例：
+# server.py — Fast pattern engine (ALT/DBL/DRAGON/MOMENTUM/CHOP/CHANGE)
+# Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
+# requirements.txt:
 # Flask==3.0.3
 # gunicorn==21.2.0
 # line-bot-sdk==3.11.0
@@ -12,7 +12,7 @@ from collections import deque
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file
-from PIL import Image, ImageDraw  # 需要 Pillow
+from PIL import Image, ImageDraw
 
 # -------------------- Flask / Logging --------------------
 app = Flask(__name__)
@@ -59,17 +59,27 @@ CSV_PATH = _csv_path()
 # -------------------- 常數 / 先驗 --------------------
 CLASS_ORDER = ("B","P","T")
 LAB_ZH = {"B":"莊","P":"閒","T":"和"}
-THEORETICAL = {"B":0.458,"P":0.446,"T":0.096}
+
+def _base_prior_from_env():
+    b = float(os.getenv("BASE_B", "0.458"))
+    p = float(os.getenv("BASE_P", "0.446"))
+    t = float(os.getenv("BASE_T", "0.096"))
+    s = b + p + t
+    if s <= 0:
+        return {"B": 0.458, "P": 0.446, "T": 0.096}
+    return {"B": b/s, "P": p/s, "T": t/s}
+
+THEORETICAL = _base_prior_from_env()
 PAYOUT = {"B":0.95, "P":1.0, "T":8.0}
 MAX_HISTORY = int(os.getenv("MAX_HISTORY","400"))
 
-# Kelly / 配注控制（可由環境變數微調）
+# Kelly / 配注控制
 KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.50"))
 MIN_BET_FRAC   = float(os.getenv("MIN_BET_FRAC","0.10"))   # >=10%
 MAX_BET_FRAC   = float(os.getenv("MAX_BET_FRAC","0.30"))   # <=30%
 ROUND_TO       = int(os.getenv("ROUND_TO","10"))
 
-# 試用與開通碼（永久，可重複使用）
+# 試用與開通碼（永久）
 TRIAL_MINUTES  = int(os.getenv("TRIAL_MINUTES","30"))
 ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")
 GLOBAL_CODES   = set()
@@ -86,11 +96,6 @@ _LAST_HIT:        Dict[str, float]     = {}
 
 # -------------------- 小工具 --------------------
 def now_ts() -> float: return time.time()
-
-def debounce(uid: str, key: str, window: float = 1.2) -> bool:
-    k = f"{uid}:{key}"; last = _LAST_HIT.get(k, 0.0); t = now_ts()
-    if t - last < window: return True
-    _LAST_HIT[k] = t; return False
 
 def ensure_user(uid: str):
     USER_HISTORY.setdefault(uid, [])
@@ -142,7 +147,6 @@ def _save_codes_to_file(path: str, codes: set):
         log.warning("save codes failed: %s", e)
 
 def init_activation_codes(base_dir: str):
-    """初始化『永久可重複使用』代碼池：ENV > 檔案 > 隨機產 30 組。"""
     global CODES_FILE, GLOBAL_CODES
     CODES_FILE = os.path.join(base_dir, "codes.txt")
 
@@ -171,7 +175,7 @@ def init_activation_codes(base_dir: str):
 
 init_activation_codes(BASE)
 
-# -------------------- 解析與常用 --------------------
+# -------------------- 解析 --------------------
 def zh_to_bpt(ch: str) -> Optional[str]:
     if ch in ("莊","B","b"): return "B"
     if ch in ("閒","P","p"): return "P"
@@ -179,7 +183,6 @@ def zh_to_bpt(ch: str) -> Optional[str]:
     return None
 
 def parse_text_seq(text: str) -> List[str]:
-    """從任意文字中抓出 B/P/T/莊/閒/和 的序列（允許貼整串歷史）。"""
     res=[]
     for ch in text:
         v = zh_to_bpt(ch)
@@ -202,7 +205,7 @@ def parse_bankroll(text: str) -> Optional[int]:
 def format_money(x: float) -> str:
     return f"{int(round(x / max(1, ROUND_TO))) * max(1, ROUND_TO):,}"
 
-# -------------------- 機率估計（逐手 + 大路） --------------------
+# -------------------- 機率基底 --------------------
 def norm(v: List[float]) -> List[float]:
     s = sum(v); s = s if s>1e-12 else 1.0
     return [max(0.0, x)/s for x in v]
@@ -234,7 +237,7 @@ def exp_decay_freq(seq: List[str], gamma: Optional[float]=None) -> List[float]:
     S=wB+wP+wT
     return [wB/S, wP/S, wT/S]
 
-# 大路
+# -------------------- 大路 --------------------
 def build_big_road(seq: List[str]) -> List[Dict]:
     cols=[]; cur=None; length=0; ties=0
     for r in seq:
@@ -268,104 +271,204 @@ def _run_length_tail(seq: List[str], k:int=1):
     blocks.appendleft((cur,cnt))
     return blocks[-k] if 0<k<=len(blocks) else (None,0)
 
-def pattern_boost(seq: List[str]) -> Dict[str,float]:
-    m={"B":1.0,"P":1.0,"T":1.0}
-    n=len(seq)
-    if n<3: return m
+# -------------------- 快速 signals 引擎 --------------------
+def _is_alt_dense(seq: List[str], win:int) -> bool:
+    if len(seq) < 3: return False
+    s = seq[-win:] if len(seq) >= win else seq[:]
+    alts = 0
+    for i in range(1, len(s)):
+        if s[i] != s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"):
+            alts += 1
+    return alts >= max(2, len(s)-1)  # 幾乎每步都在交替
 
-    alt=float(os.getenv("HOOK_ALT","1.06"))
-    dbl=float(os.getenv("HOOK_DBLJUMP","1.04"))
-    cyc=float(os.getenv("HOOK_CYCLE","1.06"))
-    th=int(os.getenv("HOOK_DRAGON_LEN","3"))
-    k=float(os.getenv("HOOK_DRAGON_K","0.06"))
+def _is_double_jump(seed: List[str]) -> bool:
+    # …A A B B / …B B A A 型，允許未滿 4 但已成形邊緣（3 格）
+    s = [x for x in seed if x in ("B","P")]
+    n = len(s)
+    if n < 3: return False
+    a,b = s[-1], s[-2]
+    if n >= 4 and s[-1]==s[-2] and s[-3]!=s[-2] and s[-3]==s[-4]:
+        return True
+    if n >= 3 and s[-1]==s[-2] and s[-3]!=s[-2]:
+        return True
+    return False
+
+def _cusum_change(seq: List[str], w:int=8) -> int:
+    # 簡易 CUSUM：後半 vs 前半 的 B-P 差，回傳偏向 B(+)/P(-) 的符號
+    s = [x for x in seq if x in ("B","P")]
+    if len(s) < 4: return 0
+    cut = s[-w:] if len(s) >= w else s[:]
+    m = len(cut)//2
+    pre = cut[:m]; post = cut[m:]
+    def bp_score(arr): return arr.count("B") - arr.count("P")
+    d = bp_score(post) - bp_score(pre)
+    if abs(d) <= 0: return 0
+    return 1 if d > 0 else -1
+
+def signals(seq: List[str], cols: List[Dict]) -> Tuple[Dict[str,float], Dict[str,float]]:
+    """
+    回傳 (multiplier, debug_detail)
+    multiplier: {"B":x, "P":y, "T":z}
+    debug_detail: 每個 signal 的倍率，便於 /predict_debug 顯示
+    """
+    mult = {"B":1.0,"P":1.0,"T":1.0}
+    dbg  = {}
+
+    n = len(seq)
+    if n < 2:
+        return mult, dbg
+
+    # === 參數（靈敏度） ===
+    ALT_WIN      = int(os.getenv("ALT_WINDOW", "5"))
+    ALT_GAIN     = float(os.getenv("ALT_GAIN", "1.10"))
+    ALT_LEAD     = float(os.getenv("ALT_LEAD", "1.05"))  # 交替即將出現時的前導
+
+    DBL_GAIN     = float(os.getenv("DBL_GAIN", "1.08"))
+
+    MOM_WIN      = int(os.getenv("MOMENTUM_WIN", "8"))
+    MOM_BONUS    = float(os.getenv("MOMENTUM_BONUS", "0.04"))  # 依差值轉為倍率
+
+    CHOP_WIN     = int(os.getenv("CHOP_WINDOW", "6"))
+    CHOP_GAIN    = float(os.getenv("CHOP_GAIN", "1.06"))
+
+    # DRAGON（跟/斷）雙通道 + 權重
+    DR_FOLLOW_LEN   = int(os.getenv("DRAGON_FOLLOW_LEN", "3"))
+    DR_FOLLOW_STEP  = float(os.getenv("DRAGON_FOLLOW_STEP", "0.03"))  # 跟龍每多 1 長度增加倍率
+    DR_BREAK_PRE    = int(os.getenv("DRAGON_BREAK_PREEMPT", "2"))     # 從多早開始預告斷
+    DR_BREAK_STEP   = float(os.getenv("DRAGON_BREAK_STEP", "0.06"))   # 斷龍每多 1 長度增加倍率
+    DR_FOLLOW_W     = float(os.getenv("DRAGON_FOLLOW_W", "0.6"))
+    DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.0"))       # 預設偏向斷（更靈敏）
+
+    # 是否關閉大類 signal
+    DISABLE_ALT  = os.getenv("DISABLE_ALT", "0") == "1"
+    DISABLE_DBL  = os.getenv("DISABLE_DBL", "0") == "1"
+    DISABLE_MOM  = os.getenv("DISABLE_MOMENTUM", "0") == "1"
+    DISABLE_CHOP = os.getenv("DISABLE_CHOP", "0") == "1"
+    DISABLE_DR   = os.getenv("DISABLE_DRAGON", "0") == "1"
 
     a, b = seq[-1], seq[-2]
 
-    # 交替（…BPBP 或 …PBPB）
-    if a!=b and n>=4 and seq[-3]!=seq[-2] and seq[-4]!=seq[-3]:
-        if a=="P": m["B"]*=alt
-        if a=="B": m["P"]*=alt
+    # === ALT：交替密度高，提前壓相反 ===
+    if not DISABLE_ALT:
+        if _is_alt_dense(seq, ALT_WIN):
+            # 交替密集 → 下一手押相反
+            opp = "B" if a=="P" else "P" if a=="B" else None
+            if opp:
+                mult[opp] *= ALT_GAIN
+                dbg["ALT"] = {"target": opp, "gain": ALT_GAIN, "mode":"dense"}
+        else:
+            # 邊緣前導：最近 2 手不同 → 小幅度提早押相反
+            if a != b and a in ("B","P") and b in ("B","P"):
+                opp = "B" if a=="P" else "P"
+                mult[opp] *= ALT_LEAD
+                dbg["ALT"] = {"target": opp, "gain": ALT_LEAD, "mode":"lead"}
 
-    # 雙跳（…BBPP 或 …PPBB 收尾為連續兩次）
-    if n>=4 and seq[-1]==seq[-2] and seq[-3]!=seq[-2] and seq[-3]==seq[-4]:
-        if a=="P": m["B"]*=dbl
-        if a=="B": m["P"]*=dbl
+    # === DBL：雙跳（含 3 格邊緣） ===
+    if not DISABLE_DBL and _is_double_jump(seq):
+        opp = "B" if a=="P" else "P" if a=="B" else None
+        if opp:
+            mult[opp] *= DBL_GAIN
+            dbg["DBL"] = {"target": opp, "gain": DBL_GAIN}
 
-    # 1-2 / 2-1 迴圈樣式（看最後 6 手）
-    if n>=6:
-        last6="".join(seq[-6:])
-        if last6 in ("BPPBPP","PPBPPB","PBBPBB","BBPBBP"):
-            if a=="P": m["B"]*=cyc
-            if a=="B": m["P"]*=cyc
+    # === MOMENTUM：最近 W 手誰優勢 ===
+    if not DISABLE_MOM and n >= 3:
+        s = [x for x in (seq[-MOM_WIN:] if n>=MOM_WIN else seq) if x in ("B","P")]
+        if len(s) >= 3:
+            diff = s.count("B") - s.count("P")
+            if diff != 0:
+                side = "B" if diff>0 else "P"
+                gain = 1.0 + min(0.12, abs(diff) * MOM_BONUS)
+                mult[side] *= gain
+                dbg["MOM"] = {"target": side, "gain": gain, "diff": diff}
 
-    # 逐手提早斷龍（當前 run length 達門檻）
-    sym, run = _run_length_tail(seq,1)
-    if run>=th and sym in ("B","P"):
-        hazard=1.0+min(0.25, k*(run-(th-1)))
-        if sym=="B": m["P"]*=hazard
-        if sym=="P": m["B"]*=hazard
+    # === CHOP：碎切盤（短窗交替很多） ===
+    if not DISABLE_CHOP and n >= 4:
+        s = seq[-CHOP_WIN:] if n>=CHOP_WIN else seq
+        alt_cnt = sum(1 for i in range(1,len(s)) if s[i]!=s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"))
+        if alt_cnt >= max(2, len(s)//2):
+            opp = "B" if a=="P" else "P" if a=="B" else None
+            if opp:
+                mult[opp] *= CHOP_GAIN
+                dbg["CHOP"] = {"target": opp, "gain": CHOP_GAIN, "alts": alt_cnt}
 
-    return m
+    # === DRAGON：跟 or 斷（線性合成，更靈敏） ===
+    if not DISABLE_DR:
+        sym, run = _run_length_tail(seq,1)
+        if sym in ("B","P") and run >= 1:
+            # 跟龍分數：run >= F_LEN 後，隨 run 線性成長
+            follow_gain = 1.0
+            if run >= DR_FOLLOW_LEN:
+                follow_gain += DR_FOLLOW_STEP * (run - (DR_FOLLOW_LEN - 1))
+            # 斷龍分數：run >= BREAK_PRE 就開始升
+            break_gain = 1.0
+            if run >= DR_BREAK_PRE:
+                break_gain += DR_BREAK_STEP * (run - (DR_BREAK_PRE - 1))
+            # 線性合成
+            follow_side = sym
+            break_side  = "B" if sym=="P" else "P"
+            # 安全夾限
+            follow_gain = max(1.0, min(1.6, follow_gain))
+            break_gain  = max(1.0, min(1.8, break_gain))
+            # 寫入
+            mult[follow_side] *= pow(follow_gain, DR_FOLLOW_W)
+            mult[break_side]  *= pow(break_gain,  DR_BREAK_W)
+            dbg["DRAGON"] = {
+                "run": run,
+                "follow": {"side": follow_side, "gain": follow_gain, "w": DR_FOLLOW_W},
+                "break":  {"side": break_side,  "gain": break_gain,  "w": DR_BREAK_W},
+            }
 
-def road_boost(cols: List[Dict]) -> Dict[str,float]:
-    m={"B":1.0,"P":1.0,"T":1.0}
-    c=len(cols)
-    if c<2: return m
-    alt=float(os.getenv("ROAD_ALT","1.06"))
-    cyc=float(os.getenv("ROAD_CYCLE","1.06"))
-    cut=int(os.getenv("ROAD_DRAGON_LEN","4"))
-    kk=float(os.getenv("ROAD_DRAGON_K","0.07"))
-    chop=float(os.getenv("ROAD_CHOP_BIAS","1.05"))
-    cur_color, cur_len = road_tail(cols,1)
-    prv_color, prv_len = road_tail(cols,2)
+    # === CUSUM-風格轉向：偵測 B→P 或 P→B 的轉點，提早對沖 ===
+    chg = _cusum_change(seq, w=int(os.getenv("CHANGE_WIN","8")))
+    CHG_GAIN = float(os.getenv("CHANGE_GAIN","1.05"))
+    if chg != 0:
+        if chg > 0:  # 後半偏 B
+            mult["B"] *= CHG_GAIN
+            dbg["CHANGE"] = {"side":"B", "gain":CHG_GAIN}
+        else:        # 偏 P
+            mult["P"] *= CHG_GAIN
+            dbg["CHANGE"] = {"side":"P", "gain":CHG_GAIN}
 
-    tail_lens = [cols[-i]["len"] for i in range(1, min(6,c)+1)]
-    if len(tail_lens)>=4 and all(L==1 for L in tail_lens[:4]):
-        if cur_color=="B": m["P"]*=alt
-        if cur_color=="P": m["B"]*=alt
+    return mult, dbg
 
-    if c>=4:
-        lens4=[cols[-i]["len"] for i in range(1,5)]
-        pat_12=(all(L in (1,2) for L in lens4) and len(set(lens4))>1)
-        if pat_12:
-            if cur_color=="B": m["P"]*=cyc
-            if cur_color=="P": m["B"]*=cyc
-
-    if cur_len>=cut:
-        hazard = 1.0 + min(0.30, kk*(cur_len-(cut-1)))
-        if cur_color=="B": m["P"]*=hazard
-        if cur_color=="P": m["B"]*=hazard
-
-    if prv_len >= max(3, cur_len+2):
-        if cur_color=="B": m["P"]*=chop
-        if cur_color=="P": m["B"]*=chop
-
-    return m
-
-def estimate_probs(seq: List[str]) -> List[float]:
+# -------------------- 機率估計（融合 signals） --------------------
+def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     if not seq:
         base=[THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
-        return norm(base)
+        return norm(base), {"base":base,"signals":{}}
+
     short = recent_freq(seq, int(os.getenv("WIN_SHORT","6")))
     longv = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
     prior = [THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
-    a=float(os.getenv("REC_W","0.20")); b=float(os.getenv("LONG_W","0.20")); c=float(os.getenv("PRIOR_W","0.20"))
+
+    a=float(os.getenv("REC_W","0.40"))   # 調高短窗權重 → 更敏捷
+    b=float(os.getenv("LONG_W","0.20"))
+    c=float(os.getenv("PRIOR_W","0.10"))
     p=[a*short[i]+b*longv[i]+c*prior[i] for i in range(3)]
     p=norm(p)
-    step = pattern_boost(seq)
+
     cols = build_big_road(seq)
-    road = road_boost(cols)
-    p=[p[0]*step["B"]*road["B"], p[1]*step["P"]*road["P"], p[2]*step["T"]*road["T"]]
+    mult, dbg = signals(seq, cols)
+
+    biasB=float(os.getenv("BIAS_B","1.0"))
+    biasP=float(os.getenv("BIAS_P","1.0"))
+    biasT=float(os.getenv("BIAS_T","1.0"))
+
+    p=[p[0]*mult["B"]*biasB,
+       p[1]*mult["P"]*biasP,
+       p[2]*mult["T"]*biasT]
     p=norm(p)
-    p=temperature(p, float(os.getenv("TEMP","1.06")))
-    floor=float(os.getenv("EPSILON_FLOOR","0.06")); cap=float(os.getenv("MAX_CAP","0.86"))
+
+    p=temperature(p, float(os.getenv("TEMP","1.02")))  # 降低溫度 → 收斂更快
+    floor=float(os.getenv("EPSILON_FLOOR","0.04"))
+    cap=float(os.getenv("MAX_CAP","0.92"))
     p=[min(cap, max(floor,x)) for x in p]
-    return norm(p)
+    return norm(p), {"short":short,"longv":longv,"prior":prior,"signals":dbg,"blend":{"REC_W":a,"LONG_W":b,"PRIOR_W":c},"mult":mult}
 
 def recommend(p: List[float]) -> str:
     return CLASS_ORDER[p.index(max(p))]
 
-# -------------------- Kelly（縮放）配注（保證 10%~30%） --------------------
+# -------------------- Kelly（縮放）配注 --------------------
 def kelly_fraction(p_win: float, b: float) -> float:
     f = (b*p_win - (1.0 - p_win)) / max(1e-9, b)
     return max(0.0, f)
@@ -388,7 +491,7 @@ def append_round_csv(uid:str, history_before:str, label:str):
     except Exception as e:
         log.warning("append csv fail: %s", e)
 
-# -------------------- 大路圖像渲染 --------------------
+# -------------------- 大路圖像 --------------------
 def _layout_big_road_points(cols: List[dict], rows:int=6, max_cols:int=60):
     pts=[]; x=0
     for col in cols:
@@ -436,7 +539,6 @@ def render_big_road_png(seq: List[str], cell:int=28, rows:int=6, max_cols:int=60
 @app.get("/")
 def root(): return "ok", 200
 
-# 健康檢查：兼容 GET/HEAD，兼容 /health 和 /health/
 @app.route("/health", methods=["GET", "HEAD"])
 @app.route("/health/", methods=["GET", "HEAD"])
 def health():
@@ -446,12 +548,26 @@ def health():
 def api_predict():
     data=request.get_json(silent=True) or {}
     seq=parse_text_seq(str(data.get("history","")))
-    p=estimate_probs(seq)
+    p, _dbg = estimate_probs(seq)
     rec=recommend(p)
     return jsonify({
         "history_len": len(seq),
         "probabilities": {"B":p[0], "P":p[1], "T":p[2]},
         "recommendation": rec
+    }), 200
+
+@app.post("/predict_debug")
+def predict_debug():
+    data = request.get_json(silent=True) or {}
+    seq  = parse_text_seq(str(data.get("history", "")))
+
+    p, detail = estimate_probs(seq)
+    return jsonify({
+        "len": len(seq),
+        "counts": {"B": seq.count("B"), "P": seq.count("P"), "T": seq.count("T")},
+        "detail": detail,
+        "final": {"B":p[0], "P":p[1], "T":p[2]},
+        "recommend": CLASS_ORDER[p.index(max(p))]
     }), 200
 
 @app.post("/road")
@@ -472,7 +588,7 @@ def road_image():
     png=render_big_road_png(seq)
     return send_file(BytesIO(png), mimetype="image/png", download_name="road.png")
 
-# -------------------- LINE（可選；有憑證才啟用） --------------------
+# -------------------- LINE（可選） --------------------
 LINE_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_SECRET=os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -517,7 +633,6 @@ if USE_LINE and handler is not None:
         text=(event.message.text or "").strip()
         ensure_user(uid)
 
-        # 試用檢查 / 開通
         if not trial_ok(uid):
             if try_activate(uid, text):
                 reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
@@ -527,7 +642,6 @@ if USE_LINE and handler is not None:
             ))
             return
 
-        # 首次：要求輸入本金
         if uid not in USER_BANKROLL or USER_BANKROLL.get(uid, 0) <= 0:
             amt = parse_bankroll(text)
             if amt is None:
@@ -541,7 +655,6 @@ if USE_LINE and handler is not None:
             ))
             return
 
-        # 路圖請求
         if text in ("路圖","大路","road","Road"):
             base=os.getenv("BACKEND_URL","").rstrip("/")
             if not base:
@@ -551,7 +664,6 @@ if USE_LINE and handler is not None:
             reply_or_push(event, ImageSendMessage(original_content_url=url, preview_image_url=url))
             return
 
-        # 控制指令
         if text == "結束分析":
             USER_HISTORY[uid]=[]
             USER_READY[uid]=False
@@ -566,10 +678,8 @@ if USE_LINE and handler is not None:
                 reply_or_push(event, TextSendMessage(text="ℹ️ 沒有可返回的步驟。"))
             return
 
-        # 歷史/逐手輸入
         seq_add = parse_text_seq(text)
 
-        # 尚未開始分析：允許貼整串歷史
         if not USER_READY[uid]:
             if seq_add:
                 cur = USER_HISTORY[uid]
@@ -595,7 +705,6 @@ if USE_LINE and handler is not None:
             ))
             return
 
-        # 已開始分析：逐手處理
         if seq_add:
             for hand in seq_add:
                 before = "".join(USER_HISTORY[uid])
@@ -606,7 +715,7 @@ if USE_LINE and handler is not None:
 
             seq = USER_HISTORY[uid]
             t0=time.time()
-            p=estimate_probs(seq)
+            p, _detail = estimate_probs(seq)
             rec=recommend(p)
             dt=int((time.time()-t0)*1000)
 
@@ -615,7 +724,7 @@ if USE_LINE and handler is not None:
 
             def qamt(f): 
                 return format_money(bankroll * f)
-            quick_line = f"🧮 快速參考：10%={qamt(0.10)}｜20%={qamt(0.20)}｜30%={qamt(0.30)}"
+            quick_line = f"🧮 10%={qamt(0.10)}｜20%={qamt(0.20)}｜30%={qamt(0.30)}"
 
             msg = (
                 f"📊 已解析 {len(seq)} 手（{dt} ms）\n"
