@@ -5,7 +5,7 @@
 # - 試用 30 分鐘；輸入任一「永久開通碼」解鎖（碼不消耗；池中 30 組；ENV 未填會自動產 30 組寫入 codes.txt）
 # - 大路（Big Road）建構 + /road/image 回大路 PNG；輸入「路圖」回圖
 # - REST：/predict /road /road/image /health
-# 依賴：Flask, gunicorn, line-bot-sdk, Pillow
+# 相依：Flask, gunicorn, line-bot-sdk, Pillow
 
 import os, csv, time, logging, random, string, re
 from typing import List, Dict, Tuple, Optional
@@ -13,7 +13,7 @@ from collections import deque
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw  # 需要 requirements.txt: Pillow==10.4.0
 
 # -------------------- Flask / Logging --------------------
 app = Flask(__name__)
@@ -60,20 +60,20 @@ CSV_PATH = _csv_path()
 # -------------------- 常數 / 先驗 --------------------
 CLASS_ORDER = ("B","P","T")
 LAB_ZH = {"B":"莊","P":"閒","T":"和"}
-THEORETICAL = {"B":0.458,"P":0.446,"T":0.096}   # 近似理論機率
-PAYOUT = {"B":0.95, "P":1.0, "T":8.0}           # 淨賠率（b）
+THEORETICAL = {"B":0.458,"P":0.446,"T":0.096}
+PAYOUT = {"B":0.95, "P":1.0, "T":8.0}
 MAX_HISTORY = int(os.getenv("MAX_HISTORY","400"))
 
 # Kelly / 配注控制（可由環境變數微調）
-KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.50"))   # Kelly 縮放（0~1）
-MIN_BET_FRAC   = float(os.getenv("MIN_BET_FRAC","0.10"))   # 最低下注比例（≥10%）
-MAX_BET_FRAC   = float(os.getenv("MAX_BET_FRAC","0.30"))   # 最高下注比例（≤30%）
-ROUND_TO       = int(os.getenv("ROUND_TO","10"))           # 金額取整到 10 元
+KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.50"))
+MIN_BET_FRAC   = float(os.getenv("MIN_BET_FRAC","0.10"))   # >=10%
+MAX_BET_FRAC   = float(os.getenv("MAX_BET_FRAC","0.30"))   # <=30%
+ROUND_TO       = int(os.getenv("ROUND_TO","10"))
 
 # 試用與開通碼（永久，可重複使用）
 TRIAL_MINUTES  = int(os.getenv("TRIAL_MINUTES","30"))
-ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")            # 5字母+5數字（大寫）
-GLOBAL_CODES   = set()                                     # 永久可用代碼池（不消耗）
+ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")
+GLOBAL_CODES   = set()
 CODES_FILE     = os.path.join(BASE, "codes.txt")
 
 # -------------------- 使用者狀態 --------------------
@@ -81,8 +81,8 @@ USER_HISTORY:     Dict[str, List[str]] = {}
 USER_READY:       Dict[str, bool]      = {}
 USER_TRIAL_START: Dict[str, float]     = {}
 USER_ACTIVATED:   Dict[str, bool]      = {}
-USER_CODE:        Dict[str, str]       = {}   # 綁定用哪一組代碼解鎖
-USER_BANKROLL:    Dict[str, int]       = {}   # 本金
+USER_CODE:        Dict[str, str]       = {}
+USER_BANKROLL:    Dict[str, int]       = {}
 _LAST_HIT:        Dict[str, float]     = {}
 
 # -------------------- 工具 --------------------
@@ -193,7 +193,6 @@ def parse_text_seq(text: str) -> List[str]:
     return res[-MAX_HISTORY:] if len(res)>MAX_HISTORY else res
 
 def parse_bankroll(text: str) -> Optional[int]:
-    """抓取訊息中的金額（整數）。"""
     nums = re.findall(r"\d+", text.replace(",", ""))
     if not nums: return None
     try:
@@ -203,9 +202,6 @@ def parse_bankroll(text: str) -> Optional[int]:
 
 def format_money(x: float) -> str:
     return f"{int(round(x / max(1, ROUND_TO))) * max(1, ROUND_TO):,}"
-
-def format_pct(x: float) -> str:
-    return f"{x*100:.1f}%"
 
 # -------------------- 機率估計（逐手 + 大路） --------------------
 def norm(v: List[float]) -> List[float]:
@@ -286,3 +282,11 @@ def pattern_boost(seq: List[str]) -> Dict[str,float]:
     # 交替
     if a!=b and n>=4 and seq[-3]!=seq[-2] and seq[-4]!=seq[-3]:
         if a=="P": m["B"]*=alt
+        if a=="B": m["P"]*=alt
+    # 雙跳
+    if n>=4 and seq[-1]==seq[-2] and seq[-3]!=seq[-2] and seq[-3]==seq[-4]:
+        if a=="P": m["B"]*=dbl
+        if a=="B": m["P"]*=dbl
+    # 1-2/2-1
+    if n>=6:
+        last6="".join(seq[-6
