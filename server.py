@@ -1,20 +1,18 @@
 # server.py — Volatility-Adaptive + Tie-aware Signals
-# Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
+# Text-only LINE UX + Big Road PNG + Trial (30m, persistent) + Permanent Codes (30) + Kelly staking
 # Requirements:
 #   Flask==3.0.3
 #   gunicorn==21.2.0
 #   line-bot-sdk==3.11.0
 #   Pillow==10.4.0
 
-import os, csv, time, logging, random, string, re, math
+import os, csv, time, logging, random, string, re, math, json
 from typing import List, Dict, Tuple, Optional
 from collections import deque
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file
-
-# Pillow 只在畫大路時用到；若沒安裝會在啟動時丟錯，請確保 requirements 有 Pillow
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw  # Big Road 圖用
 
 # -------------------- Flask 基本設定 --------------------
 app = Flask(__name__)
@@ -86,8 +84,9 @@ TRIAL_MINUTES  = int(os.getenv("TRIAL_MINUTES","30"))
 ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")
 GLOBAL_CODES   = set()
 CODES_FILE     = os.path.join(BASE, "codes.txt")
+RESET_TRIAL_ON_REFOLLOW = os.getenv("RESET_TRIAL_ON_REFOLLOW", "0") == "1"  # 預設不重置
 
-# -------------------- 使用者狀態 --------------------
+# -------------------- 使用者狀態（記憶體） --------------------
 USER_HISTORY:     Dict[str, List[str]] = {}
 USER_READY:       Dict[str, bool]      = {}
 USER_TRIAL_START: Dict[str, float]     = {}
@@ -97,18 +96,69 @@ USER_BANKROLL:    Dict[str, int]       = {}
 
 def now_ts() -> float: return time.time()
 
+# -------------------- 狀態持久化（檔案） --------------------
+STATE_DIR = os.path.join(BASE, "state"); os.makedirs(STATE_DIR, exist_ok=True)
+
+def _state_file(uid: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", uid)
+    return os.path.join(STATE_DIR, f"user_{safe}.json")
+
+def _load_state(uid: str) -> dict:
+    try:
+        with open(_state_file(uid), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_state(uid: str, obj: dict):
+    try:
+        with open(_state_file(uid), "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save user state fail uid=%s: %s", uid, e)
+
 def ensure_user(uid: str):
-    USER_HISTORY.setdefault(uid, [])
-    USER_READY.setdefault(uid, False)
-    USER_TRIAL_START.setdefault(uid, now_ts())
-    USER_ACTIVATED.setdefault(uid, False)
-    USER_CODE.setdefault(uid, "")
+    st = _load_state(uid)
+    if not st:
+        st = {
+            "history": [],
+            "ready": False,
+            "trial_start_ts": now_ts(),   # 第一次見到就記錄
+            "activated": False,
+            "code": "",
+            "bankroll": 0,
+            "expired": False
+        }
+        _save_state(uid, st)
+    USER_HISTORY[uid]     = st.get("history", [])
+    USER_READY[uid]       = st.get("ready", False)
+    USER_TRIAL_START[uid] = st.get("trial_start_ts", now_ts())
+    USER_ACTIVATED[uid]   = st.get("activated", False)
+    USER_CODE[uid]        = st.get("code", "")
+    USER_BANKROLL[uid]    = st.get("bankroll", 0)
+
+def _flush_user(uid: str):
+    st = {
+        "history": USER_HISTORY.get(uid, []),
+        "ready": USER_READY.get(uid, False),
+        "trial_start_ts": USER_TRIAL_START.get(uid, now_ts()),
+        "activated": USER_ACTIVATED.get(uid, False),
+        "code": USER_CODE.get(uid, ""),
+        "bankroll": USER_BANKROLL.get(uid, 0),
+    }
+    # 補 expired
+    expired = (not st["activated"]) and ((now_ts() - st["trial_start_ts"]) / 60.0 > TRIAL_MINUTES)
+    st["expired"] = expired
+    _save_state(uid, st)
 
 def trial_ok(uid: str) -> bool:
-    if USER_ACTIVATED.get(uid, False): return True
-    start = USER_TRIAL_START.get(uid, now_ts())
+    st = _load_state(uid)
+    if st.get("activated", False): return True
+    if st.get("expired", False):   return False
+    start = st.get("trial_start_ts", USER_TRIAL_START.get(uid, now_ts()))
     return (now_ts() - start) / 60.0 <= TRIAL_MINUTES
 
+# -------------------- 開通碼（永久性；ENV 缺省則自動產生 30 組存 codes.txt） --------------------
 def _mk_code() -> str:
     return "".join(random.choices(string.ascii_uppercase, k=5)) + \
            "".join(random.choices(string.digits, k=5))
@@ -136,7 +186,6 @@ def _save_codes_to_file(path: str, codes: set):
         log.warning("save codes failed: %s", e)
 
 def init_activation_codes(base_dir: str):
-    """ENV 沒提供 ACTIVATION_CODES 時，啟動自動生成 30 組永久碼存到 codes.txt。"""
     global CODES_FILE, GLOBAL_CODES
     CODES_FILE = os.path.join(base_dir, "codes.txt")
 
@@ -150,7 +199,6 @@ def init_activation_codes(base_dir: str):
         log.info("[ACT] Loaded %d codes from ENV (permanent).", len(GLOBAL_CODES))
         return
 
-    # 沒給就從檔案讀，檔案也沒有就生成 30 組
     GLOBAL_CODES = _load_codes_from_file(CODES_FILE)
     if not GLOBAL_CODES:
         while len(GLOBAL_CODES) < 30:
@@ -168,6 +216,7 @@ def try_activate(uid: str, text: str) -> bool:
     if code in GLOBAL_CODES:
         USER_ACTIVATED[uid] = True
         USER_CODE[uid] = code
+        _flush_user(uid)
         log.info("[ACT] uid=%s activated with code=%s", uid, code)
         return True
     return False
@@ -330,7 +379,6 @@ def _cusum_change(seq: List[str], w:int=8) -> int:
 def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
     mult = {"B":1.0,"P":1.0,"T":1.0}
     dbg  = {}
-
     n = len(seq)
     if n < 2:
         return mult, dbg
@@ -352,19 +400,18 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
     DR_FOLLOW_W     = float(os.getenv("DRAGON_FOLLOW_W", "0.5"))
     DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.1"))
 
-    # 依波動加成倍率
     VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))  # vol=1 → signals *1.5
     vol, volmeta = _volatility_score(seq)
     sig_scale = (1.0 + VOL_SIG_BOOST * vol)
 
     # ---- Tie-aware 參數 ----
-    T_NEAR_WIN      = int(os.getenv("T_NEAR_WIN","5"))    # 近幾手有 T → 前導
+    T_NEAR_WIN      = int(os.getenv("T_NEAR_WIN","5"))
     T_NEAR_GAIN     = float(os.getenv("T_NEAR_GAIN","1.06"))
     T_CLUSTER_WIN   = int(os.getenv("T_CLUSTER_WIN","10"))
-    T_CLUSTER_TH    = int(os.getenv("T_CLUSTER_TH","2"))  # 窗內 ≥ TH 個 T
+    T_CLUSTER_TH    = int(os.getenv("T_CLUSTER_TH","2"))
     T_CLUSTER_GAIN  = float(os.getenv("T_CLUSTER_GAIN","1.10"))
-    T_BREAK_GAIN    = float(os.getenv("T_BREAK_RUN_GAIN","1.10"))  # T 夾龍 → 偏斷
-    T_POST_REV_GAIN = float(os.getenv("T_POST_REV_GAIN","1.08"))   # X–T–Y → 偏向 Y
+    T_BREAK_GAIN    = float(os.getenv("T_BREAK_RUN_GAIN","1.10"))
+    T_POST_REV_GAIN = float(os.getenv("T_POST_REV_GAIN","1.08"))
 
     a, b = seq[-1], seq[-2]
 
@@ -430,13 +477,11 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
         dbg["DRAGON"] = {"run": run, "follow": {"side": follow_side, "gain": follow_gain}, "break": {"side": break_side, "gain": break_gain}}
 
     # === TIE-aware signals ===
-    # 1) 近距離有 T → 給 T 前導（群聚性/回補性）
     if _last_k_has(seq, "T", T_NEAR_WIN):
         g = (T_NEAR_GAIN * sig_scale)
         mult["T"] *= g
         dbg["T_NEAR"] = {"win": T_NEAR_WIN, "gain": g}
 
-    # 2) 短窗 T 密度高 → 再放大 T
     if T_CLUSTER_WIN > 0:
         s = seq[-T_CLUSTER_WIN:] if len(seq)>=T_CLUSTER_WIN else seq[:]
         tcnt = s.count("T")
@@ -445,16 +490,14 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult["T"] *= g
             dbg["T_CLUSTER"] = {"win": T_CLUSTER_WIN, "cnt": tcnt, "th": T_CLUSTER_TH, "gain": g}
 
-    # 3) T 夾在龍中（… X X T X …）→ 傾向視為斷龍
     if n >= 3 and seq[-2] == "T" and seq[-1] in ("B","P"):
-        pre_sym, pre_len = _run_length_tail(seq[:-1], 1)  # 不含最後一手
+        pre_sym, pre_len = _run_length_tail(seq[:-1], 1)
         if pre_sym in ("B","P") and pre_len >= 2:
             opp = "B" if pre_sym=="P" else "P"
             g = (T_BREAK_GAIN * sig_scale)
             mult[opp] *= g
             dbg["T_BREAK_RUN"] = {"pre_sym": pre_sym, "pre_len": pre_len, "target": opp, "gain": g}
 
-    # 4) X–T–Y（Y ≠ X）→ 常見「和後反轉」，偏向 Y
     if n >= 3 and seq[-2] == "T" and seq[-3] in ("B","P") and seq[-1] in ("B","P") and seq[-3] != seq[-1]:
         y = seq[-1]
         g = (T_POST_REV_GAIN * sig_scale)
@@ -463,7 +506,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
 
     return mult, dbg
 
-# -------------------- 機率估計（Volatility + Tie floor/cap） --------------------
+# -------------------- 機率估計 --------------------
 def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     if not seq:
         base=[THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
@@ -653,7 +696,7 @@ USE_LINE=False
 try:
     if LINE_TOKEN and LINE_SECRET:
         from linebot import LineBotApi, WebhookHandler
-        from linebot.models import (MessageEvent, TextMessage, TextSendMessage, ImageSendMessage)
+        from linebot.models import (MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, FollowEvent)
         USE_LINE=True
         line_bot_api=LineBotApi(LINE_TOKEN)
         handler=WebhookHandler(LINE_SECRET)
@@ -675,8 +718,7 @@ def reply_or_push(event, messages):
 
 @app.post("/line-webhook")
 def webhook():
-    if not USE_LINE or handler is None: 
-        # 未啟用 LINE 時仍回 200，避免 LINE Verify 失敗
+    if not USE_LINE or handler is None:
         return "ok", 200
     sig=request.headers.get("X-Line-Signature","")
     body=request.get_data(as_text=True)
@@ -687,19 +729,36 @@ def webhook():
     return "ok", 200
 
 if USE_LINE and handler is not None:
+
+    @handler.add(FollowEvent)
+    def on_follow(event):
+        uid = event.source.user_id
+        st = _load_state(uid)
+        if not st or RESET_TRIAL_ON_REFOLLOW:
+            ensure_user(uid)
+            USER_TRIAL_START[uid] = now_ts()
+            _flush_user(uid)
+        else:
+            ensure_user(uid)  # 不重置試用
+        reply_or_push(event, TextSendMessage(
+            text="👋 歡迎加入！你擁有 30 分鐘試用。請先輸入本金，例如 20000，接著貼上歷史（B/P/T 或 莊/閒/和）並輸入「開始分析」。"
+        ))
+
     @handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
         uid=event.source.user_id
         text=(event.message.text or "").strip()
         ensure_user(uid)
 
-        # 試用 & 開通
+        # 先允許輸入開通碼（永遠可試）
+        if try_activate(uid, text):
+            reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
+            return
+
+        # 硬鎖：試用逾時就只回引導（封鎖/解鎖不會洗掉）
         if not trial_ok(uid):
-            if try_activate(uid, text):
-                reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
-                return
             reply_or_push(event, TextSendMessage(
-                text="⏳ 試用已結束。\n請加管理員 LINE：@jins888 取得開通帳號，或直接貼上你的開通帳號（5字母+5數字）解鎖。🔐"
+                text="⏳ 試用已結束。\n請加管理員 LINE：@jins888 取得開通帳號，或直接貼上你的開通帳號（5 英文字 + 5 數字）解鎖。🔐"
             ))
             return
 
@@ -712,6 +771,7 @@ if USE_LINE and handler is not None:
                 ))
                 return
             USER_BANKROLL[uid] = amt
+            _flush_user(uid)
             reply_or_push(event, TextSendMessage(
                 text=f"👍 已設定本金：{amt:,} 元。接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入「開始分析」即可！🚀"
             ))
@@ -731,12 +791,14 @@ if USE_LINE and handler is not None:
         if text == "結束分析":
             USER_HISTORY[uid]=[]
             USER_READY[uid]=False
+            _flush_user(uid)
             reply_or_push(event, TextSendMessage(text="🛑 已結束，本金設定保留。要重新開始請先貼歷史，然後輸入「開始分析」。"))
             return
 
         if text == "返回":
             if USER_HISTORY[uid]:
                 USER_HISTORY[uid].pop()
+                _flush_user(uid)
                 reply_or_push(event, TextSendMessage(text="↩️ 已返回一步。繼續輸入下一手（莊/閒/和 或 B/P/T）。"))
             else:
                 reply_or_push(event, TextSendMessage(text="ℹ️ 沒有可返回的步驟。"))
@@ -752,6 +814,7 @@ if USE_LINE and handler is not None:
                 cur.extend(seq_add)
                 if len(cur) > MAX_HISTORY: cur[:] = cur[-MAX_HISTORY:]
                 USER_HISTORY[uid] = cur
+                _flush_user(uid)
                 append_round_csv(uid, before, f"+{len(seq_add)}init")
                 reply_or_push(event, TextSendMessage(
                     text=f"📝 已接收歷史共 {len(seq_add)} 手，目前累計 {len(USER_HISTORY[uid])} 手。\n輸入「開始分析」即可啟動。🚦"
@@ -762,6 +825,7 @@ if USE_LINE and handler is not None:
                     reply_or_push(event, TextSendMessage(text="📥 請先貼上你的歷史（例如：BPPBBP 或 莊閒閒莊…），再輸入「開始分析」。"))
                     return
                 USER_READY[uid] = True
+                _flush_user(uid)
                 reply_or_push(event, TextSendMessage(text="✅ 已開始分析。接下來每輸入一手（莊/閒/和 或 B/P/T），我會立刻回覆下一手預測 📊"))
                 return
 
@@ -778,6 +842,7 @@ if USE_LINE and handler is not None:
                 if len(USER_HISTORY[uid]) > MAX_HISTORY:
                     USER_HISTORY[uid] = USER_HISTORY[uid][-MAX_HISTORY:]
                 append_round_csv(uid, before, hand)
+            _flush_user(uid)
 
             seq = USER_HISTORY[uid]
             t0=time.time()
