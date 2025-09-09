@@ -1,10 +1,10 @@
-# server.py — Volatility-Adaptive + Tie-aware Signals (TIE_NEAR/CLUSTER/BREAK_RUN/POST_REV)
+# server.py — Volatility-Adaptive + Tie-aware Signals
 # Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
-# requirements.txt:
-# Flask==3.0.3
-# gunicorn==21.2.0
-# line-bot-sdk==3.11.0
-# Pillow==10.4.0
+# Requirements:
+#   Flask==3.0.3
+#   gunicorn==21.2.0
+#   line-bot-sdk==3.11.0
+#   Pillow==10.4.0
 
 import os, csv, time, logging, random, string, re, math
 from typing import List, Dict, Tuple, Optional
@@ -12,8 +12,11 @@ from collections import deque
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file
+
+# Pillow 只在畫大路時用到；若沒安裝會在啟動時丟錯，請確保 requirements 有 Pillow
 from PIL import Image, ImageDraw
 
+# -------------------- Flask 基本設定 --------------------
 app = Flask(__name__)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -21,7 +24,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bgs")
 
-# -------------------- Writable paths --------------------
+# -------------------- 路徑（Render Free 無法寫 /data，改判斷可寫目錄） --------------------
 def _is_writable(p: str) -> bool:
     try:
         os.makedirs(p, exist_ok=True)
@@ -91,7 +94,6 @@ USER_TRIAL_START: Dict[str, float]     = {}
 USER_ACTIVATED:   Dict[str, bool]      = {}
 USER_CODE:        Dict[str, str]       = {}
 USER_BANKROLL:    Dict[str, int]       = {}
-_LAST_HIT:        Dict[str, float]     = {}
 
 def now_ts() -> float: return time.time()
 
@@ -107,19 +109,7 @@ def trial_ok(uid: str) -> bool:
     start = USER_TRIAL_START.get(uid, now_ts())
     return (now_ts() - start) / 60.0 <= TRIAL_MINUTES
 
-def try_activate(uid: str, text: str) -> bool:
-    code = (text or "").strip().upper().replace(" ", "")
-    if not ACCOUNT_REGEX.fullmatch(code):
-        return False
-    if code in GLOBAL_CODES:
-        USER_ACTIVATED[uid] = True
-        USER_CODE[uid] = code
-        log.info("[ACT] uid=%s activated with code=%s (permanent)", uid, code)
-        return True
-    return False
-
 def _mk_code() -> str:
-    import random, string
     return "".join(random.choices(string.ascii_uppercase, k=5)) + \
            "".join(random.choices(string.digits, k=5))
 
@@ -146,12 +136,12 @@ def _save_codes_to_file(path: str, codes: set):
         log.warning("save codes failed: %s", e)
 
 def init_activation_codes(base_dir: str):
+    """ENV 沒提供 ACTIVATION_CODES 時，啟動自動生成 30 組永久碼存到 codes.txt。"""
     global CODES_FILE, GLOBAL_CODES
     CODES_FILE = os.path.join(base_dir, "codes.txt")
 
     env_codes = os.getenv("ACTIVATION_CODES", "").strip()
     if env_codes:
-        GLOBAL_CODES.clear()
         for token in env_codes.replace(" ", ",").replace("，", ",").split(","):
             t = token.strip().upper()
             if ACCOUNT_REGEX.fullmatch(t):
@@ -160,21 +150,31 @@ def init_activation_codes(base_dir: str):
         log.info("[ACT] Loaded %d codes from ENV (permanent).", len(GLOBAL_CODES))
         return
 
+    # 沒給就從檔案讀，檔案也沒有就生成 30 組
     GLOBAL_CODES = _load_codes_from_file(CODES_FILE)
-    if GLOBAL_CODES:
+    if not GLOBAL_CODES:
+        while len(GLOBAL_CODES) < 30:
+            GLOBAL_CODES.add(_mk_code())
+        _save_codes_to_file(CODES_FILE, GLOBAL_CODES)
+        log.info("[ACT] Generated %d activation codes (permanent). Stored in %s", len(GLOBAL_CODES), CODES_FILE)
+        for c in sorted(GLOBAL_CODES):
+            log.info("[ACT-CODE] %s", c)
+    else:
         log.info("[ACT] Loaded %d codes from file (permanent).", len(GLOBAL_CODES))
-        return
 
-    while len(GLOBAL_CODES) < 30:
-        GLOBAL_CODES.add(_mk_code())
-    _save_codes_to_file(CODES_FILE, GLOBAL_CODES)
-    log.info("[ACT] Generated %d activation codes (permanent). See logs.", len(GLOBAL_CODES))
-    for c in sorted(GLOBAL_CODES):
-        log.info("[ACT-CODE] %s", c)
+def try_activate(uid: str, text: str) -> bool:
+    code = (text or "").strip().upper().replace(" ", "")
+    if not ACCOUNT_REGEX.fullmatch(code): return False
+    if code in GLOBAL_CODES:
+        USER_ACTIVATED[uid] = True
+        USER_CODE[uid] = code
+        log.info("[ACT] uid=%s activated with code=%s", uid, code)
+        return True
+    return False
 
 init_activation_codes(BASE)
 
-# -------------------- 解析 --------------------
+# -------------------- 解析/格式 --------------------
 def zh_to_bpt(ch: str) -> Optional[str]:
     if ch in ("莊","B","b"): return "B"
     if ch in ("閒","P","p"): return "P"
@@ -202,7 +202,8 @@ def parse_bankroll(text: str) -> Optional[int]:
     except: return None
 
 def format_money(x: float) -> str:
-    return f"{int(round(x / max(1, ROUND_TO))) * max(1, ROUND_TO):,}"
+    rt = max(1, ROUND_TO)
+    return f"{int(round(x / rt)) * rt:,}"
 
 # -------------------- 機率基底 --------------------
 def norm(v: List[float]) -> List[float]:
@@ -236,7 +237,7 @@ def exp_decay_freq(seq: List[str], gamma: Optional[float]=None) -> List[float]:
     S=wB+wP+wT
     return [wB/S, wP/S, wT/S]
 
-# -------------------- 大路 --------------------
+# -------------------- 大路（Big Road） --------------------
 def build_big_road(seq: List[str]) -> List[Dict]:
     cols=[]; cur=None; length=0; ties=0
     for r in seq:
@@ -291,12 +292,6 @@ def _volatility_score(seq: List[str]) -> Tuple[float, dict]:
     return vol, {"window":win, "entropy":ent, "alt_rate":alt, "score":vol}
 
 # -------------------- Tie-aware helpers --------------------
-def _last_index(items: List[str], target: str) -> int:
-    for i in range(len(items)-1, -1, -1):
-        if items[i] == target:
-            return i
-    return -1
-
 def _last_k_has(items: List[str], target: str, k:int) -> bool:
     s = items[-k:] if len(items)>=k else items[:]
     return target in s
@@ -450,9 +445,8 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult["T"] *= g
             dbg["T_CLUSTER"] = {"win": T_CLUSTER_WIN, "cnt": tcnt, "th": T_CLUSTER_TH, "gain": g}
 
-    # 3) T 夾在龍中（… X X T X …）→ 視為斷龍傾向
+    # 3) T 夾在龍中（… X X T X …）→ 傾向視為斷龍
     if n >= 3 and seq[-2] == "T" and seq[-1] in ("B","P"):
-        # 判斷 T 前一段 run 的主色
         pre_sym, pre_len = _run_length_tail(seq[:-1], 1)  # 不含最後一手
         if pre_sym in ("B","P") and pre_len >= 2:
             opp = "B" if pre_sym=="P" else "P"
@@ -460,7 +454,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult[opp] *= g
             dbg["T_BREAK_RUN"] = {"pre_sym": pre_sym, "pre_len": pre_len, "target": opp, "gain": g}
 
-    # 4) X–T–Y（Y ≠ X）→ 常見為「和後反轉」，偏向 Y（也能處理你提的 B–T–P–B–P–P 類型）
+    # 4) X–T–Y（Y ≠ X）→ 常見「和後反轉」，偏向 Y
     if n >= 3 and seq[-2] == "T" and seq[-3] in ("B","P") and seq[-1] in ("B","P") and seq[-3] != seq[-1]:
         y = seq[-1]
         g = (T_POST_REV_GAIN * sig_scale)
@@ -514,7 +508,6 @@ def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     p[2] = min(T_CAP, max(T_FLOOR, p[2]))
 
     p=norm(p)
-
     p=temperature(p, float(os.getenv("TEMP","1.02")))
     floor=float(os.getenv("EPSILON_FLOOR","0.04"))
     cap=float(os.getenv("MAX_CAP","0.92"))
@@ -608,7 +601,7 @@ def root(): return "ok", 200
 @app.route("/health", methods=["GET", "HEAD"])
 @app.route("/health/", methods=["GET", "HEAD"])
 def health():
-    return {"status": "healthy", "csv": CSV_PATH}, 200
+    return {"status": "healthy", "csv": CSV_PATH, "base_dir": BASE}, 200
 
 @app.post("/predict")
 def api_predict():
@@ -653,7 +646,7 @@ def road_image():
     png=render_big_road_png(seq)
     return send_file(BytesIO(png), mimetype="image/png", download_name="road.png")
 
-# -------------------- LINE（可選） --------------------
+# -------------------- LINE（可選；未設憑證則不處理事件） --------------------
 LINE_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_SECRET=os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -682,7 +675,9 @@ def reply_or_push(event, messages):
 
 @app.post("/line-webhook")
 def webhook():
-    if not USE_LINE or handler is None: return "ok", 200
+    if not USE_LINE or handler is None: 
+        # 未啟用 LINE 時仍回 200，避免 LINE Verify 失敗
+        return "ok", 200
     sig=request.headers.get("X-Line-Signature","")
     body=request.get_data(as_text=True)
     try:
@@ -698,6 +693,7 @@ if USE_LINE and handler is not None:
         text=(event.message.text or "").strip()
         ensure_user(uid)
 
+        # 試用 & 開通
         if not trial_ok(uid):
             if try_activate(uid, text):
                 reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
@@ -707,6 +703,7 @@ if USE_LINE and handler is not None:
             ))
             return
 
+        # 初次先要本金
         if uid not in USER_BANKROLL or USER_BANKROLL.get(uid, 0) <= 0:
             amt = parse_bankroll(text)
             if amt is None:
@@ -720,6 +717,7 @@ if USE_LINE and handler is not None:
             ))
             return
 
+        # 快捷：大路圖
         if text in ("路圖","大路","road","Road"):
             base=os.getenv("BACKEND_URL","").rstrip("/")
             if not base:
@@ -729,6 +727,7 @@ if USE_LINE and handler is not None:
             reply_or_push(event, ImageSendMessage(original_content_url=url, preview_image_url=url))
             return
 
+        # 控制命令
         if text == "結束分析":
             USER_HISTORY[uid]=[]
             USER_READY[uid]=False
@@ -745,6 +744,7 @@ if USE_LINE and handler is not None:
 
         seq_add = parse_text_seq(text)
 
+        # 準備期：收歷史、等待開始
         if not USER_READY[uid]:
             if seq_add:
                 cur = USER_HISTORY[uid]
@@ -770,6 +770,7 @@ if USE_LINE and handler is not None:
             ))
             return
 
+        # 已開始分析：逐手回覆
         if seq_add:
             for hand in seq_add:
                 before = "".join(USER_HISTORY[uid])
@@ -803,6 +804,7 @@ if USE_LINE and handler is not None:
             reply_or_push(event, TextSendMessage(text=msg))
             return
 
+        # 非預期文字
         reply_or_push(event, TextSendMessage(
             text="🤔 我看不出有莊/閒/和（或 B/P/T）。\n已開始分析時，請直接輸入當前開出結果即可，例如「莊」或「P」。"
         ))
