@@ -1,4 +1,4 @@
-# server.py — Fast pattern engine (ALT/DBL/DRAGON/MOMENTUM/CHOP/CHANGE)
+# server.py — Volatility-Adaptive (irregular turbo) + Fast signals
 # Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
 # requirements.txt:
 # Flask==3.0.3
@@ -6,7 +6,7 @@
 # line-bot-sdk==3.11.0
 # Pillow==10.4.0
 
-import os, csv, time, logging, random, string, re
+import os, csv, time, logging, random, string, re, math
 from typing import List, Dict, Tuple, Optional
 from collections import deque
 from io import BytesIO
@@ -94,7 +94,6 @@ USER_CODE:        Dict[str, str]       = {}
 USER_BANKROLL:    Dict[str, int]       = {}
 _LAST_HIT:        Dict[str, float]     = {}
 
-# -------------------- 小工具 --------------------
 def now_ts() -> float: return time.time()
 
 def ensure_user(uid: str):
@@ -271,6 +270,32 @@ def _run_length_tail(seq: List[str], k:int=1):
     blocks.appendleft((cur,cnt))
     return blocks[-k] if 0<k<=len(blocks) else (None,0)
 
+# -------------------- Volatility 指標 --------------------
+def _entropy_bp(s: List[str]) -> float:
+    # Shannon entropy on {B,P} ignoring T
+    a=[x for x in s if x in ("B","P")]
+    if not a: return 0.0
+    pB=a.count("B")/len(a); pP=1.0-pB
+    ent=0.0
+    for p in (pB,pP):
+        if p>1e-12: ent -= p*math.log2(p)
+    return ent  # 0~1
+
+def _alt_rate(s: List[str]) -> float:
+    a=[x for x in s if x in ("B","P")]
+    if len(a)<2: return 0.0
+    alt=sum(1 for i in range(1,len(a)) if a[i]!=a[i-1])
+    return alt/(len(a)-1)
+
+def _volatility_score(seq: List[str]) -> Tuple[float, dict]:
+    win=int(os.getenv("VOL_WIN","8"))
+    s=seq[-win:] if len(seq)>=win else seq[:]
+    ent=_entropy_bp(s)           # 0~1
+    alt=_alt_rate(s)             # 0~1
+    # 結合：不規律 = 高熵且高交替
+    vol = max(0.0, min(1.0, 0.6*ent + 0.4*alt))
+    return vol, {"window":win, "entropy":ent, "alt_rate":alt, "score":vol}
+
 # -------------------- 快速 signals 引擎 --------------------
 def _is_alt_dense(seq: List[str], win:int) -> bool:
     if len(seq) < 3: return False
@@ -279,14 +304,12 @@ def _is_alt_dense(seq: List[str], win:int) -> bool:
     for i in range(1, len(s)):
         if s[i] != s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"):
             alts += 1
-    return alts >= max(2, len(s)-1)  # 幾乎每步都在交替
+    return alts >= max(2, len(s)-1)
 
 def _is_double_jump(seed: List[str]) -> bool:
-    # …A A B B / …B B A A 型，允許未滿 4 但已成形邊緣（3 格）
     s = [x for x in seed if x in ("B","P")]
     n = len(s)
     if n < 3: return False
-    a,b = s[-1], s[-2]
     if n >= 4 and s[-1]==s[-2] and s[-3]!=s[-2] and s[-3]==s[-4]:
         return True
     if n >= 3 and s[-1]==s[-2] and s[-3]!=s[-2]:
@@ -294,7 +317,6 @@ def _is_double_jump(seed: List[str]) -> bool:
     return False
 
 def _cusum_change(seq: List[str], w:int=8) -> int:
-    # 簡易 CUSUM：後半 vs 前半 的 B-P 差，回傳偏向 B(+)/P(-) 的符號
     s = [x for x in seq if x in ("B","P")]
     if len(s) < 4: return 0
     cut = s[-w:] if len(s) >= w else s[:]
@@ -305,12 +327,7 @@ def _cusum_change(seq: List[str], w:int=8) -> int:
     if abs(d) <= 0: return 0
     return 1 if d > 0 else -1
 
-def signals(seq: List[str], cols: List[Dict]) -> Tuple[Dict[str,float], Dict[str,float]]:
-    """
-    回傳 (multiplier, debug_detail)
-    multiplier: {"B":x, "P":y, "T":z}
-    debug_detail: 每個 signal 的倍率，便於 /predict_debug 顯示
-    """
+def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,float]]:
     mult = {"B":1.0,"P":1.0,"T":1.0}
     dbg  = {}
 
@@ -318,152 +335,168 @@ def signals(seq: List[str], cols: List[Dict]) -> Tuple[Dict[str,float], Dict[str
     if n < 2:
         return mult, dbg
 
-    # === 參數（靈敏度） ===
+    # 靈敏度（基礎）
     ALT_WIN      = int(os.getenv("ALT_WINDOW", "5"))
-    ALT_GAIN     = float(os.getenv("ALT_GAIN", "1.10"))
-    ALT_LEAD     = float(os.getenv("ALT_LEAD", "1.05"))  # 交替即將出現時的前導
-
-    DBL_GAIN     = float(os.getenv("DBL_GAIN", "1.08"))
-
+    ALT_GAIN     = float(os.getenv("ALT_GAIN", "1.12"))
+    ALT_LEAD     = float(os.getenv("ALT_LEAD", "1.06"))
+    DBL_GAIN     = float(os.getenv("DBL_GAIN", "1.10"))
     MOM_WIN      = int(os.getenv("MOMENTUM_WIN", "8"))
-    MOM_BONUS    = float(os.getenv("MOMENTUM_BONUS", "0.04"))  # 依差值轉為倍率
-
+    MOM_BONUS    = float(os.getenv("MOMENTUM_BONUS", "0.05"))
     CHOP_WIN     = int(os.getenv("CHOP_WINDOW", "6"))
-    CHOP_GAIN    = float(os.getenv("CHOP_GAIN", "1.06"))
+    CHOP_GAIN    = float(os.getenv("CHOP_GAIN", "1.08"))
 
-    # DRAGON（跟/斷）雙通道 + 權重
     DR_FOLLOW_LEN   = int(os.getenv("DRAGON_FOLLOW_LEN", "3"))
-    DR_FOLLOW_STEP  = float(os.getenv("DRAGON_FOLLOW_STEP", "0.03"))  # 跟龍每多 1 長度增加倍率
-    DR_BREAK_PRE    = int(os.getenv("DRAGON_BREAK_PREEMPT", "2"))     # 從多早開始預告斷
-    DR_BREAK_STEP   = float(os.getenv("DRAGON_BREAK_STEP", "0.06"))   # 斷龍每多 1 長度增加倍率
-    DR_FOLLOW_W     = float(os.getenv("DRAGON_FOLLOW_W", "0.6"))
-    DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.0"))       # 預設偏向斷（更靈敏）
+    DR_FOLLOW_STEP  = float(os.getenv("DRAGON_FOLLOW_STEP", "0.03"))
+    DR_BREAK_PRE    = int(os.getenv("DRAGON_BREAK_PREEMPT", "2"))
+    DR_BREAK_STEP   = float(os.getenv("DRAGON_BREAK_STEP", "0.08"))
+    DR_FOLLOW_W     = float(os.getenv("DRAGON_FOLLOW_W", "0.5"))
+    DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.1"))
 
-    # 是否關閉大類 signal
-    DISABLE_ALT  = os.getenv("DISABLE_ALT", "0") == "1"
-    DISABLE_DBL  = os.getenv("DISABLE_DBL", "0") == "1"
-    DISABLE_MOM  = os.getenv("DISABLE_MOMENTUM", "0") == "1"
-    DISABLE_CHOP = os.getenv("DISABLE_CHOP", "0") == "1"
-    DISABLE_DR   = os.getenv("DISABLE_DRAGON", "0") == "1"
+    # 依波動加成倍率
+    VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))  # vol=1 → 所有 signal 增乘 (1+0.5)=1.5x
+    vol, volmeta = _volatility_score(seq)
+    sig_scale = (1.0 + VOL_SIG_BOOST * vol)
 
     a, b = seq[-1], seq[-2]
 
-    # === ALT：交替密度高，提前壓相反 ===
-    if not DISABLE_ALT:
-        if _is_alt_dense(seq, ALT_WIN):
-            # 交替密集 → 下一手押相反
-            opp = "B" if a=="P" else "P" if a=="B" else None
-            if opp:
-                mult[opp] *= ALT_GAIN
-                dbg["ALT"] = {"target": opp, "gain": ALT_GAIN, "mode":"dense"}
-        else:
-            # 邊緣前導：最近 2 手不同 → 小幅度提早押相反
-            if a != b and a in ("B","P") and b in ("B","P"):
-                opp = "B" if a=="P" else "P"
-                mult[opp] *= ALT_LEAD
-                dbg["ALT"] = {"target": opp, "gain": ALT_LEAD, "mode":"lead"}
-
-    # === DBL：雙跳（含 3 格邊緣） ===
-    if not DISABLE_DBL and _is_double_jump(seq):
+    # ALT
+    if _is_alt_dense(seq, ALT_WIN):
         opp = "B" if a=="P" else "P" if a=="B" else None
         if opp:
-            mult[opp] *= DBL_GAIN
-            dbg["DBL"] = {"target": opp, "gain": DBL_GAIN}
+            g = ALT_GAIN * sig_scale
+            mult[opp] *= g
+            dbg["ALT"] = {"target": opp, "gain": g, "mode":"dense"}
+    else:
+        if a != b and a in ("B","P") and b in ("B","P"):
+            opp = "B" if a=="P" else "P"
+            g = ALT_LEAD * sig_scale
+            mult[opp] *= g
+            dbg["ALT"] = {"target": opp, "gain": g, "mode":"lead"}
 
-    # === MOMENTUM：最近 W 手誰優勢 ===
-    if not DISABLE_MOM and n >= 3:
+    # DBL
+    if _is_double_jump(seq):
+        opp = "B" if a=="P" else "P" if a=="B" else None
+        if opp:
+            g = DBL_GAIN * sig_scale
+            mult[opp] *= g
+            dbg["DBL"] = {"target": opp, "gain": g}
+
+    # MOMENTUM
+    if n >= 3:
         s = [x for x in (seq[-MOM_WIN:] if n>=MOM_WIN else seq) if x in ("B","P")]
         if len(s) >= 3:
             diff = s.count("B") - s.count("P")
             if diff != 0:
                 side = "B" if diff>0 else "P"
-                gain = 1.0 + min(0.12, abs(diff) * MOM_BONUS)
+                gain = (1.0 + min(0.15, abs(diff) * MOM_BONUS)) * sig_scale
                 mult[side] *= gain
                 dbg["MOM"] = {"target": side, "gain": gain, "diff": diff}
 
-    # === CHOP：碎切盤（短窗交替很多） ===
-    if not DISABLE_CHOP and n >= 4:
+    # CHOP
+    if n >= 4:
         s = seq[-CHOP_WIN:] if n>=CHOP_WIN else seq
         alt_cnt = sum(1 for i in range(1,len(s)) if s[i]!=s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"))
         if alt_cnt >= max(2, len(s)//2):
             opp = "B" if a=="P" else "P" if a=="B" else None
             if opp:
-                mult[opp] *= CHOP_GAIN
-                dbg["CHOP"] = {"target": opp, "gain": CHOP_GAIN, "alts": alt_cnt}
+                g = CHOP_GAIN * sig_scale
+                mult[opp] *= g
+                dbg["CHOP"] = {"target": opp, "gain": g, "alts": alt_cnt}
 
-    # === DRAGON：跟 or 斷（線性合成，更靈敏） ===
-    if not DISABLE_DR:
-        sym, run = _run_length_tail(seq,1)
-        if sym in ("B","P") and run >= 1:
-            # 跟龍分數：run >= F_LEN 後，隨 run 線性成長
-            follow_gain = 1.0
-            if run >= DR_FOLLOW_LEN:
-                follow_gain += DR_FOLLOW_STEP * (run - (DR_FOLLOW_LEN - 1))
-            # 斷龍分數：run >= BREAK_PRE 就開始升
-            break_gain = 1.0
-            if run >= DR_BREAK_PRE:
-                break_gain += DR_BREAK_STEP * (run - (DR_BREAK_PRE - 1))
-            # 線性合成
-            follow_side = sym
-            break_side  = "B" if sym=="P" else "P"
-            # 安全夾限
-            follow_gain = max(1.0, min(1.6, follow_gain))
-            break_gain  = max(1.0, min(1.8, break_gain))
-            # 寫入
-            mult[follow_side] *= pow(follow_gain, DR_FOLLOW_W)
-            mult[break_side]  *= pow(break_gain,  DR_BREAK_W)
-            dbg["DRAGON"] = {
-                "run": run,
-                "follow": {"side": follow_side, "gain": follow_gain, "w": DR_FOLLOW_W},
-                "break":  {"side": break_side,  "gain": break_gain,  "w": DR_BREAK_W},
-            }
+    # DRAGON
+    sym, run = _run_length_tail(seq,1)
+    if sym in ("B","P") and run >= 1:
+        follow_gain = 1.0
+        if run >= DR_FOLLOW_LEN:
+            follow_gain += DR_FOLLOW_STEP * (run - (DR_FOLLOW_LEN - 1))
+        break_gain = 1.0
+        if run >= DR_BREAK_PRE:
+            break_gain += DR_BREAK_STEP * (run - (DR_BREAK_PRE - 1))
+        follow_side = sym
+        break_side  = "B" if sym=="P" else "P"
+        follow_gain = max(1.0, min(1.7, follow_gain)) * sig_scale
+        break_gain  = max(1.0, min(1.9, break_gain))  * sig_scale
+        mult[follow_side] *= pow(follow_gain, DR_FOLLOW_W)
+        mult[break_side]  *= pow(break_gain,  DR_BREAK_W)
+        dbg["DRAGON"] = {
+            "run": run, "vol": volmeta,
+            "follow": {"side": follow_side, "gain": follow_gain, "w": DR_FOLLOW_W},
+            "break":  {"side": break_side,  "gain": break_gain,  "w": DR_BREAK_W},
+        }
 
-    # === CUSUM-風格轉向：偵測 B→P 或 P→B 的轉點，提早對沖 ===
+    # CUSUM change（轉向）
     chg = _cusum_change(seq, w=int(os.getenv("CHANGE_WIN","8")))
-    CHG_GAIN = float(os.getenv("CHANGE_GAIN","1.05"))
+    CHG_GAIN = float(os.getenv("CHANGE_GAIN","1.06")) * sig_scale
     if chg != 0:
-        if chg > 0:  # 後半偏 B
+        if chg > 0:
             mult["B"] *= CHG_GAIN
-            dbg["CHANGE"] = {"side":"B", "gain":CHG_GAIN}
-        else:        # 偏 P
+            dbg["CHANGE"] = {"side":"B", "gain":CHG_GAIN, "vol": volmeta}
+        else:
             mult["P"] *= CHG_GAIN
-            dbg["CHANGE"] = {"side":"P", "gain":CHG_GAIN}
+            dbg["CHANGE"] = {"side":"P", "gain":CHG_GAIN, "vol": volmeta}
 
     return mult, dbg
 
-# -------------------- 機率估計（融合 signals） --------------------
+# -------------------- 機率估計（Volatility 自適應融合） --------------------
 def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     if not seq:
         base=[THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
         return norm(base), {"base":base,"signals":{}}
 
+    # 基礎頻率
     short = recent_freq(seq, int(os.getenv("WIN_SHORT","6")))
-    longv = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.96")))
+    longv = exp_decay_freq(seq, float(os.getenv("EW_GAMMA","0.95")))
     prior = [THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
 
-    a=float(os.getenv("REC_W","0.40"))   # 調高短窗權重 → 更敏捷
-    b=float(os.getenv("LONG_W","0.20"))
-    c=float(os.getenv("PRIOR_W","0.10"))
-    p=[a*short[i]+b*longv[i]+c*prior[i] for i in range(3)]
-    p=norm(p)
+    # 讀取靜態權重
+    REC_W  = float(os.getenv("REC_W","0.40"))
+    LONG_W = float(os.getenv("LONG_W","0.20"))
+    PRIOR_W= float(os.getenv("PRIOR_W","0.10"))
 
-    cols = build_big_road(seq)
-    mult, dbg = signals(seq, cols)
+    # 波動評分
+    vol, volmeta = _volatility_score(seq)
+    # 依波動調權重：波動高 → 更信短窗，降長窗與先驗
+    VOL_REC_BOOST  = float(os.getenv("VOL_REC_BOOST","1.20"))  # vol=1 → REC_W *= (1+1.2)=2.2x
+    VOL_LONG_CUT   = float(os.getenv("VOL_LONG_CUT","0.80"))   # vol=1 → LONG_W *= (1-0.8)=0.2x
+    VOL_PRIOR_CUT  = float(os.getenv("VOL_PRIOR_CUT","0.80"))  # vol=1 → PRIOR_W *= 0.2x
 
+    rec_w  = REC_W  * (1.0 + VOL_REC_BOOST * vol)
+    long_w = LONG_W * (1.0 - VOL_LONG_CUT  * vol)
+    prior_w= PRIOR_W* (1.0 - VOL_PRIOR_CUT * vol)
+    # 安全夾限
+    rec_w  = max(0.05, min(2.5, rec_w))
+    long_w = max(0.00, min(1.0, long_w))
+    prior_w= max(0.00, min(0.8, prior_w))
+
+    base = [rec_w*short[i] + long_w*longv[i] + prior_w*prior[i] for i in range(3)]
+    base = norm(base)
+
+    # 行為 signals（已含波動放大）
+    mult, sdbg = signals(seq)
+
+    # 外部偏置
     biasB=float(os.getenv("BIAS_B","1.0"))
     biasP=float(os.getenv("BIAS_P","1.0"))
     biasT=float(os.getenv("BIAS_T","1.0"))
 
-    p=[p[0]*mult["B"]*biasB,
-       p[1]*mult["P"]*biasP,
-       p[2]*mult["T"]*biasT]
+    p=[base[0]*mult["B"]*biasB,
+       base[1]*mult["P"]*biasP,
+       base[2]*mult["T"]*biasT]
     p=norm(p)
 
-    p=temperature(p, float(os.getenv("TEMP","1.02")))  # 降低溫度 → 收斂更快
+    # 降溫/地板/封頂（輕度）
+    p=temperature(p, float(os.getenv("TEMP","1.02")))
     floor=float(os.getenv("EPSILON_FLOOR","0.04"))
     cap=float(os.getenv("MAX_CAP","0.92"))
     p=[min(cap, max(floor,x)) for x in p]
-    return norm(p), {"short":short,"longv":longv,"prior":prior,"signals":dbg,"blend":{"REC_W":a,"LONG_W":b,"PRIOR_W":c},"mult":mult}
+    p=norm(p)
+
+    return p, {
+        "volatility": volmeta,
+        "short":short,"longv":longv,"prior":prior,
+        "weights":{"REC_W":rec_w,"LONG_W":long_w,"PRIOR_W":prior_w},
+        "signals":sdbg,"mult":mult
+    }
 
 def recommend(p: List[float]) -> str:
     return CLASS_ORDER[p.index(max(p))]
@@ -560,7 +593,6 @@ def api_predict():
 def predict_debug():
     data = request.get_json(silent=True) or {}
     seq  = parse_text_seq(str(data.get("history", "")))
-
     p, detail = estimate_probs(seq)
     return jsonify({
         "len": len(seq),
