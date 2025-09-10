@@ -1,4 +1,10 @@
-Flask==3.0.3
-gunicorn==21.2.0
-line-bot-sdk==3.11.0
-Pillow==10.4.0
+Flask
+numpy
+pandas
+scikit-learn
+joblib
+line-bot-sdk
+# 可選（更快）
+xgboost
+lightgbm
+flask-cors
