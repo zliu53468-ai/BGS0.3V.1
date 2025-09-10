@@ -441,7 +441,7 @@ def home():
     if "application/json" in accept:
         return jsonify(status)
     # Graphical dashboard (pure HTML+JS)
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="zh-Hant"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BGS Dashboard</title>
