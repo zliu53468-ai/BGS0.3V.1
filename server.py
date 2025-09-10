@@ -56,7 +56,16 @@ def trial_check_and_maybe_warn(user_id: str, reply_fn):
         reply_fn(f"⏰ 試用已超過 {TRIAL_MINUTES} 分鐘，請完成登入或續期。若已完成登入但仍看到此訊息，輸入：RESET TRIAL")
 
 # ---------- Storage paths ----------
+# Resolve storage root. If DATA_ROOT is an absolute path we may not have permission on Render.
+# Try to create it; on failure, fall back to a local ./storage directory.
 ROOT = _Path(os.getenv("DATA_ROOT", "."))
+try:
+    (ROOT / ".probe").parent.mkdir(parents=True, exist_ok=True)
+    (ROOT / ".probe").write_text("ok", encoding="utf-8")
+    (ROOT / ".probe").unlink(missing_ok=True)
+except Exception:
+    # fallback to project-local storage
+    ROOT = _Path("./storage")
 DATA = ROOT / "data"; DATA.mkdir(parents=True, exist_ok=True)
 MODELS = ROOT / "models"; MODELS.mkdir(parents=True, exist_ok=True)
 REPORTS = ROOT / "reports"; REPORTS.mkdir(parents=True, exist_ok=True)
