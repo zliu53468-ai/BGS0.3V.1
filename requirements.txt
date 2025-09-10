@@ -1,10 +1,11 @@
 Flask
+flask-cors
 numpy
 pandas
 scikit-learn
 joblib
-line-bot-sdk
-# 可選（更快）
 xgboost
 lightgbm
-flask-cors
+line-bot-sdk
+gunicorn
+
