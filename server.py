@@ -1,22 +1,19 @@
-# server.py — Volatility-Adaptive + Tie-aware Signals + Low-Confidence Hold
-# Text-only LINE UX + Big Road PNG + Trial (30m) + Permanent Codes (30) + Kelly staking
+# server.py — Proactive 30m trial + persistent state + text-only LINE UX + Big Road PNG
 # Requirements:
 #   Flask==3.0.3
 #   gunicorn==21.2.0
 #   line-bot-sdk==3.11.0
 #   Pillow==10.4.0
 
-import os, csv, time, logging, random, string, re, math
+import os, csv, time, logging, random, string, re, math, threading, json
 from typing import List, Dict, Tuple, Optional
 from collections import deque
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file
-
-# Pillow 只在畫大路時用到；若沒安裝會在啟動時丟錯，請確保 requirements 有 Pillow
 from PIL import Image, ImageDraw
 
-# -------------------- Flask 基本設定 --------------------
+# -------------------- Flask / Logs --------------------
 app = Flask(__name__)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -24,7 +21,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bgs")
 
-# -------------------- 路徑（Render Free 無法寫 /data，改判斷可寫目錄） --------------------
+# -------------------- Writable base --------------------
 def _is_writable(p: str) -> bool:
     try:
         os.makedirs(p, exist_ok=True)
@@ -63,7 +60,6 @@ CLASS_ORDER = ("B","P","T")
 LAB_ZH = {"B":"莊","P":"閒","T":"和"}
 
 def _base_prior_from_env():
-    # 可由 ENV 覆蓋
     b = float(os.getenv("BASE_B", "0.458"))
     p = float(os.getenv("BASE_P", "0.446"))
     t = float(os.getenv("BASE_T", "0.096"))
@@ -73,12 +69,7 @@ def _base_prior_from_env():
     return {"B": b/s, "P": p/s, "T": t/s}
 
 THEORETICAL = _base_prior_from_env()
-# 支付賠率（可由 ENV 覆蓋，但預設沿用一般桌）
-PAYOUT = {
-    "B": float(os.getenv("PAYOUT_B", "0.95")),
-    "P": float(os.getenv("PAYOUT_P", "1.0")),
-    "T": float(os.getenv("PAYOUT_T", "8.0")),
-}
+PAYOUT = {"B":0.95, "P":1.0, "T":8.0}
 MAX_HISTORY = int(os.getenv("MAX_HISTORY","400"))
 
 # Kelly / 配注控制
@@ -87,34 +78,82 @@ MIN_BET_FRAC   = float(os.getenv("MIN_BET_FRAC","0.10"))   # >=10%
 MAX_BET_FRAC   = float(os.getenv("MAX_BET_FRAC","0.30"))   # <=30%
 ROUND_TO       = int(os.getenv("ROUND_TO","10"))
 
-# 試用與開通碼（永久）
-TRIAL_MINUTES  = int(os.getenv("TRIAL_MINUTES","30"))
-ACCOUNT_REGEX  = re.compile(r"^[A-Z]{5}\d{5}$")
-GLOBAL_CODES   = set()
-CODES_FILE     = os.path.join(BASE, "codes.txt")
+# 試用 & 開通碼（永久）
+TRIAL_MINUTES     = int(os.getenv("TRIAL_MINUTES","30"))
+TRIAL_SCAN_INTERVAL_SEC = int(os.getenv("TRIAL_SCAN_INTERVAL_SEC","30"))  # 背景掃描頻率
+ACCOUNT_REGEX     = re.compile(r"^[A-Z]{5}\d{5}$")
+GLOBAL_CODES      = set()
+CODES_FILE        = os.path.join(BASE, "codes.txt")
 
-# -------------------- 使用者狀態 --------------------
-USER_HISTORY:     Dict[str, List[str]] = {}
-USER_READY:       Dict[str, bool]      = {}
-USER_TRIAL_START: Dict[str, float]     = {}
-USER_ACTIVATED:   Dict[str, bool]      = {}
-USER_CODE:        Dict[str, str]       = {}
-USER_BANKROLL:    Dict[str, int]       = {}
+# 狀態持久化
+STATE_DIR         = os.path.join(BASE, "state")
+PERSIST_ENABLED   = os.getenv("PERSIST_STATE","1") != "0"
+
+# -------------------- 使用者狀態（記憶體） --------------------
+USER_HISTORY:      Dict[str, List[str]] = {}
+USER_READY:        Dict[str, bool]      = {}
+USER_TRIAL_START:  Dict[str, float]     = {}
+USER_ACTIVATED:    Dict[str, bool]      = {}
+USER_CODE:         Dict[str, str]       = {}
+USER_BANKROLL:     Dict[str, int]       = {}
+USER_TRIAL_WARNED: Dict[str, bool]      = {}
+ACTIVE_USERS:      set                  = set()
 
 def now_ts() -> float: return time.time()
 
+# -------------------- 狀態持久化 helpers --------------------
+def _state_path(uid: str) -> str:
+    return os.path.join(STATE_DIR, f"{uid}.json")
+
+def _load_state(uid: str) -> dict:
+    if not PERSIST_ENABLED: return {}
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        p = _state_path(uid)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning("load state failed uid=%s: %s", uid, e)
+    return {}
+
+def _save_state(uid: str):
+    if not PERSIST_ENABLED: return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        data = {
+            "trial_start": USER_TRIAL_START.get(uid),
+            "activated": USER_ACTIVATED.get(uid, False),
+            "code": USER_CODE.get(uid, ""),
+            "warned": USER_TRIAL_WARNED.get(uid, False),
+            "bankroll": USER_BANKROLL.get(uid, 0),
+        }
+        with open(_state_path(uid), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save state failed uid=%s: %s", uid, e)
+
 def ensure_user(uid: str):
+    # 先載入
+    st = _load_state(uid)
     USER_HISTORY.setdefault(uid, [])
     USER_READY.setdefault(uid, False)
-    USER_TRIAL_START.setdefault(uid, now_ts())
-    USER_ACTIVATED.setdefault(uid, False)
-    USER_CODE.setdefault(uid, "")
+    USER_TRIAL_START.setdefault(uid, st.get("trial_start", now_ts()))
+    USER_ACTIVATED.setdefault(uid, bool(st.get("activated", False)))
+    USER_CODE.setdefault(uid, st.get("code",""))
+    USER_TRIAL_WARNED.setdefault(uid, bool(st.get("warned", False)))
+    USER_BANKROLL.setdefault(uid, int(st.get("bankroll", 0)))
+    ACTIVE_USERS.add(uid)
+    # 若首次建立 trial_start，立即落地
+    if "trial_start" not in st:
+        _save_state(uid)
 
 def trial_ok(uid: str) -> bool:
     if USER_ACTIVATED.get(uid, False): return True
     start = USER_TRIAL_START.get(uid, now_ts())
     return (now_ts() - start) / 60.0 <= TRIAL_MINUTES
 
+# -------------------- 開通碼（永久 30 組；ENV 覆寫） --------------------
 def _mk_code() -> str:
     return "".join(random.choices(string.ascii_uppercase, k=5)) + \
            "".join(random.choices(string.digits, k=5))
@@ -142,7 +181,6 @@ def _save_codes_to_file(path: str, codes: set):
         log.warning("save codes failed: %s", e)
 
 def init_activation_codes(base_dir: str):
-    """ENV 沒提供 ACTIVATION_CODES 時，啟動自動生成 30 組永久碼存到 codes.txt。"""
     global CODES_FILE, GLOBAL_CODES
     CODES_FILE = os.path.join(base_dir, "codes.txt")
 
@@ -156,7 +194,6 @@ def init_activation_codes(base_dir: str):
         log.info("[ACT] Loaded %d codes from ENV (permanent).", len(GLOBAL_CODES))
         return
 
-    # 沒給就從檔案讀，檔案也沒有就生成 30 組
     GLOBAL_CODES = _load_codes_from_file(CODES_FILE)
     if not GLOBAL_CODES:
         while len(GLOBAL_CODES) < 30:
@@ -174,6 +211,8 @@ def try_activate(uid: str, text: str) -> bool:
     if code in GLOBAL_CODES:
         USER_ACTIVATED[uid] = True
         USER_CODE[uid] = code
+        USER_TRIAL_WARNED[uid] = True  # 之後不再推播試用到期
+        _save_state(uid)
         log.info("[ACT] uid=%s activated with code=%s", uid, code)
         return True
     return False
@@ -200,6 +239,7 @@ def parse_text_seq(text: str) -> List[str]:
     return res[-MAX_HISTORY:] if len(res)>MAX_HISTORY else res
 
 def parse_bankroll(text: str) -> Optional[int]:
+    import re
     nums = re.findall(r"\d+", text.replace(",", ""))
     if not nums: return None
     try:
@@ -211,7 +251,7 @@ def format_money(x: float) -> str:
     rt = max(1, ROUND_TO)
     return f"{int(round(x / rt)) * rt:,}"
 
-# -------------------- 機率基底 --------------------
+# -------------------- 機率/指標 --------------------
 def norm(v: List[float]) -> List[float]:
     s = sum(v); s = s if s>1e-12 else 1.0
     return [max(0.0, x)/s for x in v]
@@ -273,7 +313,7 @@ def _run_length_tail(seq: List[str], k:int=1):
     blocks.appendleft((cur,cnt))
     return blocks[-k] if 0<k<=len(blocks) else (None,0)
 
-# -------------------- Volatility 指標 --------------------
+# -------------------- Volatility --------------------
 def _entropy_bp(s: List[str]) -> float:
     a=[x for x in s if x in ("B","P")]
     if not a: return 0.0
@@ -297,12 +337,11 @@ def _volatility_score(seq: List[str]) -> Tuple[float, dict]:
     vol = max(0.0, min(1.0, 0.6*ent + 0.4*alt))
     return vol, {"window":win, "entropy":ent, "alt_rate":alt, "score":vol}
 
-# -------------------- Tie-aware helpers --------------------
 def _last_k_has(items: List[str], target: str, k:int) -> bool:
     s = items[-k:] if len(items)>=k else items[:]
     return target in s
 
-# -------------------- 快速 signals（含 Tie-aware） --------------------
+# -------------------- Signals（含 Tie-aware） --------------------
 def _is_alt_dense(seq: List[str], win:int) -> bool:
     if len(seq) < 3: return False
     s = seq[-win:] if len(seq) >= win else seq[:]
@@ -341,7 +380,6 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
     if n < 2:
         return mult, dbg
 
-    # 靈敏度（基礎）
     ALT_WIN      = int(os.getenv("ALT_WINDOW", "5"))
     ALT_GAIN     = float(os.getenv("ALT_GAIN", "1.12"))
     ALT_LEAD     = float(os.getenv("ALT_LEAD", "1.06"))
@@ -358,12 +396,11 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
     DR_FOLLOW_W     = float(os.getenv("DRAGON_FOLLOW_W", "0.5"))
     DR_BREAK_W      = float(os.getenv("DRAGON_BREAK_W", "1.1"))
 
-    # 依波動加成倍率
-    VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))  # vol=1 → signals *1.5
+    VOL_SIG_BOOST = float(os.getenv("VOL_SIG_BOOST","0.50"))
     vol, volmeta = _volatility_score(seq)
     sig_scale = (1.0 + VOL_SIG_BOOST * vol)
 
-    # ---- Tie-aware 參數 ----
+    # Tie-aware
     T_NEAR_WIN      = int(os.getenv("T_NEAR_WIN","5"))
     T_NEAR_GAIN     = float(os.getenv("T_NEAR_GAIN","1.06"))
     T_CLUSTER_WIN   = int(os.getenv("T_CLUSTER_WIN","10"))
@@ -374,7 +411,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
 
     a, b = seq[-1], seq[-2]
 
-    # === ALT（交替） ===
+    # ALT
     if _is_alt_dense(seq, ALT_WIN):
         opp = "B" if a=="P" else "P" if a=="B" else None
         if opp:
@@ -388,7 +425,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult[opp] *= g
             dbg["ALT"] = {"target": opp, "gain": g, "mode":"lead"}
 
-    # === DBL（雙跳） ===
+    # DBL
     if _is_double_jump(seq):
         opp = "B" if a=="P" else "P" if a=="B" else None
         if opp:
@@ -396,7 +433,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult[opp] *= g
             dbg["DBL"] = {"target": opp, "gain": g}
 
-    # === MOMENTUM ===
+    # MOMENTUM
     if n >= 3:
         s = [x for x in (seq[-MOM_WIN:] if n>=MOM_WIN else seq) if x in ("B","P")]
         if len(s) >= 3:
@@ -407,7 +444,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
                 mult[side] *= gain
                 dbg["MOM"] = {"target": side, "gain": gain, "diff": diff}
 
-    # === CHOP（碎切） ===
+    # CHOP
     if n >= 4:
         s = seq[-CHOP_WIN:] if n>=CHOP_WIN else seq
         alt_cnt = sum(1 for i in range(1,len(s)) if s[i]!=s[i-1] and s[i] in ("B","P") and s[i-1] in ("B","P"))
@@ -418,7 +455,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
                 mult[opp] *= g
                 dbg["CHOP"] = {"target": opp, "gain": g, "alts": alt_cnt}
 
-    # === DRAGON（跟 / 斷） ===
+    # DRAGON（跟 / 斷）
     sym, run = _run_length_tail(seq,1)
     if sym in ("B","P") and run >= 1:
         follow_gain = 1.0
@@ -435,14 +472,12 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
         mult[break_side]  *= pow(break_gain,  DR_BREAK_W)
         dbg["DRAGON"] = {"run": run, "follow": {"side": follow_side, "gain": follow_gain}, "break": {"side": break_side, "gain": break_gain}}
 
-    # === TIE-aware signals ===
-    # 1) 近距離有 T → 給 T 前導
+    # TIE-aware
     if _last_k_has(seq, "T", T_NEAR_WIN):
         g = (T_NEAR_GAIN * sig_scale)
         mult["T"] *= g
         dbg["T_NEAR"] = {"win": T_NEAR_WIN, "gain": g}
 
-    # 2) 窗內 T 密度高 → 增強 T
     if T_CLUSTER_WIN > 0:
         s = seq[-T_CLUSTER_WIN:] if len(seq)>=T_CLUSTER_WIN else seq[:]
         tcnt = s.count("T")
@@ -451,16 +486,14 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
             mult["T"] *= g
             dbg["T_CLUSTER"] = {"win": T_CLUSTER_WIN, "cnt": tcnt, "th": T_CLUSTER_TH, "gain": g}
 
-    # 3) T 夾在龍中（… X X T X …）→ 偏斷
     if n >= 3 and seq[-2] == "T" and seq[-1] in ("B","P"):
-        pre_sym, pre_len = _run_length_tail(seq[:-1], 1)  # 不含最後一手
+        pre_sym, pre_len = _run_length_tail(seq[:-1], 1)
         if pre_sym in ("B","P") and pre_len >= 2:
             opp = "B" if pre_sym=="P" else "P"
             g = (T_BREAK_GAIN * sig_scale)
             mult[opp] *= g
             dbg["T_BREAK_RUN"] = {"pre_sym": pre_sym, "pre_len": pre_len, "target": opp, "gain": g}
 
-    # 4) X–T–Y（Y ≠ X）→ 「和後反轉」，偏向 Y
     if n >= 3 and seq[-2] == "T" and seq[-3] in ("B","P") and seq[-1] in ("B","P") and seq[-3] != seq[-1]:
         y = seq[-1]
         g = (T_POST_REV_GAIN * sig_scale)
@@ -469,7 +502,7 @@ def signals(seq: List[str]) -> Tuple[Dict[str,float], Dict[str,dict]]:
 
     return mult, dbg
 
-# -------------------- 機率估計（Volatility + Tie floor/cap） --------------------
+# -------------------- 機率估計 --------------------
 def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
     if not seq:
         base=[THEORETICAL["B"],THEORETICAL["P"],THEORETICAL["T"]]
@@ -508,7 +541,7 @@ def estimate_probs(seq: List[str]) -> Tuple[List[float], Dict]:
        base[1]*mult["P"]*biasP,
        base[2]*mult["T"]*biasT]
 
-    # T 專屬 floor/cap
+    # T floor/cap
     T_FLOOR = float(os.getenv("T_FLOOR","0.05"))
     T_CAP   = float(os.getenv("T_CAP","0.40"))
     p[2] = min(T_CAP, max(T_FLOOR, p[2]))
@@ -543,7 +576,7 @@ def stake_amount(bankroll: int, rec: str, p: List[float]) -> Tuple[float, float]
     amt = bankroll * f
     return f, amt
 
-# -------------------- CSV 紀錄 --------------------
+# -------------------- CSV --------------------
 def append_round_csv(uid:str, history_before:str, label:str):
     if os.getenv("EXPORT_LOGS","1")!="1": return
     try:
@@ -553,7 +586,7 @@ def append_round_csv(uid:str, history_before:str, label:str):
     except Exception as e:
         log.warning("append csv fail: %s", e)
 
-# -------------------- 大路圖像 --------------------
+# -------------------- Big Road PNG --------------------
 def build_big_road_cols(seq: List[str]) -> List[Dict]:
     return build_big_road(seq)
 
@@ -652,7 +685,7 @@ def road_image():
     png=render_big_road_png(seq)
     return send_file(BytesIO(png), mimetype="image/png", download_name="road.png")
 
-# -------------------- LINE（可選；未設憑證則不處理事件） --------------------
+# -------------------- LINE 啟用與事件 --------------------
 LINE_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
 LINE_SECRET=os.getenv("LINE_CHANNEL_SECRET","")
 USE_LINE=False
@@ -681,8 +714,7 @@ def reply_or_push(event, messages):
 
 @app.post("/line-webhook")
 def webhook():
-    if not USE_LINE or handler is None: 
-        # 未啟用 LINE 時仍回 200，避免 LINE Verify 失敗
+    if not USE_LINE or handler is None:
         return "ok", 200
     sig=request.headers.get("X-Line-Signature","")
     body=request.get_data(as_text=True)
@@ -692,6 +724,37 @@ def webhook():
         log.error("LINE handle error: %s", e)
     return "ok", 200
 
+# ---- 背景：試用到時主動推播（僅 LINE 啟用時） ----
+def _trial_watcher():
+    log.info("[TRIAL] watcher started, interval=%ss, minutes=%s", TRIAL_SCAN_INTERVAL_SEC, TRIAL_MINUTES)
+    while True:
+        try:
+            if USE_LINE and line_bot_api is not None:
+                now = now_ts()
+                for uid in list(ACTIVE_USERS):
+                    if not USER_ACTIVATED.get(uid, False):
+                        start = USER_TRIAL_START.get(uid, now)
+                        expired = (now - start) >= TRIAL_MINUTES*60
+                        if expired and not USER_TRIAL_WARNED.get(uid, False):
+                            try:
+                                line_bot_api.push_message(uid, TextSendMessage(
+                                    text="⏰ 試用時間已滿 30 分鐘。\n若要繼續使用，請加管理員 LINE：@jins888 取得開通帳號（5字母+5數字），或直接貼上開通碼解鎖。🔐"
+                                ))
+                                USER_TRIAL_WARNED[uid] = True
+                                _save_state(uid)
+                                log.info("[TRIAL] warned uid=%s", uid)
+                            except Exception as e:
+                                log.warning("[TRIAL] push warn fail uid=%s: %s", uid, e)
+            time.sleep(TRIAL_SCAN_INTERVAL_SEC)
+        except Exception as e:
+            log.error("[TRIAL] watcher loop error: %s", e)
+            time.sleep(TRIAL_SCAN_INTERVAL_SEC)
+
+if USE_LINE:
+    t = threading.Thread(target=_trial_watcher, daemon=True)
+    t.start()
+
+# ---- LINE 文字事件 ----
 if USE_LINE and handler is not None:
     @handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
@@ -699,17 +762,19 @@ if USE_LINE and handler is not None:
         text=(event.message.text or "").strip()
         ensure_user(uid)
 
-        # 試用 & 開通
+        # 先試開通碼（任何時刻輸入都可解鎖）
+        if try_activate(uid, text):
+            reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
+            return
+
+        # 試用時限檢查（過期就只回引導）
         if not trial_ok(uid):
-            if try_activate(uid, text):
-                reply_or_push(event, TextSendMessage(text="✅ 已解鎖，歡迎繼續使用！🔓"))
-                return
             reply_or_push(event, TextSendMessage(
                 text="⏳ 試用已結束。\n請加管理員 LINE：@jins888 取得開通帳號，或直接貼上你的開通帳號（5字母+5數字）解鎖。🔐"
             ))
             return
 
-        # 初次先要本金
+        # 初次：需要本金
         if uid not in USER_BANKROLL or USER_BANKROLL.get(uid, 0) <= 0:
             amt = parse_bankroll(text)
             if amt is None:
@@ -718,6 +783,7 @@ if USE_LINE and handler is not None:
                 ))
                 return
             USER_BANKROLL[uid] = amt
+            _save_state(uid)
             reply_or_push(event, TextSendMessage(
                 text=f"👍 已設定本金：{amt:,} 元。接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入「開始分析」即可！🚀"
             ))
@@ -792,34 +858,18 @@ if USE_LINE and handler is not None:
             dt=int((time.time()-t0)*1000)
 
             bankroll = USER_BANKROLL.get(uid, 0)
-
-            # --- 低信心「觀望」策略（由 ENV 控制，0=關）---
-            edge_min = float(os.getenv("CONF_EDGE_MIN", "0"))      # p_max - p_2nd < edge_min → 觀望
-            t_max    = float(os.getenv("CONF_T_MAX", "1.0"))       # p_T > t_max → 觀望
-            p_sorted = sorted(p, reverse=True)
-            edge     = p_sorted[0] - p_sorted[1]
-            low_conf = (edge_min > 0 and edge < edge_min) or (p[2] > t_max)
-
-            if low_conf:
-                frac, amt = 0.0, 0.0
-            else:
-                frac, amt = stake_amount(bankroll, rec, p)
+            frac, amt = stake_amount(bankroll, rec, p)
 
             def qamt(f): 
                 return format_money(bankroll * f)
             quick_line = f"🧮 10%={qamt(0.10)}｜20%={qamt(0.20)}｜30%={qamt(0.30)}"
-
-            if low_conf:
-                advise = "⚠️ 低信心區，建議觀望一手，等待走勢更明朗再下。"
-            else:
-                advise = f"✅ 建議下注：{format_money(amt)} ＝ {bankroll:,} × {frac*100:.1f}%"
 
             msg = (
                 f"📊 已解析 {len(seq)} 手（{dt} ms）\n"
                 f"機率：莊 {p[0]:.3f}｜閒 {p[1]:.3f}｜和 {p[2]:.3f}\n"
                 f"👉 下一手建議：{LAB_ZH[rec]} 🎯\n"
                 f"💵 本金：{bankroll:,}\n"
-                f"{advise}\n"
+                f"✅ 建議下注：{format_money(amt)} ＝ {bankroll:,} × {frac*100:.1f}%\n"
                 f"{quick_line}\n"
                 f"🔁 直接輸入下一手結果（莊/閒/和 或 B/P/T），我會再幫你算下一局。"
             )
