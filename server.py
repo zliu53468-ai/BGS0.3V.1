@@ -13,6 +13,31 @@ from io import BytesIO
 from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw
 
+
+# ==== Hot-train imports (新增) ====
+import threading
+from pathlib import Path as _Path
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+ROOT = _Path('.')
+DATA = ROOT / 'data'
+MODELS = ROOT / 'models'
+REPORTS = ROOT / 'reports'
+for _p in (DATA, MODELS, REPORTS): _p.mkdir(exist_ok=True)
+SEED_CSV   = DATA / 'seed.csv'
+SIM_ROWS   = DATA / 'sim_rows.csv'
+MODEL_PATH = MODELS / 'baseline.joblib'
+PRIORS_JSON= REPORTS / 'priors.json'
+_hot_lock = threading.Lock()
+_hot_training = False
+_hot_last_metrics = None
+OUTMAP = {"B":0, "P":1, "T":2}
+# ==== Hot-train imports (新增) 結束 ====
+
+
 # -------------------- Flask / Logs --------------------
 app = Flask(__name__)
 logging.basicConfig(
@@ -226,7 +251,180 @@ def zh_to_bpt(ch: str) -> Optional[str]:
     if ch in ("和","T","t"): return "T"
     return None
 
-def parse_text_seq(text: str) -> List[str]:
+def parse_text_seq(
+
+# ==== Hot-train: 生成/展開/訓練（輕量版） ====
+from collections import defaultdict, Counter
+import random, json
+import numpy as np
+import pandas as pd
+
+def _append_seed_history(history: str) -> int:
+    toks = [t for t in history.replace(',', ' ').split() if t in OUTMAP]
+    if len(toks) < 6:
+        raise ValueError('history 長度至少 6')
+    df_new = pd.DataFrame({'history':[' '.join(toks)]})
+    if SEED_CSV.exists():
+        df = pd.read_csv(SEED_CSV)
+        df = pd.concat([df, df_new], ignore_index=True)
+    else:
+        df = df_new
+    df.to_csv(SEED_CSV, index=False)
+    return len(df)
+
+def _read_seed_histories():
+    if not SEED_CSV.exists(): return []
+    df = pd.read_csv(SEED_CSV)
+    seqs = []
+    for s in df['history'].astype(str).tolist():
+        toks = [t for t in s.split() if t in OUTMAP]
+        if len(toks) >= 6: seqs.append(toks)
+    return seqs
+
+def _estimate_ngram(seqs, order=2, laplace=0.5):
+    counts = defaultdict(Counter)
+    for seq in seqs:
+        if len(seq) <= order: continue
+        for i in range(order, len(seq)):
+            ctx = tuple(seq[i-order:i]); nxt = seq[i]
+            counts[ctx][nxt] += 1
+    vocab = ['B','P','T']; trans = {}
+    for ctx, ctr in counts.items():
+        total = sum(ctr.values()) + laplace*len(vocab)
+        trans[ctx] = {v:(ctr[v]+laplace)/total for v in vocab}
+    return trans
+
+def _style_adjust(probs, last, style='hybrid', tie_rate=0.06):
+    pB, pP, pT = probs.get('B',1/3), probs.get('P',1/3), probs.get('T',1/3)
+    pT = 0.85*pT + 0.15*tie_rate
+    remain = 1 - pT; s = max(pB+pP, 1e-12)
+    pB, pP = remain*(pB/s), remain*(pP/s)
+    if last in ('B','P'):
+        if style in ('long','hybrid'):
+            if last=='B': pB += 0.1
+            else: pP += 0.1
+        if style in ('jumpy','hybrid'):
+            if last=='B': pP += 0.1
+            else: pB += 0.1
+    tot = pB+pP+pT
+    return {'B':pB/tot,'P':pP/tot,'T':pT/tot}
+
+def _sample_next(probs):
+    r = random.random(); acc = 0.0
+    for k in ('B','P','T'):
+        acc += probs[k]
+        if r <= acc: return k
+    return 'T'
+
+def _gen_sequences(trans, order=2, n_seq=200, min_len=60, max_len=120, style='hybrid', tie_rate=0.06):
+    contexts = list(trans.keys())
+    if not contexts: raise ValueError('轉移為空，seed 不足或 order 過大')
+    seqs = []
+    for _ in range(n_seq):
+        cur = list(random.choice(contexts))
+        L = random.randint(min_len, max_len)
+        last = cur[-1] if cur else None
+        while len(cur) < L:
+            probs = trans.get(tuple(cur[-order:]), {'B':1/3,'P':1/3,'T':1/3})
+            probs = _style_adjust(probs, last, style, tie_rate)
+            nxt = _sample_next(probs)
+            cur.append(nxt); last = nxt
+        seqs.append(cur)
+    return seqs
+
+def _expand_rows(seqs, max_history=12):
+    rows = []
+    for sid, seq in enumerate(seqs):
+        streak=0
+        for i in range(len(seq)-1):
+            cur = seq[:i+1]; nxt = seq[i+1]
+            streak = 1 if i==0 else (streak+1 if cur[-1]==cur[-2] else 1)
+            k = min(max_history, len(cur)); win = cur[-k:]
+            wB=win.count('B')/k; wP=win.count('P')/k; wT=win.count('T')/k
+            switches = sum(1 for j in range(1,len(win)) if win[j]!=win[j-1])
+            osc = switches/(len(win)-1) if len(win)>1 else 0.0
+            ctx1=cur[-1]; ctx2=''.join(cur[-2:]) if i>=1 else '_'+ctx1; ctx3=''.join(cur[-3:]) if i>=2 else '_'+ctx2
+            rows.append({'seq_id':sid,'step':i,'streak':streak,'wB':wB,'wP':wP,'wT':wT,'osc':osc,'last':ctx1,'ctx1':ctx1,'ctx2':ctx2,'ctx3':ctx3,'y':OUTMAP[nxt]})
+    df = pd.DataFrame(rows)
+    for col in ['last','ctx1','ctx2','ctx3']:
+        d = pd.get_dummies(df[col], prefix=col)
+        df = pd.concat([df.drop(columns=[col]), d], axis=1)
+    return df
+
+def _train_and_save(df):
+    from sklearn.model_selection import train_test_split
+    X = df.drop(columns=['y']).values; y = df['y'].values
+    Xtr, Xva, ytr, yva = train_test_split(X,y,test_size=0.1,random_state=42,stratify=y)
+    model = None
+    try:
+        import lightgbm as lgb
+        model = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=63, subsample=0.9, colsample_bytree=0.9, random_state=42)
+    except Exception:
+        try:
+            import xgboost as xgb
+            model = xgb.XGBClassifier(n_estimators=500,max_depth=6,learning_rate=0.05,subsample=0.9,colsample_bytree=0.9,reg_lambda=1.0,objective='multi:softprob',num_class=3,random_state=42,tree_method='hist')
+        except Exception:
+            from sklearn.linear_model import LogisticRegression
+            model = LogisticRegression(max_iter=200, multi_class='multinomial')
+    model.fit(Xtr,ytr)
+    try:
+        import joblib; joblib.dump(model, MODEL_PATH)
+    except Exception:
+        pass
+    from sklearn.metrics import log_loss
+    import numpy as np
+    pva = model.predict_proba(Xva)
+    acc = float((pva.argmax(1)==yva).mean())
+    ll  = float(log_loss(yva,pva))
+    return {'valid_acc':acc, 'logloss':ll}
+
+def _synth_and_train(target_rows=300000, order=2, style='hybrid', tie_rate=0.06):
+    seqs = _read_seed_histories()
+    if not seqs: raise ValueError('沒有 seed，請先 /ingest-seed 或 LINE: SEED: <...>')
+    trans = _estimate_ngram(seqs, order=order, laplace=0.5)
+    sim = []; rows_est = 0
+    while rows_est < target_rows:
+        batch = _gen_sequences(trans, order=order, n_seq=200, min_len=60, max_len=120, style=style, tie_rate=tie_rate)
+        sim.extend(batch)
+        rows_est = sum(max(0,len(s)-1) for s in sim)
+    df = _expand_rows(sim, max_history=12)
+    if len(df) > target_rows:
+        df = df.sample(n=target_rows, random_state=2025).sort_index()
+    df.to_csv(SIM_ROWS, index=False)
+    m = _train_and_save(df)
+    with open(PRIORS_JSON,'w',encoding='utf-8') as f:
+        json.dump({'style':style,'tie_rate':tie_rate,'rows':int(len(df)),'valid_acc':m['valid_acc'],'logloss':m['logloss']}, f, ensure_ascii=False, indent=2)
+    return m
+
+def _predict_next_with_model(history: str):
+    if not (MODEL_PATH.exists() and joblib is not None):
+        return None
+    try:
+        clf = joblib.load(MODEL_PATH)
+    except Exception:
+        return None
+    toks = [t for t in history.replace(',', ' ').split() if t in OUTMAP]
+    if len(toks) < 3: return None
+    import pandas as _pd
+    cur = toks; i = len(cur)-1
+    k = min(12, len(cur)); win = cur[-k:]
+    wB=win.count('B')/k; wP=win.count('P')/k; wT=win.count('T')/k
+    switches = sum(1 for j in range(1,len(win)) if win[j]!=win[j-1])
+    osc = switches/(len(win)-1) if len(win)>1 else 0.0
+    ctx1=cur[-1]; ctx2=''.join(cur[-2:]) if i>=1 else '_'+ctx1; ctx3=''.join(cur[-3:]) if i>=2 else '_'+ctx2
+    row={'seq_id':0,'step':i,'streak':1,'wB':wB,'wP':wP,'wT':wT,'osc':osc,'last':ctx1,'ctx1':ctx1,'ctx2':ctx2,'ctx3':ctx3}
+    df=_pd.DataFrame([row])
+    for col in ['last','ctx1','ctx2','ctx3']:
+        d=_pd.get_dummies(df[col], prefix=col); df=_pd.concat([df.drop(columns=[col]), d], axis=1)
+    if SIM_ROWS.exists():
+        ref_cols=_pd.read_csv(SIM_ROWS, nrows=1).drop(columns=['y']).columns.tolist()
+        for c in ref_cols:
+            if c not in df.columns: df[c]=0
+        df=df[ref_cols]
+    proba = clf.predict_proba(df.values)[0]
+    return {'B':float(proba[0]),'P':float(proba[1]),'T':float(proba[2])}
+# ==== Hot-train 區塊結束 ====
+text: str) -> List[str]:
     res=[]
     for ch in text:
         v = zh_to_bpt(ch)
@@ -642,18 +840,6 @@ def root(): return "ok", 200
 def health():
     return {"status": "healthy", "csv": CSV_PATH, "base_dir": BASE}, 200
 
-@app.post("/predict")
-def api_predict():
-    data=request.get_json(silent=True) or {}
-    seq=parse_text_seq(str(data.get("history","")))
-    p, _dbg = estimate_probs(seq)
-    rec=recommend(p)
-    return jsonify({
-        "history_len": len(seq),
-        "probabilities": {"B":p[0], "P":p[1], "T":p[2]},
-        "recommendation": rec
-    }), 200
-
 @app.post("/predict_debug")
 def predict_debug():
     data = request.get_json(silent=True) or {}
@@ -675,6 +861,48 @@ def api_road():
     return jsonify({"n_cols":len(cols), "cols":cols, "tail":cols[-5:] if len(cols)>5 else cols}), 200
 
 @app.get("/road/image")
+
+
+# ==== Hot-train: REST API ====
+@app.post('/ingest-seed')
+def ingest_seed():
+    data = request.get_json(silent=True) or {}
+    history = str(data.get('history','')).strip()
+    if not history:
+        return jsonify({'ok':False,'msg':'history 必填'}), 400
+    try:
+        n = _append_seed_history(history)
+        return jsonify({'ok':True,'seed_records': n}), 200
+    except Exception as e:
+        return jsonify({'ok':False,'error':str(e)}), 400
+
+def _bg_train_hot(target_rows:int, style:str, tie_rate:float):
+    global _hot_training, _hot_last_metrics
+    try:
+        with _hot_lock:
+            _hot_training = True
+        m = _synth_and_train(target_rows=target_rows, style=style, tie_rate=tie_rate)
+        _hot_last_metrics = m
+    except Exception as e:
+        _hot_last_metrics = {'error': str(e)}
+    finally:
+        with _hot_lock:
+            _hot_training = False
+
+@app.post('/synth-train')
+def synth_train():
+    data = request.get_json(silent=True) or {}
+    target_rows = int(data.get('target_rows', 300000))
+    style = str(data.get('style','hybrid'))
+    tie_rate = float(data.get('tie_rate', 0.06))
+    with _hot_lock:
+        if _hot_training:
+            return jsonify({'ok':False,'msg':'training in progress'}), 409
+    t = threading.Thread(target=_bg_train_hot, args=(target_rows, style, tie_rate), daemon=True)
+    t.start()
+    return jsonify({'ok':True,'msg':'started'}), 200
+# ==== Hot-train: REST API 結束 ====
+
 def road_image():
     uid=request.args.get("uid")
     hist_q=request.args.get("history","")
@@ -758,6 +986,55 @@ if USE_LINE:
 if USE_LINE and handler is not None:
     @handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
+
+        # ==== Hot-train LINE 指令（新增）====
+        up = text.upper()
+        if up.startswith('SEED:'):
+            history = text.split(':',1)[1]
+            try:
+                n = _append_seed_history(history)
+                reply_or_push(event, TextSendMessage(text=f'✅ 已追加 seed（共 {n} 筆）。可下：TRAIN 300000 hybrid 0.06'))
+            except Exception as e:
+                reply_or_push(event, TextSendMessage(text=f'❌ 追加失敗：{e}'))
+            return
+        if up.startswith('TRAIN'):
+            parts = text.split()
+            target = int(parts[1]) if len(parts)>=2 else 300000
+            style  = parts[2] if len(parts)>=3 else 'hybrid'
+            try:
+                tie = float(parts[3]) if len(parts)>=4 else 0.06
+            except Exception:
+                tie = 0.06
+            with _hot_lock:
+                if _hot_training:
+                    reply_or_push(event, TextSendMessage(text='⚠️ 目前已有訓練在進行中'))
+                    return
+            threading.Thread(target=_bg_train_hot, args=(target, style, tie), daemon=True).start()
+            reply_or_push(event, TextSendMessage(text=f'🚀 開始訓練：rows={target} style={style} tie={tie}'))
+            return
+        if up.startswith('STATUS'):
+            if _hot_training:
+                reply_or_push(event, TextSendMessage(text='🔄 訓練中…'))
+            else:
+                if _hot_last_metrics and 'error' not in _hot_last_metrics:
+                    reply_or_push(event, TextSendMessage(text=f"✅ 最近模型 acc={_hot_last_metrics.get('valid_acc'):.3f} logloss={_hot_last_metrics.get('logloss'):.3f}"))
+                elif _hot_last_metrics and 'error' in _hot_last_metrics:
+                    reply_or_push(event, TextSendMessage(text=f"❌ 上次訓練錯誤：{_hot_last_metrics['error']}"))
+                else:
+                    reply_or_push(event, TextSendMessage(text='ℹ️ 尚無訓練紀錄'))
+            return
+        if up.startswith('PRED '):
+            hist = text.split(' ',1)[1]
+            model_proba = _predict_next_with_model(hist)
+            if model_proba is not None:
+                msg = f"模型機率 → 莊 {model_proba['B']:.2f}｜閒 {model_proba['P']:.2f}｜和 {model_proba['T']:.2f}"
+            else:
+                seq_tmp = parse_text_seq(hist)
+                p, _ = estimate_probs(seq_tmp)
+                msg = f"啟發式機率 → 莊 {p[0]:.2f}｜閒 {p[1]:.2f}｜和 {p[2]:.2f}"
+            reply_or_push(event, TextSendMessage(text=msg))
+            return
+        # ==== Hot-train 指令到此 ====
         uid=event.source.user_id
         text=(event.message.text or "").strip()
         ensure_user(uid)
@@ -884,3 +1161,43 @@ if USE_LINE and handler is not None:
 # -------------------- main --------------------
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")), debug=False)
+
+
+
+# ==== Hot-train: /predict 升級（先模型，再啟發式） ====
+@app.post('/predict')
+def api_predict():
+    data = request.get_json(silent=True) or {}
+    seq_text = str(data.get('history',''))
+    model_proba = _predict_next_with_model(seq_text)
+    if model_proba is not None:
+        pB,pP,pT = model_proba['B'], model_proba['P'], model_proba['T']
+        return jsonify({'ok':True,'probabilities': {'B':pB,'P':pP,'T':pT}, 'source':'model'}), 200
+    seq = parse_text_seq(seq_text)
+    p, detail = estimate_probs(seq)
+    return jsonify({'ok':True,'probabilities': {'B':p[0],'P':p[1],'T':p[2]}, 'source':'heuristic','detail':detail}), 200
+# ==== Hot-train: /predict 升級 結束 ====
+
+
+
+# ==== Hot-train Dashboard & Health ====
+@app.get('/health')
+def __health__():
+    return "OK", 200
+
+@app.get('/')
+def __home__():
+    html = "<!doctype html><html><body><h3>BGS Dashboard</h3><p>Use /predict, /ingest-seed, /synth-train</p></body></html>"
+    from flask import request
+    seed_n = 0
+    try:
+        import pandas as _pd
+        if SEED_CSV.exists():
+            seed_n = len(_pd.read_csv(SEED_CSV))
+    except Exception:
+        seed_n = 0
+    status = {'seed_records': seed_n, 'model_exists': MODEL_PATH.exists(), 'is_training': _hot_training, 'last_metrics': _hot_last_metrics}
+    if "application/json" in (request.headers.get("Accept","")):
+        return jsonify(status)
+    return html
+# ==== Hot-train Dashboard 結束 ====
