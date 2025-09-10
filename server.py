@@ -195,6 +195,43 @@ def _expand_rows(seqs: List[List[str]], max_history:int=12):
         df = _pd.concat([df.drop(columns=[col]), d], axis=1)
     return df
 
+
+
+def _collect_seed_feature_rows(max_history:int=12):
+    從 SEED 直接展開特徵列（不做 n-gram 合成），回傳 DataFrame。
+    import pandas as pd
+    seqs = _read_seed_histories()
+    if not seqs:
+        raise ValueError("沒有 seed，無法以 feature 模式合成；請先 /ingest-seed")
+    df_seed = _expand_rows(seqs, max_history=max_history)
+    return df_seed
+
+def _sample_feature_rows(df_seed, target_rows:int, jitter:float=0.02, random_seed:int=2025):
+    從 df_seed 以「有放回抽樣 + 輕微抖動」生成 target_rows 列；維持欄位一致。
+    import numpy as np, pandas as pd
+    rng = np.random.default_rng(random_seed)
+    if len(df_seed) == 0:
+        raise ValueError("df_seed 為空，無法合成")
+    idx = rng.integers(0, len(df_seed), size=target_rows)
+    df = df_seed.iloc[idx].copy().reset_index(drop=True)
+    # 對連續特徵做小幅抖動；再做安全界限與歸一化
+    for col in ['wB','wP','wT','osc']:
+        if col in df.columns:
+            noise = rng.normal(0, jitter, size=len(df))
+            df[col] = df[col].astype(float) + noise
+    # 夾在 [0,1]，且 wB+wP+wT 重新歸一
+    for col in ['wB','wP','wT','osc']:
+        if col in df.columns:
+            df[col] = df[col].clip(0.0, 1.0)
+    if all(c in df.columns for c in ['wB','wP','wT']):
+        s = (df['wB']+df['wP']+df['wT']).replace(0, 1.0)
+        df['wB'] = df['wB']/s
+        df['wP'] = df['wP']/s
+        df['wT'] = df['wT']/s
+    # 重新指定 seq_id / step（非必需，但讓數值看起來合理遞增）
+    df['seq_id'] = np.arange(len(df)) // 100  # 每百列算一條序列
+    df['step']   = np.arange(len(df)) %  100
+    return df
 def _train_baseline(df, valid_ratio:float=0.1):
     from sklearn.model_selection import train_test_split
     X = df.drop(columns=['y']).values; y = df['y'].values
@@ -225,21 +262,56 @@ def _train_baseline(df, valid_ratio:float=0.1):
         except Exception: pass
     return clf, {"valid_acc":acc,"logloss":ll,"model":model_name,"rows":int(len(df))}
 
-def _synth_and_train(target_rows:int=300_000, order:int=2, style:str='hybrid', tie_rate:float=0.06, random_seed:int=2025):
+def _synth_and_train(target_rows:int=300_000, order:int=2, style:str='hybrid', tie_rate:float=0.06, random_seed:int=2025, mode:str='ngram', mode:str='ngram', jitter:float=0.02):
     import numpy as np
     np.random.seed(random_seed); random.seed(random_seed)
     seqs = _read_seed_histories()
     if not seqs: raise ValueError("沒有 seed，請先 /ingest-seed 或在 LINE 打：SEED: <B/P/T 串>")
-    trans = _estimate_ngram(seqs, order=order, laplace=0.5)
-    sim: List[List[str]] = []; rows_est = 0
-    while rows_est < target_rows:
-        batch = _gen_sequences(trans, order, n_seq=200, min_len=60, max_len=120, style=style, long_strength=0.5, jumpy_strength=0.5, tie_rate=tie_rate)
-        sim.extend(batch)
-        rows_est = sum(max(0,len(s)-1) for s in sim)
-    df = _expand_rows(sim, max_history=12)
-    if len(df) > target_rows:
-        df = df.sample(n=target_rows, random_state=random_seed).sort_index()
-    df.to_csv(SIM_ROWS, index=False)
+    if mode == 'feature':
+        df_seed = _collect_seed_feature_rows(max_history=12)
+        df = _sample_feature_rows(df_seed, target_rows=target_rows, jitter=jitter, random_seed=random_seed)
+        df.to_csv(SIM_ROWS, index=False)
+    elif mode == 'uniform':
+        # 純隨機 baseline：均勻上下文 + 隨機連續特徵 + 類別依種子整體先驗抽樣
+        import numpy as np, pandas as pd
+        rng = np.random.default_rng(random_seed)
+        # 先驗：從 seeds 估計類別比例
+        from collections import Counter
+        ctr = Counter()
+        for s in seqs:
+            for t in s:
+                ctr[t]+=1
+        total = sum(ctr.values()) or 1
+        prior = {k: ctr.get(k,0)/total for k in ('B','P','T')}
+        # 組欄位
+        rows=[]
+        for i in range(target_rows):
+            wB,wP = rng.random(), rng.random()
+            rem = max(1e-9, 1.0-wB)
+            wP = rem * wP
+            wT = max(0.0, 1.0 - (wB+wP))
+            osc = rng.random()
+            last = rng.choice(['B','P','T'])
+            ctx2 = last + rng.choice(['B','P','T'])
+            ctx3 = ctx2 + rng.choice(['B','P','T'])
+            # y 依先驗
+            y = np.argmax(rng.multinomial(1, [prior['B'],prior['P'],prior['T']]))
+            rows.append({'seq_id':i//100,'step':i%100,'streak':1,'wB':wB,'wP':wP,'wT':wT,'osc':osc,'last':last,'ctx1':last,'ctx2':ctx2,'ctx3':ctx3,'y':int(y)})
+        df = pd.DataFrame(rows)
+        for col in ['last','ctx1','ctx2','ctx3']:
+            d = pd.get_dummies(df[col], prefix=col); df = pd.concat([df.drop(columns=[col]), d], axis=1)
+        df.to_csv(SIM_ROWS, index=False)
+    else:
+        trans = _estimate_ngram(seqs, order=order, laplace=0.5)
+        sim: List[List[str]] = []; rows_est = 0
+        while rows_est < target_rows:
+            batch = _gen_sequences(trans, order, n_seq=200, min_len=60, max_len=120, style=style, long_strength=0.5, jumpy_strength=0.5, tie_rate=tie_rate)
+            sim.extend(batch)
+            rows_est = sum(max(0,len(s)-1) for s in sim)
+        df = _expand_rows(sim, max_history=12)
+        if len(df) > target_rows:
+            df = df.sample(n=target_rows, random_state=random_seed).sort_index()
+        df.to_csv(SIM_ROWS, index=False)
     _, metrics = _train_baseline(df, valid_ratio=0.1)
     with open(PRIORS_JSON,'w',encoding='utf-8') as f:
         json.dump({"order":order,"style":style,"tie_rate":tie_rate,"target_rows":target_rows, **metrics}, f, ensure_ascii=False, indent=2)
@@ -302,13 +374,17 @@ def _bg_train_hot(target_rows:int, style:str, tie_rate:float):
 @app.post("/synth-train")
 def synth_train():
     data = request.get_json(silent=True) or {}
-    target_rows = int(data.get("target_rows", 300000))
-    style = str(data.get("style","hybrid"))
-    tie_rate = float(data.get("tie_rate", 0.06))
+    target_rows = int(data.get(\"target_rows\", 300000))
+    style = str(data.get(\"style\",\"hybrid\"))
+    tie_rate = float(data.get(\"tie_rate\", 0.06))
+    mode = str(data.get(\"mode\",\"ngram\"))
     with _hot_lock:
         if _hot_training:
             return jsonify({"ok":False,"msg":"training in progress"}), 409
-    t = threading.Thread(target=_bg_train_hot, args=(target_rows, style, tie_rate), daemon=True)
+    def _runner():
+        _bg_train_hot(target_rows, style, tie_rate) if mode=='ngram' else None
+    # 直接把 mode 透傳給 _synth_and_train
+    t = threading.Thread(target=lambda: _synth_and_train(target_rows=target_rows, style=style, tie_rate=tie_rate, mode=mode, jitter=jitter), daemon=True)
     t.start()
     return jsonify({"ok":True,"msg":"started"}), 200
 
@@ -418,7 +494,7 @@ def home():
     <div class="row">
       <label>rows</label><input id="rows" type="number" value="300000" style="width:160px"/>
       <label>style</label><select id="style"><option>hybrid</option><option>jumpy</option><option>long</option></select>
-      <label>tie_rate</label><input id="tie" type="number" step="0.01" value="0.06" style="width:120px"/>
+      <label>tie_rate</label><input id="tie" type="number" step="0.01" value="0.06" style="width:120px"/> <label>mode</label><select id="mode"><option value="ngram" selected>ngram</option><option value="feature">feature</option><option value="uniform">uniform</option></select> <label>jitter</label><input id="jitter" type="number" step="0.005" value="0.02" style="width:120px"/>
       <button onclick="doTrain()">開始訓練</button>
     </div>
     <pre class="muted">提示：免費方案先以 120000～200000 測試。</pre>
@@ -429,7 +505,7 @@ def home():
 async function refreshStatus(){try{const r=await fetch(location.origin + "/",{headers:{"Accept":"application/json"}});const j=await r.json();document.getElementById("statusBox").textContent=JSON.stringify(j,null,2);}catch(e){document.getElementById("statusBox").textContent="讀取失敗："+e;}}
 async function doPredict(){const history=document.getElementById("predInput").value.trim();const r=await fetch("/predict",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({history})});const j=await r.json();document.getElementById("predBox").textContent=JSON.stringify(j,null,2);}
 async function doSeed(){const history=document.getElementById("seedInput").value.trim();const r=await fetch("/ingest-seed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({history})});const j=await r.json();document.getElementById("seedBox").textContent=JSON.stringify(j,null,2);refreshStatus();}
-async function doTrain(){const target_rows=parseInt(document.getElementById("rows").value||"300000",10);const style=document.getElementById("style").value;const tie_rate=parseFloat(document.getElementById("tie").value||"0.06");const r=await fetch("/synth-train",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target_rows,style,tie_rate})});const j=await r.json();document.getElementById("trainBox").textContent=JSON.stringify(j,null,2);refreshStatus();}
+async function doTrain(){const target_rows=parseInt(document.getElementById("rows").value||"300000",10);const style=document.getElementById("style").value;const tie_rate=parseFloat(document.getElementById("tie").value||"0.06");const r=await fetch("/synth-train",{method:"POST",headers:{"Content-Type":"application/json"},const mode=document.getElementById('mode').value; body:JSON.stringify({target_rows,style,tie_rate,mode})});const j=await r.json();document.getElementById("trainBox").textContent=JSON.stringify(j,null,2);refreshStatus();}
 refreshStatus();
 </script>
 </body></html>"""
@@ -514,7 +590,7 @@ if _line_enabled:
                 _reply(f"❌ 追加失敗：{e}")
             return
 
-        if up.startswith("TRAIN"):
+        if up.startswith("TRAIN"):  # TRAIN rows [style] [tie] [mode] [jitter]
             if not is_admin(user_id):
                 _reply("⛔ 僅管理員可啟動訓練")
                 return
@@ -525,12 +601,17 @@ if _line_enabled:
                 tie = float(parts[3]) if len(parts)>=4 else 0.06
             except Exception:
                 tie = 0.06
+            mode = parts[4] if len(parts)>=5 else 'ngram'
+            try:
+                jitter = float(parts[5]) if len(parts)>=6 else 0.02
+            except Exception:
+                jitter = 0.02
             with _hot_lock:
                 if _hot_training:
                     _reply("⚠️ 目前已有訓練在進行中")
                     return
-            threading.Thread(target=_bg_train_hot, args=(target, style, tie), daemon=True).start()
-            _reply(f"🚀 開始訓練：rows={target} style={style} tie={tie}")
+            threading.Thread(target=lambda: _synth_and_train(target_rows=target, style=style, tie_rate=tie, mode=mode, jitter=jitter), daemon=True).start()
+            _reply(f"🚀 開始訓練：rows={target} style={style} tie={tie} mode={mode} jitter={jitter}")
             return
 
         if up.startswith("STATUS"):
