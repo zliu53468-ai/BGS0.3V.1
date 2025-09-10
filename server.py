@@ -57,9 +57,9 @@ def trial_check_and_maybe_warn(user_id: str, reply_fn):
 
 # ---------- Storage paths ----------
 ROOT = _Path(os.getenv("DATA_ROOT", "."))
-DATA = ROOT / "data"; DATA.mkdir(exist_ok=True)
-MODELS = ROOT / "models"; MODELS.mkdir(exist_ok=True)
-REPORTS = ROOT / "reports"; REPORTS.mkdir(exist_ok=True)
+DATA = ROOT / "data"; DATA.mkdir(parents=True, exist_ok=True)
+MODELS = ROOT / "models"; MODELS.mkdir(parents=True, exist_ok=True)
+REPORTS = ROOT / "reports"; REPORTS.mkdir(parents=True, exist_ok=True)
 
 SEED_CSV   = DATA / "seed.csv"
 SIM_ROWS   = DATA / "sim_rows.csv"
