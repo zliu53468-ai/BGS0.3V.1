@@ -1,1 +1,129 @@
-{"nbformat":4,"nbformat_minor":0,"metadata":{"colab":{"provenance":[],"authorship_tag":"ABX9TyNYIu3XWcR1C7VnDKMp69yv"},"kernelspec":{"name":"python3","display_name":"Python 3"},"language_info":{"name":"python"}},"cells":[{"cell_type":"code","source":["from google.colab import drive\n","drive.mount('/content/drive')\n","\n","# 建專案資料夾\n","BASE = \"/content/drive/MyDrive/bgs\"\n","import os\n","os.makedirs(BASE, exist_ok=True)\n","print(\"BASE =\", BASE)"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"27tiKYingMZE","executionInfo":{"status":"ok","timestamp":1757490130885,"user_tz":-480,"elapsed":2466,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"ea12f1c4-be5f-4745-bdeb-36a5a86cf3f7"},"execution_count":11,"outputs":[{"output_type":"stream","name":"stdout","text":["Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount(\"/content/drive\", force_remount=True).\n","BASE = /content/drive/MyDrive/bgs\n"]}]},{"cell_type":"code","source":["seeds_raw = [\n","\"\"\"\n","P P T B T B P B P P B B T B B P B B P B B T P B B T P B P B P B B T P T B B P P B P B P T P B B B P B B B B P P P B P B P B P B T P B B P B P T B B P B B P T T B P B B P P B P B P T P B P B P T T B P B B P B B P T T B P B B B B B P P B P B B P P P P P P B B T B T B P P P B P B P B P B T P B B P B B B P P B B P B B T P T B B P B P B P B B P B P T T B B B B P B B B P B T P P B B B P P P B P B P P P B P T B P B T B P B P P P P B P B P B T T B P B B P P P B P B T B P B P B P T P B B P B B P T B P T B B B P T B B P B B P T B B P B P B T B B P P B B P T P P B P B B B B P B P B B T P B P B T T B P P B P P B B P B P T P P P P B B B B B P B P B P B B P B P P B B T P B P B P B B B P B P B P T B P B P T B B P B B P P P B B P B T B T B P B P T P B B P P P B P B P B B T P B P B P B B B B P B B B B B P P P P P B P P P P P B P P B P B B P T B P B P P T P B B T B P T P B P B B P B B T P P P P T P T B B P B B P P P B P B P T P P T P P B P P B P P B P P T B P B\n","\"\"\".strip(),\n","\n","\"\"\"\n","P P B B B B T T T B B B B B B P P P T P T B P P T P B P P B P P P P B P B P P B B P B B B B P P P P P T P B P P B T B B B B P B B B B B B P B P P B P P B P B B P B P B P P T P B P B B P P T B B P P B T T B P B B B T T B B P B T P B P B P P P B P B P P B P P P P B B P P T P B B P P B T B B P P P T P B T P B B P B B T T B B P B B P P P P B B P P T P B B P P B T B B P P P T P B T P B B P B B T T B B P B B B P P P P B B P P T P B B P P B T B B P P P T P B T P B B P B B T T B B P B B B B B B P B T T P B B B P B B P B P B P B P P P P P P P B B B P T P B T B B B B T B P B B B B B B P B P B B P P B P P P P P B B B B B T B B P B P T P B P B B P B B B P P P B P P B P P B B P P B P B B B B B B B B P T P B P B P P B B P B P P T B B P P B B P B B T P P B T P B B P B P B P B B B B B P P P B B P P B T P P B T B P P P B B P B B B P B P P B B B B B P P T B B P P B P B P P P P B B P P B P P T P P P B P P P B B B P P B P B B T P B P P T P P P B B P P T P T B T P B P P B B P P P B B P P B P T P P P B B P P B P B P B B P T B P T T P T B T P T P T P P B B P P P P P\n","\"\"\".strip()\n","]\n","\n","# 轉為每行一段、去空白\n","cleaned = []\n","for block in seeds_raw:\n","    s = block.replace(\"\\n\",\" \").replace(\"\\t\",\" \").strip()\n","    s = \" \".join(s.split())\n","    cleaned.append(s)\n","\n","path = f\"{BASE}/seeds.txt\"\n","with open(path, \"w\") as f:\n","    for line in cleaned:\n","        f.write(line + \"\\n\")\n","print(\"Wrote:\", path)"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"8svZbt_cgM80","executionInfo":{"status":"ok","timestamp":1757490130972,"user_tz":-480,"elapsed":89,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"5beeb7e9-b0eb-4c33-cdea-168c9f15864e"},"execution_count":12,"outputs":[{"output_type":"stream","name":"stdout","text":["Wrote: /content/drive/MyDrive/bgs/seeds.txt\n"]}]},{"cell_type":"code","source":["%%writefile /content/gen_synth.py\n","import argparse, csv, os, random, re\n","from collections import Counter\n","\n","def parse_seq(line):\n","    toks = re.split(r\"[\\s,]+\", line.strip().upper())\n","    return [t for t in toks if t in (\"B\",\"P\",\"T\")]\n","\n","def load_seeds(path):\n","    seeds=[]\n","    with open(path,\"r\") as f:\n","        for ln in f:\n","            s=parse_seq(ln)\n","            if len(s)>=20:\n","                seeds.append(s)\n","    if not seeds:\n","        raise ValueError(\"seeds.txt 沒有有效序列（至少 20 手）\")\n","    return seeds\n","\n","def random_hist(seed, min_len=18, max_len=60):\n","    n = random.randint(min_len, max_len)\n","    if len(seed) <= n:\n","        return seed[:]\n","    # 隨機截一段後段資料較多（模擬最近性）\n","    start = random.randint(max(0, len(seed)-n-30), len(seed)-n)\n","    return seed[start:start+n]\n","\n","def synth_next(hist, bias_t=0.10):\n","    # 簡單規則：根據最後 8 手頻率 + 一點點轉場噪音 + T 機率保底\n","    win = 8\n","    cut = hist[-win:] if len(hist)>=win else hist\n","    c = Counter(cut)\n","    pB = (c[\"B\"] + 0.5) / (len(cut) + 1.5)\n","    pP = (c[\"P\"] + 0.5) / (len(cut) + 1.5)\n","    pT = (c[\"T\"] + 0.5) / (len(cut) + 1.5)\n","    # ties floor / cap\n","    pT = min(0.35, max(bias_t, pT))\n","\n","    # 轉場微噪音：若最後一手和倒數第二手不同，給一點延續偏置\n","    if len(hist)>=2 and hist[-1] != hist[-2] and hist[-1] in (\"B\",\"P\") and hist[-2] in (\"B\",\"P\"):\n","        if hist[-1]==\"B\": pB *= 1.06\n","        if hist[-1]==\"P\": pP *= 1.06\n","\n","    s = pB + pP + pT\n","    pB, pP, pT = pB/s, pP/s, pT/s\n","    r = random.random()\n","    if r < pB: return \"B\"\n","    if r < pB + pP: return \"P\"\n","    return \"T\"\n","\n","def main():\n","    ap = argparse.ArgumentParser()\n","    ap.add_argument(\"--seeds\", required=True)\n","    ap.add_argument(\"--out\", required=True)\n","    ap.add_argument(\"--target\", type=int, default=200000)\n","    ap.add_argument(\"--append\", action=\"store_true\", help=\"若存在就接續增加\")\n","    args = ap.parse_args()\n","\n","    seeds = load_seeds(args.seeds)\n","    os.makedirs(os.path.dirname(args.out), exist_ok=True)\n","\n","    mode = \"a\" if (args.append and os.path.exists(args.out)) else \"w\"\n","    written = 0\n","    if mode==\"a\" and os.path.exists(args.out):\n","        # 估計已存在多少筆\n","        with open(args.out,\"r\") as f:\n","            existing = sum(1 for _ in f) - 1  # 扣 header\n","        written = max(0, existing)\n","    with open(args.out, mode, newline=\"\") as f:\n","        w = csv.writer(f)\n","        if mode==\"w\":\n","            w.writerow([\"hist\",\"next\"])\n","        batch = 0\n","        while written < args.target:\n","            seed = random.choice(seeds)\n","            h = random_hist(seed, 18, 60)\n","            nx = synth_next(h, bias_t=0.10)\n","            w.writerow([\"\".join(h), nx])\n","            written += 1\n","            batch += 1\n","            if batch >= 5000:\n","                f.flush()\n","                os.fsync(f.fileno())\n","                batch = 0\n","    print(\"done, total rows =\", written)\n","\n","if __name__ == \"__main__\":\n","    main()"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"Bc5xRiM_gPt8","executionInfo":{"status":"ok","timestamp":1757490130980,"user_tz":-480,"elapsed":6,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"8e5b83d2-52f4-4420-da14-369aca626770"},"execution_count":13,"outputs":[{"output_type":"stream","name":"stdout","text":["Overwriting /content/gen_synth.py\n"]}]},{"cell_type":"code","source":["# 參數：要幾筆？建議先 200_000，跑得動再拉高\n","N = 200_000\n","\n","import random, json, os, numpy as np, pandas as pd\n","\n","BASE = \"/content/drive/MyDrive/bgs\"\n","with open(f\"{BASE}/seeds.txt\",\"r\") as f:\n","    seeds = [ln.strip().replace(\" \",\"\") for ln in f if ln.strip()]\n","\n","def jitter_blocks(seq):\n","    \"\"\"很簡單的區塊抖動 + 插入少量 T，保持路型但有隨機性\"\"\"\n","    out=[]\n","    i=0\n","    while i < len(seq):\n","        j=i\n","        while j<len(seq) and seq[j]==seq[i]: j+=1\n","        block=list(seq[i:j])\n","        # 可能把一段切成兩段（模擬斷續）\n","        if len(block)>=3 and random.random()<0.25:\n","            cut=random.randint(1,len(block)-1)\n","            out+=block[:cut]\n","            # 斷掉後偶爾插 T 或換邊\n","            if random.random()<0.35: out+=[\"T\"]\n","            out+=block[cut:]\n","        else:\n","            out+=block\n","        # 偶爾在段與段間插 T\n","        if random.random()<0.15: out+=[\"T\"]\n","        i=j\n","    return out\n","\n","def synth_one():\n","    base = list(random.choice(seeds))\n","    # 1~3 次抖動\n","    for _ in range(random.randint(1,3)):\n","        base = jitter_blocks(base)\n","    # 再隨機加減幾手\n","    for _ in range(random.randint(0,3)):\n","        base.append(random.choice([\"B\",\"P\",\"T\",\"B\",\"P\"]))  # T 機率較低\n","    return \"\".join(base)\n","\n","rows=[]\n","for _ in range(N):\n","    s = synth_one()\n","    # 取最後一手當 label，前面當 history\n","    if len(s) < 4:\n","        continue\n","    rows.append({\"history\": s[:-1], \"label\": s[-1]})\n","\n","out = pd.DataFrame(rows)\n","os.makedirs(f\"{BASE}/out\", exist_ok=True)\n","out_path = f\"{BASE}/out/train.csv\"\n","out.to_csv(out_path, index=False)\n","print(\"Wrote\", out_path, \"rows:\", len(out))"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"CMgsV9ayh5f0","executionInfo":{"status":"ok","timestamp":1757490239868,"user_tz":-480,"elapsed":108887,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"3ceee4df-3a92-4ad7-9214-2a94b0cb6979"},"execution_count":14,"outputs":[{"output_type":"stream","name":"stdout","text":["Wrote /content/drive/MyDrive/bgs/out/train.csv rows: 200000\n"]}]},{"cell_type":"code","source":["!pip -q install scikit-learn pandas\n","\n","import pandas as pd, numpy as np, json, os, re\n","from sklearn.feature_extraction.text import CountVectorizer\n","from sklearn.linear_model import LogisticRegression\n","\n","BASE = \"/content/drive/MyDrive/bgs\"\n","df = pd.read_csv(f\"{BASE}/out/train.csv\")\n","\n","# 只保留 B/P/T 字元\n","df[\"history\"] = df[\"history\"].str.replace(r\"[^BPT]\",\"\", regex=True)\n","\n","# 用 3-gram 抓路型片段（你可改成 2~4-gram）\n","cv = CountVectorizer(analyzer='char', ngram_range=(2,3), min_df=5)\n","X = cv.fit_transform(df[\"history\"])\n","y = df[\"label\"]\n","\n","# one-vs-rest 三個類別各一個 logistic\n","labels = [\"B\",\"P\",\"T\"]\n","coefs = {}\n","for lab in labels:\n","    lr = LogisticRegression(max_iter=200, n_jobs=-1)\n","    lr.fit(X, (y==lab).astype(int))\n","    coefs[lab] = {\n","        \"intercept\": float(lr.intercept_[0]),\n","        \"coef\": {feat: float(w) for feat, w in zip(cv.get_feature_names_out(), lr.coef_[0])}\n","    }\n","\n","meta = {\n","    \"ngram\": [2,3],\n","    \"min_df\": 5,\n","    \"features\": cv.get_feature_names_out().tolist(),\n","    \"coefs\": coefs\n","}\n","\n","os.makedirs(f\"{BASE}/models\", exist_ok=True)\n","with open(f\"{BASE}/models/meta.json\",\"w\") as f:\n","    json.dump(meta, f)\n","print(\"Wrote\", f\"{BASE}/models/meta.json\")"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"WG4ZkJ_tiAhs","executionInfo":{"status":"ok","timestamp":1757490377339,"user_tz":-480,"elapsed":137458,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"ab7b4e8d-10c8-4db5-c9b1-f1d400cec687"},"execution_count":15,"outputs":[{"output_type":"stream","name":"stdout","text":["Wrote /content/drive/MyDrive/bgs/models/meta.json\n"]}]},{"cell_type":"code","source":["%%writefile /content/br_features.py\n","from typing import List, Dict\n","from collections import Counter\n","\n","MAP = {\"B\":0, \"P\":1, \"T\":2}\n","\n","def _alt_rate(bp: List[int]) -> float:\n","    if len(bp) < 2: return 0.0\n","    return sum(1 for i in range(1,len(bp)) if bp[i]!=bp[i-1]) / (len(bp)-1)\n","\n","def _run_len_tail(bp: List[int]):\n","    if not bp: return (None,0)\n","    cur = bp[-1]; n=1\n","    for x in reversed(bp[:-1]):\n","        if x==cur: n+=1\n","        else: break\n","    return cur, n\n","\n","def _tie_density(ws: List[int]) -> float:\n","    return 0.0 if not ws else ws.count(2)/len(ws)\n","\n","def _count_pattern(bp: List[int], pat: List[int]) -> int:\n","    if len(bp) < len(pat): return 0\n","    k=len(pat); c=0\n","    for i in range(len(bp)-k+1):\n","        if bp[i:i+k]==pat: c+=1\n","    return c\n","\n","def window_features(seq: List[str], win: int=20) -> Dict:\n","    z = seq[-win:] if len(seq)>=win else seq[:]\n","    bp = [MAP[x] for x in z]\n","    bp_only = [x for x in bp if x in (0,1)]\n","    feats = {}\n","    c = Counter(bp); n = max(1,len(bp))\n","    feats[\"f_B\"] = c.get(0,0)/n\n","    feats[\"f_P\"] = c.get(1,0)/n\n","    feats[\"f_T\"] = c.get(2,0)/n\n","    feats[\"alt_rate\"] = _alt_rate(bp_only)\n","    sym, rlen = _run_len_tail(bp_only)\n","    feats[\"tail_sym\"] = -1 if sym is None else sym\n","    feats[\"tail_len\"] = rlen\n","    feats[\"tie_dens\"] = _tie_density(bp)\n","    feats[\"near_T\"]   = 1.0 if 2 in bp[-5:] else 0.0\n","    feats[\"pat_010\"]  = _count_pattern(bp_only,[0,1,0])\n","    feats[\"pat_101\"]  = _count_pattern(bp_only,[1,0,1])\n","    feats[\"pat_0011\"] = _count_pattern(bp_only,[0,0,1,1])\n","    feats[\"pat_1100\"] = _count_pattern(bp_only,[1,1,0,0])\n","    feats[\"is_dragon\"]  = 1.0 if rlen>=3 else 0.0\n","    feats[\"is_dragon5\"] = 1.0 if rlen>=5 else 0.0\n","    feats[\"win_len\"] = len(bp)\n","    return feats\n","\n","def make_supervised_rows(lines: List[str], win:int=20, max_len:int=400):\n","    X=[]; y=[]\n","    for raw in lines:\n","        s=[c for c in raw.strip() if c in (\"B\",\"P\",\"T\")]\n","        if not s: continue\n","        s = s[-max_len:] if len(s)>max_len else s\n","        for t in range(5, len(s)):\n","            past = s[:t]\n","            X.append(window_features(past, win=win))\n","            y.append(MAP[s[t]])\n","    return X,y\n","\n","def last_window_row(seq: List[str], win:int=20) -> Dict:\n","    return window_features(seq, win=win)"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"7yPhSgyJjqhT","executionInfo":{"status":"ok","timestamp":1757490377387,"user_tz":-480,"elapsed":39,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"51f3dfdd-01d3-4aa2-d64b-2d70565a434a"},"execution_count":16,"outputs":[{"output_type":"stream","name":"stdout","text":["Overwriting /content/br_features.py\n"]}]},{"cell_type":"code","source":["%%writefile /content/lgbm_train.py\n","import os, json\n","import lightgbm as lgb\n","from sklearn.feature_extraction import DictVectorizer\n","from sklearn.model_selection import train_test_split\n","from sklearn.metrics import log_loss\n","from br_features import make_supervised_rows\n","\n","BASE = \"/content/drive/MyDrive/bgs\"\n","SEEDS_FILE = f\"{BASE}/seeds.txt\"\n","OUT_PATH   = f\"{BASE}/models/lgbm.txt\"\n","WIN = 20\n","\n","os.makedirs(f\"{BASE}/models\", exist_ok=True)\n","\n","with open(SEEDS_FILE,\"r\",encoding=\"utf-8\") as f:\n","    lines = [ln.strip() for ln in f if ln.strip()]\n","\n","Xdict, y = make_supervised_rows(lines, win=WIN, max_len=400)\n","\n","vec = DictVectorizer(sparse=True)\n","X = vec.fit_transform(Xdict)\n","\n","Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.15, random_state=42, stratify=y)\n","\n","dtr = lgb.Dataset(Xtr, label=ytr)\n","dva = lgb.Dataset(Xva, label=yva, reference=dtr)\n","\n","params = dict(\n","    objective=\"multiclass\",\n","    num_class=3,\n","    learning_rate=0.05,\n","    num_leaves=63,\n","    min_data_in_leaf=40,\n","    feature_fraction=0.9,\n","    bagging_fraction=0.9,\n","    bagging_freq=1,\n","    lambda_l2=1e-3,\n","    metric=\"multi_logloss\",\n","    verbosity=-1,\n",")\n","\n","bst = lgb.train(params, dtr, num_boost_round=2000,\n","                valid_sets=[dtr,dva], valid_names=[\"train\",\"valid\"],\n","                early_stopping_rounds=100)\n","\n","pva = bst.predict(Xva, num_iteration=bst.best_iteration)\n","print(\"valid logloss:\", log_loss(yva, pva))\n","\n","bst.save_model(OUT_PATH)\n","with open(OUT_PATH + \".dv.json\",\"w\",encoding=\"utf-8\") as f:\n","    json.dump({\"feature_names\": vec.feature_names_}, f, ensure_ascii=False)\n","print(\"saved:\", OUT_PATH)"],"metadata":{"colab":{"base_uri":"https://localhost:8080/"},"id":"ghA_oBd1kr_T","executionInfo":{"status":"ok","timestamp":1757490377390,"user_tz":-480,"elapsed":4,"user":{"displayName":"劉志謙","userId":"11004738754150995016"}},"outputId":"d0bf0912-d9f2-4c69-ad41-8dba21148bdf"},"execution_count":17,"outputs":[{"output_type":"stream","name":"stdout","text":["Overwriting /content/lgbm_train.py\n"]}]}]}
+# lgbm_train.py
+import os, csv, numpy as np
+MAP = {"B":0,"P":1,"T":2}
+
+FEAT_WIN  = int(os.getenv("FEAT_WIN","40"))
+GRID_ROWS = int(os.getenv("GRID_ROWS","6"))
+GRID_COLS = int(os.getenv("GRID_COLS","20"))
+OUT_PATH  = os.getenv("LGBM_OUT_PATH","/data/models/lgbm.txt")
+SEED      = int(os.getenv("SEED","42"))
+
+def parse_history(s):
+    s=(s or "").strip().upper()
+    toks=s.split(); seq=list(s) if len(toks)==1 else toks
+    out=[]; 
+    for ch in seq:
+        if ch in MAP: out.append(MAP[ch])
+    return out
+
+def big_road_grid(seq, rows=6, cols=20):
+    import numpy as np
+    grid_sign=np.zeros((rows,cols),dtype=np.int8)
+    grid_ties=np.zeros((rows,cols),dtype=np.int16)
+    r=0; c=0; last_bp=None
+    for v in seq:
+        if v==2:
+            if 0<=r<rows and 0<=c<cols: grid_ties[r,c]+=1
+            continue
+        cur_bp=+1 if v==0 else -1
+        if last_bp is None:
+            r,c=0,0; grid_sign[r,c]=cur_bp; last_bp=cur_bp; continue
+        if cur_bp==last_bp:
+            nr=r+1; nc=c
+            if nr>=rows or grid_sign[nr,nc]!=0:
+                nr=r; nc=c+1
+            r,c=nr,nc
+            if 0<=r<rows and 0<=c<cols: grid_sign[r,c]=cur_bp
+        else:
+            c=c+1; r=0
+            if c<cols: grid_sign[r,c]=cur_bp
+            last_bp=cur_bp
+    return grid_sign, grid_ties, (r,c)
+
+def big_road_features(seq, rows=6, cols=20, win=40):
+    import numpy as np
+    sub=seq[-win:] if len(seq)>win else seq[:]
+    gs,gt,(r,c)=big_road_grid(sub,rows,cols)
+    grid_sign_flat=gs.flatten().astype(np.float32)
+    grid_tie_flat =np.clip(gt.flatten(),0,3).astype(np.float32)/3.0
+    bp_only=[x for x in sub if x in (0,1)]
+    streak_len=0; streak_side=0.0
+    if bp_only:
+        last=bp_only[-1]
+        for v in reversed(bp_only):
+            if v==last: streak_len+=1
+            else: break
+        streak_side=+1.0 if last==0 else -1.0
+    col_heights=[]
+    for cc in range(cols-1,-1,-1):
+        h=int((gs[:,cc]!=0).sum())
+        if h>0: col_heights.append(h)
+        if len(col_heights)>=6: break
+    while len(col_heights)<6: col_heights.append(0)
+    col_heights=np.array(col_heights,dtype=np.float32)/rows
+    cur_col_height=float((gs[:,c]!=0).sum())/rows if 0<=c<cols else 0.0
+    cur_col_side =float(gs[0,c]) if 0<=c<cols else 0.0
+    cnt=np.bincount(sub,minlength=3).astype(np.float32)
+    freq=cnt / max(1,len(sub))
+    feat=np.concatenate([grid_sign_flat, grid_tie_flat,
+                         np.array([streak_len/rows, streak_side],dtype=np.float32),
+                         col_heights,
+                         np.array([cur_col_height,cur_col_side],dtype=np.float32),
+                         freq],axis=0)
+    return feat
+
+def load_dataset():
+    X=[]; y=[]
+    if os.path.exists("data/train.csv"):
+        import csv
+        with open("data/train.csv", newline='', encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                hist=row.get("history") or row.get("seq") or row.get("sequence")
+                nxt =row.get("next") or row.get("label") or row.get("y")
+                if not hist or not nxt: continue
+                seq=parse_history(hist); nxt=nxt.strip().upper()[:1]
+                if nxt not in MAP: continue
+                X.append(big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN))
+                y.append(MAP[nxt])
+    if os.path.exists("data/train.txt"):
+        with open("data/train.txt", encoding="utf-8") as f:
+            for line in f:
+                line=line.strip()
+                if "->" not in line: continue
+                left,right=line.split("->",1)
+                seq=parse_history(left)
+                nxt=right.strip().upper()[:1]
+                if nxt not in MAP: continue
+                X.append(big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN))
+                y.append(MAP[nxt])
+    if not X: raise SystemExit("No data found.")
+    return np.stack(X,0), np.array(y,dtype=np.int32)
+
+def main():
+    import lightgbm as lgb
+    X,y=load_dataset()
+    n=len(X); tr=int(n*0.8)
+    ltr=lgb.Dataset(X[:tr], label=y[:tr])
+    lva=lgb.Dataset(X[tr:], label=y[tr:]) if tr<n else None
+    params={
+        "objective":"multiclass",
+        "num_class":3,
+        "learning_rate":0.05,
+        "num_leaves":64,
+        "feature_fraction":0.9,
+        "bagging_fraction":0.9,
+        "bagging_freq":1,
+        "seed":SEED,
+        "metric":"multi_logloss"
+    }
+    bst=lgb.train(params, ltr, num_boost_round=2000,
+                  valid_sets=[ltr, lva] if lva else [ltr],
+                  valid_names=["train","valid"] if lva else ["train"],
+                  early_stopping_rounds=100 if lva else None,
+                  verbose_eval=100)
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    bst.save_model(OUT_PATH)
+    print(f"Saved LGBM model to {OUT_PATH}")
+
+if __name__=="__main__":
+    main()
