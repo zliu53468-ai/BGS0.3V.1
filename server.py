@@ -570,8 +570,7 @@ def _handle_command(txt: str) -> str:
         SEED_FILE.write_text(" ".join(merged), encoding="utf-8")
         if AUTO_TRAIN and len(merged)>=MIN_SEED_FOR_TRAIN and not _is_training:
             _start_training_async(merged)
-        return f"📝 已接收歷史共 {len(seq)} 手，目前累計 {_fmt_money(len(merged))} 手。
-輸入『開始分析』即可啟動。"
+        return f"📝 已接收歷史共 {len(seq)} 手，目前累計 {_fmt_money(len(merged))} 手。\n輸入『開始分析』即可啟動。"
     m = re.match(r"(?i)^TRAIN\s+(\d+)(?:\s+(\S+))?(?:\s+([\d\.]+))?(?:\s+(\S+))?(?:\s+([\d\.]+))?(?:\s+(\d+))?", t)
     if m:
         rows = int(m.group(1)); style = m.group(2) or "hybrid"; tie = float(m.group(3) or "0.06")
