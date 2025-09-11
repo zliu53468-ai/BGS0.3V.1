@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-import os, json, re, time, threading, random, string, math
+import os, json, re, threading, random
 from pathlib import Path
 from datetime import datetime
-from collections import Counter, defaultdict
-
+from collections import Counter
 from flask import Flask, request, jsonify, Response
 
-# ---- 可選：LINE Webhook（有設環境變數才啟用） -----------------
+# ---------- LINE (optional) ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_ENABLED = bool(LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN)
@@ -17,21 +16,21 @@ if LINE_ENABLED:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     parser = WebhookParser(LINE_CHANNEL_SECRET)
 
-# ---- 目錄與檔案 ------------------------------------------------
+# ---------- paths ----------
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/bgs-data"))
 MODEL_DIR = DATA_DIR / "models"
 STATE_FILE = DATA_DIR / "state.json"
 SEED_FILE = DATA_DIR / "seed.txt"
-for p in [DATA_DIR, MODEL_DIR]:
+for p in (DATA_DIR, MODEL_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
-# ---- 訓練設定（預設 5 萬筆） -----------------------------------
-AUTO_ROWS   = int(os.getenv("DEFAULT_ROWS", "50000"))
-TIE_RATE    = float(os.getenv("DEFAULT_TIE_RATE", "0.06"))
-JITTER      = float(os.getenv("DEFAULT_JITTER", "0.02"))
-AUTO_RUN    = True  # 開機或新增種子就自動訓練
+# ---------- training defaults ----------
+AUTO_ROWS = int(os.getenv("DEFAULT_ROWS", "50000"))
+TIE_RATE = float(os.getenv("DEFAULT_TIE_RATE", "0.06"))
+JITTER = float(os.getenv("DEFAULT_JITTER", "0.02"))
+AUTO_RUN = True  # auto train on boot or when new seed comes in
 
-# ---- 嘗試用 LightGBM；沒有就退回 LogisticRegression -------------
+# ---------- ML deps ----------
 USE_LGBM = True
 try:
     import lightgbm as lgb
@@ -41,26 +40,28 @@ from sklearn.linear_model import LogisticRegression
 import numpy as np
 import joblib
 
-# ---- Flask -----------------------------------------------------
+# ---------- app & globals ----------
 app = Flask(__name__)
-
-# ---- 全域狀態 --------------------------------------------------
 _lock = threading.Lock()
 _is_training = False
 _last_metrics = None
 _model_path = MODEL_DIR / "bgs_model.pkl"
-_thresholds = dict(B=0.5, P=0.5, T=0.5)  # 下注判斷門檻，可日後外部化
 
-# ---- 工具 ------------------------------------------------------
 BP_MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV_MAP = {0:"B", 1:"P", 2:"T"}
-
 TOKEN_RE = re.compile(r"[BPT莊閒和]+", re.I)
 
+# ---------- utils ----------
 def _read_seed() -> str:
     if SEED_FILE.exists():
         return SEED_FILE.read_text(encoding="utf-8").strip()
     return ""
+
+def normalize_seq(s: str) -> str:
+    s = s.strip().upper()
+    s = s.replace("莊","B").replace("閒","P").replace("和","T")
+    s = re.sub(r"[^BPT]", "", s)
+    return s
 
 def _append_seed(s: str):
     s = normalize_seq(s)
@@ -80,32 +81,23 @@ def _save_state():
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     return state
 
-def normalize_seq(s: str) -> str:
-    s = s.strip().upper()
-    s = s.replace("莊","B").replace("閒","P").replace("和","T")
-    s = re.sub(r"[^BPT]", "", s)
-    return s
-
 def markov_sample(seed: str, n: int, tie_rate: float, jitter: float) -> str:
-    # 簡單一階轉移機率（從種子估計），若太短則用固定分佈
     seed = normalize_seq(seed)
     if len(seed) < 10:
         base = {"B":0.46, "P":0.48, "T":tie_rate}
-        # 正規化
         s = sum(base.values())
         base = {k:v/s for k,v in base.items()}
         out = []
         for _ in range(n):
             r = random.random()
             cum = 0.0
-            for k in ["B","P","T"]:
+            for k in ("B","P","T"):
                 p = max(0.0, min(1.0, base[k] + random.uniform(-jitter, jitter)))
                 cum += p
                 if r <= cum:
                     out.append(k); break
         return "".join(out)
 
-    # 估轉移
     trans = {"B":Counter(), "P":Counter(), "T":Counter()}
     for a,b in zip(seed[:-1], seed[1:]):
         trans[a][b] += 1
@@ -113,33 +105,27 @@ def markov_sample(seed: str, n: int, tie_rate: float, jitter: float) -> str:
     for _ in range(n-1):
         row = trans[out[-1]]
         total = sum(row.values())
-        if total == 0:  # 落入未知，退回平均
-            nxt = random.choice(["B","P","T"])
+        if total == 0:
+            nxt = random.choice(("B","P","T"))
         else:
+            keys = ("B","P","T")
             ps = []
-            keys = ["B","P","T"]
             for k in keys:
-                p = row[k]/total
-                if k=="T":
+                p = row[k] / total if total else 1/3
+                if k == "T":
                     p = p*(1-jitter) + tie_rate*(1-jitter)
                 else:
                     p = p*(1-jitter) + (1-tie_rate)/2 * jitter
                 ps.append(p)
-            # normalize
-            s = sum(ps)
-            ps = [x/s for x in ps]
-            r = random.random()
-            cum=0.0
-            nxt="B"
-            for k,p in zip(keys, ps):
+            s = sum(ps); ps = [x/s for x in ps]
+            r = random.random(); cum = 0.0; nxt = "B"
+            for k, p in zip(keys, ps):
                 cum += p
-                if r<=cum:
-                    nxt=k; break
+                if r <= cum: nxt = k; break
         out.append(nxt)
     return "".join(out)
 
 def build_supervised(seq: str, k: int = 6):
-    # 以最近 k 手的 one-hot 當特徵，預測下一手
     X, y = [], []
     arr = [BP_MAP[c] for c in seq]
     for i in range(k, len(arr)):
@@ -147,8 +133,7 @@ def build_supervised(seq: str, k: int = 6):
         feat = np.zeros(3*k, dtype=np.float32)
         for j,v in enumerate(ctx):
             feat[j*3 + v] = 1.0
-        X.append(feat)
-        y.append(arr[i])
+        X.append(feat); y.append(arr[i])
     if not X: return np.zeros((0,3*k)), np.zeros((0,))
     return np.vstack(X), np.array(y)
 
@@ -159,54 +144,34 @@ def train_background(rows: int = AUTO_ROWS, tie_rate: float = TIE_RATE, jitter: 
             return
         _is_training = True
         _save_state()
-
     try:
         seed = _read_seed()
         if not seed or len(seed) < 20:
-            _last_metrics = {"error": "seed_too_short"}
+            _last_metrics = {"error":"seed_too_short"}
             return
         synth = markov_sample(seed, max(rows, 20000), tie_rate, jitter)
-        # 用 seed + synth 組合
         combo = seed + synth
         X, y = build_supervised(combo, k=6)
         if len(y) < 100:
             _last_metrics = {"error":"not_enough_samples"}
             return
-
-        # 切 train/valid
-        n = len(y)
-        idx = int(n*0.85)
-        Xtr, Ytr = X[:idx], y[:idx]
-        Xva, Yva = X[idx:], y[idx:]
+        n = len(y); idx = int(n*0.85)
+        Xtr, Ytr = X[:idx], y[:idx]; Xva, Yva = X[idx:], y[idx:]
 
         if USE_LGBM:
             train_set = lgb.Dataset(Xtr, label=Ytr)
             valid_set = lgb.Dataset(Xva, label=Yva, reference=train_set)
-            params = dict(
-                objective="multiclass",
-                num_class=3,
-                learning_rate=0.1,
-                num_leaves=31,
-                min_data_in_leaf=20,
-                feature_fraction=0.9,
-                bagging_fraction=0.9,
-                bagging_freq=1,
-                verbose=-1,
-            )
-            model = lgb.train(
-                params,
-                train_set,
-                valid_sets=[valid_set],
-                num_boost_round=200,
-                early_stopping_rounds=20,
-                verbose_eval=False
-            )
+            params = dict(objective="multiclass", num_class=3, learning_rate=0.1,
+                          num_leaves=31, min_data_in_leaf=20,
+                          feature_fraction=0.9, bagging_fraction=0.9, bagging_freq=1, verbose=-1)
+            model = lgb.train(params, train_set, valid_sets=[valid_set],
+                              num_boost_round=200, early_stopping_rounds=20, verbose_eval=False)
             pred = model.predict(Xva)
             acc = float((pred.argmax(axis=1) == Yva).mean())
             joblib.dump({"kind":"lgbm","model":model}, _model_path)
             _last_metrics = {"acc": round(acc,4), "algo":"lgbm", "n_samples": int(n)}
         else:
-            clf = LogisticRegression(max_iter=400, n_jobs=None)
+            clf = LogisticRegression(max_iter=400)
             clf.fit(Xtr, Ytr)
             acc = float((clf.predict(Xva) == Yva).mean())
             joblib.dump({"kind":"lr","model":clf}, _model_path)
@@ -219,7 +184,6 @@ def train_background(rows: int = AUTO_ROWS, tie_rate: float = TIE_RATE, jitter: 
             _save_state()
 
 def ensure_model_async():
-    # 若沒有模型或剛新增種子，就啟動背景訓練
     if _model_path.exists() or _is_training:
         return
     threading.Thread(target=train_background, daemon=True).start()
@@ -234,35 +198,26 @@ def load_model():
 
 def predict_next(seq_recent: str):
     m = load_model()
-    if not m:
-        return None
-    kind = m.get("kind","")
-    model = m["model"]
+    if not m: return None
+    kind = m.get("kind",""); model = m["model"]
     seq_recent = normalize_seq(seq_recent)
-    if len(seq_recent) < 6:
-        return None
+    if len(seq_recent) < 6: return None
     X, _ = build_supervised(seq_recent, k=6)
-    if X.shape[0] == 0:
-        return None
+    if X.shape[0] == 0: return None
     x = X[-1].reshape(1,-1)
     if kind == "lgbm":
         proba = model.predict(x)[0]
     else:
         proba = model.predict_proba(x)[0]
-    # clamp
-    proba = np.maximum(1e-6, np.array(proba))
-    proba = proba / proba.sum()
+    proba = np.maximum(1e-6, np.array(proba)); proba = proba / proba.sum()
     idx = int(proba.argmax())
     return {"B": float(proba[0]), "P": float(proba[1]), "T": float(proba[2]), "suggest": INV_MAP[idx]}
 
 def format_advise(prob, bankroll: int = 5000):
-    sug = prob["suggest"]
-    b, p, t = prob["B"], prob["P"], prob["T"]
-    # very simple bet sizing: 建議金額 = 本金 * (max_prob-0.5)*0.3，限制在 [0, 0.3]
-    maxp = max(b,p,t)
-    rate = max(0.0, min(0.3, (maxp-0.5)*0.6))
+    sug = prob["suggest"]; b, p, t = prob["B"], prob["P"], prob["T"]
+    maxp = max(b,p,t); rate = max(0.0, min(0.3, (maxp-0.5)*0.6))
     bet = int(round(bankroll * rate))
-    name = {"B":"莊", "P":"閒", "T":"和"}[sug]
+    name = {"B":"莊","P":"閒","T":"和"}[sug]
     lines = []
     lines.append(f"機率：莊 {b:.3f}｜閒 {p:.3f}｜和 {t:.3f}")
     lines.append(f"👉 下一手建議：{name}")
@@ -270,7 +225,7 @@ def format_advise(prob, bankroll: int = 5000):
     lines.append(f"✅ 建議下注：{bet:,}（約 {rate*100:.1f}%）")
     return "\n".join(lines)
 
-# ---- HTTP ------------------------------------------------------
+# ---------- HTTP ----------
 @app.get("/health")
 def health():
     return "OK"
@@ -293,7 +248,7 @@ def home():
 
 @app.post("/ingest-seed")
 def ingest_seed():
-    text = (request.form.get("seed") or request.json.get("seed","") if request.is_json else "").strip()
+    text = (request.form.get("seed") or (request.json.get("seed","") if request.is_json else "")).strip()
     s = normalize_seq(text)
     if not s:
         return jsonify({"ok": False, "msg":"no tokens"})
@@ -303,8 +258,7 @@ def ingest_seed():
 
 @app.get("/predict")
 def http_predict():
-    seq = request.args.get("seq","")
-    seq = normalize_seq(seq)
+    seq = normalize_seq(request.args.get("seq",""))
     if not seq:
         return jsonify({"error":"empty"})
     res = predict_next(seq)
@@ -312,14 +266,13 @@ def http_predict():
         return jsonify({"error":"model_not_ready"})
     return jsonify(res)
 
-# ---- LINE Webhook（無設定就不啟用） ---------------------------
+# ---------- LINE Webhook ----------
 def _extract_tokens(s: str) -> str:
     m = TOKEN_RE.findall(s.upper())
     if not m: return ""
     return normalize_seq("".join(m))
 
 def _detect_bankroll(s: str) -> int:
-    # 取第一個整數視為本金
     m = re.search(r"(\d{2,})", s.replace(",",""))
     if not m: return 5000
     try:
@@ -344,12 +297,9 @@ if LINE_ENABLED:
             user_text = ev.message.text.strip()
             tokens = _extract_tokens(user_text)
 
-            # 1) 有貼路單：累積 + 自動訓練（若尚未在訓練）
             if len(tokens) >= 1:
-                prev_len = len(_read_seed())
                 _append_seed(tokens)
                 ensure_model_async()
-                # 直接嘗試預測（用最近 12 手）
                 recent = (_read_seed())[-12:]
                 res = predict_next(recent)
                 if res:
@@ -360,7 +310,6 @@ if LINE_ENABLED:
                 line_bot_api.reply_message(ev.reply_token, TextSendMessage(reply))
                 continue
 
-            # 2) 沒有路單但想看建議：用目前 seed 的最近 12 手
             recent = (_read_seed())[-12:]
             res = predict_next(recent)
             if res:
@@ -371,12 +320,12 @@ if LINE_ENABLED:
             line_bot_api.reply_message(ev.reply_token, TextSendMessage(reply))
         return "OK"
 
-# ---- 服務啟動 --------------------------------------------------
-@app.before_first_request
-def _boot():
-    # 啟動時若無模型就自動訓練
-    if AUTO_RUN:
+# ---------- auto-train on import (Flask 3 compatible) ----------
+if AUTO_RUN:
+    try:
         ensure_model_async()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
