@@ -1,10 +1,10 @@
-# server.py — BGS AI (Big Road 6x20 + Heuristic + Optional XGB/LGBM/RNN)
+# server.py — BGS AI (Big Road 6x20 + Heuristic + XGB/LGBM + RNN)
 # + LINE Webhook（Emoji & 快速回覆）
-# + 新用戶 30 分鐘免費試用 / 開通帳號機制
-# + /predict 回傳相同的 emoji 文字訊息
-# + /health 健康檢查端點（Render 會打這個）
-# 啟動（Render）：
-#   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 --graceful-timeout 30
+# + 30 分鐘免費試用 / 單一密碼開通（只從環境變數讀取）
+# + /predict 同款 Emoji 文本
+# + /health 健康檢查
+# 啟動：
+#   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 --graceful-timeout 45
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -21,13 +21,13 @@ FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
 
-# Ensemble 權重（有模型檔才會啟用）
+# Ensemble 權重（有對應模型檔才會參與）
 ENS_W_HEU  = float(os.getenv("ENS_W_HEU", "0.55"))
 ENS_W_XGB  = float(os.getenv("ENS_W_XGB", "0.25"))
 ENS_W_LGB  = float(os.getenv("ENS_W_LGB", "0.20"))
-ENS_W_RNN  = float(os.getenv("ENS_W_RNN", "0.00"))   # 預設 0，未安裝 torch 也不會影響
+ENS_W_RNN  = float(os.getenv("ENS_W_RNN", "0.15"))  # 預設啟用 RNN 權重
 
-MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.07"))      # 推薦下注的最小差距
+MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.07"))
 TEMP       = float(os.getenv("TEMP", "0.95"))
 CLIP_T_MIN = float(os.getenv("CLIP_T_MIN", "0.02"))
 CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.12"))
@@ -36,9 +36,9 @@ np.random.seed(SEED)
 
 # ===== 試用 / 開通設定 =====
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")    # 顯示在通知上的官方 LINE
-# 多組啟用碼，逗號分隔；留空 = 任何非空代碼都接受（僅供測試）
-ACTIVATION_CODES = set([c.strip() for c in os.getenv("ACTIVATION_CODES", "").split(",") if c.strip()])
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
+# 唯一密碼只從環境變數讀取，程式碼不內嵌任何預設值
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 例：在 Render 設定
 
 # ===== LINE =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -57,9 +57,8 @@ except Exception as e:
     line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
 
-# ===== Session (in-memory) =====
-# { user_id: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
-SESS: Dict[str, Dict[str, object]] = {}
+# ===== Session =====
+SESS: Dict[str, Dict[str, object]] = {}  # { user_id: {bankroll, seq, trial_start, premium} }
 
 # ===== Optional models (lazy load) =====
 XGB_MODEL = None
@@ -90,9 +89,11 @@ def _load_lgb():
         log.warning("[MODEL] LGBM load failed: %s", e)
 
 def _load_rnn():
+    """載入 /data/models/rnn.pt（Tiny GRU）"""
     global RNN_MODEL
     try:
-        import torch, torch.nn as nn, os
+        import torch
+        import torch.nn as nn
         class TinyRNN(nn.Module):
             def __init__(self, in_dim=3, hid=32, out_dim=3):
                 super().__init__()
@@ -103,11 +104,14 @@ def _load_rnn():
         path = os.getenv("RNN_OUT_PATH", "/data/models/rnn.pt")
         if os.path.exists(path):
             RNN_MODEL = TinyRNN()
-            state = __import__("torch").load(path, map_location="cpu")
+            import torch as _torch
+            state = _torch.load(path, map_location="cpu")
             RNN_MODEL.load_state_dict(state); RNN_MODEL.eval()
             log.info("[MODEL] RNN loaded: %s", path)
+        else:
+            log.warning("[MODEL] RNN file not found at %s (skipping)", path)
     except Exception as e:
-        log.info("[MODEL] RNN not available (torch missing): %s", e)
+        log.warning("[MODEL] RNN load failed: %s", e)
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
@@ -302,9 +306,9 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float, bankroll:int, 
 def fmt_trial_over() -> str:
     return (
         "⛔ 免費試用已結束。\n"
-        f"📬 請聯繫管理員官方 LINE：{ADMIN_CONTACT} 開通帳號後再使用。\n"
-        "🔐 開通方式：收到啟用碼後，直接輸入：\n"
-        "【開通 你的啟用碼】（例：開通 vip888）"
+        f"📬 請先聯繫管理員官方 LINE：{ADMIN_CONTACT} 取得開通密碼後再使用。\n"
+        "🔐 開通方式：收到密碼後，直接輸入：\n"
+        "【開通 你的密碼】（例如：開通 abc123）"
     )
 
 def quick_reply_buttons():
@@ -325,12 +329,11 @@ def root():
 
 @app.route("/health", methods=["GET"])
 def health():
-    # 給 Render Health Check 用
     return jsonify(status="ok"), 200
 
 @app.route("/predict", methods=["POST"])
 def predict_api():
-    # /predict 不做試用限制（保留給你的前端/內部系統）
+    # /predict 不做試用限制（供你前端/內部）
     data = request.get_json(silent=True) or {}
     history = data.get("history", "")
     bankroll = int(data.get("bankroll", 0) or 0)
@@ -373,7 +376,7 @@ def on_follow(event):
         f"🎁 已啟用 {mins} 分鐘免費試用，現在就開始吧！\n"
         "請先輸入你的本金（例如：5000 或 20000），我會用它計算下注建議。💡\n"
         "接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入『開始分析』即可！📊\n"
-        "🔐 若試用到期，聯繫管理員官方 LINE 開通："
+        "🔐 試用到期後，請聯繫管理員取得開通密碼："
         f"{ADMIN_CONTACT}"
     )
     line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
@@ -384,21 +387,19 @@ def on_text(event):
     text = (event.message.text or "").strip()
     sess = SESS.setdefault(uid, {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": False})
 
-    # ===== 檢查是否已過試用（未開通者鎖定） =====
+    # ===== 檢查試用到期（未開通者鎖定）=====
     if not sess.get("premium", False):
         start = int(sess.get("trial_start", int(time.time())))
         elapsed_min = (int(time.time()) - start) / 60.0
         if elapsed_min >= TRIAL_MINUTES:
-            # 允許輸入「開通 XXX」來解鎖
+            # 只接受「開通 <密碼>」且密碼需等於 ADMIN_ACTIVATION_SECRET
             if text.startswith("開通") or text.lower().startswith("activate"):
                 code = text.split(" ",1)[1].strip() if " " in text else ""
                 if validate_activation_code(code):
                     sess["premium"] = True
-                    reply = "✅ 已開通成功！現在可以繼續使用所有功能。歡迎你～ 🎉"
-                    safe_reply(event.reply_token, reply, uid)
+                    safe_reply(event.reply_token, "✅ 已開通成功！現在可以繼續使用所有功能。🎉", uid)
                 else:
-                    safe_reply(event.reply_token,
-                               "❌ 開通碼無效。\n請確認管理員提供的啟用碼是否正確，或重新索取。", uid)
+                    safe_reply(event.reply_token, "❌ 開通密碼不正確，請向管理員索取正確密碼。", uid)
             else:
                 safe_reply(event.reply_token, fmt_trial_over(), uid)
             return
@@ -411,14 +412,14 @@ def on_text(event):
         safe_reply(event.reply_token, msg, uid)
         return
 
-    # 2) 開通碼（試用未到期也允許先開通）
+    # 2) 開通密碼（試用未到期也可先開通）
     if text.startswith("開通") or text.lower().startswith("activate"):
         code = text.split(" ",1)[1].strip() if " " in text else ""
         if validate_activation_code(code):
             sess["premium"] = True
             safe_reply(event.reply_token, "✅ 已開通成功！現在可以繼續使用所有功能。🎉", uid)
         else:
-            safe_reply(event.reply_token, "❌ 開通碼無效，請洽管理員取得正確的啟用碼。", uid)
+            safe_reply(event.reply_token, "❌ 開通密碼不正確，請向管理員索取正確密碼。", uid)
         return
 
     # 3) 歷史或單手結果
@@ -427,7 +428,6 @@ def on_text(event):
     seq = parse_history(norm)
 
     if seq and ("開始分析" not in text):
-        # 單字＝追加一手；多字＝覆蓋歷史
         if len(seq) == 1:
             sess.setdefault("seq", [])
             sess["seq"].append(seq[0])
@@ -455,21 +455,19 @@ def on_text(event):
         "• 輸入『數字』設定本金（例：5000）\n"
         "• 貼上歷史：B/P/T 或 莊/閒/和（可有空白）\n"
         "• 輸入『開始分析』取得建議\n"
-        "• 開通帳號：輸入『開通 你的啟用碼』\n"
+        "• 試用到期後輸入：『開通 你的密碼』\n"
         f"• 管理員官方 LINE：{ADMIN_CONTACT}"
     )
     safe_reply(event.reply_token, msg, uid)
 
 def validate_activation_code(code: str) -> bool:
-    if not code: 
+    # 只有當 ADMIN_ACTIVATION_SECRET 設定且完全相等才通過；否則一律拒絕
+    if not ADMIN_ACTIVATION_SECRET:
+        # 若你忘了設定密碼，為安全起見，直接拒絕
         return False
-    if ACTIVATION_CODES:
-        return code in ACTIVATION_CODES
-    # 未設定 ACTIVATION_CODES 時，任何非空碼都接受（測試用）
-    return True
+    return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
 
 def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
-    """優先 reply；失敗（如 400 Invalid reply token）就 push。"""
     try:
         line_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
     except Exception as e:
@@ -481,6 +479,11 @@ def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
                 log.error("[LINE] push failed: %s", e2)
 
 # ===== Main =====
+@app.route("/health", methods=["GET"])
+def _health_dup_for_gunicorn():
+    # 某些平台可能探測兩次，保險起見
+    return jsonify(status="ok"), 200
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
