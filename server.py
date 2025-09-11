@@ -2,6 +2,7 @@
 # + LINE Webhook（Emoji & 快速回覆）
 # + 新用戶 30 分鐘免費試用 / 開通帳號機制
 # + /predict 回傳相同的 emoji 文字訊息
+# + /health 健康檢查端點（Render 會打這個）
 # 啟動（Render）：
 #   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 --graceful-timeout 30
 
@@ -24,7 +25,7 @@ GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
 ENS_W_HEU  = float(os.getenv("ENS_W_HEU", "0.55"))
 ENS_W_XGB  = float(os.getenv("ENS_W_XGB", "0.25"))
 ENS_W_LGB  = float(os.getenv("ENS_W_LGB", "0.20"))
-ENS_W_RNN  = float(os.getenv("ENS_W_RNN", "0.00"))
+ENS_W_RNN  = float(os.getenv("ENS_W_RNN", "0.00"))   # 預設 0，未安裝 torch 也不會影響
 
 MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.07"))      # 推薦下注的最小差距
 TEMP       = float(os.getenv("TEMP", "0.95"))
@@ -106,7 +107,7 @@ def _load_rnn():
             RNN_MODEL.load_state_dict(state); RNN_MODEL.eval()
             log.info("[MODEL] RNN loaded: %s", path)
     except Exception as e:
-        log.warning("[MODEL] RNN load failed: %s", e)
+        log.info("[MODEL] RNN not available (torch missing): %s", e)
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
@@ -270,10 +271,8 @@ def decide_bet(p: np.ndarray) -> Tuple[str, float, float]:
     arr.sort(reverse=True, key=lambda x: x[0])
     top_p, top_lab = arr[0]
     edge = top_p - arr[1][0]
-    # 和太低時不建議
     if top_lab == "和" and p[2] < max(0.05, CLIP_T_MIN + 0.01):
         return "觀望", edge, 0.0
-    # 分級下注
     if edge >= max(0.10, MIN_EDGE+0.02):
         bet_pct = 0.30
     elif edge >= max(0.08, MIN_EDGE):
@@ -305,8 +304,7 @@ def fmt_trial_over() -> str:
         "⛔ 免費試用已結束。\n"
         f"📬 請聯繫管理員官方 LINE：{ADMIN_CONTACT} 開通帳號後再使用。\n"
         "🔐 開通方式：收到啟用碼後，直接輸入：\n"
-        "【開通 你的啟用碼】\n"
-        "（例：開通 vip888）"
+        "【開通 你的啟用碼】（例：開通 vip888）"
     )
 
 def quick_reply_buttons():
@@ -324,6 +322,11 @@ def quick_reply_buttons():
 @app.route("/", methods=["GET"])
 def root():
     return "BGS AI server ok", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    # 給 Render Health Check 用
+    return jsonify(status="ok"), 200
 
 @app.route("/predict", methods=["POST"])
 def predict_api():
