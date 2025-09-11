@@ -1,161 +1,132 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Train TinyRNN (GRU) aligned with server v15.3
-- Input: sequence of one-hot(B,P,T), padded/truncated to FEAT_WIN
-- Label: next outcome class (B/P/T) from CSV rows (history_before -> label)
-- Saves state_dict to RNN_PATH
-"""
-
-import os, csv, random
-from typing import List, Tuple
+# train_rnn.py
+import os, csv, math, random
 import numpy as np
+import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-import torch
-import torch.nn as tnn
-import torch.optim as optim
+MAP = {"B":0,"P":1,"T":2}
 
-TRAIN_DATA_PATH = os.getenv("TRAIN_DATA_PATH", "/data/logs/rounds.csv")
-RNN_OUT_PATH    = os.getenv("RNN_OUT_PATH",   "/data/models/rnn.pt")
-os.makedirs(os.path.dirname(RNN_OUT_PATH), exist_ok=True)
+FEAT_WIN = int(os.getenv("FEAT_WIN","40"))
+BATCH    = int(os.getenv("RNN_BATCH","64"))
+EPOCHS   = int(os.getenv("RNN_EPOCHS","30"))
+LR       = float(os.getenv("RNN_LR","1e-3"))
+OUT_PATH = os.getenv("RNN_OUT_PATH","/data/models/rnn.pt")
+SEED     = int(os.getenv("SEED","42"))
 
-FEAT_WIN   = int(os.getenv("FEAT_WIN", "20"))
-VAL_SPLIT  = float(os.getenv("VAL_SPLIT", "0.15"))
-BATCH_SIZE = int(os.getenv("RNN_BS", "64"))
-EPOCHS     = int(os.getenv("RNN_EPOCHS", "15"))
-LR         = float(os.getenv("RNN_LR", "0.003"))
-MAX_HISTORY= int(os.getenv("MAX_HISTORY", "400"))
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-LUT = {'B':0,'P':1,'T':2}
-CLASS_ORDER = ("B","P","T")
+def parse_history(s):
+    s=(s or "").strip().upper()
+    toks=s.split(); seq=list(s) if len(toks)==1 else toks
+    out=[]
+    for ch in seq:
+        if ch in MAP: out.append(MAP[ch])
+    return out
 
-class TinyRNN(tnn.Module):
-    def __init__(self, in_dim=3, hidden=16, out_dim=3):
+def one_hot_seq(seq, win):
+    sub = seq[-win:] if len(seq)>win else seq[:]
+    pad = [-1]*max(0, win-len(sub))
+    final = (pad+sub)[-win:]
+    oh=[]
+    for v in final:
+        a=[0,0,0]
+        if v in (0,1,2): a[v]=1
+        oh.append(a)
+    return np.array(oh, dtype=np.float32)   # [win,3]
+
+class SeqDataset(Dataset):
+    def __init__(self, X, y):
+        self.X=X; self.y=y
+    def __len__(self): return len(self.X)
+    def __getitem__(self, i):
+        return torch.from_numpy(self.X[i]), torch.tensor(self.y[i], dtype=torch.long)
+
+def load_dataset():
+    X=[]; y=[]
+    if os.path.exists("data/train.csv"):
+        with open("data/train.csv", newline='', encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                hist=row.get("history") or row.get("seq") or row.get("sequence")
+                nxt=row.get("next") or row.get("label") or row.get("y")
+                if not hist or not nxt: continue
+                seq=parse_history(hist); nxt=nxt.strip().upper()[:1]
+                if nxt not in MAP: continue
+                X.append(one_hot_seq(seq, FEAT_WIN))
+                y.append(MAP[nxt])
+    if os.path.exists("data/train.txt"):
+        with open("data/train.txt", encoding="utf-8") as f:
+            for line in f:
+                if "->" not in line: continue
+                left,right=line.split("->",1)
+                seq=parse_history(left)
+                nxt=right.strip().upper()[:1]
+                if nxt not in MAP: continue
+                X.append(one_hot_seq(seq, FEAT_WIN))
+                y.append(MAP[nxt])
+    if not X: raise SystemExit("No data found.")
+    X=np.stack(X,0)   # [N,win,3]
+    y=np.array(y, dtype=np.int64)
+    return X,y
+
+class TinyRNN(nn.Module):
+    def __init__(self, in_dim=3, hid=64, out_dim=3):
         super().__init__()
-        self.rnn = tnn.GRU(in_dim, hidden, batch_first=True)
-        self.fc  = tnn.Linear(hidden, out_dim)
+        self.gru = nn.GRU(input_size=in_dim, hidden_size=hid, num_layers=1, batch_first=True)
+        self.fc  = nn.Linear(hid, out_dim)
     def forward(self, x):
-        o, _ = self.rnn(x)
-        return self.fc(o[:, -1, :])
-
-def load_rows(path: str):
-    rows = []
-    if not os.path.exists(path):
-        print(f"[ERROR] data file not found: {path}")
-        return rows
-    with open(path, "r", encoding="utf-8") as f:
-        r = csv.reader(f)
-        for line in r:
-            if not line or len(line) < 4: continue
-            try:
-                ts = int(line[1])
-            except Exception:
-                continue
-            hist = (line[2] or "").strip().upper()
-            lab  = (line[3] or "").strip().upper()
-            if lab in LUT:
-                rows.append((ts, hist, lab))
-    rows.sort(key=lambda x: x[0])
-    return rows
-
-def hist_to_tensor(hist: str, K: int) -> torch.Tensor:
-    seq = [ch for ch in hist if ch in LUT]
-    if len(seq) > MAX_HISTORY:
-        seq = seq[-MAX_HISTORY:]
-    take = seq[-K:]
-    pad = K - len(take)
-    out = []
-    # left-pad with zeros
-    for _ in range(pad):
-        out.append([0.0, 0.0, 0.0])
-    for ch in take:
-        one = [0.0,0.0,0.0]; one[LUT[ch]] = 1.0
-        out.append(one)
-    return torch.tensor(out, dtype=torch.float32)  # (K,3)
-
-def build_xy(rows, K: int):
-    X, y = [], []
-    for _, hist, lab in rows:
-        X.append(hist_to_tensor(hist, K))
-        y.append(LUT[lab])
-    X = torch.stack(X, dim=0)  # (N,K,3)
-    y = torch.tensor(y, dtype=torch.long)
-    return X, y
-
-def time_split(rows, val_ratio: float):
-    n = len(rows)
-    k = max(1, int(n*(1.0 - val_ratio)))
-    return rows[:k], rows[k:]
-
-def class_weights(y: torch.Tensor) -> torch.Tensor:
-    counts = torch.bincount(y, minlength=3).float()
-    counts[counts==0] = 1.0
-    inv = 1.0 / counts
-    w = inv[y]
-    w *= (len(w) / w.sum())
-    # use per-class weights
-    per_class = inv * (3.0 / inv.sum())
-    return per_class
-
-def batch_iter(X, y, bs: int, shuffle=True):
-    idx = list(range(len(y)))
-    if shuffle: random.shuffle(idx)
-    for i in range(0, len(idx), bs):
-        j = idx[i:i+bs]
-        yield X[j], y[j]
+        o,_ = self.gru(x)    # [B,T,H]
+        last = o[:, -1, :]
+        return self.fc(last)
 
 def main():
-    rows = load_rows(TRAIN_DATA_PATH)
-    if len(rows) < 50:
-        print(f"[WARN] few samples: {len(rows)}; training anyway.")
-    tr, va = time_split(rows, VAL_SPLIT)
-    Xtr, ytr = build_xy(tr, FEAT_WIN)
-    Xva, yva = build_xy(va, FEAT_WIN) if va else (None, None)
+    X,y=load_dataset()
+    n=len(X); tr=int(n*0.85)
+    Xtr, ytr = X[:tr], y[:tr]
+    Xva, yva = X[tr:], y[tr:] if tr<n else (X[:0], y[:0])
 
-    model = TinyRNN(in_dim=3, hidden=16, out_dim=3)
-    opt = optim.Adam(model.parameters(), lr=LR)
-    crit = tnn.CrossEntropyLoss(weight=class_weights(ytr))
+    tr_ds=SeqDataset(Xtr,ytr); va_ds=SeqDataset(Xva,yva)
+    tr_dl=DataLoader(tr_ds, batch_size=BATCH, shuffle=True)
+    va_dl=DataLoader(va_ds, batch_size=BATCH, shuffle=False) if len(va_ds)>0 else None
 
-    best_va = float("inf")
-    patience = max(3, EPOCHS//3)
-    bad = 0
+    model=TinyRNN()
+    opt=torch.optim.AdamW(model.parameters(), lr=LR)
+    crit=nn.CrossEntropyLoss()
 
+    best_loss=1e9; patience=6; bad=0
     for ep in range(1, EPOCHS+1):
-        model.train()
-        total = 0.0
-        for xb, yb in batch_iter(Xtr, ytr, BATCH_SIZE, shuffle=True):
+        model.train(); tl=0.0; nbt=0
+        for xb,yb in tr_dl:
             opt.zero_grad()
-            logits = model(xb)
-            loss = crit(logits, yb)
+            logits=model(xb)
+            loss=crit(logits, yb)
             loss.backward()
             opt.step()
-            total += loss.item() * len(yb)
-        tr_loss = total / len(ytr)
+            tl += float(loss); nbt += 1
+        tl /= max(1,nbt)
 
-        model.eval()
-        with torch.no_grad():
-            if Xva is not None:
-                logits = model(Xva)
-                va_loss = tnn.functional.cross_entropy(logits, yva).item()
-            else:
-                va_loss = tr_loss
+        vl=0.0; nvb=0
+        if va_dl:
+            model.eval()
+            with torch.no_grad():
+                for xb,yb in va_dl:
+                    logits=model(xb)
+                    loss=crit(logits,yb)
+                    vl += float(loss); nvb += 1
+            vl /= max(1,nvb)
+        else:
+            vl = tl
 
-        print(f"[EP {ep}] train={tr_loss:.4f} valid={va_loss:.4f}")
-
-        if va_loss + 1e-6 < best_va:
-            best_va = va_loss; bad = 0
-            torch.save(model.state_dict(), RNN_OUT_PATH)
-            print(f"  -> checkpoint saved to {RNN_OUT_PATH}")
+        print(f"Epoch {ep:02d} | train {tl:.4f} | valid {vl:.4f}")
+        if vl < best_loss - 1e-4:
+            best_loss = vl; bad = 0
+            os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+            torch.save(model.state_dict(), OUT_PATH)
+            print(f"  -> saved {OUT_PATH}")
         else:
             bad += 1
             if bad >= patience:
                 print("Early stop.")
                 break
 
-    # final save (in case very small data / no val improvement caught)
-    if not os.path.exists(RNN_OUT_PATH):
-        torch.save(model.state_dict(), RNN_OUT_PATH)
-    print(f"[OK] saved RNN -> {RNN_OUT_PATH}")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
