@@ -1,9 +1,11 @@
 # server.py — BGS AI (Big Road 6x20 + Heuristic + Optional XGB/LGBM/RNN)
-# + LINE Webhook（含 Emoji & 快速回覆）+ /predict 也回傳相同文字格式
+# + LINE Webhook（Emoji & 快速回覆）
+# + 新用戶 30 分鐘免費試用 / 開通帳號機制
+# + /predict 回傳相同的 emoji 文字訊息
 # 啟動（Render）：
 #   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120 --graceful-timeout 30
 
-import os, logging, math
+import os, logging, time
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
@@ -31,6 +33,12 @@ CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.12"))
 SEED       = int(os.getenv("SEED", "42"))
 np.random.seed(SEED)
 
+# ===== 試用 / 開通設定 =====
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")    # 顯示在通知上的官方 LINE
+# 多組啟用碼，逗號分隔；留空 = 任何非空代碼都接受（僅供測試）
+ACTIVATION_CODES = set([c.strip() for c in os.getenv("ACTIVATION_CODES", "").split(",") if c.strip()])
+
 # ===== LINE =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -49,7 +57,7 @@ except Exception as e:
     log.warning("LINE SDK not fully available: %s", e)
 
 # ===== Session (in-memory) =====
-# { user_id: {"bankroll": int, "seq": List[int]} }
+# { user_id: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
 SESS: Dict[str, Dict[str, object]] = {}
 
 # ===== Optional models (lazy load) =====
@@ -258,7 +266,6 @@ def fuse_probs(ph: np.ndarray,
 
 def decide_bet(p: np.ndarray) -> Tuple[str, float, float]:
     """回傳 (建議: '莊'/'閒'/'和'/'觀望', 邊際, 建議下注比例%)"""
-    labels = ["莊","閒","和"]
     arr = [(float(p[0]),"莊"), (float(p[1]),"閒"), (float(p[2]),"和")]
     arr.sort(reverse=True, key=lambda x: x[0])
     top_p, top_lab = arr[0]
@@ -277,7 +284,7 @@ def decide_bet(p: np.ndarray) -> Tuple[str, float, float]:
         return "觀望", edge, 0.0
     return top_lab, edge, bet_pct
 
-# ===== Emoji 文字樣式（/predict 與 LINE 共用） =====
+# ===== Emoji 訊息樣式 =====
 def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float, bankroll:int, bet_pct:float) -> str:
     b, pl, t = p[0], p[1], p[2]
     lines = []
@@ -292,6 +299,15 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float, bankroll:int, 
         lines.append(f"🧮 10%={int(round(bankroll*0.10)):,}｜20%={int(round(bankroll*0.20)):,}｜30%={int(round(bankroll*0.30)):,}")
     lines.append("📝 直接輸入下一手結果（莊/閒/和 或 B/P/T），我會再幫你算下一局。")
     return "\n".join(lines)
+
+def fmt_trial_over() -> str:
+    return (
+        "⛔ 免費試用已結束。\n"
+        f"📬 請聯繫管理員官方 LINE：{ADMIN_CONTACT} 開通帳號後再使用。\n"
+        "🔐 開通方式：收到啟用碼後，直接輸入：\n"
+        "【開通 你的啟用碼】\n"
+        "（例：開通 vip888）"
+    )
 
 def quick_reply_buttons():
     try:
@@ -311,6 +327,7 @@ def root():
 
 @app.route("/predict", methods=["POST"])
 def predict_api():
+    # /predict 不做試用限制（保留給你的前端/內部系統）
     data = request.get_json(silent=True) or {}
     history = data.get("history", "")
     bankroll = int(data.get("bankroll", 0) or 0)
@@ -326,7 +343,7 @@ def predict_api():
         "edge": round(edge,3),
         "bet_pct": bet_pct,
         "bet_amount": int(round(bankroll*bet_pct)) if bankroll and bet_pct>0 else 0,
-        "message": text  # 👈 提供相同 Emoji 文本
+        "message": text
     })
 
 # ===== LINE webhook =====
@@ -345,11 +362,16 @@ def line_webhook():
 @line_handler.add(FollowEvent)
 def on_follow(event):
     uid = event.source.user_id
-    SESS[uid] = {"bankroll": 0, "seq": []}
+    now = int(time.time())
+    SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": now, "premium": False}
+    mins = TRIAL_MINUTES
     msg = (
         "🤖 歡迎加入！\n"
+        f"🎁 已啟用 {mins} 分鐘免費試用，現在就開始吧！\n"
         "請先輸入你的本金（例如：5000 或 20000），我會用它計算下注建議。💡\n"
-        "接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入『開始分析』即可！📊"
+        "接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入『開始分析』即可！📊\n"
+        "🔐 若試用到期，聯繫管理員官方 LINE 開通："
+        f"{ADMIN_CONTACT}"
     )
     line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
 
@@ -357,8 +379,28 @@ def on_follow(event):
 def on_text(event):
     uid = event.source.user_id
     text = (event.message.text or "").strip()
-    sess = SESS.setdefault(uid, {"bankroll": 0, "seq": []})
+    sess = SESS.setdefault(uid, {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": False})
 
+    # ===== 檢查是否已過試用（未開通者鎖定） =====
+    if not sess.get("premium", False):
+        start = int(sess.get("trial_start", int(time.time())))
+        elapsed_min = (int(time.time()) - start) / 60.0
+        if elapsed_min >= TRIAL_MINUTES:
+            # 允許輸入「開通 XXX」來解鎖
+            if text.startswith("開通") or text.lower().startswith("activate"):
+                code = text.split(" ",1)[1].strip() if " " in text else ""
+                if validate_activation_code(code):
+                    sess["premium"] = True
+                    reply = "✅ 已開通成功！現在可以繼續使用所有功能。歡迎你～ 🎉"
+                    safe_reply(event.reply_token, reply, uid)
+                else:
+                    safe_reply(event.reply_token,
+                               "❌ 開通碼無效。\n請確認管理員提供的啟用碼是否正確，或重新索取。", uid)
+            else:
+                safe_reply(event.reply_token, fmt_trial_over(), uid)
+            return
+
+    # ===== 正常流程 =====
     # 1) 數字 → 設定本金
     if text.isdigit():
         sess["bankroll"] = int(text)
@@ -366,7 +408,17 @@ def on_text(event):
         safe_reply(event.reply_token, msg, uid)
         return
 
-    # 2) 歷史字串（或單手結果）
+    # 2) 開通碼（試用未到期也允許先開通）
+    if text.startswith("開通") or text.lower().startswith("activate"):
+        code = text.split(" ",1)[1].strip() if " " in text else ""
+        if validate_activation_code(code):
+            sess["premium"] = True
+            safe_reply(event.reply_token, "✅ 已開通成功！現在可以繼續使用所有功能。🎉", uid)
+        else:
+            safe_reply(event.reply_token, "❌ 開通碼無效，請洽管理員取得正確的啟用碼。", uid)
+        return
+
+    # 3) 歷史或單手結果
     zh2eng = {"莊":"B","閒":"P","和":"T"}
     norm = "".join(zh2eng.get(ch, ch) for ch in text.upper())
     seq = parse_history(norm)
@@ -383,7 +435,7 @@ def on_text(event):
         safe_reply(event.reply_token, msg, uid)
         return
 
-    # 3) 開始分析
+    # 4) 開始分析
     if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
         sseq: List[int] = sess.get("seq", [])
         bankroll: int = int(sess.get("bankroll", 0) or 0)
@@ -394,15 +446,24 @@ def on_text(event):
         safe_reply(event.reply_token, reply, uid)
         return
 
-    # 4) 說明
+    # 5) 說明
     msg = (
         "🧭 指令說明：\n"
         "• 輸入『數字』設定本金（例：5000）\n"
         "• 貼上歷史：B/P/T 或 莊/閒/和（可有空白）\n"
         "• 輸入『開始分析』取得建議\n"
-        "• 每局結束後，輸入『莊/閒/和 或 B/P/T』即可追加一手再分析"
+        "• 開通帳號：輸入『開通 你的啟用碼』\n"
+        f"• 管理員官方 LINE：{ADMIN_CONTACT}"
     )
     safe_reply(event.reply_token, msg, uid)
+
+def validate_activation_code(code: str) -> bool:
+    if not code: 
+        return False
+    if ACTIVATION_CODES:
+        return code in ACTIVATION_CODES
+    # 未設定 ACTIVATION_CODES 時，任何非空碼都接受（測試用）
+    return True
 
 def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
     """優先 reply；失敗（如 400 Invalid reply token）就 push。"""
