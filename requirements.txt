@@ -1,11 +1,23 @@
-Flask
-flask-cors
-numpy
-pandas
-scikit-learn
-joblib
-xgboost
-lightgbm
-line-bot-sdk
-gunicorn
+# === Web / WSGI ===
+Flask==3.0.3
+gunicorn==21.2.0
 
+# === LINE Bot SDK ===
+line-bot-sdk==3.11.0
+
+# === Imaging / CV ===
+pillow>=10,<12
+opencv-python-headless==4.10.0.84
+
+# === Numerics / ML ===
+numpy==1.26.4          # 與下列套件相容、manylinux 內建輪子，部署穩定
+scipy==1.11.4
+scikit-learn==1.4.2
+xgboost==2.0.3
+lightgbm==4.4.0
+joblib==1.3.2
+threadpoolctl==3.4.0
+
+# === HTTP / Utils ===
+requests==2.32.3
+python-dateutil==2.9.0.post0
