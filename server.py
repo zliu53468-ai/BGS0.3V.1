@@ -1,596 +1,383 @@
 # -*- coding: utf-8 -*-
-"""
-BGS server.py  (直接覆蓋可用)
-- Dashboard:        GET /
-- Status JSON:      GET /status.json
-- Health:           GET /health
-- Ingest seed:      POST /ingest-seed  { "text": "B P P T ... 或 莊 閒 和 ..." }
-- Train synth:      GET  /synth-train?rows=100000&style=hybrid&tie_rate=0.06&mode=feature&jitter=0.02&with_xgb=0
-- Predict:          GET  /predict?seq=BPTBPB&ensemble=light&mc=0
-- LINE webhook:     POST /line-webhook   (需設定 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN)
-"""
-import os
-import re
-import json
-import random
-from datetime import datetime
+import os, json, re, time, threading, random, string, math
 from pathlib import Path
-from threading import Thread, Lock
-from typing import List, Tuple, Dict
+from datetime import datetime
+from collections import Counter, defaultdict
 
 from flask import Flask, request, jsonify, Response
 
-# ==== 路徑與檔案 ====
-ROOT = Path(os.getenv("APP_ROOT") or Path(__file__).parent.resolve())
-DATA = ROOT / "data"
-MODELS = ROOT / "models"
-DATA.mkdir(exist_ok=True)
-MODELS.mkdir(exist_ok=True)
+# ---- 可選：LINE Webhook（有設環境變數才啟用） -----------------
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_ENABLED = bool(LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN)
+if LINE_ENABLED:
+    from linebot import LineBotApi, WebhookParser
+    from linebot.models import MessageEvent, TextMessage, TextSendMessage
+    from linebot.exceptions import InvalidSignatureError
+    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+    parser = WebhookParser(LINE_CHANNEL_SECRET)
 
-SEED_FILE = DATA / "seed.txt"
-LGBM_FILE = MODELS / "lgbm.pkl"
-LR_FILE   = MODELS / "lr.pkl"
-XGB_FILE  = MODELS / "xgb.pkl"
+# ---- 目錄與檔案 ------------------------------------------------
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/bgs-data"))
+MODEL_DIR = DATA_DIR / "models"
+STATE_FILE = DATA_DIR / "state.json"
+SEED_FILE = DATA_DIR / "seed.txt"
+for p in [DATA_DIR, MODEL_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
 
-# ==== 旗標 / 共享狀態 ====
-_is_training = False
-_last_metrics = None
-_lock = Lock()
+# ---- 訓練設定（預設 5 萬筆） -----------------------------------
+AUTO_ROWS   = int(os.getenv("DEFAULT_ROWS", "50000"))
+TIE_RATE    = float(os.getenv("DEFAULT_TIE_RATE", "0.06"))
+JITTER      = float(os.getenv("DEFAULT_JITTER", "0.02"))
+AUTO_RUN    = True  # 開機或新增種子就自動訓練
 
-# ==== 依賴套件 ====
-import numpy as np
-import pandas as pd
+# ---- 嘗試用 LightGBM；沒有就退回 LogisticRegression -------------
+USE_LGBM = True
+try:
+    import lightgbm as lgb
+except Exception:
+    USE_LGBM = False
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import log_loss, accuracy_score
-from joblib import dump, load
+import numpy as np
+import joblib
 
-# LightGBM
-try:
-    from lightgbm import LGBMClassifier
-except Exception:
-    LGBMClassifier = None
-
-# XGBoost（可選）
-try:
-    from xgboost import XGBClassifier
-except Exception:
-    XGBClassifier = None
-
-# LINE SDK（若未設環境變數會跳過初始化）
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-line_bot = None
-if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
-    try:
-        from linebot.v3.webhook import WebhookParser
-        from linebot.v3.messaging import (
-            MessagingApi, Configuration, ApiClient,
-            ReplyMessageRequest, TextMessage
-        )
-        parser = WebhookParser(LINE_CHANNEL_SECRET)
-        configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-        api_client = ApiClient(configuration)
-        line_bot = MessagingApi(api_client)
-    except Exception as e:
-        print("[WARN] LINE SDK init failed:", e)
-        line_bot = None
-
+# ---- Flask -----------------------------------------------------
 app = Flask(__name__)
 
-# ====== 工具 ======
-ALIAS = {
-    "莊": "B", "閒": "P", "和": "T",
-    "b": "B", "p": "P", "t": "T"
-}
-VALID = {"B", "P", "T"}
+# ---- 全域狀態 --------------------------------------------------
+_lock = threading.Lock()
+_is_training = False
+_last_metrics = None
+_model_path = MODEL_DIR / "bgs_model.pkl"
+_thresholds = dict(B=0.5, P=0.5, T=0.5)  # 下注判斷門檻，可日後外部化
 
-def normalize_tokens(txt: str) -> List[str]:
-    # 將輸入轉為 B/P/T token list
-    t = re.sub(r"[,\u3000\t]+", " ", txt.strip())
-    t = re.sub(r"\s+", " ", t)
-    out = []
-    for w in re.split(r"[ \n\r]+", t):
-        w = w.strip()
-        if not w:
-            continue
-        w_up = w.upper()
-        if w_up in VALID:
-            out.append(w_up)
-            continue
-        # 中文別名
-        if w in ALIAS:
-            out.append(ALIAS[w])
-            continue
-        # 單字串如 "BPPTB"
-        if re.fullmatch(r"[BPTbpt]+", w):
-            out.extend([ALIAS.get(ch, ch).upper() for ch in w])
-            continue
-        # 中文連續如 "莊莊閒和"
-        if re.fullmatch(r"[莊閒和]+", w):
-            out.extend([ALIAS[ch] for ch in w])
-            continue
-    return out
+# ---- 工具 ------------------------------------------------------
+BP_MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
+INV_MAP = {0:"B", 1:"P", 2:"T"}
 
-def save_seed_lines(tokens: List[str]) -> int:
-    prev = []
+TOKEN_RE = re.compile(r"[BPT莊閒和]+", re.I)
+
+def _read_seed() -> str:
     if SEED_FILE.exists():
-        prev = normalize_tokens(SEED_FILE.read_text(encoding="utf-8"))
-    merged = prev + tokens
-    SEED_FILE.write_text(" ".join(merged), encoding="utf-8")
-    return len(merged)
+        return SEED_FILE.read_text(encoding="utf-8").strip()
+    return ""
 
-def seed_len() -> int:
-    if not SEED_FILE.exists():
-        return 0
-    return len(normalize_tokens(SEED_FILE.read_text(encoding="utf-8")))
+def _append_seed(s: str):
+    s = normalize_seq(s)
+    if not s: return
+    prev = _read_seed()
+    new = (prev + s) if prev else s
+    SEED_FILE.write_text(new, encoding="utf-8")
 
-# ====== 特徵工程（簡單穩定版）======
-def build_feature_row(seq: List[str], i: int) -> Tuple[List[float], str]:
-    """
-    以 seq[0:i] 過去視窗做特徵，標籤為 seq[i]。
-    特徵：最後1/2/3手 one-hot、B/P/T 數量、近期連莊/連閒、上手是否和。
-    """
-    y = seq[i]
-    past = seq[:i]
-    last1 = past[-1] if i >= 1 else "_"
-    last2 = past[-2] if i >= 2 else "_"
-    last3 = past[-3] if i >= 3 else "_"
+def _save_state():
+    state = {
+        "is_training": _is_training,
+        "model_exists": _model_path.exists(),
+        "seed_records": len(_read_seed()),
+        "last_metrics": _last_metrics,
+        "ts": datetime.utcnow().isoformat()
+    }
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
 
-    def onehot(v):
-        return [1.0 if v == "B" else 0.0, 1.0 if v == "P" else 0.0, 1.0 if v == "T" else 0.0]
+def normalize_seq(s: str) -> str:
+    s = s.strip().upper()
+    s = s.replace("莊","B").replace("閒","P").replace("和","T")
+    s = re.sub(r"[^BPT]", "", s)
+    return s
 
-    cB = past.count("B"); cP = past.count("P"); cT = past.count("T")
-    # 連莊/連閒
-    streakB = 0; streakP = 0
-    for k in reversed(past):
-        if k == "B":
-            streakB += 1
-            break
-        elif k == "P":
-            streakP += 1
-            break
+def markov_sample(seed: str, n: int, tie_rate: float, jitter: float) -> str:
+    # 簡單一階轉移機率（從種子估計），若太短則用固定分佈
+    seed = normalize_seq(seed)
+    if len(seed) < 10:
+        base = {"B":0.46, "P":0.48, "T":tie_rate}
+        # 正規化
+        s = sum(base.values())
+        base = {k:v/s for k,v in base.items()}
+        out = []
+        for _ in range(n):
+            r = random.random()
+            cum = 0.0
+            for k in ["B","P","T"]:
+                p = max(0.0, min(1.0, base[k] + random.uniform(-jitter, jitter)))
+                cum += p
+                if r <= cum:
+                    out.append(k); break
+        return "".join(out)
+
+    # 估轉移
+    trans = {"B":Counter(), "P":Counter(), "T":Counter()}
+    for a,b in zip(seed[:-1], seed[1:]):
+        trans[a][b] += 1
+    out = [seed[-1]]
+    for _ in range(n-1):
+        row = trans[out[-1]]
+        total = sum(row.values())
+        if total == 0:  # 落入未知，退回平均
+            nxt = random.choice(["B","P","T"])
         else:
-            break
-    # 上一手是否和
-    last_is_T = 1.0 if (i >= 1 and past[-1] == "T") else 0.0
-
-    feats = []
-    feats += onehot(last1)
-    feats += onehot(last2)
-    feats += onehot(last3)
-    feats += [cB, cP, cT, streakB, streakP, last_is_T]
-    return feats, y
-
-def make_synth_dataset(tokens: List[str], rows: int = 100000,
-                       style: str = "hybrid", tie_rate: float = 0.06,
-                       jitter: float = 0.02, mode: str = "feature") -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    style: 'pure' 只用馬可夫/統計產生；'hybrid' 以 seed 為底並混入亂數
-    mode:  'feature' 用上面的特徵；'ngram' 以 n-gram 來當 X
-    """
-    if len(tokens) < 8:
-        raise ValueError("seed 太短，至少 8 手以上。")
-
-    # 先構建一條基礎序列 base_seq 長度 >= rows+8
-    base_seq: List[str] = tokens[:]
-    # 平衡 T 比例
-    def rand_next(prev):
-        # 簡易馬可夫：看最後一手，偏向交替
-        if not prev:
-            return random.choices(["B", "P", "T"], [0.47, 0.47, 0.06])[0]
-        last = prev[-1]
-        if last == "B":
-            probs = [0.45, 0.49, tie_rate]
-        elif last == "P":
-            probs = [0.49, 0.45, tie_rate]
-        else:
-            probs = [0.49, 0.49, tie_rate]
-        return random.choices(["B", "P", "T"], probs)[0]
-
-    while len(base_seq) < rows + 16:
-        if style == "pure":
-            base_seq.append(rand_next(base_seq))
-        else:
-            # hybrid: 以真實 seed 為骨幹，穿插擾動
-            if random.random() < 0.7:
-                base_seq.append(rand_next(base_seq))
-            else:
-                base_seq.append(random.choice(tokens))
-
-    # jitter：隨機把少量樣本改成 T 或互換 B/P
-    if jitter > 0:
-        for i in range(len(base_seq)):
-            if random.random() < jitter:
-                r = random.random()
-                if r < tie_rate:
-                    base_seq[i] = "T"
+            ps = []
+            keys = ["B","P","T"]
+            for k in keys:
+                p = row[k]/total
+                if k=="T":
+                    p = p*(1-jitter) + tie_rate*(1-jitter)
                 else:
-                    base_seq[i] = "B" if base_seq[i] == "P" else "P"
+                    p = p*(1-jitter) + (1-tie_rate)/2 * jitter
+                ps.append(p)
+            # normalize
+            s = sum(ps)
+            ps = [x/s for x in ps]
+            r = random.random()
+            cum=0.0
+            nxt="B"
+            for k,p in zip(keys, ps):
+                cum += p
+                if r<=cum:
+                    nxt=k; break
+        out.append(nxt)
+    return "".join(out)
 
-    # 建特徵
-    X_rows = []
-    y_rows = []
-    if mode == "feature":
-        for i in range(3, min(len(base_seq) - 1, rows + 3)):
-            feats, y = build_feature_row(base_seq, i)
-            X_rows.append(feats)
-            y_rows.append(y)
-        X = pd.DataFrame(X_rows,
-                         columns=["l1B","l1P","l1T","l2B","l2P","l2T","l3B","l3P","l3T",
-                                  "cB","cP","cT","streakB","streakP","lastT"])
-        y = pd.Series(y_rows)
-        return X, y
-    else:
-        # ngram：最近3手 one-hot 當 X
-        for i in range(3, min(len(base_seq) - 1, rows + 3)):
-            feats, y = build_feature_row(base_seq, i) # 直接沿用
-            X_rows.append(feats[:9])  # 只取 last1~3 的 onehot
-            y_rows.append(y)
-        X = pd.DataFrame(X_rows,
-                         columns=["l1B","l1P","l1T","l2B","l2P","l2T","l3B","l3P","l3T"])
-        y = pd.Series(y_rows)
-        return X, y
+def build_supervised(seq: str, k: int = 6):
+    # 以最近 k 手的 one-hot 當特徵，預測下一手
+    X, y = [], []
+    arr = [BP_MAP[c] for c in seq]
+    for i in range(k, len(arr)):
+        ctx = arr[i-k:i]
+        feat = np.zeros(3*k, dtype=np.float32)
+        for j,v in enumerate(ctx):
+            feat[j*3 + v] = 1.0
+        X.append(feat)
+        y.append(arr[i])
+    if not X: return np.zeros((0,3*k)), np.zeros((0,))
+    return np.vstack(X), np.array(y)
 
-def fit_models(X: pd.DataFrame, y: pd.Series, with_xgb: int = 0) -> Dict[str, str]:
-    global _last_metrics
-    results = {}
-
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.15, random_state=42, stratify=y)
-
-    # LGBM
-    if LGBMClassifier is None:
-        raise RuntimeError("lightgbm 未安裝")
-    lgbm = LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=-1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-        n_jobs=-1
-    )
-    lgbm.fit(X_train, y_train)
-    dump(lgbm, LGBM_FILE)
-    p_val = lgbm.predict_proba(X_val)
-    acc = accuracy_score(y_val, np.argmax(p_val, axis=1).astype(object).astype(str))
-    results["lgbm_acc"] = f"{acc:.3f}"
-
-    # LR
-    lr = LogisticRegression(max_iter=1000, n_jobs=None, multi_class="auto")
-    lr.fit(X_train, y_train)
-    dump(lr, LR_FILE)
-    p2 = lr.predict_proba(X_val)
-    acc2 = accuracy_score(y_val, np.argmax(p2, axis=1).astype(object).astype(str))
-    results["lr_acc"] = f"{acc2:.3f}"
-
-    # XGB 可選
-    if with_xgb and XGBClassifier is not None:
-        xgb = XGBClassifier(
-            n_estimators=300, max_depth=6, learning_rate=0.05,
-            subsample=0.9, colsample_bytree=0.9, random_state=42, n_jobs=2
-        )
-        xgb.fit(X_train, y_train)
-        dump(xgb, XGB_FILE)
-        p3 = xgb.predict_proba(X_val)
-        acc3 = accuracy_score(y_val, np.argmax(p3, axis=1).astype(object).astype(str))
-        results["xgb_acc"] = f"{acc3:.3f}"
-
-    _last_metrics = {"when": datetime.utcnow().isoformat() + "Z", **results}
-    return results
-
-def model_exists() -> bool:
-    return LGBM_FILE.exists() and LR_FILE.exists()
-
-def load_all_models():
-    models = {}
-    if LGBM_FILE.exists(): models["lgbm"] = load(LGBM_FILE)
-    if LR_FILE.exists():   models["lr"]   = load(LR_FILE)
-    if XGB_FILE.exists():  models["xgb"]  = load(XGB_FILE)
-    return models
-
-def seq_to_features(seq: List[str]) -> List[float]:
-    # 轉單筆特徵（對應 feature 模式）
-    if len(seq) < 3:
-        # 補齊空
-        pad = ["_"] * (3 - len(seq)) + seq
-        seq = pad[-3:]
-    feats, _ = build_feature_row(seq + ["B"], len(seq))  # 假標籤無用
-    return feats
-
-def ensemble_predict(seq: List[str], mode: str = "light") -> Dict:
-    models = load_all_models()
-    if not models:
-        raise RuntimeError("尚未訓練，請先 /synth-train")
-
-    x = np.array([seq_to_features(seq)], dtype=float)
-
-    probs_list = []
-    names = []
-    if "lgbm" in models:
-        p = models["lgbm"].predict_proba(x)[0]
-        probs_list.append(p); names.append("lgbm")
-    if "lr" in models:
-        p = models["lr"].predict_proba(x)[0]
-        probs_list.append(p); names.append("lr")
-    if mode == "full" and "xgb" in models:
-        p = models["xgb"].predict_proba(x)[0]
-        probs_list.append(p); names.append("xgb")
-
-    if not probs_list:
-        raise RuntimeError("沒有可用模型")
-
-    p_avg = np.mean(probs_list, axis=0)
-    # 對應類別順序（sklearn 會依 y 的排序決定）
-    classes = getattr(models[names[0]], "classes_")
-    # 轉成 B/P/T 機率
-    map_idx = {c: i for i, c in enumerate(classes)}
-    def pick(c):
-        return float(p_avg[map_idx[c]]) if c in map_idx else 0.0
-    pb = pick("B"); pp = pick("P"); pt = pick("T")
-    label = ["B", "P", "T"][int(np.argmax([pb, pp, pt]))]
-    return {"probabilities": {"B": pb, "P": pp, "T": pt}, "label": label}
-
-# ====== 背景訓練 ======
-def _start_training_async(tokens: List[str], rows: int, style: str,
-                          tie_rate: float, mode: str, jitter: float, with_xgb: int):
+def train_background(rows: int = AUTO_ROWS, tie_rate: float = TIE_RATE, jitter: float = JITTER):
     global _is_training, _last_metrics
+    with _lock:
+        if _is_training:
+            return
+        _is_training = True
+        _save_state()
+
     try:
-        with _lock:
-            if _is_training: 
-                return
-            _is_training = True
-        X, y = make_synth_dataset(tokens, rows=rows, style=style,
-                                  tie_rate=tie_rate, jitter=jitter, mode=mode)
-        metrics = fit_models(X, y, with_xgb=with_xgb)
-        _last_metrics = {"rows": len(X), **metrics}
+        seed = _read_seed()
+        if not seed or len(seed) < 20:
+            _last_metrics = {"error": "seed_too_short"}
+            return
+        synth = markov_sample(seed, max(rows, 20000), tie_rate, jitter)
+        # 用 seed + synth 組合
+        combo = seed + synth
+        X, y = build_supervised(combo, k=6)
+        if len(y) < 100:
+            _last_metrics = {"error":"not_enough_samples"}
+            return
+
+        # 切 train/valid
+        n = len(y)
+        idx = int(n*0.85)
+        Xtr, Ytr = X[:idx], y[:idx]
+        Xva, Yva = X[idx:], y[idx:]
+
+        if USE_LGBM:
+            train_set = lgb.Dataset(Xtr, label=Ytr)
+            valid_set = lgb.Dataset(Xva, label=Yva, reference=train_set)
+            params = dict(
+                objective="multiclass",
+                num_class=3,
+                learning_rate=0.1,
+                num_leaves=31,
+                min_data_in_leaf=20,
+                feature_fraction=0.9,
+                bagging_fraction=0.9,
+                bagging_freq=1,
+                verbose=-1,
+            )
+            model = lgb.train(
+                params,
+                train_set,
+                valid_sets=[valid_set],
+                num_boost_round=200,
+                early_stopping_rounds=20,
+                verbose_eval=False
+            )
+            pred = model.predict(Xva)
+            acc = float((pred.argmax(axis=1) == Yva).mean())
+            joblib.dump({"kind":"lgbm","model":model}, _model_path)
+            _last_metrics = {"acc": round(acc,4), "algo":"lgbm", "n_samples": int(n)}
+        else:
+            clf = LogisticRegression(max_iter=400, n_jobs=None)
+            clf.fit(Xtr, Ytr)
+            acc = float((clf.predict(Xva) == Yva).mean())
+            joblib.dump({"kind":"lr","model":clf}, _model_path)
+            _last_metrics = {"acc": round(acc,4), "algo":"logreg", "n_samples": int(n)}
     except Exception as e:
-        _last_metrics = {"error": str(e)}
+        _last_metrics = {"error": f"{type(e).__name__}: {e}"}
     finally:
         with _lock:
             _is_training = False
+            _save_state()
 
-# ====== Flask Routes ======
+def ensure_model_async():
+    # 若沒有模型或剛新增種子，就啟動背景訓練
+    if _model_path.exists() or _is_training:
+        return
+    threading.Thread(target=train_background, daemon=True).start()
+
+def load_model():
+    if not _model_path.exists():
+        return None
+    try:
+        return joblib.load(_model_path)
+    except Exception:
+        return None
+
+def predict_next(seq_recent: str):
+    m = load_model()
+    if not m:
+        return None
+    kind = m.get("kind","")
+    model = m["model"]
+    seq_recent = normalize_seq(seq_recent)
+    if len(seq_recent) < 6:
+        return None
+    X, _ = build_supervised(seq_recent, k=6)
+    if X.shape[0] == 0:
+        return None
+    x = X[-1].reshape(1,-1)
+    if kind == "lgbm":
+        proba = model.predict(x)[0]
+    else:
+        proba = model.predict_proba(x)[0]
+    # clamp
+    proba = np.maximum(1e-6, np.array(proba))
+    proba = proba / proba.sum()
+    idx = int(proba.argmax())
+    return {"B": float(proba[0]), "P": float(proba[1]), "T": float(proba[2]), "suggest": INV_MAP[idx]}
+
+def format_advise(prob, bankroll: int = 5000):
+    sug = prob["suggest"]
+    b, p, t = prob["B"], prob["P"], prob["T"]
+    # very simple bet sizing: 建議金額 = 本金 * (max_prob-0.5)*0.3，限制在 [0, 0.3]
+    maxp = max(b,p,t)
+    rate = max(0.0, min(0.3, (maxp-0.5)*0.6))
+    bet = int(round(bankroll * rate))
+    name = {"B":"莊", "P":"閒", "T":"和"}[sug]
+    lines = []
+    lines.append(f"機率：莊 {b:.3f}｜閒 {p:.3f}｜和 {t:.3f}")
+    lines.append(f"👉 下一手建議：{name}")
+    lines.append(f"💰 本金：{bankroll:,}")
+    lines.append(f"✅ 建議下注：{bet:,}（約 {rate*100:.1f}%）")
+    return "\n".join(lines)
+
+# ---- HTTP ------------------------------------------------------
 @app.get("/health")
 def health():
-    return Response("OK", mimetype="text/plain; charset=utf-8")
-
-@app.get("/status.json")
-def status_json():
-    return jsonify({
-        "health": "/health",
-        "is_training": bool(_is_training),
-        "last_metrics": _last_metrics,
-        "model_exists": model_exists(),
-        "seed_records": seed_len(),
-        "webhook": "/line-webhook"
-    })
+    return "OK"
 
 @app.get("/")
-def dashboard_html():
-    html = """
-<!doctype html>
-<html lang="zh-Hant"><meta charset="utf-8">
-<title>BGS Dashboard</title>
-<body style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:20px">
-<h1>BGS Dashboard</h1>
-<button onclick="refresh()">重新整理狀態</button>
-<span>　Webhook：/line-webhook　健康：/health</span>
-<pre id="statusBox">{}</pre>
-
-<h3>即時預測 /predict</h3>
-<input id="seq" placeholder="例如：BPPTB" style="width:240px">
-<button onclick="doPred()">送出</button>
-<pre id="predBox"></pre>
-
-<h3>追加種子 /ingest-seed</h3>
-<textarea id="seed" placeholder="貼上真實歷史：B P P T B …" style="width:260px;height:80px"></textarea><br>
-<button onclick="doSeed()">追加</button>
-<pre id="seedBox"></pre>
-
-<h3>啟動訓練 /synth-train</h3>
-<label>rows <input id="rows" value="100000" style="width:100px"></label>
-<label>style <select id="style"><option>hybrid</option><option>pure</option></select></label>
-<label>tie_rate <input id="tie" value="0.06" style="width:60px"></label>
-<label>mode <select id="mode"><option>feature</option><option>ngram</option></select></label>
-<label>jitter <input id="jit" value="0.02" style="width:60px"></label>
-<label>with_xgb <select id="xgb"><option value="0">0</option><option value="1">1</option></select></label>
-<button onclick="doTrain()">開始訓練</button>
-<pre id="trainBox"></pre>
-
-<script>
-async function refresh(){
-  try{
-    const r = await fetch('/status.json');
-    const j = await r.json();
-    document.getElementById('statusBox').textContent = JSON.stringify(j,null,2);
-  }catch(e){
-    document.getElementById('statusBox').textContent = '讀取失敗：'+e;
-  }
-}
-async function doPred(){
-  const s = document.getElementById('seq').value.trim();
-  const r = await fetch('/predict?seq='+encodeURIComponent(s)+'&ensemble=light&mc=0');
-  document.getElementById('predBox').textContent = await r.text();
-}
-async function doSeed(){
-  const s = document.getElementById('seed').value;
-  const r = await fetch('/ingest-seed', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:s})});
-  document.getElementById('seedBox').textContent = await r.text();
-}
-async function doTrain(){
-  const q = new URLSearchParams({
-    rows: document.getElementById('rows').value,
-    style: document.getElementById('style').value,
-    tie_rate: document.getElementById('tie').value,
-    mode: document.getElementById('mode').value,
-    jitter: document.getElementById('jit').value,
-    with_xgb: document.getElementById('xgb').value
-  }).toString();
-  const r = await fetch('/synth-train?'+q);
-  document.getElementById('trainBox').textContent = await r.text();
-}
-refresh();
-</script>
-</body></html>
-"""
+def home():
+    state = _save_state()
+    html = f"""
+    <h3>BGS Dashboard</h3>
+    <pre>{json.dumps(state, ensure_ascii=False, indent=2)}</pre>
+    <form action="/predict" method="get">
+      <div>即時預測：<input name="seq" placeholder="BPPBT..." /> <button type="submit">送出</button></div>
+    </form>
+    <form action="/ingest-seed" method="post">
+      <div>追加種子：<textarea name="seed" rows="3" cols="40" placeholder="貼上歷史 B/P/T 或 莊/閒/和"></textarea></div>
+      <button type="submit">追加</button>
+    </form>
+    """
     return Response(html, mimetype="text/html; charset=utf-8")
 
 @app.post("/ingest-seed")
 def ingest_seed():
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        text = payload.get("text", "")
-        tokens = normalize_tokens(text)
-        if not tokens:
-            return jsonify({"ok": False, "err": "no tokens"})
-        total = save_seed_lines(tokens)
-        msg = f"📝 已接收歷史共 {len(tokens)} 手，目前累計 {total} 手。\\n輸入『開始分析』即可啟動。"
-        return jsonify({"ok": True, "added": len(tokens), "total": total, "msg": msg})
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)}), 400
-
-@app.get("/synth-train")
-def synth_train():
-    rows = int(request.args.get("rows", os.getenv("TRAIN_ROWS", "100000")))
-    style = request.args.get("style", "hybrid")
-    tie_rate = float(request.args.get("tie_rate", "0.06"))
-    mode = request.args.get("mode", os.getenv("TRAIN_MODE", "feature"))
-    jitter = float(request.args.get("jitter", "0.02"))
-    with_xgb = int(request.args.get("with_xgb", os.getenv("TRAIN_WITH_XGB", "0")))
-
-    tokens = []
-    if SEED_FILE.exists():
-        tokens = normalize_tokens(SEED_FILE.read_text(encoding="utf-8"))
-    if not tokens:
-        return jsonify({"ok": False, "err": "請先 /ingest-seed 貼歷史"}), 400
-
-    Thread(target=_start_training_async, args=(tokens, rows, style, tie_rate, mode, jitter, with_xgb), daemon=True).start()
-    return jsonify({"ok": True, "msg": "training started", "rows": rows, "style": style, "mode": mode})
+    text = (request.form.get("seed") or request.json.get("seed","") if request.is_json else "").strip()
+    s = normalize_seq(text)
+    if not s:
+        return jsonify({"ok": False, "msg":"no tokens"})
+    _append_seed(s)
+    ensure_model_async()
+    return jsonify({"ok": True, "added": len(s), "seed_records": len(_read_seed())})
 
 @app.get("/predict")
-def predict_api():
-    seq_txt = request.args.get("seq", "")
-    ensemble = request.args.get("ensemble", os.getenv("PRED_ENSEMBLE", "light"))
-    mc = int(request.args.get("mc", os.getenv("PRED_MC", "0")))
-    tokens = normalize_tokens(seq_txt)
-    if not tokens:
-        return jsonify({"ok": False, "err": "seq required"}), 400
-    if not model_exists():
-        return jsonify({"ok": False, "err": "尚未訓練"}), 400
-    # Monte Carlo 未開，直接推
-    res = ensemble_predict(tokens, mode="full" if ensemble == "full" else "light")
-    return jsonify({"ok": True, "source": "ensemble", **res})
+def http_predict():
+    seq = request.args.get("seq","")
+    seq = normalize_seq(seq)
+    if not seq:
+        return jsonify({"error":"empty"})
+    res = predict_next(seq)
+    if not res:
+        return jsonify({"error":"model_not_ready"})
+    return jsonify(res)
 
-# ====== LINE Webhook（簡化、穩定語法）======
-def fmt_money(n: int) -> str:
-    s = f"{n:,}"
-    return s
+# ---- LINE Webhook（無設定就不啟用） ---------------------------
+def _extract_tokens(s: str) -> str:
+    m = TOKEN_RE.findall(s.upper())
+    if not m: return ""
+    return normalize_seq("".join(m))
 
-def reply_text(reply_token: str, text: str):
-    if not line_bot:
-        return
+def _detect_bankroll(s: str) -> int:
+    # 取第一個整數視為本金
+    m = re.search(r"(\d{2,})", s.replace(",",""))
+    if not m: return 5000
     try:
-        line_bot.reply_message(ReplyMessageRequest(
-            reply_token=reply_token,
-            messages=[TextMessage(text=text)]
-        ))
-    except Exception as e:
-        print("[LINE] reply error:", e)
+        v = int(m.group(1))
+        return max(100, min(2_000_000, v))
+    except Exception:
+        return 5000
 
-@app.post("/line-webhook")
-def line_webhook():
-    if not line_bot or not parser:
-        return "LINE disabled", 200
-    body = request.get_data(as_text=True)
-    signature = request.headers.get("X-Line-Signature", "")
-    try:
-        events = parser.parse(body, signature)
-    except Exception as e:
-        print("[LINE] parse error:", e)
-        return "NG", 400
-    for ev in events:
-        if ev.type != "message": 
-            continue
-        text_raw = getattr(ev.message, "text", "").strip()
-        up = text_raw.upper()
+if LINE_ENABLED:
+    @app.post("/line-webhook")
+    def line_webhook():
+        signature = request.headers.get("X-Line-Signature", "")
+        body = request.get_data(as_text=True)
+        try:
+            events = parser.parse(body, signature)
+        except InvalidSignatureError:
+            return "bad sig", 400
 
-        # 本金
-        m = re.search(r"(\d{3,})", up)
-        if ("本金" in text_raw) or (m and not normalize_tokens(up)):
-            try:
-                amt = int(m.group(1)) if m else 5000
-                app.config["CAPITAL"] = amt
-                reply_text(ev.reply_token, f"👍 已設定本金：{fmt_money(amt)} 元。接著貼上歷史（B/P/T 或 莊/閒/和），然後輸入「開始分析」即可。")
-            except Exception:
-                reply_text(ev.reply_token, "請輸入數字本金，例如 5000 或 本金 20000")
-            continue
+        for ev in events:
+            if not isinstance(ev, MessageEvent): continue
+            if not isinstance(ev.message, TextMessage): continue
+            user_text = ev.message.text.strip()
+            tokens = _extract_tokens(user_text)
 
-        # 開始/結束
-        if up in ("開始分析", "START", "GO"):
-            reply_text(ev.reply_token, "✅ 已開始分析。直接輸入下一手結果（莊／閒／和 或 B/P/T），我會再幫你算下一局。")
-            continue
-        if up in ("結束分析", "STOP", "END"):
-            reply_text(ev.reply_token, "⛔ 已結束，本金設定保留。要重新開始請先貼歷史，然後輸入「開始分析」。")
-            continue
+            # 1) 有貼路單：累積 + 自動訓練（若尚未在訓練）
+            if len(tokens) >= 1:
+                prev_len = len(_read_seed())
+                _append_seed(tokens)
+                ensure_model_async()
+                # 直接嘗試預測（用最近 12 手）
+                recent = (_read_seed())[-12:]
+                res = predict_next(recent)
+                if res:
+                    bankroll = _detect_bankroll(user_text)
+                    reply = "已更新路單。\n" + format_advise(res, bankroll) + "\n（模型持續優化中）"
+                else:
+                    reply = f"已接收路單，共 {len(_read_seed())} 手。模型訓練中，完成後會套用最新數據。"
+                line_bot_api.reply_message(ev.reply_token, TextSendMessage(reply))
+                continue
 
-        # 路單 or 預測
-        toks = normalize_tokens(text_raw)
-        if toks:
-            total = save_seed_lines(toks)
-            if not model_exists():
-                # 若尚未有模型，提醒可訓練
-                reply_text(ev.reply_token, f"📝 已接收歷史共 {len(toks)} 手，目前累計 {total} 手。\\n尚未訓練，請到後端按『開始訓練』或輸入 TRAIN。")
+            # 2) 沒有路單但想看建議：用目前 seed 的最近 12 手
+            recent = (_read_seed())[-12:]
+            res = predict_next(recent)
+            if res:
+                bankroll = _detect_bankroll(user_text)
+                reply = format_advise(res, bankroll)
             else:
-                # 做即時預測
-                res = ensemble_predict(toks)
-                pB = res["probabilities"]["B"]; pP = res["probabilities"]["P"]; pT = res["probabilities"]["T"]
-                top = res["label"]
-                capital = int(app.config.get("CAPITAL", 5000))
-                # 建議下注比例（示例：min(0.2, top_prob*0.2)）
-                top_p = {"B": pB, "P": pP, "T": pT}[top]
-                bet_rate = max(0.10, min(0.20, float(top_p)*0.20))
-                bet_amt = int(round(capital * bet_rate))
-                text = (
-                    f"🇮🇹 已解析 {len(toks)} 手 (0 ms)\\n"
-                    f"機率：莊 {pB:.3f} ｜ 閒 {pP:.3f} ｜ 和 {pT:.3f}\\n"
-                    f"👉 下一手建議：{'莊' if top=='B' else '閒' if top=='P' else '和'} 🎯\\n"
-                    f"💰 本金：{fmt_money(capital)}\\n"
-                    f"✅ 建議下注：{fmt_money(bet_amt)} = {fmt_money(capital)} × {bet_rate*100:.1f}%\\n"
-                    f"🧱 10%={fmt_money(int(capital*0.10))} ｜ 20%={fmt_money(int(capital*0.20))} ｜ 30%={fmt_money(int(capital*0.30))}\\n"
-                    f"📨 直接輸入下一手結果（莊／閒／和 或 B/P/T），我會再幫你算下一局。"
-                )
-                reply_text(ev.reply_token, text)
-            continue
+                reply = "目前尚無可用模型或歷史太少，請先貼上幾手路單即可自動開始。"
+            line_bot_api.reply_message(ev.reply_token, TextSendMessage(reply))
+        return "OK"
 
-        # TRAIN 指令
-        if up.startswith("TRAIN"):
-            if not SEED_FILE.exists():
-                reply_text(ev.reply_token, "請先貼歷史（B/P/T 或 莊/閒/和）再 TRAIN。")
-            else:
-                tokens = normalize_tokens(SEED_FILE.read_text(encoding="utf-8"))
-                Thread(target=_start_training_async, args=(tokens, 100000, "hybrid", 0.06, "feature", 0.02, 0), daemon=True).start()
-                reply_text(ev.reply_token, "已啟動訓練（100k, feature, hybrid）。等待約數十秒後即可開始分析。")
-            continue
+# ---- 服務啟動 --------------------------------------------------
+@app.before_first_request
+def _boot():
+    # 啟動時若無模型就自動訓練
+    if AUTO_RUN:
+        ensure_model_async()
 
-        # STATUS
-        if up.startswith("STATUS"):
-            js = {
-                "is_training": bool(_is_training),
-                "model_exists": model_exists(),
-                "seed_records": seed_len(),
-                "last_metrics": _last_metrics
-            }
-            reply_text(ev.reply_token, json.dumps(js, ensure_ascii=False, indent=2))
-            continue
-
-        # 其他
-        reply_text(ev.reply_token, "指令：SEED: <路單>｜TRAIN <rows> [style] [tie] [mode] [jitter]｜STATUS｜PRED <路單>｜LOGIN <code>｜RESET TRIAL")
-    return "OK", 200
-
-# ====== 啟動 ======
 if __name__ == "__main__":
-    # 本地/預覽可直接跑；在 Render 用 gunicorn 啟動時不會進來這段
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT") or os.getenv("LISTEN_PORT") or os.getenv("RENDER_PORT") or "8000")
-    app.run(host=host, port=port)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
