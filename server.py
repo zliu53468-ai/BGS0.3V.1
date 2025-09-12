@@ -1,16 +1,18 @@
-# server.py — LiveBoot Baccarat AI
-# Regime-Primary + Threshold-First + Streak Enhancer + Comeback Detector + RNN Safe-Guard
-# + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
+# server.py — LiveBoot Baccarat AI (Enhanced Anti-Chase)
+# Regime-Primary + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
+# + Chop/Pattern Detection + Hysteresis & Cooldown (Anti-Chase)
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
 
+# ====== 日誌 / App ======
 log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
 
+# ====== 小工具 ======
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None: return 1 if default else 0
@@ -21,7 +23,7 @@ def env_flag(name: str, default: int = 1) -> int:
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
-# ===== 基本/特徵 =====
+# ====== 基本設定 ======
 FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
@@ -31,22 +33,24 @@ CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.12"))
 SEED       = int(os.getenv("SEED", "42"))
 np.random.seed(SEED)
 
+# 特徵融合
 USE_FULL_SHOE = env_flag("USE_FULL_SHOE", 1)
 LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.65"))
 GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.35"))
 MAX_RNN_LEN   = int(os.getenv("MAX_RNN_LEN", "256"))
 
-# ===== 試用/開通 =====
+# 試用 / 開通
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 SHOW_REMAINING_TIME = env_flag("SHOW_REMAINING_TIME", 1)
 
+# API 試用鎖
 API_TRIAL_ENFORCE = env_flag("API_TRIAL_ENFORCE", 0)
 API_TRIAL_MINUTES = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))
 API_MINIMAL_JSON  = env_flag("API_MINIMAL_JSON", 0)
 
-# ===== 模型/集成 =====
+# ====== 集成 / 深度 ======
 DEEP_ONLY   = int(os.getenv("DEEP_ONLY", "0"))
 DISABLE_RNN = int(os.getenv("DISABLE_RNN", "0"))
 RNN_HIDDEN  = int(os.getenv("RNN_HIDDEN", "32"))
@@ -55,12 +59,12 @@ TEMP_XGB = float(os.getenv("TEMP_XGB", "0.95"))
 TEMP_LGB = float(os.getenv("TEMP_LGB", "0.95"))
 TEMP_RNN = float(os.getenv("TEMP_RNN", "0.85"))
 
-# ===== 門檻/票數 =====
+# ====== 票數 / 邊際 / 進場門檻 ======
 ABSTAIN_EDGE  = float(os.getenv("ABSTAIN_EDGE", "0.08"))
 ABSTAIN_VOTES = int(os.getenv("ABSTAIN_VOTES", "2"))
 EDGE_ENTER    = float(os.getenv("EDGE_ENTER", "0.08"))
 
-# ===== 震盪防護 =====
+# ====== 震盪防護 ======
 VOL_GUARD      = int(os.getenv("VOL_GUARD", "1"))
 ALT_WIN        = int(os.getenv("ALT_WIN", "24"))
 VOL_ALT_BAND   = float(os.getenv("VOL_ALT_BAND", "0.08"))
@@ -68,7 +72,7 @@ VOL_ALT_BOOST  = float(os.getenv("VOL_ALT_BOOST", "0.02"))
 VOL_FLIP_TH    = float(os.getenv("VOL_FLIP_TH", "0.65"))
 VOL_FLIP_BOOST = float(os.getenv("VOL_FLIP_BOOST", "0.02"))
 
-# ===== 線上回饋 =====
+# ====== 線上回饋（自適應門檻） ======
 ONLINE_ADAPT       = int(os.getenv("ONLINE_ADAPT", "1"))
 ONLINE_MIN_SAMPLES = int(os.getenv("ONLINE_MIN_SAMPLES", "10"))
 ONLINE_ACC_LOW     = float(os.getenv("ONLINE_ACC_LOW", "0.45"))
@@ -77,7 +81,7 @@ EDGE_STEP_UP       = float(os.getenv("EDGE_STEP_UP", "0.02"))
 EDGE_STEP_DOWN     = float(os.getenv("EDGE_STEP_DOWN", "0.005"))
 EDGE_ADAPT_CAP     = float(os.getenv("EDGE_ADAPT_CAP", "0.04"))
 
-# ===== 場況（Regime）=====
+# ====== 場況（Regime） ======
 REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))
 REG_WIN       = int(os.getenv("REG_WIN", "32"))
 REG_STREAK_TH = float(os.getenv("REG_STREAK_TH", "0.62"))
@@ -88,40 +92,27 @@ REG_WEIGHTS   = os.getenv("REG_WEIGHTS",
 REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
-REGIME_PRIMARY = int(os.getenv("REGIME_PRIMARY", "1"))
+REGIME_PRIMARY            = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先
 
-# ===== 連段強化 =====
-STREAK_CTRL          = int(os.getenv("STREAK_CTRL", "1"))
-STREAK_MIN_LEN       = int(os.getenv("STREAK_MIN_LEN", "3"))
-STREAK_BONUS         = float(os.getenv("STREAK_BONUS", "0.02"))
-STREAK_BREAK_BONUS   = float(os.getenv("STREAK_BREAK_BONUS", "0.03"))
-STREAK_CHOP_PENALTY  = float(os.getenv("STREAK_CHOP_PENALTY", "0.02"))
-
-# ===== 回補勢（新增重點）=====
-COMEBACK_CTRL            = int(os.getenv("COMEBACK_CTRL", "1"))
-COMEBACK_WIN_SHORT       = int(os.getenv("COMEBACK_WIN_SHORT", "12"))  # 短期視窗
-COMEBACK_WIN_LONG        = int(os.getenv("COMEBACK_WIN_LONG",  "48"))  # 長期視窗
-COMEBACK_MIN_GAP         = float(os.getenv("COMEBACK_MIN_GAP", "0.12"))# 短期EMA-長期EMA 門檻
-COMEBACK_REQUIRE_STREAK  = int(os.getenv("COMEBACK_REQUIRE_STREAK","2"))# 近K手同向
-COMEBACK_LATE_HANDS      = int(os.getenv("COMEBACK_LATE_HANDS", "40")) # 中後段起算
-COMEBACK_BONUS           = float(os.getenv("COMEBACK_BONUS", "0.02"))  # 進場門檻下調
-COMEBACK_OVERRIDE_NEUTRAL= int(os.getenv("COMEBACK_OVERRIDE_NEUTRAL","1")) # neutral 時可改為回補偏向
-
-# ===== EMA =====
+# ====== EMA 平滑 ======
 EMA_ENABLE    = int(os.getenv("EMA_ENABLE", "1"))
 EMA_PROB_A    = float(os.getenv("EMA_PROB_A", "0.30"))
 EMA_BET_A     = float(os.getenv("EMA_BET_A", "0.20"))
 SHOW_EMA_NOTE = int(os.getenv("SHOW_EMA_NOTE", "1"))
 
+# ====== 未達門檻的顯示行為 ======
 SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))
 FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))
 
-# ===== RNN 安全防護 =====
-RNN_MAX_MS             = int(os.getenv("RNN_MAX_MS", "80"))
-RNN_DISABLE_AFTER_FAIL = int(os.getenv("RNN_DISABLE_AFTER_FAIL", "2"))
-RNN_HEALTH = {"disabled": False, "fails": 0}
+# ====== 交錯/規律 強化 + 反短期追單（新增） ======
+CHOP_WIN = int(os.getenv("CHOP_WIN", "14"))                    # 近幾手評估對敲
+CHOP_STRICT_TH = float(os.getenv("CHOP_STRICT_TH", "0.70"))    # flip 比例門檻
+CHOP_PATTERN_BONUS = float(os.getenv("CHOP_PATTERN_BONUS", "0.02"))  # 交錯明顯時下調門檻
+PATTERN_STICKY = int(os.getenv("PATTERN_STICKY", "1"))         # 規律盤時不亂換邊
+HYSTERESIS_EDGE = float(os.getenv("HYSTERESIS_EDGE", "0.015"))  # 新方向需比舊邊際好多少才換邊
+SWITCH_COOLDOWN = int(os.getenv("SWITCH_COOLDOWN", "2"))       # 換邊後至少過幾手才能再換
 
-# ===== LINE =====
+# ====== LINE SDK ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -138,9 +129,11 @@ except Exception as e:
     line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
 
-SESS: Dict[str, Dict[str, object]] = {}
-SESS_API: Dict[str, Dict[str, object]] = {}
+# ====== Sessions ======
+SESS: Dict[str, Dict[str, object]] = {}      # LINE
+SESS_API: Dict[str, Dict[str, object]] = {}  # API
 
+# ====== 模型載入 ======
 XGB_MODEL = None
 LGB_MODEL = None
 RNN_MODEL = None
@@ -198,7 +191,7 @@ def _load_rnn():
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
-# ===== 牌路/特徵 =====
+# ====== 牌路處理 ======
 MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"B", 1:"P", 2:"T"}
 
@@ -334,24 +327,7 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
-# ===== Streak/Regime helpers =====
-def _streak_stats(seq: List[int]) -> Tuple[int, Optional[int], Optional[int]]:
-    bp=[v for v in seq if v in (0,1)]
-    if len(bp)==0: return -1, None, None
-    runs=[]; cur_side=bp[0]; cur_len=1
-    for v in bp[1:]:
-        if v==cur_side: cur_len+=1
-        else:
-            runs.append((cur_side, cur_len))
-            cur_side=v; cur_len=1
-    runs.append((cur_side, cur_len))
-    last_side, last_len = runs[-1]
-    prev_same_len=None
-    for i in range(len(runs)-2, -1, -1):
-        if runs[i][0]==last_side:
-            prev_same_len = runs[i][1]; break
-    return last_side, last_len, prev_same_len
-
+# ====== Regime ======
 def _regime_detect(seq: List[int]) -> Tuple[str, Optional[str]]:
     if not REGIME_CTRL or len(seq) < 8: return "neutral", None
     bp=[v for v in seq[-REG_WIN:] if v in (0,1)]
@@ -383,56 +359,30 @@ def _parse_triplets(spec: str) -> Dict[str, Tuple[float,float,float]]:
 
 REG_TRIPLE = _parse_triplets(REG_WEIGHTS)
 
-def _regime_label(regime: str, prefer: Optional[str], extra: Optional[str]=None) -> str:
+def _regime_label(regime: str, prefer: Optional[str]) -> str:
     zh = {"neutral":"中性","streak":"連莊","chop":"對敲","banker":"莊偏","player":"閒偏"}
     base = zh.get(str(regime).lower(), "中性")
-    s = f"{base}{('→'+prefer) if prefer else ''}"
-    if extra: s += f"｜{extra}"
-    return s
+    return f"{base}{('→'+prefer) if prefer else ''}"
 
-# ===== 回補勢偵測（新增）=====
-def _ema_side(arr: List[int], win: int) -> Optional[float]:
-    # side: B=+1, P=-1, 忽略和；EMA 用 2/(win+1)
-    s = [1.0 if v==0 else (-1.0 if v==1 else None) for v in arr]
-    s = [x for x in s if x is not None]
-    if not s: return None
-    a = 2.0 / (win + 1.0)
-    ema = s[0]
-    for x in s[1:]:
-        ema = (1-a)*ema + a*x
-    return float(ema)
+# ====== 新增：交錯/規律偵測 ======
+def _chop_pattern_score(seq: List[int], win: int) -> Tuple[float, int]:
+    """回傳 (flip_ratio, max_alt_streak)。只看莊/閒，忽略和。"""
+    bp = [v for v in seq[-win:] if v in (0,1)]
+    if len(bp) < 3:
+        return 0.5, 1
+    flips = [1 if bp[i]!=bp[i-1] else 0 for i in range(1, len(bp))]
+    flip_ratio = float(sum(flips)) / max(1, len(flips))
+    # 連續交錯長度（B P B P ...）
+    max_alt = 1; cur = 1
+    for i in range(1, len(bp)):
+        if bp[i]!=bp[i-1]:
+            cur += 1
+            if cur > max_alt: max_alt = cur
+        else:
+            cur = 1
+    return flip_ratio, max_alt
 
-def _comeback_detect(seq: List[int]) -> Tuple[bool, Optional[str], Optional[str]]:
-    if not COMEBACK_CTRL: return False, None, None
-    n = len(seq)
-    if n < max(COMEBACK_WIN_LONG//2, 12):  # 太早不判
-        return False, None, None
-    bp=[v for v in seq if v in (0,1)]
-    if len(bp) < max(8, COMEBACK_REQUIRE_STREAK+1): return False, None, None
-
-    ema_s = _ema_side(bp, COMEBACK_WIN_SHORT)
-    ema_l = _ema_side(bp, COMEBACK_WIN_LONG)
-    if ema_s is None or ema_l is None: return False, None, None
-
-    gap = ema_s - ema_l  # >0 偏莊，<0 偏閒（因為 B=+1, P=-1）
-    # 近 K 手持續性
-    recent = bp[-COMEBACK_REQUIRE_STREAK:]
-    if len(recent) < COMEBACK_REQUIRE_STREAK: return False, None, None
-    majority = 0 if recent.count(0) >= recent.count(1) else 1
-
-    # 判定 comeback 方向
-    prefer = None
-    if gap >= COMEBACK_MIN_GAP and majority == 0:  # 短期>長期且近況偏莊
-        prefer = "莊"
-    elif gap <= -COMEBACK_MIN_GAP and majority == 1:  # 短期<長期且近況偏閒
-        prefer = "閒"
-
-    if prefer is None: return False, None, None
-
-    phase = "late" if n >= COMEBACK_LATE_HANDS else "mid"
-    return True, prefer, phase
-
-# ===== 模型推論（含 RNN 熔斷）=====
+# ====== 模型預測 ======
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
     import xgboost as xgb
@@ -447,33 +397,17 @@ def lgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     return np.array(p, dtype=np.float32)
 
 def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
-    if RNN_MODEL is None or RNN_HEALTH["disabled"]: return None
+    if RNN_MODEL is None: return None
     try:
         import torch
     except Exception:
         return None
-    try:
-        x=one_hot_seq(seq, FEAT_WIN)
-        t0=time.perf_counter()
-        with __import__("torch").no_grad():
-            logits=RNN_MODEL(__import__("torch").from_numpy(x))
-            logits = logits / max(1e-6, TEMP_RNN)
-            p = __import__("torch").softmax(logits, dim=-1).cpu().numpy()[0]
-        ms=(time.perf_counter()-t0)*1000.0
-        if ms > RNN_MAX_MS:
-            RNN_HEALTH["fails"] += 1
-            log.warning("[RNN] slow inference %.1fms (> %dms) [%d/%d]", ms, RNN_MAX_MS, RNN_HEALTH["fails"], RNN_DISABLE_AFTER_FAIL)
-            if RNN_HEALTH["fails"] >= RNN_DISABLE_AFTER_FAIL:
-                RNN_HEALTH["disabled"]=True
-                log.warning("[RNN] disabled due to repeated slow/failed inference")
-                return None
-        return p.astype(np.float32)
-    except Exception as e:
-        RNN_HEALTH["fails"] += 1
-        log.warning("[RNN] inference failed: %s [%d/%d]", e, RNN_HEALTH["fails"], RNN_DISABLE_AFTER_FAIL)
-        if RNN_HEALTH["fails"] >= RNN_DISABLE_AFTER_FAIL:
-            RNN_HEALTH["disabled"]=True
-        return None
+    x=one_hot_seq(seq, FEAT_WIN)
+    with __import__("torch").no_grad():
+        logits=RNN_MODEL(__import__("torch").from_numpy(x))
+        logits = logits / max(1e-6, TEMP_RNN)
+        p = __import__("torch").softmax(logits, dim=-1).cpu().numpy()[0]
+    return p.astype(np.float32)
 
 def _parse_weights(spec: str) -> Dict[str, float]:
     out={"XGB":0.33,"LGBM":0.33,"RNN":0.34}
@@ -545,7 +479,7 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
 
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
-# ===== 震盪/配注/EMA =====
+# ====== 震盪度 & 門檻 / EMA / 配注 ======
 def _alt_flip_metrics(seq: List[int], win: int = 24) -> Tuple[float, float]:
     if not seq: return 0.5, 0.5
     sub=[x for x in seq[-win:] if x in (0,1)]
@@ -582,13 +516,14 @@ def _ema_scalar(prev: Optional[float], x: float, a: float) -> float:
     return float((1.0-a)*float(prev) + a*float(x))
 
 def bet_ladder_text(bankroll: int) -> str:
-    if not bankroll or bankroll <= 0: return ""
+    if not bankroll or bankroll <= 0:
+        return ""
     a = int(round(bankroll * 0.10))
     b = int(round(bankroll * 0.20))
     c = int(round(bankroll * 0.30))
     return f"🪜 配注 10% {a:,}｜20% {b:,}｜30% {c:,}"
 
-# ===== 決策（含場況/連段/回補勢）=====
+# ====== 決策（含 Anti-Chase 強化） ======
 def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
                           seq: Optional[List[int]] = None, sess: Optional[Dict[str,object]] = None,
                           regime_info: Tuple[str,Optional[str]]=("neutral", None)) -> Tuple[str,float,float,float,str]:
@@ -598,27 +533,11 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     (p1, lab1), (p2, _) = arr[0], arr[1]
     edge = p1 - p2
 
-    # 回補勢偵測（中後段短期>長期且近況同向）
-    comeback_note = None
-    if COMEBACK_CTRL:
-        ok, cb_side, phase = _comeback_detect(seq or [])
-        if ok and cb_side in ("莊","閒"):
-            comeback_note = f"回補勢→{cb_side}{'(晚盤)' if phase=='late' else ''}"
-            if REGIME_PRIMARY and regime == "neutral" and COMEBACK_OVERRIDE_NEUTRAL:
-                # 中性場況時讓回補勢主導方向
-                lab1 = cb_side
-                p_prefer = float(p[0] if cb_side=="莊" else p[1])
-                p_other  = float(p[1] if cb_side=="莊" else p[0])
-                p2 = max(p_other, float(p[2]))
-                edge = p_prefer - p2
-            # 門檻下調
-            EDGE_bonus = COMEBACK_BONUS * (1.2 if (phase=="late") else 1.0)
-        else:
-            EDGE_bonus = 0.0
-    else:
-        EDGE_bonus = 0.0
+    # —— 強化：交錯/規律偵測 —— #
+    flip_ratio, alt_streak = _chop_pattern_score(seq or [], CHOP_WIN)
+    chop_strong = (flip_ratio >= CHOP_STRICT_TH and alt_streak >= 3)
 
-    # 場況主導（非中性時維持）
+    # —— 場況主導方向（只在有偏向時，且只挑莊/閒） —— #
     if REGIME_PRIMARY and regime in ("streak","chop","banker","player") and prefer in ("莊","閒"):
         lab1 = prefer
         p_prefer = float(p[0] if prefer=="莊" else p[1])
@@ -626,17 +545,29 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
         p2 = max(p_other, float(p[2]))
         edge = p_prefer - p2
 
+    # —— 在 neutral/chop 且交錯很強：優先走交錯方向（避免短期盲追） —— #
+    if (regime in ("neutral","chop")) and chop_strong and (seq and len(seq)>=1):
+        last = [v for v in seq if v in (0,1)]
+        if last:
+            last_side = last[-1]
+            prefer_side = "閒" if last_side==0 else "莊"
+            if prefer_side in ("莊","閒"):
+                lab1 = prefer_side
+                p_prefer = float(p[0] if prefer_side=="莊" else p[1])
+                p_other  = float(p[1] if prefer_side=="莊" else p[0])
+                p2 = max(p_other, float(p[2]))
+                edge = p_prefer - p2
+
+    # 票數與避和
     max_votes = max(votes.get("莊",0), votes.get("閒",0), votes.get("和",0)) if models_used>0 else 0
     vote_conf = (max_votes / models_used) if models_used>0 else 0.0
-
     if (not REGIME_PRIMARY) and models_used>0 and max_votes < ABSTAIN_VOTES:
         return "觀望（票少）", edge, 0.0, vote_conf, ""
-
     if lab1=="和" and p[2] < max(0.05, CLIP_T_MIN+0.01):
         return "觀望（避和）", edge, 0.0, vote_conf, ""
 
+    # 進場門檻：基礎 + 場況一致性 + 震盪 + 線上回饋
     enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
-
     if REGIME_CTRL and prefer in ("莊","閒"):
         if lab1 == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
@@ -646,47 +577,65 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
             else:
                 enter_th += REG_MISMATCH_EDGE_PENALTY
 
-    # 連段強化
-    if STREAK_CTRL and regime == "streak" and lab1 == (prefer or lab1):
-        side, last_len, prev_same_len = _streak_stats(seq or [])
-        if last_len and last_len >= STREAK_MIN_LEN:
-            enter_th = max(0.0, enter_th - STREAK_BONUS)
-            if prev_same_len is not None and last_len > prev_same_len:
-                enter_th = max(0.0, enter_th - STREAK_BREAK_BONUS)
-    if STREAK_CTRL and regime == "chop" and lab1 in ("莊","閒"):
-        enter_th += STREAK_CHOP_PENALTY
+    # 交錯很強：門檻再下調（強化規律敏感）
+    if chop_strong:
+        enter_th = max(0.0, enter_th - CHOP_PATTERN_BONUS)
 
-    # 回補勢門檻下調
-    if EDGE_bonus > 0:
-        enter_th = max(0.0, enter_th - EDGE_bonus)
-
-    # 震盪 & 線上回饋
     if VOL_GUARD and seq is not None:
         alt, flip = _alt_flip_metrics(seq, ALT_WIN)
         if abs(alt-0.5) < VOL_ALT_BAND: enter_th += VOL_ALT_BOOST
         if flip >= VOL_FLIP_TH:          enter_th += VOL_FLIP_BOOST
 
     boost = _online_edge_boost(sess); enter_th += boost
-    note = f"門檻{enter_th:.3f}"
-    if comeback_note: note += f"｜{comeback_note}"
+    vol_note = f"門檻{enter_th:.3f}"
+    if chop_strong: vol_note += "｜交錯強"
 
+    # —— 遲滯 & 冷卻（Anti-Chase）：避免見莊就莊、見閒就閒 —— #
+    if sess is not None and lab1 in ("莊","閒"):
+        last_pick = sess.get("last_suggestion")
+        last_edge = float(sess.get("last_edge", 0.0))
+        last_len  = int(sess.get("last_len", len(seq or [])))
+        cooled = (len(seq or []) - last_len) >= SWITCH_COOLDOWN
+        if last_pick in ("莊","閒") and last_pick != lab1:
+            if (edge < last_edge + HYSTERESIS_EDGE) or (not cooled):
+                # 不換，維持上一建議
+                lab1 = last_pick
+                p_prefer = float(p[0] if lab1=="莊" else p[1])
+                p_other  = float(p[1] if lab1=="莊" else p[0])
+                p2       = max(p_other, float(p[2]))
+                edge     = p_prefer - p2
+
+    # —— 未達門檻 —— #
     if edge < enter_th:
-        bias_tag = {"莊":"莊","閒":"閒","和":"和"}.get(lab1, "")
         if FORCE_DIRECTION_WHEN_UNDEREDGE:
-            return lab1, edge, 0.0, vote_conf, note + "（未達）"
-        if SHOW_BIAS_ON_ABSTAIN and bias_tag:
-            return f"觀望（偏{bias_tag}）", edge, 0.0, vote_conf, note
-        return "觀望", edge, 0.0, vote_conf, note
+            # 仍回報方向但不下注
+            if sess is not None:
+                sess["last_suggestion"] = lab1 if lab1 in ("莊","閒","和") else None
+                sess["last_edge"] = float(edge)
+                sess["last_len"]  = int(len(seq or []))
+            return lab1, edge, 0.0, vote_conf, vol_note + "（未達）"
+        if SHOW_BIAS_ON_ABSTAIN and lab1 in ("莊","閒","和"):
+            return f"觀望（偏{lab1}）", edge, 0.0, vote_conf, vol_note
+        return "觀望", edge, 0.0, vote_conf, vol_note
 
+    # —— 達門檻：下注（固定梯度 10/20/30%）—— #
     base_pct = edge_to_base_pct(edge)
     if base_pct == 0.0:
-        return "觀望", edge, 0.0, vote_conf, note
+        return "觀望", edge, 0.0, vote_conf, vol_note
     bet_pct = base_pct
-    return lab1, edge, bet_pct, vote_conf, note
+
+    # 記錄遲滯狀態
+    if sess is not None:
+        sess["last_suggestion"] = lab1
+        sess["last_edge"] = float(edge)
+        sess["last_len"]  = int(len(seq or []))
+
+    return lab1, edge, bet_pct, vote_conf, vol_note
 
 def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
     return f"{vote_counts.get('莊',0)}/{models_used}·{vote_counts.get('閒',0)}/{models_used}·{vote_counts.get('和',0)}/{models_used}"
 
+# ====== 簡短文案（含 Emoji）======
 def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    bankroll:int, bet_pct:float, vote_labels:Dict[str,str],
                    vote_counts:Dict[str,int], models_used:int, remain_min:Optional[int],
@@ -739,7 +688,7 @@ def quick_reply_buttons():
     except Exception:
         return None
 
-# ===== API / LINE webhook（與你之前版一致）=====
+# ====== API ======
 @app.route("/", methods=["GET"])
 def root():
     return "LiveBoot ok", 200
@@ -806,7 +755,10 @@ def predict_api():
         p_smooth = p_avg
 
     models_used = len(vote_labels)
-    sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(p_smooth, vote_counts, models_used, seq, None, regime_info)
+    # 這裡改為把 sess 丟進去（原本是 None），讓 API 也享有 Anti-Chase 遲滯/冷卻
+    sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(
+        p_smooth, vote_counts, models_used, seq, sess, regime_info
+    )
 
     if EMA_ENABLE and session_key:
         ema_b_prev = SESS_API[session_key].get("ema_b_api")
@@ -841,6 +793,7 @@ def predict_api():
         "message": text
     })
 
+# ====== LINE Webhook ======
 @app.route("/line-webhook", methods=["POST"])
 def line_webhook():
     if not line_handler or not line_api:
@@ -988,8 +941,11 @@ def on_text(event):
                                vote_labels, vote_counts, models_used, None, vol_note, regime_info)
         safe_reply(event.reply_token, reply, uid); return
 
-    safe_reply(event.reply_token, "🧭 指令：設定本金→貼歷史→『開始分析』｜『返回』撤回｜『結束分析』清空｜『結果 ⋯』回報上一手", uid)
+    # 說明
+    msg = ("🧭 指令：設定本金→貼歷史→『開始分析』｜『返回』撤回｜『結束分析』清空｜『結果 ⋯』回報上一手")
+    safe_reply(event.reply_token, msg, uid)
 
+# ====== Utils ======
 def validate_activation_code(code: str) -> bool:
     if not ADMIN_ACTIVATION_SECRET: return False
     return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
