@@ -1,4 +1,5 @@
-# server.py — LiveBoot Baccarat AI (Regime-Primary + Threshold-First + Short Reply + Emojis)
+# server.py — LiveBoot Baccarat AI
+# Regime-Primary + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -10,6 +11,7 @@ log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
 
+# ====== 小工具 ======
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None: return 1 if default else 0
@@ -90,7 +92,7 @@ REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
 
-# —— 場況主導下注（你要求的！） ——
+# —— 場況主導下注（你要求的） ——
 REGIME_PRIMARY = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先決定方向（莊/閒）
 
 # ====== EMA 平滑 ======
@@ -100,8 +102,8 @@ EMA_BET_A     = float(os.getenv("EMA_BET_A", "0.20"))
 SHOW_EMA_NOTE = int(os.getenv("SHOW_EMA_NOTE", "1"))
 
 # ====== 未達門檻的顯示行為 ======
-SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))   # 觀望時顯示「偏⋯」
-FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))  # 未達門檻也顯示方向但下注=0
+SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))
+FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))
 
 # ====== LINE SDK ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -452,7 +454,7 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
 
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
-# ====== 震盪度 & 門檻 / EMA ======
+# ====== 震盪度 & 門檻 / EMA / 配注 ======
 def _alt_flip_metrics(seq: List[int], win: int = 24) -> Tuple[float, float]:
     if not seq: return 0.5, 0.5
     sub=[x for x in seq[-win:] if x in (0,1)]
@@ -487,6 +489,14 @@ def _ema_update(prev: Optional[np.ndarray], x: np.ndarray, a: float) -> np.ndarr
 def _ema_scalar(prev: Optional[float], x: float, a: float) -> float:
     if prev is None: return float(x)
     return float((1.0-a)*float(prev) + a*float(x))
+
+def bet_ladder_text(bankroll: int) -> str:
+    if not bankroll or bankroll <= 0:
+        return ""
+    a = int(round(bankroll * 0.10))
+    b = int(round(bankroll * 0.20))
+    c = int(round(bankroll * 0.30))
+    return f"🪜 配注 10% {a:,}｜20% {b:,}｜30% {c:,}"
 
 def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
                           seq: Optional[List[int]] = None, sess: Optional[Dict[str,object]] = None,
@@ -544,12 +554,11 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
             return f"觀望（偏{bias_tag}）", edge, 0.0, vote_conf, vol_note
         return "觀望", edge, 0.0, vote_conf, vol_note
 
-    # —— 達門檻：下注 ——
+    # —— 達門檻：下注（固定梯度 10/20/30%）——
     base_pct = edge_to_base_pct(edge)
     if base_pct == 0.0:
         return "觀望", edge, 0.0, vote_conf, vol_note
-    scale = 0.5 + 0.5*vote_conf
-    bet_pct = float(np.clip(base_pct * scale, 0.05, 0.30))
+    bet_pct = base_pct  # 固定梯度，不再用票數縮放
     return lab1, edge, bet_pct, vote_conf, vol_note
 
 def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
@@ -562,26 +571,36 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    vol_note:Optional[str]=None, regime_info:Tuple[str,Optional[str]]=("neutral",None)) -> str:
     b, pl, t = p[0], p[1], p[2]
     regime, prefer = regime_info
-    # 若無偏向，也用最大機率方向當作顯示箭頭
     bias = prefer or {0:"莊",1:"閒",2:"和"}[int(np.argmax(p))]
+
     # 第一行：建議 + 邊際 + 金額/比例
     if bet_pct > 0 and bankroll:
         bet_amt = int(round(bankroll * bet_pct))
         head = f"👉 {sug} 🎯 邊際 {edge:.3f}｜💰{bet_amt:,}（{bet_pct*100:.1f}%）"
     else:
         head = f"👉 {sug} 🟡 邊際 {edge:.3f}"
-    # 第二行：機率簡報
+
     probs = f"📊 機率 B {b:.2f}｜P {pl:.2f}｜T {t:.2f}"
-    # 第三行：場況＋票數（極簡）
     votes = f"🗳️ 票 {vote_summary_text(vote_counts, models_used)}"
     reg   = f"🎛️ 場況 {_regime_label(regime, bias)}"
-    # 第四行：門檻/EMA/時間（極簡）
+
+    lines=[head, probs, f"{reg}｜{votes}"]
+
+    # 配注梯度 & 本手下多少
+    ladder = bet_ladder_text(bankroll)
+    if ladder:
+        if bet_pct > 0 and bankroll:
+            bet_amt = int(round(bankroll * bet_pct))
+            lines.append(f"{ladder} ｜ ✅ 下 {bet_amt:,}")
+        else:
+            lines.append(ladder)
+
     tail=[]
     if vol_note: tail.append(f"⚙️ {vol_note}")
     if EMA_ENABLE and SHOW_EMA_NOTE: tail.append(f"🔧 EMA")
     if remain_min is not None and SHOW_REMAINING_TIME: tail.append(f"⏳{max(0,remain_min)}m")
-    lines=[head, probs, f"{reg}｜{votes}"]
     if tail: lines.append("｜".join(tail))
+
     return "\n".join(lines)
 
 def fmt_trial_over() -> str:
