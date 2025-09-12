@@ -1,13 +1,12 @@
 # server.py — LiveBoot Baccarat AI (XGB/LGBM/RNN 投票 + 平均機率)
-# 功能：
-# • 3 模型投票決策（XGB / LGBM / RNN），平均機率作最終機率
-# • 配注比例 = 邊際分級(10/20/30%) × 投票信心（0.5~1.0倍）
-# • LINE Webhook（Emoji & 快速回覆）
-# • 30 分鐘試用 / 單一密碼開通（環境變數 ADMIN_ACTIVATION_SECRET）
-# • /predict 回傳同款 Emoji 文本
-# • /health 健檢
-# 啟動（Render）：
-#   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 --graceful-timeout 45
+# 功能總覽：
+# • 三模型投票（XGB/LGBM/RNN）＋平均機率融合
+# • 配注 = 邊際分級(10/20/30%) × 投票共識度（3/3, 2/3, 1/3）
+# • LINE：返回/結束分析、30 分鐘試用到期即鎖，只允許「開通 密碼」
+# • API：/predict 支援 action=undo/reset、session_key、activation_code
+# • API 試用鎖：API_TRIAL_ENFORCE=1 會啟用 30 分鐘限制（同 LINE）
+# • 回傳 votes 與 vote_summary，/health, /healthz 健檢
+# • 啟動（Render）：gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 --graceful-timeout 45
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -24,7 +23,6 @@ FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
 
-# 配注分級與限制
 MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.07"))   # 最小邊際建倉門檻
 TEMP       = float(os.getenv("TEMP", "0.95"))
 CLIP_T_MIN = float(os.getenv("CLIP_T_MIN", "0.02"))
@@ -35,8 +33,12 @@ np.random.seed(SEED)
 # 試用 / 開通
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
-ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 你在 Render 填的唯一密碼
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 唯一密碼（Render 環境變數）
 SHOW_REMAINING_TIME = int(os.getenv("SHOW_REMAINING_TIME", "1"))
+
+# API 試用鎖
+API_TRIAL_ENFORCE  = int(os.getenv("API_TRIAL_ENFORCE", "0"))  # 1=啟用
+API_TRIAL_MINUTES  = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))  # 預設與 LINE 同
 
 # ===== LINE =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -56,8 +58,11 @@ except Exception as e:
     log.warning("LINE SDK not fully available: %s", e)
 
 # ===== Session（in-memory）=====
-# { user_id: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
+# LINE 使用 SESS；API 使用 SESS_API（避免 key 衝突）
+# LINE: { user_id: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
+# API:  { session_key: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
 SESS: Dict[str, Dict[str, object]] = {}
+SESS_API: Dict[str, Dict[str, object]] = {}
 
 # ===== 模型（Lazy Load）=====
 XGB_MODEL = None
@@ -127,10 +132,12 @@ def parse_history(s: str) -> List[int]:
         if ch in MAP: out.append(MAP[ch])
     return out
 
+def encode_history(seq: List[int]) -> str:
+    return " ".join(INV.get(v,"?") for v in seq)
+
 def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
-    import numpy as _np
-    grid_sign = _np.zeros((rows, cols), dtype=_np.int8)
-    grid_ties = _np.zeros((rows, cols), dtype=_np.int16)
+    grid_sign = np.zeros((rows, cols), dtype=np.int8)
+    grid_ties = np.zeros((rows, cols), dtype=np.int16)
     r = 0; c = 0; last_bp = None
     for v in seq:
         if v == 2:
@@ -195,7 +202,6 @@ def one_hot_seq(seq: List[int], win:int) -> np.ndarray:
     return np.array(oh, dtype=np.float32)[np.newaxis, :, :]
 
 def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
-    # 避免過度尖銳：對機率做溫度縮放（log-space）
     x = np.log(np.clip(p,1e-9,None)) / max(1e-9, temp)
     x = x - x.max()
     e = np.exp(x)
@@ -227,11 +233,7 @@ def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
 
 # ===== 三模型投票 + 平均機率融合 =====
 def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[str,int]]:
-    """回傳 (p_avg, vote_labels, vote_counts)
-    p_avg: 三模型的平均機率（有載入的才參與；至少一個）
-    vote_labels: 各模型的投票（'XGB':'莊' 等）
-    vote_counts: 各類票數 {'莊':v_b,'閒':v_p,'和':v_t}
-    """
+    """回傳 (p_avg, vote_labels, vote_counts)"""
     preds = []
     vote_labels = {}
     vote_counts = {'莊':0,'閒':0,'和':0}
@@ -248,20 +250,17 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
         preds.append(pr); vote_labels['RNN']  = label_map[int(pr.argmax())]; vote_counts[vote_labels['RNN']]+=1
 
     if not preds:
-        # 全部模型都沒有 → 退回簡單 heuristic 當保底
         ph, _ = heuristic_probs(seq)
         return ph, {}, {'莊':0,'閒':0,'和':0}
 
     P = np.stack(preds, axis=0).astype(np.float32)
-    # 平均之前做個溫度縮放以避免單一模型過尖（可關閉）
     P = np.stack([softmax_log(p, TEMP) for p in P], axis=0)
     p_avg = P.mean(axis=0)
-    # clip tie
     p_avg[2] = np.clip(p_avg[2], CLIP_T_MIN, CLIP_T_MAX)
     p_avg = np.clip(p_avg, 1e-6, None); p_avg = p_avg / p_avg.sum()
     return p_avg, vote_labels, vote_counts
 
-# ===== Heuristic（保底用；三模型都缺時）=====
+# ===== Heuristic（保底；三模型皆缺時）=====
 def heuristic_probs(seq: List[int]) -> Tuple[np.ndarray, str]:
     if not seq:
         return np.array([0.49,0.49,0.02], dtype=np.float32), "prior"
@@ -269,12 +268,11 @@ def heuristic_probs(seq: List[int]) -> Tuple[np.ndarray, str]:
     cnt = np.bincount(sub, minlength=3).astype(np.float32)
     freq = cnt / max(1,len(sub))
     p0 = 0.90*freq + 0.10*np.array([0.49,0.49,0.02], dtype=np.float32)
-    # tie clip
     p0[2] = np.clip(p0[2], CLIP_T_MIN, CLIP_T_MAX)
     p0 = np.clip(p0,1e-6,None); p0 = p0/p0.sum()
     return p0, "heuristic"
 
-# ===== 配注（依投票%）=====
+# ===== 配注（依投票共識%）=====
 def edge_to_base_pct(edge: float) -> float:
     if edge >= max(0.10, MIN_EDGE+0.02): return 0.30
     if edge >= max(0.08, MIN_EDGE):      return 0.20
@@ -283,17 +281,14 @@ def edge_to_base_pct(edge: float) -> float:
 
 def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int) -> Tuple[str,float,float, float]:
     """回傳 (建議, 邊際, 最終下注比例, 投票信心)"""
-    labels = ["莊","閒","和"]
     arr = [(float(p[0]),"莊"), (float(p[1]),"閒"), (float(p[2]),"和")]
     arr.sort(reverse=True, key=lambda x: x[0])
     (p1, lab1), (p2, _) = arr[0], arr[1]
     edge = p1 - p2
 
-    # 投票信心：最高票 / 參與模型數
     max_votes = max(votes.get("莊",0), votes.get("閒",0), votes.get("和",0)) if models_used>0 else 0
     vote_conf = (max_votes / models_used) if models_used>0 else 0.0
 
-    # 和的保護：機率過低不主推
     if lab1 == "和" and p[2] < max(0.05, CLIP_T_MIN + 0.01):
         return "觀望", edge, 0.0, vote_conf
 
@@ -301,14 +296,15 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int) 
     if base_pct == 0.0:
         return "觀望", edge, 0.0, vote_conf
 
-    # 依投票強度調整倉位（1/3→0.66倍, 2/3→0.83倍, 3/3→1.0倍）
-    scale = 0.5 + 0.5*vote_conf
+    scale = 0.5 + 0.5*vote_conf  # (1/3=0.66, 2/3≈0.83, 3/3=1.0)
     bet_pct = base_pct * scale
-    # 上下限保護
     bet_pct = float(np.clip(bet_pct, 0.05 if base_pct>0 else 0.0, 0.30))
     return lab1, edge, bet_pct, vote_conf
 
-# ===== Emoji 訊息 =====
+def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
+    return f"莊 {vote_counts.get('莊',0)}/{models_used}, 閒 {vote_counts.get('閒',0)}/{models_used}, 和 {vote_counts.get('和',0)}/{models_used}"
+
+# ===== Emoji/文本 =====
 def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    bankroll:int, bet_pct:float, vote_labels:Dict[str,str],
                    vote_counts:Dict[str,int], models_used:int, remain_min:Optional[int]) -> str:
@@ -318,13 +314,12 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
     lines.append(f"📈 平均機率：莊 {b:.3f}｜閒 {pl:.3f}｜和 {t:.3f}")
 
     if models_used>0:
-        vB, vP, vT = vote_counts.get('莊',0), vote_counts.get('閒',0), vote_counts.get('和',0)
-        vote_line = f"🗳️ 投票（{models_used} 模型）：莊 {vB}｜閒 {vP}｜和 {vT}"
+        vline = f"🗳️ 投票（{models_used} 模型）：{vote_summary_text(vote_counts, models_used)}"
         who = []
         for k in ["XGB","LGBM","RNN"]:
             if k in vote_labels: who.append(f"{k}→{vote_labels[k]}")
-        if who: vote_line += "｜" + "，".join(who)
-        lines.append(vote_line)
+        if who: vline += "｜" + "，".join(who)
+        lines.append(vline)
 
     badge = "🎯" if sug != "觀望" else "🟡"
     lines.append(f"👉 下一手建議：{sug} {badge}（邊際 {edge:.3f}）")
@@ -338,7 +333,7 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
     if remain_min is not None and SHOW_REMAINING_TIME:
         lines.append(f"⏳ 試用剩餘：約 {max(0, remain_min)} 分鐘")
 
-    lines.append("📝 直接輸入下一手結果（莊/閒/和 或 B/P/T），我會再幫你算下一局。")
+    lines.append("📝 輸入下一手（莊/閒/和 或 B/P/T）。操作：『返回』撤回上一手、『結束分析』清空歷史。")
     return "\n".join(lines)
 
 def fmt_trial_over() -> str:
@@ -356,6 +351,8 @@ def quick_reply_buttons():
             QuickReplyButton(action=MessageAction(label="閒", text="閒")),
             QuickReplyButton(action=MessageAction(label="和", text="和")),
             QuickReplyButton(action=MessageAction(label="開始分析", text="開始分析")),
+            QuickReplyButton(action=MessageAction(label="返回 ⬅️", text="返回")),
+            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
         ])
     except Exception:
         return None
@@ -369,26 +366,88 @@ def root():
 def health():
     return jsonify(status="ok"), 200
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify(status="ok"), 200
+
 @app.route("/predict", methods=["POST"])
 def predict_api():
+    """支援 action 與 session_key；可選擇啟用試用鎖（API_TRIAL_ENFORCE=1）
+    請求 JSON：
+      - session_key: 建議必填（API_TRIAL_ENFORCE=1 時必填）
+      - history: 歷史（可留空，若用 session 記錄）
+      - bankroll: 本金
+      - action: 'undo' | 'reset' | ''  （撤回／清空／分析）
+      - activation_code: API 端開通密碼（等同 LINE 的 ADMIN_ACTIVATION_SECRET）
+    """
     data = request.get_json(silent=True) or {}
+    action = str(data.get("action","")).strip().lower()
+    session_key = data.get("session_key")
+    bankroll_in = data.get("bankroll")
     history = data.get("history", "")
-    bankroll = int(data.get("bankroll", 0) or 0)
-    seq = parse_history(history)
+    activation_code = str(data.get("activation_code","")).strip()
 
+    # 如果啟用 API 試用鎖，要求必須有 session_key 才能追蹤時長
+    if API_TRIAL_ENFORCE and not session_key:
+        return jsonify(error="session_key_required",
+                       message="API trial enforcement is ON. Please provide session_key, or include activation_code to unlock."), 400
+
+    # 取得或建立 API 會話
+    if session_key:
+        sess = SESS_API.setdefault(session_key, {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": False})
+        # 接受 API 端開通
+        if activation_code and ADMIN_ACTIVATION_SECRET and (activation_code == ADMIN_ACTIVATION_SECRET):
+            sess["premium"] = True
+        # 試用鎖邏輯
+        if API_TRIAL_ENFORCE and not sess.get("premium", False):
+            now = int(time.time())
+            start = int(sess.get("trial_start", now))
+            elapsed_min = (now - start) // 60
+            if elapsed_min >= API_TRIAL_MINUTES:
+                return jsonify(error="trial_expired",
+                               message="⛔ API 試用已結束。請提供 activation_code 開通後再使用。",
+                               contact=ADMIN_CONTACT,
+                               minutes=API_TRIAL_MINUTES), 403
+        # 同步 bankroll / history
+        if bankroll_in is not None:
+            try: sess["bankroll"] = int(bankroll_in)
+            except: pass
+        if history:
+            sess["seq"] = parse_history(history)  # 覆蓋完整歷史
+        seq = list(sess.get("seq", []))
+        bankroll = int(sess.get("bankroll", 0) or 0)
+    else:
+        # 未啟用 API 試用鎖或無 session 模式：stateless
+        seq = parse_history(history)
+        bankroll = int(bankroll_in or 0)
+
+    # action：undo/reset
+    if action == "undo":
+        if seq: seq.pop(-1)
+        if session_key: SESS_API[session_key]["seq"] = seq
+    elif action == "reset":
+        seq = []
+        if session_key: SESS_API[session_key]["seq"] = []
+
+    # 推論
     p_avg, vote_labels, vote_counts = vote_and_average(seq)
     models_used = len(vote_labels)
     sug, edge, bet_pct, vote_conf = decide_bet_from_votes(p_avg, vote_counts, models_used)
-    text = fmt_line_reply(len(seq), p_avg, sug, edge, bankroll, bet_pct, vote_labels, vote_counts, models_used, None)
+
+    history_str = encode_history(seq)
+    text = fmt_line_reply(len(seq), p_avg, sug, edge, bankroll, bet_pct,
+                          vote_labels, vote_counts, models_used, None)
 
     return jsonify({
+        "history_str": history_str,
         "hands": len(seq),
         "probs": {"banker": round(float(p_avg[0]),3), "player": round(float(p_avg[1]),3), "tie": round(float(p_avg[2]),3)},
         "suggestion": sug,
         "edge": round(float(edge),3),
         "bet_pct": float(bet_pct),
         "bet_amount": int(round(bankroll*bet_pct)) if bankroll and bet_pct>0 else 0,
-        "votes": {"models_used": models_used, **vote_counts},
+        "votes": {"models_used": models_used, "莊": vote_counts.get("莊",0), "閒": vote_counts.get("閒",0), "和": vote_counts.get("和",0)},
+        "vote_summary": f"莊 {vote_counts.get('莊',0)}/{models_used}, 閒 {vote_counts.get('閒',0)}/{models_used}, 和 {vote_counts.get('和',0)}/{models_used}",
         "message": text
     })
 
@@ -426,7 +485,7 @@ def on_text(event):
     text = (event.message.text or "").strip()
     sess = SESS.setdefault(uid, {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": False})
 
-    # 試用檢查
+    # 試用檢查（LINE）
     if not sess.get("premium", False):
         start = int(sess.get("trial_start", int(time.time())))
         now   = int(time.time())
@@ -446,14 +505,29 @@ def on_text(event):
     else:
         remain_min = None
 
+    # 系統指令：返回 / 結束分析
+    if text in ["返回", "undo", "回上一步"]:
+        seq: List[int] = sess.get("seq", [])
+        if seq:
+            last = seq.pop(-1)
+            sess["seq"] = seq
+            msg = f"↩️ 已撤回上一手（{INV.get(last,'?')}）。目前共 {len(seq)} 手。輸入『開始分析』或再輸入下一手。"
+        else:
+            msg = "ℹ️ 目前沒有可撤回的紀錄。請先輸入歷史或單手結果。"
+        safe_reply(event.reply_token, msg, uid); return
+
+    if text in ["結束分析", "清空", "reset"]:
+        sess["seq"] = []
+        msg = "🧹 已清空歷史。保留本金設定不變。\n貼上新歷史（B/P/T 或 莊/閒/和），或直接輸入單手結果開始紀錄。"
+        safe_reply(event.reply_token, msg, uid); return
+
     # 本金設定
     if text.isdigit():
         sess["bankroll"] = int(text)
         msg = f"👍 已設定本金：{int(text):,} 元。\n貼上歷史（B/P/T 或 莊/閒/和）後輸入『開始分析』即可！🚀"
-        safe_reply(event.reply_token, msg, uid)
-        return
+        safe_reply(event.reply_token, msg, uid); return
 
-    # 開通碼
+    # 開通碼（LINE）
     if text.startswith("開通") or text.lower().startswith("activate"):
         code = text.split(" ",1)[1].strip() if " " in text else ""
         if validate_activation_code(code):
@@ -472,12 +546,13 @@ def on_text(event):
         if len(seq) == 1:
             sess.setdefault("seq", [])
             sess["seq"].append(seq[0])
+            n = len(sess["seq"])
+            msg = f"✅ 已記錄 1 手：{norm}。目前累計 {n} 手。\n輸入『開始分析』或繼續輸入下一手（或用『返回』撤回）。"
         else:
             sess["seq"] = seq
-        n = len(sess["seq"])
-        msg = f"✅ 已接收歷史共 {n} 手，目前累計 {n} 手。\n輸入『開始分析』即可啟動。🧪"
-        safe_reply(event.reply_token, msg, uid)
-        return
+            n = len(seq)
+            msg = f"✅ 已覆蓋歷史共 {n} 手。\n輸入『開始分析』即可啟動。🧪"
+        safe_reply(event.reply_token, msg, uid); return
 
     # 分析
     if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
@@ -487,22 +562,22 @@ def on_text(event):
         models_used = len(vote_labels)
         sug, edge, bet_pct, vote_conf = decide_bet_from_votes(p_avg, vote_counts, models_used)
         reply = fmt_line_reply(len(sseq), p_avg, sug, edge, bankroll, bet_pct, vote_labels, vote_counts, models_used, remain_min)
-        safe_reply(event.reply_token, reply, uid)
-        return
+        safe_reply(event.reply_token, reply, uid); return
 
     # 說明
     msg = (
         "🧭 指令說明：\n"
         "• 輸入『數字』設定本金（例：5000）\n"
         "• 貼上歷史：B/P/T 或 莊/閒/和（可含空白）\n"
-        "• 輸入『開始分析』取得建議（採 XGB/LGBM/RNN 投票＋平均機率）\n"
+        "• 『開始分析』：採 XGB/LGBM/RNN 投票＋平均機率\n"
+        "• 『返回』：撤回上一手；『結束分析』：清空歷史\n"
         "• 試用到期後輸入：『開通 你的密碼』\n"
         f"• 管理員官方 LINE：{ADMIN_CONTACT}"
     )
     safe_reply(event.reply_token, msg, uid)
 
+# ===== Util =====
 def validate_activation_code(code: str) -> bool:
-    # 只有當 ADMIN_ACTIVATION_SECRET 設定且完全相等才通過；否則一律拒絕
     if not ADMIN_ACTIVATION_SECRET:
         return False
     return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
@@ -517,11 +592,6 @@ def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
                 line_api.push_message(uid, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
             except Exception as e2:
                 log.error("[LINE] push failed: %s", e2)
-
-# 再多一個 health 以防部分平台重複探測
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return jsonify(status="ok"), 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
