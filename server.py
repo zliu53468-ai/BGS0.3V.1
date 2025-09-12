@@ -467,8 +467,11 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
 
     pr = rnn_probs(seq)
     if pr is not None:
-        p = softmax_log(pr, 1.0); preds.append(p); names.append("RNN")
-        vote_labels['RNN']=label_map[int(pr.argmax())]); vote_counts[vote_labels['RNN']]+=1
+        p = softmax_log(pr, 1.0)
+        preds.append(p)
+        names.append("RNN")
+        vote_labels['RNN'] = label_map[int(pr.argmax())]
+        vote_counts[vote_labels['RNN']] += 1
 
     regime, prefer = _regime_detect(seq)
 
