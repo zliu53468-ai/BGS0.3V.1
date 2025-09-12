@@ -1,12 +1,13 @@
-# server.py — LiveBoot Baccarat AI (XGB/LGBM/RNN 投票 + 平均機率)
-# 功能總覽：
-# • 三模型投票（XGB/LGBM/RNN）＋平均機率融合
-# • 配注 = 邊際分級(10/20/30%) × 投票共識度（3/3, 2/3, 1/3）
-# • LINE：返回/結束分析、30 分鐘試用到期即鎖，只允許「開通 密碼」
-# • API：/predict 支援 action=undo/reset、session_key、activation_code
-# • API 試用鎖：API_TRIAL_ENFORCE=1 會啟用 30 分鐘限制（同 LINE）
-# • 回傳 votes 與 vote_summary，/health, /healthz 健檢
-# • 啟動（Render）：gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 --graceful-timeout 45
+# server.py — LiveBoot Baccarat AI
+# 功能：
+# • 模型：XGB/LGBM/RNN 三模型投票 + 平均機率融合（含溫度、Tie 夾限）
+# • 特徵：大路(6×20) 局部(Local) + 整盤(Global) 融合（可開關、可調權重）
+# • 配注：邊際(10/20/30%) × 投票共識(3/3,2/3,1/3)
+# • LINE：返回/結束分析、30 分鐘試用到期鎖，只允許「開通 密碼」
+# • API：/predict 支援 action=undo/reset、session_key、activation_code；可啟用試用鎖
+# • 健康檢查：/health, /healthz
+# 啟動（Render）：
+#   gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180 --graceful-timeout 45
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -17,6 +18,20 @@ from flask import Flask, request, jsonify, abort
 log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
+
+# ===== helpers for env flags (容錯：1/0/true/false/on/off 皆可) =====
+def env_flag(name: str, default: int = 1) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return 1 if default else 0
+    v = str(val).strip().lower()
+    if v in ("1", "true", "t", "yes", "y", "on"):  return 1
+    if v in ("0", "false", "t", "f", "no", "n", "off"): return 0
+    if v == "1/0": return 1  # 容錯
+    try:
+        return 1 if int(float(v)) != 0 else 0
+    except:
+        return 1 if default else 0
 
 # ===== Config =====
 FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
@@ -30,15 +45,21 @@ CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.12"))
 SEED       = int(os.getenv("SEED", "42"))
 np.random.seed(SEED)
 
+# 全盤/近端融合
+USE_FULL_SHOE = env_flag("USE_FULL_SHOE", 1)  # 1=Local+Global 融合；0=僅 Local
+LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.65"))
+GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.35"))
+MAX_RNN_LEN   = int(os.getenv("MAX_RNN_LEN", "256"))
+
 # 試用 / 開通
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
-ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 唯一密碼（Render 環境變數）
-SHOW_REMAINING_TIME = int(os.getenv("SHOW_REMAINING_TIME", "1"))
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 唯一密碼
+SHOW_REMAINING_TIME = env_flag("SHOW_REMAINING_TIME", 1)
 
 # API 試用鎖
-API_TRIAL_ENFORCE  = int(os.getenv("API_TRIAL_ENFORCE", "0"))  # 1=啟用
-API_TRIAL_MINUTES  = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))  # 預設與 LINE 同
+API_TRIAL_ENFORCE  = env_flag("API_TRIAL_ENFORCE", 0)  # 1=啟用 API 試用限制
+API_TRIAL_MINUTES  = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))
 
 # ===== LINE =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -58,9 +79,8 @@ except Exception as e:
     log.warning("LINE SDK not fully available: %s", e)
 
 # ===== Session（in-memory）=====
-# LINE 使用 SESS；API 使用 SESS_API（避免 key 衝突）
 # LINE: { user_id: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
-# API:  { session_key: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
+# API : { session_key: {"bankroll": int, "seq": List[int], "trial_start": int, "premium": bool} }
 SESS: Dict[str, Dict[str, object]] = {}
 SESS_API: Dict[str, Dict[str, object]] = {}
 
@@ -107,6 +127,7 @@ def _load_rnn():
         path = os.getenv("RNN_OUT_PATH", "/data/models/rnn.pt")
         if os.path.exists(path):
             RNN_MODEL = TinyRNN()
+            import torch
             state = torch.load(path, map_location="cpu")
             RNN_MODEL.load_state_dict(state); RNN_MODEL.eval()
             log.info("[MODEL] RNN loaded: %s", path)
@@ -158,7 +179,66 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
             last_bp = cur_bp
     return grid_sign, grid_ties, (r,c)
 
-def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
+# -------- Global + Local features ----------
+def _global_aggregates(seq: List[int]) -> np.ndarray:
+    """整盤統計：頻率、交替率、連莊均值/變異、轉移率、和比例（固定長度）"""
+    n = len(seq)
+    if n == 0:
+        return np.array([0.49,0.49,0.02, 0.5,0.5, 0.0,0.0,0.0,0.0, 0.5,0.5,0.5,0.5, 0.0], dtype=np.float32)
+
+    arr = np.array(seq, dtype=np.int16)
+    cnt = np.bincount(arr, minlength=3).astype(np.float32); freq = cnt / n
+
+    # 交替率（只看 B/P）
+    bp = arr[arr != 2]
+    if len(bp) >= 2:
+        altern = float(np.mean(bp[1:] != bp[:-1]))
+    else:
+        altern = 0.5
+
+    # 連莊 run-length 統計（B 與 P）
+    def run_stats(side):
+        x = (bp == side).astype(np.int8)
+        if x.size == 0: return 0.0, 0.0
+        runs = []; cur = 0
+        for v in x:
+            if v == 1: cur += 1
+            elif cur > 0: runs.append(cur); cur = 0
+        if cur>0: runs.append(cur)
+        if len(runs)==0: return 0.0, 0.0
+        r = np.array(runs, dtype=np.float32)
+        return float(r.mean()), float(r.var()) if r.size>1 else 0.0
+    b_mean, b_var = run_stats(0); p_mean, p_var = run_stats(1)
+
+    # 轉移機率（B->B, P->P, B->P, P->B）
+    b2b=p2p=b2p=p2b=0; cb=cp=0
+    for i in range(len(bp)-1):
+        a, b = bp[i], bp[i+1]
+        if a==0:
+            cb += 1
+            if b==0: b2b += 1
+            else:    b2p += 1
+        else:
+            cp += 1
+            if b==1: p2p += 1
+            else:    p2b += 1
+    B2B = (b2b / cb) if cb>0 else 0.5
+    P2P = (p2p / cp) if cp>0 else 0.5
+    B2P = (b2p / cb) if cb>0 else 0.5
+    P2B = (p2b / cp) if cp>0 else 0.5
+
+    tie_rate = float((arr==2).mean()) if n>0 else 0.0
+
+    return np.array([
+        float(freq[0]), float(freq[1]), float(freq[2]),
+        float(altern), float(1.0 - altern),
+        float(b_mean), float(b_var), float(p_mean), float(p_var),
+        float(B2B), float(P2P), float(B2P), float(P2B),
+        float(tie_rate)
+    ], dtype=np.float32)
+
+def _local_bigroad_feat(seq: List[int], rows:int, cols:int, win:int) -> np.ndarray:
+    """近端視窗的 6×20 大路形狀 + 輔助特徵"""
     sub = seq[-win:] if len(seq)>win else seq[:]
     gs, gt, (r,c) = big_road_grid(sub, rows, cols)
     grid_sign_flat = gs.flatten().astype(np.float32)
@@ -190,16 +270,39 @@ def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np
         freq
     ], axis=0)
 
+def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
+    """Local(大路視窗) + Global(整盤統計) 融合；維持固定長度供 XGB/LGBM 用"""
+    local = _local_bigroad_feat(seq, rows, cols, win).astype(np.float32)
+    if USE_FULL_SHOE:
+        glob  = _global_aggregates(seq).astype(np.float32)
+        lw = max(0.0, LOCAL_WEIGHT); gw = max(0.0, GLOBAL_WEIGHT)
+        s = lw + gw
+        if s == 0: lw, gw = 1.0, 0.0
+        else:      lw, gw = lw/s, gw/s
+        feat = np.concatenate([local*lw, glob*gw], axis=0).astype(np.float32)
+        return feat
+    else:
+        return local
+
 def one_hot_seq(seq: List[int], win:int) -> np.ndarray:
-    sub = seq[-win:] if len(seq)>win else seq[:]
-    pad = [-1]*max(0, win-len(sub))
-    final = (pad+sub)[-win:]
-    oh=[]
-    for v in final:
-        a=[0,0,0]
-        if v in (0,1,2): a[v]=1
-        oh.append(a)
-    return np.array(oh, dtype=np.float32)[np.newaxis, :, :]
+    """RNN 輸入：USE_FULL_SHOE=1 → 整盤（最多 MAX_RNN_LEN）；否則近段 win。"""
+    if USE_FULL_SHOE:
+        sub = seq[-MAX_RNN_LEN:] if len(seq) > MAX_RNN_LEN else seq[:]
+        L = len(sub)
+        oh = np.zeros((1, L, 3), dtype=np.float32)
+        for i, v in enumerate(sub):
+            if v in (0,1,2): oh[0, i, v] = 1.0
+        return oh
+    else:
+        sub = seq[-win:] if len(seq)>win else seq[:]
+        pad = [-1]*max(0, win-len(sub))
+        final = (pad+sub)[-win:]
+        oh=[]
+        for v in final:
+            a=[0,0,0]
+            if v in (0,1,2): a[v]=1
+            oh.append(a)
+        return np.array(oh, dtype=np.float32)[np.newaxis, :, :]
 
 def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     x = np.log(np.clip(p,1e-9,None)) / max(1e-9, temp)
@@ -232,10 +335,20 @@ def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
     return p.astype(np.float32)
 
 # ===== 三模型投票 + 平均機率融合 =====
+def heuristic_probs(seq: List[int]) -> Tuple[np.ndarray, str]:
+    if not seq:
+        return np.array([0.49,0.49,0.02], dtype=np.float32), "prior"
+    sub = seq[-FEAT_WIN:] if len(seq)>FEAT_WIN else seq
+    cnt = np.bincount(sub, minlength=3).astype(np.float32)
+    freq = cnt / max(1,len(sub))
+    p0 = 0.90*freq + 0.10*np.array([0.49,0.49,0.02], dtype=np.float32)
+    p0[2] = np.clip(p0[2], CLIP_T_MIN, CLIP_T_MAX)
+    p0 = np.clip(p0,1e-6,None); p0 = p0/p0.sum()
+    return p0, "heuristic"
+
 def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[str,int]]:
-    """回傳 (p_avg, vote_labels, vote_counts)"""
     preds = []
-    vote_labels = {}
+    vote_labels: Dict[str,str] = {}
     vote_counts = {'莊':0,'閒':0,'和':0}
     label_map = ["莊","閒","和"]
 
@@ -260,27 +373,14 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
     p_avg = np.clip(p_avg, 1e-6, None); p_avg = p_avg / p_avg.sum()
     return p_avg, vote_labels, vote_counts
 
-# ===== Heuristic（保底；三模型皆缺時）=====
-def heuristic_probs(seq: List[int]) -> Tuple[np.ndarray, str]:
-    if not seq:
-        return np.array([0.49,0.49,0.02], dtype=np.float32), "prior"
-    sub = seq[-FEAT_WIN:] if len(seq)>FEAT_WIN else seq
-    cnt = np.bincount(sub, minlength=3).astype(np.float32)
-    freq = cnt / max(1,len(sub))
-    p0 = 0.90*freq + 0.10*np.array([0.49,0.49,0.02], dtype=np.float32)
-    p0[2] = np.clip(p0[2], CLIP_T_MIN, CLIP_T_MAX)
-    p0 = np.clip(p0,1e-6,None); p0 = p0/p0.sum()
-    return p0, "heuristic"
-
-# ===== 配注（依投票共識%）=====
+# ===== 配注 =====
 def edge_to_base_pct(edge: float) -> float:
     if edge >= max(0.10, MIN_EDGE+0.02): return 0.30
     if edge >= max(0.08, MIN_EDGE):      return 0.20
     if edge >= max(0.05, MIN_EDGE-0.01): return 0.10
     return 0.0
 
-def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int) -> Tuple[str,float,float, float]:
-    """回傳 (建議, 邊際, 最終下注比例, 投票信心)"""
+def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int) -> Tuple[str,float,float,float]:
     arr = [(float(p[0]),"莊"), (float(p[1]),"閒"), (float(p[2]),"和")]
     arr.sort(reverse=True, key=lambda x: x[0])
     (p1, lab1), (p2, _) = arr[0], arr[1]
@@ -304,7 +404,7 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int) 
 def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
     return f"莊 {vote_counts.get('莊',0)}/{models_used}, 閒 {vote_counts.get('閒',0)}/{models_used}, 和 {vote_counts.get('和',0)}/{models_used}"
 
-# ===== Emoji/文本 =====
+# ===== 文案 =====
 def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    bankroll:int, bet_pct:float, vote_labels:Dict[str,str],
                    vote_counts:Dict[str,int], models_used:int, remain_min:Optional[int]) -> str:
@@ -321,6 +421,7 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
         if who: vline += "｜" + "，".join(who)
         lines.append(vline)
 
+    lines.append(f"🧩 特徵權重：Local {int(LOCAL_WEIGHT*100)}% / Global {int(GLOBAL_WEIGHT*100)}%")
     badge = "🎯" if sug != "觀望" else "🟡"
     lines.append(f"👉 下一手建議：{sug} {badge}（邊際 {edge:.3f}）")
 
@@ -387,18 +488,18 @@ def predict_api():
     history = data.get("history", "")
     activation_code = str(data.get("activation_code","")).strip()
 
-    # 如果啟用 API 試用鎖，要求必須有 session_key 才能追蹤時長
+    # API 試用鎖需要 session_key
     if API_TRIAL_ENFORCE and not session_key:
         return jsonify(error="session_key_required",
                        message="API trial enforcement is ON. Please provide session_key, or include activation_code to unlock."), 400
 
-    # 取得或建立 API 會話
+    # 取得/建立 API 會話
     if session_key:
         sess = SESS_API.setdefault(session_key, {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": False})
-        # 接受 API 端開通
+        # API 開通
         if activation_code and ADMIN_ACTIVATION_SECRET and (activation_code == ADMIN_ACTIVATION_SECRET):
             sess["premium"] = True
-        # 試用鎖邏輯
+        # 試用鎖
         if API_TRIAL_ENFORCE and not sess.get("premium", False):
             now = int(time.time())
             start = int(sess.get("trial_start", now))
@@ -413,11 +514,10 @@ def predict_api():
             try: sess["bankroll"] = int(bankroll_in)
             except: pass
         if history:
-            sess["seq"] = parse_history(history)  # 覆蓋完整歷史
+            sess["seq"] = parse_history(history)  # 覆蓋
         seq = list(sess.get("seq", []))
         bankroll = int(sess.get("bankroll", 0) or 0)
     else:
-        # 未啟用 API 試用鎖或無 session 模式：stateless
         seq = parse_history(history)
         bankroll = int(bankroll_in or 0)
 
@@ -435,8 +535,7 @@ def predict_api():
     sug, edge, bet_pct, vote_conf = decide_bet_from_votes(p_avg, vote_counts, models_used)
 
     history_str = encode_history(seq)
-    text = fmt_line_reply(len(seq), p_avg, sug, edge, bankroll, bet_pct,
-                          vote_labels, vote_counts, models_used, None)
+    text = fmt_line_reply(len(seq), p_avg, sug, edge, bankroll, bet_pct, vote_labels, vote_counts, models_used, None)
 
     return jsonify({
         "history_str": history_str,
@@ -447,7 +546,7 @@ def predict_api():
         "bet_pct": float(bet_pct),
         "bet_amount": int(round(bankroll*bet_pct)) if bankroll and bet_pct>0 else 0,
         "votes": {"models_used": models_used, "莊": vote_counts.get("莊",0), "閒": vote_counts.get("閒",0), "和": vote_counts.get("和",0)},
-        "vote_summary": f"莊 {vote_counts.get('莊',0)}/{models_used}, 閒 {vote_counts.get('閒',0)}/{models_used}, 和 {vote_counts.get('和',0)}/{models_used}",
+        "vote_summary": vote_summary_text(vote_counts, models_used),
         "message": text
     })
 
@@ -505,7 +604,7 @@ def on_text(event):
     else:
         remain_min = None
 
-    # 系統指令：返回 / 結束分析
+    # 系統指令
     if text in ["返回", "undo", "回上一步"]:
         seq: List[int] = sess.get("seq", [])
         if seq:
