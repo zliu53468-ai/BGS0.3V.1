@@ -1,40 +1,16 @@
-# server.py — LiveBoot Baccarat AI (Regime-Aware + EMA Smoothing + RNN-First)
-# 功能總覽：
-# • 三模型：XGB / LGBM / RNN（可加權、可深度主導 DEEP_ONLY；各自溫度 TEMP_*）
-# • 特徵：6×20 大路 Local + 整盤 Global 融合；RNN 可吃整盤（MAX_RNN_LEN）
-# • 場況：neutral / streak(連莊) / chop(對敲) / banker(莊偏) / player(閒偏)
-#   → 依場況動態重配三模型權重 + 同向一致性門檻（不符可觀望或加門檻）
-# • 風控：Tie 夾限、票數/邊際雙門檻、震盪防護（交替/翻轉）、EMA 平滑(機率與下注比例)
-# • 線上回饋：使用者回報「結果 莊/閒/和」→ 動態抬降進場門檻
-# • LINE：30 分鐘試用鎖、開通密碼、返回/結束分析、Emoji 文案
-# • API：/predict（支援 session_key / action=undo|reset / activation_code / minimal JSON）、/health
-#
-# 【必要環境變數】
-# LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, ADMIN_ACTIVATION_SECRET
-#
-# 【常用環境變數（可選）】
-# TRIAL_MINUTES=30, ADMIN_CONTACT=@jins888, SHOW_REMAINING_TIME=1
-# USE_FULL_SHOE=1, LOCAL_WEIGHT=0.65, GLOBAL_WEIGHT=0.35
-# FEAT_WIN=40, GRID_ROWS=6, GRID_COLS=20, MAX_RNN_LEN=256
-# ENSEMBLE_WEIGHTS="xgb:0.2,lgb:0.2,rnn:0.6", TEMP_XGB=0.95, TEMP_LGB=0.95, TEMP_RNN=0.85
-# DEEP_ONLY=0, DISABLE_RNN=0, RNN_HIDDEN=32, TORCH_NUM_THREADS=1
-# ABSTAIN_EDGE=0.08, ABSTAIN_VOTES=2, MIN_EDGE=0.07, EDGE_ENTER=0.08
-# VOL_GUARD=1, ALT_WIN=24, VOL_ALT_BAND=0.08, VOL_ALT_BOOST=0.02, VOL_FLIP_TH=0.65, VOL_FLIP_BOOST=0.02
-# ONLINE_ADAPT=1, ONLINE_MIN_SAMPLES=10, ONLINE_ACC_LOW=0.45, ONLINE_ACC_HIGH=0.60,
-# EDGE_STEP_UP=0.02, EDGE_STEP_DOWN=0.005, EDGE_ADAPT_CAP=0.04
-# REGIME_CTRL=1, REG_WIN=32, REG_STREAK_TH=0.62, REG_CHOP_TH=0.62, REG_SIDE_BIAS=0.58
-# REG_WEIGHTS="0.20/0.20/0.60,0.10/0.10/0.80,0.30/0.30/0.40,0.15/0.15/0.70,0.15/0.15/0.70"
-# REG_ALIGN_EDGE_BONUS=0.01, REG_ALIGN_REQUIRE=1, REG_MISMATCH_EDGE_PENALTY=0.02
-# EMA_ENABLE=1, EMA_PROB_A=0.30, EMA_BET_A=0.20, SHOW_EMA_NOTE=1
-# API_TRIAL_ENFORCE=0, API_TRIAL_MINUTES=30, API_MINIMAL_JSON=0
-# CLIP_T_MIN=0.02, CLIP_T_MAX=0.12
+# server.py — LiveBoot Baccarat AI (Threshold-First + Short Reply + Emojis)
+# ✅ 以「進場門檻」為唯一下注標準；未達門檻一律不下注。
+# ✅ 簡短回覆＋表情符號；支援「觀望（偏⋯）」顯示。
+# ✅ 三模型融合（XGB/LGBM/RNN）、場況（regime）動態加權、震盪防護、EMA 平滑。
+# ✅ LINE：30 分鐘試用鎖、開通密碼、返回/結束分析。
+# ✅ API：/predict（支援 session_key / undo|reset / activation_code / minimal JSON）、健康檢查 /health
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
 
-# ===== App / Log =====
+# ====== 日誌 / App ======
 log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
@@ -45,95 +21,91 @@ def env_flag(name: str, default: int = 1) -> int:
     v = str(val).strip().lower()
     if v in ("1","true","t","yes","y","on"): return 1
     if v in ("0","false","f","no","n","off"): return 0
-    if v == "1/0": return 1
-    try:
-        return 1 if int(float(v)) != 0 else 0
-    except:
-        return 1 if default else 0
+    if v == "1/0": return 1   # 防手誤
+    try: return 1 if int(float(v)) != 0 else 0
+    except: return 1 if default else 0
 
-# ===== Base Config =====
+# ====== 基本設定 ======
 FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
-
 MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.07"))
-TEMP       = float(os.getenv("TEMP", "0.95"))
 CLIP_T_MIN = float(os.getenv("CLIP_T_MIN", "0.02"))
 CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.12"))
 SEED       = int(os.getenv("SEED", "42"))
 np.random.seed(SEED)
 
-# Local + Global 融合
+# 特徵融合
 USE_FULL_SHOE = env_flag("USE_FULL_SHOE", 1)
 LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.65"))
 GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.35"))
 MAX_RNN_LEN   = int(os.getenv("MAX_RNN_LEN", "256"))
 
-# 試用/開通
+# 試用 / 開通
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 SHOW_REMAINING_TIME = env_flag("SHOW_REMAINING_TIME", 1)
 
 # API 試用鎖
-API_TRIAL_ENFORCE  = env_flag("API_TRIAL_ENFORCE", 0)
-API_TRIAL_MINUTES  = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))
-API_MINIMAL_JSON   = env_flag("API_MINIMAL_JSON", 0)
+API_TRIAL_ENFORCE = env_flag("API_TRIAL_ENFORCE", 0)
+API_TRIAL_MINUTES = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))
+API_MINIMAL_JSON  = env_flag("API_MINIMAL_JSON", 0)
 
-# ===== Ensemble / 深度主導 & 溫度 =====
+# ====== 集成 / 深度 ======
 DEEP_ONLY   = int(os.getenv("DEEP_ONLY", "0"))
 DISABLE_RNN = int(os.getenv("DISABLE_RNN", "0"))
 RNN_HIDDEN  = int(os.getenv("RNN_HIDDEN", "32"))
-
 ENSEMBLE_WEIGHTS = os.getenv("ENSEMBLE_WEIGHTS", "xgb:0.2,lgb:0.2,rnn:0.6")
 TEMP_XGB = float(os.getenv("TEMP_XGB", "0.95"))
 TEMP_LGB = float(os.getenv("TEMP_LGB", "0.95"))
 TEMP_RNN = float(os.getenv("TEMP_RNN", "0.85"))
 
-# ===== 票數/邊際 =====
+# ====== 票數 / 邊際 / 進場門檻 ======
 ABSTAIN_EDGE  = float(os.getenv("ABSTAIN_EDGE", "0.08"))
 ABSTAIN_VOTES = int(os.getenv("ABSTAIN_VOTES", "2"))
-
-# ===== Volatility Guard（震盪防護）=====
-VOL_GUARD     = int(os.getenv("VOL_GUARD", "1"))
-ALT_WIN       = int(os.getenv("ALT_WIN", "24"))
-VOL_ALT_BAND  = float(os.getenv("VOL_ALT_BAND", "0.08"))
-VOL_ALT_BOOST = float(os.getenv("VOL_ALT_BOOST", "0.02"))
-VOL_FLIP_TH   = float(os.getenv("VOL_FLIP_TH", "0.65"))
-VOL_FLIP_BOOST= float(os.getenv("VOL_FLIP_BOOST", "0.02"))
 EDGE_ENTER    = float(os.getenv("EDGE_ENTER", "0.08"))
 
-# ===== Online feedback（線上動態門檻）=====
-ONLINE_ADAPT        = int(os.getenv("ONLINE_ADAPT", "1"))
-ONLINE_MIN_SAMPLES  = int(os.getenv("ONLINE_MIN_SAMPLES", "10"))
-ONLINE_ACC_LOW      = float(os.getenv("ONLINE_ACC_LOW", "0.45"))
-ONLINE_ACC_HIGH     = float(os.getenv("ONLINE_ACC_HIGH", "0.60"))
-EDGE_STEP_UP        = float(os.getenv("EDGE_STEP_UP", "0.02"))
-EDGE_STEP_DOWN      = float(os.getenv("EDGE_STEP_DOWN", "0.005"))
-EDGE_ADAPT_CAP      = float(os.getenv("EDGE_ADAPT_CAP", "0.04"))
+# ====== 震盪防護 ======
+VOL_GUARD      = int(os.getenv("VOL_GUARD", "1"))
+ALT_WIN        = int(os.getenv("ALT_WIN", "24"))
+VOL_ALT_BAND   = float(os.getenv("VOL_ALT_BAND", "0.08"))
+VOL_ALT_BOOST  = float(os.getenv("VOL_ALT_BOOST", "0.02"))
+VOL_FLIP_TH    = float(os.getenv("VOL_FLIP_TH", "0.65"))
+VOL_FLIP_BOOST = float(os.getenv("VOL_FLIP_BOOST", "0.02"))
 
-# ===== Regime Controller（場況）=====
+# ====== 線上回饋（自適應門檻） ======
+ONLINE_ADAPT       = int(os.getenv("ONLINE_ADAPT", "1"))
+ONLINE_MIN_SAMPLES = int(os.getenv("ONLINE_MIN_SAMPLES", "10"))
+ONLINE_ACC_LOW     = float(os.getenv("ONLINE_ACC_LOW", "0.45"))
+ONLINE_ACC_HIGH    = float(os.getenv("ONLINE_ACC_HIGH", "0.60"))
+EDGE_STEP_UP       = float(os.getenv("EDGE_STEP_UP", "0.02"))
+EDGE_STEP_DOWN     = float(os.getenv("EDGE_STEP_DOWN", "0.005"))
+EDGE_ADAPT_CAP     = float(os.getenv("EDGE_ADAPT_CAP", "0.04"))
+
+# ====== 場況（Regime） ======
 REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))
 REG_WIN       = int(os.getenv("REG_WIN", "32"))
 REG_STREAK_TH = float(os.getenv("REG_STREAK_TH", "0.62"))
 REG_CHOP_TH   = float(os.getenv("REG_CHOP_TH", "0.62"))
 REG_SIDE_BIAS = float(os.getenv("REG_SIDE_BIAS", "0.58"))
-# neutral, streak, chop, banker, player → 每組 "xgb/lgb/rnn"
-REG_WEIGHTS = os.getenv(
-    "REG_WEIGHTS",
-    "0.20/0.20/0.60,0.10/0.10/0.80,0.30/0.30/0.40,0.15/0.15/0.70,0.15/0.15/0.70"
-)
-REG_ALIGN_EDGE_BONUS     = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))  # 同向→降低進場門檻
-REG_ALIGN_REQUIRE        = int(os.getenv("REG_ALIGN_REQUIRE", "1"))          # 1=不符則觀望
-REG_MISMATCH_EDGE_PENALTY= float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))  # 不同向時加門檻
+REG_WEIGHTS   = os.getenv("REG_WEIGHTS",
+    "0.20/0.20/0.60,0.10/0.10/0.80,0.30/0.30/0.40,0.15/0.15/0.70,0.15/0.15/0.70")
+REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
+REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
+REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
 
-# ===== EMA 平滑 =====
-EMA_ENABLE   = int(os.getenv("EMA_ENABLE", "1"))
-EMA_PROB_A   = float(os.getenv("EMA_PROB_A", "0.30"))
-EMA_BET_A    = float(os.getenv("EMA_BET_A", "0.20"))
-SHOW_EMA_NOTE= int(os.getenv("SHOW_EMA_NOTE", "1"))
+# ====== EMA 平滑 ======
+EMA_ENABLE    = int(os.getenv("EMA_ENABLE", "1"))
+EMA_PROB_A    = float(os.getenv("EMA_PROB_A", "0.30"))
+EMA_BET_A     = float(os.getenv("EMA_BET_A", "0.20"))
+SHOW_EMA_NOTE = int(os.getenv("SHOW_EMA_NOTE", "1"))
 
-# ===== LINE SDK =====
+# ====== 未達門檻的顯示行為 ======
+SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))   # 觀望時顯示「偏⋯」
+FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))  # 未達門檻也顯示方向但下注=0
+
+# ====== LINE SDK ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -150,38 +122,33 @@ except Exception as e:
     line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
 
-# ===== Sessions =====
-SESS: Dict[str, Dict[str, object]] = {}      # for LINE
-SESS_API: Dict[str, Dict[str, object]] = {}  # for /predict
+# ====== Sessions ======
+SESS: Dict[str, Dict[str, object]] = {}      # LINE
+SESS_API: Dict[str, Dict[str, object]] = {}  # API
 
-# ===== Models (lazy) =====
+# ====== 模型載入 ======
 XGB_MODEL = None
 LGB_MODEL = None
 RNN_MODEL = None
 
 def _load_xgb():
     global XGB_MODEL
-    if DEEP_ONLY == 1:
-        log.info("[MODEL] DEEP_ONLY=1 → skip XGB")
-        return
+    if DEEP_ONLY == 1: return
     try:
         import xgboost as xgb, os
-        path = os.getenv("XGB_OUT_PATH", "/data/models/xgb.json")
+        path = os.getenv("XGB_OUT_PATH", "data/models/xgb.json")
         if os.path.exists(path):
             booster = xgb.Booster(); booster.load_model(path)
-            XGB_MODEL = booster
-            log.info("[MODEL] XGB loaded: %s", path)
+            XGB_MODEL = booster; log.info("[MODEL] XGB loaded: %s", path)
     except Exception as e:
         log.warning("[MODEL] XGB load failed: %s", e)
 
 def _load_lgb():
     global LGB_MODEL
-    if DEEP_ONLY == 1:
-        log.info("[MODEL] DEEP_ONLY=1 → skip LGBM")
-        return
+    if DEEP_ONLY == 1: return
     try:
         import lightgbm as lgb, os
-        path = os.getenv("LGBM_OUT_PATH", "/data/models/lgbm.txt")
+        path = os.getenv("LGBM_OUT_PATH", "data/models/lgbm.txt")
         if os.path.exists(path):
             LGB_MODEL = lgb.Booster(model_file=path)
             log.info("[MODEL] LGBM loaded: %s", path)
@@ -190,26 +157,26 @@ def _load_lgb():
 
 def _load_rnn():
     global RNN_MODEL
-    if DISABLE_RNN == 1:
-        log.info("[MODEL] DISABLE_RNN=1 → skip RNN")
+    if DISABLE_RNN == 1: 
+        log.info("[MODEL] RNN disabled by env")
         return
     try:
         import torch
         import torch.nn as nn
         torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS","1")))
         class TinyRNN(nn.Module):
-            def __init__(self, in_dim=3, hid=RNN_HIDDEN, out_dim=3):
+            def __init__(self, in_dim=3, hid=int(os.getenv("RNN_HIDDEN","32")), out_dim=3):
                 super().__init__()
                 self.gru = nn.GRU(input_size=in_dim, hidden_size=hid, num_layers=1, batch_first=True)
                 self.fc  = nn.Linear(hid, out_dim)
             def forward(self, x):
-                o,_ = self.gru(x); return self.fc(o[:, -1, :])
-        path = os.getenv("RNN_OUT_PATH", "/data/models/rnn.pt")
+                o,_ = self.gru(x); return self.fc(o[:,-1,:])
+        path = os.getenv("RNN_OUT_PATH", "data/models/rnn.pt")
         if os.path.exists(path):
             RNN_MODEL = TinyRNN()
             state = __import__("torch").load(path, map_location="cpu")
             RNN_MODEL.load_state_dict(state); RNN_MODEL.eval()
-            log.info("[MODEL] RNN loaded: %s (hidden=%s)", path, RNN_HIDDEN)
+            log.info("[MODEL] RNN loaded: %s", path)
         else:
             log.warning("[MODEL] RNN file not found at %s", path)
     except Exception as e:
@@ -217,8 +184,8 @@ def _load_rnn():
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
-# ===== Big Road & Features =====
-MAP = {"B":0, "P":1, "T":2}
+# ====== 牌路處理 ======
+MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"B", 1:"P", 2:"T"}
 
 def parse_history(s: str) -> List[int]:
@@ -238,33 +205,32 @@ def encode_history(seq: List[int]) -> str:
 def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
     grid_sign = np.zeros((rows, cols), dtype=np.int8)
     grid_ties = np.zeros((rows, cols), dtype=np.int16)
-    r = 0; c = 0; last_bp = None
+    r=c=0; last_bp=None
     for v in seq:
-        if v == 2:
-            if 0 <= r < rows and 0 <= c < cols: grid_ties[r, c] += 1
+        if v==2:
+            if 0<=r<rows and 0<=c<cols: grid_ties[r,c]+=1
             continue
-        cur_bp = +1 if v==0 else -1
+        cur = +1 if v==0 else -1
         if last_bp is None:
-            r,c=0,0; grid_sign[r,c]=cur_bp; last_bp=cur_bp; continue
-        if cur_bp == last_bp:
+            r=c=0; grid_sign[r,c]=cur; last_bp=cur; continue
+        if cur==last_bp:
             nr=r+1; nc=c
-            if nr>=rows or grid_sign[nr,nc]!=0:
-                nr=r; nc=c+1
-            r,c=nr,nc
-            if 0<=r<rows and 0<=c<cols: grid_sign[r,c]=cur_bp
+            if nr>=rows or grid_sign[nr,nc]!=0: nr=r; nc=c+1
+            r,c=nr,nc; 
+            if 0<=r<rows and 0<=c<cols: grid_sign[r,c]=cur
         else:
-            c=c+1; r=0; last_bp=cur_bp
-            if c<cols: grid_sign[r,c]=cur_bp
+            c=c+1; r=0; last_bp=cur
+            if c<cols: grid_sign[r,c]=cur
     return grid_sign, grid_ties, (r,c)
 
 def _global_aggregates(seq: List[int]) -> np.ndarray:
-    n = len(seq)
-    if n == 0:
-        return np.array([0.49,0.49,0.02, 0.5,0.5, 0.0,0.0,0.0,0.0, 0.5,0.5,0.5,0.5, 0.0], dtype=np.float32)
-    arr = np.array(seq, dtype=np.int16)
-    cnt = np.bincount(arr, minlength=3).astype(np.float32); freq = cnt / n
-    bp = arr[arr != 2]
-    altern = 0.5 if len(bp)<2 else float(np.mean(bp[1:] != bp[:-1]))
+    n=len(seq)
+    if n==0:
+        return np.array([0.49,0.49,0.02, 0.5,0.5, 0,0,0,0, 0.5,0.5,0.5,0.5, 0.0], dtype=np.float32)
+    arr=np.array(seq, dtype=np.int16)
+    cnt=np.bincount(arr, minlength=3).astype(np.float32); freq=cnt/n
+    bp=arr[arr!=2]
+    altern=0.5 if len(bp)<2 else float(np.mean(bp[1:]!=bp[:-1]))
     def run_stats(side):
         x=(bp==side).astype(np.int8)
         if x.size==0: return 0.0,0.0
@@ -279,29 +245,22 @@ def _global_aggregates(seq: List[int]) -> np.ndarray:
     b_mean,b_var = run_stats(0); p_mean,p_var = run_stats(1)
     b2b=p2p=b2p=p2b=0; cb=cp=0
     for i in range(len(bp)-1):
-        a,b = bp[i], bp[i+1]
-        if a==0:
-            cb+=1; b2b+=(b==0); b2p+=(b==1)
-        else:
-            cp+=1; p2p+=(b==1); p2b+=(b==0)
+        a,b=bp[i], bp[i+1]
+        if a==0: cb+=1; b2b+=(b==0); b2p+=(b==1)
+        else:    cp+=1; p2p+=(b==1); p2b+=(b==0)
     B2B=(b2b/cb) if cb>0 else 0.5
     P2P=(p2p/cp) if cp>0 else 0.5
     B2P=(b2p/cb) if cb>0 else 0.5
     P2B=(p2b/cp) if cp>0 else 0.5
     tie_rate=float((arr==2).mean())
-    return np.array([
-        float(freq[0]), float(freq[1]), float(freq[2]),
-        float(altern), float(1.0-altern),
-        float(b_mean), float(b_var), float(p_mean), float(p_var),
-        float(B2B), float(P2P), float(B2P), float(P2B),
-        float(tie_rate)
-    ], dtype=np.float32)
+    return np.array([freq[0],freq[1],freq[2], altern,1.0-altern,
+                     b_mean,b_var,p_mean,p_var, B2B,P2P,B2P,P2B, tie_rate], dtype=np.float32)
 
 def _local_bigroad_feat(seq: List[int], rows:int, cols:int, win:int) -> np.ndarray:
     sub = seq[-win:] if len(seq)>win else seq[:]
     gs, gt, (r,c) = big_road_grid(sub, rows, cols)
     grid_sign_flat = gs.flatten().astype(np.float32)
-    grid_tie_flat  = np.clip(gt.flatten(), 0, 3).astype(np.float32) / 3.0
+    grid_tie_flat  = np.clip(gt.flatten(),0,3).astype(np.float32)/3.0
     bp_only=[x for x in sub if x in (0,1)]
     streak_len=0; streak_side=0.0
     if bp_only:
@@ -320,13 +279,11 @@ def _local_bigroad_feat(seq: List[int], rows:int, cols:int, win:int) -> np.ndarr
     cur_col_height=float((gs[:,c]!=0).sum())/rows if 0<=c<cols else 0.0
     cur_col_side=float(gs[0,c]) if 0<=c<cols else 0.0
     cnt=np.bincount(sub, minlength=3).astype(np.float32); freq=cnt/max(1,len(sub))
-    return np.concatenate([
-        grid_sign_flat, grid_tie_flat,
-        np.array([streak_len/rows, streak_side], dtype=np.float32),
-        col_heights,
-        np.array([cur_col_height, cur_col_side], dtype=np.float32),
-        freq
-    ], axis=0)
+    return np.concatenate([grid_sign_flat, grid_tie_flat,
+                           np.array([streak_len/rows, streak_side], dtype=np.float32),
+                           col_heights,
+                           np.array([cur_col_height, cur_col_side], dtype=np.float32),
+                           freq], axis=0)
 
 def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
     local=_local_bigroad_feat(seq, rows, cols, win).astype(np.float32)
@@ -334,28 +291,28 @@ def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np
         glob=_global_aggregates(seq).astype(np.float32)
         lw=max(0.0, LOCAL_WEIGHT); gw=max(0.0, GLOBAL_WEIGHT); s=lw+gw
         if s==0: lw,gw=1.0,0.0
-        else:    lw,gw=lw/s,gw/s
+        else: lw,gw=lw/s,gw/s
         return np.concatenate([local*lw, glob*gw], axis=0).astype(np.float32)
     else:
         return local
 
 def one_hot_seq(seq: List[int], win:int) -> np.ndarray:
     if USE_FULL_SHOE:
-        sub = seq[-MAX_RNN_LEN:] if len(seq) > MAX_RNN_LEN else seq[:]
-        L = len(sub); oh = np.zeros((1, L, 3), dtype=np.float32)
-        for i, v in enumerate(sub):
-            if v in (0,1,2): oh[0, i, v] = 1.0
+        sub = seq[-MAX_RNN_LEN:] if len(seq)>MAX_RNN_LEN else seq[:]
+        L=len(sub); oh=np.zeros((1,L,3), dtype=np.float32)
+        for i,v in enumerate(sub):
+            if v in (0,1,2): oh[0,i,v]=1.0
         return oh
     else:
         sub = seq[-win:] if len(seq)>win else seq[:]
         pad = [-1]*max(0, win-len(sub))
-        final = (pad+sub)[-win:]
+        final=(pad+sub)[-win:]
         oh=[]
         for v in final:
             a=[0,0,0]
             if v in (0,1,2): a[v]=1
             oh.append(a)
-        return np.array(oh, dtype=np.float32)[np.newaxis, :, :]
+        return np.array(oh, dtype=np.float32)[np.newaxis,:,:]
 
 def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     x = np.log(np.clip(p,1e-9,None)) / max(1e-9, temp)
@@ -363,62 +320,50 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
-# ===== Regime 判斷 & 權重 =====
+# ====== Regime ======
 def _regime_detect(seq: List[int]) -> Tuple[str, Optional[str]]:
-    """回傳 (regime, preferred_label)；preferred_label in {'莊','閒',None}"""
-    if not REGIME_CTRL or len(seq) < 8:
-        return "neutral", None
-    bp = [v for v in seq[-REG_WIN:] if v in (0,1)]
-    if len(bp) < 6:
-        return "neutral", None
-    arr = np.array(bp, dtype=np.int8)
-    diffs = arr[1:] != arr[:-1]
-    chop_ratio = float(diffs.mean())
-    same_ratio = 1.0 - chop_ratio
-    b_rate = float((arr==0).mean())
-    p_rate = 1.0 - b_rate
-
+    if not REGIME_CTRL or len(seq) < 8: return "neutral", None
+    bp=[v for v in seq[-REG_WIN:] if v in (0,1)]
+    if len(bp)<6: return "neutral", None
+    arr=np.array(bp, dtype=np.int8)
+    dif = arr[1:] != arr[:-1]
+    chop_ratio=float(dif.mean())
+    same_ratio=1.0 - chop_ratio
+    b_rate=float((arr==0).mean()); p_rate=1.0-b_rate
     if same_ratio >= REG_STREAK_TH:
-        last = arr[-1]
-        return "streak", ("莊" if last==0 else "閒")
+        last=arr[-1]; return "streak", ("莊" if last==0 else "閒")
     if chop_ratio >= REG_CHOP_TH:
-        last = arr[-1]
-        return "chop", ("閒" if last==0 else "莊")
-    if b_rate >= REG_SIDE_BIAS:
-        return "banker", "莊"
-    if p_rate >= REG_SIDE_BIAS:
-        return "player", "閒"
+        last=arr[-1]; return "chop", ("閒" if last==0 else "莊")
+    if b_rate >= REG_SIDE_BIAS: return "banker", "莊"
+    if p_rate >= REG_SIDE_BIAS: return "player", "閒"
     return "neutral", None
 
 def _parse_triplets(spec: str) -> Dict[str, Tuple[float,float,float]]:
-    parts = [s.strip() for s in (spec or "").split(",")]
-    pads = ["0.20/0.20/0.60","0.10/0.10/0.80","0.30/0.30/0.40","0.15/0.15/0.70","0.15/0.15/0.70"]
-    while len(parts) < 5: parts.append(pads[len(parts)])
+    parts=[s.strip() for s in (spec or "").split(",")]
+    pads=["0.20/0.20/0.60","0.10/0.10/0.80","0.30/0.30/0.40","0.15/0.15/0.70","0.15/0.15/0.70"]
+    while len(parts)<5: parts.append(pads[len(parts)])
     def one(tri:str):
         try:
-            x,y,z = [max(0.0, float(v)) for v in tri.split("/")]
-            s = x+y+z
-            return (x/s, y/s, z/s) if s>0 else (1/3,1/3,1/3)
-        except:
-            return (1/3,1/3,1/3)
-    t = list(map(one, parts[:5]))
+            x,y,z=[max(0.0, float(v)) for v in tri.split("/")]
+            s=x+y+z; return (x/s,y/s,z/s) if s>0 else (1/3,1/3,1/3)
+        except: return (1/3,1/3,1/3)
+    t=list(map(one, parts[:5]))
     return {"neutral":t[0], "streak":t[1], "chop":t[2], "banker":t[3], "player":t[4]}
 
 REG_TRIPLE = _parse_triplets(REG_WEIGHTS)
 
-# ===== Models → prob =====
+# ====== 模型預測 ======
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
     import xgboost as xgb
-    feat = big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).astype(np.float32)
-    d = xgb.DMatrix(feat.reshape(1,-1))
-    p = XGB_MODEL.predict(d)[0]
+    feat=big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).reshape(1,-1)
+    p=XGB_MODEL.predict(xgb.DMatrix(feat))[0]
     return np.array(p, dtype=np.float32)
 
 def lgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if LGB_MODEL is None: return None
-    feat = big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).astype(np.float32).reshape(1,-1)
-    p = LGB_MODEL.predict(feat)[0]
+    feat=big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).reshape(1,-1)
+    p=LGB_MODEL.predict(feat)[0]
     return np.array(p, dtype=np.float32)
 
 def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
@@ -427,11 +372,11 @@ def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
         import torch
     except Exception:
         return None
-    x = one_hot_seq(seq, FEAT_WIN)
-    with torch.no_grad():
-        logits = RNN_MODEL(torch.from_numpy(x))
+    x=one_hot_seq(seq, FEAT_WIN)
+    with __import__("torch").no_grad():
+        logits=RNN_MODEL(__import__("torch").from_numpy(x))
         logits = logits / max(1e-6, TEMP_RNN)
-        p = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+        p = __import__("torch").softmax(logits, dim=-1).cpu().numpy()[0]
     return p.astype(np.float32)
 
 def _parse_weights(spec: str) -> Dict[str, float]:
@@ -442,9 +387,9 @@ def _parse_weights(spec: str) -> Dict[str, float]:
             if ":" in part:
                 k,v=part.split(":",1)
                 k=k.strip().lower(); v=float(v)
-                if k=="xgb":  tmp["XGB"]=v
-                if k=="lgb":  tmp["LGBM"]=v
-                if k=="rnn":  tmp["RNN"]=v
+                if k=="xgb": tmp["XGB"]=v
+                if k=="lgb": tmp["LGBM"]=v
+                if k=="rnn": tmp["RNN"]=v
         if tmp:
             s=sum(max(0.0,x) for x in tmp.values()) or 1.0
             for k in tmp: tmp[k]=max(0.0,tmp[k])/s
@@ -453,18 +398,16 @@ def _parse_weights(spec: str) -> Dict[str, float]:
     return out
 
 def heuristic_probs(seq: List[int]) -> Tuple[np.ndarray, str]:
-    if not seq:
-        return np.array([0.49,0.49,0.02], dtype=np.float32), "prior"
-    sub = seq[-FEAT_WIN:] if len(seq)>FEAT_WIN else seq
-    cnt = np.bincount(sub, minlength=3).astype(np.float32)
-    freq = cnt / max(1,len(sub))
-    p0 = 0.90*freq + 0.10*np.array([0.49,0.49,0.02], dtype=np.float32)
-    p0[2] = np.clip(p0[2], CLIP_T_MIN, CLIP_T_MAX)
-    p0 = np.clip(p0,1e-6,None); p0 = p0/p0.sum()
+    if not seq: return np.array([0.49,0.49,0.02], dtype=np.float32), "prior"
+    sub=seq[-FEAT_WIN:] if len(seq)>FEAT_WIN else seq
+    cnt=np.bincount(sub, minlength=3).astype(np.float32)
+    freq=cnt/max(1,len(sub))
+    p0=0.90*freq + 0.10*np.array([0.49,0.49,0.02], dtype=np.float32)
+    p0[2]=np.clip(p0[2], CLIP_T_MIN, CLIP_T_MAX)
+    p0=np.clip(p0,1e-6,None); p0=p0/p0.sum()
     return p0, "heuristic"
 
 def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[str,int], Tuple[str,Optional[str]]]:
-    """回傳：平均機率、各模投票標籤、投票數、(regime, preferred_label)"""
     weights_global=_parse_weights(ENSEMBLE_WEIGHTS)
     preds=[]; names=[]; vote_labels={}; vote_counts={'莊':0,'閒':0,'和':0}
     label_map=["莊","閒","和"]
@@ -481,43 +424,39 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
 
     pr = rnn_probs(seq)
     if pr is not None:
-        p = softmax_log(pr, 1.0)  # TEMP_RNN 已用於 logits
-        preds.append(p); names.append("RNN")
+        p = softmax_log(pr, 1.0); preds.append(p); names.append("RNN")
         vote_labels['RNN']=label_map[int(pr.argmax())]; vote_counts[vote_labels['RNN']]+=1
 
     regime, prefer = _regime_detect(seq)
 
     if not preds:
-        ph, _ = heuristic_probs(seq)
+        ph,_ = heuristic_probs(seq)
         return ph, {}, {'莊':0,'閒':0,'和':0}, (regime, prefer)
 
-    # 場況權重
-    rx, rl, rr = REG_TRIPLE.get(regime, REG_TRIPLE["neutral"])
-    regime_w = {"XGB":rx, "LGBM":rl, "RNN":rr}
-
-    # 實際加權 = (global) * (regime) 逐模型相乘再正規化
-    raw_w=[]
+    rx, rl, rr = _parse_triplets(REG_WEIGHTS).get(regime, (0.33,0.33,0.34))
+    regime_w={"XGB":rx,"LGBM":rl,"RNN":rr}
+    raw=[]
     for n in names:
-        raw_w.append(max(0.0, weights_global.get(n,0.0)) * max(0.0, regime_w.get(n,0.0)))
-    W=np.array(raw_w, dtype=np.float32)
+        raw.append(max(0.0, weights_global.get(n,0.0)) * max(0.0, regime_w.get(n,0.0)))
+    W=np.array(raw, dtype=np.float32)
     if W.sum()<=0: W=np.ones_like(W)/len(W)
     W=W/W.sum()
 
     P=np.stack(preds, axis=0).astype(np.float32)
     p_avg=(P*W[:,None]).sum(axis=0)
     p_avg[2]=np.clip(p_avg[2], CLIP_T_MIN, CLIP_T_MAX)
-    p_avg=np.clip(p_avg, 1e-6, None); p_avg=p_avg/p_avg.sum()
+    p_avg=np.clip(p_avg,1e-6,None); p_avg=p_avg/p_avg.sum()
+
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
-# ===== Volatility / Decision / EMA =====
+# ====== 震盪度 & 門檻 / EMA ======
 def _alt_flip_metrics(seq: List[int], win: int = 24) -> Tuple[float, float]:
     if not seq: return 0.5, 0.5
-    sub = [x for x in seq[-win:] if x in (0,1)]
-    if len(sub) <= 1: return 0.5, 0.5
-    diffs = np.array(sub[1:]) != np.array(sub[:-1])
-    flip_ratio = float(diffs.mean())
-    alternation = flip_ratio
-    return alternation, flip_ratio
+    sub=[x for x in seq[-win:] if x in (0,1)]
+    if len(sub)<=1: return 0.5,0.5
+    dif=np.array(sub[1:])!=np.array(sub[:-1])
+    flip_ratio=float(dif.mean())
+    return flip_ratio, flip_ratio
 
 def edge_to_base_pct(edge: float) -> float:
     if edge >= max(0.10, MIN_EDGE+0.02): return 0.30
@@ -527,35 +466,30 @@ def edge_to_base_pct(edge: float) -> float:
 
 def _online_edge_boost(sess: Optional[Dict[str,object]]) -> float:
     if not ONLINE_ADAPT or not sess: return 0.0
-    stat = sess.get("perf", {"ok":0,"ng":0,"boost":0.0})
-    ok, ng = int(stat.get("ok",0)), int(stat.get("ng",0))
-    n = ok + ng
+    stat=sess.get("perf", {"ok":0,"ng":0,"boost":0.0})
+    ok,ng=int(stat.get("ok",0)), int(stat.get("ng",0))
+    n=ok+ng
     if n < ONLINE_MIN_SAMPLES: return float(stat.get("boost",0.0))
     acc = ok / max(1,n)
-    boost = float(stat.get("boost",0.0))
-    if acc < ONLINE_ACC_LOW:
-        boost = min(EDGE_ADAPT_CAP, boost + EDGE_STEP_UP)
-    elif acc >= ONLINE_ACC_HIGH and boost > 0.0:
-        boost = max(0.0, boost - EDGE_STEP_DOWN)
-    stat["boost"]=boost
-    sess["perf"]=stat
+    boost=float(stat.get("boost",0.0))
+    if acc < ONLINE_ACC_LOW: boost=min(EDGE_ADAPT_CAP, boost+EDGE_STEP_UP)
+    elif acc >= ONLINE_ACC_HIGH and boost>0: boost=max(0.0, boost-EDGE_STEP_DOWN)
+    stat["boost"]=boost; sess["perf"]=stat
     return boost
 
 def _ema_update(prev: Optional[np.ndarray], x: np.ndarray, a: float) -> np.ndarray:
-    if prev is None: 
-        return x.astype(np.float32)
-    return (1.0 - a) * prev.astype(np.float32) + a * x.astype(np.float32)
+    if prev is None: return x.astype(np.float32)
+    return (1.0-a)*prev.astype(np.float32) + a*x.astype(np.float32)
 
 def _ema_scalar(prev: Optional[float], x: float, a: float) -> float:
-    if prev is None: 
-        return float(x)
-    return float((1.0 - a) * float(prev) + a * float(x))
+    if prev is None: return float(x)
+    return float((1.0-a)*float(prev) + a*float(x))
 
 def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
                           seq: Optional[List[int]] = None, sess: Optional[Dict[str,object]] = None,
                           regime_info: Tuple[str,Optional[str]]=("neutral", None)) -> Tuple[str,float,float,float,str]:
     regime, prefer = regime_info
-    arr = [(float(p[0]),"莊"), (float(p[1]),"閒"), (float(p[2]),"和")]
+    arr=[(float(p[0]),"莊"), (float(p[1]),"閒"), (float(p[2]),"和")]
     arr.sort(reverse=True, key=lambda x: x[0])
     (p1, lab1), (p2, _) = arr[0], arr[1]
     edge = p1 - p2
@@ -565,98 +499,81 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
 
     # 票數門檻
     if models_used>0 and max_votes < ABSTAIN_VOTES:
-        return "觀望", edge, 0.0, vote_conf, f"🟡 票數不足：{max_votes}/{models_used}"
+        return "觀望（票少）", edge, 0.0, vote_conf, ""
 
-    # Tie 避免
-    if lab1 == "和" and p[2] < max(0.05, CLIP_T_MIN + 0.01):
-        return "觀望", edge, 0.0, vote_conf, ""
+    # Tie 低機率時避免
+    if lab1=="和" and p[2] < max(0.05, CLIP_T_MIN+0.01):
+        return "觀望（避和）", edge, 0.0, vote_conf, ""
 
-    # 進場門檻：基礎 + 場況一致性 + 震盪 + 線上回饋
+    # 進場門檻組合：基礎 + 場況一致性 + 震盪 + 線上回饋
     vol_note=""; enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
-
-    # 場況一致性
     if REGIME_CTRL and prefer in ("莊","閒"):
         if lab1 == prefer:
-            enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)  # 同向→放寬
+            enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
         else:
             if REG_ALIGN_REQUIRE == 1:
-                return "觀望", edge, 0.0, vote_conf, f"🟠 場況({regime})不符：偏{prefer}"
+                return "觀望（逆場況）", edge, 0.0, vote_conf, f"場況：{regime}→{prefer}"
             else:
                 enter_th += REG_MISMATCH_EDGE_PENALTY
 
-    # 震盪防護
     if VOL_GUARD and seq is not None:
         alt, flip = _alt_flip_metrics(seq, ALT_WIN)
-        if abs(alt-0.5) < VOL_ALT_BAND:
-            enter_th += VOL_ALT_BOOST; vol_note += f"交替≈{alt:.2f}+{VOL_ALT_BOOST:.2f}；"
-        if flip >= VOL_FLIP_TH:
-            enter_th += VOL_FLIP_BOOST; vol_note += f"翻轉{flip:.2f}+{VOL_FLIP_BOOST:.2f}；"
+        if abs(alt-0.5) < VOL_ALT_BAND: enter_th += VOL_ALT_BOOST
+        if flip >= VOL_FLIP_TH:          enter_th += VOL_FLIP_BOOST
 
-    # 線上回饋
-    boost = _online_edge_boost(sess)
-    enter_th += boost
-    if vol_note or boost>0 or (REGIME_CTRL and prefer):
-        reg_note = f"場況：{regime}{'→'+prefer if prefer else ''}"
-        extra = []
-        if vol_note: extra.append(vol_note.rstrip("；"))
-        if boost>0: extra.append(f"回饋+{round(boost,3)}")
-        note = "；".join(x for x in extra if x)
-        vol_note = f"⚙️ 門檻 {enter_th:.3f}（{reg_note}{'；'+note if note else ''}）"
+    boost = _online_edge_boost(sess); enter_th += boost
+    vol_note = f"門檻{enter_th:.3f}"
 
+    # —— 未達門檻：不下注，但可顯示偏向 ——
     if edge < enter_th:
+        bias_tag = {"莊":"莊","閒":"閒","和":"和"}.get(lab1, "")
+        if FORCE_DIRECTION_WHEN_UNDEREDGE:
+            return lab1, edge, 0.0, vote_conf, vol_note + "（未達）"
+        if SHOW_BIAS_ON_ABSTAIN and bias_tag:
+            return f"觀望（偏{bias_tag}）", edge, 0.0, vote_conf, vol_note
         return "觀望", edge, 0.0, vote_conf, vol_note
 
+    # —— 達門檻：下注 ——
     base_pct = edge_to_base_pct(edge)
     if base_pct == 0.0:
         return "觀望", edge, 0.0, vote_conf, vol_note
-
-    # 配注：隨投票共識縮放
     scale = 0.5 + 0.5*vote_conf
-    bet_pct = base_pct * scale
-    bet_pct = float(np.clip(bet_pct, 0.05 if base_pct>0 else 0.0, 0.30))
+    bet_pct = float(np.clip(base_pct * scale, 0.05, 0.30))
     return lab1, edge, bet_pct, vote_conf, vol_note
 
 def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
-    return f"莊 {vote_counts.get('莊',0)}/{models_used}, 閒 {vote_counts.get('閒',0)}/{models_used}, 和 {vote_counts.get('和',0)}/{models_used}"
+    return f"{vote_counts.get('莊',0)}/{models_used}·{vote_counts.get('閒',0)}/{models_used}·{vote_counts.get('和',0)}/{models_used}"
 
-# ===== 文案 =====
+# ====== 簡短文案（含 Emoji）======
 def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    bankroll:int, bet_pct:float, vote_labels:Dict[str,str],
                    vote_counts:Dict[str,int], models_used:int, remain_min:Optional[int],
-                   vol_note:Optional[str]=None) -> str:
+                   vol_note:Optional[str]=None, regime_info:Tuple[str,Optional[str]]=("neutral",None)) -> str:
     b, pl, t = p[0], p[1], p[2]
-    lines = []
-    lines.append(f"📊 已解析 {n_hand} 手")
-    lines.append(f"📈 平均機率：莊 {b:.3f}｜閒 {pl:.3f}｜和 {t:.3f}")
-    if SHOW_EMA_NOTE and EMA_ENABLE:
-        lines.append(f"🔧 已套用移動平均（αp={EMA_PROB_A:.2f}，αbet={EMA_BET_A:.2f}）")
-    if models_used>0:
-        vline = f"🗳️ 投票（{models_used} 模型）：{vote_summary_text(vote_counts, models_used)}"
-        who = []
-        for k in ["XGB","LGBM","RNN"]:
-            if k in vote_labels: who.append(f"{k}→{vote_labels[k]}")
-        if who: vline += "｜" + "，".join(who)
-        lines.append(vline)
-    lines.append(f"🧩 特徵權重：Local {int(LOCAL_WEIGHT*100)}% / Global {int(GLOBAL_WEIGHT*100)}%")
-    badge = "🎯" if sug != "觀望" else "🟡"
-    lines.append(f"👉 下一手建議：{sug} {badge}（邊際 {edge:.3f}）")
-    if vol_note: lines.append(vol_note)
-    if bankroll and bet_pct>0:
+    regime, prefer = regime_info
+    # 第一行：建議 + 邊際 + 金額/比例
+    if bet_pct > 0 and bankroll:
         bet_amt = int(round(bankroll * bet_pct))
-        lines.append(f"💵 本金：{bankroll:,}")
-        lines.append(f"✅ 建議下注：{bet_amt:,} ＝ {bankroll:,} × {bet_pct*100:.1f}%")
-        lines.append(f"🧮 10%={int(round(bankroll*0.10)):,}｜20%={int(round(bankroll*0.20)):,}｜30%={int(round(bankroll*0.30)):,}")
-    if remain_min is not None and SHOW_REMAINING_TIME:
-        lines.append(f"⏳ 試用剩餘：約 {max(0, remain_min)} 分鐘")
-    lines.append("📝 操作：輸入莊/閒/和（或 B/P/T）；『開始分析』；『返回』撤回；『結束分析』清空；『結果 莊/閒/和』回報上一手實盤。")
+        head = f"👉 {sug} 🎯 邊際 {edge:.3f}｜💰{bet_amt:,}（{bet_pct*100:.1f}%）"
+    else:
+        head = f"👉 {sug} 🟡 邊際 {edge:.3f}"
+    # 第二行：機率簡報
+    probs = f"📊 機率 B {b:.2f}｜P {pl:.2f}｜T {t:.2f}"
+    # 第三行：場況＋票數（極簡）
+    votes = f"🗳️ 票 {vote_summary_text(vote_counts, models_used)}"
+    reg   = f"🎛️ 場況 {regime}{('→'+prefer) if prefer else ''}"
+    # 第四行：門檻/EMA/時間（極簡）
+    tail=[]
+    if vol_note: tail.append(f"⚙️ {vol_note}")
+    if EMA_ENABLE and SHOW_EMA_NOTE: tail.append(f"🔧 EMA")
+    if remain_min is not None and SHOW_REMAINING_TIME: tail.append(f"⏳{max(0,remain_min)}m")
+    # 組裝
+    lines=[head, probs, f"{reg}｜{votes}"]
+    if tail: lines.append("｜".join(tail))
     return "\n".join(lines)
 
 def fmt_trial_over() -> str:
-    return (
-        "⛔ 免費試用已結束。\n"
-        f"📬 請聯繫管理員官方 LINE：{ADMIN_CONTACT} 取得開通密碼。\n"
-        "🔐 直接輸入：【開通 你的密碼】（例如：開通 abc123）"
-    )
+    return f"⛔ 試用結束\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
 
 def quick_reply_buttons():
     try:
@@ -671,7 +588,7 @@ def quick_reply_buttons():
     except Exception:
         return None
 
-# ===== API =====
+# ====== API ======
 @app.route("/", methods=["GET"])
 def root():
     return "LiveBoot ok", 200
@@ -702,8 +619,7 @@ def predict_api():
         if activation_code and ADMIN_ACTIVATION_SECRET and (activation_code == ADMIN_ACTIVATION_SECRET):
             sess["premium"] = True
         if API_TRIAL_ENFORCE and not sess.get("premium", False):
-            now = int(time.time())
-            start = int(sess.get("trial_start", now))
+            now = int(time.time()); start = int(sess.get("trial_start", now))
             elapsed_min = (now - start) // 60
             if elapsed_min >= API_TRIAL_MINUTES:
                 return jsonify(error="trial_expired",
@@ -753,22 +669,17 @@ def predict_api():
     if API_MINIMAL_JSON:
         return jsonify(
             hands=len(seq),
-            probs={
-                "banker": round(float(p_smooth[0]),3),
-                "player": round(float(p_smooth[1]),3),
-                "tie":    round(float(p_smooth[2]),3)
-            },
+            probs={"banker": round(float(p_smooth[0]),3), "player": round(float(p_smooth[1]),3), "tie": round(float(p_smooth[2]),3)},
             suggestion=sug,
             edge=round(float(edge),3),
             bet_pct=float(bet_pct_s),
             bet_amount=int(round(bankroll*bet_pct_s)) if bankroll and bet_pct_s>0 else 0
         )
 
-    history_str = encode_history(seq)
-    text = fmt_line_reply(len(seq), p_smooth, sug, edge, bankroll, bet_pct_s, vote_labels, vote_counts, models_used, None, vol_note)
+    text = fmt_line_reply(len(seq), p_smooth, sug, edge, bankroll, bet_pct_s, vote_labels, vote_counts, models_used, None, vol_note, regime_info)
 
     return jsonify({
-        "history_str": history_str,
+        "history_str": encode_history(seq),
         "hands": len(seq),
         "probs": {"banker": round(float(p_smooth[0]),3), "player": round(float(p_smooth[1]),3), "tie": round(float(p_smooth[2]),3)},
         "suggestion": sug,
@@ -778,11 +689,10 @@ def predict_api():
         "votes": {"models_used": models_used, "莊": vote_counts.get("莊",0), "閒": vote_counts.get("閒",0), "和": vote_counts.get("和",0)},
         "regime": {"type": regime_info[0], "prefer": regime_info[1]},
         "vote_summary": vote_summary_text(vote_counts, models_used),
-        "vol_note": vol_note,
         "message": text
     })
 
-# ===== LINE webhook =====
+# ====== LINE Webhook ======
 @app.route("/line-webhook", methods=["POST"])
 def line_webhook():
     if not line_handler or not line_api:
@@ -801,13 +711,9 @@ def on_follow(event):
     now = int(time.time())
     SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": now, "premium": False, "perf": {"ok":0,"ng":0,"boost":0.0}}
     mins = TRIAL_MINUTES
-    msg = (
-        "🤖 歡迎加入！\n"
-        f"🎁 已啟用 {mins} 分鐘免費試用，現在就開始吧！\n"
-        "先輸入本金（例如：5000），再貼歷史（B/P/T 或 莊/閒/和），輸入『開始分析』即可！📊\n"
-        "🔐 到期後輸入：開通 你的密碼（向管理員索取）\n"
-        f"👤 管理員：{ADMIN_CONTACT}"
-    )
+    msg = (f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
+           "先輸入本金（例：5000）→ 貼歷史（B/P/T 或 莊/閒/和）→ 輸入『開始分析』📊\n"
+           f"到期請輸入：開通 你的密碼（向管理員索取）@{ADMIN_CONTACT.lstrip('@')}")
     line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
 
 @line_handler.add(MessageEvent, message=TextMessage)
@@ -827,49 +733,44 @@ def on_text(event):
                 code = text.split(" ",1)[1].strip() if " " in text else ""
                 if validate_activation_code(code):
                     sess["premium"] = True
-                    safe_reply(event.reply_token, "✅ 已開通成功！現在可以繼續使用所有功能。🎉", uid)
+                    safe_reply(event.reply_token, "✅ 已開通成功！🎉", uid)
                 else:
-                    safe_reply(event.reply_token, "❌ 開通密碼不正確，請向管理員索取正確密碼。", uid)
+                    safe_reply(event.reply_token, "❌ 密碼錯誤，請向管理員索取。", uid)
             else:
                 safe_reply(event.reply_token, fmt_trial_over(), uid)
             return
     else:
         remain_min = None
 
-    # 系統指令：返回
+    # 系統指令
     if text in ["返回", "undo", "回上一步"]:
         seq: List[int] = sess.get("seq", [])
         if seq:
-            last = seq.pop(-1)
-            sess["seq"] = seq
-            msg = f"↩️ 已撤回上一手（{INV.get(last,'?')}）。目前共 {len(seq)} 手。輸入『開始分析』或再輸入下一手。"
+            last = seq.pop(-1); sess["seq"] = seq
+            msg = f"↩️ 撤回 {INV.get(last,'?')}，共 {len(seq)} 手。"
         else:
-            msg = "ℹ️ 目前沒有可撤回的紀錄。請先輸入歷史或單手結果。"
+            msg = "ℹ️ 沒有可撤回的紀錄。"
         safe_reply(event.reply_token, msg, uid); return
 
-    # 系統指令：結束分析
     if text in ["結束分析", "清空", "reset"]:
         sess["seq"] = []
-        msg = "🧹 已清空歷史。保留本金設定不變。\n貼上新歷史（B/P/T 或 莊/閒/和），或直接輸入單手結果開始紀錄。"
-        safe_reply(event.reply_token, msg, uid); return
+        safe_reply(event.reply_token, "🧹 已清空歷史。", uid); return
 
-    # 開通
     if text.startswith("開通") or text.lower().startswith("activate"):
         code = text.split(" ",1)[1].strip() if " " in text else ""
         if validate_activation_code(code):
             sess["premium"] = True
-            safe_reply(event.reply_token, "✅ 已開通成功！現在可以繼續使用所有功能。🎉", uid)
+            safe_reply(event.reply_token, "✅ 已開通成功！🎉", uid)
         else:
-            safe_reply(event.reply_token, "❌ 開通密碼不正確，請向管理員索取正確密碼。", uid)
+            safe_reply(event.reply_token, "❌ 密碼錯誤，請向管理員索取。", uid)
         return
 
-    # 本金設定（純數字）
+    # 本金（純數字）
     if text.isdigit():
         sess["bankroll"] = int(text)
-        msg = f"👍 已設定本金：{int(text):,} 元。\n貼上歷史（B/P/T 或 莊/閒/和）後輸入『開始分析』即可！🚀"
-        safe_reply(event.reply_token, msg, uid); return
+        safe_reply(event.reply_token, f"👍 已設定本金：{int(text):,}", uid); return
 
-    # 結果回報（線上表現回饋）
+    # 結果回報
     if text.startswith("結果") or text.lower().startswith("result"):
         parts = text.split()
         if len(parts) >= 2:
@@ -884,31 +785,25 @@ def on_text(event):
                            (last_sug=="和" and outcome=="T")) else 0
                 perf["ok"] = int(perf.get("ok",0)) + (1 if ok else 0)
                 perf["ng"] = int(perf.get("ng",0)) + (0 if ok else 1)
-                sess["perf"] = perf
                 acc = perf["ok"]/max(1,(perf["ok"]+perf["ng"]))
-                msg = f"📥 已記錄結果：{token}（{'✅ 命中' if ok else '❌ 未中'}）\n"
-                msg+= f"近況：{perf['ok']} 中 / {perf['ok']+perf['ng']} 次（命中率 {acc:.2f}）"
+                msg = f"📥 已記錄：{token}（{'✅' if ok else '❌'}）｜近況 {perf['ok']}/{perf['ok']+perf['ng']}（{acc:.2f}）"
             else:
-                msg = "ℹ️ 尚無上一手建議或結果格式錯誤。用法：結果 莊/閒/和（或 B/P/T）。"
+                msg = "ℹ️ 尚無上一手建議或格式錯誤。"
         else:
-            msg = "ℹ️ 用法：結果 莊/閒/和（或 B/P/T）。"
+            msg = "ℹ️ 用法：結果 莊/閒/和"
         safe_reply(event.reply_token, msg, uid); return
 
-    # 歷史/單手輸入
+    # 歷史/單手
     zh2eng = {"莊":"B","閒":"P","和":"T"}
     norm = "".join(zh2eng.get(ch, ch) for ch in text.upper())
     seq_in = parse_history(norm)
     if seq_in and ("開始分析" not in text):
         if len(seq_in) == 1:
-            sess.setdefault("seq", [])
-            sess["seq"].append(seq_in[0])
-            n = len(sess["seq"])
-            msg = f"✅ 已記錄 1 手：{norm}。目前累計 {n} 手。\n輸入『開始分析』或繼續輸入下一手（或用『返回』撤回）。"
+            sess.setdefault("seq", []); sess["seq"].append(seq_in[0])
+            safe_reply(event.reply_token, f"✅ 已記 1 手：{norm}（共 {len(sess['seq'])}）", uid); return
         else:
             sess["seq"] = seq_in
-            n = len(seq_in)
-            msg = f"✅ 已覆蓋歷史共 {n} 手。\n輸入『開始分析』即可啟動。🧪"
-        safe_reply(event.reply_token, msg, uid); return
+            safe_reply(event.reply_token, f"✅ 已覆蓋歷史：{len(seq_in)} 手", uid); return
 
     # 分析
     if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
@@ -917,7 +812,7 @@ def on_text(event):
 
         p_avg, vote_labels, vote_counts, regime_info = vote_and_average(sseq)
 
-        # —— 機率 EMA（LINE user）——
+        # 機率 EMA（LINE）
         if EMA_ENABLE:
             ema_prev = sess.get("ema_p_line")
             p_smooth = _ema_update(ema_prev, p_avg, EMA_PROB_A)
@@ -929,7 +824,7 @@ def on_text(event):
         sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(p_smooth, vote_counts, models_used, sseq, sess, regime_info)
         sess["last_suggestion"] = sug if sug in ("莊","閒","和") else None
 
-        # —— 下注比例 EMA（LINE user）——
+        # 下注 EMA（LINE）
         if EMA_ENABLE:
             ema_b_prev = sess.get("ema_b_line")
             bet_pct_s  = _ema_scalar(ema_b_prev, bet_pct, EMA_BET_A)
@@ -937,26 +832,17 @@ def on_text(event):
         else:
             bet_pct_s = bet_pct
 
-        reply = fmt_line_reply(len(sseq), p_smooth, sug, edge, bankroll, bet_pct_s, vote_labels, vote_counts, models_used, remain_min, vol_note)
+        reply = fmt_line_reply(len(sseq), p_smooth, sug, edge, bankroll, bet_pct_s,
+                               vote_labels, vote_counts, models_used, remain_min, vol_note, regime_info)
         safe_reply(event.reply_token, reply, uid); return
 
     # 說明
-    msg = (
-        "🧭 指令說明：\n"
-        "• 數字：設定本金（例：5000）\n"
-        "• 貼歷史：B/P/T 或 莊/閒/和（可含空白）\n"
-        "• 『開始分析』：三模型加權＋場況判斷＋RNN 溫度強化\n"
-        "• 『返回』撤回上一手；『結束分析』清空歷史\n"
-        "• 『結果 莊/閒/和』回報上一手實盤（用於線上回饋）\n"
-        "• 試用到期後：『開通 你的密碼』\n"
-        f"• 管理員：{ADMIN_CONTACT}"
-    )
+    msg = ("🧭 指令：設定本金→貼歷史→『開始分析』｜『返回』撤回｜『結束分析』清空｜『結果 ⋯』回報上一手")
     safe_reply(event.reply_token, msg, uid)
 
-# ===== Utils =====
+# ====== Utils ======
 def validate_activation_code(code: str) -> bool:
-    if not ADMIN_ACTIVATION_SECRET:
-        return False
+    if not ADMIN_ACTIVATION_SECRET: return False
     return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
 
 def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
