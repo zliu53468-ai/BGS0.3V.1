@@ -1,9 +1,4 @@
-# server.py — LiveBoot Baccarat AI (Threshold-First + Short Reply + Emojis)
-# ✅ 以「進場門檻」為唯一下注標準；未達門檻一律不下注。
-# ✅ 簡短回覆＋表情符號；支援「觀望（偏⋯）」顯示。
-# ✅ 三模型融合（XGB/LGBM/RNN）、場況（regime）動態加權、震盪防護、EMA 平滑。
-# ✅ LINE：30 分鐘試用鎖、開通密碼、返回/結束分析。
-# ✅ API：/predict（支援 session_key / undo|reset / activation_code / minimal JSON）、健康檢查 /health
+# server.py — LiveBoot Baccarat AI (Regime-Primary + Threshold-First + Short Reply + Emojis)
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -21,7 +16,7 @@ def env_flag(name: str, default: int = 1) -> int:
     v = str(val).strip().lower()
     if v in ("1","true","t","yes","y","on"): return 1
     if v in ("0","false","f","no","n","off"): return 0
-    if v == "1/0": return 1   # 防手誤
+    if v == "1/0": return 1
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
@@ -95,6 +90,9 @@ REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
 
+# —— 場況主導下注（你要求的！） ——
+REGIME_PRIMARY = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先決定方向（莊/閒）
+
 # ====== EMA 平滑 ======
 EMA_ENABLE    = int(os.getenv("EMA_ENABLE", "1"))
 EMA_PROB_A    = float(os.getenv("EMA_PROB_A", "0.30"))
@@ -157,7 +155,7 @@ def _load_lgb():
 
 def _load_rnn():
     global RNN_MODEL
-    if DISABLE_RNN == 1: 
+    if DISABLE_RNN == 1:
         log.info("[MODEL] RNN disabled by env")
         return
     try:
@@ -352,6 +350,11 @@ def _parse_triplets(spec: str) -> Dict[str, Tuple[float,float,float]]:
 
 REG_TRIPLE = _parse_triplets(REG_WEIGHTS)
 
+def _regime_label(regime: str, prefer: Optional[str]) -> str:
+    zh = {"neutral":"中性","streak":"連莊","chop":"對敲","banker":"莊偏","player":"閒偏"}
+    base = zh.get(str(regime).lower(), "中性")
+    return f"{base}{('→'+prefer) if prefer else ''}"
+
 # ====== 模型預測 ======
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
@@ -494,19 +497,27 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     (p1, lab1), (p2, _) = arr[0], arr[1]
     edge = p1 - p2
 
+    # —— 場況主導方向（只在有偏向時，且只挑莊/閒）——
+    if REGIME_PRIMARY and regime in ("streak","chop","banker","player") and prefer in ("莊","閒"):
+        lab1 = prefer
+        p_prefer = float(p[0] if prefer=="莊" else p[1])
+        p_other  = float(p[1] if prefer=="莊" else p[0])
+        p2 = max(p_other, float(p[2]))
+        edge = p_prefer - p2
+
     max_votes = max(votes.get("莊",0), votes.get("閒",0), votes.get("和",0)) if models_used>0 else 0
     vote_conf = (max_votes / models_used) if models_used>0 else 0.0
 
-    # 票數門檻
-    if models_used>0 and max_votes < ABSTAIN_VOTES:
+    # 票數門檻（若場況主導則不卡票數）
+    if (not REGIME_PRIMARY) and models_used>0 and max_votes < ABSTAIN_VOTES:
         return "觀望（票少）", edge, 0.0, vote_conf, ""
 
     # Tie 低機率時避免
     if lab1=="和" and p[2] < max(0.05, CLIP_T_MIN+0.01):
         return "觀望（避和）", edge, 0.0, vote_conf, ""
 
-    # 進場門檻組合：基礎 + 場況一致性 + 震盪 + 線上回饋
-    vol_note=""; enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
+    # 進場門檻：基礎 + 場況一致性 + 震盪 + 線上回饋
+    enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
     if REGIME_CTRL and prefer in ("莊","閒"):
         if lab1 == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
@@ -551,6 +562,8 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
                    vol_note:Optional[str]=None, regime_info:Tuple[str,Optional[str]]=("neutral",None)) -> str:
     b, pl, t = p[0], p[1], p[2]
     regime, prefer = regime_info
+    # 若無偏向，也用最大機率方向當作顯示箭頭
+    bias = prefer or {0:"莊",1:"閒",2:"和"}[int(np.argmax(p))]
     # 第一行：建議 + 邊際 + 金額/比例
     if bet_pct > 0 and bankroll:
         bet_amt = int(round(bankroll * bet_pct))
@@ -561,13 +574,12 @@ def fmt_line_reply(n_hand:int, p:np.ndarray, sug:str, edge:float,
     probs = f"📊 機率 B {b:.2f}｜P {pl:.2f}｜T {t:.2f}"
     # 第三行：場況＋票數（極簡）
     votes = f"🗳️ 票 {vote_summary_text(vote_counts, models_used)}"
-    reg   = f"🎛️ 場況 {regime}{('→'+prefer) if prefer else ''}"
+    reg   = f"🎛️ 場況 {_regime_label(regime, bias)}"
     # 第四行：門檻/EMA/時間（極簡）
     tail=[]
     if vol_note: tail.append(f"⚙️ {vol_note}")
     if EMA_ENABLE and SHOW_EMA_NOTE: tail.append(f"🔧 EMA")
     if remain_min is not None and SHOW_REMAINING_TIME: tail.append(f"⏳{max(0,remain_min)}m")
-    # 組裝
     lines=[head, probs, f"{reg}｜{votes}"]
     if tail: lines.append("｜".join(tail))
     return "\n".join(lines)
@@ -647,7 +659,6 @@ def predict_api():
 
     p_avg, vote_labels, vote_counts, regime_info = vote_and_average(seq)
 
-    # —— 機率 EMA（API）——
     if EMA_ENABLE and session_key:
         ema_prev = SESS_API[session_key].get("ema_p_api")
         p_smooth = _ema_update(ema_prev, p_avg, EMA_PROB_A)
@@ -658,7 +669,6 @@ def predict_api():
     models_used = len(vote_labels)
     sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(p_smooth, vote_counts, models_used, seq, None, regime_info)
 
-    # —— 下注比例 EMA（API）——
     if EMA_ENABLE and session_key:
         ema_b_prev = SESS_API[session_key].get("ema_b_api")
         bet_pct_s  = _ema_scalar(ema_b_prev, bet_pct, EMA_BET_A)
@@ -713,7 +723,7 @@ def on_follow(event):
     mins = TRIAL_MINUTES
     msg = (f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
            "先輸入本金（例：5000）→ 貼歷史（B/P/T 或 莊/閒/和）→ 輸入『開始分析』📊\n"
-           f"到期請輸入：開通 你的密碼（向管理員索取）@{ADMIN_CONTACT.lstrip('@')}")
+           f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}")
     line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
 
 @line_handler.add(MessageEvent, message=TextMessage)
@@ -754,7 +764,13 @@ def on_text(event):
 
     if text in ["結束分析", "清空", "reset"]:
         sess["seq"] = []
-        safe_reply(event.reply_token, "🧹 已清空歷史。", uid); return
+        sess["bankroll"] = 0
+        safe_reply(
+            event.reply_token,
+            "🧹 已清空歷史。\n請輸入你的本金（例：5000）。\n輸入後貼歷史或打「開始分析」即可 📊",
+            uid
+        )
+        return
 
     if text.startswith("開通") or text.lower().startswith("activate"):
         code = text.split(" ",1)[1].strip() if " " in text else ""
@@ -812,7 +828,6 @@ def on_text(event):
 
         p_avg, vote_labels, vote_counts, regime_info = vote_and_average(sseq)
 
-        # 機率 EMA（LINE）
         if EMA_ENABLE:
             ema_prev = sess.get("ema_p_line")
             p_smooth = _ema_update(ema_prev, p_avg, EMA_PROB_A)
@@ -824,7 +839,6 @@ def on_text(event):
         sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(p_smooth, vote_counts, models_used, sseq, sess, regime_info)
         sess["last_suggestion"] = sug if sug in ("莊","閒","和") else None
 
-        # 下注 EMA（LINE）
         if EMA_ENABLE:
             ema_b_prev = sess.get("ema_b_line")
             bet_pct_s  = _ema_scalar(ema_b_prev, bet_pct, EMA_BET_A)
@@ -833,7 +847,7 @@ def on_text(event):
             bet_pct_s = bet_pct
 
         reply = fmt_line_reply(len(sseq), p_smooth, sug, edge, bankroll, bet_pct_s,
-                               vote_labels, vote_counts, models_used, remain_min, vol_note, regime_info)
+                               vote_labels, vote_counts, models_used, None, vol_note, regime_info)
         safe_reply(event.reply_token, reply, uid); return
 
     # 說明
