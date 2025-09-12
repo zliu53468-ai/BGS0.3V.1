@@ -1,6 +1,7 @@
-# server.py — LiveBoot Baccarat AI (Soft Regime + Anti-Lock)
+# server.py — LiveBoot Baccarat AI (Soft Regime + Anti-Lock + DummyHandler Safe)
 # Regime-Primary(soft) + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
 # + Chop/Pattern Detection + Hysteresis & Cooldown (Anti-Chase) + Same-Side Cap
+# + Safe LINE DummyHandler (no crash even if keys missing)
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -19,7 +20,7 @@ def env_flag(name: str, default: int = 1) -> int:
     v = str(val).strip().lower()
     if v in ("1","true","t","yes","y","on"): return 1
     if v in ("0","false","f","no","n","off"): return 0
-    if v == "1/0": return 1  # 兼容你先前輸入過的 '1/0'
+    if v == "1/0": return 1  # 兼容你之前的輸入
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
@@ -92,12 +93,12 @@ REG_WEIGHTS   = os.getenv("REG_WEIGHTS",
 REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
-REGIME_PRIMARY            = int(os.getenv("REGIME_PRIMARY", "1"))  # 舊開關仍保留
+REGIME_PRIMARY            = int(os.getenv("REGIME_PRIMARY", "1"))  # 舊開關保留
 
 # —— 新：場況偏好軟化 + 同邊連押上限 —— #
 REGIME_PRIMARY_SOFT = int(os.getenv("REGIME_PRIMARY_SOFT", "1"))   # 1=只調門檻，不硬改方向
 MAX_SAME_SIDE       = int(os.getenv("MAX_SAME_SIDE", "3"))         # 同方向最多連押 N 手
-UNLOCK_DELTA        = float(os.getenv("UNLOCK_DELTA", "0.02"))     # 連押達上限後，需多出此邊際才續押
+UNLOCK_DELTA        = float(os.getenv("UNLOCK_DELTA", "0.02"))     # 超上限需多出此邊際才續押
 HYSTERESIS_SCOPE    = os.getenv("HYSTERESIS_SCOPE", "non_chop")    # all / non_chop
 
 # ====== EMA 平滑 ======
@@ -118,7 +119,7 @@ PATTERN_STICKY = int(os.getenv("PATTERN_STICKY", "1"))
 HYSTERESIS_EDGE = float(os.getenv("HYSTERESIS_EDGE", "0.015"))
 SWITCH_COOLDOWN = int(os.getenv("SWITCH_COOLDOWN", "2"))
 
-# ====== LINE SDK ======
+# ====== LINE SDK（Safe DummyHandler） ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -134,6 +135,14 @@ except Exception as e:
     line_api = None
     line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
+
+# 🔧 沒金鑰時也不會掛：提供 DummyHandler 讓 decorator 不爆
+if line_handler is None:
+    class _DummyHandler:
+        def add(self, *_, **__):
+            def _wrap(fn): return fn
+            return _wrap
+    line_handler = _DummyHandler()
 
 # ====== Sessions ======
 SESS: Dict[str, Dict[str, object]] = {}      # LINE
@@ -459,7 +468,7 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
     pr = rnn_probs(seq)
     if pr is not None:
         p = softmax_log(pr, 1.0); preds.append(p); names.append("RNN")
-        vote_labels['RNN']=label_map[int(pr.argmax())]; vote_counts[vote_labels['RNN']]+=1
+        vote_labels['RNN']=label_map[int(pr.argmax())]); vote_counts[vote_labels['RNN']]+=1
 
     regime, prefer = _regime_detect(seq)
 
@@ -479,7 +488,8 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
     P=np.stack(preds, axis=0).astype(np.float32)
     p_avg=(P*W[:,None]).sum(axis=0)
     p_avg[2]=np.clip(p_avg[2], CLIP_T_MIN, CLIP_T_MAX)
-    p_avg=np.clip(p_avg,1e-6,None); p_avg=p_avg/p0.sum() if (p0:=p_avg).sum()!=0 else p_avg
+    p_avg=np.clip(p_avg,1e-9,None)
+    p_avg=p_avg/p_avg.sum()
 
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
@@ -554,10 +564,8 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
 
     if REGIME_CTRL and prefer in ("莊","閒"):
         if REGIME_PRIMARY and not REGIME_PRIMARY_SOFT:
-            # 老硬性模式（若你要軟性，請設 REGIME_PRIMARY_SOFT=1）
             if lab1 != prefer and REG_ALIGN_REQUIRE == 1:
                 return "觀望（逆場況）", edge, 0.0, vote_conf, f"場況：{regime}→{prefer}"
-        # 軟性：只調門檻，不改方向
         if lab1 == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
         else:
@@ -804,14 +812,16 @@ def predict_api():
 # ====== LINE Webhook ======
 @app.route("/line-webhook", methods=["POST"])
 def line_webhook():
-    if not line_handler or not line_api:
+    if not line_handler or not ('handle' in dir(line_handler)):
         abort(503, "LINE not configured")
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         line_handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400, "Invalid signature")
+    except Exception as e:
+        log.warning("LINE handle warn: %s", e)
+        if 'InvalidSignatureError' in globals() and isinstance(e, InvalidSignatureError):
+            abort(400, "Invalid signature")
     return "OK", 200
 
 @line_handler.add(FollowEvent)
@@ -823,7 +833,8 @@ def on_follow(event):
     msg = (f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
            "先輸入本金（例：5000）→ 貼歷史（B/P/T 或 莊/閒/和）→ 輸入『開始分析』📊\n"
            f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}")
-    line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
+    if line_api:
+        line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
 
 @line_handler.add(MessageEvent, message=TextMessage)
 def on_text(event):
@@ -960,11 +971,16 @@ def validate_activation_code(code: str) -> bool:
 
 def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
     try:
-        line_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
+        if 'line_api' in globals() and line_api:
+            from linebot.models import TextSendMessage
+            line_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
+        else:
+            log.info("[LINE] not configured, would send: %s", text)
     except Exception as e:
         log.warning("[LINE] reply failed, try push: %s", e)
-        if uid:
+        if uid and 'line_api' in globals() and line_api:
             try:
+                from linebot.models import TextSendMessage
                 line_api.push_message(uid, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
             except Exception as e2:
                 log.error("[LINE] push failed: %s", e2)
