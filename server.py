@@ -1,5 +1,5 @@
 # server.py — LiveBoot Baccarat AI
-# Regime-Primary + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
+# Regime-Primary + Threshold-First + Streak Enhancer + RNN Safe-Guard + Fixed Bet Ladder (10/20/30%)
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -92,8 +92,15 @@ REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
 
-# —— 場況主導下注（你要求的） ——
-REGIME_PRIMARY = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先決定方向（莊/閒）
+# —— 場況主導下注 ——
+REGIME_PRIMARY = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先
+
+# ====== 連段強化（新）======
+STREAK_CTRL          = int(os.getenv("STREAK_CTRL", "1"))
+STREAK_MIN_LEN       = int(os.getenv("STREAK_MIN_LEN", "3"))   # 當前連段長度達到才啟動
+STREAK_BONUS         = float(os.getenv("STREAK_BONUS", "0.02"))  # 連段時門檻減少
+STREAK_BREAK_BONUS   = float(os.getenv("STREAK_BREAK_BONUS", "0.03"))  # 突破前一段長度時再降
+STREAK_CHOP_PENALTY  = float(os.getenv("STREAK_CHOP_PENALTY", "0.02"))  # chop 明顯時加價
 
 # ====== EMA 平滑 ======
 EMA_ENABLE    = int(os.getenv("EMA_ENABLE", "1"))
@@ -101,9 +108,14 @@ EMA_PROB_A    = float(os.getenv("EMA_PROB_A", "0.30"))
 EMA_BET_A     = float(os.getenv("EMA_BET_A", "0.20"))
 SHOW_EMA_NOTE = int(os.getenv("SHOW_EMA_NOTE", "1"))
 
-# ====== 未達門檻的顯示行為 ======
+# ====== 未達門檻顯示 ======
 SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))
 FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))
+
+# ====== RNN 安全防護（新）======
+RNN_MAX_MS             = int(os.getenv("RNN_MAX_MS", "80"))      # 單次推論最長毫秒
+RNN_DISABLE_AFTER_FAIL = int(os.getenv("RNN_DISABLE_AFTER_FAIL", "2"))  # 失敗/超時次數後熔斷
+RNN_HEALTH = {"disabled": False, "fails": 0}
 
 # ====== LINE SDK ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -320,6 +332,27 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
+# ====== Streak helpers（新）======
+def _streak_stats(seq: List[int]) -> Tuple[int, Optional[int], Optional[int]]:
+    """回傳 (last_side, last_len, prev_same_len)。side: 0=莊,1=閒；若不足回傳 None。"""
+    bp=[v for v in seq if v in (0,1)]
+    if len(bp)==0: return -1, None, None
+    # 萃取連段
+    runs=[]; cur_side=bp[0]; cur_len=1
+    for v in bp[1:]:
+        if v==cur_side: cur_len+=1
+        else:
+            runs.append((cur_side, cur_len))
+            cur_side=v; cur_len=1
+    runs.append((cur_side, cur_len))
+    last_side, last_len = runs[-1]
+    prev_same_len=None
+    # 找到前一個「同邊」的段長
+    for i in range(len(runs)-2, -1, -1):
+        if runs[i][0]==last_side:
+            prev_same_len = runs[i][1]; break
+    return last_side, last_len, prev_same_len
+
 # ====== Regime ======
 def _regime_detect(seq: List[int]) -> Tuple[str, Optional[str]]:
     if not REGIME_CTRL or len(seq) < 8: return "neutral", None
@@ -357,7 +390,7 @@ def _regime_label(regime: str, prefer: Optional[str]) -> str:
     base = zh.get(str(regime).lower(), "中性")
     return f"{base}{('→'+prefer) if prefer else ''}"
 
-# ====== 模型預測 ======
+# ====== 模型預測（含 RNN 熔斷）======
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
     import xgboost as xgb
@@ -372,17 +405,34 @@ def lgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     return np.array(p, dtype=np.float32)
 
 def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
-    if RNN_MODEL is None: return None
+    if RNN_MODEL is None or RNN_HEALTH["disabled"]: return None
     try:
         import torch
     except Exception:
         return None
-    x=one_hot_seq(seq, FEAT_WIN)
-    with __import__("torch").no_grad():
-        logits=RNN_MODEL(__import__("torch").from_numpy(x))
-        logits = logits / max(1e-6, TEMP_RNN)
-        p = __import__("torch").softmax(logits, dim=-1).cpu().numpy()[0]
-    return p.astype(np.float32)
+    try:
+        x=one_hot_seq(seq, FEAT_WIN)
+        t0=time.perf_counter()
+        with __import__("torch").no_grad():
+            logits=RNN_MODEL(__import__("torch").from_numpy(x))
+            logits = logits / max(1e-6, TEMP_RNN)
+            p = __import__("torch").softmax(logits, dim=-1).cpu().numpy()[0]
+        ms=(time.perf_counter()-t0)*1000.0
+        if ms > RNN_MAX_MS:
+            RNN_HEALTH["fails"] += 1
+            log.warning("[RNN] slow inference %.1fms (> %dms) [%d/%d]", ms, RNN_MAX_MS, RNN_HEALTH["fails"], RNN_DISABLE_AFTER_FAIL)
+            if RNN_HEALTH["fails"] >= RNN_DISABLE_AFTER_FAIL:
+                RNN_HEALTH["disabled"]=True
+                log.warning("[RNN] disabled due to repeated slow/failed inference")
+                return None
+        return p.astype(np.float32)
+    except Exception as e:
+        RNN_HEALTH["fails"] += 1
+        log.warning("[RNN] inference failed: %s [%d/%d]", e, RNN_HEALTH["fails"], RNN_DISABLE_AFTER_FAIL)
+        if RNN_HEALTH["fails"] >= RNN_DISABLE_AFTER_FAIL:
+            RNN_HEALTH["disabled"]=True
+            log.warning("[RNN] disabled due to failures")
+        return None
 
 def _parse_weights(spec: str) -> Dict[str, float]:
     out={"XGB":0.33,"LGBM":0.33,"RNN":0.34}
@@ -526,8 +576,10 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     if lab1=="和" and p[2] < max(0.05, CLIP_T_MIN+0.01):
         return "觀望（避和）", edge, 0.0, vote_conf, ""
 
-    # 進場門檻：基礎 + 場況一致性 + 震盪 + 線上回饋
+    # 進場門檻：基礎
     enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
+
+    # 場況一致/不一致加價
     if REGIME_CTRL and prefer in ("莊","閒"):
         if lab1 == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
@@ -537,6 +589,18 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
             else:
                 enter_th += REG_MISMATCH_EDGE_PENALTY
 
+    # —— 連段強化：當前連段越長、越突破，越容易進場 —— #
+    if STREAK_CTRL and regime == "streak" and lab1 == (prefer or lab1):
+        side, last_len, prev_same_len = _streak_stats(seq or [])
+        if last_len and last_len >= STREAK_MIN_LEN:
+            enter_th = max(0.0, enter_th - STREAK_BONUS)
+            if prev_same_len is not None and last_len > prev_same_len:
+                enter_th = max(0.0, enter_th - STREAK_BREAK_BONUS)
+    # chop 明顯時，增加門檻（避免硬拗連段）
+    if STREAK_CTRL and regime == "chop" and lab1 in ("莊","閒"):
+        enter_th += STREAK_CHOP_PENALTY
+
+    # 震盪 & 線上回饋
     if VOL_GUARD and seq is not None:
         alt, flip = _alt_flip_metrics(seq, ALT_WIN)
         if abs(alt-0.5) < VOL_ALT_BAND: enter_th += VOL_ALT_BOOST
@@ -558,7 +622,7 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     base_pct = edge_to_base_pct(edge)
     if base_pct == 0.0:
         return "觀望", edge, 0.0, vote_conf, vol_note
-    bet_pct = base_pct  # 固定梯度，不再用票數縮放
+    bet_pct = base_pct
     return lab1, edge, bet_pct, vote_conf, vol_note
 
 def vote_summary_text(vote_counts: Dict[str,int], models_used:int) -> str:
