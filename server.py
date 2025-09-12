@@ -1,6 +1,6 @@
-# server.py — LiveBoot Baccarat AI (Enhanced Anti-Chase)
-# Regime-Primary + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
-# + Chop/Pattern Detection + Hysteresis & Cooldown (Anti-Chase)
+# server.py — LiveBoot Baccarat AI (Soft Regime + Anti-Lock)
+# Regime-Primary(soft) + Threshold-First + Fixed Bet Ladder (10/20/30%) + Short Reply + Emojis
+# + Chop/Pattern Detection + Hysteresis & Cooldown (Anti-Chase) + Same-Side Cap
 
 import os, logging, time
 from typing import List, Tuple, Optional, Dict
@@ -19,7 +19,7 @@ def env_flag(name: str, default: int = 1) -> int:
     v = str(val).strip().lower()
     if v in ("1","true","t","yes","y","on"): return 1
     if v in ("0","false","f","no","n","off"): return 0
-    if v == "1/0": return 1
+    if v == "1/0": return 1  # 兼容你先前輸入過的 '1/0'
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
@@ -92,7 +92,13 @@ REG_WEIGHTS   = os.getenv("REG_WEIGHTS",
 REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.01"))
 REG_ALIGN_REQUIRE         = int(os.getenv("REG_ALIGN_REQUIRE", "1"))
 REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.02"))
-REGIME_PRIMARY            = int(os.getenv("REGIME_PRIMARY", "1"))  # 1=場況優先
+REGIME_PRIMARY            = int(os.getenv("REGIME_PRIMARY", "1"))  # 舊開關仍保留
+
+# —— 新：場況偏好軟化 + 同邊連押上限 —— #
+REGIME_PRIMARY_SOFT = int(os.getenv("REGIME_PRIMARY_SOFT", "1"))   # 1=只調門檻，不硬改方向
+MAX_SAME_SIDE       = int(os.getenv("MAX_SAME_SIDE", "3"))         # 同方向最多連押 N 手
+UNLOCK_DELTA        = float(os.getenv("UNLOCK_DELTA", "0.02"))     # 連押達上限後，需多出此邊際才續押
+HYSTERESIS_SCOPE    = os.getenv("HYSTERESIS_SCOPE", "non_chop")    # all / non_chop
 
 # ====== EMA 平滑 ======
 EMA_ENABLE    = int(os.getenv("EMA_ENABLE", "1"))
@@ -104,13 +110,13 @@ SHOW_EMA_NOTE = int(os.getenv("SHOW_EMA_NOTE", "1"))
 SHOW_BIAS_ON_ABSTAIN = int(os.getenv("SHOW_BIAS_ON_ABSTAIN", "1"))
 FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "0"))
 
-# ====== 交錯/規律 強化 + 反短期追單（新增） ======
-CHOP_WIN = int(os.getenv("CHOP_WIN", "14"))                    # 近幾手評估對敲
-CHOP_STRICT_TH = float(os.getenv("CHOP_STRICT_TH", "0.70"))    # flip 比例門檻
-CHOP_PATTERN_BONUS = float(os.getenv("CHOP_PATTERN_BONUS", "0.02"))  # 交錯明顯時下調門檻
-PATTERN_STICKY = int(os.getenv("PATTERN_STICKY", "1"))         # 規律盤時不亂換邊
-HYSTERESIS_EDGE = float(os.getenv("HYSTERESIS_EDGE", "0.015"))  # 新方向需比舊邊際好多少才換邊
-SWITCH_COOLDOWN = int(os.getenv("SWITCH_COOLDOWN", "2"))       # 換邊後至少過幾手才能再換
+# ====== 交錯/規律 強化 + 反短期追單 ======
+CHOP_WIN = int(os.getenv("CHOP_WIN", "14"))
+CHOP_STRICT_TH = float(os.getenv("CHOP_STRICT_TH", "0.70"))
+CHOP_PATTERN_BONUS = float(os.getenv("CHOP_PATTERN_BONUS", "0.02"))
+PATTERN_STICKY = int(os.getenv("PATTERN_STICKY", "1"))
+HYSTERESIS_EDGE = float(os.getenv("HYSTERESIS_EDGE", "0.015"))
+SWITCH_COOLDOWN = int(os.getenv("SWITCH_COOLDOWN", "2"))
 
 # ====== LINE SDK ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -364,15 +370,13 @@ def _regime_label(regime: str, prefer: Optional[str]) -> str:
     base = zh.get(str(regime).lower(), "中性")
     return f"{base}{('→'+prefer) if prefer else ''}"
 
-# ====== 新增：交錯/規律偵測 ======
+# ====== 交錯/規律偵測 ======
 def _chop_pattern_score(seq: List[int], win: int) -> Tuple[float, int]:
-    """回傳 (flip_ratio, max_alt_streak)。只看莊/閒，忽略和。"""
     bp = [v for v in seq[-win:] if v in (0,1)]
     if len(bp) < 3:
         return 0.5, 1
     flips = [1 if bp[i]!=bp[i-1] else 0 for i in range(1, len(bp))]
     flip_ratio = float(sum(flips)) / max(1, len(flips))
-    # 連續交錯長度（B P B P ...）
     max_alt = 1; cur = 1
     for i in range(1, len(bp)):
         if bp[i]!=bp[i-1]:
@@ -475,7 +479,7 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
     P=np.stack(preds, axis=0).astype(np.float32)
     p_avg=(P*W[:,None]).sum(axis=0)
     p_avg[2]=np.clip(p_avg[2], CLIP_T_MIN, CLIP_T_MAX)
-    p_avg=np.clip(p_avg,1e-6,None); p_avg=p_avg/p_avg.sum()
+    p_avg=np.clip(p_avg,1e-6,None); p_avg=p_avg/p0.sum() if (p0:=p_avg).sum()!=0 else p_avg
 
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
@@ -523,7 +527,7 @@ def bet_ladder_text(bankroll: int) -> str:
     c = int(round(bankroll * 0.30))
     return f"🪜 配注 10% {a:,}｜20% {b:,}｜30% {c:,}"
 
-# ====== 決策（含 Anti-Chase 強化） ======
+# ====== 決策（軟性場況 + Anti-Lock） ======
 def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
                           seq: Optional[List[int]] = None, sess: Optional[Dict[str,object]] = None,
                           regime_info: Tuple[str,Optional[str]]=("neutral", None)) -> Tuple[str,float,float,float,str]:
@@ -533,30 +537,9 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     (p1, lab1), (p2, _) = arr[0], arr[1]
     edge = p1 - p2
 
-    # —— 強化：交錯/規律偵測 —— #
+    # 交錯偵測
     flip_ratio, alt_streak = _chop_pattern_score(seq or [], CHOP_WIN)
     chop_strong = (flip_ratio >= CHOP_STRICT_TH and alt_streak >= 3)
-
-    # —— 場況主導方向（只在有偏向時，且只挑莊/閒） —— #
-    if REGIME_PRIMARY and regime in ("streak","chop","banker","player") and prefer in ("莊","閒"):
-        lab1 = prefer
-        p_prefer = float(p[0] if prefer=="莊" else p[1])
-        p_other  = float(p[1] if prefer=="莊" else p[0])
-        p2 = max(p_other, float(p[2]))
-        edge = p_prefer - p2
-
-    # —— 在 neutral/chop 且交錯很強：優先走交錯方向（避免短期盲追） —— #
-    if (regime in ("neutral","chop")) and chop_strong and (seq and len(seq)>=1):
-        last = [v for v in seq if v in (0,1)]
-        if last:
-            last_side = last[-1]
-            prefer_side = "閒" if last_side==0 else "莊"
-            if prefer_side in ("莊","閒"):
-                lab1 = prefer_side
-                p_prefer = float(p[0] if prefer_side=="莊" else p[1])
-                p_other  = float(p[1] if prefer_side=="莊" else p[0])
-                p2 = max(p_other, float(p[2]))
-                edge = p_prefer - p2
 
     # 票數與避和
     max_votes = max(votes.get("莊",0), votes.get("閒",0), votes.get("和",0)) if models_used>0 else 0
@@ -566,18 +549,23 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
     if lab1=="和" and p[2] < max(0.05, CLIP_T_MIN+0.01):
         return "觀望（避和）", edge, 0.0, vote_conf, ""
 
-    # 進場門檻：基礎 + 場況一致性 + 震盪 + 線上回饋
+    # 進場門檻：基礎 + 場況「軟性偏好」 + 交錯強加成 + 震盪 + 線上回饋
     enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
+
     if REGIME_CTRL and prefer in ("莊","閒"):
+        if REGIME_PRIMARY and not REGIME_PRIMARY_SOFT:
+            # 老硬性模式（若你要軟性，請設 REGIME_PRIMARY_SOFT=1）
+            if lab1 != prefer and REG_ALIGN_REQUIRE == 1:
+                return "觀望（逆場況）", edge, 0.0, vote_conf, f"場況：{regime}→{prefer}"
+        # 軟性：只調門檻，不改方向
         if lab1 == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
         else:
-            if REG_ALIGN_REQUIRE == 1:
+            if REG_ALIGN_REQUIRE == 1 and REGIME_PRIMARY_SOFT==0:
                 return "觀望（逆場況）", edge, 0.0, vote_conf, f"場況：{regime}→{prefer}"
             else:
                 enter_th += REG_MISMATCH_EDGE_PENALTY
 
-    # 交錯很強：門檻再下調（強化規律敏感）
     if chop_strong:
         enter_th = max(0.0, enter_th - CHOP_PATTERN_BONUS)
 
@@ -587,28 +575,49 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
         if flip >= VOL_FLIP_TH:          enter_th += VOL_FLIP_BOOST
 
     boost = _online_edge_boost(sess); enter_th += boost
-    vol_note = f"門檻{enter_th:.3f}"
-    if chop_strong: vol_note += "｜交錯強"
+    vol_note = f"門檻{enter_th:.3f}" + ("｜交錯強" if chop_strong else "")
 
-    # —— 遲滯 & 冷卻（Anti-Chase）：避免見莊就莊、見閒就閒 —— #
-    if sess is not None and lab1 in ("莊","閒"):
+    # 遲滯/冷卻：只在非交錯強時啟用，避免鎖住不換邊
+    use_hyst = (HYSTERESIS_SCOPE == "all") or ((HYSTERESIS_SCOPE == "non_chop") and (not chop_strong))
+    if sess is not None and lab1 in ("莊","閒") and use_hyst:
         last_pick = sess.get("last_suggestion")
         last_edge = float(sess.get("last_edge", 0.0))
         last_len  = int(sess.get("last_len", len(seq or [])))
         cooled = (len(seq or []) - last_len) >= SWITCH_COOLDOWN
         if last_pick in ("莊","閒") and last_pick != lab1:
             if (edge < last_edge + HYSTERESIS_EDGE) or (not cooled):
-                # 不換，維持上一建議
                 lab1 = last_pick
                 p_prefer = float(p[0] if lab1=="莊" else p[1])
                 p_other  = float(p[1] if lab1=="莊" else p[0])
                 p2       = max(p_other, float(p[2]))
                 edge     = p_prefer - p2
 
-    # —— 未達門檻 —— #
+    # 同邊連押上限（解鎖需額外邊際）
+    if sess is not None and lab1 in ("莊","閒"):
+        same_pick = sess.get("same_pick")
+        same_run  = int(sess.get("same_run", 0))
+        if same_pick == lab1:
+            same_run += 1
+        else:
+            same_pick = lab1
+            same_run  = 1
+        if same_run > MAX_SAME_SIDE:
+            if edge < enter_th + UNLOCK_DELTA:
+                note = vol_note + f"｜解鎖需+{UNLOCK_DELTA:.3f}"
+                sess["same_pick"] = same_pick
+                sess["same_run"]  = same_run
+                sess["last_suggestion"] = lab1
+                sess["last_edge"] = float(edge)
+                sess["last_len"]  = int(len(seq or []))
+                if SHOW_BIAS_ON_ABSTAIN:
+                    return f"觀望（偏{lab1}）", edge, 0.0, vote_conf, note
+                return "觀望", edge, 0.0, vote_conf, note
+        sess["same_pick"] = same_pick
+        sess["same_run"]  = same_run
+
+    # 未達門檻
     if edge < enter_th:
         if FORCE_DIRECTION_WHEN_UNDEREDGE:
-            # 仍回報方向但不下注
             if sess is not None:
                 sess["last_suggestion"] = lab1 if lab1 in ("莊","閒","和") else None
                 sess["last_edge"] = float(edge)
@@ -618,13 +627,13 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
             return f"觀望（偏{lab1}）", edge, 0.0, vote_conf, vol_note
         return "觀望", edge, 0.0, vote_conf, vol_note
 
-    # —— 達門檻：下注（固定梯度 10/20/30%）—— #
+    # 達門檻：固定梯度配注
     base_pct = edge_to_base_pct(edge)
     if base_pct == 0.0:
         return "觀望", edge, 0.0, vote_conf, vol_note
     bet_pct = base_pct
 
-    # 記錄遲滯狀態
+    # 記錄狀態
     if sess is not None:
         sess["last_suggestion"] = lab1
         sess["last_edge"] = float(edge)
@@ -755,9 +764,8 @@ def predict_api():
         p_smooth = p_avg
 
     models_used = len(vote_labels)
-    # 這裡改為把 sess 丟進去（原本是 None），讓 API 也享有 Anti-Chase 遲滯/冷卻
     sug, edge, bet_pct, vote_conf, vol_note = decide_bet_from_votes(
-        p_smooth, vote_counts, models_used, seq, sess, regime_info
+        p_smooth, vote_counts, models_used, seq, SESS_API.get(session_key) if session_key else None, regime_info
     )
 
     if EMA_ENABLE and session_key:
