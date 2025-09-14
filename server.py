@@ -1,4 +1,7 @@
-# server.py — LiveBoot Baccarat AI (Simple Reply + Soft Regime + Trial Auto-Notify + Feedback Log)
+# server.py — LiveBoot Baccarat AI (Regime-First + Threshold + Short Reply + Emojis)
+# - Follow/結束分析：提示輸入本金，並說明配注 10/20/30%
+# - Trial 30 分鐘到期：所有訊息都只回「請聯繫管理員開通」
+# - 決策：場況優先（跟龍/對敲/側偏）＋門檻＋變向冷卻＋震盪防護；避免只押機率最大
 
 import os, logging, time, csv
 from typing import List, Tuple, Optional, Dict
@@ -9,6 +12,7 @@ log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
 
+# ---------- utils ----------
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None: return 1 if default else 0
@@ -19,7 +23,7 @@ def env_flag(name: str, default: int = 1) -> int:
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
-# ===== 基本 / 特徵 =====
+# ---------- 基本 / 特徵 ----------
 FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
@@ -34,18 +38,17 @@ LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.65"))
 GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.35"))
 MAX_RNN_LEN   = int(os.getenv("MAX_RNN_LEN", "256"))
 
-# ===== 試用 / 開通 =====
+# ---------- 試用 / 開通 ----------
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@jins888")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 SHOW_REMAINING_TIME = env_flag("SHOW_REMAINING_TIME", 1)
-
 API_TRIAL_ENFORCE = env_flag("API_TRIAL_ENFORCE", 0)
 API_TRIAL_MINUTES = int(os.getenv("API_TRIAL_MINUTES", str(TRIAL_MINUTES)))
 API_MINIMAL_JSON  = env_flag("API_MINIMAL_JSON", 0)
 CRON_TOKEN = os.getenv("CRON_TOKEN", "")
 
-# ===== 模型與權重 =====
+# ---------- 模型與權重 ----------
 DEEP_ONLY   = int(os.getenv("DEEP_ONLY", "0"))
 DISABLE_RNN = int(os.getenv("DISABLE_RNN", "0"))
 RNN_HIDDEN  = int(os.getenv("RNN_HIDDEN", "32"))
@@ -97,29 +100,27 @@ SAME_SIDE_PENALTY  = float(os.getenv("SAME_SIDE_PENALTY", "0.02"))
 
 FEEDBACK_LOG_PATH = os.getenv("FEEDBACK_LOG_PATH", "data/feedback.csv")
 
+# ---------- LINE ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
     from linebot import LineBotApi, WebhookHandler
     from linebot.exceptions import InvalidSignatureError
-    from linebot.models import MessageEvent, TextMessage, FollowEvent, TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+    from linebot.models import (
+        MessageEvent, TextMessage, FollowEvent, TextSendMessage,
+        QuickReply, QuickReplyButton, MessageAction
+    )
     line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
     line_handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 except Exception as e:
     line_api = None; line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
 
-# 若沒設好 LINE，就用 stub 讓模組可載入（/line-webhook 會回 503）
-if line_handler is None:
-    class _Stub:
-        def add(self, *a, **k):
-            def deco(f): return f
-            return deco
-    line_handler = _Stub()
-    log.warning("LINE handler stubbed (no secret/token); /line-webhook will return 503")
-
+# ---------- sessions ----------
 SESS: Dict[str, Dict[str, object]] = {}
 SESS_API: Dict[str, Dict[str, object]] = {}
+
+# ---------- model load ----------
 XGB_MODEL = None; LGB_MODEL = None; RNN_MODEL = None
 
 def _load_xgb():
@@ -149,11 +150,9 @@ def _load_lgb():
 def _load_rnn():
     global RNN_MODEL
     if DISABLE_RNN == 1:
-        log.info("[MODEL] RNN disabled by env")
-        return
+        log.info("[MODEL] RNN disabled by env"); return
     try:
-        import torch
-        import torch.nn as nn   # ← 修正：分開寫
+        import torch, torch.nn as nn
         torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS","1")))
         class TinyRNN(nn.Module):
             def __init__(self, in_dim=3, hid=int(os.getenv("RNN_HIDDEN","32")), out_dim=3):
@@ -175,6 +174,7 @@ def _load_rnn():
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
+# ---------- features ----------
 MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"B", 1:"P", 2:"T"}
 
@@ -310,6 +310,7 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
+# ---------- regime ----------
 def _regime_detect(seq: List[int]) -> Tuple[str, Optional[str]]:
     if not REGIME_CTRL or len(seq) < 8: return "neutral", None
     bp=[v for v in seq[-REG_WIN:] if v in (0,1)]
@@ -339,6 +340,7 @@ def _parse_triplets(spec: str) -> Dict[str, Tuple[float,float,float]]:
     t=list(map(one, parts[:5]))
     return {"neutral":t[0], "streak":t[1], "chop":t[2], "banker":t[3], "player":t[4]}
 
+# ---------- model probs ----------
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
     import xgboost as xgb
@@ -435,6 +437,7 @@ def vote_and_average(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[st
 
     return p_avg, vote_labels, vote_counts, (regime, prefer)
 
+# ---------- 震盪與下注 ----------
 def _alt_flip_metrics(seq: List[int], win: int = 24) -> Tuple[float, float]:
     if not seq: return 0.5, 0.5
     sub=[x for x in seq[-win:] if x in (0,1)]
@@ -462,33 +465,82 @@ def _online_edge_boost(sess: Optional[Dict[str,object]]) -> float:
     stat["boost"]=boost; sess["perf"]=stat
     return boost
 
-def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
-                          seq: Optional[List[int]] = None, sess: Optional[Dict[str,object]] = None,
-                          regime_info: Tuple[str,Optional[str]]=("neutral", None)) -> Tuple[str,float,float]:
-    regime, prefer = regime_info
-    best = int(np.argmax(p)); lab1 = "莊" if best==0 else ("閒" if best==1 else "和")
-    p1 = float(p[best]); p2 = float(sorted([p[0],p[1],p[2]], reverse=True)[1])
-    edge = p1 - p2
+def _current_run(seq: List[int]) -> Tuple[int, Optional[str]]:
+    bp = [x for x in seq if x in (0,1)]
+    if not bp: return 0, None
+    last = bp[-1]; run = 1
+    for v in reversed(bp[:-1]):
+        if v == last: run += 1
+        else: break
+    return run, ("莊" if last==0 else "閒")
 
+def decide_bet_from_votes(
+    p: np.ndarray,
+    votes: Dict[str,int],
+    models_used:int,
+    seq: Optional[List[int]] = None,
+    sess: Optional[Dict[str,object]] = None,
+    regime_info: Tuple[str,Optional[str]]=("neutral", None)
+) -> Tuple[str,float,float]:
+    # 參數（可用環境變數調）
+    FOLLOW_STREAK = int(os.getenv("FOLLOW_STREAK", "1"))
+    CONTRA_CHOP   = int(os.getenv("CONTRA_CHOP", "1"))
+    SIDE_BIAS_GAIN= float(os.getenv("SIDE_BIAS_GAIN", "0.02"))
+    MIN_DELTA_STREAK = float(os.getenv("MIN_DELTA_STREAK","0.04"))
+    MIN_DELTA_CHOP   = float(os.getenv("MIN_DELTA_CHOP","0.03"))
+    HYST_COOLDOWN    = int(os.getenv("HYST_COOLDOWN","2"))
+    RUN_FOLLOW_MIN   = int(os.getenv("RUN_FOLLOW_MIN","3"))
+
+    # 基本機率與邊際
+    base_idx = int(np.argmax(p))
+    base_lab = "莊" if base_idx==0 else ("閒" if base_idx==1 else "和")
+    arr_sorted = sorted([float(p[0]),float(p[1]),float(p[2])], reverse=True)
+    edge_base = arr_sorted[0] - arr_sorted[1]
+
+    # 場況策略
+    regime, prefer = regime_info
+    run_len, last_side = _current_run(seq or [])
+    lab = base_lab if base_lab!="和" else ("莊" if p[0]>=p[1] else "閒")
+    edge = edge_base
+
+    if regime in ("streak","chop","banker","player"):
+        if regime == "streak" and FOLLOW_STREAK and last_side in ("莊","閒"):
+            if run_len >= RUN_FOLLOW_MIN:
+                lab = last_side
+                edge = max(edge, MIN_DELTA_STREAK)
+        elif regime == "chop" and CONTRA_CHOP and last_side in ("莊","閒"):
+            lab = "閒" if last_side=="莊" else "莊"
+            edge = max(edge, MIN_DELTA_CHOP)
+        elif regime in ("banker","player"):
+            if prefer in ("莊","閒"):
+                gain = SIDE_BIAS_GAIN
+                if prefer == "莊":
+                    if p[0] + gain > p[1]: lab = "莊"
+                else:
+                    if p[1] + gain > p[0]: lab = "閒"
+                edge = max(edge, MIN_EDGE)
+
+    # 變向冷卻（避免見莊打莊→見閒打閒來回抖動）
+    if sess is not None:
+        last_sug = sess.get("last_suggestion")
+        last_turn = int(sess.get("last_turn", 0))
+        turn = int(sess.get("turn", 0)) + 1
+        sess["turn"] = turn
+        if last_sug in ("莊","閒") and lab in ("莊","閒"):
+            if (turn - last_turn) < HYST_COOLDOWN and last_sug != lab:
+                lab = last_sug
+        sess["last_turn"] = turn
+
+    # 進場門檻
     enter_th = max(MIN_EDGE, ABSTAIN_EDGE, EDGE_ENTER)
-    if REGIME_CTRL and prefer in ("莊","閒"):
-        if lab1 == prefer:
+    if regime in ("streak","chop","banker","player") and lab in ("莊","閒") and prefer in ("莊","閒"):
+        if lab == prefer:
             enter_th = max(0.0, enter_th - REG_ALIGN_EDGE_BONUS)
         else:
             if REG_ALIGN_REQUIRE == 1:
+                return f"觀望（逆{prefer}）", edge, 0.0
+            else:
                 enter_th += REG_MISMATCH_EDGE_PENALTY
-
-    if sess:
-        same_run = int(sess.get("same_side_run", 0))
-        last_sug = sess.get("last_suggestion")
-        if last_sug and lab1 in ("莊","閒"):
-            if last_sug == lab1: same_run += 1
-            else: same_run = 1
-        else:
-            same_run = 1
-        sess["same_side_run"] = same_run
-        if same_run > max(1, SAME_SIDE_SOFT_CAP):
-            enter_th += SAME_SIDE_PENALTY
 
     if VOL_GUARD and seq is not None:
         alt, flip = _alt_flip_metrics(seq, ALT_WIN)
@@ -497,26 +549,40 @@ def decide_bet_from_votes(p: np.ndarray, votes: Dict[str,int], models_used:int,
 
     enter_th += _online_edge_boost(sess)
 
-    if edge < enter_th or lab1=="和":
-        return lab1, edge, 0.0
+    if lab == "和":
+        return "觀望（避和）", edge_base, 0.0
+    if edge < enter_th:
+        return f"觀望（偏{lab}）", edge, 0.0
+
     bet_pct = edge_to_base_pct(edge)
-    return lab1, edge, bet_pct
+    if bet_pct <= 0: 
+        return "觀望", edge, 0.0
+    return lab, edge, bet_pct
 
 def bet_amount(bankroll:int, pct:float) -> int:
     if not bankroll or bankroll<=0 or pct<=0: return 0
     return int(round(bankroll*pct))
 
+def bet_ladder_text(bankroll: int) -> str:
+    if not bankroll or bankroll <= 0:
+        return "🪜 配注：10%／20%／30%（先輸入本金以顯示金額）"
+    a = int(round(bankroll * 0.10))
+    b = int(round(bankroll * 0.20))
+    c = int(round(bankroll * 0.30))
+    return f"🪜 配注 10% {a:,}｜20% {b:,}｜30% {c:,}"
+
 def simple_reply(n_hand:int, lab:str, edge:float, p:np.ndarray, bankroll:int, bet_pct:float) -> str:
     conf = int(round(100*max(p[0], p[1], p[2])))
     amt = bet_amount(bankroll, bet_pct)
     if bet_pct > 0 and amt > 0:
-        return f"📝 已記 {n_hand} 手\n👉 下一局：{lab}（{conf}%）🎯\n💰 建議：{amt:,}"
+        return f"👉 下一局：{lab}（{conf}%）🎯｜💰 {amt:,}"
     else:
-        return f"📝 已記 {n_hand} 手\n👉 下一局：{lab}（{conf}%）🟡"
+        return f"👉 下一局：{lab}（{conf}%）🟡"
 
 def trial_over_text() -> str:
     return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
 
+# ---------- LINE helpers ----------
 def quick_reply_buttons():
     try:
         return QuickReply(items=[
@@ -530,7 +596,45 @@ def quick_reply_buttons():
     except Exception:
         return None
 
-# ===== 基礎路由 =====
+def _init_user(uid:str):
+    now = int(time.time())
+    SESS[uid] = {
+        "bankroll": 0, "seq": [], "trial_start": now, "premium": False,
+        "perf": {"ok":0,"ng":0,"boost":0.0},
+        "ema_p": None, "ema_b": None,
+        "last_suggestion": None,
+        "same_side_run": 0,
+        "trial_notified": False,
+        "turn": 0, "last_turn": 0,
+    }
+
+def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
+    try:
+        line_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
+    except Exception as e:
+        log.warning("[LINE] reply failed, try push: %s", e)
+        if uid:
+            try:
+                line_api.push_message(uid, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
+            except Exception as e2:
+                log.error("[LINE] push failed: %s", e2)
+
+def validate_activation_code(code: str) -> bool:
+    if not ADMIN_ACTIVATION_SECRET: return False
+    return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
+
+def trial_guard(uid:str, reply_token:str) -> bool:
+    sess = SESS.get(uid) or {}
+    if sess.get("premium", False): return False
+    start = int(sess.get("trial_start", int(time.time())))
+    now   = int(time.time())
+    elapsed_min = (now - start) // 60
+    if elapsed_min >= TRIAL_MINUTES:
+        safe_reply(reply_token, trial_over_text(), uid)
+        return True
+    return False
+
+# ---------- HTTP ----------
 @app.get("/")
 def root(): return "LiveBoot ok", 200
 
@@ -540,20 +644,6 @@ def health(): return jsonify(status="ok"), 200
 @app.get("/healthz")
 def healthz(): return jsonify(status="ok"), 200
 
-# ===== LINE Webhook（缺這個會完全沒回應）=====
-@app.post("/line-webhook")
-def line_webhook():
-    if not line_handler or not line_api or not isinstance(line_handler, WebhookHandler):
-        abort(503, "LINE not configured")
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    try:
-        line_handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400, "Invalid signature")
-    return "OK", 200
-
-# ===== 定時推播（試用期到期通知）=====
 @app.get("/cron")
 def cron():
     token = request.args.get("token","")
@@ -571,7 +661,6 @@ def cron():
                 log.warning("cron push failed: %s", e)
     return jsonify(pushed=cnt), 200
 
-# ===== 簡易 API 測試 =====
 @app.post("/predict")
 def predict_api():
     data = request.get_json(silent=True) or {}
@@ -618,6 +707,7 @@ def predict_api():
 
     p_avg, vote_labels, vote_counts, regime_info = vote_and_average(seq)
     lab, edge, bet_pct = decide_bet_from_votes(p_avg, vote_counts, len(vote_labels), seq, None, regime_info)
+
     if API_MINIMAL_JSON:
         return jsonify(
             hands=len(seq),
@@ -631,172 +721,143 @@ def predict_api():
     return jsonify(message=text, hands=len(seq), suggestion=lab,
                    bet_pct=float(bet_pct), bet_amount=bet_amount(bankroll, bet_pct)), 200
 
-# ====== LINE 互動 ======
-def _init_user(uid:str):
-    now = int(time.time())
-    SESS[uid] = {
-        "bankroll": 0, "seq": [], "trial_start": now, "premium": False,
-        "perf": {"ok":0,"ng":0,"boost":0.0},
-        "ema_p": None, "ema_b": None,
-        "last_suggestion": None,
-        "same_side_run": 0,
-        "trial_notified": False,
-    }
+# ---------- LINE webhook ----------
+if line_handler and line_api:
+    @line_handler.add(FollowEvent)
+    def on_follow(event):
+        uid = event.source.user_id
+        _init_user(uid)
+        mins = TRIAL_MINUTES
+        msg = (
+            f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
+            "請先輸入本金（例：5000）💵\n"
+            "再貼歷史（B/P/T 或 莊/閒/和）→『開始分析』📊\n"
+            "配注：10%／20%／30%（輸入本金後顯示金額）\n"
+            f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}"
+        )
+        line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
 
-@line_handler.add(FollowEvent)
-def on_follow(event):
-    uid = event.source.user_id
-    _init_user(uid)
-    mins = TRIAL_MINUTES
-    msg = (f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
-           "先輸入本金（例：5000）→ 貼歷史（B/P/T 或 莊/閒/和）→ 輸入『開始分析』📊\n"
-           f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}")
-    # 改用 safe_reply，避免冷啟動 reply_token 失效
-    safe_reply(event.reply_token, msg, uid)
+    @line_handler.add(MessageEvent, message=TextMessage)
+    def on_text(event):
+        uid = event.source.user_id
+        text = (event.message.text or "").strip()
+        if uid not in SESS: _init_user(uid)
+        sess = SESS[uid]
 
-def trial_guard(uid:str, text_in:str, reply_token:str) -> bool:
-    sess = SESS.get(uid) or {}
-    if sess.get("premium", False): return False
-    start = int(sess.get("trial_start", int(time.time())))
-    now   = int(time.time())
-    elapsed_min = (now - start) // 60
-    if elapsed_min >= TRIAL_MINUTES:
-        safe_reply(reply_token, trial_over_text(), uid)
-        sess["trial_notified"] = True
-        return True
-    return False
+        # 先做試用守門（到期則只回到期訊息）
+        if trial_guard(uid, event.reply_token): return
 
-def feedback_log(row: Dict[str, object]):
+        # 系統指令
+        if text in ["返回", "undo", "回上一步"]:
+            seq: List[int] = sess.get("seq", [])
+            if seq:
+                last = seq.pop(-1); sess["seq"] = seq
+                safe_reply(event.reply_token, f"↩️ 撤回 {INV.get(last,'?')}，共 {len(seq)} 手。", uid)
+            else:
+                safe_reply(event.reply_token, "ℹ️ 沒有可撤回的紀錄。", uid)
+            return
+
+        if text in ["結束分析", "清空", "reset"]:
+            sess["seq"] = []; sess["bankroll"] = 0
+            sess["ema_p"] = None; sess["ema_b"] = None
+            sess["last_suggestion"] = None; sess["same_side_run"]=0
+            safe_reply(
+                event.reply_token,
+                "🧹 已清空。\n請輸入本金（例：5000）💵\n🪜 配注：10%／20%／30%｜輸入本金後顯示金額\n貼歷史後輸入「開始分析」📊",
+                uid
+            )
+            return
+
+        if text.startswith("開通") or text.lower().startswith("activate"):
+            code = text.split(" ",1)[1].strip() if " " in text else ""
+            if validate_activation_code(code):
+                sess["premium"] = True
+                safe_reply(event.reply_token, "✅ 已開通成功！🎉", uid)
+            else:
+                safe_reply(event.reply_token, "❌ 密碼錯誤，請向管理員索取。", uid)
+            return
+
+        # 本金（純數字）
+        if text.isdigit():
+            sess["bankroll"] = int(text)
+            ladder = bet_ladder_text(sess["bankroll"])
+            safe_reply(event.reply_token, f"👍 已設定本金：{int(text):,}\n{ladder}", uid)
+            return
+
+        # 回報結果（線上自適應）
+        if text.startswith("結果") or text.lower().startswith("result"):
+            parts = text.split()
+            if len(parts) >= 2:
+                token = parts[1].strip().upper()
+                mapping = {"莊":"B","閒":"P","和":"T","B":"B","P":"P","T":"T"}
+                outcome = mapping.get(token)
+                last_sug = sess.get("last_suggestion")
+                perf = sess.setdefault("perf", {"ok":0,"ng":0,"boost":0.0})
+                if outcome and last_sug:
+                    ok = 1 if ((last_sug=="莊" and outcome=="B") or
+                               (last_sug=="閒" and outcome=="P") or
+                               (last_sug=="和" and outcome=="T")) else 0
+                    perf["ok"] = int(perf.get("ok",0)) + (1 if ok else 0)
+                    perf["ng"] = int(perf.get("ng",0)) + (0 if ok else 1)
+                # 簡化回覆
+                safe_reply(event.reply_token, "📥 已記錄結果", uid)
+            else:
+                safe_reply(event.reply_token, "ℹ️ 用法：結果 莊/閒/和", uid)
+            return
+
+        # 歷史/單手輸入
+        zh2eng = {"莊":"B","閒":"P","和":"T"}
+        norm = "".join(zh2eng.get(ch, ch) for ch in text.upper())
+        seq_in = parse_history(norm)
+        if seq_in and ("開始分析" not in text):
+            if len(seq_in) == 1:
+                sess.setdefault("seq", []); sess["seq"].append(seq_in[0])
+                safe_reply(event.reply_token, f"✅ 已記 1 手：{norm}（共 {len(sess['seq'])}）", uid)
+            else:
+                sess["seq"] = seq_in
+                safe_reply(event.reply_token, f"✅ 已覆蓋歷史：{len(seq_in)} 手", uid)
+            return
+
+        # 分析
+        if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
+            sseq: List[int] = sess.get("seq", [])
+            bankroll: int = int(sess.get("bankroll", 0) or 0)
+            p_avg, vote_labels, vote_counts, regime_info = vote_and_average(sseq)
+            # EMA
+            if EMA_ENABLE:
+                prev = sess.get("ema_p")
+                p_use = (1-EMA_PROB_A)*(prev if prev is not None else p_avg) + EMA_PROB_A*p_avg
+                sess["ema_p"] = p_use
+            else:
+                p_use = p_avg
+            # 決策
+            lab, edge, bet_pct = decide_bet_from_votes(p_use, vote_counts, len(vote_labels), sseq, sess, regime_info)
+            sess["last_suggestion"] = lab if lab in ("莊","閒","和") else None
+            sess["last_edge"] = float(edge); sess["last_bet_pct"] = float(bet_pct)
+            sess["last_probs"] = [float(p_use[0]), float(p_use[1]), float(p_use[2])]
+            reply = simple_reply(len(sseq), lab, edge, p_use, bankroll, bet_pct)
+            # 若未設定本金，提醒一次配注說明
+            if not bankroll or bankroll <= 0:
+                reply += "\n🪜 請先輸入本金以顯示 10%／20%／30% 配注金額"
+            safe_reply(event.reply_token, reply, uid); return
+
+        # 說明
+        safe_reply(event.reply_token, "🧭 指令：設定本金→貼歷史→『開始分析』｜『返回』撤回｜『結束分析』清空｜『結果 ⋯』回報上一手", uid)
+
+# ---------- LINE webhook endpoint ----------
+@app.post("/line-webhook")
+def line_webhook():
+    if not line_handler or not line_api:
+        abort(503, "LINE not configured")
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
     try:
-        path = FEEDBACK_LOG_PATH
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        new_file = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "ts","uid","hands","history","sug","p_b","p_p","p_t","edge","bankroll","bet_pct","bet_amt","result"
-            ])
-            if new_file: w.writeheader()
-            w.writerow(row)
-    except Exception as e:
-        log.warning("feedback log failed: %s", e)
+        line_handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400, "Invalid signature")
+    return "OK", 200
 
-def safe_reply(reply_token: str, text: str, uid: Optional[str] = None):
-    try:
-        line_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
-    except Exception as e:
-        log.warning("[LINE] reply failed, try push: %s", e)
-        if uid:
-            try:
-                line_api.push_message(uid, TextSendMessage(text=text, quick_reply=quick_reply_buttons()))
-            except Exception as e2:
-                log.error("[LINE] push failed: %s", e2)
-
-def validate_activation_code(code: str) -> bool:
-    if not ADMIN_ACTIVATION_SECRET: return False
-    return bool(code) and (code == ADMIN_ACTIVATION_SECRET)
-
-@line_handler.add(MessageEvent, message=TextMessage)
-def on_text(event):
-    uid = event.source.user_id
-    text = (event.message.text or "").strip()
-    if uid not in SESS: _init_user(uid)
-    sess = SESS[uid]
-
-    if trial_guard(uid, text, event.reply_token): return
-
-    if text in ["返回", "undo", "回上一步"]:
-        seq: List[int] = sess.get("seq", [])
-        if seq:
-            last = seq.pop(-1); sess["seq"] = seq
-            safe_reply(event.reply_token, f"↩️ 撤回 {INV.get(last,'?')}，共 {len(seq)} 手。", uid)
-        else:
-            safe_reply(event.reply_token, "ℹ️ 沒有可撤回的紀錄。", uid)
-        return
-
-    if text in ["結束分析", "清空", "reset"]:
-        sess["seq"] = []; sess["bankroll"] = 0
-        sess["ema_p"] = None; sess["ema_b"] = None
-        sess["last_suggestion"] = None; sess["same_side_run"]=0
-        safe_reply(event.reply_token, "🧹 已清空，請輸入本金（例：5000）後貼歷史或輸入「開始分析」📊", uid)
-        return
-
-    if text.startswith("開通") or text.lower().startswith("activate"):
-        code = text.split(" ",1)[1].strip() if " " in text else ""
-        if validate_activation_code(code):
-            sess["premium"] = True
-            safe_reply(event.reply_token, "✅ 已開通成功！🎉", uid)
-        else:
-            safe_reply(event.reply_token, "❌ 密碼錯誤，請向管理員索取。", uid)
-        return
-
-    if text.isdigit():
-        sess["bankroll"] = int(text)
-        safe_reply(event.reply_token, f"👍 已設定本金：{int(text):,}", uid)
-        return
-
-    if text.startswith("結果") or text.lower().startswith("result"):
-        parts = text.split()
-        if len(parts) >= 2:
-            token = parts[1].strip().upper()
-            mapping = {"莊":"B","閒":"P","和":"T","B":"B","P":"P","T":"T"}
-            outcome = mapping.get(token)
-            last_sug = sess.get("last_suggestion")
-            perf = sess.setdefault("perf", {"ok":0,"ng":0,"boost":0.0})
-            if outcome and last_sug:
-                ok = 1 if ((last_sug=="莊" and outcome=="B") or
-                           (last_sug=="閒" and outcome=="P") or
-                           (last_sug=="和" and outcome=="T")) else 0
-                perf["ok"] = int(perf.get("ok",0)) + (1 if ok else 0)
-                perf["ng"] = int(perf.get("ng",0)) + (0 if ok else 1)
-            hist = encode_history(sess.get("seq", []))
-            p = sess.get("last_probs") or [0.0,0.0,0.0]
-            row = {
-                "ts": int(time.time()), "uid": uid, "hands": len(sess.get("seq",[])),
-                "history": hist, "sug": last_sug or "",
-                "p_b": round(float(p[0]),4), "p_p": round(float(p[1]),4), "p_t": round(float(p[2]),4),
-                "edge": round(float(sess.get("last_edge",0.0)),4),
-                "bankroll": int(sess.get("bankroll",0) or 0),
-                "bet_pct": float(sess.get("last_bet_pct",0.0)),
-                "bet_amt": bet_amount(int(sess.get("bankroll",0) or 0), float(sess.get("last_bet_pct",0.0))),
-                "result": token if outcome else "",
-            }
-            feedback_log(row)
-            safe_reply(event.reply_token, "📥 已記錄結果", uid)
-        else:
-            safe_reply(event.reply_token, "ℹ️ 用法：結果 莊/閒/和", uid)
-        return
-
-    zh2eng = {"莊":"B","閒":"P","和":"T"}
-    norm = "".join(zh2eng.get(ch, ch) for ch in text.upper())
-    seq_in = parse_history(norm)
-    if seq_in and ("開始分析" not in text):
-        if len(seq_in) == 1:
-            sess.setdefault("seq", []); sess["seq"].append(seq_in[0])
-            safe_reply(event.reply_token, f"✅ 已記 1 手：{norm}（共 {len(sess['seq'])}）", uid)
-        else:
-            sess["seq"] = seq_in
-            safe_reply(event.reply_token, f"✅ 已覆蓋歷史：{len(seq_in)} 手", uid)
-        return
-
-    if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
-        sseq: List[int] = sess.get("seq", [])
-        bankroll: int = int(sess.get("bankroll", 0) or 0)
-        p_avg, vote_labels, vote_counts, regime_info = vote_and_average(sseq)
-        if EMA_ENABLE:
-            prev = sess.get("ema_p")
-            p_use = (1-EMA_PROB_A)*(prev if prev is not None else p_avg) + EMA_PROB_A*p_avg
-            sess["ema_p"] = p_use
-        else:
-            p_use = p_avg
-        lab, edge, bet_pct = decide_bet_from_votes(p_use, vote_counts, len(vote_labels), sseq, sess, regime_info)
-        sess["last_suggestion"] = lab if lab in ("莊","閒","和") else None
-        sess["last_edge"] = float(edge); sess["last_bet_pct"] = float(bet_pct)
-        sess["last_probs"] = [float(p_use[0]), float(p_use[1]), float(p_use[2])]
-        reply = simple_reply(len(sseq), lab, edge, p_use, bankroll, bet_pct)
-        safe_reply(event.reply_token, reply, uid); return
-
-    safe_reply(event.reply_token, "🧭 指令：設定本金→貼歷史→『開始分析』｜『返回』撤回｜『結束分析』清空｜『結果 ⋯』回報上一手", uid)
-
+# ---------- main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
