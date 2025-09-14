@@ -1,32 +1,8 @@
-# Web framework
-Flask==3.0.3
-gunicorn==21.2.0
-
-# LINE Bot
-line-bot-sdk==3.11.0
-requests==2.31.0  # 與 line-bot-sdk 相容
-
-# Core scientific stack
-numpy==1.26.4
-scipy==1.11.4
-scikit-learn==1.4.2
-joblib==1.3.2
-threadpoolctl==3.4.0
-python-dateutil==2.9.0.post0
-pydantic==2.11.7
-
-# Gradient-boosting models
-xgboost==2.0.3
-lightgbm==4.4.0
-
-# Deep learning (CPU)
-torch==2.3.1
-
-# Utils / I/O
-pillow==11.3.0
-opencv-python-headless==4.10.0.84
-aiohttp==3.9.5
-aenum==3.1.16
-typing-inspection==0.4.1
-Deprecated==1.2.18
-future==1.0.0
+Flask
+Flask-Cors
+numpy
+xgboost
+lightgbm
+torch
+line-bot-sdk
+gunicorn
