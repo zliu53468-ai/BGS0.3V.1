@@ -4,10 +4,12 @@ import os, logging, time, csv
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
 
 log = logging.getLogger("liveboot-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 app = Flask(__name__)
+CORS(app) # 允許跨來源請求
 
 # ---------- 配置參數（經修正與平衡）----------
 def env_flag(name: str, default: int = 1) -> int:
@@ -96,7 +98,7 @@ SESS: Dict[str, Dict[str, object]] = {}
 SESS_API: Dict[str, Dict[str, object]] = {}
 XGB_MODEL = None; LGB_MODEL = None; RNN_MODEL = None
 
-# ---------- 模型載入 (與原版相同) ----------
+# ---------- 模型載入 ----------
 def _load_xgb():
     global XGB_MODEL
     if DEEP_ONLY == 1: return
@@ -148,7 +150,7 @@ def _load_rnn():
 
 _load_xgb(); _load_lgb(); _load_rnn()
 
-# ---------- 基礎功能 (與原版大致相同) ----------
+# ---------- 基礎功能 ----------
 MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"B", 1:"P", 2:"T"}
 
@@ -180,7 +182,7 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
         if cur==last_bp:
             nr=r+1; nc=c
             if nr>=rows or gs[nr,nc]!=0: nr=r; nc=c+1
-            r,c=nr,nc; 
+            r,c=nr,nc;
             if 0<=r<rows and 0<=c<cols: gs[r,c]=cur
         else:
             c=c+1; r=0; last_bp=cur
@@ -267,7 +269,11 @@ def one_hot_seq(seq: List[int], win:int) -> np.ndarray:
         sub = seq[-win:] if len(seq)>win else seq[:]
         pad = [-1]*max(0, win-len(sub)); final=(pad+sub)[-win:]
         oh=[]
-        for v in final: a=[0,0,0]; (v in (0,1,2)) and (a[v]:=1); oh.append(a)
+        for v in final:
+            a=[0,0,0]
+            if v in (0,1,2):
+                a[v]=1
+            oh.append(a)
         return np.array(oh, dtype=np.float32)[np.newaxis,:,:]
 
 def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
@@ -281,14 +287,14 @@ def detect_regime(seq: List[int]) -> str:
     """分析最近的歷史紀錄以判斷當前的場態"""
     bp = [x for x in seq if x != 2]
     if len(bp) < REG_WIN: return "NORMAL"
-    
+
     sub = bp[-REG_WIN:]
-    
+
     # 單跳檢測
     chops = sum(1 for i in range(1, len(sub)) if sub[i] != sub[i-1])
     chop_rate = chops / (len(sub) - 1)
     if chop_rate >= REG_CHOP_TH: return "CHOP"
-    
+
     # 長龍檢測
     streaks = sum(1 for i in range(1, len(sub)) if sub[i] == sub[i-1])
     streak_rate = streaks / (len(sub) - 1)
@@ -302,7 +308,7 @@ def detect_regime(seq: List[int]) -> str:
 
     return "NORMAL"
 
-# ---------- 模型預測 (與原版大致相同) ----------
+# ---------- 模型預測 ----------
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
     if XGB_MODEL is None: return None
     import xgboost as xgb
@@ -367,7 +373,7 @@ def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[s
     if pr is not None:
         p = softmax_log(pr, TEMP_RNN); preds.append(p); names.append("RNN")
         vote_labels['RNN']=label_map[int(pr.argmax())]; vote_counts[vote_labels['RNN']]+=1
-    
+
     regime = detect_regime(seq) if REGIME_CTRL else "DISABLED"
 
     if not preds: return heuristic_probs(seq), {}, {'莊':0,'閒':0,'和':0}, regime
@@ -386,10 +392,10 @@ def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[s
 def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, float, float]:
     best_idx = int(np.argmax(p))
     best_label = "莊" if best_idx==0 else ("閒" if best_idx==1 else "和")
-    
+
     sorted_probs = sorted(p, reverse=True)
     edge = float(sorted_probs[0] - sorted_probs[1])
-    
+
     # 修正信心指數邏輯
     confidence_multiplier = 1.0
     if seq and len(seq) > 10:
@@ -399,9 +405,9 @@ def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, 
             change_rate = changes / (len(recent) - 1)
             # 變化率越高(單跳)，信心越低
             confidence_multiplier = 1.2 - 0.6 * change_rate
-    
+
     adjusted_edge = edge * confidence_multiplier
-    
+
     # 獲取當前連勝狀態
     bp_only = [x for x in seq if x != 2]
     streak_len = 0
@@ -435,13 +441,13 @@ def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, 
             return f"{best_label}（觀）", edge, 0.0
         else:
             return "觀望", edge, 0.0
-    
+
     # 動態下注比例
     if adjusted_edge >= 0.10: bet_pct = 0.25
     elif adjusted_edge >= 0.07: bet_pct = 0.15
     elif adjusted_edge >= 0.04: bet_pct = 0.10
     else: bet_pct = 0.05
-    
+
     return best_label, edge, bet_pct
 
 def bet_amount(bankroll:int, pct:float) -> int:
@@ -459,7 +465,7 @@ def simple_reply(n_hand:int, lab:str, edge:float, p:np.ndarray, bankroll:int, be
     amt = bet_amount(bankroll, bet_pct)
     b_pct, p_pct, t_pct = int(round(100*p[0])), int(round(100*p[1])), int(round(100*p[2]))
     prob_display = f"莊{b_pct}%｜閒{p_pct}%｜和{t_pct}%"
-    
+
     regime_map = {"NORMAL": "標準", "STREAK": "長龍", "CHOP": "單跳", "SIDE_BIAS": "偏格", "DISABLED": "關閉"}
     regime_text = f"場態：{regime_map.get(regime, '未知')}"
 
@@ -471,7 +477,7 @@ def simple_reply(n_hand:int, lab:str, edge:float, p:np.ndarray, bankroll:int, be
 def trial_over_text() -> str:
     return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
 
-# ---------- LINE功能 & HTTP API (與原版大致相同, 僅修改 predict 調用) ----------
+# ---------- LINE功能 & HTTP API ----------
 def quick_reply_buttons():
     try:
         return QuickReply(items=[
@@ -627,13 +633,13 @@ if line_handler and line_api:
         if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
             sseq = sess.get("seq", [])
             bankroll = int(sess.get("bankroll", 0) or 0)
-            
+
             p_avg, _, _, regime = enhanced_ensemble(sseq)
             lab, edge, bet_pct = flexible_decision(p_avg, sseq, regime)
-            
+
             sess["last_suggestion"] = lab if lab in ("莊","閒","和") else None
             reply = simple_reply(len(sseq), lab, edge, p_avg, bankroll, bet_pct, regime)
-            
+
             if not bankroll or bankroll <= 0:
                 reply += f"\n{bet_ladder_text(0)}"
             safe_reply(event.reply_token, reply, uid)
@@ -652,3 +658,4 @@ def line_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
