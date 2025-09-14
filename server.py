@@ -61,11 +61,15 @@ TEMP_RNN = float(os.getenv("TEMP_RNN", "0.8"))
 EDGE_ENTER    = float(os.getenv("EDGE_ENTER", "0.03"))
 
 # 場態控制 - 解決問題的核心
-REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))  # [修改] 預設啟用場態控制
-REG_WIN       = int(os.getenv("REG_WIN", "25"))     # [修改] 加長場態分析窗口
+REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))      # [修改] 預設啟用場態控制
+REG_WIN       = int(os.getenv("REG_WIN", "25"))         # [修改] 加長場態分析窗口
 REG_STREAK_TH = float(os.getenv("REG_STREAK_TH", "0.65")) # 長龍趨勢門檻
 REG_CHOP_TH   = float(os.getenv("REG_CHOP_TH", "0.60")) # 單跳趨勢門檻
 REG_SIDE_BIAS = float(os.getenv("REG_SIDE_BIAS", "0.70")) # 強勢邊門檻
+# [新增] 雙跳判斷參數
+REG_DCHOP_TH  = float(os.getenv("REG_DCHOP_TH", "0.66")) # 雙跳趨勢門檻 (最近6次有4次是連2)
+REG_DCHOP_WIN = int(os.getenv("REG_DCHOP_WIN", "6"))     # 雙跳分析窗口 (看最近6次轉換)
+
 
 # 場態調整參數
 REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.02")) # 順勢加成
@@ -282,9 +286,9 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
-# ---------- [新增] 場態分析 ----------
+# ---------- [升級] 場態分析 ----------
 def detect_regime(seq: List[int]) -> str:
-    """分析最近的歷史紀錄以判斷當前的場態"""
+    """分析最近的歷史紀錄以判斷當前的場態（新增雙跳檢測）"""
     bp = [x for x in seq if x != 2]
     if len(bp) < REG_WIN: return "NORMAL"
 
@@ -299,6 +303,25 @@ def detect_regime(seq: List[int]) -> str:
     streaks = sum(1 for i in range(1, len(sub)) if sub[i] == sub[i-1])
     streak_rate = streaks / (len(sub) - 1)
     if streak_rate >= REG_STREAK_TH: return "STREAK"
+
+    # [新增] 雙跳檢測 (e.g., BB PP BB PP)
+    if len(bp) > REG_DCHOP_WIN:
+        runs = []
+        if bp:
+            current_run = 1
+            for i in range(1, len(bp)):
+                if bp[i] == bp[i-1]:
+                    current_run += 1
+                else:
+                    runs.append(current_run)
+                    current_run = 1
+            runs.append(current_run)
+
+        if len(runs) >= REG_DCHOP_WIN:
+            recent_runs = runs[-REG_DCHOP_WIN:]
+            double_chop_count = recent_runs.count(2)
+            if double_chop_count / len(recent_runs) >= REG_DCHOP_TH:
+                return "DOUBLE_CHOP"
 
     # 強勢邊檢測
     b_count = sub.count(0)
@@ -388,7 +411,7 @@ def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[s
 
     return p_avg, vote_labels, vote_counts, regime
 
-# ---------- [修改] 決策邏輯 ----------
+# ---------- [升級] 決策邏輯 ----------
 def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, float, float]:
     best_idx = int(np.argmax(p))
     best_label = "莊" if best_idx==0 else ("閒" if best_idx==1 else "和")
@@ -430,6 +453,15 @@ def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, 
             adjusted_edge += REG_ALIGN_EDGE_BONUS
         elif regime == "CHOP" and prediction_is_streak and streak_len >= 2:
             adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+        # [新增] 雙跳邏輯
+        elif regime == "DOUBLE_CHOP":
+            # 雙跳邏輯：連2後斷，單1後連
+            if streak_len == 1 and prediction_is_streak: # 剛開單顆，預測連成對子
+                adjusted_edge += REG_ALIGN_EDGE_BONUS
+            elif streak_len == 2 and prediction_is_chop: # 已成對子，預測斷開換邊
+                adjusted_edge += REG_ALIGN_EDGE_BONUS
+            else: # 其他情況（例如想在單顆時就斷，或雙顆時繼續連）視為逆勢
+                adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
 
     # 連續同邊懲罰
     if streak_len >= SAME_SIDE_SOFT_CAP and best_idx == (bp_only[-1] if bp_only else -1):
@@ -466,7 +498,7 @@ def simple_reply(n_hand:int, lab:str, edge:float, p:np.ndarray, bankroll:int, be
     b_pct, p_pct, t_pct = int(round(100*p[0])), int(round(100*p[1])), int(round(100*p[2]))
     prob_display = f"莊{b_pct}%｜閒{p_pct}%｜和{t_pct}%"
 
-    regime_map = {"NORMAL": "標準", "STREAK": "長龍", "CHOP": "單跳", "SIDE_BIAS": "偏格", "DISABLED": "關閉"}
+    regime_map = {"NORMAL": "標準", "STREAK": "長龍", "CHOP": "單跳", "DOUBLE_CHOP": "雙跳", "SIDE_BIAS": "偏格", "DISABLED": "關閉"}
     regime_text = f"場態：{regime_map.get(regime, '未知')}"
 
     if bet_pct > 0 and amt > 0:
