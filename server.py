@@ -23,10 +23,10 @@ def env_flag(name: str, default: int = 1) -> int:
     except: return 1 if default else 0
 
 # 基礎參數 - 提高判斷穩定性
-FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))  # 稍稍加長特徵窗口
+FEAT_WIN   = int(os.getenv("FEAT_WIN", "40"))
 GRID_ROWS  = int(os.getenv("GRID_ROWS", "6"))
 GRID_COLS  = int(os.getenv("GRID_COLS", "20"))
-MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.035")) # 略微提高最小邊際，避免過度頻繁進場
+MIN_EDGE   = float(os.getenv("MIN_EDGE", "0.035"))
 CLIP_T_MIN = float(os.getenv("CLIP_T_MIN", "0.06"))
 CLIP_T_MAX = float(os.getenv("CLIP_T_MAX", "0.20"))
 SEED       = int(os.getenv("SEED", "42"))
@@ -34,8 +34,8 @@ np.random.seed(SEED)
 
 # 權重平衡 - 解決趨勢跟隨偏誤的關鍵
 USE_FULL_SHOE = env_flag("USE_FULL_SHOE", 1)
-LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.5"))  # [修改] 平衡本地與全域權重
-GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.5"))  # [修改] 平衡本地與全域權重
+LOCAL_WEIGHT  = float(os.getenv("LOCAL_WEIGHT", "0.5"))
+GLOBAL_WEIGHT = float(os.getenv("GLOBAL_WEIGHT", "0.5"))
 MAX_RNN_LEN   = int(os.getenv("MAX_RNN_LEN", "128"))
 
 # 試用設定
@@ -60,24 +60,28 @@ TEMP_RNN = float(os.getenv("TEMP_RNN", "0.8"))
 # 進場門檻
 EDGE_ENTER    = float(os.getenv("EDGE_ENTER", "0.03"))
 
-# 場態控制 - 解決問題的核心
-REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))      # [修改] 預設啟用場態控制
-REG_WIN       = int(os.getenv("REG_WIN", "25"))         # [修改] 加長場態分析窗口
-REG_STREAK_TH = float(os.getenv("REG_STREAK_TH", "0.65")) # 長龍趨勢門檻
-REG_CHOP_TH   = float(os.getenv("REG_CHOP_TH", "0.60")) # 單跳趨勢門檻
-REG_SIDE_BIAS = float(os.getenv("REG_SIDE_BIAS", "0.70")) # 強勢邊門檻
-# [新增] 雙跳判斷參數
-REG_DCHOP_TH  = float(os.getenv("REG_DCHOP_TH", "0.66")) # 雙跳趨勢門檻 (最近6次有4次是連2)
-REG_DCHOP_WIN = int(os.getenv("REG_DCHOP_WIN", "6"))     # 雙跳分析窗口 (看最近6次轉換)
+# 場態控制
+REGIME_CTRL   = int(os.getenv("REGIME_CTRL", "1"))
+REG_WIN       = int(os.getenv("REG_WIN", "25"))
+REG_STREAK_TH = float(os.getenv("REG_STREAK_TH", "0.65"))
+REG_CHOP_TH   = float(os.getenv("REG_CHOP_TH", "0.60"))
+REG_SIDE_BIAS = float(os.getenv("REG_SIDE_BIAS", "0.70"))
+REG_DCHOP_TH  = float(os.getenv("REG_DCHOP_TH", "0.66"))
+REG_DCHOP_WIN = int(os.getenv("REG_DCHOP_WIN", "6"))
+REG_PATTERN_WIN = int(os.getenv("REG_PATTERN_WIN", "4"))
+REG_EVENFEET_WIN = int(os.getenv("REG_EVENFEET_WIN", "3"))
 
+# [新增] 歷史圖形比對控制
+HISTORICAL_MATCH_CTRL  = int(os.getenv("HISTORICAL_MATCH_CTRL", "1")) # 啟用歷史圖形比對
+HISTORICAL_MATCH_BONUS = float(os.getenv("HISTORICAL_MATCH_BONUS", "0.05")) # 找到符合圖形時的信心加成
 
 # 場態調整參數
-REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.02")) # 順勢加成
-REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.04")) # 逆勢懲罰
+REG_ALIGN_EDGE_BONUS      = float(os.getenv("REG_ALIGN_EDGE_BONUS", "0.02"))
+REG_MISMATCH_EDGE_PENALTY = float(os.getenv("REG_MISMATCH_EDGE_PENALTY", "0.04"))
 
 # 同邊投注限制
-SAME_SIDE_SOFT_CAP = int(os.getenv("SAME_SIDE_SOFT_CAP", "4")) # 連續同邊4次後開始謹慎
-SAME_SIDE_PENALTY  = float(os.getenv("SAME_SIDE_PENALTY", "0.015")) # 同邊懲罰
+SAME_SIDE_SOFT_CAP = int(os.getenv("SAME_SIDE_SOFT_CAP", "4"))
+SAME_SIDE_PENALTY  = float(os.getenv("SAME_SIDE_PENALTY", "0.015"))
 
 FORCE_DIRECTION_WHEN_UNDEREDGE = int(os.getenv("FORCE_DIRECTION_WHEN_UNDEREDGE", "1"))
 
@@ -286,50 +290,73 @@ def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     e = np.exp(x)
     return e / e.sum()
 
-# ---------- [升級] 場態分析 ----------
+# ---------- [升級] 場態分析 & 歷史比對 ----------
 def detect_regime(seq: List[int]) -> str:
-    """分析最近的歷史紀錄以判斷當前的場態（新增雙跳檢測）"""
+    """分析最近的歷史紀錄以判斷當前的場態"""
     bp = [x for x in seq if x != 2]
-    if len(bp) < REG_WIN: return "NORMAL"
+    if len(bp) < 10: return "NORMAL"
 
-    sub = bp[-REG_WIN:]
+    sub = bp[-REG_WIN:] if len(bp) >= REG_WIN else bp
 
-    # 單跳檢測
-    chops = sum(1 for i in range(1, len(sub)) if sub[i] != sub[i-1])
-    chop_rate = chops / (len(sub) - 1)
-    if chop_rate >= REG_CHOP_TH: return "CHOP"
+    if len(sub) > 1:
+        chops = sum(1 for i in range(1, len(sub)) if sub[i] != sub[i-1])
+        chop_rate = chops / (len(sub) - 1)
+        if chop_rate >= REG_CHOP_TH: return "CHOP"
 
-    # 長龍檢測
-    streaks = sum(1 for i in range(1, len(sub)) if sub[i] == sub[i-1])
-    streak_rate = streaks / (len(sub) - 1)
-    if streak_rate >= REG_STREAK_TH: return "STREAK"
+        streaks = sum(1 for i in range(1, len(sub)) if sub[i] == sub[i-1])
+        streak_rate = streaks / (len(sub) - 1)
+        if streak_rate >= REG_STREAK_TH: return "STREAK"
 
-    # [新增] 雙跳檢測 (e.g., BB PP BB PP)
-    if len(bp) > REG_DCHOP_WIN:
-        runs = []
-        if bp:
-            current_run = 1
-            for i in range(1, len(bp)):
-                if bp[i] == bp[i-1]:
-                    current_run += 1
-                else:
-                    runs.append(current_run)
-                    current_run = 1
-            runs.append(current_run)
+    runs, run_sides = [], []
+    if bp:
+        current_run, current_side = 1, bp[0]
+        for i in range(1, len(bp)):
+            if bp[i] == bp[i-1]: current_run += 1
+            else:
+                runs.append(current_run); run_sides.append(current_side)
+                current_run, current_side = 1, bp[i]
+        runs.append(current_run); run_sides.append(current_side)
 
-        if len(runs) >= REG_DCHOP_WIN:
-            recent_runs = runs[-REG_DCHOP_WIN:]
-            double_chop_count = recent_runs.count(2)
-            if double_chop_count / len(recent_runs) >= REG_DCHOP_TH:
-                return "DOUBLE_CHOP"
+    if len(runs) >= REG_DCHOP_WIN:
+        recent_runs = runs[-REG_DCHOP_WIN:]
+        if recent_runs.count(2) / len(recent_runs) >= REG_DCHOP_TH:
+            return "DOUBLE_CHOP"
+            
+    if len(runs) >= REG_PATTERN_WIN:
+        recent_runs, recent_sides = runs[-REG_PATTERN_WIN:], run_sides[-REG_PATTERN_WIN:]
+        if (recent_runs == [2, 1, 2, 1] and recent_sides == [0, 1, 0, 1]): return "PATTERN_BBP"
+        if (recent_runs == [2, 1, 2, 1] and recent_sides == [1, 0, 1, 0]): return "PATTERN_PPB"
+            
+    if len(runs) >= REG_EVENFEET_WIN:
+        recent_runs = runs[-REG_EVENFEET_WIN:]
+        if len(set(recent_runs)) == 1 and recent_runs[0] > 1:
+            return "EVEN_FEET"
 
-    # 強勢邊檢測
-    b_count = sub.count(0)
-    p_count = sub.count(1)
+    b_count, p_count = sub.count(0), sub.count(1)
     if b_count / len(sub) >= REG_SIDE_BIAS or p_count / len(sub) >= REG_SIDE_BIAS:
         return "SIDE_BIAS"
 
     return "NORMAL"
+
+def find_historical_pattern_match(seq: List[int]) -> Optional[int]:
+    """在大路圖中尋找與當前欄位完全相同的歷史圖形"""
+    if len(seq) < 10: return None
+    gs, _, (r, c) = big_road_grid(seq, GRID_ROWS, GRID_COLS)
+    if c == 0 and r == 0: return None
+
+    current_col_raw = gs[:, c]
+    current_col_pattern = current_col_raw[current_col_raw != 0]
+    if current_col_pattern.size == 0: return None
+
+    for prev_c in range(c - 1, -1, -1):
+        prev_col_raw = gs[:, prev_c]
+        prev_col_pattern = prev_col_raw[prev_col_raw != 0]
+
+        if np.array_equal(current_col_pattern, prev_col_pattern):
+            next_outcome_side = gs[0, prev_c + 1]
+            if next_outcome_side == 1: return 0  # 歷史下一手為莊
+            elif next_outcome_side == -1: return 1 # 歷史下一手為閒
+    return None
 
 # ---------- 模型預測 ----------
 def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
@@ -381,7 +408,7 @@ def heuristic_probs(seq: List[int]) -> np.ndarray:
     p0=np.clip(p0,1e-6,None); p0=p0/p0.sum()
     return p0
 
-def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[str,int], str]:
+def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[str,int], str, Optional[int]]:
     weights=_parse_weights(ENSEMBLE_WEIGHTS); preds=[]; names=[];
     vote_labels={}; vote_counts={'莊':0,'閒':0,'和':0}; label_map=["莊","閒","和"]
     px = None if DEEP_ONLY==1 else xgb_probs(seq)
@@ -398,8 +425,9 @@ def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[s
         vote_labels['RNN']=label_map[int(pr.argmax())]; vote_counts[vote_labels['RNN']]+=1
 
     regime = detect_regime(seq) if REGIME_CTRL else "DISABLED"
+    hist_sug = find_historical_pattern_match(seq) if HISTORICAL_MATCH_CTRL else None
 
-    if not preds: return heuristic_probs(seq), {}, {'莊':0,'閒':0,'和':0}, regime
+    if not preds: return heuristic_probs(seq), {}, {'莊':0,'閒':0,'和':0}, regime, hist_sug
 
     W=np.array([weights.get(n,0.0) for n in names], dtype=np.float32)
     if W.sum()<=0: W=np.ones_like(W)/len(W)
@@ -409,72 +437,82 @@ def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, Dict[str,str], Dict[s
     p_avg[2]=np.clip(p_avg[2], CLIP_T_MIN, CLIP_T_MAX)
     p_avg=np.clip(p_avg,1e-6,None); p_avg=p_avg/p_avg.sum()
 
-    return p_avg, vote_labels, vote_counts, regime
+    return p_avg, vote_labels, vote_counts, regime, hist_sug
 
 # ---------- [升級] 決策邏輯 ----------
-def flexible_decision(p: np.ndarray, seq: List[int], regime: str) -> Tuple[str, float, float]:
-    best_idx = int(np.argmax(p))
-    best_label = "莊" if best_idx==0 else ("閒" if best_idx==1 else "和")
+def flexible_decision(p: np.ndarray, seq: List[int], regime: str, historical_suggestion: Optional[int]) -> Tuple[str, float, float]:
+    
+    if historical_suggestion is not None:
+        # 歷史圖形比對有結果，具最高優先級
+        best_idx = historical_suggestion
+        best_label = "莊" if best_idx == 0 else "閒"
+        p_sorted = sorted(p, reverse=True)
+        second_best_prob = p_sorted[0] if p.argmax() != best_idx else p_sorted[1]
+        edge = p[best_idx] - second_best_prob
+        adjusted_edge = edge + HISTORICAL_MATCH_BONUS
+    else:
+        # 正常模型預測與場態分析
+        best_idx = int(np.argmax(p))
+        best_label = "莊" if best_idx==0 else ("閒" if best_idx==1 else "和")
+        sorted_probs = sorted(p, reverse=True)
+        edge = float(sorted_probs[0] - sorted_probs[1])
+        confidence_multiplier = 1.0
+        if seq and len(seq) > 10:
+            recent = [x for x in seq[-10:] if x != 2]
+            if len(recent) > 1:
+                changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+                change_rate = changes / (len(recent) - 1)
+                confidence_multiplier = 1.2 - 0.6 * change_rate
+        adjusted_edge = edge * confidence_multiplier
 
-    sorted_probs = sorted(p, reverse=True)
-    edge = float(sorted_probs[0] - sorted_probs[1])
+        bp_only = [x for x in seq if x != 2]
+        streak_len = 0
+        if bp_only:
+            last = bp_only[-1]
+            for v in reversed(bp_only):
+                if v == last: streak_len += 1
+                else: break
+        runs = []
+        if bp_only:
+            current_run = 1
+            for i in range(1, len(bp_only)):
+                if bp_only[i] == bp_only[i-1]: current_run += 1
+                else: runs.append(current_run); current_run = 1
+            runs.append(current_run)
 
-    # 修正信心指數邏輯
-    confidence_multiplier = 1.0
-    if seq and len(seq) > 10:
-        recent = [x for x in seq[-10:] if x != 2]
-        if len(recent) > 1:
-            changes = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
-            change_rate = changes / (len(recent) - 1)
-            # 變化率越高(單跳)，信心越低
-            confidence_multiplier = 1.2 - 0.6 * change_rate
+        if REGIME_CTRL:
+            prediction_is_streak = (best_idx == (bp_only[-1] if bp_only else -1))
+            prediction_is_chop = not prediction_is_streak
+            if regime == "STREAK" and prediction_is_streak: adjusted_edge += REG_ALIGN_EDGE_BONUS
+            elif regime == "STREAK" and prediction_is_chop: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+            elif regime == "CHOP" and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+            elif regime == "CHOP" and prediction_is_streak and streak_len >= 2: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+            elif regime == "DOUBLE_CHOP":
+                if streak_len == 1 and prediction_is_streak: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                elif streak_len == 2 and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+            elif regime == "PATTERN_BBP":
+                if streak_len == 2 and bp_only[-1] == 0 and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                elif streak_len == 1 and bp_only[-1] == 1 and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+            elif regime == "PATTERN_PPB":
+                if streak_len == 2 and bp_only[-1] == 1 and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                elif streak_len == 1 and bp_only[-1] == 0 and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
+            elif regime == "EVEN_FEET":
+                if len(runs) >= 2:
+                    last_run_height = runs[-2]
+                    if streak_len < last_run_height and prediction_is_streak: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                    elif streak_len == last_run_height and prediction_is_chop: adjusted_edge += REG_ALIGN_EDGE_BONUS
+                    else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
 
-    adjusted_edge = edge * confidence_multiplier
+        if streak_len >= SAME_SIDE_SOFT_CAP and best_idx == (bp_only[-1] if bp_only else -1):
+            adjusted_edge -= (streak_len - SAME_SIDE_SOFT_CAP + 1) * SAME_SIDE_PENALTY
 
-    # 獲取當前連勝狀態
-    bp_only = [x for x in seq if x != 2]
-    streak_len = 0
-    if bp_only:
-        last = bp_only[-1]
-        for v in reversed(bp_only):
-            if v == last: streak_len += 1
-            else: break
-
-    # 場態調整
-    if REGIME_CTRL:
-        prediction_is_streak = (best_idx == (bp_only[-1] if bp_only else -1))
-        prediction_is_chop = (best_idx != (bp_only[-1] if bp_only else -1))
-
-        if regime == "STREAK" and prediction_is_streak:
-            adjusted_edge += REG_ALIGN_EDGE_BONUS
-        elif regime == "STREAK" and prediction_is_chop:
-            adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
-        elif regime == "CHOP" and prediction_is_chop:
-            adjusted_edge += REG_ALIGN_EDGE_BONUS
-        elif regime == "CHOP" and prediction_is_streak and streak_len >= 2:
-            adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
-        # [新增] 雙跳邏輯
-        elif regime == "DOUBLE_CHOP":
-            # 雙跳邏輯：連2後斷，單1後連
-            if streak_len == 1 and prediction_is_streak: # 剛開單顆，預測連成對子
-                adjusted_edge += REG_ALIGN_EDGE_BONUS
-            elif streak_len == 2 and prediction_is_chop: # 已成對子，預測斷開換邊
-                adjusted_edge += REG_ALIGN_EDGE_BONUS
-            else: # 其他情況（例如想在單顆時就斷，或雙顆時繼續連）視為逆勢
-                adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
-
-    # 連續同邊懲罰
-    if streak_len >= SAME_SIDE_SOFT_CAP and best_idx == (bp_only[-1] if bp_only else -1):
-        adjusted_edge -= (streak_len - SAME_SIDE_SOFT_CAP + 1) * SAME_SIDE_PENALTY
-
-    # 最終決策
     if adjusted_edge < EDGE_ENTER:
-        if FORCE_DIRECTION_WHEN_UNDEREDGE:
-            return f"{best_label}（觀）", edge, 0.0
-        else:
-            return "觀望", edge, 0.0
+        if FORCE_DIRECTION_WHEN_UNDEREDGE: return f"{best_label}（觀）", edge, 0.0
+        else: return "觀望", edge, 0.0
 
-    # 動態下注比例
     if adjusted_edge >= 0.10: bet_pct = 0.25
     elif adjusted_edge >= 0.07: bet_pct = 0.15
     elif adjusted_edge >= 0.04: bet_pct = 0.10
@@ -498,7 +536,12 @@ def simple_reply(n_hand:int, lab:str, edge:float, p:np.ndarray, bankroll:int, be
     b_pct, p_pct, t_pct = int(round(100*p[0])), int(round(100*p[1])), int(round(100*p[2]))
     prob_display = f"莊{b_pct}%｜閒{p_pct}%｜和{t_pct}%"
 
-    regime_map = {"NORMAL": "標準", "STREAK": "長龍", "CHOP": "單跳", "DOUBLE_CHOP": "雙跳", "SIDE_BIAS": "偏格", "DISABLED": "關閉"}
+    regime_map = {
+        "NORMAL": "標準", "STREAK": "長龍", "CHOP": "單跳", "DOUBLE_CHOP": "雙跳",
+        "PATTERN_BBP": "規律(莊莊閒)", "PATTERN_PPB": "規律(閒閒莊)",
+        "EVEN_FEET": "齊腳", "SIDE_BIAS": "偏格", "DISABLED": "關閉",
+        "HISTORICAL_MATCH": "歷史參照"
+    }
     regime_text = f"場態：{regime_map.get(regime, '未知')}"
 
     if bet_pct > 0 and amt > 0:
@@ -543,7 +586,7 @@ def trial_guard(uid:str, reply_token:str) -> bool:
     return False
 
 @app.get("/")
-def root(): return "LiveBoot Enhanced (Fixed) ok", 200
+def root(): return "LiveBoot Enhanced (Final) ok", 200
 @app.get("/health")
 def health(): return jsonify(status="ok"), 200
 @app.get("/healthz")
@@ -598,11 +641,12 @@ def predict_api():
         seq = []
         if session_key: SESS_API[session_key]["seq"] = []
 
-    p_avg, _, _, regime = enhanced_ensemble(seq)
-    lab, edge, bet_pct = flexible_decision(p_avg, seq, regime)
+    p_avg, _, _, regime, hist_sug = enhanced_ensemble(seq)
+    lab, edge, bet_pct = flexible_decision(p_avg, seq, regime, hist_sug)
 
-    text = simple_reply(len(seq), lab, edge, p_avg, bankroll, bet_pct, regime)
-    return jsonify(message=text, hands=len(seq), suggestion=lab, regime=regime,
+    display_regime = "HISTORICAL_MATCH" if hist_sug is not None else regime
+    text = simple_reply(len(seq), lab, edge, p_avg, bankroll, bet_pct, display_regime)
+    return jsonify(message=text, hands=len(seq), suggestion=lab, regime=display_regime,
                    bet_pct=float(bet_pct), bet_amount=bet_amount(bankroll, bet_pct),
                    probabilities={"banker": float(p_avg[0]), "player": float(p_avg[1]), "tie": float(p_avg[2])}), 200
 
@@ -666,11 +710,13 @@ if line_handler and line_api:
             sseq = sess.get("seq", [])
             bankroll = int(sess.get("bankroll", 0) or 0)
 
-            p_avg, _, _, regime = enhanced_ensemble(sseq)
-            lab, edge, bet_pct = flexible_decision(p_avg, sseq, regime)
+            p_avg, _, _, regime, hist_sug = enhanced_ensemble(sseq)
+            lab, edge, bet_pct = flexible_decision(p_avg, sseq, regime, hist_sug)
 
             sess["last_suggestion"] = lab if lab in ("莊","閒","和") else None
-            reply = simple_reply(len(sseq), lab, edge, p_avg, bankroll, bet_pct, regime)
+            
+            display_regime = "HISTORICAL_MATCH" if hist_sug is not None else regime
+            reply = simple_reply(len(sseq), lab, edge, p_avg, bankroll, bet_pct, display_regime)
 
             if not bankroll or bankroll <= 0:
                 reply += f"\n{bet_ladder_text(0)}"
