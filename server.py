@@ -109,6 +109,15 @@ except Exception as e:
     line_api = None; line_handler = None
     log.warning("LINE SDK not fully available: %s", e)
 
+# 若沒設好 LINE，就用 stub 讓模組可載入（/line-webhook 會回 503）
+if line_handler is None:
+    class _Stub:
+        def add(self, *a, **k):
+            def deco(f): return f
+            return deco
+    line_handler = _Stub()
+    log.warning("LINE handler stubbed (no secret/token); /line-webhook will return 503")
+
 SESS: Dict[str, Dict[str, object]] = {}
 SESS_API: Dict[str, Dict[str, object]] = {}
 XGB_MODEL = None; LGB_MODEL = None; RNN_MODEL = None
@@ -143,7 +152,8 @@ def _load_rnn():
         log.info("[MODEL] RNN disabled by env")
         return
     try:
-        import torch, torch.nn as nn
+        import torch
+        import torch.nn as nn   # ← 修正：分開寫
         torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS","1")))
         class TinyRNN(nn.Module):
             def __init__(self, in_dim=3, hid=int(os.getenv("RNN_HIDDEN","32")), out_dim=3):
@@ -520,6 +530,7 @@ def quick_reply_buttons():
     except Exception:
         return None
 
+# ===== 基礎路由 =====
 @app.get("/")
 def root(): return "LiveBoot ok", 200
 
@@ -529,6 +540,20 @@ def health(): return jsonify(status="ok"), 200
 @app.get("/healthz")
 def healthz(): return jsonify(status="ok"), 200
 
+# ===== LINE Webhook（缺這個會完全沒回應）=====
+@app.post("/line-webhook")
+def line_webhook():
+    if not line_handler or not line_api or not isinstance(line_handler, WebhookHandler):
+        abort(503, "LINE not configured")
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        line_handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400, "Invalid signature")
+    return "OK", 200
+
+# ===== 定時推播（試用期到期通知）=====
 @app.get("/cron")
 def cron():
     token = request.args.get("token","")
@@ -546,6 +571,7 @@ def cron():
                 log.warning("cron push failed: %s", e)
     return jsonify(pushed=cnt), 200
 
+# ===== 簡易 API 測試 =====
 @app.post("/predict")
 def predict_api():
     data = request.get_json(silent=True) or {}
@@ -605,6 +631,7 @@ def predict_api():
     return jsonify(message=text, hands=len(seq), suggestion=lab,
                    bet_pct=float(bet_pct), bet_amount=bet_amount(bankroll, bet_pct)), 200
 
+# ====== LINE 互動 ======
 def _init_user(uid:str):
     now = int(time.time())
     SESS[uid] = {
@@ -624,7 +651,8 @@ def on_follow(event):
     msg = (f"🤖 歡迎！已啟用 {mins} 分鐘試用\n"
            "先輸入本金（例：5000）→ 貼歷史（B/P/T 或 莊/閒/和）→ 輸入『開始分析』📊\n"
            f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}")
-    line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
+    # 改用 safe_reply，避免冷啟動 reply_token 失效
+    safe_reply(event.reply_token, msg, uid)
 
 def trial_guard(uid:str, text_in:str, reply_token:str) -> bool:
     sess = SESS.get(uid) or {}
@@ -633,11 +661,8 @@ def trial_guard(uid:str, text_in:str, reply_token:str) -> bool:
     now   = int(time.time())
     elapsed_min = (now - start) // 60
     if elapsed_min >= TRIAL_MINUTES:
-        if not sess.get("trial_notified"):
-            safe_reply(reply_token, trial_over_text(), uid)
-            sess["trial_notified"] = True
-        else:
-            safe_reply(reply_token, trial_over_text(), uid)
+        safe_reply(reply_token, trial_over_text(), uid)
+        sess["trial_notified"] = True
         return True
     return False
 
