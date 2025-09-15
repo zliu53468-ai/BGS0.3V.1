@@ -1,4 +1,4 @@
-# server.py — 純算牌 + 粒子濾波（ONLY 莊/閒建議｜EV含抽水｜¼-Kelly｜試用制｜卡片輸出｜支援和局回報）
+# server.py — Outcome-only（PF + RB-Exact）| 只回「莊/閒」| 卡片文案含建議下注金額
 # Author: 親愛的 x GPT-5 Thinking
 
 import os, logging, time, csv, pathlib, re
@@ -7,8 +7,7 @@ import numpy as np
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
-# ==== 基本設定 ====
-VERSION = "bgs-deplete-pf-2025-09-15"
+VERSION = "bgs-pf-rbexact-cardbet-2025-09-16"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -24,38 +23,19 @@ def env_flag(name: str, default: int = 1) -> int:
     try: return 1 if int(float(v)) != 0 else 0
     except: return 1 if default else 0
 
-# ==== 牌路/顯示 ====
+# ===== 文字解析（可選）=====
 MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"莊", 1:"閒", 2:"和"}
 
-def parse_history(s: str) -> List[int]:
-    s = (s or "").strip().upper()
-    if not s: return []
-    s = s.replace("，"," ").replace("、"," ").replace("\u3000"," ")
-    toks = s.split()
-    seq = list(s) if (len(toks) == 1 and len(s) <= 12) else toks
-    out = []
-    for ch in seq:
-        ch = ch.strip().upper()
-        if ch in MAP: out.append(MAP[ch])
-    return out
-
-# 解析「上局結果：閒6 莊8 / 和9 / TIE / DRAW」等；回 (P_total, B_total) 或 None
 def parse_last_hand_points(text: str):
+    """支援：上局結果：閒6 莊8 / 和9 / TIE / DRAW；回 (P_total, B_total) 或 None"""
     if not text: return None
     s = text.strip().upper().replace("：", ":")
     s = re.sub(r"\s+", "", s)
-
-    # 明確和局：和9 / TIE9 / DRAW9 → 視為 P_total=B_total=9
     m = re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*\s*(?:和|TIE|DRAW)\s*:?(\d)', s)
-    if m:
-        d = int(m.group(1)); return (d, d)
-
-    # 單獨和（無點數）：不扣牌，但後續照常預測
+    if m: d = int(m.group(1)); return (d, d)
     if re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*\s*(?:和|TIE|DRAW)\b', s):
         return None
-
-    # 一般格式
     m = re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*\s*(?:閒|P)\s*:?(\d)\s*(?:[,/]|)?\s*(?:莊|B)\s*:?(\d)', s)
     if m: return (int(m.group(1)), int(m.group(2)))
     m = re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*\s*(?:莊|B)\s*:?(\d)\s*(?:[,/]|)?\s*(?:閒|P)\s*:?(\d)', s)
@@ -66,7 +46,7 @@ def parse_last_hand_points(text: str):
     if m: return (int(m.group(2)), int(m.group(1)))
     return None
 
-# ==== 試用 / 營運 ====
+# ===== 試用 / 營運 =====
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
@@ -74,7 +54,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 SESS: Dict[str, Dict[str, object]] = {}
 def _init_user(uid:str):
     now = int(time.time())
-    SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": now, "premium": False}
+    SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": now, "premium": False, "last_pts_text": None}
 
 def validate_activation_code(code: str) -> bool:
     return bool(ADMIN_ACTIVATION_SECRET) and bool(code) and (code == ADMIN_ACTIVATION_SECRET)
@@ -87,35 +67,27 @@ def trial_guard(uid:str) -> Optional[str]:
         return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
     return None
 
-# ==== 算牌引擎 ====
-from bgs.deplete import DepleteMC
-from bgs.pfilter import OutcomePF
-
+# ===== 引擎：Outcome 粒子濾波（RB-Exact 前向）=====
 SEED = int(os.getenv("SEED","42"))
-DEPL_DECKS  = int(os.getenv("DEPL_DECKS", "8"))
-DEPL_SIMS   = int(os.getenv("DEPL_SIMS", "30000"))
+DECKS = int(os.getenv("DECKS","8"))
 
-# 粒子濾波（只用輸贏也能學）
+from bgs.pfilter import OutcomePF
 PF_N        = int(os.getenv("PF_N", "200"))
 PF_UPD_SIMS = int(os.getenv("PF_UPD_SIMS", "80"))
-PF_PRED_SIMS= int(os.getenv("PF_PRED_SIMS", "220"))
+PF_PRED_SIMS= int(os.getenv("PF_PRED_SIMS", "0"))
 PF_RESAMPLE = float(os.getenv("PF_RESAMPLE", "0.5"))
-PF_DIR_ALPHA= float(os.getenv("PF_DIR_ALPHA", "0.8"))  # Dirichlet 先驗強度
-PF_USE_EXACT= int(os.getenv("PF_USE_EXACT", "0"))      # 0=MC 前向；1=Exact-lite 前向
+PF_DIR_EPS  = float(os.getenv("PF_DIR_EPS", "0.002"))
+PF_BACKEND  = os.getenv("PF_BACKEND", "exact").lower()   # exact | mc
 
-DEPL = DepleteMC(decks=DEPL_DECKS, seed=SEED)
-PF   = OutcomePF(
-        decks=DEPL_DECKS, seed=SEED, n_particles=PF_N,
-        sims_lik=PF_UPD_SIMS, resample_thr=PF_RES_SAMPLE if (PF_RESAMPLE:=PF_RESAMPLE) else 0.5
-      ) if False else OutcomePF(decks=DEPL_DECKS, seed=SEED, n_particles=PF_N,
-                                sims_lik=PF_UPD_SIMS, resample_thr=PF_RESAMPLE,
-                                dirichlet_alpha=PF_DIR_ALPHA, use_exact=bool(PF_USE_EXACT))
+PF = OutcomePF(decks=DECKS, seed=SEED, n_particles=PF_N,
+               sims_lik=max(1, PF_UPD_SIMS), resample_thr=PF_RESAMPLE,
+               backend=PF_BACKEND, dirichlet_eps=PF_DIR_EPS)
 
-# ==== 決策（僅莊/閒）====
-EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.03"))  # 觀望門檻
+# ===== 決策（僅莊/閒）=====
+EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.03"))
 USE_KELLY   = env_flag("USE_KELLY", 1)
-KELLY_FACTOR= float(os.getenv("KELLY_FACTOR", "0.25"))  # ¼-Kelly
-MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))  # 單注上限 1.5%
+KELLY_FACTOR= float(os.getenv("KELLY_FACTOR", "0.25"))
+MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
 
 LOG_DIR     = os.getenv("LOG_DIR", "logs")
 pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -124,10 +96,8 @@ if not os.path.exists(PRED_CSV):
     with open(PRED_CSV, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(["ts","version","hands","pB","pP","pT","choice","edge","bet_pct","bankroll","bet_amt","engine","reason"])
 
-def banker_ev(pB, pP):  # tie 退回
-    return 0.95*pB - pP
-def player_ev(pB, pP):
-    return pP - pB
+def banker_ev(pB, pP): return 0.95*pB - pP
+def player_ev(pB, pP): return pP - pB
 def kelly_fraction(p_win: float, payoff: float):
     q = 1.0 - p_win
     edge = p_win*payoff - q
@@ -137,7 +107,7 @@ def bet_amount(bankroll:int, pct:float) -> int:
     return int(round(bankroll*pct))
 
 def decide_only_bp(prob):
-    pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
+    pB, pP, _ = float(prob[0]), float(prob[1]), float(prob[2])
     evB, evP = banker_ev(pB, pP), player_ev(pB, pP)
     side = 0 if evB > evP else 1
     edge_prob = abs(pB - pP)
@@ -147,13 +117,13 @@ def decide_only_bp(prob):
     if USE_KELLY:
         f = KELLY_FACTOR * (kelly_fraction(pB, 0.95) if side==0 else kelly_fraction(pP, 1.0))
         bet_pct = min(MAX_BET_PCT, float(max(0.0, f)))
-        reason = "🧠 純算牌｜📐 ¼-Kelly"
+        reason = "🧠 OutcomePF（RB-Exact）｜📐 ¼-Kelly"
     else:
         if final_edge >= 0.10: bet_pct = 0.25
         elif final_edge >= 0.07: bet_pct = 0.15
         elif final_edge >= 0.04: bet_pct = 0.10
         else: bet_pct = 0.05
-        reason = "🧠 純算牌｜🪜 階梯式配注"
+        reason = "🧠 OutcomePF（RB-Exact）｜🪜 階梯式配注"
     return (INV[side], final_edge, bet_pct, reason)
 
 def log_prediction(hands:int, p, choice:str, edge:float, bankroll:int, bet_pct:float, engine:str, reason:str):
@@ -164,103 +134,79 @@ def log_prediction(hands:int, p, choice:str, edge:float, bankroll:int, bet_pct:f
     except Exception as e:
         log.warning("log_prediction failed: %s", e)
 
-# ===== 卡片輸出 =====
-def format_card_output(prob, choice, last_pts_text: Optional[str]):
-    b_pct = f"{prob[0]*100:.2f}%"
-    p_pct = f"{prob[1]*100:.2f}%"
+# ===== 卡片樣式：第一行顯示「建議下注：莊（金額）」或「本局建議：觀望」=====
+def format_card_output(prob, choice, last_pts_text: Optional[str],
+                       bet_amt: Optional[int] = None, bet_pct: Optional[float] = None):
+    b_pct_txt = f"{prob[0]*100:.2f}%"
+    p_pct_txt = f"{prob[1]*100:.2f}%"
     header = []
     if last_pts_text:
         header = ["讀取完成", last_pts_text, "開始分析下局....", ""]
+    if choice != "觀望" and (bet_amt or 0) > 0:
+        first_line = f"建議下注：{choice}（{bet_amt:,}）"
+    else:
+        first_line = "本局建議：觀望"
     block = [
+        first_line,
+        "",
         "【預測結果】",
-        f"閒：{p_pct}",
-        f"莊：{b_pct}",
+        f"閒：{p_pct_txt}",
+        f"莊：{b_pct_txt}",
         f"本次預測結果：{choice if choice!='觀望' else '觀'}"
     ]
     return "\n".join(header + block)
 
-# ==== 健康檢查 ====
+# ===== 健康檢查 =====
 @app.get("/")
-def root(): return f"✅ BGS Deplete+PF Server OK ({VERSION})", 200
-
+def root(): return f"✅ BGS PF Server OK ({VERSION})", 200
 @app.get("/healthz")
 def healthz(): return jsonify(ok=True, ts=time.time(), version=VERSION), 200
 
-# ==== API：/update-hand（有點數時可用；只有輸贏不必呼叫）====
-@app.post("/update-hand")
-def update_hand_api():
-    obs = request.get_json(silent=True) or {}
-    try:
-        # Deplete 扣牌（有點數最準）
-        if "p_total" in obs and "b_total" in obs:
-            DEPL.update_hand(obs)
-            last_outcome = 1 if int(obs["p_total"]) > int(obs["b_total"]) else (0 if int(obs["b_total"]) > int(obs["p_total"]) else 2)
-            PF.update_outcome(last_outcome)
-        return jsonify(ok=True), 200
-    except Exception as e:
-        log.warning("update_hand failed: %s", e)
-        return jsonify(ok=False, msg=str(e)), 400
+# ===== API：/update-outcome（只輸贏）=====
+@app.post("/update-outcome")
+def update_outcome_api():
+    data = request.get_json(silent=True) or {}
+    o = str(data.get("outcome","")).strip().upper()
+    if o in ("B","莊","0"): PF.update_outcome(0)
+    elif o in ("P","閒","1"): PF.update_outcome(1)
+    elif o in ("T","和","TIE","DRAW","2"): PF.update_outcome(2)
+    else: return jsonify(ok=False, msg="outcome 必須是 B/P/T 或 莊/閒/和"), 400
+    return jsonify(ok=True), 200
 
-# ==== API：/predict（只回傳莊/閒建議；可回卡片）====
+# ===== API：/predict（只回莊/閒；style='card' 顯示金額）=====
 @app.post("/predict")
 def predict_api():
     data = request.get_json(silent=True) or {}
     bankroll = int(float(data.get("bankroll") or 0))
-    seq = parse_history(str(data.get("history","")))
     lp = data.get("last_pts")
-    pts = None
-    engine_note = None
+    lo = str(data.get("last_outcome","")).strip().upper()
 
-    # 先處理 last_pts（可能是點數；也可能是「和」）
     last_text = None
+    pts = None
     if lp:
         pts = parse_last_hand_points(lp)
         if pts is not None:
-            DEPL.update_hand({"p_total": int(pts[1 if False else 0]), "b_total": int(pts[1]) if False else int(pts[1]), "trials": 400})  # 只是保留防呆；下行為正確
-            try:
-                DEPL.update_hand({"p_total": int(pts[0]), "b_total": int(pts[1]), "trials": 400})
-                engine_note = "Deplete"
-                last_text = f"上局結果: 閒 {int(pts[0])} 莊 {int(pts[1])}"
-                PF.update_outcome(1 if int(pts[0])>int(pts[1]) else (0 if int(pts[1])>int(pts[0]) else 2))
-            except Exception as e:
-                log.warning("deplete update in /predict failed: %s", e)
+            last_outcome = 1 if int(pts[0]) > int(pts[1]) else (0 if int(pts[1]) > int(pts[0]) else 2)
+            PF.update_outcome(last_outcome)
+            last_text = f"上局結果: 閒 {int(pts[0])} 莊 {int(pts[1])}"
         else:
             if re.search(r'(?:和|TIE|DRAW)\b', str(lp).upper()):
-                PF.update_outcome(2)
-                last_text = "上局結果: 和局"
+                PF.update_outcome(2); last_text = "上局結果: 和局"
 
-    # 也可直接傳 last_outcome: "B"/"P"/"T"
-    if "last_outcome" in data:
-        o = str(data["last_outcome"]).strip().upper()
-        if o in ("B","莊","0"): PF.update_outcome(0); last_text = "上局結果: 莊勝"
-        elif o in ("P","閒","1"): PF.update_outcome(1); last_text = "上局結果: 閒勝"
-        elif o in ("T","和","2"): PF.update_outcome(2); last_text = "上局結果: 和局"
+    if not last_text and lo:
+        if lo in ("B","莊","0"): PF.update_outcome(0); last_text = "上局結果: 莊勝"
+        elif lo in ("P","閒","1"): PF.update_outcome(1); last_text = "上局結果: 閒勝"
+        elif lo in ("T","和","TIE","DRAW","2"): PF.update_outcome(2); last_text = "上局結果: 和局"
 
-    # 取得概率
-    p_depl = None; p_pf = None
-    try: p_depl = DEPL.predict(sims=DEPL_SIMS)
-    except Exception as e: log.warning("deplete predict failed: %s", e)
-    try: p_pf   = PF.predict(sims_per_particle=PF_PRED_SIMS)
-    except Exception as e: log.warning("pf predict failed: %s", e)
-
-    if (p_depl is not None) and (p_pf is not None):
-        if pts is not None: w_depl, w_pf = 0.7, 0.3; engine_note = "Mix(Deplete↑)"
-        else:               w_depl, w_pf = 0.3, 0.7; engine_note = "Mix(PF↑)"
-        p = w_depl * p_depl + w_pf * p_pf
-        p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
-    elif p_depl is not None:
-        p = p_depl; engine_note = "Deplete"
-    elif p_pf is not None:
-        p = p_pf; engine_note = "PF"
-    else:
-        p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
+    p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS","0"))))
+    engine_note = f"PF-{PF.backend}"
 
     choice, edge, bet_pct, reason = decide_only_bp(p)
     amt = bet_amount(bankroll, bet_pct)
 
     style = str(data.get("style","")).lower()
     if style == "card":
-        msg = format_card_output(p, choice, last_text)
+        msg = format_card_output(p, choice, last_text, bet_amt=amt, bet_pct=bet_pct)
     else:
         b_pct, p_pct = int(round(100*p[0])), int(round(100*p[1]))
         evB = banker_ev(float(p[0]), float(p[1])); evP = player_ev(float(p[0]), float(p[1]))
@@ -272,14 +218,15 @@ def predict_api():
             f"🧭 {reason}｜引擎：{engine_note}"
         )
 
-    log_prediction(len(seq), p, choice, edge, bankroll, bet_pct, engine_note or "NA", reason)
+    log_prediction(-1, p, choice, edge, bankroll, bet_pct, engine_note, reason)
     return jsonify(
-        message=msg, version=VERSION, hands=len(seq),
-        suggestion=choice, bet_pct=float(bet_pct), bet_amount=amt,
+        message=msg, version=VERSION,
+        suggestion=choice,  # 「莊」或「閒」或「觀望」
+        bet_pct=float(bet_pct), bet_amount=amt,
         probabilities={"banker": float(p[0]), "player": float(p[1])}
     ), 200
 
-# ==== （可選）LINE Webhook：未設 TOKEN 也能啟動 API ====
+# ===== （可選）LINE Webhook =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 line_api = None; line_handler = None
@@ -314,7 +261,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         def on_follow(event):
             uid = event.source.user_id; _init_user(uid)
             msg = (f"🤖 歡迎！提供 {TRIAL_MINUTES} 分鐘試用。\n"
-                   "輸入本金（例：5000）→ 回報『上局結果：閒6 莊8』或僅回『莊/閒/和』→『開始分析』。\n"
+                   "輸入本金（例：5000）→ 回報『B/P/T 或 莊/閒/和』 → 「開始分析」。\n"
                    "只建議『莊/閒』，不建議押『和』。\n"
                    f"到期請輸入：開通 你的密碼（向管理員索取）{ADMIN_CONTACT}")
             line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=quick_reply_buttons()))
@@ -327,8 +274,8 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             if guard: safe_reply(event.reply_token, guard, uid); return
 
             if text in ["結束分析", "清空", "reset"]:
-                SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": SESS.get(uid,{}).get("premium", False)}
-                safe_reply(event.reply_token, "🧹 已清空。請輸入本金（例：5000），或回報『上局結果：閒6 莊8』或『莊/閒/和』。", uid); return
+                SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": SESS.get(uid,{}).get("premium", False), "last_pts_text": None}
+                safe_reply(event.reply_token, "🧹 已清空。請輸入本金（例：5000），或回報『莊/閒/和』。", uid); return
             if text.startswith("開通") or text.lower().startswith("activate"):
                 code = text.split(" ",1)[1].strip() if " " in text else ""
                 SESS[uid]["premium"] = validate_activation_code(code)
@@ -337,57 +284,37 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 SESS[uid]["bankroll"] = int(text)
                 safe_reply(event.reply_token, f"👍 已設定本金：{int(text):,}", uid); return
 
-            # 點數句子 → Deplete 扣牌 + PF 同步勝負 + 卡片抬頭
+            # 只輸贏：更新 PF
+            up = text.strip().upper()
+            if up in ("B","莊","BANKER"):
+                PF.update_outcome(0); SESS[uid].setdefault("seq", []).append(0); SESS[uid]["last_pts_text"] = "上局結果: 莊勝"
+                safe_reply(event.reply_token, "📝 已記錄上一局：莊勝", uid); return
+            if up in ("P","閒","PLAYER"):
+                PF.update_outcome(1); SESS[uid].setdefault("seq", []).append(1); SESS[uid]["last_pts_text"] = "上局結果: 閒勝"
+                safe_reply(event.reply_token, "📝 已記錄上一局：閒勝", uid); return
+            if up in ("T","和","TIE","DRAW"):
+                PF.update_outcome(2); SESS[uid].setdefault("seq", []).append(2); SESS[uid]["last_pts_text"] = "上局結果: 和局"
+                safe_reply(event.reply_token, "📝 已記錄上一局：和局", uid); return
+
+            # 若使用者給點數字串，也支援（可選）
             pts = parse_last_hand_points(text)
             if pts is not None:
-                p_total, b_total = pts
-                try:
-                    DEPL.update_hand({"p_total": p_total, "b_total": b_total, "trials": 400})
-                    last_outcome = 1 if p_total > b_total else (0 if b_total > p_total else 2)
-                    PF.update_outcome(last_outcome)
-                except Exception as e:
-                    log.warning("deplete update(line) failed: %s", e)
-                SESS[uid].setdefault("seq", []).append(last_outcome)
-                SESS[uid]["last_pts_text"] = f"上局結果: 閒 {p_total} 莊 {b_total}"
-                safe_reply(event.reply_token, "讀取完成\n"+SESS[uid]["last_pts_text"]+"\n開始分析下局....", uid); return
+                last_outcome = 1 if int(pts[0]) > int(pts[1]) else (0 if int(pts[1]) > int(pts[0]) else 2)
+                PF.update_outcome(last_outcome)
+                SESS[uid]["last_pts_text"] = f"上局結果: 閒 {int(pts[0])} 莊 {int(pts[1])}"
+                safe_reply(event.reply_token, SESS[uid]["last_pts_text"], uid); return
 
-            # 只回「莊/閒/和」：用 PF 更新
-            single = text.strip().upper()
-            if single in ("B","莊","BANKER"):
-                PF.update_outcome(0); SESS[uid].setdefault("seq", []).append(0); SESS[uid]["last_pts_text"]="上局結果: 莊勝"
-                safe_reply(event.reply_token, "讀取完成\n上局結果: 莊勝\n開始分析下局....", uid); return
-            if single in ("P","閒","PLAYER"):
-                PF.update_outcome(1); SESS[uid].setdefault("seq", []).append(1); SESS[uid]["last_pts_text"]="上局結果: 閒勝"
-                safe_reply(event.reply_token, "讀取完成\n上局結果: 閒勝\n開始分析下局....", uid); return
-            if single in ("T","和","TIE","DRAW"):
-                PF.update_outcome(2); SESS[uid].setdefault("seq", []).append(2); SESS[uid]["last_pts_text"]="上局結果: 和局"
-                safe_reply(event.reply_token, "讀取完成\n上局結果: 和局\n開始分析下局....", uid); return
-
-            # 開始分析
-            if ("開始分析" in text) or (text in ["分析","開始","GO","go"]):
-                p_depl = None; p_pf = None
-                try: p_depl = DEPL.predict(sims=DEPL_SIMS)
-                except Exception as e: log.warning("deplete predict failed: %s", e)
-                try: p_pf   = PF.predict(sims_per_particle=PF_PRED_SIMS)
-                except Exception as e: log.warning("pf predict failed: %s", e)
-
-                if (p_depl is not None) and (p_pf is not None):
-                    w_depl, w_pf = (0.5, 0.5)
-                    p = w_depl * p_depl + w_pf * p_pf
-                    p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
-                    engine_note = "Mix"
-                elif p_depl is not None:
-                    p = p_depl; engine_note = "Deplete"
-                elif p_pf is not None:
-                    p = p_pf; engine_note = "PF"
-                else:
-                    p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
-
+            if ("開始分析" in up) or (up in ["分析","開始","GO"]):
+                p = PF.predict()
                 choice, edge, bet_pct, reason = decide_only_bp(p)
-                msg = format_card_output(p, choice, SESS[uid].get("last_pts_text"))
+                bankroll_now = int(SESS[uid].get("bankroll", 0))
+                msg = format_card_output(
+                    p, choice, SESS[uid].get("last_pts_text"),
+                    bet_amt=bet_amount(bankroll_now, bet_pct), bet_pct=bet_pct
+                )
                 safe_reply(event.reply_token, msg, uid); return
 
-            safe_reply(event.reply_token, "🧭 指令：輸入本金 → 回報『上局結果：閒6 莊8』或『莊/閒/和』 → 「開始分析」", uid)
+            safe_reply(event.reply_token, "🧭 指令：輸入本金 → 回報『B/P/T 或 莊/閒/和』 →「開始分析」", uid)
 
         @app.post("/line-webhook")
         def line_webhook():
@@ -398,7 +325,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     except Exception as e:
         log.warning("LINE not fully configured: %s", e)
 
-# ==== 本地啟動 ====
+# ===== 本地啟動 =====
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     log.info("Starting %s on port %s", VERSION, port)
