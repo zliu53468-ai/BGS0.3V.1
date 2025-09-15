@@ -1,8 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
 .env
-models/*.pkl
-models/*.npz
-models/*.ubj
-models/*.json
-models/*.txt
+logs/
+
+
