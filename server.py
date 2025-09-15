@@ -174,7 +174,7 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
             if 0<=r<rows and 0<=c<cols: gs[r,c]=cur
         else:
             c=c+1; r=0; last_bp=cur
-            if c<cols: 
+            if c<cols:
                 gs[r,c]=cur
     return gs, gt, (r,c)
 
@@ -495,5 +495,4 @@ def line_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
 
