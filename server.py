@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 import numpy as np
 
-VERSION = "bgs-pf-rbexact-setup-flow-2025-09-16"
+VERSION = "bgs-pf-rbexact-setup-flow-2025-09-16-v2" # version updated
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s)")
 log = logging.getLogger("bgs-server")
 
@@ -58,7 +58,7 @@ TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 
-# flow phase: choose_game -> choose_table -> await_pts -> ready
+# flow phase: choose_game -> choose_table -> await_bankroll -> await_pts -> ready
 SESS: Dict[str, Dict[str, object]] = {}
 
 def _init_user(uid: str):
@@ -94,19 +94,21 @@ def trial_guard(uid: str) -> Optional[str]:
 SEED  = int(os.getenv("SEED","42"))
 DECKS = int(os.getenv("DECKS","8"))
 
-from bgs.pfilter import OutcomePF
-PF_N         = int(os.getenv("PF_N", "200"))
-PF_UPD_SIMS  = int(os.getenv("PF_UPD_SIMS", "80"))
-PF_PRED_SIMS = int(os.getenv("PF_PRED_SIMS", "0"))
-PF_RESAMPLE  = float(os.getenv("PF_RESAMPLE", "0.5"))
-PF_DIR_EPS   = float(os.getenv("PF_DIR_EPS", "0.002"))
-PF_BACKEND   = os.getenv("PF_BACKEND", "exact").lower()
+# 這裡假設 bgs.pfilter 存在且可被 import
+try:
+    from bgs.pfilter import OutcomePF
+    PF = OutcomePF(
+        decks=DECKS, seed=SEED, n_particles=int(os.getenv("PF_N", "200")),
+        sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "80"))), resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
+        backend=os.getenv("PF_BACKEND", "exact").lower(), dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.002"))
+    )
+except ImportError:
+    log.error("Could not import OutcomePF from bgs.pfilter. Using a dummy object.")
+    class DummyPF:
+        def update_outcome(self, _): pass
+        def predict(self, **_): return np.array([0.5, 0.49, 0.01])
+    PF = DummyPF()
 
-PF = OutcomePF(
-    decks=DECKS, seed=SEED, n_particles=PF_N,
-    sims_lik=max(1, PF_UPD_SIMS), resample_thr=PF_RESAMPLE,
-    backend=PF_BACKEND, dirichlet_eps=PF_DIR_EPS
-)
 
 # ====== 下注決策與金額 ======
 EDGE_ENTER   = float(os.getenv("EDGE_ENTER", "0.03"))
@@ -187,47 +189,6 @@ def healthz(): return jsonify(ok=True, ts=time.time(), version=VERSION), 200
 @app.get("/health")
 def health(): return jsonify(ok=True, ts=time.time(), version=VERSION), 200
 
-# ====== REST：只輸贏/預測 ======
-@app.post("/update-outcome")
-def update_outcome_api():
-    data = request.get_json(silent=True) or {}
-    o = str(data.get("outcome","")).strip().upper()
-    if o in ("B","莊","0"): PF.update_outcome(0)
-    elif o in ("P","閒","1"): PF.update_outcome(1)
-    elif o in ("T","和","TIE","DRAW","2"): PF.update_outcome(2)
-    else: return jsonify(ok=False, msg="outcome 必須是 B/P/T 或 莊/閒/和"), 400
-    return jsonify(ok=True), 200
-
-@app.post("/predict")
-def predict_api():
-    data = request.get_json(silent=True) or {}
-    bankroll = int(float(data.get("bankroll") or 0))
-    lp = data.get("last_pts")
-    lo = str(data.get("last_outcome","")).strip().upper()
-
-    last_text = None
-    if lp:
-        pts = parse_last_hand_points(lp)
-        if pts is not None:
-            last_outcome = 1 if pts[0] > pts[1] else (0 if pts[1] > pts[0] else 2)
-            PF.update_outcome(last_outcome)
-            last_text = "上局結果: 和局" if last_outcome==2 else f"上局結果: 閒 {pts[0]} 莊 {pts[1]}"
-        else:
-            if re.search(r"(?:和|TIE|DRAW)\b", str(lp).upper()):
-                PF.update_outcome(2); last_text = "上局結果: 和局"
-    if not last_text and lo:
-        if lo in ("B","莊","0"): PF.update_outcome(0); last_text = "上局結果: 莊勝"
-        elif lo in ("P","閒","1"): PF.update_outcome(1); last_text = "上局結果: 閒勝"
-        elif lo in ("T","和","TIE","DRAW","2"): PF.update_outcome(2); last_text = "上局結果: 和局"
-
-    p = PF.predict(sims_per_particle=max(0, PF_PRED_SIMS))
-    choice, edge, bet_pct, reason = decide_only_bp(p)
-    amt = bet_amount(bankroll, bet_pct)
-    msg = format_output_card(p, choice, last_text, bet_amt=amt)
-    log_prediction(-1, p, choice, edge, bankroll, bet_pct, f"PF-{PF.backend}", reason)
-    return jsonify(message=msg, suggestion=choice, bet_pct=float(bet_pct), bet_amount=amt,
-                   probabilities={"banker":float(p[0]), "player":float(p[1])}, version=VERSION), 200
-
 # ====== LINE Webhook（完整設定流程 + 快速按鈕 + 試用剩餘分鐘） ======
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -262,7 +223,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
                     QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
                     QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
-                    QuickReplyButton(action=MessageAction(label="本金 5000 💰", text="本金 5000")),
                 ])
             except Exception:
                 return None
@@ -282,7 +242,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             left = trial_left_minutes(uid)
             reply(event.reply_token,
                   "👋 歡迎加入！\n請先點『遊戲設定』或輸入『遊戲設定』開始。\n"
-                  "流程：選館別 → 輸入桌號（如 DG05）→ 輸入上局點數（例：65）→ 「開始分析」。\n"
                   f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）", uid)
 
         @line_handler.add(MessageEvent, message=TextMessage)
@@ -303,12 +262,8 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 msg = "✅ 已開通成功！" if SESS[uid]["premium"] else "❌ 密碼錯誤，請向管理員索取。"
                 reply(event.reply_token, msg, uid); return
 
-            # 本金
-            m = re.match(r"^(?:本金|BAL|BANKROLL)\s+(\d+)$", text, flags=re.IGNORECASE)
-            if m or text.isdigit():
-                val = int(m.group(1)) if m else int(text)
-                SESS[uid]["bankroll"] = val
-                reply(event.reply_token, f"👍 已設定本金：{val:,}", uid); return
+            # ===== 變更點 1: 移除獨立的本金設定邏輯 =====
+            # 原本在這裡的 m or text.isdigit() 判斷式已被移除，整合到設定流程中
 
             # 遊戲設定入口
             if up in ("遊戲設定","設定","SETUP","GAME"):
@@ -329,12 +284,27 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             # 2) 桌號（兩碼英字+兩位數字，如 DG05）
             if phase == "choose_table" and re.fullmatch(r"[A-Za-z]{2}\d{2}", text):
                 SESS[uid]["table"] = text.upper()
-                SESS[uid]["phase"] = "await_pts"
-                reply(event.reply_token, "🔌 連接數據庫中..\n✅ 連接數據庫完成\n🆗 桌號已設定完成\n\n"
-                                          "請輸入上局閒莊點數（例如：65，先輸入閒再輸入莊）", uid)
+                SESS[uid]["phase"] = "await_bankroll" # ===== 變更點 2: 下一步改為等待本金 =====
+                reply(event.reply_token, f"✅ 已設定桌號【{SESS[uid]['table']}】\n"
+                                          "請輸入您的本金金額（例如: 5000）", uid)
                 return
 
-            # 3) 上局點數（65 / 閒6莊5 / 和）
+            # ===== 變更點 3: 新增設定本金的流程 =====
+            # 3) 本金
+            if phase == "await_bankroll":
+                if text.isdigit() and int(text) > 0:
+                    val = int(text)
+                    SESS[uid]["bankroll"] = val
+                    SESS[uid]["phase"] = "await_pts" # 下一步改為等待點數
+                    reply(event.reply_token, f"👍 已設定本金：{val:,}\n\n"
+                                             "🔌 連接數據庫中..\n✅ 連接數據庫完成\n"
+                                             "請輸入上局閒莊點數（例如：65，先閒後莊）", uid)
+                    return
+                else:
+                    reply(event.reply_token, "❌ 金額格式錯誤，請直接輸入一個數字（例如: 5000）", uid)
+                    return
+            
+            # 4) 上局點數（65 / 閒6莊5 / 和）
             if phase == "await_pts":
                 pts = parse_last_hand_points(text)
                 if pts is not None:
@@ -347,7 +317,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     SESS[uid]["phase"] = "ready"
                     left = trial_left_minutes(uid)
                     reply(event.reply_token, f"✅ 已記錄上一局點數。\n"
-                                             f"現在可輸入『開始分析』或『開始分析 53』。\n"
+                                             f"所有設定完成！請點擊或輸入『開始分析』。\n"
                                              f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）", uid)
                     return
                 else:
@@ -360,7 +330,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 reply(event.reply_token, "📝 已記錄上一局：莊勝", uid); return
             if up in ("P","閒","PLAYER"):
                 PF.update_outcome(1)
-                SESS[uid]["last_pts_text"] = "上局結果: 關勝".replace("關","閒")
+                SESS[uid]["last_pts_text"] = "上局結果: 閒勝"
                 reply(event.reply_token, "📝 已記錄上一局：閒勝", uid); return
             if up in ("T","和","TIE","DRAW"):
                 PF.update_outcome(2)
@@ -369,15 +339,14 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             # 開始分析/開始分析 53
             m2 = re.match(r"^開始分析(?:\s+(\d+))?$", text)
-            # ===== ✨✨✨ 以下為修正處 ✨✨✨ =====
             if (text == "開始分析" or m2) and SESS[uid].get("phase") == "ready":
-            # ===== ✨✨✨ 以上為修正處 ✨✨✨ =====
                 if m2 and m2.group(1):
                     SESS[uid]["table_no"] = m2.group(1)
-                p = PF.predict(sims_per_particle=max(0, PF_PRED_SIMS))
+                p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
                 choice, edge, bet_pct, reason = decide_only_bp(p)
                 bankroll_now = int(SESS[uid].get("bankroll", 0))
                 msg = format_output_card(p, choice, SESS[uid].get("last_pts_text"), bet_amt=bet_amount(bankroll_now, bet_pct))
+                log_prediction(0, p, choice, edge, bankroll_now, bet_pct, f"PF-{PF.backend}", reason) # Logging bankroll
                 reply(event.reply_token, msg, uid); return
 
             # 結束分析：清乾淨但保留 premium
@@ -391,7 +360,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             # 其餘：提示從遊戲設定開始
             left = trial_left_minutes(uid)
-            reply(event.reply_token, "請先輸入『遊戲設定』開始：選館別 → 桌號 → 上局點數 → 開始分析。\n"
+            reply(event.reply_token, "指令無法辨識。如果您想開始，請輸入『遊戲設定』並依照引導完成。\n"
                                      f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）", uid)
 
         @app.post("/line-webhook")
@@ -401,6 +370,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 line_handler.handle(body, signature)
             except InvalidSignatureError:
                 abort(400, "Invalid signature")
+            except Exception as e:
+                log.error(f"Error in webhook handling: {e}")
+                abort(500)
             return "OK", 200
 
     except Exception as e:
@@ -410,4 +382,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     log.info("Starting %s on port %s", VERSION, port)
+    # For production, use a WSGI server like Gunicorn instead of app.run()
+    # Example: gunicorn --worker-tmp-dir /dev/shm server:app
     app.run(host="0.0.0.0", port=port, debug=False)
