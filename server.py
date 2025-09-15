@@ -106,7 +106,7 @@ XGB_MODEL = None; LGB_MODEL = None; RNN_MODEL = None
 MAP = {"B":0, "P":1, "T":2, "莊":0, "閒":1, "和":2}
 INV = {0:"B", 1:"P", 2:"T"}
 
-# ---------- 模型載入 (省略未變更的程式碼) ----------
+# ---------- 模型載入 ----------
 def _load_xgb():
     global XGB_MODEL
     if DEEP_ONLY == 1: return
@@ -147,14 +147,17 @@ def _load_rnn():
     except Exception as e: log.warning("[MODEL] RNN load failed: %s", e)
 _load_xgb(); _load_lgb(); _load_rnn()
 
-# ---------- 基礎功能 & 特徵工程 (省略未變更的程式碼) ----------
+# ---------- 基礎功能 & 特徵工程 ----------
 def parse_history(s: str) -> List[int]:
-    s = (s or "").strip().upper(); out=[]
+    s = (s or "").strip().upper()
     if not s: return []
-    toks = s.split(); seq = list(s) if len(toks)==1 else toks
+    toks = s.split()
+    seq = list(s) if len(toks) == 1 else toks
+    out = []
     for ch in seq:
         ch = ch.strip().upper()
-        if ch in MAP: out.append(MAP[ch])
+        if ch in MAP:
+            out.append(MAP[ch])
     return out
 
 def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
@@ -170,13 +173,30 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
         if cur==last_bp:
             nr=r+1; nc=c
             if nr>=rows or gs[nr,nc]!=0: nr=r; nc=c+1
-            r,c=nr,nc;
+            r,c=nr,nc
             if 0<=r<rows and 0<=c<cols: gs[r,c]=cur
         else:
             c=c+1; r=0; last_bp=cur
             if c<cols:
                 gs[r,c]=cur
     return gs, gt, (r,c)
+
+def _parse_weights(spec: str) -> Dict[str, float]:
+    out={"XGB":0.33,"LGBM":0.33,"RNN":0.34}
+    try:
+        tmp={}
+        for part in (spec or "").split(","):
+            if ":" in part:
+                k,v=part.split(":",1); k=k.strip().lower(); v=float(v)
+                if k=="xgb": tmp["XGB"]=v
+                if k=="lgb": tmp["LGBM"]=v
+                if k=="rnn": tmp["RNN"]=v
+        if tmp:
+            s=sum(max(0.0,x) for x in tmp.values()) or 1.0
+            for k in tmp: tmp[k]=max(0.0,tmp[k])/s
+            out.update(tmp)
+    except: pass
+    return out
 
 def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
     local=_local_bigroad_feat(seq, rows, cols, win).astype(np.float32)
@@ -239,6 +259,7 @@ def _local_bigroad_feat(seq: List[int], rows:int, cols:int, win:int) -> np.ndarr
     cur_col_height=float((gs[:,c]!=0).sum())/rows if 0<=c<cols else 0.0; cur_col_side=float(gs[0,c]) if 0<=c<cols else 0.0
     cnt=np.bincount(sub, minlength=3).astype(np.float32); freq=cnt/max(1,len(sub))
     return np.concatenate([grid_sign_flat, grid_tie_flat, np.array([streak_len/rows, streak_side], dtype=np.float32), col_heights, np.array([cur_col_height, cur_col_side], dtype=np.float32), freq], axis=0)
+
 def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
     x = np.log(np.clip(p,1e-9,None)) / max(1e-9, temp); x = x - x.max(); e = np.exp(x); return e / e.sum()
 
@@ -277,6 +298,33 @@ def find_historical_pattern_match(seq: List[int]) -> Optional[int]:
             if next_outcome_side == 1: return 0
             elif next_outcome_side == -1: return 1
     return None
+
+def xgb_probs(seq: List[int]) -> Optional[np.ndarray]:
+    if XGB_MODEL is None: return None
+    import xgboost as xgb
+    feat=big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).reshape(1,-1)
+    p=XGB_MODEL.predict(xgb.DMatrix(feat))[0]
+    return np.array(p, dtype=np.float32)
+
+def lgb_probs(seq: List[int]) -> Optional[np.ndarray]:
+    if LGB_MODEL is None: return None
+    feat=big_road_features(seq, GRID_ROWS, GRID_COLS, FEAT_WIN).reshape(1,-1)
+    p=LGB_MODEL.predict(feat)[0]
+    return np.array(p, dtype=np.float32)
+
+def rnn_probs(seq: List[int]) -> Optional[np.ndarray]:
+    if RNN_MODEL is None: return None
+    import torch
+    # Simplified one_hot_seq to avoid potential issues with old unused code paths
+    sub = seq[-MAX_RNN_LEN:] if len(seq) > MAX_RNN_LEN else seq[:]
+    L=len(sub); oh=np.zeros((1,L,3), dtype=np.float32)
+    for i,v in enumerate(sub):
+        if v in (0,1,2): oh[0,i,v]=1.0
+    x = torch.from_numpy(oh)
+    with torch.no_grad():
+        logits=RNN_MODEL(x)
+        p = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+    return p.astype(np.float32)
 
 # ---------- 模型預測 ----------
 def enhanced_ensemble(seq: List[int]) -> Tuple[np.ndarray, str, List[int], List[int], Optional[int]]:
@@ -326,23 +374,18 @@ def flexible_decision(p: np.ndarray, seq: List[int], regime: str, runs: List[int
                 adjusted_edge += REG_ALIGN_EDGE_BONUS; decision_reason = f"順應齊腳(高{last_run_height})"
             else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY; decision_reason = "齊腳結構警示"
         
-        # --- 一房兩廳的嚴謹對稱邏輯 ---
-        elif regime == "PATTERN_BBP": # 莊莊閒 (BBP)
-            # 狀態1: 當前為BB (len=2, side=B=0), 期待 P(1)
+        elif regime == "PATTERN_BBP":
             if streak_len == 2 and last_event == 0:
                 if predicted_side == 1: adjusted_edge += REG_ALIGN_EDGE_BONUS; decision_reason = "順應一房兩廳(莊莊->閒)"
                 else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
-            # 狀態2: 當前為P (len=1, side=P=1), 期待 B(0)
             elif streak_len == 1 and last_event == 1:
                 if predicted_side == 0: adjusted_edge += REG_ALIGN_EDGE_BONUS; decision_reason = "順應一房兩廳(閒->莊)"
                 else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
         
-        elif regime == "PATTERN_PPB": # 閒閒莊 (PPB)
-            # 狀態1: 當前為PP (len=2, side=P=1), 期待 B(0)
+        elif regime == "PATTERN_PPB":
             if streak_len == 2 and last_event == 1:
                 if predicted_side == 0: adjusted_edge += REG_ALIGN_EDGE_BONUS; decision_reason = "順應一房兩廳(閒閒->莊)"
                 else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
-            # 狀態2: 當前為B (len=1, side=B=0), 期待 P(1)
             elif streak_len == 1 and last_event == 0:
                 if predicted_side == 1: adjusted_edge += REG_ALIGN_EDGE_BONUS; decision_reason = "順應一房兩廳(莊->閒)"
                 else: adjusted_edge -= REG_MISMATCH_EDGE_PENALTY
@@ -465,10 +508,15 @@ if line_handler and line_api:
             safe_reply(event.reply_token, f"👍 已設定本金：{int(text):,}\n{bet_ladder_text(sess['bankroll'])}", uid)
             return
 
-        seq_in = parse_history("".join(MAP.get(ch, ch) for ch in text.upper()))
+        # [CRASH FIX] Correctly parse history from user input
+        seq_in = parse_history(text)
         if seq_in and ("開始分析" not in text):
-            if len(seq_in) == 1: sess.setdefault("seq", []).append(seq_in[0]); safe_reply(event.reply_token, f"✅ 已記錄 {text}（共 {len(sess['seq'])} 手）", uid)
-            else: sess["seq"] = seq_in; safe_reply(event.reply_token, f"✅ 已覆蓋歷史：{len(seq_in)} 手", uid)
+            if len(seq_in) == 1:
+                sess.setdefault("seq", []).append(seq_in[0])
+                safe_reply(event.reply_token, f"✅ 已記錄 {text}（共 {len(sess['seq'])} 手）", uid)
+            else:
+                sess["seq"] = seq_in
+                safe_reply(event.reply_token, f"✅ 已覆蓋歷史：{len(seq_in)} 手", uid)
             return
 
         if ("開始分析" in text) or (text in ["分析", "開始", "GO", "go"]):
@@ -495,4 +543,3 @@ def line_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
