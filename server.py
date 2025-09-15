@@ -49,7 +49,7 @@ def parse_last_hand_points(text: str):
     m = re.search(r"(?:莊|B)[:]?(\d)\D+(?:閒|P)[:]?(\d)", u)
     if m: return (int(m.group(2)), int(m.group(1)))
     # 僅輸贏字母
-    if u in ("B","莊"): return (0,1)  # 讓下方判斷能得出莊勝
+    if u in ("B","莊"): return (0,1) # 讓下方判斷能得出莊勝
     if u in ("P","閒"): return (1,0)
     return None
 
@@ -70,7 +70,7 @@ def _init_user(uid: str):
         "phase": "choose_game",
         "game": None,
         "table": None,
-        "last_pts_text": None,  # "上局結果: 閒 X 莊 Y" / "上局結果: 和局"
+        "last_pts_text": None, # "上局結果: 閒 X 莊 Y" / "上局結果: 和局"
         "table_no": None,
     }
 
@@ -158,7 +158,7 @@ def log_prediction(hands:int, p, choice:str, edge:float, bankroll:int, bet_pct:f
         bet_amt = bet_amount(bankroll, bet_pct)
         with open(PRED_CSV, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([int(time.time()), VERSION, hands, float(p[0]), float(p[1]), float(p[2]),
-                                    choice, float(edge), float(bet_pct), int(bankroll), int(bet_amt), engine, reason])
+                                      choice, float(edge), float(bet_pct), int(bankroll), int(bet_amt), engine, reason])
     except Exception as e:
         log.warning("log_prediction failed: %s", e)
 
@@ -169,7 +169,7 @@ def format_output_card(prob, choice, last_pts_text: Optional[str], bet_amt: int)
     header = ["讀取完成"]
     if last_pts_text: header.append(last_pts_text)
     header.append("開始分析下局....")
-    header.append("")  # 空行
+    header.append("") # 空行
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
@@ -323,7 +323,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 SESS[uid]["game"] = GAMES[text]
                 SESS[uid]["phase"] = "choose_table"
                 reply(event.reply_token, f"✅ 已設定遊戲類別【{SESS[uid]['game']}】\n"
-                                         "請輸入需預測桌號（Ex: DG01）", uid)
+                                          "請輸入需預測桌號（Ex: DG01）", uid)
                 return
 
             # 2) 桌號（兩碼英字+兩位數字，如 DG05）
@@ -331,7 +331,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 SESS[uid]["table"] = text.upper()
                 SESS[uid]["phase"] = "await_pts"
                 reply(event.reply_token, "🔌 連接數據庫中..\n✅ 連接數據庫完成\n🆗 桌號已設定完成\n\n"
-                                         "請輸入上局閒莊點數（例如：65，先輸入閒再輸入莊）", uid)
+                                          "請輸入上局閒莊點數（例如：65，先輸入閒再輸入莊）", uid)
                 return
 
             # 3) 上局點數（65 / 閒6莊5 / 和）
@@ -369,7 +369,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             # 開始分析/開始分析 53
             m2 = re.match(r"^開始分析(?:\s+(\d+))?$", text)
-            if text == "開始分析" or m2:
+            # ===== ✨✨✨ 以下為修正處 ✨✨✨ =====
+            if (text == "開始分析" or m2) and SESS[uid].get("phase") == "ready":
+            # ===== ✨✨✨ 以上為修正處 ✨✨✨ =====
                 if m2 and m2.group(1):
                     SESS[uid]["table_no"] = m2.group(1)
                 p = PF.predict(sims_per_particle=max(0, PF_PRED_SIMS))
