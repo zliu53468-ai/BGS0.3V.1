@@ -1,8 +1,5 @@
-Flask
-Flask-Cors
-numpy
-xgboost
-lightgbm
-torch
-line-bot-sdk
-gunicorn
+Flask==2.3.3
+gunicorn==21.2.0
+flask-cors==4.0.1
+line-bot-sdk==2.5.2
+numpy==1.26.4
