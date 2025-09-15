@@ -156,6 +156,7 @@ def parse_history(s: str) -> List[int]:
         ch = ch.strip().upper()
         if ch in MAP: out.append(MAP[ch])
     return out
+
 def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
     gs = np.zeros((rows, cols), dtype=np.int8); gt = np.zeros((rows, cols), dtype=np.int16)
     r=c=0; last_bp=None
@@ -173,8 +174,10 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
             if 0<=r<rows and 0<=c<cols: gs[r,c]=cur
         else:
             c=c+1; r=0; last_bp=cur
-            if c<cols: gs[r,c]=cur
+            if c<cols: 
+                gs[r,c]=cur
     return gs, gt, (r,c)
+
 def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
     local=_local_bigroad_feat(seq, rows, cols, win).astype(np.float32)
     if USE_FULL_SHOE:
@@ -184,6 +187,7 @@ def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np
         else: lw,gw=lw/s,gw/s
         return np.concatenate([local*lw, glob*gw], axis=0).astype(np.float32)
     else: return local
+
 def _global_aggregates(seq: List[int]) -> np.ndarray:
     n=len(seq)
     if n==0: return np.array([0.45,0.45,0.1, 0.5,0.5, 0,0,0,0, 0.5,0.5,0.5,0.5, 0.1], dtype=np.float32)
@@ -212,6 +216,7 @@ def _global_aggregates(seq: List[int]) -> np.ndarray:
     B2P=(b2p/cb) if cb>0 else 0.5; P2B=(p2b/cp) if cp>0 else 0.5
     tie_rate=float((arr==2).mean())
     return np.array([freq[0],freq[1],freq[2], altern,1.0-altern,b_mean,b_var,p_mean,p_var, B2B,P2P,B2P,P2B, tie_rate], dtype=np.float32)
+
 def _local_bigroad_feat(seq: List[int], rows:int, cols:int, win:int) -> np.ndarray:
     sub = seq[-win:] if len(seq)>win else seq[:]
     gs, gt, (r,c) = big_road_grid(sub, rows, cols)
@@ -409,6 +414,11 @@ def trial_guard(uid:str, reply_token:str) -> bool:
 
 @app.get("/")
 def root(): return "LiveBoot Enhanced (Balanced Logic) ok", 200
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok"), 200
+
 @app.post("/predict")
 def predict_api():
     data = request.get_json(silent=True) or {}; bankroll = int(data.get("bankroll") or 0)
@@ -485,4 +495,5 @@ def line_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
