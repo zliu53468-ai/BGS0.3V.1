@@ -1,78 +1,49 @@
 services:
   - type: web
-    name: bgs-backend-chop
+    name: bgs-outcome-only
     env: python
     plan: free
-
+    region: singapore
     buildCommand: pip install -r requirements.txt
-    startCommand: >
-      gunicorn server:app
-      --bind 0.0.0.0:$PORT
-      --workers 1
-      --threads 8
-      --timeout 120
-      --graceful-timeout 30
-      --log-level info
-
-    healthCheckPath: /health
-
+    startCommand: gunicorn server:app --workers=1 --threads=8 --timeout=120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
     envVars:
-      # --- runtime / logs ---
-      - key: LOG_LEVEL           ; value: INFO
-      - key: DEBOUNCE_SEC        ; value: 1.2
-      - key: EXPORT_LOGS         ; value: "1"
-
-      # --- writable storage (Render Free 可寫) ---
-      - key: DATA_BASE           ; value: /tmp/bgs
-      - key: DATA_LOG_PATH       ; value: /tmp/bgs/logs/rounds.csv
-
-      # --- windows & memory (CHOP+) ---
-      - key: WIN_SHORT           ; value: "4"
-      - key: WIN_MID             ; value: "10"
-      - key: WIN_LONG            ; value: "20"
-      - key: EW_GAMMA            ; value: "0.94"
-      - key: MKV_DECAY           ; value: "0.960"
-
-      # --- weights (CHOP+) ---
-      - key: REC_W               ; value: "0.32"
-      - key: LONG_W              ; value: "0.12"
-      - key: MKV_W               ; value: "0.18"
-      - key: PRIOR_W             ; value: "0.18"
-
-      # --- reversion / anti-chop ---
-      - key: W_HAZARD            ; value: "0.70"
-      - key: W_WALL              ; value: "0.35"
-      - key: W_SWING             ; value: "0.35"
-      - key: W_MEANREV           ; value: "0.25"
-      - key: BOOST_ALT           ; value: "1.10"
-
-      # --- tie calibration ---
-      - key: T_BLEND             ; value: "0.55"
-      - key: T_MIN               ; value: "0.05"
-      - key: T_MAX               ; value: "0.18"
-      - key: BOOST_T             ; value: "1.03"
-
-      # --- safety layer ---
-      - key: EPSILON_FLOOR       ; value: "0.07"
-      - key: MAX_CAP             ; value: "0.80"
-      - key: TEMP                ; value: "1.08"
-
-      # --- overheat counter ---
-      - key: OVERHEAT_TH         ; value: "0.65"
-      - key: OVERHEAT_BOOST      ; value: "1.10"
-
-      # --- regime detection (Page–Hinkley) ---
-      - key: REC_WIN_FOR_PH      ; value: "10"
-      - key: PH_DELTA            ; value: "0.003"
-      - key: PH_LAMBDA           ; value: "0.06"
-      - key: DRIFT_STEPS         ; value: "6"
-
-      # --- misc ---
-      - key: MAX_HISTORY         ; value: "400"
-      - key: FEAT_WIN            ; value: "120"
-
-      # --- optional models (沒有檔也不影響) ---
-      - key: RNN_PATH            ; value: /opt/models/rnn.pt
-      - key: XGB_PATH            ; value: /opt/models/xgb.json
-      - key: LGBM_PATH           ; value: /opt/models/lgbm.txt
-      - key: RELOAD_TOKEN        ; value: mysecret123
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TZ
+        value: Asia/Taipei
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # 試用與運營
+      - key: TRIAL_MINUTES
+        value: "30"
+      - key: ADMIN_CONTACT
+        value: "@admin"
+      - key: ADMIN_ACTIVATION_SECRET
+        sync: false
+      # OutcomePF 參數
+      - key: DECKS
+        value: "8"
+      - key: PF_N
+        value: "200"
+      - key: PF_BACKEND
+        value: "exact"    # exact 或 mc
+      - key: PF_RESAMPLE
+        value: "0.5"
+      - key: PF_DIR_EPS
+        value: "0.002"
+      # 決策/資金
+      - key: EDGE_ENTER
+        value: "0.03"
+      - key: USE_KELLY
+        value: "1"
+      - key: KELLY_FACTOR
+        value: "0.25"
+      - key: MAX_BET_PCT
+        value: "0.015"
+      # LINE（可選）
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
