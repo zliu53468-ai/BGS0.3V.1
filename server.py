@@ -164,13 +164,15 @@ def big_road_grid(seq: List[int], rows:int=6, cols:int=20):
             if 0<=r<rows and 0<=c<cols: gt[r,c]+=1
             continue
         cur = +1 if v==0 else -1
-        if last_bp is None: r=c=0; gs[r,c]=cur; last_bp=cur; continue
+        if last_bp is None:
+            r=c=0; gs[r,c]=cur; last_bp=cur; continue
         if cur==last_bp:
             nr=r+1; nc=c
             if nr>=rows or gs[nr,nc]!=0: nr=r; nc=c+1
             r,c=nr,nc;
             if 0<=r<rows and 0<=c<cols: gs[r,c]=cur
-        else: c=c+1; r=0; last_bp=cur;
+        else:
+            c=c+1; r=0; last_bp=cur
             if c<cols: gs[r,c]=cur
     return gs, gt, (r,c)
 def big_road_features(seq: List[int], rows:int=6, cols:int=20, win:int=40) -> np.ndarray:
