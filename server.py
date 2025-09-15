@@ -1,6 +1,6 @@
-# server.py — 已整合 Redis + 開始分析XY（無空格）+ 去重 + 健康檢查 版
+# server.py — 已整合 Redis + 開始分析XY（無空格）+ 去重 + 健康檢查 + 固定密碼預設
 # Author: 親愛的 x GPT-5 Thinking
-# Version: bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka2
+# Version: bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka3
 
 import os
 import logging
@@ -14,7 +14,7 @@ import redis
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
-VERSION = "bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka2"
+VERSION = "bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka3"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -146,10 +146,15 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 # ---------- 試用/授權 ----------
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
-ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
+
+# 預設密碼：若未設定環境變數，預設為 aaa8881688
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
 def validate_activation_code(code: str) -> bool:
-    return bool(ADMIN_ACTIVATION_SECRET) and code and (code.strip() == ADMIN_ACTIVATION_SECRET)
+    # 允許前後空白、全形空白，精確比對
+    if not code: return False
+    norm = str(code).replace("\u3000", " ").strip()
+    return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
 
 def trial_left_minutes(sess: Dict[str, Any]) -> int:
     if sess.get("premium", False): return 9999
@@ -162,6 +167,15 @@ def trial_guard(sess: Dict[str, Any]) -> Optional[str]:
     if trial_left_minutes(sess) <= 0:
         return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
     return None
+
+# 啟動時印出是否載到密碼（不印明文）
+try:
+    masked = "*" * len(ADMIN_ACTIVATION_SECRET) if ADMIN_ACTIVATION_SECRET else "(empty)"
+    log.info("Activation secret loaded? %s (len=%d)", bool(ADMIN_ACTIVATION_SECRET), len(ADMIN_ACTIVATION_SECRET))
+    # 若你想更明確，可開下面這行（但仍不印明文）
+    # log.info("Activation secret mask: %s", masked)
+except Exception:
+    pass
 
 # ---------- Outcome PF ----------
 try:
@@ -204,11 +218,9 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     if USE_KELLY:
         # 非嚴格 Kelly，取 1/4 Kelly
         if side == 0:
-            # 莊：贏付 0.95
             b = 0.95
             f = KELLY_FACTOR * ((pB * b - (1 - pB)) / b)
         else:
-            # 閒：贏付 1
             b = 1.0
             f = KELLY_FACTOR * ((pP * b - (1 - pP)) / b)
         bet_pct = min(MAX_BET_PCT, max(0.0, float(f)))
@@ -271,14 +283,6 @@ def game_menu_text(left_min: int) -> str:
     lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
     return "\n".join(lines)
 
-def _reply(token: str, text: str):
-    from linebot.models import TextSendMessage
-    try:
-        qr = _quick_buttons()
-        line_api.reply_message(token, TextSendMessage(text=text, quick_reply=qr))
-    except Exception as e:
-        log.warning("[LINE] reply failed: %s", e)
-
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
@@ -292,6 +296,14 @@ def _quick_buttons():
         ])
     except Exception:
         return None
+
+def _reply(token: str, text: str):
+    from linebot.models import TextSendMessage
+    try:
+        qr = _quick_buttons()
+        line_api.reply_message(token, TextSendMessage(text=text, quick_reply=qr))
+    except Exception as e:
+        log.warning("[LINE] reply failed: %s", e)
 
 def _dedupe_event(event_id: Optional[str]) -> bool:
     """返回 True 表示「本次事件可處理」，False 表示重覆（應忽略）。"""
@@ -310,7 +322,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
         @line_handler.add(FollowEvent)
         def on_follow(event):
-            # 去重
             if not _dedupe_event(getattr(event, "id", None)):
                 return
             uid = event.source.user_id
@@ -322,12 +333,13 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):
-            # 去重（LINE v3 事件有 event.id；若取不到就略過去重）
             if not _dedupe_event(getattr(event, "id", None)):
                 return
 
             uid = event.source.user_id
-            text = (event.message.text or "").strip()
+            raw = (event.message.text or "")
+            # 正規化空白：把全形空白換半形，並保留單一空白給指令解析
+            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
             sess = get_session(uid)
 
             try:
@@ -340,7 +352,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     return
 
                 # 先處理：開始分析XY（無空格，支援全形）
-                norm = text.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+                norm = raw.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
                 norm = re.sub(r"\s+", "", norm)  # 去掉所有空白
                 m_ka = re.fullmatch(r"開始分析(\d)(\d)", norm)
                 if m_ka:
@@ -353,9 +365,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                             except Exception as e: log.warning("tie update skipped: %s", e)
                     else:
                         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
-                        PF.update_outcome(1 if p_pts > b_pts else 0)
+                        try: PF.update_outcome(1 if p_pts > b_pts else 0)
+                        except Exception as e: log.warning("PF update err: %s", e)
 
-                    # 直接做預測
                     sess["phase"] = "ready"
                     p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS","0"))))
                     choice, edge, bet_pct, reason = decide_only_bp(p)
@@ -368,11 +380,13 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                 up = text.upper()
 
-                # 開通
+                # 開通（允許全形/多空白）：格式「開通 空格 密碼」
                 if up.startswith("開通") or up.startswith("ACTIVATE"):
-                    code = text.split(" ", 1)[1].strip() if " " in text else ""
-                    sess["premium"] = validate_activation_code(code)
-                    _reply(event.reply_token, "✅ 已開通成功！" if sess["premium"] else "❌ 密碼錯誤")
+                    parts = text.split(" ", 1)
+                    code = parts[1] if len(parts) == 2 else ""
+                    ok = validate_activation_code(code)
+                    sess["premium"] = bool(ok)
+                    _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                     save_session(uid, sess)
                     return
 
