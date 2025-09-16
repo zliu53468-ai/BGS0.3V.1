@@ -1,6 +1,6 @@
-# server.py — 已整合 Redis + 開始分析XY（無空格）+ 去重 + 健康檢查 + 固定密碼預設
+# server.py — Redis + 開始分析XY + 去重 + 健康檢查 + 開通先於試用守門 + 多格式開通
 # Author: 親愛的 x GPT-5 Thinking
-# Version: bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka3
+# Version: bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka4
 
 import os
 import logging
@@ -14,7 +14,7 @@ import redis
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
-VERSION = "bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka3"
+VERSION = "bgs-pf-rbexact-setup-flow-2025-09-17-redis-final-ka4"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -151,7 +151,7 @@ ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
 def validate_activation_code(code: str) -> bool:
-    # 允許前後空白、全形空白，精確比對
+    # 允許前後空白、全形空白與冒號，多格式：開通 密碼 / 開通密碼 / 開通:密碼
     if not code: return False
     norm = str(code).replace("\u3000", " ").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -170,10 +170,7 @@ def trial_guard(sess: Dict[str, Any]) -> Optional[str]:
 
 # 啟動時印出是否載到密碼（不印明文）
 try:
-    masked = "*" * len(ADMIN_ACTIVATION_SECRET) if ADMIN_ACTIVATION_SECRET else "(empty)"
     log.info("Activation secret loaded? %s (len=%d)", bool(ADMIN_ACTIVATION_SECRET), len(ADMIN_ACTIVATION_SECRET))
-    # 若你想更明確，可開下面這行（但仍不印明文）
-    # log.info("Activation secret mask: %s", masked)
 except Exception:
     pass
 
@@ -209,14 +206,12 @@ def bet_amount(bankroll: int, pct: float) -> int:
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     pB, pP = float(prob[0]), float(prob[1])
-    # 邊際 EV
     evB, evP = 0.95 * pB - pP, pP - pB
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
     if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
     if USE_KELLY:
-        # 非嚴格 Kelly，取 1/4 Kelly
         if side == 0:
             b = 0.95
             f = KELLY_FACTOR * ((pB * b - (1 - pB)) / b)
@@ -252,7 +247,6 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
 # ---------- 健康檢查 ----------
 @app.get("/")
 def root():
-    # UptimeRobot 可能用 HEAD/GET 打根路徑
     ua = request.headers.get("User-Agent", "")
     if "UptimeRobot" in ua:
         return "OK", 200
@@ -306,7 +300,6 @@ def _reply(token: str, text: str):
         log.warning("[LINE] reply failed: %s", e)
 
 def _dedupe_event(event_id: Optional[str]) -> bool:
-    """返回 True 表示「本次事件可處理」，False 表示重覆（應忽略）。"""
     if not event_id: return True
     key = f"dedupe:{event_id}"
     return _rsetnx(key, "1", DEDUPE_TTL)
@@ -338,14 +331,33 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             uid = event.source.user_id
             raw = (event.message.text or "")
-            # 正規化空白：把全形空白換半形，並保留單一空白給指令解析
+            # 正規化空白：把全形空白換半形，保留單一空白給指令解析
             text = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
             sess = get_session(uid)
 
             try:
                 log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
 
-                # 試用守門
+                # --- 1) 先處理「開通」指令（避免被試用守門擋掉） ---
+                up = text.upper()
+                if up.startswith("開通") or up.startswith("ACTIVATE"):
+                    # 支援：開通 密碼｜開通密碼｜開通:密碼（半形/全形冒號、空白）
+                    code = ""
+                    # 取「開通」後的字串
+                    after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
+                    after = after.replace("\u3000", " ").replace("：", ":").strip()
+                    if after:
+                        if after[0] in (":", "："): after = after[1:].strip()
+                        # 去掉可能的前導「:」或空白
+                        after = after.lstrip(":").strip()
+                        code = after
+                    ok = validate_activation_code(code)
+                    sess["premium"] = bool(ok)
+                    _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
+                    save_session(uid, sess)
+                    return
+
+                # --- 2) 再做試用守門 ---
                 guard = trial_guard(sess)
                 if guard:
                     _reply(event.reply_token, guard)
@@ -375,18 +387,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     msg = format_output_card(p, choice, sess.get("last_pts_text"),
                                              bet_amt=bet_amount(bankroll_now, bet_pct))
                     _reply(event.reply_token, msg)
-                    save_session(uid, sess)
-                    return
-
-                up = text.upper()
-
-                # 開通（允許全形/多空白）：格式「開通 空格 密碼」
-                if up.startswith("開通") or up.startswith("ACTIVATE"):
-                    parts = text.split(" ", 1)
-                    code = parts[1] if len(parts) == 2 else ""
-                    ok = validate_activation_code(code)
-                    sess["premium"] = bool(ok)
-                    _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                     save_session(uid, sess)
                     return
 
