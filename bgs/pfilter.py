@@ -2,7 +2,18 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import Literal
-from .deplete import init_counts
+# Attempt to import ``init_counts`` from the local ``deplete`` module.  When
+# running inside a package this relative import works; when executed as a
+# standalone file the relative import fails and we fall back to a top‑level
+# import instead.  If both attempts fail the ImportError is re‑raised to
+# surface the underlying issue.
+try:
+    from .deplete import init_counts  # type: ignore
+except Exception:
+    try:
+        from deplete import init_counts  # type: ignore
+    except Exception as _exc:
+        raise _exc
 
 # ---------- 百家樂規則 ----------
 def points_add(a, b): 
