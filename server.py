@@ -9,6 +9,7 @@ server.py — 連續模式修正版（Render 優化版）
 """
 
 import os
+import sys
 import logging
 import time
 import re
@@ -16,9 +17,29 @@ import json
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
-import redis
-from flask import Flask, request, jsonify, abort
-from flask_cors import CORS
+# Optional imports for optional dependencies.  Render free plans may not
+# have redis or Flask installed.  Wrap the imports in try/except blocks
+# and fall back to dummy objects when unavailable.
+try:
+    import redis  # type: ignore
+except Exception:
+    redis = None  # type: ignore
+
+try:
+    from flask import Flask, request, jsonify, abort  # type: ignore
+    from flask_cors import CORS  # type: ignore
+    _flask_available = True
+except Exception:
+    _flask_available = False
+    Flask = None  # type: ignore
+    request = None  # type: ignore
+    def jsonify(*args, **kwargs):  # type: ignore
+        raise RuntimeError("Flask is not available; jsonify cannot be used.")
+    def abort(*args, **kwargs):  # type: ignore
+        raise RuntimeError("Flask is not available; abort cannot be used.")
+    def CORS(app):  # type: ignore
+        # no‑op when Flask is absent
+        return None
 
 
 # 版本號
@@ -30,21 +51,53 @@ log = logging.getLogger("bgs-server")
 
 
 # ---------- Flask 初始化 ----------
-app = Flask(__name__)
-CORS(app)
+if _flask_available and Flask is not None:
+    # Initialise a real Flask application when Flask is installed
+    app = Flask(__name__)
+    CORS(app)
+else:
+    # Provide a dummy app object so that decorators do not raise
+    class _DummyApp:
+        """Fallback for when Flask is not available.
+
+        Methods ``get`` and ``post`` return a decorator that simply
+        returns the wrapped function unchanged, allowing route
+        definitions to execute without a real server.  The ``run``
+        method logs a warning instead of starting a server.
+        """
+        def get(self, *args, **kwargs):  # type: ignore
+            def _decorator(func):
+                return func
+            return _decorator
+
+        def post(self, *args, **kwargs):  # type: ignore
+            def _decorator(func):
+                return func
+            return _decorator
+
+        def run(self, *args, **kwargs):  # type: ignore
+            log.warning("Flask not available; dummy app cannot run a server.")
+
+    app = _DummyApp()
 
 
 # ---------- Redis 或記憶體 Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
-redis_client: Optional[redis.Redis] = None
-if REDIS_URL:
+redis_client: Optional["redis.Redis"] = None  # type: ignore
+if redis is not None and REDIS_URL:
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         log.info("Successfully connected to Redis.")
     except Exception as e:
+        # Fall back to in‑memory sessions if Redis connection fails
+        redis_client = None
         log.error("Failed to connect to Redis: %s. Using in-memory session.", e)
 else:
-    log.warning("REDIS_URL not set. Using in-memory session.")
+    # Either redis is not available or no URL provided
+    if redis is None:
+        log.warning("redis module not available; using in-memory session store.")
+    elif not REDIS_URL:
+        log.warning("REDIS_URL not set. Using in-memory session store.")
 
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE_SECONDS = 3600  # 1 小時
@@ -239,30 +292,62 @@ os.environ['PF_UPD_SIMS'] = '20'
 os.environ['PF_PRED_SIMS'] = '0'
 os.environ['DECKS'] = '6'
 
+# Default backend to Monte‑Carlo to greatly reduce computational burden on
+# resource‑constrained platforms.  If a caller explicitly sets
+# ``PF_BACKEND`` in the environment it will override this value.
+if not os.getenv('PF_BACKEND'):
+    os.environ['PF_BACKEND'] = 'mc'
+
 log.info("強制設置 PF 參數: PF_N=30, PF_UPD_SIMS=20, PF_PRED_SIMS=0, DECKS=6")
 
 try:
-    from bgs.pfilter import OutcomePF
-    PF = OutcomePF(
-        decks=int(os.getenv("DECKS", "6")),  # 強制使用6副牌
-        seed=int(os.getenv("SEED", "42")),
-        n_particles=int(os.getenv("PF_N", "30")),  # 強制使用30個粒子
-        sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "20"))),  # 強制20次模擬
-        resample_thr=float(os.getenv("PF_RESAMPLE", "0.6")),
-        backend=os.getenv("PF_BACKEND", "exact").lower(),
-        dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
-    )
-    log.info("PF 初始化成功: n_particles=%d, sims_lik=%d", PF.n_particles, PF.sims_lik)
-except Exception as e:
-    log.error("Could not import OutcomePF, using Dummy. err=%s", e)
+    # Attempt to import OutcomePF from the ``bgs`` package first
+    from bgs.pfilter import OutcomePF  # type: ignore
+except Exception:
+    try:
+        # Fallback to a local ``pfilter`` module located in the same
+        # directory as this file.  When running outside of a package
+        # context, add the current directory to ``sys.path`` so that
+        # ``import pfilter`` resolves correctly.
+        _cur_dir = os.path.dirname(os.path.abspath(__file__))
+        if _cur_dir not in sys.path:
+            sys.path.insert(0, _cur_dir)
+        from pfilter import OutcomePF  # type: ignore
+        log.info("Imported OutcomePF from local pfilter module.")
+    except Exception as _pf_exc:
+        OutcomePF = None  # type: ignore
+        log.error("Could not import OutcomePF: %s", _pf_exc)
 
+if OutcomePF:
+    try:
+        PF = OutcomePF(
+            decks=int(os.getenv("DECKS", "6")),
+            seed=int(os.getenv("SEED", "42")),
+            n_particles=int(os.getenv("PF_N", "30")),
+            sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "20"))),
+            resample_thr=float(os.getenv("PF_RESAMPLE", "0.6")),
+            backend=os.getenv("PF_BACKEND", "mc").lower(),
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
+        )
+        log.info(
+            "PF 初始化成功: n_particles=%d, sims_lik=%d (backend=%s)",
+            PF.n_particles,
+            getattr(PF, "sims_lik", 0),
+            getattr(PF, "backend", "unknown"),
+        )
+    except Exception as _e:
+        log.error("Failed to initialise OutcomePF: %s", _e)
+        OutcomePF = None
+
+if not OutcomePF:
+    # Provide a minimal dummy PF implementation as a safety net
     class DummyPF:
         def update_outcome(self, outcome):
             log.info("DummyPF 更新: %s", outcome)
-            
+
         def predict(self, **kwargs):
             log.info("DummyPF 預測")
-            return np.array([0.48, 0.47, 0.05])  # B, P, T
+            return np.array([0.48, 0.47, 0.05], dtype=np.float32)
 
         @property
         def backend(self):
