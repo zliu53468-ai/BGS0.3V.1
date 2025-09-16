@@ -1,16 +1,11 @@
 """
-server.py — 連續模式修正版
+server.py — 連續模式修正版（Render 優化版）
 
-此檔案整合了 Redis sessions、LINE 機器人處理、粒子過濾模型，以及連續模式邏輯，
-讓用戶在完成遊戲館別、桌號和本金設定後，只需直接輸入兩位數點數（或和局）即可
-自動分析下一局，不需再輸入「開始分析」。
-
-修正內容：
-  - 點數解析函式 parse_last_hand_points 在偵測任意兩位數時，僅當文字本身不含其他英文字母且恰好包含兩個數字時才視為上局點數。避免「DG09」這類桌號與「5000」這類本金被誤判為點數。
-  - 健康檢查路由使用正確換行的 decorator 寫法，避免 SyntaxError。
-
-部署建議：
-  - 將本檔案覆蓋至伺服器上對應的 server.py，再重新部署。
+針對 Render 免費版資源限制進行優化：
+  - 強制設置輕量級粒子過濾器參數
+  - 添加詳細診斷日誌
+  - 優化錯誤處理防止卡死
+  - 備用 Dummy 模式確保基本功能
 """
 
 import os
@@ -27,7 +22,7 @@ from flask_cors import CORS
 
 
 # 版本號
-VERSION = "bgs-pf-continuous-2025-09-17-ka7-fixed"
+VERSION = "bgs-pf-render-optimized-2025-09-17"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -150,24 +145,6 @@ def env_flag(name: str, default: int = 1) -> int:
 def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     """
     將輸入文字解析為上一局點數 (P_total, B_total)。
-
-    支援的輸入包括：
-      - 單純兩個數字，例如 '47'、'4 7'、'4-7'、'4,7' 等（先閒後莊）
-      - 閒莊格式，例如『閒4莊7』、『閒 4 莊 7』、『P4 B7』等，順序自動推斷
-      - '開始分析47' 這類前綴附帶點數的指令（會自動剝掉 '開始分析'）
-      - 和局關鍵字：'和'、'TIE'、'DRAW'（回傳 (0,0) 表示和）
-      - 單字母快速上報：'B'/'莊'/'庄' 表示莊贏 (0,1)，'P'/'閒'/'闲' 表示閒贏 (1,0)，'T'/'和' 表示和局 (0,0)
-
-    解析邏輯說明：
-    1. 先將全形數字與全形冒號轉為半形，移除零寬與控制字元，並將全形空白 (\u3000) 替換為半形空白。
-    2. 去除開頭的 '開始分析' 前綴，以便支援『開始分析47』這類輸入。
-    3. 嘗試匹配和局、閒莊格式；若匹配成功則直接回傳。
-    4. 單字母輸入視為快速上報（支援中文繁體與簡體）：
-       - 莊贏：'B'、'莊'、'庄' → (0,1)
-       - 閒贏：'P'、'閒'、'闲' → (1,0)
-       - 和局：'T'、'和' → (0,0)
-    5. 若輸入包含其他英文字母（A-Z）代表可能是桌號或其他指令，不視為點數。
-    6. 若以上皆不符，僅當輸入恰好包含兩個數字時，將其視為點數 (先閒後莊)。
     """
     if not text:
         return None
@@ -256,32 +233,43 @@ except Exception:
 
 
 # ---------- Outcome PF (粒子過濾器) ----------
+# 強制設置輕量級參數（針對 Render 免費版優化）
+os.environ['PF_N'] = '30'
+os.environ['PF_UPD_SIMS'] = '20'
+os.environ['PF_PRED_SIMS'] = '0'
+os.environ['DECKS'] = '6'
+
+log.info("強制設置 PF 參數: PF_N=30, PF_UPD_SIMS=20, PF_PRED_SIMS=0, DECKS=6")
+
 try:
     from bgs.pfilter import OutcomePF
     PF = OutcomePF(
-        decks=int(os.getenv("DECKS", "8")),
+        decks=int(os.getenv("DECKS", "6")),  # 強制使用6副牌
         seed=int(os.getenv("SEED", "42")),
-        n_particles=int(os.getenv("PF_N", "200")),
-        sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "80"))),
-        resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
+        n_particles=int(os.getenv("PF_N", "30")),  # 強制使用30個粒子
+        sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "20"))),  # 強制20次模擬
+        resample_thr=float(os.getenv("PF_RESAMPLE", "0.6")),
         backend=os.getenv("PF_BACKEND", "exact").lower(),
-        dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.002")),
+        dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
     )
+    log.info("PF 初始化成功: n_particles=%d, sims_lik=%d", PF.n_particles, PF.sims_lik)
 except Exception as e:
     log.error("Could not import OutcomePF, using Dummy. err=%s", e)
 
     class DummyPF:
-        def update_outcome(self, _):
-            pass
-
-        def predict(self, **_):
-            return np.array([0.5, 0.49, 0.01])  # B, P, T
+        def update_outcome(self, outcome):
+            log.info("DummyPF 更新: %s", outcome)
+            
+        def predict(self, **kwargs):
+            log.info("DummyPF 預測")
+            return np.array([0.48, 0.47, 0.05])  # B, P, T
 
         @property
         def backend(self):
             return "dummy"
 
     PF = DummyPF()
+    log.info("使用 DummyPF 模式")
 
 
 # ---------- 投注決策 ----------
@@ -290,6 +278,8 @@ USE_KELLY = env_flag("USE_KELLY", 1)
 KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.25"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)  # 1=連續模式；0=舊流程
+
+INV = {0: "莊", 1: "閒"}  # 添加缺失的 INV 映射
 
 
 def bet_amount(bankroll: int, pct: float) -> int:
@@ -431,27 +421,46 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
 
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
     """在連續模式或人工模式中處理點數並預測下一局。"""
+    log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
+    start_time = time.time()
+    
     # 更新上一局結果
     if p_pts == b_pts:
         sess["last_pts_text"] = "上局結果: 和局"
         try:
             if int(os.getenv("SKIP_TIE_UPD", "0")) == 0:
                 PF.update_outcome(2)
+                log.info("和局更新完成, 耗時: %.2fs", time.time() - start_time)
         except Exception as e:
             log.warning("PF tie update err: %s", e)
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         try:
-            PF.update_outcome(1 if p_pts > b_pts else 0)
+            outcome = 1 if p_pts > b_pts else 0
+            PF.update_outcome(outcome)
+            log.info("勝局更新完成 (%s), 耗時: %.2fs", "閒勝" if outcome == 1 else "莊勝", time.time() - start_time)
         except Exception as e:
             log.warning("PF update err: %s", e)
+    
     # 做預測
     sess["phase"] = "ready"
-    p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
-    choice, edge, bet_pct, reason = decide_only_bp(p)
-    bankroll_now = int(sess.get("bankroll", 0))
-    msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amount(bankroll_now, bet_pct), cont=bool(CONTINUOUS_MODE))
-    _reply(reply_token, msg)
+    try:
+        predict_start = time.time()
+        p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
+        log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
+        
+        choice, edge, bet_pct, reason = decide_only_bp(p)
+        bankroll_now = int(sess.get("bankroll", 0))
+        bet_amt = bet_amount(bankroll_now, bet_pct)
+        
+        msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+        _reply(reply_token, msg)
+        log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
+        
+    except Exception as e:
+        log.error("預測過程中錯誤: %s", e)
+        _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
+    
     # 若為連續模式，保持在 await_pts 狀態，方便下一局直接輸入點數
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
