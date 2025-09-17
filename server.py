@@ -38,7 +38,7 @@ except Exception:
     def abort(*args, **kwargs):  # type: ignore
         raise RuntimeError("Flask is not available; abort cannot be used.")
     def CORS(app):  # type: ignore
-        # no‑op when Flask is absent
+        # no-op when Flask is absent
         return None
 
 
@@ -89,7 +89,7 @@ if redis is not None and REDIS_URL:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         log.info("Successfully connected to Redis.")
     except Exception as e:
-        # Fall back to in‑memory sessions if Redis connection fails
+        # Fall back to in-memory sessions if Redis connection fails
         redis_client = None
         log.error("Failed to connect to Redis: %s. Using in-memory session.", e)
 else:
@@ -292,8 +292,8 @@ os.environ['PF_UPD_SIMS'] = '20'
 os.environ['PF_PRED_SIMS'] = '0'
 os.environ['DECKS'] = '6'
 
-# Default backend to Monte‑Carlo to greatly reduce computational burden on
-# resource‑constrained platforms.  If a caller explicitly sets
+# Default backend to Monte-Carlo to greatly reduce computational burden on
+# resource-constrained platforms.  If a caller explicitly sets
 # ``PF_BACKEND`` in the environment it will override this value.
 if not os.getenv('PF_BACKEND'):
     os.environ['PF_BACKEND'] = 'mc'
@@ -362,9 +362,16 @@ EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
 USE_KELLY = env_flag("USE_KELLY", 1)
 KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.25"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
-CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)  # 1=連續模式；0=舊流程
 
-INV = {0: "莊", 1: "閒"}  # 添加缺失的 INV 映射
+# === 新增：勝率→配注（5%~40% 線性映射，可由環境變數調整） ===
+USE_WINRATE_MAP = env_flag("USE_WINRATE_MAP", 1)
+BET_MIN_PCT = float(os.getenv("BET_MIN_PCT", "0.05"))   # 5%
+BET_MAX_PCT = float(os.getenv("BET_MAX_PCT", "0.40"))   # 40%
+WINRATE_FLOOR = float(os.getenv("WINRATE_FLOOR", "0.50"))
+WINRATE_CEIL  = float(os.getenv("WINRATE_CEIL",  "0.75"))
+
+CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)  # 1=連續模式；0=舊流程
+INV = {0: "莊", 1: "閒"}  # 映射
 
 
 def bet_amount(bankroll: int, pct: float) -> int:
@@ -377,9 +384,26 @@ def bet_amount(bankroll: int, pct: float) -> int:
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     """根據閒、莊機率，決定下注方向與邊際與下注比例。"""
     pB, pP = float(prob[0]), float(prob[1])
+
+    # 選擇較高勝率的一方
+    side = 0 if pB >= pP else 1
+    p_star = max(pB, pP)
+
+    # EV 粗估（顯示/參考用）
     evB, evP = 0.95 * pB - pP, pP - pB
-    side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
+
+    # ★ 勝率線性配注：把勝率映射到 5%~40%，並夾緊於區間
+    if USE_WINRATE_MAP:
+        lo, hi = WINRATE_FLOOR, WINRATE_CEIL
+        span = max(1e-6, hi - lo)
+        t = (p_star - lo) / span
+        t = 0.0 if t < 0 else (1.0 if t > 1.0 else t)
+        bet_pct = BET_MIN_PCT + t * (BET_MAX_PCT - BET_MIN_PCT)
+        reason = "勝率線性配注"
+        return (INV[side], final_edge, bet_pct, reason)
+
+    # ★ 備用：原 Kelly/階梯（僅當 USE_WINRATE_MAP=0 才會走）
     if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
     if USE_KELLY:
@@ -405,19 +429,23 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
 
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
-    """組合回覆文字。"""
+    """組合回覆文字：只顯示金額；若觀望不顯示金額。"""
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
     header: list[str] = []
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
+
+    # 観望不顯示金額；非觀望只顯示金額（不顯示百分比）
+    bet_line = "建議：觀望" if choice == "觀望" else f"建議下注：{bet_amt:,}"
+
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
         f"莊：{b_pct_txt}",
         f"本次預測結果：{choice if choice != '觀望' else '觀'}",
-        f"建議下注：{bet_amt:,}",
+        bet_line,
     ]
     if cont:
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
