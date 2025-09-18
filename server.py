@@ -255,7 +255,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 def validate_activation_code(code: str) -> bool:
     """驗證管理員提供的開通密碼。"""
     if not code:
-        return False
+    return False
     # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -330,7 +330,7 @@ if OutcomePF:
             dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
         )
         log.info(
-            "PF 初始化成功: n_particles极=%d, sims_lik=%d (backend=%s)",
+            "PF 初始化成功: n_particles=%d, sims_lik=%d (backend=%s)",
             PF.n_particles,
             getattr(PF, "sims_lik", 0),
             getattr(PF, "backend", "unknown"),
@@ -351,7 +351,7 @@ if not OutcomePF:
 
         @property
         def backend(self):
-            return "极dummy"
+            return "dummy"
 
     PF = DummyPF()
     log.info("使用 DummyPF 模式")
@@ -408,7 +408,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str, float]:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足", 0.0)
     
     # 使用信心度配注系統
-    max_prob = max(p极B, pP)
+    max_prob = max(pB, pP)
     bet_pct = calculate_confidence_bet_pct(final_edge, max_prob)
     
     # 計算信心度百分比
@@ -431,7 +431,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
-        f"莊：{b_pct极txt}",
+        f"莊：{b_pct_txt}",
         f"本次預測結果：{choice if choice != '觀望' else '觀'}",
         f"信心度：{confidence:.1f}%",
         f"建議下注：{bet_amt:,}",
@@ -495,7 +495,7 @@ def _quick_buttons():
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
         items = [
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action极=MessageAction(label="結束分析 🧹", text="結束分析")),
+            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
             QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
             QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
             QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
@@ -558,7 +558,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
         
-        msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, 
+        msg = format_output_card(p, choice, sess.get("last极pts_text"), bet_amt, 
                                cont=bool(CONTINUOUS_MODE), confidence=confidence, reason=reason)
         _reply(reply_token, msg)
         log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
@@ -638,10 +638,10 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["phase"] = "choose_game"
                     left = trial_left_minutes(sess)
                     menu = ["【請選擇遊戲館別】"]
-                    for k in sorted(GAMES.keys(), key=lambda x:极int(x)):
+                    for k in sorted(GAMES.keys(), key=lambda x: int(x)):
                         menu.append(f"{k}. {GAMES[k]}")
                     menu.append("「請直接輸入數字選擇」")
-                    menu.append(f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
+                    menu.append(f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 極分鐘）")
                     _reply(event.reply_token, "\n".join(menu))
                     save_session(uid, sess)
                     return
@@ -660,10 +660,10 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 elif phase == "choose_table":
                     # 設定桌號：格式為 2 英文 + 2 數字
                     t = re.sub(r"\s+", "", text).upper()
-                    if re.fullmatch(r"[A-Z]{2}\d{2}", t):
+                    if re.fullmatch(r"[A-Z]{2}\d{极2}", t):
                         sess["table"] = t
                         sess["phase"] = "await_bankroll"
-                        _reply(event.reply_token, f"✅ 已設定桌號【{sess['table']}】\n請輸入您的本金（例：5000）")
+                        _reply(event.reply_token, f"✅ 已設定桌極號【{sess['table']}】\n請輸入您的本金（例：5000）")
                         save_session(uid, sess)
                         return
                     else:
@@ -677,7 +677,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         sess["phase"] = "await_pts"
                         _reply(
                             event.reply_token,
-                            f"👍 極已設定本金：{sess['bankroll']:,}\n📌 連續模式開啟：現在直接輸入上局點數（例：65 / 和 / 閒6莊5）即可自動預測。",
+                            f"👍 已設定本金：{sess['bankroll']:,}\n📌 連續模式開啟：現在直接輸入上局點數（例：65 / 和 / 閒6莊5）即可自動預測。",
                         )
                         save_session(uid, sess)
                         return
