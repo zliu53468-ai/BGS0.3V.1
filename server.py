@@ -13,6 +13,7 @@ import sys
 import logging
 import time
 import re
+import math  # for margin weighting calculations
 import json
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -396,6 +397,58 @@ def calculate_confidence_bet_pct(edge: float, max_prob: float) -> float:
     
     return max(MIN_BET_PCT, min(MAX_BET_PCT, bet_pct))
 
+# ---------- 連續點數差加權學習 ----------
+def _calc_margin_weight(p_pts: int, b_pts: int, last_prob_gap: float) -> float:
+    """
+    連續加權函式：
+      - margin = |p_pts - b_pts|：點數差越大權重越大；
+      - last_prob_gap = |pB - pP| (上一手預測莊閒機率差)：差距越大權重越大。
+    權重取值經過 sigmoid 與線性歸一化後疊加一個基礎值。
+    權重會被限制在 [W_MIN, W_MAX] 範圍內避免過度消耗資源。
+
+    環境變數可調整參數：
+      W_BASE   基礎權重 (預設1.0)
+      W_MIN    最小權重 (預設0.6)
+      W_MAX    最大權重 (預設2.5)
+      W_ALPHA  點數差權重係數 (預設0.80)
+      W_SIG_K  sigmoid斜率 (預設1.00)
+      W_SIG_MID sigmoid中點 (預設2.0)
+      W_GAMMA  機率差權重係數 (預設0.80)
+      W_GAP_CAP 機率差最大截斷值 (預設0.04)
+    """
+    # 計算 margin (點數差)
+    try:
+        margin = abs(int(p_pts) - int(b_pts))
+    except Exception:
+        margin = abs(p_pts - b_pts)
+    # 解析上一手機率差
+    try:
+        last_gap = float(last_prob_gap)
+    except Exception:
+        last_gap = 0.0
+    # 取得環境變數並設定預設值
+    W_BASE = float(os.getenv("W_BASE", "1.0"))
+    W_MIN = float(os.getenv("W_MIN", "0.6"))
+    W_MAX = float(os.getenv("W_MAX", "2.5"))
+    W_ALPHA = float(os.getenv("W_ALPHA", "0.80"))
+    W_SIG_K = float(os.getenv("W_SIG_K", "1.00"))
+    W_SIG_MID = float(os.getenv("W_SIG_MID", "2.0"))
+    W_GAMMA = float(os.getenv("W_GAMMA", "0.80"))
+    W_GAP_CAP = float(os.getenv("W_GAP_CAP", "0.04"))
+    # margin部分：使用sigmoid平滑增長
+    sig = 1.0 / (1.0 + math.exp(-W_SIG_K * (margin - W_SIG_MID)))
+    part_margin = W_ALPHA * sig
+    # gap部分：對上一手機率差歸一化到0-1後乘以權重
+    gap_norm = min(max(last_gap, 0.0), W_GAP_CAP) / max(W_GAP_CAP, 1e-6)
+    part_gap = W_GAMMA * gap_norm
+    w = W_BASE + part_margin + part_gap
+    # 夾在 W_MIN 與 W_MAX 之間
+    if w < W_MIN:
+        w = W_MIN
+    elif w > W_MAX:
+        w = W_MAX
+    return w
+
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str, float]:
     """根據閒、莊機率，決定下注方向與邊際與下注比例。"""
@@ -534,10 +587,13 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     start_time = time.time()
     
     # 更新上一局結果 - 正確處理和局
+    # 同時依照點數差距與上一手機率差加權更新次數
+    # 讀取上一手機率差，若不存在則為0
+    last_gap = float(sess.get("last_prob_gap", 0.0))
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
         try:
-            # 和局時更新PF狀態（使用outcome=2表示和局）
+            # 和局時更新PF狀態（使用outcome=2表示和局），權重保持1次
             PF.update_outcome(2)
             log.info("和局更新完成, 耗時: %.2fs", time.time() - start_time)
         except Exception as e:
@@ -546,8 +602,14 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         try:
             outcome = 1 if p_pts > b_pts else 0
-            PF.update_outcome(outcome)
-            log.info("勝局更新完成 (%s), 耗時: %.2fs", "閒勝" if outcome == 1 else "莊勝", time.time() - start_time)
+            # 計算點差權重並重複更新
+            w = _calc_margin_weight(p_pts, b_pts, last_gap)
+            # 限制迭代次數，避免過度消耗資源（至少1次，至多3次）
+            rep = max(1, min(3, int(round(w))))
+            for _ in range(rep):
+                PF.update_outcome(outcome)
+            log.info("勝局更新完成 (%s), 權重=%.3f, 重複=%d, 耗時: %.2fs",
+                     "閒勝" if outcome == 1 else "莊勝", w, rep, time.time() - start_time)
         except Exception as e:
             log.warning("PF update err: %s", e)
     
@@ -557,7 +619,11 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         predict_start = time.time()
         p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
-        
+        # 將本次預測莊閒機率差保存於 session，用於下局加權
+        try:
+            sess["last_prob_gap"] = abs(float(p[0]) - float(p[1]))
+        except Exception:
+            sess["last_prob_gap"] = 0.0
         choice, edge, bet_pct, reason, confidence = decide_only_bp(p)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
