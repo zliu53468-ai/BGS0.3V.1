@@ -255,7 +255,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 def validate_activation_code(code: str) -> bool:
     """驗證管理員提供的開通密碼。"""
     if not code:
-        return False
+    return False
     # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -383,16 +383,16 @@ def calculate_confidence_bet_pct(edge: float, max_prob: float) -> float:
     回傳: 下注比例 (0.05-0.40)
     """
     # 基礎信心度：優勢越高，信心度越高
-    base_confidence = min(1.0, edge * 10)  # 將優勢轉換為0-1的信心度
+    base_confidence = min(1.0, edge * 15)  # 提高優勢轉換係數，讓系統更積極
     
     # 機率信心度：機率越高，信心度越高
-    prob_confidence = max(0, (max_prob - 0.5) * 2)  # 機率50%以上才有信心
+    prob_confidence = max(0, (max_prob - 0.45) * 2.5)  # 降低門檻到45%，提高係數
     
-    # 綜合信心度
-    total_confidence = (base_confidence * 0.6 + prob_confidence * 0.4)
+    # 綜合信心度（更積極的加權）
+    total_confidence = (base_confidence * 0.5 + prob_confidence * 0.5)
     
-    # 映射到5%-40%的配注範圍
-    bet_pct = MIN_BET_PCT + total_confidence * (MAX_BET_PCT - MIN_BET_PCT)
+    # 映射到5%-40%的配注範圍，使用指數增長讓高信心度時下注更積極
+    bet_pct = MIN_BET_PCT + (total_confidence ** 0.8) * (MAX_BET_PCT - MIN_BET_PCT)
     
     return max(MIN_BET_PCT, min(MAX_BET_PCT, bet_pct))
 
@@ -404,9 +404,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str, float]:
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
     
-    if final_edge < EDGE_ENTER:
-        return ("觀望", final_edge, 0.0, "⚪ 優勢不足", 0.0)
-    
+    # 永遠進行下注，不再有觀望狀態
     # 使用信心度配注系統
     max_prob = max(pB, pP)
     bet_pct = calculate_confidence_bet_pct(final_edge, max_prob)
@@ -414,7 +412,13 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str, float]:
     # 計算信心度百分比
     confidence_percent = (bet_pct - MIN_BET_PCT) / (MAX_BET_PCT - MIN_BET_PCT) * 100
     
-    reason = f"信心度配注 {confidence_percent:.1f}% (優勢: {final_edge*100:.1f}%, 機率: {max_prob*100:.1f}%)"
+    # 根據邊際優勢調整建議文字
+    if final_edge >= 0.05:
+        reason = f"🔥 高信心配注 {confidence_percent:.1f}% (優勢: {final_edge*100:.1f}%)"
+    elif final_edge >= 0.03:
+        reason = f"✅ 中信心配注 {confidence_percent:.1f}% (優勢: {final_edge*100:.1f}%)"
+    else:
+        reason = f"🟡 低信心配注 {confidence_percent:.1f}% (優勢: {final_edge*100:.1f}%)"
     
     return (INV[side], final_edge, bet_pct, reason, confidence_percent)
 
@@ -432,7 +436,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         "【預測結果】",
         f"閒：{p_pct_txt}",
         f"莊：{b_pct_txt}",
-        f"本次預測結果：{choice if choice != '觀望' else '觀'}",
+        f"本次預測結果：{choice}",
         f"信心度：{confidence:.1f}%",
         f"建議下注：{bet_amt:,}",
         f"配注策略：{reason}",
@@ -741,3 +745,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     log.info("Starting %s on port %s (CONTINUOUS_MODE=%s)", VERSION, port, CONTINUOUS_MODE)
     app.run(host="0.0.0.0", port=port, debug=False)
+[file content end]
