@@ -1,13 +1,3 @@
-"""
-server.py — 連續模式修正版（Render 優化版 + 信心度→金額 + 和局穩定器）
-
-- Render 免費版資源優化（輕量 PF）
-- 依「信心度/優勢」配注金額（階梯 5% / 10% / 20% / 30%）
-- 觀望不顯示金額；非觀望只顯示金額
-- 和局處理：T 機率夾緊 + 和局後冷卻（可關）
-- 機率平滑與溫度縮放（可關）
-"""
-
 import os
 import sys
 import logging
@@ -16,6 +6,8 @@ import re
 import json
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
 
 # ---- Optional deps ----
 try:
@@ -23,40 +15,13 @@ try:
 except Exception:
     redis = None  # type: ignore
 
-try:
-    from flask import Flask, request, jsonify, abort  # type: ignore
-    from flask_cors import CORS  # type: ignore
-    _flask_available = True
-except Exception:
-    _flask_available = False
-    Flask = None  # type: ignore
-    request = None  # type: ignore
-    def jsonify(*args, **kwargs):  # type: ignore
-        raise RuntimeError("Flask is not available")
-    def abort(*args, **kwargs):  # type: ignore
-        raise RuntimeError("Flask is not available")
-    def CORS(app):  # type: ignore
-        return None
-
 VERSION = "bgs-pf-render-optimized-2025-09-17"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
-# ---- Flask or dummy ----
-if _flask_available and Flask is not None:
-    app = Flask(__name__)
-    CORS(app)
-else:
-    class _DummyApp:
-        def get(self, *args, **kwargs):
-            def _d(fn): return fn
-            return _d
-        def post(self, *args, **kwargs):
-            def _d(fn): return fn
-            return _d
-        def run(self, *args, **kwargs):
-            log.warning("Flask not available; dummy app cannot run.")
-    app = _DummyApp()
+# ---- Flask app setup ----
+app = Flask(__name__)
+CORS(app)
 
 # ---- Redis or in-memory session ----
 REDIS_URL = os.getenv("REDIS_URL")
@@ -78,6 +43,7 @@ SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE_SECONDS = 3600
 DEDUPE_TTL = 60
 
+# ---- Session handling ----
 def _rget(k: str) -> Optional[str]:
     try:
         return redis_client.get(k) if redis_client else None
@@ -138,79 +104,73 @@ def save_session(uid: str, data: Dict[str, Any]):
     else:
         SESS_FALLBACK[uid] = data
 
-def env_flag(name: str, default: int = 1) -> int:
-    val = os.getenv(name)
-    if val is None:
-        return 1 if default else 0
-    v = str(val).strip().lower()
-    if v in ("1", "true", "t", "yes", "y", "on"): return 1
-    if v in ("0", "false", "f", "no", "n", "off"): return 0
-    try:
-        return 1 if int(float(v)) != 0 else 0
-    except Exception:
-        return 1 if default else 0
-
 # ---- Betting knobs ----
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
-USE_KELLY = env_flag("USE_KELLY", 1)
+USE_KELLY = 1
 KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.25"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
 
-# 勝率→配注（線性）：環境變數可調（現行改為用信心度，保留參數不動）
-USE_WINRATE_MAP = env_flag("USE_WINRATE_MAP", 1)
-BET_MIN_PCT = float(os.getenv("BET_MIN_PCT", "0.05"))   # 5%
-BET_MAX_PCT = float(os.getenv("BET_MAX_PCT", "0.40"))   # 40%
-WINRATE_FLOOR = float(os.getenv("WINRATE_FLOOR", "0.50"))
-WINRATE_CEIL  = float(os.getenv("WINRATE_CEIL",  "0.75"))
+# ---- Betting logic ----
+def bet_amount(bankroll: int, pct: float) -> int:
+    if not bankroll or bankroll <= 0 or pct <= 0:
+        return 0
+    return int(round(bankroll * pct))
 
-# 和局穩定器 + 機率平滑 + 溫度縮放
-TIE_PROB_MIN = float(os.getenv("TIE_PROB_MIN", "0.02"))
-TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX", "0.12"))
-POST_TIE_COOLDOWN = int(os.getenv("POST_TIE_COOLDOWN", "1"))
-PROB_SMA_ALPHA = float(os.getenv("PROB_SMA_ALPHA", os.getenv("PROB_SMA_ALPHA".lower(), "0")))
-PROB_TEMP = float(os.getenv("PROB_TEMP", os.getenv("PROB_TEMP".lower(), "1.0")))
+def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
+    """根據信心度（優勢）來決定下注金額（不再用勝率映射）。"""
+    pB, pP = float(prob[0]), float(prob[1])
+    side = 0 if pB >= pP else 1
 
-CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
-INV = {0: "莊", 1: "閒"}
+    # 優勢（信心度）：考慮 0.95 抽水
+    evB, evP = 0.95 * pB - pP, pP - pB
+    final_edge = max(abs(evB), abs(evP))
 
-# ---- Parse last hand points ----
-def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
-    if not text:
-        return None
-    s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
-    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
-    s = s.replace("\u3000", " ")
-    u = s.upper().strip()
-    u = re.sub(r"^開始分析", "", u)
+    # 階梯配注：5% / 10% / 20% / 30%
+    if final_edge >= 0.10:
+        bet_pct, reason = 0.30, "高信心"
+    elif final_edge >= 0.07:
+        bet_pct, reason = 0.20, "中等信心"
+    elif final_edge >= 0.04:
+        bet_pct, reason = 0.10, "低信心"
+    else:
+        bet_pct, reason = 0.05, "非常低信心"
 
-    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
-    if m:
-        d = m.group(1)
-        return (int(d), int(d)) if d else (0, 0)
+    # 仍保留 MAX_BET_PCT 上限（更保守）
+    bet_pct = min(bet_pct, float(os.getenv("BET_MAX_PCT", str(0.40))))
 
-    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
-    if m:
-        return (int(m.group(1)), int(m.group(2)))
+    return ("莊" if side == 0 else "閒", final_edge, bet_pct, reason)
 
-    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
-    if m:
-        return (int(m.group(2)), int(m.group(1)))
+# ---- Health Routes ----
+@app.get("/")
+def root():
+    return f"✅ BGS PF Server OK ({VERSION})", 200
 
-    t = u.replace(" ", "").replace("\u3000", "")
-    if t in ("B", "莊", "庄"): return (0, 1)
-    if t in ("P", "閒", "闲"): return (1, 0)
-    if t in ("T", "和"):       return (0, 0)
+@app.get("/health")
+def health():
+    return jsonify(ok=True, ts=time.time(), version=VERSION), 200
 
-    if re.search(r"[A-Z]", u):
-        return None
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True, ts=time.time(), version=VERSION), 200
 
-    digits = re.findall(r"\d", u)
-    if len(digits) == 2:
-        return (int(digits[0]), int(digits[1]))
-    return None
+# ---- Line Webhook ----
+@app.post("/line-webhook")
+def line_webhook():
+    from linebot.exceptions import InvalidSignatureError
+    try:
+        signature = request.headers.get("X-Line-Signature", "")
+        body = request.get_data(as_text=True)
+        # You would need to process the webhook here with the handler
+        return "OK", 200
+    except InvalidSignatureError:
+        log.error("Invalid signature on webhook")
+        return "Invalid signature", 400
+    except Exception as e:
+        log.error("Webhook error: %s", e)
+        return "Internal error", 500
 
 # ---- Main ----
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s)", VERSION, port, CONTINUOUS_MODE)
+    log.info("Starting %s on port %s", VERSION, port)
     app.run(host="0.0.0.0", port=port, debug=False)
