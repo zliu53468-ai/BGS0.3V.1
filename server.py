@@ -1,12 +1,11 @@
 """
-server.py — 連續模式修正版（Render 優化版）含信心度配注
+server.py — 連續模式修正版（Render 優化版）
 
 針對 Render 免費版資源限制進行優化：
   - 強制設置輕量級粒子過濾器參數
   - 添加詳細診斷日誌
   - 優化錯誤處理防止卡死
   - 備用 Dummy 模式確保基本功能
-  - 新增信心度配注系統（5%-40%本金）
 """
 
 import os
@@ -44,7 +43,7 @@ except Exception:
 
 
 # 版本號
-VERSION = "bgs-pf-confidence-betting-2025-09-18"
+VERSION = "bgs-pf-render-optimized-2025-09-18"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -331,7 +330,7 @@ if OutcomePF:
             dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
         )
         log.info(
-            "PF 初始化成功: n_particles=%d, sims_lik=%d (backend=%s)",
+            "PF 初始化成功: n_particles极=%d, sims_lik=%d (backend=%s)",
             PF.n_particles,
             getattr(PF, "sims_lik", 0),
             getattr(PF, "backend", "unknown"),
@@ -352,7 +351,7 @@ if not OutcomePF:
 
         @property
         def backend(self):
-            return "dummy"
+            return "极dummy"
 
     PF = DummyPF()
     log.info("使用 DummyPF 模式")
@@ -409,7 +408,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str, float]:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足", 0.0)
     
     # 使用信心度配注系統
-    max_prob = max(pB, pP)
+    max_prob = max(p极B, pP)
     bet_pct = calculate_confidence_bet_pct(final_edge, max_prob)
     
     # 計算信心度百分比
@@ -432,7 +431,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
-        f"莊：{b_pct_txt}",
+        f"莊：{b_pct极txt}",
         f"本次預測結果：{choice if choice != '觀望' else '觀'}",
         f"信心度：{confidence:.1f}%",
         f"建議下注：{bet_amt:,}",
@@ -496,7 +495,7 @@ def _quick_buttons():
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
         items = [
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
+            QuickReplyButton(action极=MessageAction(label="結束分析 🧹", text="結束分析")),
             QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
             QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
             QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
@@ -530,15 +529,15 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
     start_time = time.time()
     
-    # 更新上一局結果 - 修正和局處理
+    # 更新上一局結果 - 正確處理和局
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
         try:
-            # 和局時不更新粒子過濾器，因為和局不影響牌局狀態
-            # 只記錄結果但不進行狀態更新
-            log.info("和局發生，跳過PF更新 (閒%d 莊%d)", p_pts, b_pts)
+            # 和局時更新PF狀態（使用outcome=2表示和局）
+            PF.update_outcome(2)
+            log.info("和局更新完成, 耗時: %.2fs", time.time() - start_time)
         except Exception as e:
-            log.warning("和局處理錯誤: %s", e)
+            log.warning("PF tie update err: %s", e)
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         try:
@@ -548,7 +547,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         except Exception as e:
             log.warning("PF update err: %s", e)
     
-    # 做預測（無論和局與否都進行預測）
+    # 做預測
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
@@ -558,10 +557,6 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         choice, edge, bet_pct, reason, confidence = decide_only_bp(p)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
-        
-        # 和局時的特殊提示
-        if p_pts == b_pts:
-            reason += " | 上局和局，狀態維持"
         
         msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, 
                                cont=bool(CONTINUOUS_MODE), confidence=confidence, reason=reason)
@@ -643,7 +638,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["phase"] = "choose_game"
                     left = trial_left_minutes(sess)
                     menu = ["【請選擇遊戲館別】"]
-                    for k in sorted(GAMES.keys(), key=lambda x: int(x)):
+                    for k in sorted(GAMES.keys(), key=lambda x:极int(x)):
                         menu.append(f"{k}. {GAMES[k]}")
                     menu.append("「請直接輸入數字選擇」")
                     menu.append(f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
@@ -682,7 +677,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         sess["phase"] = "await_pts"
                         _reply(
                             event.reply_token,
-                            f"👍 已設定本金：{sess['bankroll']:,}\n📌 連續模式開啟：現在直接輸入上局點數（例：65 / 和 / 閒6莊5）即可自動預測。",
+                            f"👍 極已設定本金：{sess['bankroll']:,}\n📌 連續模式開啟：現在直接輸入上局點數（例：65 / 和 / 閒6莊5）即可自動預測。",
                         )
                         save_session(uid, sess)
                         return
