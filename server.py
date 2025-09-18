@@ -255,7 +255,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 def validate_activation_code(code: str) -> bool:
     """驗證管理員提供的開通密碼。"""
     if not code:
-    return False
+        return False
     # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -558,7 +558,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
         
-        msg = format_output_card(p, choice, sess.get("last极pts_text"), bet_amt, 
+        msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, 
                                cont=bool(CONTINUOUS_MODE), confidence=confidence, reason=reason)
         _reply(reply_token, msg)
         log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
@@ -641,7 +641,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     for k in sorted(GAMES.keys(), key=lambda x: int(x)):
                         menu.append(f"{k}. {GAMES[k]}")
                     menu.append("「請直接輸入數字選擇」")
-                    menu.append(f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 極分鐘）")
+                    menu.append(f"⏳ 試用剩餘 {left} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
                     _reply(event.reply_token, "\n".join(menu))
                     save_session(uid, sess)
                     return
@@ -660,10 +660,10 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 elif phase == "choose_table":
                     # 設定桌號：格式為 2 英文 + 2 數字
                     t = re.sub(r"\s+", "", text).upper()
-                    if re.fullmatch(r"[A-Z]{2}\d{极2}", t):
+                    if re.fullmatch(r"[A-Z]{2}\d{2}", t):
                         sess["table"] = t
                         sess["phase"] = "await_bankroll"
-                        _reply(event.reply_token, f"✅ 已設定桌極號【{sess['table']}】\n請輸入您的本金（例：5000）")
+                        _reply(event.reply_token, f"✅ 已設定桌號【{sess['table']}】\n請輸入您的本金（例：5000）")
                         save_session(uid, sess)
                         return
                     else:
