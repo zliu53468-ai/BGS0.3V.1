@@ -530,15 +530,15 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
     start_time = time.time()
     
-    # 更新上一局結果
+    # 更新上一局結果 - 修正和局處理
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
         try:
-            if int(os.getenv("SKIP_TIE_UPD", "0")) == 0:
-                PF.update_outcome(2)
-                log.info("和局更新完成, 耗時: %.2fs", time.time() - start_time)
+            # 和局時不更新粒子過濾器，因為和局不影響牌局狀態
+            # 只記錄結果但不進行狀態更新
+            log.info("和局發生，跳過PF更新 (閒%d 莊%d)", p_pts, b_pts)
         except Exception as e:
-            log.warning("PF tie update err: %s", e)
+            log.warning("和局處理錯誤: %s", e)
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         try:
@@ -548,7 +548,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         except Exception as e:
             log.warning("PF update err: %s", e)
     
-    # 做預測
+    # 做預測（無論和局與否都進行預測）
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
@@ -558,6 +558,10 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         choice, edge, bet_pct, reason, confidence = decide_only_bp(p)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
+        
+        # 和局時的特殊提示
+        if p_pts == b_pts:
+            reason += " | 上局和局，狀態維持"
         
         msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, 
                                cont=bool(CONTINUOUS_MODE), confidence=confidence, reason=reason)
@@ -687,7 +691,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         return
 
                 # --- 兼容舊流程：開始分析XY ---
-                norm = raw.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+                norm = raw.translate(str.maketrans("０一二三四五六七八九", "0123456789"))
                 norm = re.sub(r"\s+", "", norm)
                 m_ka = re.fullmatch(r"開始分析(\d)(\d)", norm)
                 if m_ka and sess.get("bankroll"):
