@@ -17,8 +17,8 @@ import json
 from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
-# Optional imports for optional dependencies.  Render free plans may not
-# have redis or Flask installed.  Wrap the imports in try/except blocks
+# Optional imports for optional dependencies. Render free plans may not
+# have redis or Flask installed. Wrap the imports in try/except blocks
 # and fall back to dummy objects when unavailable.
 try:
     import redis  # type: ignore
@@ -62,7 +62,7 @@ else:
 
         Methods ``get`` and ``post`` return a decorator that simply
         returns the wrapped function unchanged, allowing route
-        definitions to execute without a real server.  The ``run``
+        definitions to execute without a real server. The ``run``
         method logs a warning instead of starting a server.
         """
         def get(self, *args, **kwargs):  # type: ignore
@@ -255,7 +255,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 def validate_activation_code(code: str) -> bool:
     """驗證管理員提供的開通密碼。"""
     if not code:
-    return False
+        return False
     # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -293,7 +293,7 @@ os.environ['PF_PRED_SIMS'] = '0'
 os.environ['DECKS'] = '6'
 
 # Default backend to Monte‑Carlo to greatly reduce computational burden on
-# resource‑constrained platforms.  If a caller explicitly sets
+# resource‑constrained platforms. If a caller explicitly sets
 # ``PF_BACKEND`` in the environment it will override this value.
 if not os.getenv('PF_BACKEND'):
     os.environ['PF_BACKEND'] = 'mc'
@@ -306,7 +306,7 @@ try:
 except Exception:
     try:
         # Fallback to a local ``pfilter`` module located in the same
-        # directory as this file.  When running outside of a package
+        # directory as this file. When running outside of a package
         # context, add the current directory to ``sys.path`` so that
         # ``import pfilter`` resolves correctly.
         _cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -745,4 +745,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     log.info("Starting %s on port %s (CONTINUOUS_MODE=%s)", VERSION, port, CONTINUOUS_MODE)
     app.run(host="0.0.0.0", port=port, debug=False)
-[file content end]
