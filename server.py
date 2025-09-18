@@ -264,13 +264,13 @@ def _quick_buttons():
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
         items = [
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析"))),
-            QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B"))),
-            QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P"))),
-            QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T"))),
+            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
+            QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
+            QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
+            QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
         ]
         if CONTINUOUS_MODE == 0:
-            items.insert(0, QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始分析"))))
+            items.insert(0, QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始分析")))
         return QuickReply(items=items)
     except Exception:
         return None
@@ -316,19 +316,19 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
 
-        # --- 機率平滑（滑動平均） ---
+        # --- 機率平滑（滑動平均） --- 
         p = np.asarray(p, dtype=np.float32)
         if PROB_SMA_ALPHA > 0:
             last_p = np.asarray(sess.get("last_prob") or p, dtype=np.float32)
             p = (1 - PROB_SMA_ALPHA) * last_p + PROB_SMA_ALPHA * p
 
-        # --- 溫度縮放（讓分布更穩/尖） ---
+        # --- 溫度縮放（讓分布更穩/尖） --- 
         if PROB_TEMP > 0 and abs(PROB_TEMP - 1.0) > 1e-6:
             logits = np.log(np.clip(p, 1e-6, 1.0))
             p = np.exp(logits / PROB_TEMP)
             p = p / np.sum(p)
 
-        # --- 和局機率夾緊（避免 T 過低/過高扭曲） ---
+        # --- 和局機率夾緊（避免 T 過低/過高扭曲） --- 
         try:
             pB, pP, pT = float(p[0]), float(p[1]), float(p[2])
             pT = min(max(pT, TIE_PROB_MIN), TIE_PROB_MAX)
@@ -346,7 +346,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         # 存回平滑後值供下輪使用
         sess["last_prob"] = p.tolist()
 
-        # --- 出手決策（含和局冷卻） ---
+        # --- 出手決策（含和局冷卻） --- 
         choice, edge, bet_pct, reason = decide_only_bp(p)
 
         # 和局冷卻：>0 則本手觀望
