@@ -15,7 +15,7 @@ import logging
 import time
 import re
 import json
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 # Optional imports for optional dependencies.  Render free plans may not
@@ -44,7 +44,7 @@ except Exception:
 
 
 # 版本號
-VERSION = "bgs-pf-confidence-betting-2025-09-17"
+VERSION = "bgs-pf-confidence-betting-2025-09-18"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -231,7 +231,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     t = u.replace(" ", "").replace("\u3000", "")
     if t in ("B", "莊", "庄"):
         return (0, 1)
-    if t in ("P", "閒", "閑"):
+    if t in ("P", "閒", "闲"):
         return (1, 0)
     if t in ("T", "和"):
         return (0, 0)
@@ -256,7 +256,7 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 def validate_activation_code(code: str) -> bool:
     """驗證管理員提供的開通密碼。"""
     if not code:
-    return False
+        return False
     # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
@@ -425,7 +425,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     """組合回覆文字。"""
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
-    header: list[str] = []
+    header: List[str] = []
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
@@ -446,7 +446,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
 # ---------- 健康檢查路由 ----------
 @app.get("/")
 def root():
-    ua = request.headers.get("User-Agent", "")
+    ua = request.headers.get("User-Agent", "") if request else ""
     if "UptimeRobot" in ua:
         return "OK", 200
     return f"✅ BGS PF Server OK ({VERSION})", 200
@@ -509,6 +509,8 @@ def _quick_buttons():
 
 
 def _reply(token: str, text: str):
+    if not line_api:
+        return
     from linebot.models import TextSendMessage
     try:
         line_api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
