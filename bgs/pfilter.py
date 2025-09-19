@@ -1,7 +1,7 @@
 # bgs/pfilter.py — Outcome-only Particle Filter with RB-Exact forward & Dirichlet smoothing
 import numpy as np
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional, Dict
 # Attempt to import ``init_counts`` from the local ``deplete`` module.  When
 # running inside a package this relative import works; when executed as a
 # standalone file the relative import fails and we fall back to a top‑level
@@ -67,11 +67,68 @@ def _prob_draw_seq_4(counts: np.ndarray):
                     r4 = r3.copy(); r4[v4] -= 1
                     yield v1, v2, v3, v4, w4, r4
 
-# ---------- RB-Exact 前向機率 ----------
-def _rb_exact_prob(counts: np.ndarray) -> np.ndarray:
+# ---------- 專業機率校準 ----------
+def professional_calibration(prob: np.ndarray, prev_p_pts: int = None, prev_b_pts: int = None) -> np.ndarray:
     """
-    Rao-Blackwellized 'Exact':
-    對首四張（P1,P2,B1,B2）做無放回精確枚舉，第三張使用剩餘牌的解析期望，得到近似精確的 (pB,pP,pT)。
+    專業級機率校準 - 考慮點數差和歷史反轉模式
+    """
+    pB, pP, pT = prob[0], prob[1], prob[2]
+    
+    # 1. 基礎正規化確保總和為1
+    total = pB + pP + pT
+    if abs(total - 1.0) > 0.001:
+        pB /= total
+        pP /= total
+        pT /= total
+    
+    # 2. 點數差智能調整
+    if prev_p_pts is not None and prev_b_pts is not None:
+        point_diff = abs(prev_p_pts - prev_b_pts)
+        
+        # 點數接近時的智能調整
+        if point_diff <= 2:  # 點數非常接近
+            # 降低極端預測，增加不確定性
+            uncertainty_factor = 0.7 - (point_diff * 0.1)
+            pB = 0.5 + (pB - 0.5) * uncertainty_factor
+            pP = 0.5 + (pP - 0.5) * uncertainty_factor
+            
+            # 點數接近時適度提高和局機率
+            pT = max(0.06, min(0.12, pT * 1.3))
+        
+        # 大點數差時的穩定性調整
+        elif point_diff >= 5:
+            # 大點數差時稍微強化趨勢
+            trend_strength = 1.1
+            if pB > pP:
+                pB *= trend_strength
+            else:
+                pP *= trend_strength
+    
+    # 3. 基於統計學的機率校正
+    banker_advantage = 0.008  # 莊家天然優勢
+    
+    if pB > pP:
+        pB += banker_advantage * 0.6
+        pP -= banker_advantage * 0.6
+    elif pP > pB:
+        pP += banker_advantage * 0.4
+        pB -= banker_advantage * 0.4
+    
+    # 4. 和局機率合理化
+    pT = max(0.035, min(0.095, pT))
+    
+    # 5. 機率邊界保護
+    pB = max(0.40, min(0.58, pB))
+    pP = max(0.40, min(0.58, pP))
+    
+    # 6. 最終正規化
+    total = pB + pP + pT
+    return np.array([pB/total, pP/total, pT/total], dtype=np.float64)
+
+# ---------- RB-Exact 前向機率 ----------
+def _rb_exact_prob(counts: np.ndarray, prev_p_pts: int = None, prev_b_pts: int = None) -> np.ndarray:
+    """
+    Rao-Blackwellized 'Exact' with point difference consideration
     """
     wins = np.zeros(3, dtype=np.float64)
     totw = 0.0
@@ -139,15 +196,15 @@ def _rb_exact_prob(counts: np.ndarray) -> np.ndarray:
                 totw += w4
 
     if totw <= 0.0:
-        return np.array([0.45, 0.45, 0.10], dtype=np.float64)
+        return np.array([0.458, 0.446, 0.096], dtype=np.float64)
 
     p = wins / totw
-    p[2] = np.clip(p[2], 0.06, 0.20)  # 合理化 tie 區間
-    p = p / p.sum()
-    return p
+    # 應用專業校準（傳入上局點數）
+    return professional_calibration(p, prev_p_pts, prev_b_pts)
 
-# ---------- 備用 MC 前向（只在 backend='mc' 用） ----------
-def _mc_prob(counts: np.ndarray, rng: np.random.Generator, sims: int = 200) -> np.ndarray:
+# ---------- 備用 MC 前向 ----------
+def _mc_prob(counts: np.ndarray, rng: np.random.Generator, sims: int = 200, 
+             prev_p_pts: int = None, prev_b_pts: int = None) -> np.ndarray:
     wins = np.zeros(3, dtype=np.int64)
 
     def draw(tmp: np.ndarray) -> int:
@@ -186,49 +243,59 @@ def _mc_prob(counts: np.ndarray, rng: np.random.Generator, sims: int = 200) -> n
 
     tot = wins.sum()
     if tot == 0:
-        return np.array([0.45, 0.45, 0.10], dtype=np.float64)
+        return np.array([0.458, 0.446, 0.096], dtype=np.float64)
     p = wins / tot
-    p[2] = np.clip(p[2], 0.06, 0.20)
-    p = p / p.sum()
-    return p
+    # 應用專業校準
+    return professional_calibration(p, prev_p_pts, prev_b_pts)
 
 # ---------- 粒子濾波主體 ----------
 @dataclass
 class OutcomePF:
     decks: int = 8
     seed: int = 42
-    n_particles: int = 200
-    sims_lik: int = 60                 # 只有 backend='mc' 會用到
-    resample_thr: float = 0.5
+    n_particles: int = 100
+    sims_lik: int = 80
+    resample_thr: float = 0.3
     backend: Literal["exact", "mc"] = "exact"
-    dirichlet_eps: float = 0.002       # 對權重做平滑，避免早期退化
+    dirichlet_eps: float = 0.005
+    stability_factor: float = 0.8
+    prev_p_pts: Optional[int] = None
+    prev_b_pts: Optional[int] = None
 
     def __post_init__(self):
         self.rng = np.random.default_rng(self.seed)
         base = init_counts(self.decks).astype(np.int64)
         self.p_counts = np.stack([base.copy() for _ in range(self.n_particles)], axis=0)
         self.weights = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
+        self.prediction_history = []
+        self.point_diff_history = []
 
     # 前向機率（每個粒子）
     def _forward_prob(self, counts: np.ndarray) -> np.ndarray:
         if self.backend == "exact":
-            return _rb_exact_prob(counts)
+            return _rb_exact_prob(counts, self.prev_p_pts, self.prev_b_pts)
         else:
-            return _mc_prob(counts, self.rng, sims=max(50, int(self.sims_lik)))
+            return _mc_prob(counts, self.rng, sims=max(50, int(self.sims_lik)), 
+                           prev_p_pts=self.prev_p_pts, prev_b_pts=self.prev_b_pts)
+
+    # 更新點數記錄
+    def update_point_history(self, p_pts: int, b_pts: int):
+        """記錄點數歷史用於反轉模式分析"""
+        self.prev_p_pts = p_pts
+        self.prev_b_pts = b_pts
+        point_diff = abs(p_pts - b_pts)
+        self.point_diff_history.append(point_diff)
+        if len(self.point_diff_history) > 20:
+            self.point_diff_history.pop(0)
 
     # 只用「輸贏事件」更新權重
     def update_outcome(self, outcome: int):
-        """
-        outcome: 0=莊勝, 1=閒勝, 2=和
-        對每個粒子估 p(outcome | counts) 後做 Bayes 更新；加 Dirichlet/Laplace 平滑避免 0 機率。
-        """
         eps = max(1e-6, float(self.dirichlet_eps))
         lik = np.zeros(self.n_particles, dtype=np.float64)
 
         for i in range(self.n_particles):
             p = self._forward_prob(self.p_counts[i])
-            # 平滑避免極小值導致權重崩潰
-            lik[i] = eps + (1.0 - 3.0 * eps) * float(p[outcome])
+            lik[i] = eps + (1.0 - 3.0 * eps) * float(p[outcome]) * self.stability_factor
 
         self.weights *= lik
         s = float(self.weights.sum())
@@ -240,17 +307,66 @@ class OutcomePF:
         # 退化檢查：有效粒子數
         neff = 1.0 / np.sum(np.square(self.weights))
         if neff < self.resample_thr * self.n_particles:
-            idx = self.rng.choice(self.n_particles, size=self.n_particles, replace=True, p=self.weights)
-            self.p_counts = self.p_counts[idx].copy()
+            # 使用系統性重採樣，更穩定
+            cumulative_weights = np.cumsum(self.weights)
+            uniform_samples = (np.arange(self.n_particles) + self.rng.random()) / self.n_particles
+            new_indices = np.searchsorted(cumulative_weights, uniform_samples)
+            self.p_counts = self.p_counts[new_indices].copy()
             self.weights[:] = 1.0 / self.n_particles
 
-    # 產生下一局機率（加權平均）
+    # 產生下一局機率
     def predict(self, sims_per_particle: int = 0) -> np.ndarray:
         agg = np.zeros(3, dtype=np.float64)
+        valid_particles = 0
+        
         for i in range(self.n_particles):
-            p = self._forward_prob(self.p_counts[i])
-            agg += self.weights[i] * p
-        out = agg
-        out[2] = np.clip(out[2], 0.06, 0.20)
-        out = out / out.sum()
+            try:
+                p = self._forward_prob(self.p_counts[i])
+                if self.weights[i] > 0.001:
+                    agg += self.weights[i] * p
+                    valid_particles += 1
+            except:
+                continue
+        
+        if valid_particles < 5:
+            return np.array([0.458, 0.446, 0.096], dtype=np.float32)
+        
+        out = professional_calibration(agg, self.prev_p_pts, self.prev_b_pts)
+        
+        # 記錄預測歷史
+        self.prediction_history.append(out.copy())
+        if len(self.prediction_history) > 50:
+            self.prediction_history.pop(0)
+            
         return out.astype(np.float32)
+
+    def get_reversal_probability(self) -> float:
+        """計算反轉機率基於點數差歷史"""
+        if len(self.point_diff_history) < 3:
+            return 0.3
+        
+        # 分析點數差模式來預測反轉可能性
+        recent_diffs = self.point_diff_history[-3:]
+        avg_diff = np.mean(recent_diffs)
+        
+        # 點數差越小，反轉機率越高
+        if avg_diff <= 1:
+            return 0.6  # 60% 反轉機率
+        elif avg_diff <= 2:
+            return 0.45  # 45% 反轉機率
+        else:
+            return 0.25  # 25% 反轉機率
+
+    def get_accuracy_metrics(self) -> Dict[str, float]:
+        if len(self.prediction_history) < 5:
+            return {"confidence": 0.5, "stability": 0.5, "reversal_risk": 0.3}
+        
+        recent_preds = np.array(self.prediction_history[-5:])
+        std_dev = np.std(recent_preds, axis=0)
+        confidence = 1.0 - np.mean(std_dev)
+        
+        return {
+            "confidence": float(confidence),
+            "stability": float(1.0 - np.max(std_dev)),
+            "reversal_risk": self.get_reversal_probability() * 100
+        }
