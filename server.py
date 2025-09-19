@@ -1,14 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
-附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數開關）
-含 LINE webhook（有憑證→驗簽處理；否則自動退回 200）
+server.py — Render 免費版優化 + 試用到期引導(含可點連結) + 反重置試用(需 Redis)
+功能彙總：
+- 分階段流程：choose_game → choose_table → await_bankroll → await_pts
+- 點差連續加權 + 不確定性懲罰 + 手數深度權重 + 點差可靠度表(5桶)
+- 決策模式 DECIDE_MODE=prob(看勝率) / ev(含0.95抽水的期望值)
+- Thompson 縮放(配注) ；溫度 + EMA 平滑
+- LINE 事件去重(SETNX+TTL)；reply 失敗自動 push 後援
+- 試用機制：TRIAL_MINUTES；到期提示含管理員可點連結與ID；支援「開通 密碼」；Redis 記錄防止封鎖後重拿試用
 
-改良點：
-A) LINE 事件去重（SETNX + TTL 90 秒），避免重送造成重覆回覆
-B) reply_message 失敗 → 自動 push_message 後援（解決 Invalid reply token）
-C) 維持「choose_game → choose_table → await_bankroll → await_pts」分階段，避免本金/點數混淆
-D) 新增 DECIDE_MODE（prob / ev）：可選「依勝率％」或「依期望值(含抽水)」做方向決策
+環境變數(建議)：
+PF_BACKEND=mc
+DECKS=6
+PF_N=60
+PF_UPD_SIMS=30
+PF_PRED_SIMS=20
+PF_RESAMPLE=0.7
+PF_DIR_EPS=0.003
+
+TRIAL_MINUTES=30
+ADMIN_CONTACT_ID=@admin     # 顯示給用戶看的官方 Line ID（例：@bgs888）
+ADMIN_CONTACT_URL=https://lin.ee/8rwFDuh   # 你的加入好友連結(可點)
+ADMIN_ACTIVATION_SECRET=aaa8881688         # 開通密碼，不用可留空
+
+DECIDE_MODE=prob            # prob / ev
+EDGE_ENTER=0.03
+MIN_BET_PCT=0.05
+MAX_BET_PCT=0.40
+PROB_SMA_ALPHA=0.45
+PROB_TEMP=1.0
+TS_EN=0
+TS_ALPHA=2
+TS_BETA=2
+UNCERT_PENALTY_EN=1
+UNCERT_MARGIN_MAX=1
+UNCERT_RATIO=0.33
+W_BASE=1.0
+W_MIN=0.5
+W_MAX=2.8
+W_ALPHA=0.95
+W_SIG_K=1.10
+W_SIG_MID=1.8
+W_GAMMA=1.0
+W_GAP_CAP=0.06
+DEPTH_W_EN=1
+DEPTH_W_MAX=1.3
+MREL_EN=1
+MREL_LR=0.02
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -33,7 +71,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-adv-render-free-2025-09-19-line+phases+dedupe+push+decidemode"
+VERSION = "pf-adv-render-free-2025-09-19+trial-link+anti-retrial+decidemode"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -66,8 +104,8 @@ if redis and REDIS_URL:
         log.warning("Redis connect fail: %s => fallback memory store", e)
 
 SESS: Dict[str, Dict[str, Any]] = {}
-
 SESSION_EXPIRE = 3600
+
 def _rget(k: str) -> Optional[str]:
     try:
         if rcli: return rcli.get(k)
@@ -80,6 +118,17 @@ def _rset(k: str, v: str, ex: Optional[int]=None):
         if rcli: rcli.set(k, v, ex=ex)
     except Exception as e:
         log.warning("Redis SET err: %s", e)
+
+def _rsetnx(k: str, v: str, ex: int) -> bool:
+    try:
+        if rcli:
+            return bool(rcli.set(k, v, ex=ex, nx=True))
+    except Exception as e:
+        log.warning("Redis SETNX err: %s", e)
+    # fallback 本機（不持久）
+    if k in SESS: return False
+    SESS[k] = {"v": v, "exp": time.time()+ex}
+    return True
 
 # ---------- 旗標 ----------
 def env_flag(name: str, default: int=0) -> int:
@@ -97,6 +146,11 @@ GAMES = {
     "6":"歐博/卡利","7":"KG","8":"全利","9":"名人","10":"MT真人",
 }
 
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES","30"))
+ADMIN_CONTACT_ID = os.getenv("ADMIN_CONTACT_ID", "@admin")
+ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "https://lin.ee/8rwFDuh").strip()
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "").strip()
+
 def now_sess(uid: str) -> Dict[str, Any]:
     if rcli:
         j = _rget(f"sess:{uid}")
@@ -110,20 +164,67 @@ def now_sess(uid: str) -> Dict[str, Any]:
         "phase": "choose_game",
         "game": None, "table": None,
         "trial_start": int(time.time()),
-        "premium": True,
+        "trial_expired": False,
+        "premium": False,  # 預設不開通
         "last_pts_text": None,
         "last_prob_gap": 0.0,
         "hand_idx": 0,
         "mrel": {"a":[1.0]*5, "b":[1.0]*5},
     }
+    # 從 Redis 讀取舊試用紀錄（防封鎖重試用）
+    if rcli:
+        tj = _rget(f"trial:{uid}")
+        if tj:
+            try:
+                t = json.loads(tj)
+                s["trial_start"] = int(t.get("trial_start", s["trial_start"]))
+                s["trial_expired"] = bool(t.get("trial_expired", False))
+                s["premium"] = bool(t.get("premium", False))
+            except: pass
     SESS[uid] = s
     return s
 
 def save_sess(uid: str, s: Dict[str, Any]):
     if rcli:
         _rset(f"sess:{uid}", json.dumps(s), ex=SESSION_EXPIRE)
+        # 同步長期的試用狀態
+        try:
+            trial_state = {
+                "trial_start": int(s.get("trial_start", int(time.time()))),
+                "trial_expired": bool(s.get("trial_expired", False)),
+                "premium": bool(s.get("premium", False)),
+            }
+            _rset(f"trial:{uid}", json.dumps(trial_state), ex=None)  # 永不過期（或由你手動清）
+        except Exception as e:
+            log.warning("Persist trial state fail: %s", e)
     else:
         SESS[uid] = s
+
+# ---------- 試用守門 ----------
+def trial_left_minutes(sess: Dict[str,Any]) -> int:
+    if sess.get("premium", False): return 9999
+    if sess.get("trial_expired", False): return 0
+    used = (int(time.time()) - int(sess.get("trial_start", int(time.time())))) // 60
+    return max(0, TRIAL_MINUTES - used)
+
+def trial_guard_or_none(uid: str, sess: Dict[str,Any]) -> Optional[str]:
+    """回傳提示文字（含連結）或 None。到期會標記 trial_expired=True 並持久化到 Redis。"""
+    if sess.get("premium", False): return None
+    left = trial_left_minutes(sess)
+    if left > 0:
+        return None
+    # 已到期
+    sess["trial_expired"] = True
+    save_sess(uid, sess)
+    # LINE 文字訊息中貼 URL 即可點擊；同時附上官方 Line ID 可手打
+    hint = (
+        "⛔ 試用期已到\n"
+        "📣 請聯繫管理員開通登入帳號\n"
+        f"🔗 加入官方LINE：{ADMIN_CONTACT_URL}\n"
+        f"🆔 或搜尋ID：{ADMIN_CONTACT_ID}\n"
+        "（開通成功後請輸入：開通 你的密碼）"
+    )
+    return hint
 
 # ---------- 常用工具 ----------
 def _norm(s: str) -> str:
@@ -145,11 +246,13 @@ def _quick_reply():
     except Exception:
         return None
 
-def game_menu_text() -> str:
+def game_menu_text(left_min: Optional[int]=None) -> str:
     lines = ["【請選擇遊戲館別】"]
     for k in sorted(GAMES.keys(), key=lambda x: int(x)):
         lines.append(f"{k}. {GAMES[k]}")
     lines.append("（請直接輸入數字 1-10）")
+    if left_min is not None and left_min < 9999:
+        lines.append(f"⏳ 試用剩餘 {left_min} 分鐘")
     return "\n".join(lines)
 
 # ---------- 放寬版點數解析 ----------
@@ -235,8 +338,7 @@ MAX_BET_PCT = float(os.getenv("MAX_BET_PCT","0.40"))
 PROB_SMA_ALPHA = float(os.getenv("PROB_SMA_ALPHA","0.45"))
 PROB_TEMP = float(os.getenv("PROB_TEMP","1.0"))
 
-# 新增：決策模式（prob=看勝率；ev=看期望值含抽水）
-DECIDE_MODE = os.getenv("DECIDE_MODE", "prob").strip().lower()
+DECIDE_MODE = os.getenv("DECIDE_MODE", "prob").strip().lower()  # 'prob' or 'ev'
 
 TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
@@ -306,17 +408,15 @@ def decide_bp(prob: np.ndarray) -> Tuple[str, float, float]:
     - DECIDE_MODE='ev'  ：含0.95抽水的期望值
     """
     pB, pP = float(prob[0]), float(prob[1])
-
     if DECIDE_MODE == "ev":
         evB, evP = 0.95*pB - pP, pP - pB
         side = 0 if evB > evP else 1
         edge = max(abs(evB), abs(evP))
         maxp = max(pB, pP)
         return (INV[side], edge, maxp)
-
     # 'prob'：依勝率
     side = 0 if pB >= pP else 1
-    edge = abs(pB - pP)     # 機率差當作信心度
+    edge = abs(pB - pP)
     maxp = max(pB, pP)
     return (INV[side], edge, maxp)
 
@@ -386,7 +486,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
     else:
-        sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts})" if p_pts>b_pts else f"上局結果: 閒{p_pts} 莊{b_pts}"
+        sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts}"
 
     # 更新可靠度（上一手預測 vs 現在 outcome）
     if p_pts != b_pts and _prev_prob_sma is not None:
@@ -422,6 +522,21 @@ def api_predict():
     uid = str(data.get("uid","guest"))
     text = str(data.get("text","")).strip()
     sess = now_sess(uid)
+
+    # 開通密碼（REST 也支援）
+    up = text.upper()
+    if up.startswith("開通") or up.startswith("ACTIVATE"):
+        after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
+        ok = bool(ADMIN_ACTIVATION_SECRET) and (after.strip() == ADMIN_ACTIVATION_SECRET)
+        sess["premium"] = ok
+        save_sess(uid, sess)
+        return jsonify(ok=ok, msg=("✅ 已開通成功！" if ok else "❌ 密碼錯誤")), 200 if ok else 403
+
+    guard = trial_guard_or_none(uid, sess)
+    if guard:
+        save_sess(uid, sess)
+        return jsonify(ok=False, msg=guard), 402
+
     if "bankroll" in data:
         try:
             bk = int(data["bankroll"])
@@ -436,7 +551,7 @@ def api_predict():
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
 
-# ---------- LINE webhook（驗簽 / 自動降級 / 分階段 + 去重 + push 後援） ----------
+# ---------- LINE webhook（驗簽 / 自動降級 / 分階段 + 去重 + push 後援 + 試用守門） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -502,14 +617,13 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
-        # 若為 redelivery（LINE 重送）直接忽略
+        # redelivery 直接略過
         try:
             dc = getattr(event, "delivery_context", None)
             if dc and getattr(dc, "is_redelivery", False):
                 return
         except Exception:
             pass
-        # 事件去重
         if not _dedupe_event(getattr(event, "id", None)):
             return
 
@@ -520,14 +634,33 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         phase = sess.get("phase","choose_game")
         log.info("[LINE] uid=%s phase=%s text=%r norm=%r", uid, phase, raw, norm)
 
+        # --- 開通指令優先 ---
+        if norm.startswith("開通") or norm.startswith("ACTIVATE"):
+            after = raw[2:] if norm.startswith("開通") else raw[len("ACTIVATE"):]
+            ok = bool(ADMIN_ACTIVATION_SECRET) and (after.strip() == ADMIN_ACTIVATION_SECRET)
+            sess["premium"] = ok
+            save_sess(uid, sess)
+            reply_text(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤", user_id=uid)
+            return
+
+        # --- 試用守門 ---
+        guard = trial_guard_or_none(uid, sess)
+        if guard:
+            save_sess(uid, sess)
+            reply_text(event.reply_token, guard, user_id=uid)
+            return
+
         # ---- 全局指令 ----
         if norm in ("結束分析", "清空", "RESET"):
-            keep_premium = bool(sess.get("premium", True))
-            keep_trial   = int(sess.get("trial_start", int(time.time())))
+            keep_premium = bool(sess.get("premium", False))
+            # 保留 trial_start / trial_expired（防止重拿試用）
+            keep_trial_start = int(sess.get("trial_start", int(time.time())))
+            keep_trial_expired = bool(sess.get("trial_expired", False))
             SESS.pop(uid, None)
             sess = now_sess(uid)
             sess["premium"] = keep_premium
-            sess["trial_start"] = keep_trial
+            sess["trial_start"] = keep_trial_start
+            sess["trial_expired"] = keep_trial_expired
             sess["phase"] = "choose_game"
             save_sess(uid, sess)
             reply_text(event.reply_token, "🧹 已清空。輸入『遊戲設定』開始。", user_id=uid)
@@ -539,7 +672,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["table"] = None
             sess["bankroll"] = 0
             save_sess(uid, sess)
-            reply_text(event.reply_token, game_menu_text(), user_id=uid)
+            reply_text(event.reply_token, game_menu_text(trial_left_minutes(sess)), user_id=uid)
             return
 
         # ---- 分階段處理 ----
@@ -550,7 +683,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 save_sess(uid, sess)
                 reply_text(event.reply_token, f"✅ 已選【{sess['game']}】\n請輸入桌號（例：DG01，格式：2字母+2數字）", user_id=uid)
                 return
-            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + game_menu_text(), user_id=uid)
+            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + game_menu_text(trial_left_minutes(sess)), user_id=uid)
             return
 
         if phase == "choose_table":
