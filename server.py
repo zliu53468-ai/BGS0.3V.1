@@ -4,10 +4,11 @@ server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
 附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數開關）
 含 LINE webhook（有憑證→驗簽處理；否則自動退回 200）
 
-改良點（本版新增）：
+改良點：
 A) LINE 事件去重（SETNX + TTL 90 秒），避免重送造成重覆回覆
 B) reply_message 失敗 → 自動 push_message 後援（解決 Invalid reply token）
 C) 維持「choose_game → choose_table → await_bankroll → await_pts」分階段，避免本金/點數混淆
+D) 新增 DECIDE_MODE（prob / ev）：可選「依勝率％」或「依期望值(含抽水)」做方向決策
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -32,7 +33,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-adv-render-free-2025-09-19-line+phases+dedupe+push"
+VERSION = "pf-adv-render-free-2025-09-19-line+phases+dedupe+push+decidemode"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -234,6 +235,9 @@ MAX_BET_PCT = float(os.getenv("MAX_BET_PCT","0.40"))
 PROB_SMA_ALPHA = float(os.getenv("PROB_SMA_ALPHA","0.45"))
 PROB_TEMP = float(os.getenv("PROB_TEMP","1.0"))
 
+# 新增：決策模式（prob=看勝率；ev=看期望值含抽水）
+DECIDE_MODE = os.getenv("DECIDE_MODE", "prob").strip().lower()
+
 TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
@@ -294,12 +298,27 @@ def mrel_update(sess: Dict[str,Any], margin: int, correct: bool):
     if correct: sess["mrel"]["a"][b] = max(1.0, sess["mrel"]["a"][b] + MREL_LR)
     else:      sess["mrel"]["b"][b] = max(1.0, sess["mrel"]["b"][b] + MREL_LR)
 
+# ★ 決策：支援 prob / ev 兩種模式
 def decide_bp(prob: np.ndarray) -> Tuple[str, float, float]:
+    """
+    回傳：(建議方向 '莊/閒', edge, max_prob)
+    - DECIDE_MODE='prob'：純看勝率，edge=兩邊機率差(信心度)
+    - DECIDE_MODE='ev'  ：含0.95抽水的期望值
+    """
     pB, pP = float(prob[0]), float(prob[1])
-    evB, evP = 0.95*pB - pP, pP - pB
-    side = 0 if evB>evP else 1
-    edge = max(abs(evB), abs(evP))
-    return (INV[side], edge, max(pB,pP))
+
+    if DECIDE_MODE == "ev":
+        evB, evP = 0.95*pB - pP, pP - pB
+        side = 0 if evB > evP else 1
+        edge = max(abs(evB), abs(evP))
+        maxp = max(pB, pP)
+        return (INV[side], edge, maxp)
+
+    # 'prob'：依勝率
+    side = 0 if pB >= pP else 1
+    edge = abs(pB - pP)     # 機率差當作信心度
+    maxp = max(pB, pP)
+    return (INV[side], edge, maxp)
 
 def bet_amount(bankroll: int, pct: float) -> int:
     if bankroll<=0 or pct<=0: return 0
@@ -367,7 +386,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
     else:
-        sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts}"
+        sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts})" if p_pts>b_pts else f"上局結果: 閒{p_pts} 莊{b_pts}"
 
     # 更新可靠度（上一手預測 vs 現在 outcome）
     if p_pts != b_pts and _prev_prob_sma is not None:
@@ -375,13 +394,14 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         correct = (prev_choice == (1 if p_pts>b_pts else 0))
         mrel_update(sess, margin, correct)
 
+    mode_note = "（以勝率決策）" if DECIDE_MODE=="prob" else "（以期望值決策）"
     msg = [
         sess["last_pts_text"],
         "開始分析下局....",
         "【預測結果】",
         f"閒：{p_final[1]*100:.2f}%",
         f"莊：{p_final[0]*100:.2f}%",
-        f"本次預測結果：{choice}",
+        f"本次預測結果：{choice} {mode_note}",
         f"建議下注：{bet_amt:,}",
         f"(edge={edge*100:.1f}%, maxp={maxp*100:.1f}%, rep={rep}, rel={rel:.2f})",
     ]
@@ -441,7 +461,6 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
         pass
     # fallback: 本機記憶體
     if key in SESS:
-        # 清過期
         v = SESS.get(key, {})
         if isinstance(v, dict) and v.get("exp", 0) < time.time():
             SESS.pop(key, None)
