@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
-附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數開關）
+附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數）
 含 LINE webhook（有憑證→驗簽；否則回 200），事件去重 + push 後援
 
-重點：
-- DECIDE_MODE（prob / ev）：純勝率 或 期望值(含抽水BANKER_COMMISSION) 做方向決策
-- BANKER_COMMISSION：莊家派彩係數（例：0.95），以環境變數外掛
-- 30 分鐘試用，trial_start 永久綁定 uid（Redis key）避免封鎖/解鎖重刷試用
-- 試用到期自動回覆官方 LINE 連結，引導開通
+本版新增/重點：
+- 👋 首次互動與「遊戲設定」都會送出【歡迎使用 BGS AI預測分析】引導訊息＋快速按鈕
+- ⏳ 30 分鐘試用：trial_start 永久綁定 uid（Redis key），封鎖/解鎖也無法重置
+- 🛑 觀望守則：機率差過小 / 和局風險高 / 機率差波動大 → 回覆「觀望」，下注=0
+- 🧠 決策模式 DECIDE_MODE=prob/ev；ev 模式用 BANKER_COMMISSION 外掛修正莊方 EV
+- 🧮 點數差加權學習：連續權重 + margin 可靠度桶 + 小差距不確定性懲罰
+- 🧾 回覆沿用舊版樣式（含信心度/配注策略/優勢%）
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -32,7 +34,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-render-free-2025-09-19-ev-commission-triallink"
+VERSION = "pf-render-free-2025-09-19-welcome+trial+watch+probfmt"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -99,18 +101,14 @@ def _trial_key(uid: str) -> str:
     return f"trialstart:{uid}"
 
 def get_trial_start(uid: str) -> int:
-    """
-    讀取/建立「永久」trial_start（跨封鎖-解鎖仍保留）
-    Redis 可用則寫 Redis；否則落本機（容器重啟會重置）
-    """
+    """建立/讀取『永久』trial_start（可跨封鎖解鎖），Redis無過期。"""
     nowi = int(time.time())
     if rcli:
         v = _rget(_trial_key(uid))
         if v and v.isdigit():
             return int(v)
-        _rset(_trial_key(uid), str(nowi), ex=None)  # 不設過期
+        _rset(_trial_key(uid), str(nowi), ex=None)
         return nowi
-    # fallback
     s = SESS.get(_trial_key(uid))
     if s and isinstance(s, dict) and "ts" in s:
         return int(s["ts"])
@@ -118,7 +116,7 @@ def get_trial_start(uid: str) -> int:
     return nowi
 
 def trial_left_minutes(sess: Dict[str, Any], uid: str) -> int:
-    if sess.get("premium", False):  # 已開通不受限
+    if sess.get("premium", False):
         return 9999
     ts = sess.get("trial_start")
     if not ts:
@@ -128,18 +126,14 @@ def trial_left_minutes(sess: Dict[str, Any], uid: str) -> int:
     return max(0, TRIAL_MINUTES - used)
 
 def validate_activation_code(code: str) -> bool:
-    if not ADMIN_ACTIVATION_SECRET:
-        return False
-    if not code:
+    if not ADMIN_ACTIVATION_SECRET or not code:
         return False
     norm = str(code).replace("\u3000"," ").replace("：",":").strip().lstrip(":").strip()
     return norm == ADMIN_ACTIVATION_SECRET
 
 def trial_guard_or_none(sess: Dict[str,Any], uid: str) -> Optional[str]:
     left = trial_left_minutes(sess, uid)
-    if left > 0:
-        return None
-    # 試用到期文案（含 LINE 連結）
+    if left > 0: return None
     link_line = f"\n👉 加入官方 LINE：{ADMIN_CONTACT_LINK}" if ADMIN_CONTACT_LINK else ""
     return f"⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號{link_line}\n🔐 可輸入：開通 你的密碼"
 
@@ -163,6 +157,7 @@ def now_sess(uid: str) -> Dict[str, Any]:
         "game": None, "table": None,
         "trial_start": get_trial_start(uid),  # 永久綁定
         "premium": False,                     # 預設未開通
+        "welcomed": False,
         "last_pts_text": None,
         "last_prob_gap": 0.0,
         "hand_idx": 0,
@@ -200,14 +195,22 @@ def _quick_reply():
     except Exception:
         return None
 
-def game_menu_text(left_min: Optional[int]=None) -> str:
-    lines = ["【請選擇遊戲館別】"]
+def welcome_text(left_min: int) -> str:
+    menu = ["【請選擇遊戲館別】"]
     for k in sorted(GAMES.keys(), key=lambda x: int(x)):
-        lines.append(f"{k}. {GAMES[k]}")
-    lines.append("（請直接輸入數字 1-10）")
-    if left_min is not None and left_min < 9999:
-        lines.append(f"⏳ 試用剩餘 {left_min} 分鐘")
-    return "\n".join(lines)
+        menu.append(f"{k}. {GAMES[k]}")
+    menu.append("（請直接輸入數字 1-10）")
+    left_line = "" if left_min>=9999 else f"\n⏳ 試用剩餘 {left_min} 分鐘"
+    return (
+        "👋 歡迎使用 BGS AI 預測分析！\n"
+        "使用步驟：\n"
+        "1️⃣ 選擇館別（輸入 1~10）\n"
+        "2️⃣ 輸入桌號（例：DG01）\n"
+        "3️⃣ 輸入本金（例：5000）\n"
+        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可連續預測\n\n"
+        + "\n".join(menu)
+        + left_line
+    )
 
 # ---------- 放寬版點數解析 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
@@ -285,10 +288,9 @@ else:
         def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
     PF = _Dummy()
 
-# ---------- 決策/配注 ----------
-# 方向決策：prob(看勝率) / ev(含抽水期望值)
-DECIDE_MODE = os.getenv("DECIDE_MODE", "ev").strip().lower()
-BANKER_COMMISSION = float(os.getenv("BANKER_COMMISSION", "0.95"))  # 例：0.95（抽5%）
+# ---------- 決策/配注 & 觀望守則 ----------
+DECIDE_MODE = os.getenv("DECIDE_MODE", "prob").strip().lower()
+BANKER_COMMISSION = float(os.getenv("BANKER_COMMISSION", "0.95"))
 
 MIN_BET_PCT = float(os.getenv("MIN_BET_PCT","0.05"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT","0.40"))
@@ -299,6 +301,13 @@ TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
 
+# 觀望相關（可用你原本的 TIE_PROB_MAX/MIN）
+EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.025"))       # 機率差門檻（prob模式）
+TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.12"))    # 和局過高 → 觀望
+WATCH_EN = env_flag("WATCH_EN", 1)
+WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.04"))  # 機率差波動門檻
+
+# 點差學習三件套
 UNCERT_PENALTY_EN = env_flag("UNCERT_PENALTY_EN", 1)
 UNCERT_MARGIN_MAX = int(os.getenv("UNCERT_MARGIN_MAX","1"))
 UNCERT_RATIO = float(os.getenv("UNCERT_RATIO","0.33"))
@@ -355,31 +364,31 @@ def mrel_update(sess: Dict[str,Any], margin: int, correct: bool):
     if correct: sess["mrel"]["a"][b] = max(1.0, sess["mrel"]["a"][b] + MREL_LR)
     else:      sess["mrel"]["b"][b] = max(1.0, sess["mrel"]["b"][b] + MREL_LR)
 
-# ★ 決策：支援 prob / ev；ev 模式用 BANKER_COMMISSION 修正莊 EV
-def decide_bp(prob: np.ndarray) -> Tuple[str, float, float]:
+# 決策（prob / ev）
+def decide_bp(prob: np.ndarray) -> Tuple[str, float, float, float]:
     """
-    回傳：(建議方向 '莊/閒', edge, max_prob)
-    - prob：純看勝率，edge = |pB - pP|
-    - ev  ：evB = BANKER_COMMISSION * pB - pP；evP = pP - pB
+    回傳：(建議方向 '莊/閒', edge, max_prob, prob_gap)
+    - prob：edge=|pB-pP|
+    - ev  ：edge=max(|evB|,|evP|)；prob_gap=|pB-pP|
     """
     pB, pP = float(prob[0]), float(prob[1])
+    gap = abs(pB - pP)
     if DECIDE_MODE == "ev":
         evB, evP = BANKER_COMMISSION * pB - pP, pP - pB
         side = 0 if evB > evP else 1
         edge = max(abs(evB), abs(evP))
-        maxp = max(pB, pP)
-        return (INV[side], edge, maxp)
+        return (INV[side], edge, max(pB, pP), gap)
     # prob
     side = 0 if pB >= pP else 1
-    edge = abs(pB - pP)
-    maxp = max(pB, pP)
-    return (INV[side], edge, maxp)
+    edge = gap
+    return (INV[side], edge, max(pB, pP), gap)
 
 def bet_amount(bankroll: int, pct: float) -> int:
     if bankroll<=0 or pct<=0: return 0
     return int(round(bankroll * pct))
 
 def confidence_to_pct(edge: float, max_prob: float) -> float:
+    # 以舊版感覺：讓配注≈信心度（0.05~0.40）
     base_conf = min(1.0, edge*15.0)
     prob_conf = max(0.0, (max_prob-0.45)*2.5)
     total = 0.5*base_conf + 0.5*prob_conf
@@ -399,6 +408,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
     margin = abs(p_pts - b_pts)
 
+    # 1) 更新 PF（點差連續權重 + 不確定性懲罰 + 深度權重）
     last_gap = float(sess.get("last_prob_gap", 0.0))
     w = calc_margin_weight(p_pts, b_pts, last_gap)
     if DEPTH_W_EN and sess["hand_idx"]>0:
@@ -420,6 +430,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
                 try: PF.update_outcome(rev)
                 except Exception as e: log.warning("PF uncert reverse update err: %s", e)
 
+    # 2) 預測 & 平滑
     sims_pred = max(0, int(os.getenv("PF_PRED_SIMS","20")))
     p_raw = PF.predict(sims_per_particle=sims_pred)
 
@@ -431,34 +442,65 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     _prev_prob_sma = ema(_prev_prob_sma, p_temp, PROB_SMA_ALPHA)
     p_final = _prev_prob_sma if _prev_prob_sma is not None else p_temp
 
-    sess["last_prob_gap"] = abs(float(p_final[0]) - float(p_final[1]))
+    # 3) 決策
+    choice, edge, maxp, prob_gap = decide_bp(p_final)
 
-    choice, edge, maxp = decide_bp(p_final)
+    # 4) 觀望守則
+    watch = False
+    reasons = []
+    if WATCH_EN:
+        # 機率差門檻（只用 prob_gap，比模式穩定）
+        if prob_gap < EDGE_ENTER:
+            watch = True; reasons.append("機率差過小")
+        # 和局風險
+        if float(p_final[2]) > TIE_PROB_MAX:
+            watch = True; reasons.append("和局風險偏高")
+        # 波動性：與上一手 gap 差異過大
+        last_gap = float(sess.get("last_prob_gap", 0.0))
+        if abs(prob_gap - last_gap) > WATCH_INSTAB_THRESH:
+            watch = True; reasons.append("勝率波動大")
+
+    # 記錄給下一手
+    sess["last_prob_gap"] = prob_gap
+
+    # 5) 金額/文字（舊版格式）
     bankroll = int(sess.get("bankroll", 0))
-    bet_pct = thompson_scale(confidence_to_pct(edge, maxp))
-    bet_amt = bet_amount(bankroll, bet_pct)
-
-    if p_pts == b_pts:
-        sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
+    if watch:
+        bet_pct = 0.0
+        bet_amt = 0
+        conf_pct = 0.0
+        strat = f"⚠️ 觀望（{'、'.join(reasons)}）"
+        choice_text = "觀望"
     else:
-        sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts}"
+        bet_pct = thompson_scale(confidence_to_pct(edge, maxp))
+        bet_amt = bet_amount(bankroll, bet_pct)
+        conf_pct = bet_pct  # 舊版：信心度≈配注比例
+        # 策略字樣
+        if conf_pct < 0.28:  strat = f"🟡 低信心配注 {conf_pct*100:.1f}%"
+        elif conf_pct < 0.34: strat = f"🟠 中信心配注 {conf_pct*100:.1f}%"
+        else:                 strat = f"🟢 高信心配注 {conf_pct*100:.1f}%"
+        choice_text = choice
 
-    # 更新 margin 可靠度（上一手預測 vs 現在 outcome）
-    if p_pts != b_pts and _prev_prob_sma is not None:
-        prev_choice = 1 if _prev_prob_sma[1] >= _prev_prob_sma[0] else 0
-        correct = (prev_choice == (1 if p_pts>b_pts else 0))
-        mrel_update(sess, margin, correct)
+    # 上局結果行
+    if p_pts == b_pts:
+        sess["last_pts_text"] = f"上局結果: 和 {p_pts}"
+    else:
+        sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
-    mode_note = "（以勝率決策）" if DECIDE_MODE=="prob" else "（以期望值決策）"
+    mode_note = "（以勝率決策）" if DECIDE_MODE=="prob" else f"（以期望值決策，comm={BANKER_COMMISSION:.3f}）"
     msg = [
         sess["last_pts_text"],
         "開始分析下局....",
+        "",
         "【預測結果】",
         f"閒：{p_final[1]*100:.2f}%",
         f"莊：{p_final[0]*100:.2f}%",
-        f"本次預測結果：{choice} {mode_note}",
+        f"本次預測結果：{choice_text} {mode_note}",
+        f"信心度：{conf_pct*100:.1f}%",
         f"建議下注：{bet_amt:,}",
-        f"(edge={edge*100:.1f}%, maxp={maxp*100:.1f}%, rep={rep}, rel={rel:.2f}, comm={BANKER_COMMISSION:.3f})",
+        f"配注策略：{strat} (優勢: {edge*100:.1f}%)",
+        "",
+        "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
     ]
     return "\n".join(msg)
 
@@ -508,7 +550,7 @@ def api_predict():
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
 
-# ---------- LINE webhook（驗簽 / 自動降級 / 分階段 + 去重 + push 後援 + 試用守門） ----------
+# ---------- LINE webhook（驗簽 / 分階段 + 去重 + push 後援 + 試用守門 + 歡迎訊息） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -519,11 +561,9 @@ try:
 except Exception:
     _has_line = False
 
-# 事件去重（避免 LINE 重送）
-DEDUPE_TTL = 90  # 秒
+DEDUPE_TTL = 90
 def _dedupe_event(event_id: Optional[str]) -> bool:
-    if not event_id:
-        return True
+    if not event_id: return True
     key = f"dedupe:{event_id}"
     try:
         if rcli:
@@ -531,7 +571,6 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
             return bool(ok)
     except Exception:
         pass
-    # fallback: 本機記憶體
     v = SESS.get(key)
     if v and isinstance(v, dict) and v.get("exp", 0) > time.time():
         return False
@@ -568,16 +607,22 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             return "ok", 200
         return "ok", 200
 
+    def _maybe_welcome(uid: str, sess: Dict[str,Any], reply_token: str):
+        if not sess.get("welcomed", False):
+            left = trial_left_minutes(sess, uid)
+            reply_text(reply_token, welcome_text(left), user_id=uid)
+            sess["welcomed"] = True
+            save_sess(uid, sess)
+
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
-        # 跳過 Redelivery
+        # Redelivery & 去重
         try:
             dc = getattr(event, "delivery_context", None)
             if dc and getattr(dc, "is_redelivery", False):
                 return
         except Exception:
             pass
-        # 去重
         if not _dedupe_event(getattr(event, "id", None)):
             return
 
@@ -588,29 +633,28 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         phase = sess.get("phase","choose_game")
         log.info("[LINE] uid=%s phase=%s text=%r norm=%r", uid, phase, raw, norm)
 
-        # 開通 / 管理員
+        # 首次歡迎
+        _maybe_welcome(uid, sess, event.reply_token)
+
+        # 管理員/開通
         if norm.startswith("開通") or norm.startswith("ACTIVATE"):
             after = raw[2:] if norm.startswith("開通") else raw[len("ACTIVATE"):]
             ok = validate_activation_code(after)
-            sess["premium"] = bool(ok)
-            save_sess(uid, sess)
-            reply_text(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤", user_id=uid)
-            return
+            sess["premium"] = bool(ok); save_sess(uid, sess)
+            reply_text(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤", user_id=uid); return
         if norm in ("聯繫管理員","CONTACT","ADMIN","客服"):
             link_line = f"\n👉 加入官方 LINE：{ADMIN_CONTACT_LINK}" if ADMIN_CONTACT_LINK else ""
-            reply_text(event.reply_token, f"📬 請聯繫管理員開通登入帳號{link_line}", user_id=uid)
-            return
+            reply_text(event.reply_token, f"📬 請聯繫管理員開通登入帳號{link_line}", user_id=uid); return
 
-        # 試用守門（未開通者）
+        # 試用守門
         guard = trial_guard_or_none(sess, uid)
         if guard:
-            reply_text(event.reply_token, guard, user_id=uid)
-            return
+            reply_text(event.reply_token, guard, user_id=uid); return
 
         # 全局指令
         if norm in ("結束分析", "清空", "RESET"):
             keep_premium = bool(sess.get("premium", False))
-            keep_trial   = int(get_trial_start(uid))  # 再讀一次確保存在
+            keep_trial   = int(get_trial_start(uid))
             SESS.pop(uid, None)
             sess = now_sess(uid)
             sess["premium"] = keep_premium
@@ -627,7 +671,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["bankroll"] = 0
             save_sess(uid, sess)
             left = trial_left_minutes(sess, uid)
-            reply_text(event.reply_token, game_menu_text(left), user_id=uid)
+            reply_text(event.reply_token, welcome_text(left), user_id=uid)
             return
 
         # 分階段
@@ -638,7 +682,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 save_sess(uid, sess)
                 reply_text(event.reply_token, f"✅ 已選【{sess['game']}】\n請輸入桌號（例：DG01，格式：2字母+2數字）", user_id=uid)
                 return
-            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + game_menu_text(), user_id=uid)
+            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + welcome_text(trial_left_minutes(sess, uid)), user_id=uid)
             return
 
         if phase == "choose_table":
@@ -673,14 +717,11 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             return
 
         if not int(sess.get("bankroll",0)):
-            sess["phase"] = "await_bankroll"
-            save_sess(uid, sess)
-            reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid)
-            return
+            sess["phase"] = "await_bankroll"; save_sess(uid, sess)
+            reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
 
         msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
-        sess["phase"] = "await_pts"
-        save_sess(uid, sess)
+        sess["phase"] = "await_pts"; save_sess(uid, sess)
         reply_text(event.reply_token, msg, user_id=uid)
 
 else:
@@ -691,5 +732,5 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    log.info("Starting %s on port %s (DECIDE_MODE=%s, COMM=%.3f)", VERSION, port, os.getenv("DECIDE_MODE","ev"), BANKER_COMMISSION)
+    log.info("Starting %s on port %s (DECIDE_MODE=%s, COMM=%.3f)", VERSION, port, os.getenv("DECIDE_MODE","prob"), BANKER_COMMISSION)
     app.run(host="0.0.0.0", port=port, debug=False)
