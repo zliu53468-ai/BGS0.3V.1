@@ -33,6 +33,40 @@ def third_card_rule_banker(b_sum, p3):
     if b_sum == 6: return p3 in (6,7)
     return False
 
+def professional_calibration(prob: np.ndarray) -> np.ndarray:
+    """
+    專業級機率校準
+    """
+    pB, pP, pT = prob[0], prob[1], prob[2]
+    
+    # 基礎正規化
+    total = pB + pP + pT
+    if abs(total - 1.0) > 0.001:
+        pB /= total
+        pP /= total
+        pT /= total
+    
+    # 莊家優勢調整
+    banker_advantage = 0.008
+    
+    if pB > pP:
+        pB += banker_advantage * 0.6
+        pP -= banker_advantage * 0.6
+    elif pP > pB:
+        pP += banker_advantage * 0.4
+        pB -= banker_advantage * 0.4
+    
+    # 和局機率合理化
+    pT = max(0.035, min(0.085, pT))
+    
+    # 機率邊界保護
+    pB = max(0.40, min(0.58, pB))
+    pP = max(0.40, min(0.58, pP))
+    
+    # 最終正規化
+    total = pB + pP + pT
+    return np.array([pB/total, pP/total, pT/total], dtype=np.float32)
+
 @dataclass
 class DepleteMC:
     decks: int = 8
@@ -126,8 +160,8 @@ class DepleteMC:
             except:
                 continue
         tot = wins.sum()
-        if tot == 0: return np.array([0.45,0.45,0.10], dtype=np.float32)
+        if tot == 0: return np.array([0.458, 0.446, 0.096], dtype=np.float32)
         p = wins / tot
-        p[2] = np.clip(p[2], 0.06, 0.20)
-        p = p / p.sum()
-        return p.astype(np.float32)
+        # 應用專業校準
+        p_calibrated = professional_calibration(p)
+        return p_calibrated.astype(np.float32)
