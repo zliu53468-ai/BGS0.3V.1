@@ -4,11 +4,10 @@ server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
 附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數開關）
 含 LINE webhook（有憑證→驗簽處理；否則自動退回 200）
 
-改良點：
-1) LINE 互動「明確分階段」：choose_game → choose_table → await_bankroll → await_pts
-2) 每階段只接受該階段的輸入，避免把數字誤判為本金或點數
-3) 指令：『遊戲設定／結束分析』可隨時用；Quick Reply 提示
-4) 放寬點數解析（65、閒6莊5、B6P5、和…同一句含桌號也能吃）
+改良點（本版新增）：
+A) LINE 事件去重（SETNX + TTL 90 秒），避免重送造成重覆回覆
+B) reply_message 失敗 → 自動 push_message 後援（解決 Invalid reply token）
+C) 維持「choose_game → choose_table → await_bankroll → await_pts」分階段，避免本金/點數混淆
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -33,7 +32,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-adv-render-free-2025-09-19-line+phases"
+VERSION = "pf-adv-render-free-2025-09-19-line+phases+dedupe+push"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -406,7 +405,7 @@ def api_predict():
     if "bankroll" in data:
         try:
             bk = int(data["bankroll"])
-            if bk>0: 
+            if bk>0:
                 sess["bankroll"] = bk
                 sess["phase"] = "await_pts"
         except: pass
@@ -417,7 +416,7 @@ def api_predict():
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
 
-# ---------- LINE webhook（驗簽 / 自動降級 / 分階段） ----------
+# ---------- LINE webhook（驗簽 / 自動降級 / 分階段 + 去重 + push 後援） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -428,12 +427,42 @@ try:
 except Exception:
     _has_line = False
 
-def reply_text(token: str, text: str):
+# 事件去重（避免 LINE 重送）
+DEDUPE_TTL = 90  # 秒
+def _dedupe_event(event_id: Optional[str]) -> bool:
+    if not event_id:
+        return True
+    key = f"dedupe:{event_id}"
+    try:
+        if rcli:
+            ok = rcli.set(key, "1", nx=True, ex=DEDUPE_TTL)
+            return bool(ok)
+    except Exception:
+        pass
+    # fallback: 本機記憶體
+    if key in SESS:
+        # 清過期
+        v = SESS.get(key, {})
+        if isinstance(v, dict) and v.get("exp", 0) < time.time():
+            SESS.pop(key, None)
+        else:
+            return False
+    SESS[key] = {"exp": time.time() + DEDUPE_TTL}
+    return True
+
+def reply_text(token: str, text: str, user_id: Optional[str]=None):
     try:
         from linebot.models import TextSendMessage
         line_api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_reply()))
     except Exception as e:
-        log.warning("reply err: %s", e)
+        # 失敗（常見：Invalid reply token）→ 改用 push 後援
+        try:
+            if user_id:
+                line_api.push_message(user_id, TextSendMessage(text=text, quick_reply=_quick_reply()))
+            else:
+                log.warning("reply err(no uid): %s", e)
+        except Exception as e2:
+            log.warning("push fallback failed: %s", e2)
 
 if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -454,6 +483,17 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
+        # 若為 redelivery（LINE 重送）直接忽略
+        try:
+            dc = getattr(event, "delivery_context", None)
+            if dc and getattr(dc, "is_redelivery", False):
+                return
+        except Exception:
+            pass
+        # 事件去重
+        if not _dedupe_event(getattr(event, "id", None)):
+            return
+
         uid = getattr(event.source, "user_id", "guest")
         raw = (event.message.text or "")
         norm = _norm(raw)
@@ -461,7 +501,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         phase = sess.get("phase","choose_game")
         log.info("[LINE] uid=%s phase=%s text=%r norm=%r", uid, phase, raw, norm)
 
-        # ---- 全局指令（任何階段可用） ----
+        # ---- 全局指令 ----
         if norm in ("結束分析", "清空", "RESET"):
             keep_premium = bool(sess.get("premium", True))
             keep_trial   = int(sess.get("trial_start", int(time.time())))
@@ -471,7 +511,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["trial_start"] = keep_trial
             sess["phase"] = "choose_game"
             save_sess(uid, sess)
-            reply_text(event.reply_token, "🧹 已清空。輸入『遊戲設定』開始或直接輸入『遊戲設定』。")
+            reply_text(event.reply_token, "🧹 已清空。輸入『遊戲設定』開始。", user_id=uid)
             return
 
         if norm in ("遊戲設定", "設定", "SETUP", "GAME"):
@@ -480,20 +520,18 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["table"] = None
             sess["bankroll"] = 0
             save_sess(uid, sess)
-            reply_text(event.reply_token, game_menu_text())
+            reply_text(event.reply_token, game_menu_text(), user_id=uid)
             return
 
         # ---- 分階段處理 ----
         if phase == "choose_game":
-            # 只接受 1-10
             if re.fullmatch(r"(10|[1-9])", norm):
                 sess["game"] = GAMES[norm]
                 sess["phase"] = "choose_table"
                 save_sess(uid, sess)
-                reply_text(event.reply_token, f"✅ 已選【{sess['game']}】\n請輸入桌號（例：DG01，格式：2字母+2數字）")
+                reply_text(event.reply_token, f"✅ 已選【{sess['game']}】\n請輸入桌號（例：DG01，格式：2字母+2數字）", user_id=uid)
                 return
-            # 其它輸入不視為本金/點數
-            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + game_menu_text())
+            reply_text(event.reply_token, "請先選擇館別（輸入數字 1-10）。\n" + game_menu_text(), user_id=uid)
             return
 
         if phase == "choose_table":
@@ -502,13 +540,12 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 sess["table"] = t
                 sess["phase"] = "await_bankroll"
                 save_sess(uid, sess)
-                reply_text(event.reply_token, f"✅ 已設桌號【{t}】\n請輸入您的本金（例：5000）")
+                reply_text(event.reply_token, f"✅ 已設桌號【{t}】\n請輸入您的本金（例：5000）", user_id=uid)
                 return
-            reply_text(event.reply_token, "❌ 桌號格式錯誤，請輸入 2 英文 + 2 數字（例：DG01）")
+            reply_text(event.reply_token, "❌ 桌號格式錯誤，請輸入 2 英文 + 2 數字（例：DG01）", user_id=uid)
             return
 
         if phase == "await_bankroll":
-            # 只接受純數字本金
             if norm.isdigit():
                 try:
                     bk = int(norm)
@@ -516,29 +553,28 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         sess["bankroll"] = bk
                         sess["phase"] = "await_pts"
                         save_sess(uid, sess)
-                        reply_text(event.reply_token, f"👍 已設定本金：{bk:,}\n請輸入上一局點數（例：65 / 和 / 閒6莊5），之後進入連續模式。")
+                        reply_text(event.reply_token, f"👍 已設定本金：{bk:,}\n請輸入上一局點數（例：65 / 和 / 閒6莊5），之後進入連續模式。", user_id=uid)
                         return
                 except: pass
-            reply_text(event.reply_token, "請輸入本金（純數字，如 5000）。")
+            reply_text(event.reply_token, "請輸入本金（純數字，如 5000）。", user_id=uid)
             return
 
-        # phase == "await_pts"：進入連續模式，主要接受點數；也容忍 B/P/T
+        # phase == "await_pts"
         pts = parse_last_hand_points(raw)
         if pts is None:
-            reply_text(event.reply_token, "指令無法辨識。\n請輸入上一局點數（例：65 / 和 / 閒6莊5）。\n或輸入『結束分析』、『遊戲設定』。")
+            reply_text(event.reply_token, "指令無法辨識。\n請輸入上一局點數（例：65 / 和 / 閒6莊5）。\n或輸入『結束分析』、『遊戲設定』。", user_id=uid)
             return
 
         if not int(sess.get("bankroll",0)):
             sess["phase"] = "await_bankroll"
             save_sess(uid, sess)
-            reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。")
+            reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid)
             return
 
-        # 正式預測
         msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
-        sess["phase"] = "await_pts"  # 持續連續模式
+        sess["phase"] = "await_pts"
         save_sess(uid, sess)
-        reply_text(event.reply_token, msg)
+        reply_text(event.reply_token, msg, user_id=uid)
 
 else:
     @app.post("/line-webhook")
