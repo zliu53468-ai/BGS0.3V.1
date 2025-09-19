@@ -29,7 +29,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-adv-render-free-2025-09-19-line"
+VERSION = "pf-adv-render-free-2025-09-19-line+cmds"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -117,32 +117,65 @@ def save_sess(uid: str, s: Dict[str, Any]):
     else:
         SESS[uid] = s
 
-# ---------- 解析點數 ----------
+# ---------- 常用工具 ----------
+def _norm(s: str) -> str:
+    """全半形與空白標準化，轉大寫，便於比對指令。"""
+    if not s: return ""
+    s = s.translate(str.maketrans("　０１２３４５６７８９：－—～〜", " 0123456789:----"))
+    s = re.sub(r"\s+", " ", s.strip())
+    return s.upper()
+
+def _quick_reply():
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
+            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
+            QuickReplyButton(action=MessageAction(label="報莊 🅱️", text="B")),
+            QuickReplyButton(action=MessageAction(label="報閒 🅿️", text="P")),
+            QuickReplyButton(action=MessageAction(label="報和 ⚪", text="T")),
+        ])
+    except Exception:
+        return None
+
+# ---------- 解析點數（放寬版） ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
-    if not text: return None
-    s = str(text).translate(str.maketrans("０１２３４５６７８９：","0123456789:"))
+    """
+    更寬鬆版解析器：
+    - 支援：65 / 6-5 / 6:5 / 閒6莊5 / 莊5閒6 / B6P5 / P6B5 / 和 / TIE / DRAW / T
+    - 忽略桌號/emoji/符號，只取最後兩個單一位數（0-9）保底
+    """
+    if not text:
+        return None
+
+    s = str(text)
+    s = s.translate(str.maketrans("０１２３４５６７８９：－—～〜", "0123456789:----"))
     s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
-    s = s.replace("\u3000"," ")
-    u = re.sub(r"^開始分析","", s.strip().upper())
+    u = re.sub(r"\s+", " ", s).strip().upper()
 
-    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
-    if m:
-        d = m.group(1)
-        return (int(d), int(d)) if d else (0,0)
+    # 和局
+    if re.search(r"\b(和|TIE|DRAW|^T$)\b", u):
+        m = re.search(r"(?:和|TIE|DRAW|T)\s*:?\s*([0-9])", u)
+        if m:
+            d = int(m.group(1)); return (d, d)
+        return (0, 0)
 
-    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
-    if m: return (int(m.group(1)), int(m.group(2)))
-    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
+    # 閒x莊y / 莊y閒x
+    m = re.search(r"(閒|P)\s*:?\s*([0-9]).*?(莊|B)\s*:?\s*([0-9])", u)
+    if m: return (int(m.group(2)), int(m.group(4)))
+    m = re.search(r"(莊|B)\s*:?\s*([0-9]).*?(閒|P)\s*:?\s*([0-9])", u)
+    if m: return (int(m.group(4)), int(m.group(2)))
+
+    # B6P5 / P6B5（容許符號）
+    m = re.search(r"B\D*([0-9])\D*P\D*([0-9])", u)
     if m: return (int(m.group(2)), int(m.group(1)))
+    m = re.search(r"P\D*([0-9])\D*B\D*([0-9])", u)
+    if m: return (int(m.group(1)), int(m.group(2)))
 
-    t = u.replace(" ","")
-    if t in ("B","莊","庄"): return (0,1)
-    if t in ("P","閒","闲"): return (1,0)
-    if t in ("T","和"): return (0,0)
-
-    if re.search(r"[A-Z]", u): return None
-    digits = re.findall(r"\d", u)
-    if len(digits)==2: return (int(digits[0]), int(digits[1]))
+    # 保底：最後兩個數字
+    digits = re.findall(r"[0-9]", u)
+    if len(digits) >= 2:
+        return (int(digits[-2]), int(digits[-1]))
     return None
 
 # ---------- PF 匯入（本地 pfilter 或套件） ----------
@@ -410,7 +443,7 @@ def api_predict():
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
 
-# ---------- LINE webhook（自動降級） ----------
+# ---------- LINE webhook（自動降級 + 指令） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 try:
@@ -441,35 +474,97 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     @line_handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
         uid = getattr(event.source, "user_id", "guest")
-        raw = (event.message.text or "").strip()
+        raw = (event.message.text or "")
+        norm = _norm(raw)
         sess = now_sess(uid)
 
-        # 若輸入純數字→視為本金設定
-        if raw.isdigit():
+        log.info("[LINE] uid=%s text=%r norm=%r phase=%s", uid, raw, norm, sess.get("phase"))
+
+        # 指令：遊戲設定
+        if norm in ("遊戲設定", "設定", "SETUP", "GAME"):
+            sess["phase"] = "choose_game"
+            save_sess(uid, sess)
             try:
-                bk = int(raw)
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text="【請選擇遊戲館別】\n1.WM 2.PM 3.DG 4.SA 5.KU 6.歐博/卡利 7.KG 8.全利 9.名人 10.MT真人\n（直接輸入數字）\n或先輸入本金（例如：5000）",
+                        quick_reply=_quick_reply(),
+                    ),
+                )
+            except Exception as e:
+                log.warning("reply err: %s", e)
+            return
+
+        # 指令：結束分析 / 清空 / RESET
+        if norm in ("結束分析", "清空", "RESET"):
+            keep_premium = bool(sess.get("premium", True))
+            keep_trial   = int(sess.get("trial_start", int(time.time())))
+            SESS.pop(uid, None)
+            sess = now_sess(uid)
+            sess["premium"] = keep_premium
+            sess["trial_start"] = keep_trial
+            save_sess(uid, sess)
+            try:
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="🧹 已清空。輸入『遊戲設定』或直接輸入本金（例：5000）。", quick_reply=_quick_reply()),
+                )
+            except Exception as e:
+                log.warning("reply err: %s", e)
+            return
+
+        # 本金設定（純數字）
+        if norm.isdigit():
+            try:
+                bk = int(norm)
                 if bk>0:
                     sess["bankroll"] = bk
                     save_sess(uid, sess)
-                    line_api.reply_message(event.reply_token,
-                        TextSendMessage(text=f"👍 已設定本金：{bk:,}\n請直接輸入上一局點數（例：65 / 和 / 閒6莊5）"))
+                    line_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(
+                            text=f"👍 已設定本金：{bk:,}\n請直接輸入上一局點數（例：65 / 和 / 閒6莊5）。",
+                            quick_reply=_quick_reply(),
+                        ),
+                    )
                     return
-            except: pass
+            except Exception:
+                pass
 
+        # 點數解析
         pts = parse_last_hand_points(raw)
         if pts is None:
-            line_api.reply_message(event.reply_token,
-                TextSendMessage(text="指令無法辨識。\n直接輸入上一局點數（例：65 / 和 / 閒6莊5），或輸入本金（純數字）。"))
+            try:
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text="指令無法辨識。\n可輸入：\n・本金（例：5000）\n・上一局點數（例：65 / 和 / 閒6莊5）\n・『遊戲設定』或『結束分析』",
+                        quick_reply=_quick_reply(),
+                    ),
+                )
+            except Exception as e:
+                log.warning("reply err: %s", e)
             return
 
-        if not sess.get("bankroll", 0):
-            line_api.reply_message(event.reply_token,
-                TextSendMessage(text="請先輸入您的本金（例：5000），再回報點數。"))
+        # 未設定本金先提醒
+        if not int(sess.get("bankroll", 0)):
+            try:
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="請先輸入本金（例：5000），再回報點數。", quick_reply=_quick_reply()),
+                )
+            except Exception as e:
+                log.warning("reply err: %s", e)
             return
 
-        msg = handle_points_and_predict(sess, pts[0], pts[1])
+        # 正式預測
+        msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
         save_sess(uid, sess)
-        line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        try:
+            line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=_quick_reply()))
+        except Exception as e:
+            log.warning("reply err: %s", e)
 else:
     # 無 SDK 或無憑證 → 安全退回僅回 200 的最小端點（避免 404）
     @app.post("/line-webhook")
