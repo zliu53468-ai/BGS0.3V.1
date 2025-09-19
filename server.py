@@ -2,18 +2,13 @@
 """
 server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
 附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數開關）
+含 LINE webhook（有憑證→驗簽處理；否則自動退回 200）
 
-說明：
-- 不改變你既有的主流程（LINE/Redis/連續模式/EV 決策/下注映射）
-- 只在 PF.update_outcome() 前後加「權重/懲罰」與「可靠度/深度/配注縮放」的強化層
-- 依環境變數可逐項開/關，方便 A/B 測
-
-作者：for Render Free
+不改你的主流程：解析點數 → PF.update_outcome → PF.predict → EV 決策 → 配注映射
 """
 
-import os, sys, time, json, re, logging, math, random
+import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple, List
-
 import numpy as np
 
 # ---------- 可選依賴（Flask/LINE/Redis） ----------
@@ -34,7 +29,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-adv-render-free-2025-09-19"
+VERSION = "pf-adv-render-free-2025-09-19-line"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -82,7 +77,7 @@ def _rset(k: str, v: str, ex: Optional[int] = None):
     except Exception as e:
         log.warning("Redis SET err: %s", e)
 
-# ---------- 環境旗標 ----------
+# ---------- 旗標 ----------
 def env_flag(name: str, default: int=0) -> int:
     v = os.getenv(name)
     if v is None: return 1 if default else 0
@@ -184,10 +179,10 @@ if OutcomePF:
             backend=os.getenv("PF_BACKEND","mc"),
             dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.003")),
         )
-        log.info("PF init ok: n=%s backend=%s", PF.n_particles, getattr(PF,"backend","?"))
+        log.info("PF init ok: n=%s backend=%s", getattr(PF,"n_particles","?"), getattr(PF,"backend","?"))
     except Exception as e:
         log.error("PF init fail: %s", e)
-        class _Dummy:  # very minimal fallback
+        class _Dummy:  # minimal fallback
             def update_outcome(self, outcome): pass
             def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
         PF = _Dummy()
@@ -269,13 +264,12 @@ def mrel_score(sess: Dict[str,Any], margin: int) -> float:
 def mrel_update(sess: Dict[str,Any], margin: int, correct: bool):
     if not MREL_EN: return
     b = margin_bucket(margin)
-    # 輕量增減，避免失控
     if correct:
         sess["mrel"]["a"][b] = max(1.0, sess["mrel"]["a"][b] + MREL_LR)
     else:
         sess["mrel"]["b"][b] = max(1.0, sess["mrel"]["b"][b] + MREL_LR)
 
-# ---------- 決策：僅莊/閒（含 5% 抽水） ----------
+# ---------- EV 決策（只莊/閒；含 5% 抽水） ----------
 def decide_bp(prob: np.ndarray) -> Tuple[str, float, float]:
     pB, pP = float(prob[0]), float(prob[1])
     evB, evP = 0.95*pB - pP, pP - pB
@@ -296,9 +290,8 @@ def confidence_to_pct(edge: float, max_prob: float) -> float:
 
 def thompson_scale(pct: float) -> float:
     if not TS_EN: return pct
-    # 僅縮放，不改方向
     a = max(1e-3, TS_ALPHA); b = max(1e-3, TS_BETA)
-    s = np.random.beta(a, b)
+    s = np.random.beta(a, b)  # 只縮放配注，不改方向
     return max(MIN_BET_PCT, min(MAX_BET_PCT, pct*s))
 
 # ---------- 主流程：收到上一局點數，更新並預測 ----------
@@ -321,10 +314,9 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     rep = max(1, min(3, int(round(w))))
 
-    # 和局：更新一次 outcome=2；不吃懲罰
     if p_pts == b_pts:
         try:
-            PF.update_outcome(2)
+            PF.update_outcome(2)  # tie
         except Exception as e:
             log.warning("PF tie update err: %s", e)
     else:
@@ -335,10 +327,8 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             except Exception as e:
                 log.warning("PF update err: %s", e)
 
-        # 不確定性懲罰：margin <= UNCERT_MARGIN_MAX 時，反向微更新一次
         if UNCERT_PENALTY_EN and margin <= UNCERT_MARGIN_MAX:
             rev = 0 if outcome==1 else 1
-            # 以 UNCERT_RATIO 決定是否執行一次微更新（機率式）
             if random.random() < UNCERT_RATIO:
                 try:
                     PF.update_outcome(rev)
@@ -348,6 +338,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     # 2) 預測
     sims_pred = max(0, int(os.getenv("PF_PRED_SIMS","20")))
     p_raw = PF.predict(sims_per_particle=sims_pred)
+
     # 可靠度表加權（基於 margin 桶）
     rel = mrel_score(sess, margin)
     p_adj = np.array([p_raw[0]*rel, p_raw[1]*rel, p_raw[2]], dtype=np.float32)
@@ -365,34 +356,34 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     choice, edge, maxp = decide_bp(p_final)
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = confidence_to_pct(edge, maxp)
-    bet_pct = thompson_scale(bet_pct)  # 只縮放，不改方向
+    bet_pct = thompson_scale(bet_pct)
     bet_amt = bet_amount(bankroll, bet_pct)
 
-    # 4) 更新可靠度表（用實際 outcome 相對於「上一手」預測）
-    #   這裡我們用當前 margin 對「剛完成的 outcome」做線上評分：
-    #   如果 p_pts>b_pts 且我們上一手偏向閒，就算 correct；反之亦然；和局不更新。
+    # 4) 更新可靠度表（用上一手預測 vs 當前 outcome）
     if p_pts != b_pts and _prev_prob_sma is not None:
         prev_choice = 1 if _prev_prob_sma[1] >= _prev_prob_sma[0] else 0
         correct = (prev_choice == (1 if p_pts>b_pts else 0))
         mrel_update(sess, margin, correct)
 
     # 5) 輸出
-    msg = []
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和局 (閒{p_pts} 莊{b_pts})"
     else:
         sess["last_pts_text"] = f"上局結果: 閒{p_pts} 莊{b_pts}"
-    msg.append(sess["last_pts_text"])
-    msg.append("開始分析下局....")
-    msg.append("【預測結果】")
-    msg.append(f"閒：{p_final[1]*100:.2f}%")
-    msg.append(f"莊：{p_final[0]*100:.2f}%")
-    msg.append(f"本次預測結果：{choice}")
-    msg.append(f"建議下注：{bet_amt:,}")
-    msg.append(f"(edge={edge*100:.1f}%, maxp={maxp*100:.1f}%, rep={rep}, rel={rel:.2f})")
+
+    msg = [
+        sess["last_pts_text"],
+        "開始分析下局....",
+        "【預測結果】",
+        f"閒：{p_final[1]*100:.2f}%",
+        f"莊：{p_final[0]*100:.2f}%",
+        f"本次預測結果：{choice}",
+        f"建議下注：{bet_amt:,}",
+        f"(edge={edge*100:.1f}%, maxp={maxp*100:.1f}%, rep={rep}, rel={rel:.2f})",
+    ]
     return "\n".join(msg)
 
-# ---------- 路由（簡版） ----------
+# ---------- REST 路由 ----------
 @app.get("/")
 def root():
     return f"✅ BGS PF Server OK ({VERSION})", 200
@@ -407,21 +398,83 @@ def api_predict():
     uid = str(data.get("uid","guest"))
     text = str(data.get("text","")).strip()
     sess = now_sess(uid)
-
-    # 設定本金（若傳入）
     if "bankroll" in data:
         try:
             bk = int(data["bankroll"])
             if bk>0: sess["bankroll"] = bk
         except: pass
-
     pts = parse_last_hand_points(text)
     if pts is None:
         return jsonify(ok=False, err="無法解析點數（例：閒6莊5 / 65 / 和）"), 400
-
     msg = handle_points_and_predict(sess, pts[0], pts[1])
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
+
+# ---------- LINE webhook（自動降級） ----------
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+try:
+    from linebot import LineBotApi, WebhookHandler
+    from linebot.exceptions import InvalidSignatureError
+    from linebot.models import MessageEvent, TextMessage, TextSendMessage
+    _has_line = True
+except Exception:
+    _has_line = False
+
+if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
+    line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+    line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+    @app.post("/line-webhook")
+    def line_webhook():
+        signature = request.headers.get("X-Line-Signature", "")
+        body = request.get_data(as_text=True)
+        try:
+            line_handler.handle(body, signature)
+        except InvalidSignatureError:
+            return "invalid signature", 400
+        except Exception as e:
+            log.warning("line webhook err: %s", e)
+            return "ok", 200
+        return "ok", 200
+
+    @line_handler.add(MessageEvent, message=TextMessage)
+    def on_text(event):
+        uid = getattr(event.source, "user_id", "guest")
+        raw = (event.message.text or "").strip()
+        sess = now_sess(uid)
+
+        # 若輸入純數字→視為本金設定
+        if raw.isdigit():
+            try:
+                bk = int(raw)
+                if bk>0:
+                    sess["bankroll"] = bk
+                    save_sess(uid, sess)
+                    line_api.reply_message(event.reply_token,
+                        TextSendMessage(text=f"👍 已設定本金：{bk:,}\n請直接輸入上一局點數（例：65 / 和 / 閒6莊5）"))
+                    return
+            except: pass
+
+        pts = parse_last_hand_points(raw)
+        if pts is None:
+            line_api.reply_message(event.reply_token,
+                TextSendMessage(text="指令無法辨識。\n直接輸入上一局點數（例：65 / 和 / 閒6莊5），或輸入本金（純數字）。"))
+            return
+
+        if not sess.get("bankroll", 0):
+            line_api.reply_message(event.reply_token,
+                TextSendMessage(text="請先輸入您的本金（例：5000），再回報點數。"))
+            return
+
+        msg = handle_points_and_predict(sess, pts[0], pts[1])
+        save_sess(uid, sess)
+        line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+else:
+    # 無 SDK 或無憑證 → 安全退回僅回 200 的最小端點（避免 404）
+    @app.post("/line-webhook")
+    def line_webhook_min():
+        return "ok", 200
 
 # ---------- Main ----------
 if __name__ == "__main__":
