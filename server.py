@@ -302,19 +302,19 @@ TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
 
 # 觀望相關（可用你原本的 TIE_PROB_MAX/MIN）
-EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.025"))       # 機率差門檻（prob模式）
-TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.12"))    # 和局過高 → 觀望
+EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.005"))       # 降低機率差門檻
+TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.18"))    # 提高和局風險容忍度
 WATCH_EN = env_flag("WATCH_EN", 1)
-WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.04"))  # 機率差波動門檻
+WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.08"))  # 提高波動容忍度
 
 # 點差學習三件套
 UNCERT_PENALTY_EN = env_flag("UNCERT_PENALTY_EN", 1)
-UNCERT_MARGIN_MAX = int(os.getenv("UNCERT_MARGIN_MAX","1"))
-UNCERT_RATIO = float(os.getenv("UNCERT_RATIO","0.33"))
+UNCERT_MARGIN_MAX = int(os.getenv("UNCERT_MARGIN_MAX","2"))
+UNCERT_RATIO = float(os.getenv("UNCERT_RATIO","0.25"))
 
 W_BASE = float(os.getenv("W_BASE","1.0"))
 W_MIN  = float(os.getenv("W_MIN","0.5"))
-W_MAX  = float(os.getenv("W_MAX","2.8"))
+W_MAX  = float(os.getenv("W_MAX","3.0"))
 W_ALPHA= float(os.getenv("W_ALPHA","0.95"))
 W_SIG_K= float(os.getenv("W_SIG_K","1.10"))
 W_SIG_MID=float(os.getenv("W_SIG_MID","1.8"))
@@ -322,10 +322,10 @@ W_GAMMA= float(os.getenv("W_GAMMA","1.0"))
 W_GAP_CAP=float(os.getenv("W_GAP_CAP","0.06"))
 
 DEPTH_W_EN  = env_flag("DEPTH_W_EN", 1)
-DEPTH_W_MAX = float(os.getenv("DEPTH_W_MAX","1.3"))
+DEPTH_W_MAX = float(os.getenv("DEPTH_W_MAX","1.5"))
 
 MREL_EN = env_flag("MREL_EN", 1)
-MREL_LR = float(os.getenv("MREL_LR","0.02"))
+MREL_LR = float(os.getenv("MREL_LR","0.05"))
 
 INV = {0:"莊", 1:"閒"}
 
@@ -445,7 +445,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     # 3) 決策
     choice, edge, maxp, prob_gap = decide_bp(p_final)
 
-    # 4) 觀望守則
+    # 4) 觀望守則 - 放寬條件
     watch = False
     reasons = []
     if WATCH_EN:
@@ -495,6 +495,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         "【預測結果】",
         f"閒：{p_final[1]*100:.2f}%",
         f"莊：{p_final[0]*100:.2f}%",
+        f"和：{p_final[2]*100:.2f}%",  # 新增和局概率显示
         f"本次預測結果：{choice_text} {mode_note}",
         f"信心度：{conf_pct*100:.1f}%",
         f"建議下注：{bet_amt:,}",
@@ -584,7 +585,7 @@ def reply_text(token: str, text: str, user_id: Optional[str]=None):
     except Exception as e:
         try:
             if user_id:
-                line_api.push_message(user_id, TextSendMessage(text=text, quick_reply=_quick_reply()))
+                line_api.push_message(user_id, TextSendMessage(text=text, quick_reply=_quick_reply())
             else:
                 log.warning("reply err(no uid): %s", e)
         except Exception as e2:
