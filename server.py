@@ -228,7 +228,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
 
     m = re.search(r"(閒|P)\s*:?\s*([0-9]).*?(莊|B)\s*:?\s*([0-9])", u)
     if m: return (int(m.group(2)), int(m.group(4)))
-    m = re.search r"(莊|B)\s*:?\s*([0-9]).*?(閒|P)\s*:?\s*([0-9])", u)
+    m = re.search(r"(莊|B)\s*:?\s*([0-9]).*?(閒|P)\s*:?\s*([0-9])", u)
     if m: return (int(m.group(4)), int(m.group(2)))
 
     m = re.search(r"B\D*([0-9])\D*P\D*([0-9])", u)
@@ -585,6 +585,7 @@ def reply_text(token: str, text: str, user_id: Optional[str]=None):
     except Exception as e:
         try:
             if user_id:
+                # Fixed missing parenthesis: ensure push_message call is closed properly
                 line_api.push_message(user_id, TextSendMessage(text=text, quick_reply=_quick_reply()))
             else:
                 log.warning("reply err(no uid): %s", e)
