@@ -181,10 +181,17 @@ def now_sess(uid: str) -> Dict[str, Any]:
     if rcli:
         j = _rget(f"sess:{uid}")
         if j:
-            try: return json.loads(j)
+            try:
+                loaded = json.loads(j)
+                # 確保 pf 為 None（從儲存中載入時重置）
+                loaded["pf"] = None
+                return loaded
             except: pass
     s = SESS.get(uid)
-    if s: return s
+    if s: 
+        # 記憶體中也重置 pf
+        s["pf"] = None
+        return s
     s = {
         "bankroll": 0,
         "phase": "choose_game",
@@ -195,7 +202,7 @@ def now_sess(uid: str) -> Dict[str, Any]:
         "last_pts_text": None,
         "last_prob_gap": 0.0,
         "hand_idx": 0,
-        "pf": None,
+        "pf": None,  # 總是從 None 開始
         # online stats
         "stats": {
             "bets": 0,
@@ -212,10 +219,13 @@ def now_sess(uid: str) -> Dict[str, Any]:
     return s
 
 def save_sess(uid: str, s: Dict[str, Any]):
+    # 移除不可序列化的 PF 物件
+    s_copy = s.copy()
+    s_copy.pop("pf", None)
     if rcli:
-        _rset(f"sess:{uid}", json.dumps(s), ex=SESSION_EXPIRE)
+        _rset(f"sess:{uid}", json.dumps(s_copy), ex=SESSION_EXPIRE)
     else:
-        SESS[uid] = s
+        SESS[uid] = s_copy
 
 # ---------- Utils ----------
 def _norm(s: str) -> str:
