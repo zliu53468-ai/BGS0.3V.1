@@ -138,6 +138,45 @@ GAMES = {
     "6":"歐博/卡利","7":"KG","8":"全利","9":"名人","10":"MT真人",
 }
 
+# ---------- PF import ----------
+OutcomePF = None
+try:
+    from bgs.pfilter import OutcomePF  # type: ignore
+except Exception:
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        if cur not in sys.path: sys.path.insert(0, cur)
+        from pfilter import OutcomePF  # type: ignore
+        log.info("OutcomePF from local pfilter.py")
+    except Exception as e:
+        OutcomePF = None  # type: ignore
+        log.error("OutcomePF import failed: %s", e)
+
+class _DummyPF:
+    def update_outcome(self, outcome): pass
+    def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
+    def update_point_history(self, p_pts, b_pts): pass
+
+def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
+    if OutcomePF:
+        if sess.get("pf") is None:
+            try:
+                sess["pf"] = OutcomePF(
+                    decks=int(os.getenv("DECKS","6")),
+                    seed=int(os.getenv("SEED","42")),
+                    n_particles=int(os.getenv("PF_N","60")),
+                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","30"))),
+                    resample_thr=float(os.getenv("PF_RESAMPLE","0.7")),
+                    backend=os.getenv("PF_BACKEND","mc"),
+                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.003")),
+                )
+                log.info("Per-session PF init ok")
+            except Exception as e:
+                log.error("Per-session PF init fail: %s", e)
+                sess["pf"] = _DummyPF()
+        return sess["pf"]
+    return _DummyPF()
+
 def now_sess(uid: str) -> Dict[str, Any]:
     if rcli:
         j = _rget(f"sess:{uid}")
@@ -156,7 +195,7 @@ def now_sess(uid: str) -> Dict[str, Any]:
         "last_pts_text": None,
         "last_prob_gap": 0.0,
         "hand_idx": 0,
-        "mrel": {"a":[1.0]*5, "b":[1.0]*5},
+        "pf": None,
         # online stats
         "stats": {
             "bets": 0,
@@ -247,19 +286,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
         return (int(digits[-2]), int(digits[-1]))
     return None
 
-# ---------- PF import ----------
-try:
-    from bgs.pfilter import OutcomePF  # type: ignore
-except Exception:
-    try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        if cur not in sys.path: sys.path.insert(0, cur)
-        from pfilter import OutcomePF  # type: ignore
-        log.info("OutcomePF from local pfilter.py")
-    except Exception as e:
-        OutcomePF = None  # type: ignore
-        log.error("OutcomePF import failed: %s", e)
-
 # ---------- Render-safe defaults ----------
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
@@ -269,39 +295,18 @@ os.environ.setdefault("PF_PRED_SIMS", "20")
 os.environ.setdefault("PF_RESAMPLE", "0.7")
 os.environ.setdefault("PF_DIR_EPS", "0.003")
 
-# ---------- Init PF ----------
-if OutcomePF:
-    try:
-        PF = OutcomePF(
-            decks=int(os.getenv("DECKS","6")),
-            seed=int(os.getenv("SEED","42")),
-            n_particles=int(os.getenv("PF_N","60")),
-            sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","30"))),
-            resample_thr=float(os.getenv("PF_RESAMPLE","0.7")),
-            backend=os.getenv("PF_BACKEND","mc"),
-            dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.003")),
-        )
-        log.info("PF init ok: n=%s backend=%s", getattr(PF,"n_particles","?"), getattr(PF,"backend","?"))
-    except Exception as e:
-        log.error("PF init fail: %s", e)
-        class _Dummy:
-            def update_outcome(self, outcome): pass
-            def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
-        PF = _Dummy()
-else:
-    class _Dummy:
-        def update_outcome(self, outcome): pass
-        def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
-    PF = _Dummy()
-
 # ---------- PF health diag ----------
 PF_DIAG = int(os.getenv("PF_DIAG", "1"))
 def _check_pf_health() -> Dict[str, Any]:
     try:
-        pred0 = np.array(PF.predict(sims_per_particle=10), dtype=float)
+        if OutcomePF:
+            pf_test = OutcomePF(n_particles=10, backend=os.getenv("PF_BACKEND","mc"))
+            pred0 = np.array(pf_test.predict(sims_per_particle=10), dtype=float)
+        else:
+            pred0 = np.array([0.48,0.47,0.05], dtype=float)
         ok_sum = abs(pred0.sum() - 1.0) < 1e-3
         ok_range = np.all((pred0 >= -1e-6) & (pred0 <= 1+1e-6))
-        is_dummy = getattr(PF, "__class__", type("x",(object,),{})).__name__.lower().find("dummy") >= 0
+        is_dummy = OutcomePF is None
         info = {"pred0": pred0.tolist(), "ok_sum": ok_sum, "ok_range": ok_range, "is_dummy": is_dummy}
         if is_dummy or not ok_sum or not ok_range:
             log.error("PF health check FAIL: %s", info)
@@ -350,9 +355,6 @@ W_GAP_CAP=float(os.getenv("W_GAP_CAP","0.06"))
 DEPTH_W_EN  = env_flag("DEPTH_W_EN", 1)
 DEPTH_W_MAX = float(os.getenv("DEPTH_W_MAX","1.5"))
 
-MREL_EN = env_flag("MREL_EN", 1)
-MREL_LR = float(os.getenv("MREL_LR","0.05"))
-
 INV = {0:"莊", 1:"閒"}
 
 def softmax_temp(p: np.ndarray, t: float) -> np.ndarray:
@@ -374,21 +376,6 @@ def calc_margin_weight(p_pts: int, b_pts: int, last_prob_gap: float) -> float:
     part_g = W_GAMMA * gap_norm
     w = W_BASE + part_m + part_g
     return max(W_MIN, min(W_MAX, w))
-
-def margin_bucket(margin: int) -> int:
-    return 4 if margin>=4 else margin
-
-def mrel_score(sess: Dict[str,Any], margin: int) -> float:
-    if not MREL_EN: return 1.0
-    b = margin_bucket(margin)
-    a = sess["mrel"]["a"][b]; bb = sess["mrel"]["b"][b]
-    return (a)/(a+bb)
-
-def mrel_update(sess: Dict[str,Any], margin: int, correct: bool):
-    if not MREL_EN: return
-    b = margin_bucket(margin)
-    if correct: sess["mrel"]["a"][b] = max(1.0, sess["mrel"]["a"][b] + MREL_LR)
-    else:      sess["mrel"]["b"][b] = max(1.0, sess["mrel"]["b"][b] + MREL_LR)
 
 def decide_bp(prob: np.ndarray) -> Tuple[str, float, float, float]:
     pB, pP = float(prob[0]), float(prob[1])
@@ -482,7 +469,10 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     # validate points
     if not validate_input_data(p_pts, b_pts):
-        return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 閒6莊5 / 和"
+        return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
+
+    pf = _get_pf_from_sess(sess)
+    pf.update_point_history(p_pts, b_pts)
 
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
     margin = abs(p_pts - b_pts)
@@ -497,24 +487,23 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     rep = max(1, min(REP_CAP, int(round(w))))
 
     if p_pts == b_pts:
-        try: PF.update_outcome(2)
+        try: pf.update_outcome(2)
         except Exception as e: log.warning("PF tie update err: %s", e)
     else:
         outcome = 1 if p_pts > b_pts else 0
         for _ in range(rep):
-            try: PF.update_outcome(outcome)
+            try: pf.update_outcome(outcome)
             except Exception as e: log.warning("PF update err: %s", e)
         if UNCERT_PENALTY_EN and margin <= UNCERT_MARGIN_MAX:
             rev = 0 if outcome==1 else 1
             if random.random() < UNCERT_RATIO:
-                try: PF.update_outcome(rev)
+                try: pf.update_outcome(rev)
                 except Exception as e: log.warning("PF uncert reverse update err: %s", e)
 
     # 2) predict & smooth
     sims_pred = max(0, int(os.getenv("PF_PRED_SIMS","20")))
-    p_raw = PF.predict(sims_per_particle=sims_pred)
-    rel = mrel_score(sess, margin)
-    p_adj = np.array([p_raw[0]*rel, p_raw[1]*rel, p_raw[2]], dtype=np.float32)
+    p_raw = pf.predict(sims_per_particle=sims_pred)
+    p_adj = p_raw.copy()
     p_adj = p_adj / np.sum(p_adj)
     p_temp = softmax_temp(p_adj, PROB_TEMP)
     _prev_prob_sma = ema(_prev_prob_sma, p_temp, PROB_SMA_ALPHA)
@@ -776,6 +765,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["premium"] = keep_premium
             sess["trial_start"] = keep_trial
             sess["phase"] = "choose_game"
+            sess["pf"] = None  # reset PF
             save_sess(uid, sess)
             reply_text(event.reply_token, "🧹 已清空。輸入『遊戲設定』開始。", user_id=uid)
             return
@@ -785,6 +775,7 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["game"] = None
             sess["table"] = None
             sess["bankroll"] = 0
+            sess["pf"] = None  # reset PF
             save_sess(uid, sess)
             left = trial_left_minutes(sess, uid)
             reply_text(event.reply_token, welcome_text(left), user_id=uid)
