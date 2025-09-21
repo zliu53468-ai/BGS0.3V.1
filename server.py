@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render 免費版優化 + 點差連續加權 + 不確定性懲罰
-附加：手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放（皆可用環境變數）
-含 LINE webhook（有憑證→驗簽；否則回 200），事件去重 + push 後援
+server.py — Render 免費版優化 + 分離『分析信心度』與『下注配注』 + 線上命中率/ROI統計
+附加：點差連續加權、不確定性懲罰、手數深度權重、點差可靠度表(5桶)、Thompson 配注縮放
+含 LINE webhook（有憑證→驗簽；否則回 200），事件去重 + push 後援 + 30 分鐘試用
 
-本版新增/重點：
-- 👋 首次互動與「遊戲設定」都會送出【歡迎使用 BGS AI預測分析】引導訊息＋快速按鈕
-- ⏳ 30 分鐘試用：trial_start 永久綁定 uid（Redis key），封鎖/解鎖也無法重置
-- 🛑 觀望守則：機率差過小 / 和局風險高 / 機率差波動大 → 回覆「觀望」，下注=0
-- 🧠 決策模式 DECIDE_MODE=prob/ev；ev 模式用 BANKER_COMMISSION 外掛修正莊方 EV
-- 🧮 點數差加權學習：連續權重 + margin 可靠度桶 + 小差距不確定性懲罰
-- 🧾 回覆沿用舊版樣式（含信心度/配注策略/優勢%）
+重點修正：
+- 分離『分析信心度（顯示用、不影響下注）』與『下注配注比例（影響金額）』
+- 加入線上統計：出手、命中率、平均優勢、粗估盈虧（可切換精算莊抽水）
+- 保留你原有 PF 更新/平滑/觀望守則/多環旋鈕（環境變數）
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -34,7 +31,7 @@ except Exception:
     redis = None
 
 # ---------- 版本 & 日誌 ----------
-VERSION = "pf-render-free-2025-09-19-welcome+trial+watch+probfmt"
+VERSION = "pf-render-free-2025-09-21-conf-split+stats"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -95,7 +92,7 @@ def env_flag(name: str, default: int=0) -> int:
 # ---------- 試用 / 開通 ----------
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "").strip()
-ADMIN_CONTACT_LINK = os.getenv("ADMIN_CONTACT_LINK", "").strip()  # 例：https://lin.ee/8rwFDuh
+ADMIN_CONTACT_LINK = os.getenv("ADMIN_CONTACT_LINK", "").strip()  # 例：https://lin.ee/xxxx
 
 def _trial_key(uid: str) -> str:
     return f"trialstart:{uid}"
@@ -162,6 +159,14 @@ def now_sess(uid: str) -> Dict[str, Any]:
         "last_prob_gap": 0.0,
         "hand_idx": 0,
         "mrel": {"a":[1.0]*5, "b":[1.0]*5},
+        # === 線上統計 ===
+        "stats": {
+            "bets": 0,          # 出手次數
+            "wins": 0,          # 命中次數
+            "push": 0,          # 和局
+            "sum_edge": 0.0,    # 累積優勢（決策當下的 edge）
+            "payout": 0,        # 累積盈虧（+贏 -輸）
+        }
     }
     SESS[uid] = s
     return s
@@ -290,6 +295,7 @@ else:
 
 # ---------- 決策/配注 & 觀望守則 ----------
 DECIDE_MODE = os.getenv("DECIDE_MODE", "prob").strip().lower()
+# 注意：此為莊家抽水後的乘數（5% 抽水 -> 0.95）
 BANKER_COMMISSION = float(os.getenv("BANKER_COMMISSION", "0.95"))
 
 MIN_BET_PCT = float(os.getenv("MIN_BET_PCT","0.05"))
@@ -301,11 +307,11 @@ TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
 
-# 觀望相關（可用你原本的 TIE_PROB_MAX/MIN）
-EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.005"))       # 降低機率差門檻
-TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.18"))    # 提高和局風險容忍度
+# 觀望相關
+EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.005"))
+TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.18"))
 WATCH_EN = env_flag("WATCH_EN", 1)
-WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.08"))  # 提高波動容忍度
+WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.08"))
 
 # 點差學習三件套
 UNCERT_PENALTY_EN = env_flag("UNCERT_PENALTY_EN", 1)
@@ -387,23 +393,62 @@ def bet_amount(bankroll: int, pct: float) -> int:
     if bankroll<=0 or pct<=0: return 0
     return int(round(bankroll * pct))
 
-def confidence_to_pct(edge: float, max_prob: float) -> float:
-    # 以舊版感覺：讓配注≈信心度（0.05~0.40）
-    base_conf = min(1.0, edge*15.0)
-    prob_conf = max(0.0, (max_prob-0.45)*2.5)
-    total = 0.5*base_conf + 0.5*prob_conf
-    pct = MIN_BET_PCT + (total**0.8) * (MAX_BET_PCT-MIN_BET_PCT)
-    return max(MIN_BET_PCT, min(MAX_BET_PCT, pct))
+# ===== 分離顯示用「分析信心度」與「下注配注」的參數 =====
+CONF_MIN_PCT = float(os.getenv("CONF_MIN_PCT", "0.10"))  # 分析信心度顯示下限（10%）
+CONF_MAX_PCT = float(os.getenv("CONF_MAX_PCT", "0.90"))  # 分析信心度顯示上限（90%）
+RISK_LEVEL   = float(os.getenv("RISK_LEVEL", "1.0"))     # 下注風險係數（0.5~1.5）
 
-def thompson_scale(pct: float) -> float:
-    if not TS_EN: return pct
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+# ---- 分析信心度（顯示用，不影響下注） ----
+def analysis_confidence(prob: np.ndarray, prev_gap: float, cur_gap: float) -> float:
+    """
+    回傳一個 0~1 的『分析信心度』，僅用於顯示。
+    組成: 最大勝率、莊閒差距穩定度、和局風險扣分。
+    """
+    pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
+    maxp = max(pB, pP)
+    # 勝率貢獻：maxp 從 0.5 起才加分
+    c_prob = clamp((maxp - 0.50) * 4.0, 0.0, 1.0)  # 0.50→0, 0.75→1
+    # 穩定度：當前 gap 與上次 gap 越接近越穩定
+    gap_delta = abs(cur_gap - prev_gap)
+    c_stab = clamp(1.0 - (gap_delta / max(1e-6, WATCH_INSTAB_THRESH*2.0)), 0.0, 1.0)
+    # 和局風險扣分
+    t_pen = clamp((pT - TIE_PROB_MAX) * 6.0, 0.0, 1.0)
+    c = 0.55*c_prob + 0.35*c_stab - 0.30*t_pen
+    return clamp(c, 0.0, 1.0)
+
+def map_conf_to_display(c: float) -> float:
+    """把 0~1 的分析信心度映射到 CONF_MIN_PCT ~ CONF_MAX_PCT（顯示用）。"""
+    return clamp(CONF_MIN_PCT + c * (CONF_MAX_PCT - CONF_MIN_PCT), CONF_MIN_PCT, CONF_MAX_PCT)
+
+# ---- 下注配注（只影響金額，不影響預測與顯示信心度） ----
+def base_bet_pct(edge: float, max_prob: float) -> float:
+    """
+    下注配注的基礎比例（不等於顯示的信心度）。
+    依優勢 edge 與 max_prob 線性+溫和非線性映射，再乘 RISK_LEVEL。
+    """
+    # 讓 edge 在 0~6% 有感度，>6% 漸趨飽和
+    e = clamp(edge / 0.06, 0.0, 1.0)              # edge=6% -> 1
+    m = clamp((max_prob - 0.50) / 0.20, 0.0, 1.0) # maxp=70% -> 1
+    raw = (0.6*e + 0.4*m)
+    raw = raw**0.9
+    pct = MIN_BET_PCT + raw * (MAX_BET_PCT - MIN_BET_PCT)
+    pct *= clamp(RISK_LEVEL, 0.3, 2.0)
+    return clamp(pct, MIN_BET_PCT, MAX_BET_PCT)
+
+def thompson_scale_pct(pct: float) -> float:
+    if not TS_EN:
+        return pct
     a = max(1e-3, TS_ALPHA); b = max(1e-3, TS_BETA)
     s = np.random.beta(a, b)
-    return max(MIN_BET_PCT, min(MAX_BET_PCT, pct*s))
+    return clamp(pct * s, MIN_BET_PCT, MAX_BET_PCT)
 
 _prev_prob_sma: Optional[np.ndarray] = None
 
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
+    """單手資料 -> 更新PF -> 產生下一手預測 + 顯示與下注建議（已分離信心度/配注）"""
     global _prev_prob_sma
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
     margin = abs(p_pts - b_pts)
@@ -442,51 +487,71 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     _prev_prob_sma = ema(_prev_prob_sma, p_temp, PROB_SMA_ALPHA)
     p_final = _prev_prob_sma if _prev_prob_sma is not None else p_temp
 
-    # 3) 決策
+    # 3) 決策（方向） — 僅基於 p_final（與 DECIDE_MODE），不受配注與信心度影響
     choice, edge, maxp, prob_gap = decide_bp(p_final)
 
-    # 4) 觀望守則 - 放寬條件
+    # 4) 觀望守則
     watch = False
     reasons = []
     if WATCH_EN:
-        # 機率差門檻（只用 prob_gap，比模式穩定）
         if prob_gap < EDGE_ENTER:
             watch = True; reasons.append("機率差過小")
-        # 和局風險
         if float(p_final[2]) > TIE_PROB_MAX:
             watch = True; reasons.append("和局風險偏高")
-        # 波動性：與上一手 gap 差異過大
-        last_gap = float(sess.get("last_prob_gap", 0.0))
         if abs(prob_gap - last_gap) > WATCH_INSTAB_THRESH:
             watch = True; reasons.append("勝率波動大")
 
-    # 記錄給下一手
-    sess["last_prob_gap"] = prob_gap
-
-    # 5) 金額/文字（舊版格式）
+    # 5) 分離：分析信心度（顯示） vs 下注配注（下單）
     bankroll = int(sess.get("bankroll", 0))
+
+    # (a) 分析信心度（顯示用，不影響下注）
+    c0 = analysis_confidence(p_final, last_gap, prob_gap)     # 0~1
+    conf_pct_disp = map_conf_to_display(c0)                   # CONF_MIN_PCT ~ CONF_MAX_PCT
+
+    # (b) 下注配注（用 edge/maxp + 風險/探索；與分析信心度無關）
     if watch:
         bet_pct = 0.0
         bet_amt = 0
-        conf_pct = 0.0
-        strat = f"⚠️ 觀望（{'、'.join(reasons)}）"
         choice_text = "觀望"
+        strat = f"⚠️ 觀望（{'、'.join(reasons)}）"
     else:
-        bet_pct = thompson_scale(confidence_to_pct(edge, maxp))
-        bet_amt = bet_amount(bankroll, bet_pct)
-        conf_pct = bet_pct  # 舊版：信心度≈配注比例
-        # 策略字樣
-        if conf_pct < 0.28:  strat = f"🟡 低信心配注 {conf_pct*100:.1f}%"
-        elif conf_pct < 0.34: strat = f"🟠 中信心配注 {conf_pct*100:.1f}%"
-        else:                 strat = f"🟢 高信心配注 {conf_pct*100:.1f}%"
+        pct_base = base_bet_pct(edge, maxp)   # 不含隨機
+        bet_pct  = thompson_scale_pct(pct_base)   # 如需探索，僅作用在下注
+        bet_amt  = bet_amount(bankroll, bet_pct)
         choice_text = choice
+        # 配注分級（看下注比例）
+        if bet_pct < 0.28:  strat = f"🟡 低信心配注 {bet_pct*100:.1f}%"
+        elif bet_pct < 0.34: strat = f"🟠 中信心配注 {bet_pct*100:.1f}%"
+        else:                 strat = f"🟢 高信心配注 {bet_pct*100:.1f}%"
 
-    # 上局結果行
+    # 6) 線上統計（以上一局結果為準）
+    # 實際勝負：p_pts > b_pts => 閒勝；p_pts < b_pts => 莊勝；相等 => 和局
+    st = sess["stats"]
+    if p_pts == b_pts:
+        st["push"] += 1
+    else:
+        real = "閒" if p_pts > b_pts else "莊"
+        if not watch:
+            st["bets"] += 1
+            st["sum_edge"] += float(edge)
+            if choice_text == real:
+                # 精算盈虧（含莊抽水）
+                if real == "莊":
+                    st["payout"] += int(round(bet_amt * BANKER_COMMISSION))
+                else:
+                    st["payout"] += int(bet_amt)
+                st["wins"] += 1
+            else:
+                st["payout"] -= int(bet_amt)
+
+    # 上局結果行與 gap 記錄
     if p_pts == b_pts:
         sess["last_pts_text"] = f"上局結果: 和 {p_pts}"
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+    sess["last_prob_gap"] = prob_gap
 
+    # 7) 回覆格式
     mode_note = "（以勝率決策）" if DECIDE_MODE=="prob" else f"（以期望值決策，comm={BANKER_COMMISSION:.3f}）"
     msg = [
         sess["last_pts_text"],
@@ -495,14 +560,25 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         "【預測結果】",
         f"閒：{p_final[1]*100:.2f}%",
         f"莊：{p_final[0]*100:.2f}%",
-        f"和：{p_final[2]*100:.2f}%",  # 新增和局概率显示
+        f"和：{p_final[2]*100:.2f}%",
         f"本次預測結果：{choice_text} {mode_note}",
-        f"信心度：{conf_pct*100:.1f}%",
-        f"建議下注：{bet_amt:,}",
+        f"分析信心度（不影響下注）：{conf_pct_disp*100:.1f}%",
+        f"建議配注比例：{bet_pct*100:.1f}%",
+        f"建議下注金額：{bet_amt:,}",
         f"配注策略：{strat} (優勢: {edge*100:.1f}%)",
+    ]
+
+    # 統計摘要
+    bets = st["bets"]
+    hit = (st["wins"]/bets*100.0) if bets>0 else 0.0
+    avg_edge = (st["sum_edge"]/bets*100.0) if bets>0 else 0.0
+    roi = st["payout"]  # 以金額顯示
+    msg.extend([
+        "—",
+        f"📈 線上統計：出手 {bets}｜命中率 {hit:.1f}%｜平均優勢 {avg_edge:.2f}%｜粗估盈虧 {roi:,}",
         "",
         "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
-    ]
+    ])
     return "\n".join(msg)
 
 # ---------- REST ----------
@@ -585,7 +661,6 @@ def reply_text(token: str, text: str, user_id: Optional[str]=None):
     except Exception as e:
         try:
             if user_id:
-                # Fixed missing parenthesis: ensure push_message call is closed properly
                 line_api.push_message(user_id, TextSendMessage(text=text, quick_reply=_quick_reply()))
             else:
                 log.warning("reply err(no uid): %s", e)
