@@ -771,11 +771,18 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             keep_premium = bool(sess.get("premium", False))
             keep_trial   = int(get_trial_start(uid))
             SESS.pop(uid, None)
+            if rcli:
+                rcli.delete(f"sess:{uid}")  # 確保 Redis 清乾淨
             sess = now_sess(uid)
             sess["premium"] = keep_premium
             sess["trial_start"] = keep_trial
             sess["phase"] = "choose_game"
             sess["pf"] = None  # reset PF
+            sess["stats"] = {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0}
+            sess["hist_pred"] = []
+            sess["hist_real"] = []
+            sess["last_prob_gap"] = 0.0  # 清概率記憶
+            sess["hand_idx"] = 0  # 清手數計數
             save_sess(uid, sess)
             reply_text(event.reply_token, "🧹 已清空。輸入『遊戲設定』開始。", user_id=uid)
             return
