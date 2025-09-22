@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render free-friendly build
-- Split "analysis confidence (display only)" vs "bet sizing (affects money)"
-- Online stats: bets/wins, accuracy (ex-tie), recent-N accuracy, avg edge, P&L
-- PF health check; graceful dummy fallback notice
-- Keep original LINE webhook flow, trial gate, quick replies
-
-This file uses only ASCII in comments (Chinese may appear in user-facing strings).
+server.py — Right-side base + Left-side prediction tweaks + 30min Trial Gate
+- 保留右側整體流程/指令/按鈕/Redis/REST/LINE webhook
+- 採用左側去敏化 PF + should_bet 保守入場
+- 回覆訊息為你指定的段落樣式
+- 新增 30 分鐘試用與「開通 <密碼>」解除限制（讀 TRIAL_MINUTES / ADMIN_ACTIVATION_SECRET）
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -30,7 +28,7 @@ except Exception:
     redis = None
 
 # ---------- Version & logging ----------
-VERSION = "bgs-pf-right-side-with-left-pred-merge-2025-09-22"
+VERSION = "bgs-right+left-pred-trial-2025-09-22"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL","INFO"),
@@ -45,11 +43,12 @@ if _has_flask:
 else:
     app = None  # type: ignore
 
-# ---------- Helpers ----------
+# ---------- Env helpers ----------
 def env_flag(name: str, default: int = 0) -> bool:
     v = os.getenv(name, str(default)).strip().lower()
     return v in ("1","true","yes","y","on")
 
+# ---------- Core helpers ----------
 def softmax(x: np.ndarray) -> np.ndarray:
     x = np.array(x, dtype=float)
     x = np.clip(x, 1e-12, None)
@@ -60,19 +59,23 @@ def ema(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray
     if prev is None: return cur
     return alpha*cur + (1-alpha)*prev
 
-# ====== （右側既有）可調參數區 ======
-# Thompson Sampling（顯示與下注拆分保留）
+# ====== 可調參數區（右側保留 + 左側去敏化預設） ======
+# Trial / Activation
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))  # 預設 30
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")  # 可留空
+
+# Thompson
 TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
 
-# —— 入場/觀望條件（改預設值，但變數名與流程維持右側）
-EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.015"))       # ← from left: 1.5%
-TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.16"))    # ← from left
+# 入場/觀望條件（用左側保守值）
+EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.015"))
+TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.16"))
 WATCH_EN = env_flag("WATCH_EN", 1)
 WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.12"))
 
-# —— 不確定性懲罰/點差權重（保留右側、微調預設值以貼近左側）
+# 不確定性懲罰/點差權重（保留右側；係數取合理預設）
 UNCERT_PENALTY_EN = env_flag("UNCERT_PENALTY_EN", 1)
 UNCERT_MARGIN_MAX = int(os.getenv("UNCERT_MARGIN_MAX","2"))
 UNCERT_RATIO = float(os.getenv("UNCERT_RATIO","0.25"))
@@ -89,17 +92,17 @@ W_GAP_CAP= float(os.getenv("W_GAP_CAP","0.08"))
 DEPTH_W_EN  = env_flag("DEPTH_W_EN", 1)
 DEPTH_W_MAX = float(os.getenv("DEPTH_W_MAX","1.5"))
 
-# —— 溫度/平滑（保留右側）
+# 溫度/平滑（保留右側）
 TEMP_EN = env_flag("TEMP_EN", 1)
 TEMP    = float(os.getenv("TEMP","0.95"))
 SMOOTH_EN = env_flag("SMOOTH_EN", 1)
 SMOOTH_ALPHA = float(os.getenv("SMOOTH_ALPHA","0.7"))
 
-# —— 莊家抽水/決策模式（保留右側）
+# 抽水與決策模式
 BANKER_COMMISSION = float(os.getenv("BANKER_COMMISSION","0.05"))
 DECIDE_MODE = os.getenv("DECIDE_MODE","prob")  # prob|ev
 
-# ---------- PF dummy (保持右側流程) ----------
+# ---------- PF dummy（右側簡化版） ----------
 class PFHealth:
     def __init__(self): self.is_dummy=True
 PF_HEALTH = PFHealth()
@@ -115,7 +118,6 @@ class OutcomePF:
     def update_outcome(self, outcome):
         pass
     def predict(self) -> np.ndarray:
-        # dummy: 按歷史粗略偏好，否則均勻分布
         if len(self.hist)>=4:
             xs = [1,1,1]
             for p,b in self.hist[-6:]:
@@ -125,7 +127,7 @@ class OutcomePF:
             return softmax(np.array(xs, dtype=float))
         return np.array([0.45,0.45,0.10])
 
-# ---------- Redis / Session（保留右側） ----------
+# ---------- Redis / Session（右側保留） ----------
 REDIS_URL = os.getenv("REDIS_URL")
 _r = None
 if REDIS_URL and redis:
@@ -151,18 +153,55 @@ def save_sess(uid: str, sess: Dict[str,Any]):
         try: _r.set(f"sess:{uid}", json.dumps(sess) )
         except Exception as e: log.warning("Redis save sess err: %s", e)
 
-# ---------- PF 管理（保留右側；調整 PF 預設值為左側建議） ----------
+# ---------- Trial helpers ----------
+_trial_local: Dict[str, Dict[str,str]] = {}  # 無 Redis 時的本地備援
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _trial_key(uid: str) -> str:
+    return f"trial:{uid}"
+
+def trial_start_if_needed(uid: str):
+    """若未開始，立即紀錄 trial_start（永久綁定 uid）"""
+    ts = str(_now_ts())
+    if TRIAL_MINUTES <= 0:  # 關閉試用
+        return
+    if _r:
+        if _r.get(_trial_key(uid)) is None:
+            _r.set(_trial_key(uid), ts)
+    else:
+        _trial_local.setdefault(uid, {"trial_start": ts})
+
+def trial_seconds_remaining(uid: str) -> int:
+    """回傳剩餘秒數（<0 代表到期）"""
+    limit_s = TRIAL_MINUTES * 60
+    if TRIAL_MINUTES <= 0:
+        return 9_999_999
+    if _r:
+        v = _r.get(_trial_key(uid))
+        if v is None:
+            return limit_s
+        start = int(v)
+    else:
+        start = int(_trial_local.get(uid, {}).get("trial_start", _now_ts()))
+    return limit_s - (_now_ts() - start)
+
+def is_vip(sess: Dict[str,Any]) -> bool:
+    return bool(sess.get("vip", False))
+
+# ---------- PF 管理（右側保留；左側去敏化預設） ----------
 def _get_pf_from_sess(sess: Dict[str,Any]) -> OutcomePF:
     if sess.get("pf") is None:
         try:
             sess["pf"] = OutcomePF(
                 decks=int(os.getenv("DECKS","6")),
                 seed=int(os.getenv("SEED","42")),
-                n_particles=int(os.getenv("PF_N","120")),                 # ← 60 -> 120
-                sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),       # ← 30 -> 40
-                resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),      # ← 0.7 -> 0.85
+                n_particles=int(os.getenv("PF_N","120")),                 # 60 -> 120
+                sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),       # 30 -> 40
+                resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),      # 0.7 -> 0.85
                 backend=os.getenv("PF_BACKEND","mc"),
-                dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),     # ← 0.003 -> 0.025
+                dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),     # 0.003 -> 0.025
             )
             log.info("Per-session PF init ok")
         except Exception as e:
@@ -171,10 +210,7 @@ def _get_pf_from_sess(sess: Dict[str,Any]) -> OutcomePF:
             PF_HEALTH.is_dummy = True
     return sess["pf"]
 
-# ---------- 下注/配注（保留右側現有公式） ----------
-def map_conf_to_pct(x: float) -> float:
-    return max(0.05, min(0.4, 0.05 + 0.35 * x))
-
+# ---------- 下注/配注（右側保留） ----------
 def base_bet_pct(edge: float, maxp: float) -> float:
     k1 = float(os.getenv("BET_K1","0.60"))
     k2 = float(os.getenv("BET_K2","0.40"))
@@ -188,7 +224,7 @@ def thompson_scale_pct(pct: float) -> float:
 def bet_amount(bankroll: int, pct: float) -> int:
     return int(round(max(0, bankroll) * pct))
 
-# ---------- 計分與輸入解析（保留右側） ----------
+# ---------- 輸入解析（右側保留） ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
     t = text.strip()
     if t in ("和","和局"):
@@ -206,7 +242,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
 def validate_input_data(p_pts: int, b_pts: int) -> bool:
     return (0 <= p_pts <= 9) and (0 <= b_pts <= 9)
 
-# ---------- 命中率/優勢工具（保留右側；calc_margin_weight 係數取左側預設） ----------
+# ---------- 命中率/優勢工具（取左側權重邏輯） ----------
 def calc_margin_weight(p_pts: int, b_pts: int, last_prob_gap: float) -> float:
     margin = abs(int(p_pts) - int(b_pts))
     sig = 1.0/(1.0 + math.exp(-W_SIG_K * (margin - W_SIG_MID)))
@@ -216,10 +252,9 @@ def calc_margin_weight(p_pts: int, b_pts: int, last_prob_gap: float) -> float:
     w = W_BASE + part_m + part_g
     return max(W_MIN, min(W_MAX, w))
 
-# —— 新增（來自左側）：保守入場條件
 def should_bet(prob: Tuple[float,float,float], last_gap: float, cur_gap: float, idx: int) -> bool:
     """
-    max_prob>=0.52、T<=0.16、機率差變動不大、cur_gap>=1.8%、前5手略放寬
+    保守入場：max_prob>=0.52、T<=0.16、機率差變動不大、cur_gap>=1.8%、前5手略放寬
     """
     pB, pP, pT = prob
     max_prob = max(pB, pP)
@@ -253,14 +288,14 @@ def decide_bp(prob: np.ndarray) -> Tuple[str, float, float, float]:
 _prev_prob_sma: Optional[np.ndarray] = None
 
 def analysis_confidence(prob: np.ndarray, last_gap: float, cur_gap: float) -> float:
-    # 仍保留右側流程（只是不再輸出顯示）
+    # 仍保留右側流程（不輸出顯示）
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     maxp = max(pB,pP); gap=abs(pB-pP)
     x = 0.4*max(0, maxp-0.5)/0.5 + 0.4*max(0, gap)/0.5 + 0.2*max(0, 0.16-pT)/0.16
     x = max(0.0, min(1.0, x))
     return x
 
-# ---------- 主邏輯（保留右側，僅換 watch 規則 + 訊息格式） ----------
+# ---------- 主邏輯（右側保留，僅換 watch 規則 + 訊息格式） ----------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     global _prev_prob_sma
 
@@ -270,11 +305,11 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pf = _get_pf_from_sess(sess)
     pf.update_point_history(p_pts, b_pts)
 
-    # 1) 粗預測
+    # 1) 初步預測
     prob = pf.predict()  # [B,P,T]
     prob = softmax(prob)
 
-    # 2) 不確定性懲罰 + 平滑/溫度（保留右側）
+    # 2) 不確定性懲罰 + 平滑/溫度
     last_gap = float(sess.get("last_prob_gap", 0.0))
     if UNCERT_PENALTY_EN:
         margin = min(abs(p_pts-b_pts), UNCERT_MARGIN_MAX)
@@ -292,14 +327,14 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     # 3) 方向/優勢
     choice, edge, maxp, prob_gap = decide_bp(prob)
 
-    # 4) watch 規則（改為用 should_bet）
+    # 4) watch 規則（用 should_bet）
     hand_idx = int(sess.get("hand_idx", 0))
     p_final = prob
     watch = not should_bet(tuple(p_final.tolist()), last_gap, prob_gap, hand_idx)
 
-    # 5) 資金與配注（保留右側計算）
+    # 5) 資金與配注
     bankroll = int(sess.get("bankroll", 0))
-    conf_pct_disp = analysis_confidence(p_final, last_gap, prob_gap)
+    _ = analysis_confidence(p_final, last_gap, prob_gap)  # 保留內部用
     pct_base = base_bet_pct(edge, maxp)
     bet_pct  = thompson_scale_pct(pct_base)
     bet_amt  = bet_amount(bankroll, bet_pct)
@@ -315,7 +350,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         elif bet_pct < 0.34: strat = f"🟠 中信心配注 {bet_pct*100:.1f}%"
         else:                strat = f"🟢 高信心配注 {bet_pct*100:.1f}%"
 
-    # 6) 更新統計（保留右側）
+    # 6) 更新統計（右側保留）
     st = sess["stats"]
     if p_pts == b_pts:
         real_label = "和"; st["push"] += 1
@@ -333,17 +368,17 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             else:
                 st["payout"] -= int(bet_amt)
 
-    pred_label = "觀望" if watch else choice_text
     sess["hand_idx"] = int(sess.get("hand_idx",0)) + 1
     if p_pts == b_pts:
-        sess["last_pts_text"] = f"上局結果: 和 {p_pts}"
+        last_txt = f"上局結果: 和 {p_pts}"
     else:
-        sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+        last_txt = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+    sess["last_pts_text"] = last_txt
     sess["last_prob_gap"] = prob_gap
 
-    # 7) 訊息輸出（改為你指定的樣式）
+    # 7) 訊息輸出（你指定的樣式）
     msg = [
-        sess["last_pts_text"],
+        last_txt,
         "開始分析下局....",
         "",
         "【預測結果】",
@@ -357,13 +392,12 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
     ]
 
-    # PF dummy 提示（保留）
     if PF_HEALTH.is_dummy:
         msg.insert(0, "⚠️ 模型載入為簡化版（Dummy）。請確認 bgs.pfilter 是否可用。")
 
     return "\n".join(msg)
 
-# ---------- 簡易 REST（保留右側） ----------
+# ---------- 簡易 REST ----------
 @app.get("/")
 def root():
     return f"✅ BGS PF Server OK ({VERSION})", 200
@@ -379,7 +413,13 @@ def health():
 def predict_rest():
     data = request.get_json(force=True, silent=True) or {}
     uid = str(data.get("uid","demo"))
+    # Trial gate for REST
     sess = load_sess(uid)
+    if not is_vip(sess):
+        trial_start_if_needed(uid)
+        sec_left = trial_seconds_remaining(uid)
+        if sec_left <= 0:
+            return jsonify(ok=False, err="trial_expired", minutes=TRIAL_MINUTES), 403
     try:
         p_pts = int(data.get("p",0)); b_pts = int(data.get("b",0))
     except:
@@ -388,16 +428,14 @@ def predict_rest():
     save_sess(uid, sess)
     return jsonify(ok=True, msg=msg), 200
 
-# ---------- （右側）LINE webhook 保留 ----------
+# ---------- LINE webhook（右側保留 + Trial Gate + 歡迎＆選館訊息） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_TOKEN  = os.getenv("LINE_CHANNEL_TOKEN")
 
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
-    from hashlib import sha256
-    import hmac, base64
     try:
         from linebot import LineBotApi, WebhookHandler
-        from linebot.models import MessageEvent, TextMessage, TextSendMessage
+        from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent
         from linebot.exceptions import InvalidSignatureError, LineBotApiError
         _line_ok=True
     except Exception:
@@ -417,6 +455,20 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
             except Exception as e:
                 log.warning("LINE push fail: %s", e)
 
+    def _trial_notice_card(sec_left: int) -> str:
+        # 你截圖的風格：顯示試用剩餘或到期提示
+        if sec_left <= 0:
+            return (
+                "試用期已到 ❌\n"
+                "📣 請聯繫管理員開通\n"
+                "加入官方 LINE ：https://lin.ee/Dlm6y3u\n"
+                "—\n"
+                "輸入：開通 你的密碼"
+            )
+        else:
+            mm, ss = divmod(max(0,sec_left), 60)
+            return f"⏳ 試用剩餘：{mm} 分 {ss} 秒"
+
     @app.post("/line-webhook")
     def line_webhook():
         body = request.get_data(as_text=True)
@@ -428,12 +480,79 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
             return "ok", 200
         return "ok", 200
 
+    @handler.add(FollowEvent)
+    def on_follow(event):
+        uid = event.source.user_id if event.source else "demo"
+        sess = load_sess(uid)
+        if not is_vip(sess):
+            trial_start_if_needed(uid)
+            sec_left = trial_seconds_remaining(uid)
+            card = _trial_notice_card(sec_left)
+        else:
+            card = "✅ 已開通完整功能。"
+
+        welcome = (
+            "👋 歡迎使用 BGS AI 預測分析！\n"
+            "使用步驟：\n"
+            "1️⃣ 選擇館別（輸入 1~10）\n"
+            "2️⃣ 輸入桌號（例：DG01）\n"
+            "3️⃣ 輸入本金（例：5000）\n"
+            "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可連續預測！\n\n"
+            "【請選擇遊戲館別】\n"
+            "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n6. 歐博/卡利\n7. KG\n8. 全利\n9. 名人\n10. MT真人\n"
+            "(請直接輸入數字 1-10)"
+        )
+        reply_text(event.reply_token, f"{welcome}\n\n{card}", user_id=uid)
+
     @handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
         uid = event.source.user_id if event.source else "demo"
         text = (event.message.text or "").strip()
         sess = load_sess(uid)
 
+        # ===== 開通碼處理 =====
+        if text.startswith("開通"):
+            secret = text.replace("開通", "").strip()
+            if ADMIN_ACTIVATION_SECRET and secret == ADMIN_ACTIVATION_SECRET:
+                sess["vip"] = True
+                save_sess(uid, sess)
+                reply_text(event.reply_token, "✅ 已開通完整功能，無試用時間限制。", user_id=uid)
+                return
+            else:
+                reply_text(event.reply_token, "❌ 開通碼錯誤。若忘記請洽管理員。", user_id=uid)
+                return
+
+        # ===== 試用限制（非 VIP 才檢查）=====
+        if not is_vip(sess):
+            trial_start_if_needed(uid)
+            sec_left = trial_seconds_remaining(uid)
+            if sec_left <= 0:
+                # 顯示到期卡片（跟你截圖一致風格）
+                reply_text(event.reply_token, _trial_notice_card(sec_left), user_id=uid)
+                return
+
+        # ===== 原本右側流程：本金/館別/點數 =====
+        # 簡化引導指令：如果輸入「遊戲設定」或步驟數字，送歡迎+館別清單
+        if text in ("遊戲設定","/start"):
+            tip = (
+                "👋 歡迎使用 BGS AI 預測分析！\n"
+                "使用步驟：\n"
+                "1️⃣ 選擇館別（輸入 1~10）\n"
+                "2️⃣ 輸入桌號（例：DG01）\n"
+                "3️⃣ 輸入本金（例：5000）\n"
+                "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可連續預測！\n\n"
+                "【請選擇遊戲館別】\n"
+                "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n6. 歐博/卡利\n7. KG\n8. 全利\n9. 名人\n10. MT真人\n"
+                "(請直接輸入數字 1-10)"
+            )
+            if not is_vip(sess):
+                sec_left = trial_seconds_remaining(uid)
+                tip = f"{tip}\n\n{_trial_notice_card(sec_left)}"
+            reply_text(event.reply_token, tip, user_id=uid)
+            save_sess(uid, sess)
+            return
+
+        # 本金設定流程
         if sess.get("phase","await_pts") == "await_bankroll":
             try:
                 bk = int(re.sub(r"[^0-9]","", text))
@@ -444,19 +563,37 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
             except: pass
             reply_text(event.reply_token, "請輸入數字本金（例：5000）。", user_id=uid); return
 
+        # 點數 or 其他指令
         pts = parse_last_hand_points(text)
         if pts is None:
             # 還沒設定本金 → 先要求設定
             if not int(sess.get("bankroll",0)):
                 sess["phase"] = "await_bankroll"; save_sess(uid, sess)
-                reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
-            reply_text(event.reply_token, "點數格式錯誤（例：65 / 和 / 閒6莊5）。", user_id=uid); return
+                msg = "請先輸入本金（例：5000），再回報點數。"
+                if not is_vip(sess):
+                    sec_left = trial_seconds_remaining(uid)
+                    msg = f"{msg}\n{_trial_notice_card(sec_left)}"
+                reply_text(event.reply_token, msg, user_id=uid); return
+            # 非點數輸入 → 提示格式
+            msg = "點數格式錯誤（例：65 / 和 / 閒6莊5）。"
+            if not is_vip(sess):
+                sec_left = trial_seconds_remaining(uid)
+                msg = f"{msg}\n{_trial_notice_card(sec_left)}"
+            reply_text(event.reply_token, msg, user_id=uid); return
 
+        # 必要的本金保護
         if not int(sess.get("bankroll",0)):
             sess["phase"] = "await_bankroll"; save_sess(uid, sess)
             reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
 
+        # 產生預測訊息
         msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
+        # 在每次回覆尾端附上試用剩餘提示（未開通時）
+        if not is_vip(sess):
+            sec_left = trial_seconds_remaining(uid)
+            tail = _trial_notice_card(sec_left)
+            if sec_left > 0:
+                msg = f"{msg}\n\n{tail}"
         sess["phase"] = "await_pts"; save_sess(uid, sess)
         reply_text(event.reply_token, msg, user_id=uid)
 
@@ -468,5 +605,6 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    log.info("Starting %s on port %s (DECIDE_MODE=%s, COMM=%.3f)...", VERSION, port, os.getenv("DECIDE_MODE","prob"), BANKER_COMMISSION)
+    log.info("Starting %s on port %s (DECIDE_MODE=%s, COMM=%.3f, TRIAL=%dm)...",
+             VERSION, port, os.getenv("DECIDE_MODE","prob"), BANKER_COMMISSION, TRIAL_MINUTES)
     app.run(host="0.0.0.0", port=port, debug=False)
