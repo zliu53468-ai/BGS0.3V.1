@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-server.py — 完整百家樂AI + LINE webhook（Render可用直接覆蓋）
+server.py — 完整百家樂AI + LINE webhook（修正版/可直接部署 Render/Heroku/VPS）
 """
 
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 
+# ---------- Flask主體 ----------
 try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
@@ -30,9 +31,14 @@ if _has_flask:
         return jsonify(ok=True, ts=time.time(), msg="API normal"), 200
 else:
     class _DummyApp:
-        def get(self,*a,**k): def deco(f): return f; return deco
-        def post(self,*a,**k): def deco(f): return f; return deco
-        def run(self,*a,**k): print("Flask not installed; dummy app.")
+        def get(self, *a, **k):
+            def deco(f): return f
+            return deco
+        def post(self, *a, **k):
+            def deco(f): return f
+            return deco
+        def run(self, *a, **k):
+            print("Flask not installed; dummy app.")
     app = _DummyApp()
 
 # ---------- Redis / Fallback ----------
@@ -261,8 +267,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     return "\n".join(msg)
 
-# ================== LINE webhook流程(可用) ===================
-
+# ================== LINE webhook流程 ===================
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
