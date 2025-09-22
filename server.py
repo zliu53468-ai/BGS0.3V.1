@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render free-friendly build
-- Split "analysis confidence (display only)" vs "bet sizing (affects money)"
-- Online stats: bets/wins, accuracy (ex-tie), recent-N accuracy, avg edge, P&L
-- PF health check; graceful dummy fallback notice
-- Keep original LINE webhook flow, trial gate, quick replies
-
-This file uses only ASCII in comments (Chinese may appear in user-facing strings).
+server.py — Render free‑friendly build (Deepseak‑tuned 2025‑09‑22)
+==============================================================
+• Apply Deepseak PF‑stability recommendations
+• Lower PF sensitivity & weight clipping
+• Add multi‑layer confidence filter (`should_bet`)
+• Track recent probability gaps for trend‑instability watch
+• Track accuracy by margin and surface diagnostics
+• Defaults updated via `os.environ.setdefault` so ENV overrides still work
+• 100 % backwards‑compatible API/LINE webhook
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -30,9 +32,36 @@ except Exception:
     redis = None
 
 # ---------- Version & logging ----------
-VERSION = "pf-render-free-2025-09-21-conf-split+stats+diag"
+VERSION = "pf-render-free-2025-09-22-deepseak-tuned"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
+
+# ---------------------------------------------------------------------------
+#  🔧  Deepseak recommended *safer* PF defaults — must be set **before** we
+#       read them later on.  Users can still override via real ENV variables.
+# ---------------------------------------------------------------------------
+_os_set = os.environ.setdefault  # shortcut
+_os_set("PF_BACKEND", "mc")
+_os_set("DECKS", "6")
+_os_set("PF_N", "120")          # ↑ particles
+_os_set("PF_UPD_SIMS", "40")     # ↑ update sims
+_os_set("PF_PRED_SIMS", "20")
+_os_set("PF_RESAMPLE", "0.85")   # ↑ resample threshold
+_os_set("PF_DIR_EPS", "0.025")   # ↑ dirichlet eps (smoother)
+_os_set("PF_REP_CAP", "2")       # ↓ repeat cap
+# Watch/Edge sensitivity
+_os_set("EDGE_ENTER", "0.015")
+_os_set("WATCH_INSTAB_THRESH", "0.12")
+
+#  Weight formula constants (can still be overridden by ENV) -----------------
+_os_set("W_BASE", "0.8")
+_os_set("W_MIN", "0.5")
+_os_set("W_MAX", "2.0")
+_os_set("W_ALPHA", "0.7")
+_os_set("W_SIG_K", "1.5")
+_os_set("W_SIG_MID", "2.0")
+_os_set("W_GAMMA", "0.6")
+_os_set("W_GAP_CAP", "0.08")
 
 # ---------- Flask ----------
 if _has_flask:
@@ -164,11 +193,11 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
                 sess["pf"] = OutcomePF(
                     decks=int(os.getenv("DECKS","6")),
                     seed=int(os.getenv("SEED","42")),
-                    n_particles=int(os.getenv("PF_N","60")),
-                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","30"))),
-                    resample_thr=float(os.getenv("PF_RESAMPLE","0.7")),
+                    n_particles=int(os.getenv("PF_N","120")),
+                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),
+                    resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),
                     backend=os.getenv("PF_BACKEND","mc"),
-                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.003")),
+                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),
                 )
                 log.info("Per-session PF init ok")
             except Exception as e:
@@ -210,10 +239,16 @@ def now_sess(uid: str) -> Dict[str, Any]:
             "push": 0,
             "sum_edge": 0.0,
             "payout": 0,
+            "accuracy_by_margin": {
+                "0-1": {"total": 0, "correct": 0},
+                "2-3": {"total": 0, "correct": 0},
+                "4+": {"total": 0, "correct": 0},
+            }
         },
         # history for accuracy excluding tie
         "hist_pred": [],  # '莊' / '閒' / '觀望'
         "hist_real": [],  # '莊' / '閒' / '和'
+        "recent_gaps": [],  # 新增：跟踪最近的概率差距
     }
     SESS[uid] = s
     return s
@@ -296,15 +331,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
         return (int(digits[-2]), int(digits[-1]))
     return None
 
-# ---------- Render-safe defaults ----------
-os.environ.setdefault("PF_BACKEND", "mc")
-os.environ.setdefault("DECKS", "6")
-os.environ.setdefault("PF_N", "60")
-os.environ.setdefault("PF_UPD_SIMS", "30")
-os.environ.setdefault("PF_PRED_SIMS", "20")
-os.environ.setdefault("PF_RESAMPLE", "0.7")
-os.environ.setdefault("PF_DIR_EPS", "0.003")
-
 # ---------- PF health diag ----------
 PF_DIAG = int(os.getenv("PF_DIAG", "1"))
 def _check_pf_health() -> Dict[str, Any]:
@@ -344,23 +370,23 @@ TS_EN = env_flag("TS_EN", 0)
 TS_ALPHA = float(os.getenv("TS_ALPHA","2"))
 TS_BETA  = float(os.getenv("TS_BETA","2"))
 
-EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.005"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER","0.015"))
 TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.18"))
 WATCH_EN = env_flag("WATCH_EN", 1)
-WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.08"))
+WATCH_INSTAB_THRESH = float(os.getenv("WATCH_INSTAB_THRESH","0.12"))
 
 UNCERT_PENALTY_EN = env_flag("UNCERT_PENALTY_EN", 1)
 UNCERT_MARGIN_MAX = int(os.getenv("UNCERT_MARGIN_MAX","2"))
 UNCERT_RATIO = float(os.getenv("UNCERT_RATIO","0.25"))
 
-W_BASE = float(os.getenv("W_BASE","1.0"))
+W_BASE = float(os.getenv("W_BASE","0.8"))
 W_MIN  = float(os.getenv("W_MIN","0.5"))
-W_MAX  = float(os.getenv("W_MAX","3.0"))
-W_ALPHA= float(os.getenv("W_ALPHA","0.95"))
-W_SIG_K= float(os.getenv("W_SIG_K","1.10"))
-W_SIG_MID=float(os.getenv("W_SIG_MID","1.8"))
-W_GAMMA= float(os.getenv("W_GAMMA","1.0"))
-W_GAP_CAP=float(os.getenv("W_GAP_CAP","0.06"))
+W_MAX  = float(os.getenv("W_MAX","2.0"))
+W_ALPHA= float(os.getenv("W_ALPHA","0.7"))
+W_SIG_K= float(os.getenv("W_SIG_K","1.5"))
+W_SIG_MID=float(os.getenv("W_SIG_MID","2.0"))
+W_GAMMA= float(os.getenv("W_GAMMA","0.6"))
+W_GAP_CAP=float(os.getenv("W_GAP_CAP","0.08"))
 
 DEPTH_W_EN  = env_flag("DEPTH_W_EN", 1)
 DEPTH_W_MAX = float(os.getenv("DEPTH_W_MAX","1.5"))
@@ -440,6 +466,21 @@ def thompson_scale_pct(pct: float) -> float:
     s = np.random.beta(a, b)
     return clamp(pct * s, MIN_BET_PCT, MAX_BET_PCT)
 
+# ---------- Confidence filter ----------
+def should_bet(prob: np.ndarray, last_gap: float, cur_gap: float, hand_idx: int) -> bool:
+    """Return *True* if all confidence conditions are satisfied."""
+    pB, pP, pT = prob
+    max_prob = max(pB, pP)
+    gap_change = abs(cur_gap - last_gap) if last_gap > 0 else 0.0
+    conditions = [
+        max_prob >= 0.52,              # 52 %+ win‑side
+        pT <= 0.16,                    # Tie risk ≤16 %
+        gap_change <= 0.15,            # Stability
+        cur_gap >= 0.018,              # At least 1.8 % edge
+        (hand_idx > 5) or (max_prob >= 0.54),
+    ]
+    return all(conditions)
+
 # history helpers
 HIST_MAX = int(os.getenv("HIST_MAX", "200"))
 def _append_hist(sess: Dict[str,Any], pred: str, real: str):
@@ -493,7 +534,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if DEPTH_W_EN and sess["hand_idx"]>0:
         depth_boost = 1.0 + min(sess["hand_idx"]/70.0, (DEPTH_W_MAX-1.0))
         w *= depth_boost
-    REP_CAP = int(os.getenv("PF_REP_CAP", "3"))
+    REP_CAP = int(os.getenv("PF_REP_CAP", "2"))
     rep = max(1, min(REP_CAP, int(round(w))))
 
     if p_pts == b_pts:
@@ -533,6 +574,18 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         if abs(prob_gap - last_gap) > WATCH_INSTAB_THRESH:
             watch = True; reasons.append("勝率波動大")
 
+    # --- Trend instability tracking --------------------------------------
+    recent = sess.setdefault("recent_gaps", [])
+    recent.append(prob_gap)
+    if len(recent) > 10:
+        recent[:] = recent[-10:]
+    if len(recent) >= 5 and np.std(recent[-5:]) > 0.12:
+        watch = True; reasons.append("趨勢不穩定")
+
+    # --- Additional confidence filter ------------------------------------
+    if not watch and not should_bet(p_final, last_gap, prob_gap, sess["hand_idx"]):
+        watch = True; reasons.append("信心條件未滿足")
+
     # 5) confidence (display) and bet sizing (money)
     bankroll = int(sess.get("bankroll", 0))
     c0 = analysis_confidence(p_final, last_gap, prob_gap)
@@ -571,6 +624,18 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             else:
                 st["payout"] -= int(bet_amt)
 
+    # ---------- Accuracy‑by‑margin diagnostics ---------------------------
+    acc_by_m = st.setdefault("accuracy_by_margin", {
+        "0-1": {"total": 0, "correct": 0},
+        "2-3": {"total": 0, "correct": 0},
+        "4+":  {"total": 0, "correct": 0},
+    })
+    if p_pts != b_pts and not watch:
+        key = "0-1" if margin <= 1 else ("2-3" if margin <= 3 else "4+")
+        acc_by_m[key]["total"] += 1
+        if choice_text == ("閒" if p_pts > b_pts else "莊"):
+            acc_by_m[key]["correct"] += 1
+
     pred_label = "觀望" if watch else choice
     _append_hist(sess, pred_label, real_label)
 
@@ -597,6 +662,15 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         f"建議下注金額：{bet_amt:,}",
         f"配注策略：{strat} (優勢: {edge*100:.1f}%)",
     ]
+
+    # Add margin‑specific accuracy to outgoing message
+    acc_lines = []
+    for k, d in acc_by_m.items():
+        if d["total"]:
+            acc = 100.0 * d["correct"] / d["total"]
+            acc_lines.append(f"{k}點: {acc:.1f}%")
+    if acc_lines:
+        msg.extend(["", "📊 點差準確率: " + " | ".join(acc_lines)])
 
     # stats summary
     bets = st["bets"]
@@ -778,9 +852,14 @@ if _has_line and LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             sess["trial_start"] = keep_trial
             sess["phase"] = "choose_game"
             sess["pf"] = None  # reset PF
-            sess["stats"] = {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0}
+            sess["stats"] = {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0, "accuracy_by_margin": {
+                "0-1": {"total": 0, "correct": 0},
+                "2-3": {"total": 0, "correct": 0},
+                "4+": {"total": 0, "correct": 0},
+            }}
             sess["hist_pred"] = []
             sess["hist_real"] = []
+            sess["recent_gaps"] = []  # 清空近期概率差距
             sess["last_prob_gap"] = 0.0  # 清概率記憶
             sess["hand_idx"] = 0  # 清手數計數
             save_sess(uid, sess)
