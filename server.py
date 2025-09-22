@@ -7,6 +7,7 @@ server.py — Right-side base + Left-side prediction tweaks + 30min Trial Gate
 - 新增 30 分鐘試用與「開通 <密碼>」解除限制（讀 TRIAL_MINUTES / ADMIN_ACTIVATION_SECRET）
 - 試用資料向後相容（舊 Redis JSON 不再報錯），LINE webhook 增加錯誤防護
 - PF 真實載入（bgs.pfilter），失敗才退回 Dummy；PF_WARN 控制是否顯示 Dummy 警告
+- ✅ 新增 PFAgent 介面轉接器：修正 'OutcomePF' 無 update_point_history 的相容問題
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -30,7 +31,7 @@ except Exception:
     redis = None
 
 # ---------- Version & logging ----------
-VERSION = "bgs-right+left-pred-trial-2025-09-22-fixpf-trialcompat"
+VERSION = "bgs-right+left-pred-trial-2025-09-22-fixpf-trialcompat-adapter"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL","INFO"),
@@ -115,41 +116,97 @@ PF_HEALTH = PFHealth()
 try:
     # 若你的真實 PF 模組名稱不同，請把 bgs.pfilter 改成正確路徑
     from bgs.pfilter import OutcomePF as RealPF
-    def new_pf():
-        PF_HEALTH.is_dummy = False
-        return RealPF(
-            decks=int(os.getenv("DECKS","6")),
-            seed=int(os.getenv("SEED","42")),
-            n_particles=int(os.getenv("PF_N","120")),
-            sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),
-            resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),
-            backend=os.getenv("PF_BACKEND","mc"),
-            dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),
-        )
+    _REAL_PF_OK = True
     log.info("Real PF import OK")
 except Exception as _e:
-    log.warning("Real PF not available, using dummy: %s", _e)
-    def new_pf():
-        # --- Dummy PF（僅備援）---
-        class OutcomePF:
-            def __init__(self, **_):
-                import numpy as _np, random as _rd
-                _rd.seed(int(os.getenv("SEED","42"))); _np.random.seed(int(os.getenv("SEED","42")))
-                self.hist=[]
-            def update_point_history(self, p,b): self.hist.append((p,b))
-            def update_outcome(self, _): pass
-            def predict(self):
-                import numpy as _np
-                if len(self.hist)>=4:
-                    xs=[1,1,1]
-                    for p,b in self.hist[-6:]:
-                        if p==b: xs[2]+=1
-                        elif p>b: xs[1]+=1
-                        else: xs[0]+=1
-                    v=_np.array(xs,dtype=float); return v/_np.sum(v)
-                return _np.array([0.45,0.45,0.10])
-        PF_HEALTH.is_dummy = True
-        return OutcomePF()
+    _REAL_PF_OK = False
+    log.warning("Real PF not available, will use dummy: %s", _e)
+
+# ---------- PF Adapter ----------
+class PFAgent:
+    """
+    介面轉接器：
+    - 對外永遠提供：update_point_history(p_pts, b_pts)、predict()
+    - 內部自動嘗試呼叫底層 PF 的不同方法名稱；失敗時不報錯、保留本地 hist 作備援。
+    """
+    def __init__(self):
+        self.hist = []  # 本地備援
+        self.impl = None
+        try:
+            if _REAL_PF_OK:
+                self.impl = RealPF(
+                    decks=int(os.getenv("DECKS","6")),
+                    seed=int(os.getenv("SEED","42")),
+                    n_particles=int(os.getenv("PF_N","120")),
+                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),
+                    resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),
+                    backend=os.getenv("PF_BACKEND","mc"),
+                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),
+                )
+                PF_HEALTH.is_dummy = False
+            else:
+                PF_HEALTH.is_dummy = True
+        except Exception as e:
+            log.warning("Init RealPF failed, fallback to dummy: %s", e)
+            self.impl = None
+            PF_HEALTH.is_dummy = True
+
+    def _try_impl_update(self, p, b) -> bool:
+        if not self.impl: return False
+        # 嘗試一系列常見方法名稱
+        cand = [
+            "update_point_history", "observe_points", "update_points",
+            "update", "step", "append", "push"
+        ]
+        for name in cand:
+            if hasattr(self.impl, name):
+                try:
+                    getattr(self.impl, name)(p, b)
+                    return True
+                except Exception as e:
+                    log.debug("PF impl.%s fail: %s", name, e)
+        # 也許底層只吃 outcome（B/P/T）
+        if hasattr(self.impl, "update_outcome"):
+            try:
+                if p == b: outcome = "T"
+                elif p > b: outcome = "P"  # 閒
+                else: outcome = "B"       # 莊
+                getattr(self.impl, "update_outcome")(outcome)
+                return True
+            except Exception as e:
+                log.debug("PF impl.update_outcome fail: %s", e)
+        return False
+
+    def update_point_history(self, p, b):
+        # 先記在本地 hist（給備援 predict 用）
+        try:
+            self.hist.append((int(p), int(b)))
+        except:  # 保險
+            pass
+        # 盡力餵給底層 PF
+        if not self._try_impl_update(p, b):
+            # 底層沒有對應方法，不視為致命錯；交由備援預測
+            pass
+
+    def predict(self) -> np.ndarray:
+        # 優先用底層 PF 的 predict
+        if self.impl and hasattr(self.impl, "predict"):
+            try:
+                v = self.impl.predict()
+                v = np.array(v, dtype=float)
+                if v.size == 3 and np.all(v >= 0):
+                    return softmax(v)
+            except Exception as e:
+                log.debug("PF impl.predict fail: %s", e)
+        # 備援：用本地 hist 做簡易統計
+        if len(self.hist) >= 4:
+            xs = [1,1,1]
+            for p,b in self.hist[-6:]:
+                if p==b: xs[2]+=1
+                elif p>b: xs[1]+=1
+                else: xs[0]+=1
+            return softmax(np.array(xs, dtype=float))
+        return np.array([0.45,0.45,0.10], dtype=float)
 
 # ---------- Redis / Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
@@ -256,12 +313,12 @@ def is_vip(sess: Dict[str,Any]) -> bool:
 def _get_pf_from_sess(sess: Dict[str,Any]):
     if sess.get("pf") is None:
         try:
-            sess["pf"] = new_pf()
+            sess["pf"] = PFAgent()
             log.info("Per-session PF init ok (dummy=%s)", PF_HEALTH.is_dummy)
         except Exception as e:
-            log.error("PF init fail: %s; fallback dummy", e)
-            sess["pf"] = new_pf()
-            PF_HEALTH.is_dummy = True
+            log.error("PF init fail: %s; fallback agent", e)
+            sess["pf"] = PFAgent()
+            # PFAgent 內部會自行決定是否 dummy
     return sess["pf"]
 
 # ---------- 下注/配注（右側保留） ----------
@@ -356,7 +413,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if not validate_input_data(p_pts, b_pts):
         return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
 
-    pf = _get_pf_from_sess(sess)
+    pf: PFAgent = _get_pf_from_sess(sess)  # 型別註記方便閱讀
     pf.update_point_history(p_pts, b_pts)
 
     # 1) 初步預測
@@ -387,7 +444,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     watch = not should_bet(tuple(p_final.tolist()), last_gap, prob_gap, hand_idx)
 
     # 5) 資金與配注
-    bankroll = int(sess.get("bankroll", 0))
+    bankroll = int(re.sub(r"[^0-9]","", str(sess.get("bankroll", 0))) or 0)  # 安全取整數
     _ = analysis_confidence(p_final, last_gap, prob_gap)  # 保留內部用
     pct_base = base_bet_pct(edge, maxp)
     bet_pct  = thompson_scale_pct(pct_base)
@@ -621,7 +678,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
             pts = parse_last_hand_points(text)
             if pts is None:
                 # 還沒設定本金 → 先要求設定
-                if not int(sess.get("bankroll",0)):
+                if not int(re.sub(r"[^0-9]","", str(sess.get("bankroll", 0))) or 0):
                     sess["phase"] = "await_bankroll"; save_sess(uid, sess)
                     msg = "請先輸入本金（例：5000），再回報點數。"
                     if not is_vip(sess):
@@ -636,7 +693,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
                 reply_text(event.reply_token, msg, user_id=uid); return
 
             # 必要的本金保護
-            if not int(sess.get("bankroll",0)):
+            if not int(re.sub(r"[^0-9]","", str(sess.get("bankroll", 0))) or 0):
                 sess["phase"] = "await_bankroll"; save_sess(uid, sess)
                 reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
 
