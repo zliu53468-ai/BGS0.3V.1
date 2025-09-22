@@ -1,141 +1,388 @@
 # -*- coding: utf-8 -*-
 """
-pfilter.py — 完整粒子濾波/MC學習 百家樂 OutcomePF（可直接覆蓋，支援 update_outcome + MC動態預測）
+server.py — 完整百家樂AI + LINE webhook + 30分鐘試用&永久解封（直接覆蓋可用）
 """
 
-import os
+import os, sys, re, time, json, math, random, logging
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
-from dataclasses import dataclass
-from typing import Literal, Optional
 
+# ---------- Flask主體 ----------
 try:
-    from .deplete import init_counts
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
+    _has_flask = True
 except Exception:
-    from deplete import init_counts
+    _has_flask = False
+    Flask = None
+    def jsonify(*_, **__): raise RuntimeError("Flask not available")
+    def CORS(*_, **__): pass
 
-PF_N            = int(os.getenv("PF_N", "80"))
-PF_UPD_SIMS     = int(os.getenv("PF_UPD_SIMS", "36"))
-PF_RESAMPLE     = float(os.getenv("PF_RESAMPLE", "0.73"))
-PF_DIR_EPS      = float(os.getenv("PF_DIR_EPS", "0.012"))
-PF_BACKEND      = os.getenv("PF_BACKEND", "mc").strip().lower()
-PF_STAB_FACTOR  = float(os.getenv("PF_STAB_FACTOR", "0.8"))
-PF_DECKS        = int(os.getenv("DECKS", "6"))
-PF_SEED         = int(os.getenv("SEED", "42"))
+if _has_flask:
+    app = Flask(__name__)
+    CORS(app)
 
-@dataclass
-class OutcomePF:
-    decks: int = PF_DECKS
-    seed: int = PF_SEED
-    n_particles: int = PF_N
-    sims_lik: int = PF_UPD_SIMS
-    resample_thr: float = PF_RESAMPLE
-    backend: Literal["exact", "mc"] = PF_BACKEND
-    dirichlet_eps: float = PF_DIR_EPS
-    stability_factor: float = PF_STAB_FACTOR
+    @app.get("/")
+    def root():
+        return "✅ BGS PF Server OK", 200
 
-    prev_p_pts: Optional[int] = None
-    prev_b_pts: Optional[int] = None
+    @app.get("/health")
+    def health():
+        return jsonify(ok=True, ts=time.time(), msg="API normal"), 200
+else:
+    class _DummyApp:
+        def get(self, *a, **k):
+            def deco(f): return f
+            return deco
+        def post(self, *a, **k):
+            def deco(f): return f
+            return deco
+        def run(self, *a, **k):
+            print("Flask not installed; dummy app.")
+    app = _DummyApp()
 
-    def __post_init__(self):
-        self.rng = np.random.default_rng(self.seed)
-        base = init_counts(self.decks).astype(np.int64)
-        self.p_counts = np.stack([base.copy() for _ in range(self.n_particles)], axis=0)
-        self.weights = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
-        self.prediction_history = []
-        self.point_diff_history = []
+# ---------- Redis / Fallback ----------
+try:
+    import redis
+except Exception:
+    redis = None
 
-    def update_point_history(self, p_pts, b_pts):
-        self.prev_p_pts = p_pts
-        self.prev_b_pts = b_pts
-        self.point_diff_history.append(p_pts - b_pts)
-        if len(self.point_diff_history) > 200:
-            self.point_diff_history = self.point_diff_history[-200:]
+REDIS_URL = os.getenv("REDIS_URL", "")
+rcli = None
+if redis and REDIS_URL:
+    try:
+        rcli = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+        rcli.ping()
+    except Exception:
+        rcli = None
 
-    def update_outcome(self, outcome):
-        # outcome: 0=莊 1=閒 2=和
-        # 依據 outcome 對每個粒子進行 "重要性權重" 更新與重採樣
-        new_weights = np.zeros_like(self.weights)
-        for i in range(self.n_particles):
-            # 對每個粒子模擬一次這副牌 outcome 機率
-            p_win, b_win, tie = self._simulate_next_outcome(self.p_counts[i])
-            if outcome == 0:   # 莊
-                prob = b_win
-            elif outcome == 1: # 閒
-                prob = p_win
-            else:              # 和
-                prob = tie
-            new_weights[i] = self.weights[i] * (prob + self.dirichlet_eps)
-        new_weights_sum = np.sum(new_weights)
-        if new_weights_sum > 0:
-            self.weights = new_weights / new_weights_sum
+SESS: Dict[str, Dict[str, Any]] = {}
+SESSION_EXPIRE = 3600
+
+def _rget(k: str) -> Optional[str]:
+    try:
+        if rcli: return rcli.get(k)
+    except Exception: pass
+    return None
+
+def _rset(k: str, v: str, ex: Optional[int]=None):
+    try:
+        if rcli: rcli.set(k, v, ex=ex)
+    except Exception: pass
+
+# ---------- 參數強化 ----------
+os.environ.setdefault("PF_N", "80")
+os.environ.setdefault("PF_RESAMPLE", "0.73")
+os.environ.setdefault("PF_DIR_EPS", "0.012")
+os.environ.setdefault("EDGE_ENTER", "0.007")
+os.environ.setdefault("WATCH_INSTAB_THRESH", "0.16")
+os.environ.setdefault("TIE_PROB_MAX", "0.18")
+os.environ.setdefault("PF_BACKEND", "mc")
+os.environ.setdefault("DECKS", "6")
+os.environ.setdefault("PF_UPD_SIMS", "36")
+os.environ.setdefault("PF_PRED_SIMS", "30")
+os.environ.setdefault("MIN_BET_PCT", "0.08")
+os.environ.setdefault("MAX_BET_PCT", "0.26")
+os.environ.setdefault("PROB_SMA_ALPHA", "0.39")
+os.environ.setdefault("PROB_TEMP", "0.95")
+os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
+os.environ.setdefault("UNCERT_RATIO", "0.22")
+
+# ---------- PF import ----------
+OutcomePF = None
+try:
+    from bgs.pfilter import OutcomePF
+except Exception:
+    try:
+        cur = os.path.dirname(os.path.abspath(__file__))
+        if cur not in sys.path: sys.path.insert(0, cur)
+        from pfilter import OutcomePF
+    except Exception:
+        OutcomePF = None
+
+class _DummyPF:
+    def update_outcome(self, outcome): pass
+    def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
+    def update_point_history(self, p_pts, b_pts): pass
+
+def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
+    if OutcomePF:
+        if sess.get("pf") is None:
+            try:
+                sess["pf"] = OutcomePF(
+                    decks=int(os.getenv("DECKS","6")),
+                    seed=int(os.getenv("SEED","42")) + int(time.time() % 1000),
+                    n_particles=int(os.getenv("PF_N","80")),
+                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","36"))),
+                    resample_thr=float(os.getenv("PF_RESAMPLE","0.73")),
+                    backend=os.getenv("PF_BACKEND","mc"),
+                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.012")),
+                )
+            except Exception:
+                sess["pf"] = _DummyPF()
+        return sess["pf"]
+    return _DummyPF()
+
+def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
+    pred = sess.get("hist_real", [])
+    if len(pred) < dragon_len: return None
+    lastn = pred[-dragon_len:]
+    if all(x=="莊" for x in lastn): return "莊"
+    if all(x=="閒" for x in lastn): return "閒"
+    return None
+
+def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
+    if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
+        return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
+
+    pf = _get_pf_from_sess(sess)
+    pf.update_point_history(p_pts, b_pts)
+    sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
+    margin = abs(p_pts - b_pts)
+    last_gap = float(sess.get("last_prob_gap", 0.0))
+    w = 1.0 + 0.95 * (abs(p_pts - b_pts) / 9.0)
+    REP_CAP = 3
+    rep = max(1, min(REP_CAP, int(round(w))))
+    if p_pts == b_pts:
+        try: pf.update_outcome(2)
+        except Exception: pass
+    else:
+        outcome = 1 if p_pts > b_pts else 0
+        for _ in range(rep):
+            try: pf.update_outcome(outcome)
+            except Exception: pass
+
+    last_real = sess.get("hist_real", [])
+    cooling = False
+    if len(last_real)>=1 and last_real[-1]=="和":
+        cooling = True
+
+    sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
+    p_raw = pf.predict(sims_per_particle=sims_pred)
+    p_adj = p_raw / np.sum(p_raw)
+    p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","0.95")))
+    p_temp = p_temp / np.sum(p_temp)
+    if "prob_sma" not in sess: sess["prob_sma"] = None
+    alpha = float(os.getenv("PROB_SMA_ALPHA","0.39"))
+    def ema(prev, cur, alpha): return cur if prev is None else alpha*cur + (1-alpha)*prev
+    sess["prob_sma"] = ema(sess["prob_sma"], p_temp, alpha)
+    p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
+
+    dragon = _is_long_dragon(sess, dragon_len=7)
+    if dragon:
+        choice_text = dragon
+        edge = abs(float(p_final[0]) - float(p_final[1]))
+    else:
+        pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
+        edge = abs(pB - pP)
+        if pB >= pP: choice_text = "莊"
+        else:        choice_text = "閒"
+
+    if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
+        if random.random() < 0.5: choice_text = "莊"
+        else:                     choice_text = "閒"
+        edge = 0.02
+
+    watch = False
+    reasons = []
+    if cooling:
+        watch = True; reasons.append("和局冷卻")
+    elif edge < float(os.getenv("EDGE_ENTER","0.007")):
+        watch = True; reasons.append("機率差過小")
+    elif float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
+        watch = True; reasons.append("和局風險高")
+    elif abs(edge - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.16")):
+        watch = True; reasons.append("勝率波動大")
+
+    bankroll = int(sess.get("bankroll", 0))
+    bet_pct = 0.0
+    if not watch:
+        if edge < 0.015:
+            bet_pct = 0.08
+        elif edge < 0.03:
+            bet_pct = 0.14
         else:
-            self.weights[:] = 1.0 / self.n_particles
+            bet_pct = 0.26
+    bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
-        # 檢查重採樣
-        neff = 1.0 / np.sum(self.weights ** 2)
-        if neff < self.resample_thr * self.n_particles:
-            idxs = self.rng.choice(self.n_particles, self.n_particles, replace=True, p=self.weights)
-            self.p_counts = self.p_counts[idxs]
-            self.weights = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
+    st = sess.setdefault("stats", {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0})
+    if p_pts == b_pts:
+        st["push"] += 1
+        real_label = "和"
+    else:
+        real_label = "閒" if p_pts > b_pts else "莊"
+        if not watch:
+            st["bets"] += 1
+            st["sum_edge"] += float(edge)
+            if choice_text == real_label:
+                if real_label == "莊":
+                    st["payout"] += int(round(bet_amt * 0.95))
+                else:
+                    st["payout"] += int(bet_amt)
+                st["wins"] += 1
+            else:
+                st["payout"] -= int(bet_amt)
+    pred_label = "觀望" if watch else choice_text
+    if "hist_pred" not in sess: sess["hist_pred"] = []
+    if "hist_real" not in sess: sess["hist_real"] = []
+    sess["hist_pred"].append(pred_label)
+    sess["hist_real"].append(real_label)
+    if len(sess["hist_pred"])>200: sess["hist_pred"]=sess["hist_pred"][-200:]
+    if len(sess["hist_real"])>200: sess["hist_real"]=sess["hist_real"][-200:]
+    sess["last_pts_text"] = f"上局結果: {'和 '+str(p_pts) if p_pts==b_pts else '閒 '+str(p_pts)+' 莊 '+str(b_pts)}"
+    sess["last_prob_gap"] = edge
 
-    def predict(self, sims_per_particle=30):
-        # 對每個粒子進行 MC 抽樣並權重平均
-        pred = np.zeros(3, dtype=np.float64)
-        for i in range(self.n_particles):
-            p = np.zeros(3)
-            for _ in range(sims_per_particle):
-                # 每次都用粒子的當前牌堆來抽一次
-                result = self._simulate_single_game(self.p_counts[i])
-                p[result] += 1
-            if np.sum(p) > 0:
-                p = p / np.sum(p)
-            pred += self.weights[i] * p
-        # 輸出莊、閒、和 機率
-        total = np.sum(pred)
-        if total > 0:
-            return pred / total
-        return np.array([0.48, 0.47, 0.05], dtype=np.float32)
+    def _acc_ex_tie(sess, last_n=None):
+        pred, real = sess.get("hist_pred", []), sess.get("hist_real", [])
+        if last_n: pred, real = pred[-last_n:], real[-last_n:]
+        pairs = [(p,r) for p,r in zip(pred,real) if r in ("莊","閒") and p in ("莊","閒")]
+        if not pairs: return (0,0,0.0)
+        hit = sum(1 for p,r in pairs if p==r)
+        tot = len(pairs)
+        return (hit, tot, 100.0*hit/tot)
+    hit, tot, acc = _acc_ex_tie(sess, 30)
+    acc_txt = f"📊 近30手命中率：{acc:.1f}%（{hit}/{tot}）" if tot > 0 else "📊 近30手命中率：尚無資料"
 
-    def _simulate_single_game(self, shoe):
-        # 百家樂規則隨機發牌，回傳：0=莊 1=閒 2=和
-        s = shoe.copy()
-        rng = self.rng
-        def draw():
-            av = np.where(s > 0)[0]
-            if len(av) == 0:
-                return 0
-            idx = rng.choice(av)
-            s[idx] -= 1
-            return idx
-        p1, p2 = draw(), draw()
-        b1, b2 = draw(), draw()
-        p_sum = (p1 + p2) % 10
-        b_sum = (b1 + b2) % 10
-        # 玩家補牌
-        p3 = None
-        if p_sum <= 5:
-            p3 = draw()
-            p_sum = (p_sum + p3) % 10
-        # 莊家補牌
-        if b_sum <= 5:
-            b3 = draw()
-            b_sum = (b_sum + b3) % 10
-        if p_sum > b_sum:
-            return 1
-        elif b_sum > p_sum:
-            return 0
+    strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
+        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.13 else
+        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.22 else
+        f"🟢 高信心配注 {bet_pct*100:.1f}%"
+    )
+
+    msg = [
+        sess["last_pts_text"],
+        "開始分析下局....",
+        "",
+        "【預測結果】",
+        f"閒：{p_final[1]*100:.2f}%",
+        f"莊：{p_final[0]*100:.2f}%",
+        f"和：{p_final[2]*100:.2f}%",
+        f"本次預測結果：{pred_label} (優勢: {edge*100:.2f}%)",
+        f"建議下注金額：{bet_amt:,}",
+        f"配注策略：{strat}",
+        acc_txt,
+        "—",
+        "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
+    ]
+
+    return "\n".join(msg)
+
+# ================== LINE webhook流程 ===================
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+UNLOCK_PWD = os.getenv("UNLOCK_PWD", "aaa8881688")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+TRIAL_LIMIT_SEC = 30 * 60  # 30分鐘
+
+@app.route("/line-webhook", methods=['POST'])
+def callback():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("LINE webhook error:", e)
+    return "ok", 200
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_id = event.source.user_id
+    text = event.message.text.strip()
+    sess = SESS.setdefault(user_id, {"bankroll": 5000})
+
+    # ==== 開通永久解鎖密碼 ====
+    if text.lower().startswith("開通") and len(text) > 2:
+        pwd = text[2:].strip()
+        if pwd == UNLOCK_PWD:
+            sess["trial_start"] = None
+            sess["unlocked"] = True
+            reply = "✅ 已開通成功！"
         else:
-            return 2
+            reply = "❌ 開通密碼錯誤，請聯繫管理員"
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        except Exception as e:
+            print("LINE reply_message error:", e)
+        return
 
-    def _simulate_next_outcome(self, shoe):
-        # 對單一粒子模擬一堆遊戲，回傳：莊/閒/和 機率
-        p = np.zeros(3)
-        N = max(10, self.sims_lik)
-        for _ in range(N):
-            res = self._simulate_single_game(shoe)
-            p[res] += 1
-        s = np.sum(p)
-        if s > 0:
-            return p[1]/s, p[0]/s, p[2]/s  # (p_win, b_win, tie)
-        return 0.47, 0.48, 0.05
+    # ==== 30分鐘試用鎖 ====
+    if not sess.get("unlocked", False):
+        now = int(time.time())
+        trial_start = sess.get("trial_start")
+        if not trial_start:
+            trial_start = now
+            sess["trial_start"] = trial_start
+        left = TRIAL_LIMIT_SEC - (now - trial_start)
+        if left <= 0:
+            reply = (
+                "⛔ 試用期已到\n"
+                "📬 請聯繫管理員開通登入帳號\n"
+                "👉 加入官方 LINE：https://lin.ee/Dlm6Y3u"
+            )
+            try:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            except Exception as e:
+                print("LINE reply_message error:", e)
+            return
+        else:
+            min_left = left // 60
+            sec_left = left % 60
+            sess["left"] = left
+    else:
+        min_left = sec_left = None
 
+    # ==== 主流程（點數預測） ====
+    try:
+        m = re.match(r"^(\d{2})$", text)
+        if m:
+            p_pts, b_pts = int(text[0]), int(text[1])
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif re.search("閒(\d+).*莊(\d+)", text):
+            mm = re.search("閒(\d+).*莊(\d+)", text)
+            p_pts, b_pts = int(mm.group(1)), int(mm.group(2))
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif re.search("莊(\d+).*閒(\d+)", text):
+            mm = re.search("莊(\d+).*閒(\d+)", text)
+            b_pts, p_pts = int(mm.group(1)), int(mm.group(2))
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif "和" in text:
+            reply = "和局目前不需輸入點數，請直接輸入如：65"
+        else:
+            reply = (
+                "請輸入正確格式，例如 65 代表閒6莊5，或 閒6莊5 / 莊5閒6"
+            )
+
+        # 加試用倒數顯示（30分鐘內）
+        if not sess.get("unlocked", False) and sess.get("left"):
+            left = sess["left"]
+            min_left = left // 60
+            sec_left = left % 60
+            reply = (
+                reply
+                + f"\n\n🟦 試用剩餘：約 {min_left:>2} 分 {sec_left:>2} 秒"
+            )
+
+    except Exception as e:
+        reply = f"❌ 輸入格式有誤: {e}"
+
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
+        )
+    except Exception as e:
+        print("LINE reply_message error:", e)
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT","8000"))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    log = logging.getLogger("bgs-server")
+    log.info("Starting BGS-PF on port %s", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
