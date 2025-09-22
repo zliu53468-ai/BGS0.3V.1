@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render PF命中率&配注強化+標準首頁/LINE webhook骨架（直接覆蓋可用）
+server.py — 完整百家樂AI + LINE webhook（Render可用直接覆蓋）
 """
 
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 
-# ---------- Flask主體 ----------
 try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
@@ -31,14 +30,9 @@ if _has_flask:
         return jsonify(ok=True, ts=time.time(), msg="API normal"), 200
 else:
     class _DummyApp:
-        def get(self,*a,**k):
-            def deco(f): return f
-            return deco
-        def post(self,*a,**k):
-            def deco(f): return f
-            return deco
-        def run(self,*a,**k):
-            print("Flask not installed; dummy app.")
+        def get(self,*a,**k): def deco(f): return f; return deco
+        def post(self,*a,**k): def deco(f): return f; return deco
+        def run(self,*a,**k): print("Flask not installed; dummy app.")
     app = _DummyApp()
 
 # ---------- Redis / Fallback ----------
@@ -70,8 +64,7 @@ def _rset(k: str, v: str, ex: Optional[int]=None):
         if rcli: rcli.set(k, v, ex=ex)
     except Exception: pass
 
-# ---------- 參數強化 (已修正) ----------
-# 使用 setdefault，如果環境變數已存在，則不會覆蓋；若不存在，則使用此處的預設值
+# ---------- 參數強化 ----------
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
@@ -124,7 +117,6 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
         return sess["pf"]
     return _DummyPF()
 
-# ---------- 長龍判斷 ----------
 def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
     pred = sess.get("hist_real", [])
     if len(pred) < dragon_len: return None
@@ -133,7 +125,6 @@ def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
     if all(x=="閒" for x in lastn): return "閒"
     return None
 
-# ---------- 主預測邏輯 ----------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
         return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
@@ -155,13 +146,11 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             try: pf.update_outcome(outcome)
             except Exception: pass
 
-    # 和局冷卻
     last_real = sess.get("hist_real", [])
     cooling = False
     if len(last_real)>=1 and last_real[-1]=="和":
         cooling = True
 
-    # 預測
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_adj = p_raw / np.sum(p_raw)
@@ -272,12 +261,60 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     return "\n".join(msg)
 
-# ========== 這裡可以插入你 LINE webhook 互動/流程完整內容 ==========
+# ================== LINE webhook流程(可用) ===================
 
-@app.post("/line-webhook")
-def webhook():
-    # 可直接根據你原有邏輯實作。以下只是測試版（直接保證200回應）
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+@app.route("/line-webhook", methods=['POST'])
+def callback():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("LINE webhook error:", e)
     return "ok", 200
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_id = event.source.user_id
+    text = event.message.text.strip()
+    sess = SESS.setdefault(user_id, {"bankroll": 10000})
+    try:
+        # 支援格式：65、閒6莊5、莊5閒6
+        m = re.match(r"^(\d{2})$", text)
+        if m:
+            p_pts, b_pts = int(text[0]), int(text[1])
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif re.search("閒(\d+).*莊(\d+)", text):
+            mm = re.search("閒(\d+).*莊(\d+)", text)
+            p_pts, b_pts = int(mm.group(1)), int(mm.group(2))
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif re.search("莊(\d+).*閒(\d+)", text):
+            mm = re.search("莊(\d+).*閒(\d+)", text)
+            b_pts, p_pts = int(mm.group(1)), int(mm.group(2))
+            reply = handle_points_and_predict(sess, p_pts, b_pts)
+        elif "和" in text:
+            reply = "和局目前不需輸入點數，請直接輸入如：65"
+        else:
+            reply = "請輸入正確格式，例如 65 代表閒6莊5，或 閒6莊5 / 莊5閒6"
+    except Exception as e:
+        reply = f"❌ 輸入格式有誤: {e}"
+
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
+        )
+    except Exception as e:
+        print("LINE reply_message error:", e)
 
 # ---------- MAIN ----------
 if __name__ == "__main__":
