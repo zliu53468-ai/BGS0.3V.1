@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-server.py — 完整百家樂AI + LINE webhook（修正版/可直接部署 Render/Heroku/VPS）
+server.py — BGS AI (完整狀態機/館別桌號/本金/試用/預測核心) 2025-09融合版
 """
-
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
 
-# ---------- Flask主體 ----------
+# =========== Flask主體 ===========
 try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
@@ -41,7 +40,7 @@ else:
             print("Flask not installed; dummy app.")
     app = _DummyApp()
 
-# ---------- Redis / Fallback ----------
+# =========== Redis / Fallback ===========
 try:
     import redis
 except Exception:
@@ -70,7 +69,7 @@ def _rset(k: str, v: str, ex: Optional[int]=None):
         if rcli: rcli.set(k, v, ex=ex)
     except Exception: pass
 
-# ---------- 參數強化 ----------
+# =========== 參數強化 (同你最新版) ===========
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
@@ -88,7 +87,7 @@ os.environ.setdefault("PROB_TEMP", "0.95")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
 os.environ.setdefault("UNCERT_RATIO", "0.22")
 
-# ---------- PF import ----------
+# =========== 預測核心不動 (與你最新一模一樣) ===========
 OutcomePF = None
 try:
     from bgs.pfilter import OutcomePF
@@ -134,7 +133,6 @@ def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
         return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
-
     pf = _get_pf_from_sess(sess)
     pf.update_point_history(p_pts, b_pts)
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
@@ -267,15 +265,50 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     return "\n".join(msg)
 
-# ================== LINE webhook流程 ===================
+# =========== LINE webhook/狀態機/多步驟引導 ===========
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+import datetime
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    raise Exception("⚠️ 必須設置 LINE_CHANNEL_ACCESS_TOKEN 以及 LINE_CHANNEL_SECRET 環境變數！")
+
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+VENDOR_LIST = ["WM", "PM", "DG", "SA", "KU", "歐博/卡利", "KG", "金利", "名人", "MT真人"]
+
+def start_flow(user_id, sess):
+    sess.clear()
+    sess["state"] = "choose_vendor"
+    sess["trial_start"] = int(time.time())
+    items = [
+        QuickReplyButton(action=MessageAction(label=f"{i+1}.{v}", text=str(i+1)))
+        for i, v in enumerate(VENDOR_LIST)
+    ]
+    msg = TextSendMessage(
+        text="👋 歡迎使用 BGS AI 預測分析！\n\n"
+             "【使用步驟】\n"
+             "1️⃣ 選擇館別（輸入 1~10）\n"
+             "2️⃣ 輸入桌號（例：DG01）\n"
+             "3️⃣ 輸入本金（例：5000）\n"
+             "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可開始預測！\n\n"
+             "【請選擇遊戲館別】\n"
+             + "\n".join([f"{i+1}. {v}" for i, v in enumerate(VENDOR_LIST)]) +
+             "\n(請直接輸入數字1-10)",
+        quick_reply=QuickReply(items=items)
+    )
+    return msg
+
+def get_trial_status(sess):
+    # 30分鐘試用
+    start = sess.get("trial_start", int(time.time()))
+    t_left = max(0, 30*60 - (int(time.time()) - int(start)))
+    m, s = divmod(t_left, 60)
+    return f"🆓 試用剩餘：{t_left//60} 分 {t_left%60} 秒" if t_left > 0 else "⏳ 試用已到期！"
 
 @app.route("/line-webhook", methods=['POST'])
 def callback():
@@ -291,37 +324,99 @@ def callback():
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-    sess = SESS.setdefault(user_id, {"bankroll": 10000})
-    try:
-        # 支援格式：65、閒6莊5、莊5閒6
-        m = re.match(r"^(\d{2})$", text)
-        if m:
-            p_pts, b_pts = int(text[0]), int(text[1])
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif re.search("閒(\d+).*莊(\d+)", text):
-            mm = re.search("閒(\d+).*莊(\d+)", text)
-            p_pts, b_pts = int(mm.group(1)), int(mm.group(2))
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif re.search("莊(\d+).*閒(\d+)", text):
-            mm = re.search("莊(\d+).*閒(\d+)", text)
-            b_pts, p_pts = int(mm.group(1)), int(mm.group(2))
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif "和" in text:
-            reply = "和局目前不需輸入點數，請直接輸入如：65"
-        else:
-            reply = "請輸入正確格式，例如 65 代表閒6莊5，或 閒6莊5 / 莊5閒6"
-    except Exception as e:
-        reply = f"❌ 輸入格式有誤: {e}"
+    sess = SESS.setdefault(user_id, {})
+    state = sess.get("state", "init")
 
+    # 首次進入/輸入start/hi都重新引導
+    if text in ["/start", "開始", "hi", "hello", "Hello", "HI"] or state == "init":
+        msg = start_flow(user_id, sess)
+        try:
+            line_bot_api.reply_message(event.reply_token, msg)
+        except Exception as e:
+            print("LINE reply_message error:", e)
+        return
+
+    # 館別選擇
+    if state == "choose_vendor":
+        if text.isdigit() and 1 <= int(text) <= 10:
+            sess["vendor"] = int(text)
+            sess["state"] = "choose_table"
+            reply = f"✅ 已選 [{VENDOR_LIST[int(text)-1]}]\n請輸入桌號（例：DG01，格式：2字母+2數字）\n{get_trial_status(sess)}"
+        else:
+            reply = "請輸入數字1~10選擇館別"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # 桌號輸入
+    if state == "choose_table":
+        if re.match(r"^[A-Za-z]{2}\d{2}$", text):
+            sess["table"] = text.upper()
+            sess["state"] = "input_bankroll"
+            reply = f"✅ 已設桌號 [{text.upper()}]\n請輸入您的本金（例：5000）\n{get_trial_status(sess)}"
+        else:
+            reply = "請輸入正確桌號（例：DG07）"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # 本金輸入
+    if state == "input_bankroll":
+        if text.isdigit() and int(text) > 0:
+            sess["bankroll"] = int(text)
+            sess["state"] = "ready"
+            reply = (f"👍 已設定本金：{int(text):,}\n"
+                     "請輸入上一局點數（例：65 / 和 / 閒6莊5），之後能連續傳手。\n"
+                     + get_trial_status(sess))
+        else:
+            reply = "請輸入正確本金（例：5000）"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # 試用期倒數提醒
+    if sess.get("trial_start") is not None:
+        t_left = 30*60 - (int(time.time()) - int(sess["trial_start"]))
+        if t_left <= 0:
+            reply = ("⏳ 試用期已到！\n請聯繫管理員購買正式會員開通。")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
+
+    # 預測階段
+    if state == "ready":
+        try:
+            m = re.match(r"^(\d{2})$", text)
+            if m:
+                p_pts, b_pts = int(text[0]), int(text[1])
+                reply = handle_points_and_predict(sess, p_pts, b_pts) + f"\n{get_trial_status(sess)}"
+            elif re.search("閒(\d+).*莊(\d+)", text):
+                mm = re.search("閒(\d+).*莊(\d+)", text)
+                p_pts, b_pts = int(mm.group(1)), int(mm.group(2))
+                reply = handle_points_and_predict(sess, p_pts, b_pts) + f"\n{get_trial_status(sess)}"
+            elif re.search("莊(\d+).*閒(\d+)", text):
+                mm = re.search("莊(\d+).*閒(\d+)", text)
+                b_pts, p_pts = int(mm.group(1)), int(mm.group(2))
+                reply = handle_points_and_predict(sess, p_pts, b_pts) + f"\n{get_trial_status(sess)}"
+            elif "和" in text:
+                reply = "和局目前不需輸入點數，請直接輸入如：65"
+            else:
+                reply = "請輸入正確格式，例如 65 代表閒6莊5，或 閒6莊5 / 莊5閒6"
+        except Exception as e:
+            reply = f"❌ 輸入格式有誤: {e}"
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=reply)
+            )
+        except Exception as e:
+            print("LINE reply_message error:", e)
+        return
+
+    # 其他狀況預設重新引導
+    msg = start_flow(user_id, sess)
     try:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply)
-        )
+        line_bot_api.reply_message(event.reply_token, msg)
     except Exception as e:
         print("LINE reply_message error:", e)
 
-# ---------- MAIN ----------
+# =========== MAIN ===========
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
