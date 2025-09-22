@@ -5,6 +5,8 @@ server.py — Right-side base + Left-side prediction tweaks + 30min Trial Gate
 - 採用左側去敏化 PF + should_bet 保守入場
 - 回覆訊息為你指定的段落樣式
 - 新增 30 分鐘試用與「開通 <密碼>」解除限制（讀 TRIAL_MINUTES / ADMIN_ACTIVATION_SECRET）
+- 試用資料向後相容（舊 Redis JSON 不再報錯），LINE webhook 增加錯誤防護
+- PF 真實載入（bgs.pfilter），失敗才退回 Dummy；PF_WARN 控制是否顯示 Dummy 警告
 """
 
 import os, sys, re, time, json, math, random, logging
@@ -28,7 +30,7 @@ except Exception:
     redis = None
 
 # ---------- Version & logging ----------
-VERSION = "bgs-right+left-pred-trial-2025-09-22"
+VERSION = "bgs-right+left-pred-trial-2025-09-22-fixpf-trialcompat"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL","INFO"),
@@ -102,32 +104,54 @@ SMOOTH_ALPHA = float(os.getenv("SMOOTH_ALPHA","0.7"))
 BANKER_COMMISSION = float(os.getenv("BANKER_COMMISSION","0.05"))
 DECIDE_MODE = os.getenv("DECIDE_MODE","prob")  # prob|ev
 
-# ---------- PF dummy（右側簡化版） ----------
+# Dummy 警告開關
+PF_WARN = os.getenv("PF_WARN", "1")  # 1=顯示；0=不顯示
+
+# ---------- PF backend (real import with fallback) ----------
 class PFHealth:
     def __init__(self): self.is_dummy=True
 PF_HEALTH = PFHealth()
 
-class OutcomePF:
-    def __init__(self, decks=6, seed=42, n_particles=60, sims_lik=30, resample_thr=0.7, backend="mc", dirichlet_eps=0.003):
-        random.seed(seed); np.random.seed(seed)
-        self.n=n_particles; self.sims_lik=sims_lik; self.resample_thr=resample_thr
-        self.backend=backend; self.dirichlet_eps=dirichlet_eps
-        self.hist=[]
-    def update_point_history(self, p_pts, b_pts):
-        self.hist.append((p_pts,b_pts))
-    def update_outcome(self, outcome):
-        pass
-    def predict(self) -> np.ndarray:
-        if len(self.hist)>=4:
-            xs = [1,1,1]
-            for p,b in self.hist[-6:]:
-                if p==b: xs[2]+=1
-                elif p>b: xs[1]+=1
-                else: xs[0]+=1
-            return softmax(np.array(xs, dtype=float))
-        return np.array([0.45,0.45,0.10])
+try:
+    # 若你的真實 PF 模組名稱不同，請把 bgs.pfilter 改成正確路徑
+    from bgs.pfilter import OutcomePF as RealPF
+    def new_pf():
+        PF_HEALTH.is_dummy = False
+        return RealPF(
+            decks=int(os.getenv("DECKS","6")),
+            seed=int(os.getenv("SEED","42")),
+            n_particles=int(os.getenv("PF_N","120")),
+            sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),
+            resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),
+            backend=os.getenv("PF_BACKEND","mc"),
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),
+        )
+    log.info("Real PF import OK")
+except Exception as _e:
+    log.warning("Real PF not available, using dummy: %s", _e)
+    def new_pf():
+        # --- Dummy PF（僅備援）---
+        class OutcomePF:
+            def __init__(self, **_):
+                import numpy as _np, random as _rd
+                _rd.seed(int(os.getenv("SEED","42"))); _np.random.seed(int(os.getenv("SEED","42")))
+                self.hist=[]
+            def update_point_history(self, p,b): self.hist.append((p,b))
+            def update_outcome(self, _): pass
+            def predict(self):
+                import numpy as _np
+                if len(self.hist)>=4:
+                    xs=[1,1,1]
+                    for p,b in self.hist[-6:]:
+                        if p==b: xs[2]+=1
+                        elif p>b: xs[1]+=1
+                        else: xs[0]+=1
+                    v=_np.array(xs,dtype=float); return v/_np.sum(v)
+                return _np.array([0.45,0.45,0.10])
+        PF_HEALTH.is_dummy = True
+        return OutcomePF()
 
-# ---------- Redis / Session（右側保留） ----------
+# ---------- Redis / Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
 _r = None
 if REDIS_URL and redis:
@@ -141,7 +165,7 @@ def load_sess(uid: str) -> Dict[str,Any]:
     sess: Dict[str,Any] = {}
     if _r:
         j = _r.get(f"sess:{uid}")
-        if j: 
+        if j:
             try: sess = json.loads(j)
             except: sess={}
     sess.setdefault("stats", {"bets":0,"wins":0,"sum_edge":0.0,"payout":0,"push":0})
@@ -153,7 +177,7 @@ def save_sess(uid: str, sess: Dict[str,Any]):
         try: _r.set(f"sess:{uid}", json.dumps(sess) )
         except Exception as e: log.warning("Redis save sess err: %s", e)
 
-# ---------- Trial helpers ----------
+# ---------- Trial helpers (backward-compatible) ----------
 _trial_local: Dict[str, Dict[str,str]] = {}  # 無 Redis 時的本地備援
 
 def _now_ts() -> int:
@@ -162,51 +186,81 @@ def _now_ts() -> int:
 def _trial_key(uid: str) -> str:
     return f"trial:{uid}"
 
+def _parse_trial_record(raw: Optional[str]) -> Tuple[Optional[int], bool]:
+    """
+    回傳 (trial_start_ts, premium_flag)
+    - raw 可能是純數字字串，或舊版 JSON：{"trial_start": 123, "trial_expired": false, "premium": true}
+    """
+    if raw is None:
+        return (None, False)
+    s = str(raw).strip()
+    if s.isdigit():
+        return (int(s), False)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            ts = obj.get("trial_start") or obj.get("start") or obj.get("ts")
+            prem = bool(obj.get("premium") or obj.get("vip") or obj.get("is_vip", False))
+            if ts is not None:
+                try:
+                    return (int(ts), prem)
+                except Exception:
+                    return (None, prem)
+        return (None, False)
+    except Exception:
+        return (None, False)
+
 def trial_start_if_needed(uid: str):
-    """若未開始，立即紀錄 trial_start（永久綁定 uid）"""
-    ts = str(_now_ts())
-    if TRIAL_MINUTES <= 0:  # 關閉試用
+    """若未開始，或舊資料為 JSON，統一寫回「純時間戳」（VIP 不改寫）"""
+    if TRIAL_MINUTES <= 0:
         return
+    ts_now = str(_now_ts())
     if _r:
-        if _r.get(_trial_key(uid)) is None:
-            _r.set(_trial_key(uid), ts)
+        cur = _r.get(_trial_key(uid))
+        if cur is None:
+            _r.set(_trial_key(uid), ts_now)
+        else:
+            ts, prem = _parse_trial_record(cur)
+            if ts is not None and not prem and not str(cur).isdigit():
+                _r.set(_trial_key(uid), str(ts))
     else:
-        _trial_local.setdefault(uid, {"trial_start": ts})
+        _trial_local.setdefault(uid, {"trial_start": ts_now})
 
 def trial_seconds_remaining(uid: str) -> int:
-    """回傳剩餘秒數（<0 代表到期）"""
+    """回傳剩餘秒數（<0 代表到期）。若 VIP，回大數字。"""
     limit_s = TRIAL_MINUTES * 60
     if TRIAL_MINUTES <= 0:
         return 9_999_999
     if _r:
-        v = _r.get(_trial_key(uid))
-        if v is None:
+        raw = _r.get(_trial_key(uid))
+        if raw is None:
             return limit_s
-        start = int(v)
+        ts, prem = _parse_trial_record(raw)
+        if prem:
+            return 9_999_999
+        start = int(ts) if ts is not None else _now_ts()
     else:
-        start = int(_trial_local.get(uid, {}).get("trial_start", _now_ts()))
+        rec = _trial_local.get(uid)
+        if not rec:
+            return limit_s
+        try:
+            start = int(rec.get("trial_start", _now_ts()))
+        except Exception:
+            start = _now_ts()
     return limit_s - (_now_ts() - start)
 
 def is_vip(sess: Dict[str,Any]) -> bool:
     return bool(sess.get("vip", False))
 
-# ---------- PF 管理（右側保留；左側去敏化預設） ----------
-def _get_pf_from_sess(sess: Dict[str,Any]) -> OutcomePF:
+# ---------- PF 管理 ----------
+def _get_pf_from_sess(sess: Dict[str,Any]):
     if sess.get("pf") is None:
         try:
-            sess["pf"] = OutcomePF(
-                decks=int(os.getenv("DECKS","6")),
-                seed=int(os.getenv("SEED","42")),
-                n_particles=int(os.getenv("PF_N","120")),                 # 60 -> 120
-                sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","40"))),       # 30 -> 40
-                resample_thr=float(os.getenv("PF_RESAMPLE","0.85")),      # 0.7 -> 0.85
-                backend=os.getenv("PF_BACKEND","mc"),
-                dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.025")),     # 0.003 -> 0.025
-            )
-            log.info("Per-session PF init ok")
+            sess["pf"] = new_pf()
+            log.info("Per-session PF init ok (dummy=%s)", PF_HEALTH.is_dummy)
         except Exception as e:
-            log.error("Per-session PF init fail: %s; use dummy", e)
-            sess["pf"] = OutcomePF()
+            log.error("PF init fail: %s; fallback dummy", e)
+            sess["pf"] = new_pf()
             PF_HEALTH.is_dummy = True
     return sess["pf"]
 
@@ -392,7 +446,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
     ]
 
-    if PF_HEALTH.is_dummy:
+    if PF_HEALTH.is_dummy and PF_WARN == "1":
         msg.insert(0, "⚠️ 模型載入為簡化版（Dummy）。請確認 bgs.pfilter 是否可用。")
 
     return "\n".join(msg)
@@ -506,96 +560,102 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_TOKEN and _has_flask:
 
     @handler.add(MessageEvent, message=TextMessage)
     def on_text(event):
-        uid = event.source.user_id if event.source else "demo"
-        text = (event.message.text or "").strip()
-        sess = load_sess(uid)
+        try:
+            uid = event.source.user_id if event.source else "demo"
+            text = (event.message.text or "").strip()
+            sess = load_sess(uid)
 
-        # ===== 開通碼處理 =====
-        if text.startswith("開通"):
-            secret = text.replace("開通", "").strip()
-            if ADMIN_ACTIVATION_SECRET and secret == ADMIN_ACTIVATION_SECRET:
-                sess["vip"] = True
-                save_sess(uid, sess)
-                reply_text(event.reply_token, "✅ 已開通完整功能，無試用時間限制。", user_id=uid)
-                return
-            else:
-                reply_text(event.reply_token, "❌ 開通碼錯誤。若忘記請洽管理員。", user_id=uid)
-                return
-
-        # ===== 試用限制（非 VIP 才檢查）=====
-        if not is_vip(sess):
-            trial_start_if_needed(uid)
-            sec_left = trial_seconds_remaining(uid)
-            if sec_left <= 0:
-                # 顯示到期卡片（跟你截圖一致風格）
-                reply_text(event.reply_token, _trial_notice_card(sec_left), user_id=uid)
-                return
-
-        # ===== 原本右側流程：本金/館別/點數 =====
-        # 簡化引導指令：如果輸入「遊戲設定」或步驟數字，送歡迎+館別清單
-        if text in ("遊戲設定","/start"):
-            tip = (
-                "👋 歡迎使用 BGS AI 預測分析！\n"
-                "使用步驟：\n"
-                "1️⃣ 選擇館別（輸入 1~10）\n"
-                "2️⃣ 輸入桌號（例：DG01）\n"
-                "3️⃣ 輸入本金（例：5000）\n"
-                "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可連續預測！\n\n"
-                "【請選擇遊戲館別】\n"
-                "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n6. 歐博/卡利\n7. KG\n8. 全利\n9. 名人\n10. MT真人\n"
-                "(請直接輸入數字 1-10)"
-            )
-            if not is_vip(sess):
-                sec_left = trial_seconds_remaining(uid)
-                tip = f"{tip}\n\n{_trial_notice_card(sec_left)}"
-            reply_text(event.reply_token, tip, user_id=uid)
-            save_sess(uid, sess)
-            return
-
-        # 本金設定流程
-        if sess.get("phase","await_pts") == "await_bankroll":
-            try:
-                bk = int(re.sub(r"[^0-9]","", text))
-                if bk>0:
-                    sess["bankroll"]=bk; sess["phase"]="await_pts"
+            # ===== 開通碼處理 =====
+            if text.startswith("開通"):
+                secret = text.replace("開通", "").strip()
+                if ADMIN_ACTIVATION_SECRET and secret == ADMIN_ACTIVATION_SECRET:
+                    sess["vip"] = True
                     save_sess(uid, sess)
-                    reply_text(event.reply_token, "✅ 已設定本金。請回報上一局點數（例：65 / 和 / 閒6莊5）", user_id=uid); return
-            except: pass
-            reply_text(event.reply_token, "請輸入數字本金（例：5000）。", user_id=uid); return
+                    reply_text(event.reply_token, "✅ 已開通完整功能，無試用時間限制。", user_id=uid)
+                    return
+                else:
+                    reply_text(event.reply_token, "❌ 開通碼錯誤。若忘記請洽管理員。", user_id=uid)
+                    return
 
-        # 點數 or 其他指令
-        pts = parse_last_hand_points(text)
-        if pts is None:
-            # 還沒設定本金 → 先要求設定
-            if not int(sess.get("bankroll",0)):
-                sess["phase"] = "await_bankroll"; save_sess(uid, sess)
-                msg = "請先輸入本金（例：5000），再回報點數。"
+            # ===== 試用限制（非 VIP 才檢查）=====
+            if not is_vip(sess):
+                trial_start_if_needed(uid)
+                sec_left = trial_seconds_remaining(uid)
+                if sec_left <= 0:
+                    # 顯示到期卡片（跟你截圖一致風格）
+                    reply_text(event.reply_token, _trial_notice_card(sec_left), user_id=uid)
+                    return
+
+            # ===== 原本右側流程：本金/館別/點數 =====
+            if text in ("遊戲設定","/start"):
+                tip = (
+                    "👋 歡迎使用 BGS AI 預測分析！\n"
+                    "使用步驟：\n"
+                    "1️⃣ 選擇館別（輸入 1~10）\n"
+                    "2️⃣ 輸入桌號（例：DG01）\n"
+                    "3️⃣ 輸入本金（例：5000）\n"
+                    "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）即可連續預測！\n\n"
+                    "【請選擇遊戲館別】\n"
+                    "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n6. 歐博/卡利\n7. KG\n8. 全利\n9. 名人\n10. MT真人\n"
+                    "(請直接輸入數字 1-10)"
+                )
+                if not is_vip(sess):
+                    sec_left = trial_seconds_remaining(uid)
+                    tip = f"{tip}\n\n{_trial_notice_card(sec_left)}"
+                reply_text(event.reply_token, tip, user_id=uid)
+                save_sess(uid, sess)
+                return
+
+            # 本金設定流程
+            if sess.get("phase","await_pts") == "await_bankroll":
+                try:
+                    bk = int(re.sub(r"[^0-9]","", text))
+                    if bk>0:
+                        sess["bankroll"]=bk; sess["phase"]="await_pts"
+                        save_sess(uid, sess)
+                        reply_text(event.reply_token, "✅ 已設定本金。請回報上一局點數（例：65 / 和 / 閒6莊5）", user_id=uid); return
+                except: pass
+                reply_text(event.reply_token, "請輸入數字本金（例：5000）。", user_id=uid); return
+
+            # 點數 or 其他指令
+            pts = parse_last_hand_points(text)
+            if pts is None:
+                # 還沒設定本金 → 先要求設定
+                if not int(sess.get("bankroll",0)):
+                    sess["phase"] = "await_bankroll"; save_sess(uid, sess)
+                    msg = "請先輸入本金（例：5000），再回報點數。"
+                    if not is_vip(sess):
+                        sec_left = trial_seconds_remaining(uid)
+                        msg = f"{msg}\n{_trial_notice_card(sec_left)}"
+                    reply_text(event.reply_token, msg, user_id=uid); return
+                # 非點數輸入 → 提示格式
+                msg = "點數格式錯誤（例：65 / 和 / 閒6莊5）。"
                 if not is_vip(sess):
                     sec_left = trial_seconds_remaining(uid)
                     msg = f"{msg}\n{_trial_notice_card(sec_left)}"
                 reply_text(event.reply_token, msg, user_id=uid); return
-            # 非點數輸入 → 提示格式
-            msg = "點數格式錯誤（例：65 / 和 / 閒6莊5）。"
+
+            # 必要的本金保護
+            if not int(sess.get("bankroll",0)):
+                sess["phase"] = "await_bankroll"; save_sess(uid, sess)
+                reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
+
+            # 產生預測訊息
+            msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
+            # 未開通時在尾端加試用剩餘提示
             if not is_vip(sess):
                 sec_left = trial_seconds_remaining(uid)
-                msg = f"{msg}\n{_trial_notice_card(sec_left)}"
-            reply_text(event.reply_token, msg, user_id=uid); return
-
-        # 必要的本金保護
-        if not int(sess.get("bankroll",0)):
-            sess["phase"] = "await_bankroll"; save_sess(uid, sess)
-            reply_text(event.reply_token, "請先輸入本金（例：5000），再回報點數。", user_id=uid); return
-
-        # 產生預測訊息
-        msg = handle_points_and_predict(sess, int(pts[0]), int(pts[1]))
-        # 在每次回覆尾端附上試用剩餘提示（未開通時）
-        if not is_vip(sess):
-            sec_left = trial_seconds_remaining(uid)
-            tail = _trial_notice_card(sec_left)
-            if sec_left > 0:
-                msg = f"{msg}\n\n{tail}"
-        sess["phase"] = "await_pts"; save_sess(uid, sess)
-        reply_text(event.reply_token, msg, user_id=uid)
+                tail = _trial_notice_card(sec_left)
+                if sec_left > 0:
+                    msg = f"{msg}\n\n{tail}"
+            sess["phase"] = "await_pts"; save_sess(uid, sess)
+            reply_text(event.reply_token, msg, user_id=uid)
+        except Exception as e:
+            log.exception("on_text error: %s", e)
+            try:
+                reply_text(event.reply_token, "😵 抱歉，服務暫時忙碌，請再試一次。")
+            except Exception:
+                pass
 
 else:
     @app.post("/line-webhook")
