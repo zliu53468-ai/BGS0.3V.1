@@ -70,13 +70,14 @@ def _rset(k: str, v: str, ex: Optional[int]=None):
         if rcli: rcli.set(k, v, ex=ex)
     except Exception: pass
 
-# ---------- 參數強化 ----------
-os.environ["PF_N"] = "80"
-os.environ["PF_RESAMPLE"] = "0.73"
-os.environ["PF_DIR_EPS"] = "0.012"
-os.environ["EDGE_ENTER"] = "0.007"
-os.environ["WATCH_INSTAB_THRESH"] = "0.16"
-os.environ["TIE_PROB_MAX"] = "0.18"
+# ---------- 參數強化 (已修正) ----------
+# 使用 setdefault，如果環境變數已存在，則不會覆蓋；若不存在，則使用此處的預設值
+os.environ.setdefault("PF_N", "80")
+os.environ.setdefault("PF_RESAMPLE", "0.73")
+os.environ.setdefault("PF_DIR_EPS", "0.012")
+os.environ.setdefault("EDGE_ENTER", "0.007")
+os.environ.setdefault("WATCH_INSTAB_THRESH", "0.16")
+os.environ.setdefault("TIE_PROB_MAX", "0.18")
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
