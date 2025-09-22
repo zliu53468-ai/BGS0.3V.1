@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-server.py — Render PF命中率強化最強版
+server.py — Render PF命中率&配注強化版
 （參數/門檻/預測/觀望都已最佳化，所有互動功能完全不動）
 """
 
@@ -72,28 +72,23 @@ def _rset(k: str, v: str, ex: Optional[int]=None):
     except Exception as e:
         log.warning("Redis SET err: %s", e)
 
-# ---------- 參數強化 ----------
-os.environ["PF_N"] = "120"           # 強化粒子數
-os.environ["PF_RESAMPLE"] = "0.73"   # 強化重採樣，追隨又防鬼打牆
-os.environ["PF_DIR_EPS"] = "0.012"   # 均化增強，防鬼打牆
-os.environ["EDGE_ENTER"] = "0.009"   # 提高進場門檻，命中率上升
-os.environ["WATCH_INSTAB_THRESH"] = "0.13"
-os.environ["TIE_PROB_MAX"] = "0.16"
-
-# 其餘 Render最佳化安全設定
+# ---------- 參數強化 (PF_N=80/自動最佳化) ----------
+os.environ["PF_N"] = "80"            # PF粒子數（主機流暢不當機）
+os.environ["PF_RESAMPLE"] = "0.73"
+os.environ["PF_DIR_EPS"] = "0.012"
+os.environ["EDGE_ENTER"] = "0.007"   # 進場門檻下修，提高參與率
+os.environ["WATCH_INSTAB_THRESH"] = "0.16"
+os.environ["TIE_PROB_MAX"] = "0.18"
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("MIN_BET_PCT", "0.07")
-os.environ.setdefault("MAX_BET_PCT", "0.36")
+os.environ.setdefault("MIN_BET_PCT", "0.08")
+os.environ.setdefault("MAX_BET_PCT", "0.26")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.39")
 os.environ.setdefault("PROB_TEMP", "0.95")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
 os.environ.setdefault("UNCERT_RATIO", "0.22")
-
-# ---------- Session / PF Import ----------
-# ...下方全流程照你原始版，只有「handle_points_and_predict」主體強化，互動/按鈕/LINE都完全保留...
 
 # ---------- PF import ----------
 OutcomePF = None
@@ -121,7 +116,7 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
                 sess["pf"] = OutcomePF(
                     decks=int(os.getenv("DECKS","6")),
                     seed=int(os.getenv("SEED","42")) + int(time.time() % 1000),
-                    n_particles=int(os.getenv("PF_N","120")),
+                    n_particles=int(os.getenv("PF_N","80")),
                     sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","36"))),
                     resample_thr=float(os.getenv("PF_RESAMPLE","0.73")),
                     backend=os.getenv("PF_BACKEND","mc"),
@@ -145,7 +140,6 @@ def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
 
 # ---------- 命中率/和局後冷卻/PF-fallback/最佳化主預測 ----------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
-    # validate points
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
         return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
 
@@ -193,7 +187,6 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         choice_text = dragon
         edge = abs(float(p_final[0]) - float(p_final[1]))
     else:
-        # PF正常投票
         pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
         edge = abs(pB - pP)
         if pB >= pP: choice_text = "莊"
@@ -210,19 +203,23 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     reasons = []
     if cooling:
         watch = True; reasons.append("和局冷卻")
-    elif edge < float(os.getenv("EDGE_ENTER","0.009")):
+    elif edge < float(os.getenv("EDGE_ENTER","0.007")):
         watch = True; reasons.append("機率差過小")
-    elif float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.16")):
+    elif float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
         watch = True; reasons.append("和局風險高")
-    elif abs(edge - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.13")):
+    elif abs(edge - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.16")):
         watch = True; reasons.append("勝率波動大")
 
-    # ----- 下注配注百分比與建議 -----
+    # ----- 三段式配注百分比 -----
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     if not watch:
-        bet_pct = 0.07 + edge * 3.1
-        bet_pct = max(0.07, min(0.36, bet_pct))
+        if edge < 0.015:
+            bet_pct = 0.08
+        elif edge < 0.03:
+            bet_pct = 0.14
+        else:
+            bet_pct = 0.26
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
     # ----- 實際紀錄/命中率更新 -----
@@ -267,8 +264,8 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     # ----- 回傳訊息 -----
     strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.18 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.27 else
+        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.13 else
+        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.22 else
         f"🟢 高信心配注 {bet_pct*100:.1f}%"
     )
 
@@ -290,8 +287,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     return "\n".join(msg)
 
-# ----- 其餘的如API、LINE webhook、所有按鈕/設定/流程完全保留你的原版不動，直接覆蓋即可！ -----
-# 你只需要把這份主體貼回你的原始檔，其他流程不動！
+# 其餘API、LINE webhook、所有按鈕/設定/流程完全保留你的原版
 
 # ---------- Main ----------
 if __name__ == "__main__":
