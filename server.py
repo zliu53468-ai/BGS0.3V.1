@@ -62,15 +62,15 @@ SESSION_EXPIRE = 3600
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
-os.environ.setdefault("EDGE_ENTER", "0.007")
+os.environ.setdefault("EDGE_ENTER", "0.015")  # 修正：調高觀望門檻，減少風險
 os.environ.setdefault("WATCH_INSTAB_THRESH", "0.16")
 os.environ.setdefault("TIE_PROB_MAX", "0.18")
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("MIN_BET_PCT", "0.08")
-os.environ.setdefault("MAX_BET_PCT", "0.26")
+os.environ.setdefault("MIN_BET_PCT", "0.05")  # 修正：調低投注比例，防龍掛
+os.environ.setdefault("MAX_BET_PCT", "0.15")  # 修正：調低
 os.environ.setdefault("PROB_SMA_ALPHA", "0.39")
 os.environ.setdefault("PROB_TEMP", "0.95")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
@@ -195,23 +195,42 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     edge = abs(pB - pP)
     choice_text = "莊" if pB >= pP else "閒"
 
+    # 新增：趨勢檢測（追蹤連續贏家）
+    sess.setdefault("consecutive_streak", {"count": 0, "side": None})
+    current_side = "閒" if p_pts > b_pts else ("莊" if b_pts > p_pts else "和")
+    if current_side == sess["consecutive_streak"]["side"]:
+        sess["consecutive_streak"]["count"] += 1
+    else:
+        sess["consecutive_streak"] = {"count": 1, "side": current_side if current_side != "和" else None}
+
+    # 如果連續 >= 5 手同一邊，強制觀望
+    streak_watch = False
+    reasons = []
+    if sess["consecutive_streak"]["count"] >= 5 and sess["consecutive_streak"]["side"] is not None:
+        streak_watch = True
+        reasons.append("偵測到龍序列（連續" + str(sess["consecutive_streak"]["count"]) + sess["consecutive_streak"]["side"] + "）")
+
     # 風險控管（僅決定要不要觀望，不改方向）
     watch = False
-    reasons = []
     last_real = sess.get("hist_real", [])
     if len(last_real)>=1 and last_real[-1]=="和":
         watch = True; reasons.append("和局冷卻")
-    if edge < float(os.getenv("EDGE_ENTER","0.007")):
+    if edge < float(os.getenv("EDGE_ENTER","0.015")):
         watch = True; reasons.append("機率差過小")
     if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
         watch = True; reasons.append("和局風險高")
 
+    watch = watch or streak_watch
+
+    # 新增：連續虧損止損
+    sess.setdefault("consecutive_loss", 0)
+
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     if not watch:
-        if edge < 0.015: bet_pct = 0.08
-        elif edge < 0.03: bet_pct = 0.14
-        else: bet_pct = 0.26
+        if edge < 0.015: bet_pct = 0.05
+        elif edge < 0.03: bet_pct = 0.10
+        else: bet_pct = 0.15
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
     # 統計/歷史（輸出用）
@@ -227,8 +246,15 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             if choice_text == real_label:
                 st["payout"] += int(round(bet_amt * (0.95 if real_label=="莊" else 1.0)))
                 st["wins"] += 1
+                sess["consecutive_loss"] = 0
             else:
                 st["payout"] -= int(bet_amt)
+                sess["consecutive_loss"] += 1
+
+    if sess["consecutive_loss"] >= 3:
+        watch = True
+        reasons.append("連續虧損止損（" + str(sess["consecutive_loss"]) + "手）")
+        bet_amt = 0
 
     pred_label = "觀望" if watch else choice_text
     sess.setdefault("hist_pred", []).append(pred_label)
