@@ -78,7 +78,7 @@ class OutcomePF:
         return post / post.sum()
 
     def _apply_gap_adjust(self, probs: np.ndarray) -> np.ndarray:
-        """依「上一手點差」做單手微調（不跨局累加、不追單邊）。"""
+        """依「上一手點差」做單手微調（不跨局累加、不追單邊）。修正：反轉 boost 方向，實現反追（見莊打閒、見閒打莊）。"""
         if self.prev_p_pts is None or self.prev_b_pts is None:
             return probs
         gap = abs(self.prev_p_pts - self.prev_b_pts)
@@ -87,9 +87,9 @@ class OutcomePF:
         gap_eff = min(gap, GAP_MAX)
         boost = GAP_BOOST * gap_eff
         if self.prev_p_pts > self.prev_b_pts:
-            probs[1] += boost  # 閒贏 → 下手閒微強化
+            probs[0] += boost  # 閒贏 → 下手莊微強化（反轉原邏輯）
         elif self.prev_b_pts > self.prev_p_pts:
-            probs[0] += boost  # 莊贏 → 下手莊微強化
+            probs[1] += boost  # 莊贏 → 下手閒微強化（反轉原邏輯）
         return probs
 
     def predict(self, sims_per_particle: int = 30) -> np.ndarray:
