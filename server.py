@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳號/粒子濾波動態預測（修正版）
+server.py — BGS百家樂AI（獨立手判斷版）
+- 預設 MODEL_MODE=indep：每局獨立，不追歷史，不偏單邊
+- 回覆格式/配注/流程維持既有
 """
+
 import os, sys, re, time, json, math, random, logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 import numpy as np
 
 # ---------- Flask ----------
@@ -30,13 +33,13 @@ if _has_flask:
         return jsonify(ok=True, ts=time.time(), msg="API normal"), 200
 else:
     class _DummyApp:
-        def get(self, *a, **k):
+        def get(self,*a,**k):
             def deco(f): return f
             return deco
-        def post(self, *a, **k):
+        def post(self,*a,**k):
             def deco(f): return f
             return deco
-        def run(self, *a, **k):
+        def run(self,*a,**k):
             print("Flask not installed; dummy app.")
     app = _DummyApp()
 
@@ -58,7 +61,7 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- 參數（保持你原先預設） ----------
+# ---------- 環境變數（維持你原本預設） ----------
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
@@ -76,6 +79,9 @@ os.environ.setdefault("PROB_TEMP", "0.95")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
 os.environ.setdefault("UNCERT_RATIO", "0.22")
 
+# 這裡讀取 pfilter 的模式：indep(預設)/learn
+MODEL_MODE = os.getenv("MODEL_MODE", "indep").strip().lower()
+
 # ---------- PF import ----------
 OutcomePF = None
 try:
@@ -90,7 +96,7 @@ except Exception:
 
 class _DummyPF:
     def update_outcome(self, outcome): pass
-    def predict(self, **k): return np.array([0.48,0.47,0.05], dtype=np.float32)
+    def predict(self, **k): return np.array([0.458,0.446,0.096], dtype=np.float32)
     def update_point_history(self, p_pts, b_pts): pass
 
 def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
@@ -157,9 +163,12 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
-# ---------- 長龍 ----------
-def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
-    pred = sess.get("hist_real", [])
+# ---------- 觀測工具 ----------
+def _is_long_dragon(_sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
+    # 獨立模式不使用追龍來改選邊，因此直接返回 None；學習模式可保留
+    if MODEL_MODE == "indep":
+        return None
+    pred = _sess.get("hist_real", [])
     if len(pred) < dragon_len: return None
     lastn = pred[-dragon_len:]
     if all(x=="莊" for x in lastn): return "莊"
@@ -174,63 +183,50 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pf = _get_pf_from_sess(sess)
     pf.update_point_history(p_pts, b_pts)
 
-    sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
-    last_gap = float(sess.get("last_prob_gap", 0.0))
-
-    # 依點差給 outcome 更新權重（你的原邏輯）
-    w = 1.0 + 0.95 * (abs(p_pts - b_pts) / 9.0)
-    REP_CAP = 3
-    rep = max(1, min(REP_CAP, int(round(w))))
+    # 只記錄，不往歷史方向帶（獨立模式會在 pfilter 那邊自動忽略）
     if p_pts == b_pts:
         try: pf.update_outcome(2)
         except Exception: pass
     else:
         outcome = 1 if p_pts > b_pts else 0
-        for _ in range(rep):
-            try: pf.update_outcome(outcome)
-            except Exception: pass
+        try: pf.update_outcome(outcome)
+        except Exception: pass
 
-    # 和局冷卻
+    # 和局冷卻僅作為風險管理（不改選邊）
     last_real = sess.get("hist_real", [])
     cooling = bool(len(last_real)>=1 and last_real[-1]=="和")
 
-    # 預測（後面仍做你原本的溫度縮放 + EMA）
-    sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
-    p_raw = pf.predict(sims_per_particle=sims_pred)
+    # 取得單手機率（獨立）
+    p_raw = pf.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS","30")))
     p_adj = p_raw / np.sum(p_raw)
-    p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","0.95")))
-    p_temp = p_temp / np.sum(p_temp)
 
-    if "prob_sma" not in sess: sess["prob_sma"] = None
-    alpha = float(os.getenv("PROB_SMA_ALPHA","0.39"))
-    def ema(prev, cur, alpha): return cur if prev is None else alpha*cur + (1-alpha)*prev
-    sess["prob_sma"] = ema(sess["prob_sma"], p_temp, alpha)
-    p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
-
-    # 選邊/觀望
-    dragon = _is_long_dragon(sess, dragon_len=7)
-    if dragon:
-        choice_text = dragon
-        edge = abs(float(p_final[0]) - float(p_final[1]))
+    # 獨立模式下：不使用跨手EMA（避免被歷史拉扯）
+    if MODEL_MODE == "indep":
+        p_final = p_adj.copy()
     else:
-        pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
-        edge = abs(pB - pP)
-        choice_text = "莊" if pB >= pP else "閒"
+        # 學習模式：保留你的溫度+EMA
+        p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","0.95")))
+        p_temp = p_temp / np.sum(p_temp)
+        if "prob_sma" not in sess: sess["prob_sma"] = None
+        alpha = float(os.getenv("PROB_SMA_ALPHA","0.39"))
+        def ema(prev, cur, a): return cur if prev is None else a*cur + (1-a)*prev
+        sess["prob_sma"] = ema(sess["prob_sma"], p_temp, alpha)
+        p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
 
-    if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
-        choice_text = "莊" if random.random() < 0.5 else "閒"
-        edge = 0.02
+    # 選邊（不追龍）
+    pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
+    edge = abs(pB - pP)
+    choice_text = "莊" if pB >= pP else "閒"
 
+    # 風險控管：和局/波動/機率差過小 → 觀望（不改選邊方向）
     watch = False
     reasons = []
     if cooling:
         watch = True; reasons.append("和局冷卻")
-    elif edge < float(os.getenv("EDGE_ENTER","0.007")):
+    if edge < float(os.getenv("EDGE_ENTER","0.007")):
         watch = True; reasons.append("機率差過小")
-    elif float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
+    if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
         watch = True; reasons.append("和局風險高")
-    elif abs(edge - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.16")):
-        watch = True; reasons.append("勝率波動大")
 
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
@@ -243,6 +239,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             bet_pct = 0.26
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
+    # 統計（不變）
     st = sess.setdefault("stats", {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0})
     if p_pts == b_pts:
         st["push"] += 1
@@ -265,7 +262,6 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if len(sess["hist_real"])>200: sess["hist_real"]=sess["hist_real"][-200:]
 
     sess["last_pts_text"] = f"上局結果: {'和 '+str(p_pts) if p_pts==b_pts else '閒 '+str(p_pts)+' 莊 '+str(b_pts)}"
-    sess["last_prob_gap"] = edge
 
     # 近30手命中率（排除和）
     pairs = [(p,r) for p,r in zip(sess["hist_pred"], sess["hist_real"]) if r in ("莊","閒") and p in ("莊","閒")]
@@ -335,11 +331,17 @@ def welcome_text(uid):
         "(請直接輸入數字1-10)"
     )
 
+def _left_trial_sec(user_id):
+    info = _get_user_info(user_id)
+    if info.get("is_opened"): return "永久"
+    if not info.get("trial_start"): return "尚未啟動"
+    left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
+    return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-    info = _get_user_info(user_id)
 
     # 開通碼
     if text.startswith("開通"):
@@ -354,16 +356,14 @@ def handle_message(event):
 
     # 試用檢查
     if not _is_trial_valid(user_id):
-        msg = (
-            "⛔ 試用期已到\n"
-            f"📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{ADMIN_LINE}"
-        )
+        msg = ("⛔ 試用期已到\n"
+               f"📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{ADMIN_LINE}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
     _start_trial(user_id)
 
-    # 狀態機
+    # 多步驟
     sess = SESS.setdefault(user_id, {"bankroll": 0})
     sess["user_id"] = user_id
 
@@ -429,5 +429,5 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     log = logging.getLogger("bgs-server")
-    log.info("Starting BGS-PF on port %s", port)
+    log.info("Starting BGS-PF on port %s (MODEL_MODE=%s)", port, os.getenv("MODEL_MODE","indep"))
     app.run(host="0.0.0.0", port=port, debug=False)
