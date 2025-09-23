@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-server.py — BGS百家樂AI（獨立手判斷版）
-- 預設 MODEL_MODE=indep：每局獨立，不追歷史，不偏單邊
-- 回覆格式/配注/流程維持既有
+server.py — BGS百家樂AI（獨立手判斷版 + 動態配注）
 """
-
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional
 import numpy as np
@@ -61,7 +58,7 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- 環境變數（維持你原本預設） ----------
+# ---------- 參數（維持你原本預設） ----------
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
@@ -79,8 +76,7 @@ os.environ.setdefault("PROB_TEMP", "0.95")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
 os.environ.setdefault("UNCERT_RATIO", "0.22")
 
-# 這裡讀取 pfilter 的模式：indep(預設)/learn
-MODEL_MODE = os.getenv("MODEL_MODE", "indep").strip().lower()
+MODEL_MODE = os.getenv("MODEL_MODE", "indep").strip().lower()  # indep | learn
 
 # ---------- PF import ----------
 OutcomePF = None
@@ -163,18 +159,6 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
-# ---------- 觀測工具 ----------
-def _is_long_dragon(_sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
-    # 獨立模式不使用追龍來改選邊，因此直接返回 None；學習模式可保留
-    if MODEL_MODE == "indep":
-        return None
-    pred = _sess.get("hist_real", [])
-    if len(pred) < dragon_len: return None
-    lastn = pred[-dragon_len:]
-    if all(x=="莊" for x in lastn): return "莊"
-    if all(x=="閒" for x in lastn): return "閒"
-    return None
-
 # ---------- 主預測 ----------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
@@ -183,28 +167,22 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pf = _get_pf_from_sess(sess)
     pf.update_point_history(p_pts, b_pts)
 
-    # 只記錄，不往歷史方向帶（獨立模式會在 pfilter 那邊自動忽略）
+    # 記錄 outcome（獨立模式下不會累積影響）
     if p_pts == b_pts:
         try: pf.update_outcome(2)
         except Exception: pass
     else:
-        outcome = 1 if p_pts > b_pts else 0
-        try: pf.update_outcome(outcome)
+        try: pf.update_outcome(1 if p_pts > b_pts else 0)
         except Exception: pass
 
-    # 和局冷卻僅作為風險管理（不改選邊）
-    last_real = sess.get("hist_real", [])
-    cooling = bool(len(last_real)>=1 and last_real[-1]=="和")
-
-    # 取得單手機率（獨立）
+    # 預測
     p_raw = pf.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS","30")))
     p_adj = p_raw / np.sum(p_raw)
 
-    # 獨立模式下：不使用跨手EMA（避免被歷史拉扯）
+    # 獨立模式：不做跨手EMA，避免被歷史拉扯；學習模式保留你的溫度+EMA
     if MODEL_MODE == "indep":
         p_final = p_adj.copy()
     else:
-        # 學習模式：保留你的溫度+EMA
         p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","0.95")))
         p_temp = p_temp / np.sum(p_temp)
         if "prob_sma" not in sess: sess["prob_sma"] = None
@@ -213,15 +191,15 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         sess["prob_sma"] = ema(sess["prob_sma"], p_temp, alpha)
         p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
 
-    # 選邊（不追龍）
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
     edge = abs(pB - pP)
     choice_text = "莊" if pB >= pP else "閒"
 
-    # 風險控管：和局/波動/機率差過小 → 觀望（不改選邊方向）
+    # 風險控管（僅決定要不要觀望，不改方向）
     watch = False
     reasons = []
-    if cooling:
+    last_real = sess.get("hist_real", [])
+    if len(last_real)>=1 and last_real[-1]=="和":
         watch = True; reasons.append("和局冷卻")
     if edge < float(os.getenv("EDGE_ENTER","0.007")):
         watch = True; reasons.append("機率差過小")
@@ -231,15 +209,12 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     if not watch:
-        if edge < 0.015:
-            bet_pct = 0.08
-        elif edge < 0.03:
-            bet_pct = 0.14
-        else:
-            bet_pct = 0.26
+        if edge < 0.015: bet_pct = 0.08
+        elif edge < 0.03: bet_pct = 0.14
+        else: bet_pct = 0.26
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
-    # 統計（不變）
+    # 統計/歷史（輸出用）
     st = sess.setdefault("stats", {"bets": 0, "wins": 0, "push": 0, "sum_edge": 0.0, "payout": 0})
     if p_pts == b_pts:
         st["push"] += 1
@@ -330,13 +305,6 @@ def welcome_text(uid):
         "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n6. 歐博/卡利\n7. KG\n8. 金利\n9. 名人\n10. MT真人\n"
         "(請直接輸入數字1-10)"
     )
-
-def _left_trial_sec(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return "永久"
-    if not info.get("trial_start"): return "尚未啟動"
-    left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
-    return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
