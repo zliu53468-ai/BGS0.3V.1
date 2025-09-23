@@ -95,15 +95,15 @@ class OutcomePF:
     def predict(self, sims_per_particle: int = 30) -> np.ndarray:
         if MODEL_MODE == "indep":
             probs = self.prior.copy()
-            # 單手點差微調（本手即用，不累積）
-            probs = self._apply_gap_adjust(probs)
+            # 單手點差微調（本手即用，不累積） - 修正：移除以實現獨立預測，提升準確度並減少龍風險
+            # probs = self._apply_gap_adjust(probs)
             # 輕微抖動，避免機率長時間固定
             if PROB_JITTER > 0:
                 jitter = self.rng.normal(0.0, PROB_JITTER, size=3)
                 probs = probs + jitter
         else:
             probs = self._posterior_mean()
-            probs = self._apply_gap_adjust(probs)
+            # probs = self._apply_gap_adjust(probs)  # 修正：移除
 
         # 夾制和局區間
         probs[2] = np.clip(probs[2], TIE_MIN, TIE_MAX)
