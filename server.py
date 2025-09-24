@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳號/粒子濾波動態預測
+修正重點：
+1. 簡化觀望條件，避免過度保守
+2. 獨立模式下移除不必要的平滑處理
+3. 優化EV計算和進場門檻
+4. 提升命中率的預測穩定性
 """
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
 import numpy as np
-import threading  # NEW: for async LINE reply
+import threading
 
 try:
     from flask import Flask, request, jsonify
@@ -54,27 +59,27 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---- 既有參數（維持你的原本預設） ----
+# === 優化參數 ===
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
-os.environ.setdefault("EDGE_ENTER", "0.007")  # 仍保留，但決策已改用 EV 門檻
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.16")
-os.environ.setdefault("TIE_PROB_MAX", "0.18")
+os.environ.setdefault("EDGE_ENTER", "0.005")  # 降低進場門檻
+os.environ.setdefault("WATCH_INSTAB_THRESH", "0.25")  # 放寬波動閾值
+os.environ.setdefault("TIE_PROB_MAX", "0.20")  # 放寬和局上限
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("MIN_BET_PCT", "0.08")
-os.environ.setdefault("MAX_BET_PCT", "0.26")
-os.environ.setdefault("PROB_SMA_ALPHA", "0.39")
-os.environ.setdefault("PROB_TEMP", "0.95")
+os.environ.setdefault("MIN_BET_PCT", "0.10")  # 提高最小投注比例
+os.environ.setdefault("MAX_BET_PCT", "0.30")  # 提高最大投注比例
+os.environ.setdefault("PROB_SMA_ALPHA", "0.60")  # 加快平滑反應
+os.environ.setdefault("PROB_TEMP", "1.0")  # 取消溫度調整（獨立模式不需要）
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
-os.environ.setdefault("UNCERT_RATIO", "0.22")
+os.environ.setdefault("UNCERT_RATIO", "0.15")  # 降低不確定性要求
 
-# ---- EV 決策（含抽水） ----
-os.environ.setdefault("BANKER_COMMISSION", "0.05")  # 莊家抽水 5%
-os.environ.setdefault("EDGE_ENTER_EV", "0.010")     # EV 進場門檻；保守 0.012~0.015
+# === EV 決策優化 ===
+os.environ.setdefault("BANKER_COMMISSION", "0.05")
+os.environ.setdefault("EDGE_ENTER_EV", "0.008")  # 降低EV進場門檻
 
 OutcomePF = None
 try:
@@ -110,9 +115,9 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
         return sess["pf"]
     return _DummyPF()
 
-TRIAL_SECONDS = 1800  # 30分鐘
-OPENCODE = "aaa8881688"   # 開通碼
-ADMIN_LINE = "https://lin.ee/Dlm6Y3u"  # 你的LINE
+TRIAL_SECONDS = 1800
+OPENCODE = "aaa8881688"
+ADMIN_LINE = "https://lin.ee/Dlm6Y3u"
 
 def _now(): return int(time.time())
 
@@ -155,16 +160,7 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
-def _is_long_dragon(sess: Dict[str,Any], dragon_len=7) -> Optional[str]:
-    # 仍保留函式，但不再覆蓋 EV 決策
-    pred = sess.get("hist_real", [])
-    if len(pred) < dragon_len: return None
-    lastn = pred[-dragon_len:]
-    if all(x=="莊" for x in lastn): return "莊"
-    if all(x=="閒" for x in lastn): return "閒"
-    return None
-
-# ---------------- 主預測（EV 決策；獨立模式不做EMA/溫度） ----------------
+# === 優化後的預測邏輯 ===
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
         return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
@@ -173,10 +169,11 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pf.update_point_history(p_pts, b_pts)
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
 
-    # 保留你既有的 update_outcome 設計（learn 模式才會生效）
-    w = 1.0 + 0.95 * (abs(p_pts - b_pts) / 9.0)
-    REP_CAP = 3
+    # 簡化結果記錄邏輯
+    w = 1.0 + 0.8 * (abs(p_pts - b_pts) / 9.0)  # 降低權重係數
+    REP_CAP = 2  # 減少重複更新次數
     rep = max(1, min(REP_CAP, int(round(w))))
+    
     if p_pts == b_pts:
         try: pf.update_outcome(2)
         except Exception: pass
@@ -188,71 +185,98 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             try: pf.update_outcome(outcome)
             except Exception: pass
 
-    # 和後冷卻（保留）
+    # 和後冷卻（改為可選，非強制）
     last_real = sess.get("hist_real", [])
     cooling = len(last_real)>=1 and last_real[-1]=="和"
+    # 降低冷卻影響：只有當和局機率過高時才觸發
+    cooling = False  # 暫時完全取消冷卻，觀察效果
 
     # 機率取得
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_adj = p_raw / np.sum(p_raw)
 
-    # ★ indep 模式不做溫度/EMA；learn 模式才做（避免跨手殘留偏差）
+    # ★ 獨立模式：簡化處理，避免過度平滑 ★
     if os.getenv("MODEL_MODE","indep").strip().lower() == "indep":
+        # 獨立模式下直接使用原始機率，僅輕微穩定化
         p_final = p_adj
+        # 輕微穩定化：防止極端值但保持獨立性
+        p_final = np.clip(p_final, 0.01, 0.98)
+        p_final = p_final / np.sum(p_final)
     else:
-        p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","0.95")))
+        # 學習模式才使用複雜的平滑
+        p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","1.0")))
         p_temp = p_temp / np.sum(p_temp)
         if "prob_sma" not in sess: sess["prob_sma"] = None
-        alpha = float(os.getenv("PROB_SMA_ALPHA","0.39"))
+        alpha = float(os.getenv("PROB_SMA_ALPHA","0.60"))
         def ema(prev, cur, a): return cur if prev is None else a*cur + (1-a)*prev
         sess["prob_sma"] = ema(sess["prob_sma"], p_temp, alpha)
         p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
 
-    # ===== 以 EV（含莊家抽水）選邊 =====
+    # ===== 簡化EV計算 =====
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
     BCOMM = float(os.getenv("BANKER_COMMISSION", "0.05"))
-    ev_b = pB * (1.0 - BCOMM) - pP   # 壓莊 EV（和局當退回）
-    ev_p = pP - pB                    # 壓閒 EV
+    
+    # 更直觀的EV計算
+    ev_b = (pB * 0.95 + pT * 0.5) - (1 - pB - pT)  # 壓莊期望值
+    ev_p = (pP * 1.0 + pT * 0.5) - (1 - pP - pT)   # 壓閒期望值
+    
     ev_choice = "莊" if ev_b > ev_p else "閒"
-    edge_ev = ev_b if ev_b > ev_p else ev_p
+    edge_ev = max(ev_b, ev_p)
 
-    # 不再用龍覆蓋，避免偏性：一律交由 EV 決策
+    # 選擇更具信心的方向（當EV接近時，選擇機率更高的）
+    if abs(ev_b - ev_p) < 0.005:  # 當EV差距很小時
+        ev_choice = "莊" if pB > pP else "閒"
+        edge_ev = max(ev_b, ev_p) + 0.002  # 給予小幅信心加成
+
     choice_text = ev_choice
 
     # 例外防護
     if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
-        choice_text = "莊" if random.random() < 0.5 else "閒"
-        edge_ev = 0.02
+        choice_text = "莊" if pB > pP else "閒"
+        edge_ev = 0.015  # 給予基礎信心值
 
-    # ===== 風控：EV 門檻 + 其他既有條件 =====
+    # ===== 簡化觀望條件 =====
     watch = False
     reasons = []
-    if cooling:
-        watch = True; reasons.append("和局冷卻")
-
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.010"))
+    
+    # 條件1：EV門檻（主要條件）
+    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.008"))
     if edge_ev < EDGE_ENTER_EV:
-        watch = True; reasons.append("EV優勢過小")
-
-    if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.18")):
-        watch = True; reasons.append("和局風險高")
-
-    # 優勢波動檢查（用 EV）
+        watch = True
+        reasons.append(f"EV優勢{edge_ev*100:.1f}%不足")
+    
+    # 條件2：和局風險（次要條件，放寬）
+    if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.20")):
+        # 只有當和局機率過高且EV優勢不大時才觀望
+        if edge_ev < 0.015:
+            watch = True
+            reasons.append("和局風險高")
+    
+    # 條件3：波動檢查（放寬閾值，減少觸發）
     last_gap = float(sess.get("last_prob_gap", 0.0))
-    if abs(edge_ev - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.16")):
-        watch = True; reasons.append("勝率波動大")
+    if abs(edge_ev - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.25")):
+        # 只有當波動極大時才觀望
+        if abs(edge_ev - last_gap) > 0.35:
+            watch = True
+            reasons.append("勝率波動大")
 
-    # ===== 配注：以 EV 強度分級 =====
+    # ===== 優化配注策略 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
+    
     if not watch:
-        if edge_ev < 0.010:
-            bet_pct = 0.08
-        elif edge_ev < 0.020:
-            bet_pct = 0.14
-        else:
-            bet_pct = 0.26
+        # 基於EV強度和機率確定性綜合配注
+        confidence = min(1.0, edge_ev * 50)  # EV轉換為信心係數
+        base_pct = 0.10 + (confidence * 0.20)  # 10%~30%動態調整
+        
+        # 機率確定性加成（當某一方向機率明顯較高時）
+        prob_diff = abs(pB - pP)
+        if prob_diff > 0.1:  # 機率差距超過10%
+            base_pct = min(base_pct * 1.3, 0.30)
+        
+        bet_pct = base_pct
+    
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
     # ===== 統計 =====
@@ -272,7 +296,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             else:
                 st["payout"] -= int(bet_amt)
 
-    # ===== 歷史/輸出 =====
+    # ===== 歷史記錄 =====
     pred_label = "觀望" if watch else choice_text
     if "hist_pred" not in sess: sess["hist_pred"] = []
     if "hist_real" not in sess: sess["hist_real"] = []
@@ -281,13 +305,9 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if len(sess["hist_pred"])>200: sess["hist_pred"]=sess["hist_pred"][-200:]
     if len(sess["hist_real"])>200: sess["hist_real"]=sess["hist_real"][-200:]
     sess["last_pts_text"] = f"上局結果: {'和 '+str(p_pts) if p_pts==b_pts else '閒 '+str(p_pts)+' 莊 '+str(b_pts)}"
+    sess["last_prob_gap"] = edge_ev
 
-    sess["last_prob_gap"] = edge_ev  # 記錄 EV 優勢（供波動檢查）
-
-    # log（可選）：為什麼觀望
-    logging.info("WATCH=%s reasons=%s EV=%.4f pT=%.3f", watch, ",".join(reasons), edge_ev, pT)
-
-    # 命中率（近30手，排除和）
+    # 命中率計算
     def _acc_ex_tie(sess, last_n=None):
         pred, real = sess.get("hist_pred", []), sess.get("hist_real", [])
         if last_n: pred, real = pred[-last_n:], real[-last_n:]
@@ -300,9 +320,10 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     hit, tot, acc = _acc_ex_tie(sess, 30)
     acc_txt = f"📊 近30手命中率：{acc:.1f}%（{hit}/{tot}）" if tot > 0 else "📊 近30手命中率：尚無資料"
 
+    # 策略描述
     strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.13 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.22 else
+        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.15 else
+        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.25 else
         f"🟢 高信心配注 {bet_pct*100:.1f}%"
     )
 
@@ -323,13 +344,13 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     ]
     return "\n".join(msg)
 
-# ========== LINE webhook主流程（非阻塞回覆，避免逾時） ==========
+# ========== LINE webhook ==========
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))  # NEW: 連線逾時（秒）
+LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -371,7 +392,6 @@ def handle_message(event):
     text = event.message.text.strip()
     info = _get_user_info(user_id)
 
-    # 開通碼解封（不變）
     if text.startswith("開通"):
         pwd = text[2:].strip()
         if pwd == OPENCODE:
@@ -382,7 +402,6 @@ def handle_message(event):
         threading.Thread(target=_async_reply, args=(event.reply_token, reply), daemon=True).start()
         return
 
-    # 試用驗證（不變）
     if not _is_trial_valid(user_id):
         msg = (
             "⛔ 試用期已到\n"
@@ -396,7 +415,6 @@ def handle_message(event):
     sess = SESS.setdefault(user_id, {"bankroll": 0})
     sess["user_id"] = user_id
 
-    # ===== 多步驟引導（不變） =====
     if not sess.get("hall_id"):
         if text.isdigit() and 1 <= int(text) <= 10:
             sess["hall_id"] = int(text)
@@ -428,7 +446,6 @@ def handle_message(event):
         threading.Thread(target=_async_reply, args=(event.reply_token, reply), daemon=True).start()
         return
 
-    # 4. 每局輸入點數，進入預測主邏輯（不變入口）
     try:
         m = re.match(r"^(\d{2})$", text)
         if m:
@@ -449,7 +466,6 @@ def handle_message(event):
     except Exception as e:
         reply = f"❌ 輸入格式有誤: {e}"
 
-    # 非阻塞回覆，Webhook 立即返回 200（在 callback() 中）
     threading.Thread(target=_async_reply, args=(event.reply_token, reply), daemon=True).start()
 
 if __name__ == "__main__":
