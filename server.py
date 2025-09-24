@@ -2,10 +2,11 @@
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳號/粒子濾波動態預測
 修正重點：
-1. 簡化觀望條件，避免過度保守
-2. 獨立模式下移除不必要的平滑處理
-3. 優化EV計算和進場門檻
-4. 提升命中率的預測穩定性
+1. 修復信心計算公式，避免系統性偏愛閒家
+2. 簡化觀望條件，避免過度保守
+3. 獨立模式下移除不必要的平滑處理
+4. 優化EV計算和進場門檻
+5. 提升命中率的預測穩定性
 """
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
@@ -160,6 +161,23 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
+# === 修正信心計算函數 ===
+def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
+    """修正後的信⼼計算，避免莊閒不公平"""
+    
+    # 選擇方向的EV
+    selected_ev = ev_b if choice == "莊" else ev_p
+    
+    # 基礎信心：確保莊閒公平，降低放大係數
+    base_confidence = max(0, selected_ev) * 35
+    
+    # 機率確定性加成
+    prob_advantage = abs(pB - pP)
+    prob_bonus = min(0.3, prob_advantage * 1.5)
+    
+    confidence = min(1.0, base_confidence + prob_bonus)
+    return confidence
+
 # === 優化後的預測邏輯 ===
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
@@ -261,13 +279,13 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             watch = True
             reasons.append("勝率波動大")
 
-    # ===== 優化配注策略 =====
+    # ===== 修正配注策略 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     
     if not watch:
-        # 基於EV強度和機率確定性綜合配注
-        confidence = min(1.0, edge_ev * 50)  # EV轉換為信心係數
+        # 使用修正後的信⼼計算函數
+        confidence = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
         base_pct = 0.10 + (confidence * 0.20)  # 10%~30%動態調整
         
         # 機率確定性加成（當某一方向機率明顯較高時）
