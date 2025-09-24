@@ -2,11 +2,9 @@
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳號/粒子濾波動態預測
 修正重點：
-1. 修復信心計算公式，避免系統性偏愛閒家
-2. 簡化觀望條件，避免過度保守
-3. 獨立模式下移除不必要的平滑處理
-4. 優化EV計算和進場門檻
-5. 提升命中率的預測穩定性
+1. 降低觀望門檻，讓配注機制正常運作
+2. 優化信心計算，釋放完整的10%-30%配注區間
+3. 保持其他邏輯不變
 """
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
@@ -64,23 +62,23 @@ SESSION_EXPIRE = 3600
 os.environ.setdefault("PF_N", "80")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
 os.environ.setdefault("PF_DIR_EPS", "0.012")
-os.environ.setdefault("EDGE_ENTER", "0.005")  # 降低進場門檻
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.25")  # 放寬波動閾值
-os.environ.setdefault("TIE_PROB_MAX", "0.20")  # 放寬和局上限
+os.environ.setdefault("EDGE_ENTER", "0.005")
+os.environ.setdefault("WATCH_INSTAB_THRESH", "0.25")
+os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("MIN_BET_PCT", "0.10")  # 提高最小投注比例
-os.environ.setdefault("MAX_BET_PCT", "0.30")  # 提高最大投注比例
-os.environ.setdefault("PROB_SMA_ALPHA", "0.60")  # 加快平滑反應
-os.environ.setdefault("PROB_TEMP", "1.0")  # 取消溫度調整（獨立模式不需要）
+os.environ.setdefault("MIN_BET_PCT", "0.10")
+os.environ.setdefault("MAX_BET_PCT", "0.30")
+os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
+os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("UNCERT_MARGIN_MAX", "1")
-os.environ.setdefault("UNCERT_RATIO", "0.15")  # 降低不確定性要求
+os.environ.setdefault("UNCERT_RATIO", "0.15")
 
-# === EV 決策優化 ===
+# === EV 決策優化 - 降低進場門檻 ===
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
-os.environ.setdefault("EDGE_ENTER_EV", "0.008")  # 降低EV進場門檻
+os.environ.setdefault("EDGE_ENTER_EV", "0.002")  # 從0.008降到0.002，釋放配注機制
 
 OutcomePF = None
 try:
@@ -161,19 +159,19 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
-# === 修正信心計算函數 ===
+# === 修正信心計算函數 - 釋放完整的配注區間 ===
 def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """修正後的信⼼計算，避免莊閒不公平"""
+    """優化後的信⼼計算，釋放10%-30%配注區間"""
     
     # 選擇方向的EV
     selected_ev = ev_b if choice == "莊" else ev_p
     
-    # 基礎信心：確保莊閒公平，降低放大係數
-    base_confidence = max(0, selected_ev) * 35
+    # 提高敏感度，讓基礎信心更容易達到高值
+    base_confidence = max(0, selected_ev) * 60  # 從35提高到60
     
-    # 機率確定性加成
+    # 加大機率優勢權重
     prob_advantage = abs(pB - pP)
-    prob_bonus = min(0.3, prob_advantage * 1.5)
+    prob_bonus = min(0.5, prob_advantage * 2.5)  # 從1.5提高到2.5，上限從0.3提高到0.5
     
     confidence = min(1.0, base_confidence + prob_bonus)
     return confidence
@@ -188,8 +186,8 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
 
     # 簡化結果記錄邏輯
-    w = 1.0 + 0.8 * (abs(p_pts - b_pts) / 9.0)  # 降低權重係數
-    REP_CAP = 2  # 減少重複更新次數
+    w = 1.0 + 0.8 * (abs(p_pts - b_pts) / 9.0)
+    REP_CAP = 2
     rep = max(1, min(REP_CAP, int(round(w))))
     
     if p_pts == b_pts:
@@ -206,7 +204,6 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     # 和後冷卻（改為可選，非強制）
     last_real = sess.get("hist_real", [])
     cooling = len(last_real)>=1 and last_real[-1]=="和"
-    # 降低冷卻影響：只有當和局機率過高時才觸發
     cooling = False  # 暫時完全取消冷卻，觀察效果
 
     # 機率取得
@@ -216,13 +213,10 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     # ★ 獨立模式：簡化處理，避免過度平滑 ★
     if os.getenv("MODEL_MODE","indep").strip().lower() == "indep":
-        # 獨立模式下直接使用原始機率，僅輕微穩定化
         p_final = p_adj
-        # 輕微穩定化：防止極端值但保持獨立性
         p_final = np.clip(p_final, 0.01, 0.98)
         p_final = p_final / np.sum(p_final)
     else:
-        # 學習模式才使用複雜的平滑
         p_temp = np.exp(np.log(np.clip(p_adj,1e-9,1.0)) / float(os.getenv("PROB_TEMP","1.0")))
         p_temp = p_temp / np.sum(p_temp)
         if "prob_sma" not in sess: sess["prob_sma"] = None
@@ -235,62 +229,59 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
     BCOMM = float(os.getenv("BANKER_COMMISSION", "0.05"))
     
-    # 更直觀的EV計算
-    ev_b = (pB * 0.95 + pT * 0.5) - (1 - pB - pT)  # 壓莊期望值
-    ev_p = (pP * 1.0 + pT * 0.5) - (1 - pP - pT)   # 壓閒期望值
+    ev_b = (pB * 0.95 + pT * 0.5) - (1 - pB - pT)
+    ev_p = (pP * 1.0 + pT * 0.5) - (1 - pP - pT)
     
     ev_choice = "莊" if ev_b > ev_p else "閒"
     edge_ev = max(ev_b, ev_p)
 
     # 選擇更具信心的方向（當EV接近時，選擇機率更高的）
-    if abs(ev_b - ev_p) < 0.005:  # 當EV差距很小時
+    if abs(ev_b - ev_p) < 0.005:
         ev_choice = "莊" if pB > pP else "閒"
-        edge_ev = max(ev_b, ev_p) + 0.002  # 給予小幅信心加成
+        edge_ev = max(ev_b, ev_p) + 0.002
 
     choice_text = ev_choice
 
     # 例外防護
     if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
         choice_text = "莊" if pB > pP else "閒"
-        edge_ev = 0.015  # 給予基礎信心值
+        edge_ev = 0.015
 
-    # ===== 簡化觀望條件 =====
+    # ===== 降低觀望門檻，讓配注機制正常運作 =====
     watch = False
     reasons = []
     
-    # 條件1：EV門檻（主要條件）
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.008"))
+    # 條件1：大幅降低EV門檻（主要修正）
+    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.002"))  # 使用新的低門檻
     if edge_ev < EDGE_ENTER_EV:
         watch = True
         reasons.append(f"EV優勢{edge_ev*100:.1f}%不足")
     
-    # 條件2：和局風險（次要條件，放寬）
+    # 條件2：和局風險（放寬）
     if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.20")):
-        # 只有當和局機率過高且EV優勢不大時才觀望
         if edge_ev < 0.015:
             watch = True
             reasons.append("和局風險高")
     
-    # 條件3：波動檢查（放寬閾值，減少觸發）
+    # 條件3：波動檢查（放寬）
     last_gap = float(sess.get("last_prob_gap", 0.0))
     if abs(edge_ev - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.25")):
-        # 只有當波動極大時才觀望
         if abs(edge_ev - last_gap) > 0.35:
             watch = True
             reasons.append("勝率波動大")
 
-    # ===== 修正配注策略 =====
+    # ===== 修正配注策略 - 釋放完整的10%-30%區間 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     
     if not watch:
-        # 使用修正後的信⼼計算函數
+        # 使用優化後的信⼼計算函數
         confidence = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
         base_pct = 0.10 + (confidence * 0.20)  # 10%~30%動態調整
         
-        # 機率確定性加成（當某一方向機率明顯較高時）
+        # 機率確定性加成
         prob_diff = abs(pB - pP)
-        if prob_diff > 0.1:  # 機率差距超過10%
+        if prob_diff > 0.1:
             base_pct = min(base_pct * 1.3, 0.30)
         
         bet_pct = base_pct
