@@ -2,8 +2,8 @@
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳號/粒子濾波動態預測
 修正重點：
-1. 降低觀望門檻，讓配注機制正常運作
-2. 優化信心計算，釋放完整的10%-30%配注區間
+1. 修正信心計算函數，釋放完整的10%-30%配注區間
+2. 優化EV計算和進場條件
 3. 保持其他邏輯不變
 """
 import os, sys, re, time, json, math, random, logging
@@ -161,19 +161,27 @@ def _left_trial_sec(user_id):
 
 # === 修正信心計算函數 - 釋放完整的配注區間 ===
 def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """優化後的信⼼計算，釋放10%-30%配注區間"""
+    """修正後的信⼼計算，完整釋放10%-30%配注區間"""
     
     # 選擇方向的EV
     selected_ev = ev_b if choice == "莊" else ev_p
     
-    # 提高敏感度，讓基礎信心更容易達到高值
-    base_confidence = max(0, selected_ev) * 60  # 從35提高到60
+    # 修正1: 提高基礎信心的敏感度
+    base_confidence = max(0, selected_ev) * 80  # 從60提高到80
     
-    # 加大機率優勢權重
+    # 修正2: 加大機率優勢權重
     prob_advantage = abs(pB - pP)
-    prob_bonus = min(0.5, prob_advantage * 2.5)  # 從1.5提高到2.5，上限從0.3提高到0.5
+    prob_bonus = min(0.8, prob_advantage * 4.0)  # 從2.5提高到4.0，上限從0.5提高到0.8
     
-    confidence = min(1.0, base_confidence + prob_bonus)
+    # 修正3: 加入EV絕對值加成
+    ev_bonus = min(0.4, abs(selected_ev) * 100)  # EV每0.01加成0.4，上限0.4
+    
+    confidence = min(1.0, base_confidence + prob_bonus + ev_bonus)
+    
+    # 修正4: 確保信心值能達到接近1.0
+    if confidence > 0.95 and selected_ev > 0.02:
+        confidence = 1.0
+        
     return confidence
 
 # === 優化後的預測邏輯 ===
@@ -229,16 +237,17 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
     BCOMM = float(os.getenv("BANKER_COMMISSION", "0.05"))
     
-    ev_b = (pB * 0.95 + pT * 0.5) - (1 - pB - pT)
-    ev_p = (pP * 1.0 + pT * 0.5) - (1 - pP - pT)
+    # 修正EV計算公式
+    ev_b = pB * (0.95 - BCOMM) + pT * 0.5 - pP
+    ev_p = pP * 1.0 + pT * 0.5 - pB
     
     ev_choice = "莊" if ev_b > ev_p else "閒"
     edge_ev = max(ev_b, ev_p)
 
     # 選擇更具信心的方向（當EV接近時，選擇機率更高的）
-    if abs(ev_b - ev_p) < 0.005:
+    if abs(ev_b - ev_p) < 0.003:
         ev_choice = "莊" if pB > pP else "閒"
-        edge_ev = max(ev_b, ev_p) + 0.002
+        edge_ev = max(ev_b, ev_p) + 0.001
 
     choice_text = ev_choice
 
@@ -252,39 +261,47 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     reasons = []
     
     # 條件1：大幅降低EV門檻（主要修正）
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.002"))  # 使用新的低門檻
+    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV", "0.002"))
     if edge_ev < EDGE_ENTER_EV:
         watch = True
         reasons.append(f"EV優勢{edge_ev*100:.1f}%不足")
     
     # 條件2：和局風險（放寬）
-    if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.20")):
-        if edge_ev < 0.015:
+    if float(p_final[2]) > float(os.getenv("TIE_PROB_MAX","0.25")):  # 從0.20放寬到0.25
+        if edge_ev < 0.01:  # 放寬條件
             watch = True
             reasons.append("和局風險高")
     
     # 條件3：波動檢查（放寬）
     last_gap = float(sess.get("last_prob_gap", 0.0))
-    if abs(edge_ev - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.25")):
-        if abs(edge_ev - last_gap) > 0.35:
+    if abs(edge_ev - last_gap) > float(os.getenv("WATCH_INSTAB_THRESH","0.30")):  # 從0.25放寬到0.30
+        if abs(edge_ev - last_gap) > 0.40:  # 從0.35放寬到0.40
             watch = True
             reasons.append("勝率波動大")
 
-    # ===== 修正配注策略 - 釋放完整的10%-30%區間 =====
+    # ===== 修正配注策略 - 完整釋放10%-30%區間 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     
     if not watch:
-        # 使用優化後的信⼼計算函數
+        # 使用修正後的信⼼計算函數
         confidence = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
+        
+        # 修正5: 確保基礎配注區間完整
         base_pct = 0.10 + (confidence * 0.20)  # 10%~30%動態調整
         
         # 機率確定性加成
         prob_diff = abs(pB - pP)
-        if prob_diff > 0.1:
-            base_pct = min(base_pct * 1.3, 0.30)
+        if prob_diff > 0.08:  # 降低門檻從0.1到0.08
+            base_pct = min(base_pct * (1.0 + prob_diff * 2), 0.30)
         
-        bet_pct = base_pct
+        # 高EV額外加成
+        if edge_ev > 0.03:
+            base_pct = min(base_pct * 1.2, 0.30)
+        elif edge_ev > 0.05:
+            base_pct = min(base_pct * 1.4, 0.30)
+            
+        bet_pct = min(0.30, max(0.10, base_pct))  # 確保在10%-30%範圍內
     
     bet_amt = int(round(bankroll * bet_pct)) if bankroll>0 and bet_pct>0 else 0
 
