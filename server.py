@@ -4,7 +4,7 @@ server.py — BGS百家樂AI 多步驟/館別桌號/本金/30分試用/永久帳
 修正重點：
 1. 降低觀望門檻，讓配注機制正常運作
 2. 優化信心計算，釋放完整的10%-30%配注區間
-3. 保持其他邏輯不變
+3. 修正配注邏輯，真正依照信心度動態調整
 """
 import os, sys, re, time, json, math, random, logging
 from typing import Dict, Any, Optional, Tuple
@@ -69,7 +69,7 @@ os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("MIN_BET_PCT", "0.10")
+os.environ.setdefault("MIN_BET_PCT", "0.08")
 os.environ.setdefault("MAX_BET_PCT", "0.30")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 os.environ.setdefault("PROB_TEMP", "1.0")
@@ -270,19 +270,29 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             watch = True
             reasons.append("勝率波動大")
 
-    # ===== 修正配注策略 - 釋放完整的10%-30%區間 =====
+    # ===== 修正配注策略 - 真正依照信心度配注 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     
     if not watch:
         # 使用優化後的信⼼計算函數
         confidence = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_pct = 0.10 + (confidence * 0.20)  # 10%~30%動態調整
+        base_pct = 0.10 + (confidence * 0.20)  # 核心：10%~30%動態調整
         
-        # 機率確定性加成
+        # 修正：機率差異加成應該與信心度結合，而不是覆蓋
         prob_diff = abs(pB - pP)
-        if prob_diff > 0.1:
-            base_pct = min(base_pct * 1.3, 0.30)
+        if prob_diff > 0.15:  # 提高門檻到15%，避免過度觸發
+            # 根據信心度給予額外加成，而不是固定倍數
+            confidence_bonus = min(0.08, confidence * 0.1)  # 最大加成8%
+            base_pct = min(0.30, base_pct + confidence_bonus)
+        elif prob_diff > 0.25:  # 極大優勢時的特殊處理
+            confidence_bonus = min(0.12, confidence * 0.15)
+            base_pct = min(0.30, base_pct + confidence_bonus)
+        
+        # 確保即使信心度低也有最小投注
+        MIN_BET_PCT = float(os.getenv("MIN_BET_PCT", "0.08"))
+        if base_pct < MIN_BET_PCT:
+            base_pct = MIN_BET_PCT
         
         bet_pct = base_pct
     
