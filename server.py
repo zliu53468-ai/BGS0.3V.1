@@ -254,7 +254,7 @@ def _reply(token, text, quick=None):
     except Exception as e:
         print("LINE reply_message error:", e)
 
-# —— 這段完全照你的截圖文案 —— #
+# —— 完全對齊你的歡迎文案 —— #
 def welcome_text(uid):
     left = _left_trial_sec(uid)
     return (
@@ -291,7 +291,6 @@ def settings_quickreply(sess) -> list:
         _qr_btn("重設流程", "重設"),
     ]
 
-# —— 館別鍵：1~10（10 個，配合 LINE 上限 13） —— #
 def halls_quickreply() -> list:
     return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
 
@@ -439,12 +438,23 @@ def _format_stats(sess):
     acc = (wins / bets * 100.0) if bets>0 else 0.0
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
+# ----------------- LINE webhook route (FIX 404) -----------------
+@app.post("/line-webhook")
+def callback():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("LINE webhook error:", e)
+        return "bad request", 400
+    return "ok", 200
+
 # ----------------- Handlers -----------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
-    info = _get_user_info(user_id)
 
     # 開通
     if text.startswith("開通"):
@@ -456,11 +466,7 @@ def handle_message(event):
 
     # 試用檢查
     if not _is_trial_valid(user_id):
-        msg = (
-            "⛔ 試用期已到\n"
-            f"📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{ADMIN_LINE}"
-        )
-        _reply(event.reply_token, msg)
+        _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
         return
 
     _start_trial(user_id)
@@ -473,7 +479,7 @@ def handle_message(event):
     if text == "查看統計":
         _reply(event.reply_token, _format_stats(sess), quick=settings_quickreply(sess)); return
     if text == "試用剩餘":
-        _reply(event.reply_token, f"⏳ 試用剩餘：{_left_trial_sec(user_id)}", quick=settings_quickreply(sess)); return
+        _reply(event.reply_token, "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
     if text.startswith("顯示模式"):
         mode = text.replace("顯示模式","").strip().lower()
         if mode in ("smart","basic","none"):
@@ -486,7 +492,7 @@ def handle_message(event):
         SESS[user_id] = {"bankroll": 0, "user_id": user_id}
         _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
 
-    # 首次流程：館別 -> 桌號 -> 本金
+    # 館別 -> 桌號 -> 本金
     if not sess.get("hall_id"):
         if text.isdigit() and 1 <= int(text) <= 10:
             sess["hall_id"] = int(text)
@@ -517,7 +523,7 @@ def handle_message(event):
             _reply(event.reply_token, "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
         return
 
-    # 連續模式：65 / 閒6莊5 / 莊5閒6 / 和
+    # 連續模式
     try:
         if text.strip() == "和":
             pf = _get_pf_from_sess(sess)
