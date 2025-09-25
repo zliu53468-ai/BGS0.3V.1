@@ -7,7 +7,7 @@ server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
 - 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
 """
 
-import os, sys, re, time, json, logging, threading
+import os, sys, re, time, json, logging
 from typing import Dict, Any
 import numpy as np
 
@@ -64,7 +64,6 @@ SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
 # ---------- Tunables / Defaults (server + pfilter對齊) ----------
-# 核心策略/觀望
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
 os.environ.setdefault("EDGE_ENTER_EV", "0.004")
 os.environ.setdefault("ENTER_GAP_MIN", "0.03")
@@ -72,16 +71,13 @@ os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
 os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
 
-# 配注
 os.environ.setdefault("MIN_BET_PCT_BASE", "0.03")
 os.environ.setdefault("MAX_BET_PCT", "0.25")
 os.environ.setdefault("BET_UNIT", "100")
 
-# 機率平滑
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
-# PF / 模式（與 pfilter.py 強化版保持一致）
 os.environ.setdefault("MODEL_MODE", "indep")   # indep | learn
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_N", "80")
@@ -91,7 +87,6 @@ os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
 
-# 先驗/抖動/歷史參數
 os.environ.setdefault("PRIOR_B", "0.452")
 os.environ.setdefault("PRIOR_P", "0.452")
 os.environ.setdefault("PRIOR_T", "0.096")
@@ -100,11 +95,9 @@ os.environ.setdefault("PF_DECAY", "0.985")
 os.environ.setdefault("PROB_JITTER", "0.006")
 os.environ.setdefault("HISTORICAL_WEIGHT", "0.2")
 
-# Tie 基準
 os.environ.setdefault("TIE_MIN", "0.03")
 os.environ.setdefault("TIE_MAX", "0.18")
 os.environ.setdefault("DYNAMIC_TIE_RANGE", "1")
-# 強化版 tie 動態平滑
 os.environ.setdefault("TIE_BETA_A", "9.6")
 os.environ.setdefault("TIE_BETA_B", "90.4")
 os.environ.setdefault("TIE_EMA_ALPHA", "0.2")
@@ -113,7 +106,6 @@ os.environ.setdefault("TIE_DELTA", "0.35")
 os.environ.setdefault("TIE_MAX_CAP", "0.25")
 os.environ.setdefault("TIE_MIN_FLOOR", "0.01")
 
-# 強化版歷史/粒子視窗
 os.environ.setdefault("HIST_WIN", "60")
 os.environ.setdefault("HIST_PSEUDO", "1.0")
 os.environ.setdefault("HIST_WEIGHT_MAX", "0.35")
@@ -121,9 +113,6 @@ os.environ.setdefault("PF_WIN", "50")
 os.environ.setdefault("PF_ALPHA", "0.5")
 os.environ.setdefault("PF_WEIGHT_MAX", "0.7")
 os.environ.setdefault("PF_WEIGHT_K", "80")
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
 
 # ----------------- PF Loader -----------------
 OutcomePF = None
@@ -236,15 +225,84 @@ def _format_pts_text(p_pts, b_pts):
     if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
     return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
+# ----------------- LINE SDK -----------------
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
+)
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+def _qr_btn(label, text):
+    return QuickReplyButton(action=MessageAction(label=label, text=text))
+
+def _reply(token, text, quick=None):
+    try:
+        if quick:
+            line_bot_api.reply_message(
+                token,
+                TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
+            )
+        else:
+            line_bot_api.reply_message(token, TextSendMessage(text=text))
+    except Exception as e:
+        print("LINE reply_message error:", e)
+
+# —— 這段完全照你的截圖文案 —— #
+def welcome_text(uid):
+    left = _left_trial_sec(uid)
+    return (
+        "👋 歡迎使用 BGS AI 預測分析！\n"
+        "【使用步驟】\n"
+        "1️⃣ 選擇館別（輸入 1~10）\n"
+        "2️⃣ 輸入桌號（例：DG01）\n"
+        "3️⃣ 輸入本金（例：5000）\n"
+        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）\n"
+        f"💾 試用剩餘：{left}\n\n"
+        "【請選擇遊戲館別】\n"
+        "1. WM\n"
+        "2. PM\n"
+        "3. DG\n"
+        "4. SA\n"
+        "5. KU\n"
+        "6. 歐博/卡利\n"
+        "7. KG\n"
+        "8. 金利\n"
+        "9. 名人\n"
+        "10. MT真人\n"
+        "(請直接輸入數字1-10)"
+    )
+
+# —— 功能鍵（固定 ≤7） —— #
+def settings_quickreply(sess) -> list:
+    return [
+        _qr_btn("選館別", "設定 館別"),
+        _qr_btn("查看統計", "查看統計"),
+        _qr_btn("試用剩餘", "試用剩餘"),
+        _qr_btn("顯示模式 smart", "顯示模式 smart"),
+        _qr_btn("顯示模式 basic", "顯示模式 basic"),
+        _qr_btn("顯示模式 none", "顯示模式 none"),
+        _qr_btn("重設流程", "重設"),
+    ]
+
+# —— 館別鍵：1~10（10 個，配合 LINE 上限 13） —— #
+def halls_quickreply() -> list:
+    return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
+
+# ----------------- Core Predict Flow -----------------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
-    # 「和」快速通道：p_pts=b_pts=0 表示只更新 outcome，不用點差權重
     if not (p_pts == 0 and b_pts == 0):
         if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
             return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
 
     pf = _get_pf_from_sess(sess)
 
-    # ===== 記錄 outcome =====
     if p_pts == b_pts and not (p_pts == 0 and b_pts == 0):
         try: pf.update_outcome(2)
         except Exception: pass
@@ -264,17 +322,14 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             try: pf.update_outcome(outcome)
             except Exception: pass
 
-    # ===== 預測 =====
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_final = p_raw / np.sum(p_raw)
 
     mode = os.getenv("MODEL_MODE","indep").strip().lower()
     if mode == "indep":
-        p_final = np.clip(p_final, 0.01, 0.98)
-        p_final = p_final / np.sum(p_final)
+        p_final = np.clip(p_final, 0.01, 0.98); p_final = p_final / np.sum(p_final)
     else:
-        # 溫度 + EMA
         p_temp = np.exp(np.log(np.clip(p_final,1e-9,1.0)) / float(os.getenv("PROB_TEMP","1.0")))
         p_temp = p_temp / np.sum(p_temp)
         alpha = float(os.getenv("PROB_SMA_ALPHA","0.60"))
@@ -284,7 +339,6 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
 
-    # ===== EV（tie=0 EV）=====
     BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
     ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
     ev_p = pP * 1.0            - (1.0 - pP - pT)
@@ -294,14 +348,10 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if abs(ev_b - ev_p) < 0.005:
         ev_choice = "莊" if pB > pP else "閒"
         edge_ev = max(ev_b, ev_p) + 0.002
-
     if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
-        ev_choice = "莊" if pB > pP else "閒"
-        edge_ev = 0.015
+        ev_choice = "莊" if pB > pP else "閒"; edge_ev = 0.015
 
-    # ===== 觀望條件 =====
-    watch = False
-    reasons = []
+    watch, reasons = False, []
     EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.004"))
     if edge_ev < EDGE_ENTER_EV:
         watch = True; reasons.append(f"EV優勢{edge_ev*100:.1f}%不足")
@@ -312,18 +362,16 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if abs(edge_ev - last_gap) > instab:
         if abs(edge_ev - last_gap) > (instab * 1.5):
             watch = True; reasons.append("勝率波動大")
-    # 勝率差門檻
     enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.03"))
     top2 = sorted([pB, pP, pT], reverse=True)[:2]
     if (top2[0] - top2[1]) < enter_gap_min:
         watch = True; reasons.append("勝率差不足")
 
-    # ===== 配注 =====
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0; bet_amt = 0
     if not watch:
         conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_pct = 0.10 + (conf * 0.20)  # 10%~30%
+        base_pct = 0.10 + (conf * 0.20)
         prob_diff = abs(pB - pP)
         if prob_diff > 0.25:
             base_pct = min(0.30, base_pct + min(0.12, conf * 0.15))
@@ -337,19 +385,15 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             bet_amt = int(round(bankroll * bet_pct))
             bet_amt = max(0, int(round(bet_amt / unit)) * unit)
 
-    # ===== 統計 =====
     st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
     if real_label == "和":
         st["push"] += 1
     else:
         if not watch:
-            st["bets"] += 1
-            st["sum_edge"] += float(edge_ev)
+            st["bets"] += 1; st["sum_edge"] += float(edge_ev)
             if ev_choice == real_label:
-                if real_label == "莊":
-                    st["payout"] += int(round(bet_amt * (1.0 - BCOMM)))
-                else:
-                    st["payout"] += int(bet_amt)
+                if real_label == "莊": st["payout"] += int(round(bet_amt * (1.0 - BCOMM)))
+                else:                 st["payout"] += int(bet_amt)
                 st["wins"] += 1
             else:
                 st["payout"] -= int(bet_amt)
@@ -385,86 +429,9 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     msg.extend([
         "—",
         "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
-        "⚙️ 輸入「設定」可開啟快速按鈕（館別/統計/試用/顯示模式/重設）"
+        "⚙️ 輸入「設定」可開啟功能按鈕；或點「選館別」看 1~10"
     ])
     return "\n".join(msg)
-
-# ----------------- LINE SDK -----------------
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
-    QuickReply, QuickReplyButton, MessageAction
-)
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-def _qr_btn(label, text):
-    return QuickReplyButton(action=MessageAction(label=label, text=text))
-
-def _reply(token, text, quick=None):
-    try:
-        if quick:
-            line_bot_api.reply_message(
-                token,
-                TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
-            )
-        else:
-            line_bot_api.reply_message(token, TextSendMessage(text=text))
-    except Exception as e:
-        print("LINE reply_message error:", e)
-
-def welcome_text(uid):
-    left = _left_trial_sec(uid)
-    return (
-        "👋 歡迎使用 BGS AI 預測分析！\n"
-        "【使用步驟】\n"
-        "1️⃣ 選擇館別（輸入 1~10 或用快速按鈕）\n"
-        "2️⃣ 輸入桌號（例：DG01）\n"
-        "3️⃣ 輸入本金（例：5000）\n"
-        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）\n"
-        f"💾 試用剩餘：{left}\n\n"
-        "（輸入「設定」可顯示快速按鈕）"
-    )
-
-# —— 修正：Quick Reply 上限 13 —— #
-def settings_quickreply(sess) -> list:
-    # 先放功能鍵（7 個），再視需要補館別數字，但總數不超過 13
-    base = [
-        _qr_btn("選館別", "設定 館別"),
-        _qr_btn("查看統計", "查看統計"),
-        _qr_btn("試用剩餘", "試用剩餘"),
-        _qr_btn("顯示模式 smart", "顯示模式 smart"),
-        _qr_btn("顯示模式 basic", "顯示模式 basic"),
-        _qr_btn("顯示模式 none", "顯示模式 none"),
-        _qr_btn("重設流程", "重設"),
-    ]
-    items = list(base)
-
-    # 尚未選館別時，補 1~10，但維持總數 <= 13
-    if not sess.get("hall_id"):
-        remain = 13 - len(items)
-        for i in range(1, 11):
-            if remain <= 0:
-                break
-            items.append(_qr_btn(f"{i}", f"{i}"))
-            remain -= 1
-
-    return items[:13]  # 最終保險：截到 13
-
-@app.route("/line-webhook", methods=['POST'])
-def callback():
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except Exception as e:
-        print("LINE webhook error:", e)
-    return "ok", 200
 
 def _format_stats(sess):
     st = sess.get("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
@@ -472,6 +439,7 @@ def _format_stats(sess):
     acc = (wins / bets * 100.0) if bets>0 else 0.0
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
+# ----------------- Handlers -----------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
@@ -516,7 +484,7 @@ def handle_message(event):
         return
     if text == "重設":
         SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請重新選館別/桌號/本金。", quick=settings_quickreply(SESS[user_id])); return
+        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
 
     # 首次流程：館別 -> 桌號 -> 本金
     if not sess.get("hall_id"):
@@ -526,11 +494,9 @@ def handle_message(event):
             hall_name = hall_map[int(text)-1]
             _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
         elif text == "設定 館別":
-            # —— 修正：此分支只顯示 1~10 共 10 個數字鍵（不含功能鍵），避免超過 13 上限 —— #
-            items = [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=items)
+            _reply(event.reply_token, "請選擇館別（1-10）：", quick=halls_quickreply())
         else:
-            _reply(event.reply_token, welcome_text(user_id), quick=settings_quickreply(sess))
+            _reply(event.reply_token, welcome_text(user_id), quick=halls_quickreply())
         return
 
     if not sess.get("table_id"):
