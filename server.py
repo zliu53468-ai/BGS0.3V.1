@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
-相容強化版 pfilter.py：
-- 正確 EV：下注莊/閒時，和局=0 EV；BANKER_COMMISSION 套用
-- 觀望規則：EV門檻/和局風險/勝率差門檻/波動監測
-- 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
+強化：信心→配注映射重做（可調 sigmoid）、移除固定+10%底、讓高/中/低配注清楚分層
 """
 
-import os, sys, re, time, json, logging
+import os, sys, re, time, json, logging, math
 from typing import Dict, Any
 import numpy as np
 
@@ -63,7 +60,8 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- Tunables / Defaults (server + pfilter對齊) ----------
+# ---------- Tunables / Defaults ----------
+# 核心策略/觀望
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
 os.environ.setdefault("EDGE_ENTER_EV", "0.004")
 os.environ.setdefault("ENTER_GAP_MIN", "0.03")
@@ -71,13 +69,27 @@ os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
 os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
 
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.03")
-os.environ.setdefault("MAX_BET_PCT", "0.25")
+# 配注上下限與形狀（★ 新增/調整）
+os.environ.setdefault("MIN_BET_PCT_BASE", "0.03")   # 3%
+os.environ.setdefault("MAX_BET_PCT", "0.30")        # 可放大到 0.35/0.40 視風險偏好
 os.environ.setdefault("BET_UNIT", "100")
+os.environ.setdefault("CONF_GAMMA", "1.25")         # >1 使中低信心更保守
+os.environ.setdefault("LABEL_LOW_FRAC", "0.33")     # 低/中/高分段（以[min,max]線性等分）
+os.environ.setdefault("LABEL_MID_FRAC", "0.66")
 
+# 信心計算（★ 新增/調整）
+# EV sigmoid 的中心與寬度：0.004~0.02 的 EV 區間可映射到 0~1
+os.environ.setdefault("CONF_EV_MID", "0.012")       # S 型中點（~對應 50%信心）
+os.environ.setdefault("CONF_EV_SPREAD", "0.006")    # 越小越陡
+# 勝率差飽和項：1-exp(-k*|pB-pP|)
+os.environ.setdefault("PROB_BONUS_K", "2.0")        # 越大越快飽和
+os.environ.setdefault("CONF_PROB_WEIGHT", "0.40")   # 0~1：勝率差權重；EV 權重=1-此值
+
+# 機率平滑
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
+# PF / 模式（與 pfilter 對齊）
 os.environ.setdefault("MODEL_MODE", "indep")   # indep | learn
 os.environ.setdefault("DECKS", "6")
 os.environ.setdefault("PF_N", "80")
@@ -87,6 +99,7 @@ os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
 
+# 先驗/抖動/歷史參數
 os.environ.setdefault("PRIOR_B", "0.452")
 os.environ.setdefault("PRIOR_P", "0.452")
 os.environ.setdefault("PRIOR_T", "0.096")
@@ -95,6 +108,7 @@ os.environ.setdefault("PF_DECAY", "0.985")
 os.environ.setdefault("PROB_JITTER", "0.006")
 os.environ.setdefault("HISTORICAL_WEIGHT", "0.2")
 
+# Tie 動態平滑（若你有強化版 pfilter）
 os.environ.setdefault("TIE_MIN", "0.03")
 os.environ.setdefault("TIE_MAX", "0.18")
 os.environ.setdefault("DYNAMIC_TIE_RANGE", "1")
@@ -106,6 +120,7 @@ os.environ.setdefault("TIE_DELTA", "0.35")
 os.environ.setdefault("TIE_MAX_CAP", "0.25")
 os.environ.setdefault("TIE_MIN_FLOOR", "0.01")
 
+# 強化版歷史/粒子視窗
 os.environ.setdefault("HIST_WIN", "60")
 os.environ.setdefault("HIST_PSEUDO", "1.0")
 os.environ.setdefault("HIST_WEIGHT_MAX", "0.35")
@@ -113,6 +128,9 @@ os.environ.setdefault("PF_WIN", "50")
 os.environ.setdefault("PF_ALPHA", "0.5")
 os.environ.setdefault("PF_WEIGHT_MAX", "0.7")
 os.environ.setdefault("PF_WEIGHT_K", "80")
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
 
 # ----------------- PF Loader -----------------
 OutcomePF = None
@@ -194,12 +212,36 @@ def _left_trial_sec(user_id):
     return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
 
 # ----------------- Strategy helpers -----------------
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
 def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    selected_ev = ev_b if choice == "莊" else ev_p
-    base_conf = max(0, selected_ev) * 60
+    """
+    將 EV 與勝率差分別映射到 0~1 再做加權，避免幾乎都落在 >0.5 的壓縮問題。
+    - EV 映射：sigmoid( (EV - MID) / SPREAD )
+    - 勝率差映射：1 - exp(-K * |pB - pP|)
+    環境變數：
+      CONF_EV_MID, CONF_EV_SPREAD, PROB_BONUS_K, CONF_PROB_WEIGHT
+    """
+    sel_ev = max(0.0, ev_b if choice == "莊" else ev_p)
+    ev_mid    = float(os.getenv("CONF_EV_MID", "0.012"))
+    ev_spread = max(1e-9, float(os.getenv("CONF_EV_SPREAD", "0.006")))
+    k_prob    = float(os.getenv("PROB_BONUS_K", "2.0"))
+    w_prob    = float(os.getenv("CONF_PROB_WEIGHT", "0.40"))
+    w_ev = 1.0 - w_prob
+
+    # 0. EV → 0~1
+    z = (sel_ev - ev_mid) / ev_spread
+    ev_conf = _sigmoid(z)             # 0~1；ev=mid → 0.5
+
+    # 1. 勝率差 → 0~1 飽和
     prob_adv = abs(pB - pP)
-    prob_bonus = min(0.5, prob_adv * 2.5)
-    return min(1.0, base_conf + prob_bonus)
+    prob_conf = 1.0 - math.exp(-k_prob * prob_adv)  # 0~1，差距越大越接近 1
+
+    # 2. 融合
+    conf = w_ev * ev_conf + w_prob * prob_conf
+    # 3. 邊界
+    return max(0.0, min(1.0, conf))
 
 def get_stats_display(sess):
     mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
@@ -254,7 +296,7 @@ def _reply(token, text, quick=None):
     except Exception as e:
         print("LINE reply_message error:", e)
 
-# —— 完全對齊你的歡迎文案 —— #
+# —— 歡迎文案（照你的截圖） —— #
 def welcome_text(uid):
     left = _left_trial_sec(uid)
     return (
@@ -279,7 +321,6 @@ def welcome_text(uid):
         "(請直接輸入數字1-10)"
     )
 
-# —— 功能鍵（固定 ≤7） —— #
 def settings_quickreply(sess) -> list:
     return [
         _qr_btn("選館別", "設定 館別"),
@@ -302,6 +343,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     pf = _get_pf_from_sess(sess)
 
+    # 記錄 outcome
     if p_pts == b_pts and not (p_pts == 0 and b_pts == 0):
         try: pf.update_outcome(2)
         except Exception: pass
@@ -321,6 +363,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             try: pf.update_outcome(outcome)
             except Exception: pass
 
+    # 預測
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_final = p_raw / np.sum(p_raw)
@@ -338,6 +381,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
 
+    # EV（tie=0 EV）
     BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
     ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
     ev_p = pP * 1.0            - (1.0 - pP - pT)
@@ -350,6 +394,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
         ev_choice = "莊" if pB > pP else "閒"; edge_ev = 0.015
 
+    # 觀望條件
     watch, reasons = False, []
     EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.004"))
     if edge_ev < EDGE_ENTER_EV:
@@ -366,24 +411,24 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if (top2[0] - top2[1]) < enter_gap_min:
         watch = True; reasons.append("勝率差不足")
 
+    # 配注（★ 全新映射：min + (max-min) * conf^gamma）
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0; bet_amt = 0
     if not watch:
         conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_pct = 0.10 + (conf * 0.20)
-        prob_diff = abs(pB - pP)
-        if prob_diff > 0.25:
-            base_pct = min(0.30, base_pct + min(0.12, conf * 0.15))
-        elif prob_diff > 0.15:
-            base_pct = min(0.30, base_pct + min(0.08, conf * 0.10))
-        base_pct = max(float(os.getenv("MIN_BET_PCT_BASE","0.03")), base_pct)
-        base_pct = min(float(os.getenv("MAX_BET_PCT","0.25")), base_pct)
-        bet_pct = base_pct
+        min_pct = float(os.getenv("MIN_BET_PCT_BASE","0.03"))
+        max_pct = float(os.getenv("MAX_BET_PCT","0.30"))
+        gamma   = max(0.5, float(os.getenv("CONF_GAMMA","1.25")))  # 0.5~3 建議
+
+        # 映射：低信心接近 min_pct，高信心逼近 max_pct
+        bet_pct = min_pct + (max_pct - min_pct) * (conf ** gamma)
+
         if bankroll > 0 and bet_pct > 0:
             unit = int(os.getenv("BET_UNIT","100"))
             bet_amt = int(round(bankroll * bet_pct))
             bet_amt = max(0, int(round(bet_amt / unit)) * unit)
 
+    # 統計
     st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
     if real_label == "和":
         st["push"] += 1
@@ -397,6 +442,20 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             else:
                 st["payout"] -= int(bet_amt)
 
+    # 信心等級標籤（依目前 min~max 範圍比例分段）
+    min_pct = float(os.getenv("MIN_BET_PCT_BASE","0.03"))
+    max_pct = float(os.getenv("MAX_BET_PCT","0.30"))
+    low_frac = float(os.getenv("LABEL_LOW_FRAC","0.33"))
+    mid_frac = float(os.getenv("LABEL_MID_FRAC","0.66"))
+    low_cut = min_pct + (max_pct - min_pct) * low_frac
+    mid_cut = min_pct + (max_pct - min_pct) * mid_frac
+    if watch:
+        strat = f"⚠️ 觀望（{'、'.join(reasons)}）"
+    else:
+        if bet_pct < low_cut:        strat = f"🟡 低信心配注 {bet_pct*100:.1f}%"
+        elif bet_pct < mid_cut:      strat = f"🟠 中信心配注 {bet_pct*100:.1f}%"
+        else:                        strat = f"🟢 高信心配注 {bet_pct*100:.1f}%"
+
     pred_label = "觀望" if watch else ev_choice
     sess.setdefault("hist_pred", []).append(pred_label)
     sess.setdefault("hist_real", []).append(real_label)
@@ -406,12 +465,6 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     sess["last_prob_gap"] = edge_ev
 
     stats_display = get_stats_display(sess)
-    strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.15 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.25 else
-        f"🟢 高信心配注 {bet_pct*100:.1f}%"
-    )
-
     msg = [
         sess["last_pts_text"],
         "開始分析下局....",
@@ -438,7 +491,7 @@ def _format_stats(sess):
     acc = (wins / bets * 100.0) if bets>0 else 0.0
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
-# ----------------- LINE webhook route (FIX 404) -----------------
+# ----------------- LINE webhook route -----------------
 @app.post("/line-webhook")
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
