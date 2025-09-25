@@ -431,20 +431,30 @@ def welcome_text(uid):
         "（輸入「設定」可顯示快速按鈕）"
     )
 
+# —— 修正：Quick Reply 上限 13 —— #
 def settings_quickreply(sess) -> list:
-    items = [
+    # 先放功能鍵（7 個），再視需要補館別數字，但總數不超過 13
+    base = [
         _qr_btn("選館別", "設定 館別"),
         _qr_btn("查看統計", "查看統計"),
         _qr_btn("試用剩餘", "試用剩餘"),
         _qr_btn("顯示模式 smart", "顯示模式 smart"),
         _qr_btn("顯示模式 basic", "顯示模式 basic"),
         _qr_btn("顯示模式 none", "顯示模式 none"),
-        _qr_btn("重設流程", "重設")
+        _qr_btn("重設流程", "重設"),
     ]
+    items = list(base)
+
+    # 尚未選館別時，補 1~10，但維持總數 <= 13
     if not sess.get("hall_id"):
+        remain = 13 - len(items)
         for i in range(1, 11):
+            if remain <= 0:
+                break
             items.append(_qr_btn(f"{i}", f"{i}"))
-    return items[:20]
+            remain -= 1
+
+    return items[:13]  # 最終保險：截到 13
 
 @app.route("/line-webhook", methods=['POST'])
 def callback():
@@ -516,7 +526,9 @@ def handle_message(event):
             hall_name = hall_map[int(text)-1]
             _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
         elif text == "設定 館別":
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=settings_quickreply(sess))
+            # —— 修正：此分支只顯示 1~10 共 10 個數字鍵（不含功能鍵），避免超過 13 上限 —— #
+            items = [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
+            _reply(event.reply_token, "請選擇館別（1-10）：", quick=items)
         else:
             _reply(event.reply_token, welcome_text(user_id), quick=settings_quickreply(sess))
         return
