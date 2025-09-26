@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-pfilter.py — 粒子濾波/貝氏簡化器（強化版）
+pfilter.py — 粒子濾波/貝氏簡化器（強化版・含自動抖動強度計算）
 修補點：
 1) 動態和局範圍：加入 Beta 先驗 + EMA 平滑；樣本不足時保持原範圍
 2) PF/歷史視窗：使用較長視窗 + Dirichlet/Laplace 平滑，避免 0 機率
 3) 學習權重 pf_weight：依有效樣本量自動調整，與視窗一致
 4) 擾動策略：採用 Dirichlet 抖動（機率單純上），避免高斯剪裁偏差
+5) 新增 _compute_jitter_strength()：依樣本量與 PROB_JITTER, PROB_JITTER_SCALE 自動計算 alpha strength
 """
 
 import os
@@ -50,7 +51,10 @@ TIE_MIN_SAMPLES = _env_int("TIE_MIN_SAMPLES", "40")  # 样本不足時不動態�
 TIE_DELTA = _env_float("TIE_DELTA", "0.35")          # ±35% 漂移範圍（較保守）
 
 # Indeps / history smoothing
-PROB_JITTER = _env_float("PROB_JITTER", "0.006")  # 抖動強度（僅控制 Dirichlet 強度）
+PROB_JITTER = _env_float("PROB_JITTER", "0.006")  # 抖動底強度（越小 → 越穩）
+# 抖動強度上限與樣本量縮放：新增兩個參數讓你在不改碼下可微調
+PROB_JITTER_SCALE = _env_float("PROB_JITTER_SCALE", "16.0")         # 樣本量縮放因子（n/scale）
+PROB_JITTER_STRENGTH_MAX = _env_float("PROB_JITTER_STRENGTH_MAX", "400.0")  # alpha 上限
 HISTORICAL_WEIGHT = _env_float("HISTORICAL_WEIGHT", "0.2")
 HIST_WIN = _env_int("HIST_WIN", "60")             # 歷史視窗（比 20 大，降噪）
 HIST_PSEUDO = _env_float("HIST_PSEUDO", "1.0")    # Laplace 偽計數
@@ -194,6 +198,27 @@ class OutcomePF:
         mixed = probs * (1 - w) + hist_probs * w
         return mixed / mixed.sum()
 
+    # -------- jitter strength helper --------
+    def _compute_jitter_strength(self) -> Optional[float]:
+        """
+        依樣本量自動調整擾動強度：樣本越多 → 抖動越小。
+        回傳 alpha strength；若不需要抖動則回傳 None。
+        """
+        if PROB_JITTER <= 0:
+            return None
+
+        # 基礎強度：PROB_JITTER 越小，alpha 越大（抖動越小）
+        base = max(50.0, min(PROB_JITTER_STRENGTH_MAX, 1.0 / max(1e-6, PROB_JITTER)))
+        n = len(self.history_window)
+        if n <= 0 or PROB_JITTER_SCALE <= 0:
+            return base
+
+        # 樣本多時加大 Dirichlet α，抑制噪音；限制最大放大量，避免溢出
+        growth = 1.0 + min(4.0, n / PROB_JITTER_SCALE)  # 最多放大到 ~5x
+        strength = base * growth
+        return float(np.clip(strength, 50.0, PROB_JITTER_STRENGTH_MAX))
+
+    # -------- PF approx / posterior --------
     def _particle_filter_predict(self) -> np.ndarray:
         """
         PF 近似：使用較長視窗 + Dirichlet 平滑，避免 0 機率。
@@ -233,9 +258,8 @@ class OutcomePF:
             probs = self._light_historical_update(probs)
 
             # 採 Dirichlet 擾動（在機率單純上）
-            if PROB_JITTER > 0:
-                # PROB_JITTER 作為 1/strength 的近似控制，值越小 → 擾動越小
-                strength = max(50.0, min(400.0, 1.0 / max(1e-6, PROB_JITTER)))
+            strength = self._compute_jitter_strength()
+            if strength is not None:
                 probs = self._dirichlet_jitter(probs, strength)
 
         elif MODEL_MODE == "learn":
