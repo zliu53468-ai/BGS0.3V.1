@@ -32,7 +32,7 @@ if _has_flask:
 
     @app.get("/health")
     def health():
-        return jsonify(ok=True, ts=time.time(), msg="API normal"), 200
+        return jsonify(ok=True, ts=time.time(), msg="API normal", pf_status=PF_STATUS), msg="API normal"), 200
 else:
     class _DummyApp:
         def get(self, *a, **k):
@@ -131,23 +131,50 @@ class _DummyPF:
     def predict(self, **k): return np.array([0.458, 0.446, 0.096], dtype=np.float32)
     def update_point_history(self, p_pts, b_pts): pass
 
+
 def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
-    if OutcomePF:
-        if sess.get("pf") is None:
+    """Get particle filter for the session, tracking failures explicitly."""
+    global PF_STATUS
+
+    if not OutcomePF:
+        PF_STATUS = {"ready": False, "error": "OutcomePF module missing"}
+        sess["_pf_dummy"] = True
+        return _DummyPF()
+
+    if sess.get("pf") is None and not sess.get("_pf_failed"):
+        try:
+            sess["pf"] = OutcomePF(
+                decks=int(os.getenv("DECKS", "6")),
+                seed=int(os.getenv("SEED", "42")) + int(time.time() % 1000),
+                n_particles=int(os.getenv("PF_N", "80")),
+                sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "36"))),
+                resample_thr=float(os.getenv("PF_RESAMPLE", "0.73")),
+                backend=os.getenv("PF_BACKEND", "mc"),
+                dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.012")),
+            )
+            PF_STATUS = {"ready": True, "error": None}
+            sess.pop("_pf_dummy", None)
+        except Exception as exc:
+            sess["_pf_failed"] = True
+            sess["_pf_dummy"] = True
+            sess["_pf_error_msg"] = str(exc)
+            PF_STATUS = {"ready": False, "error": str(exc)}
             try:
-                sess["pf"] = OutcomePF(
-                    decks=int(os.getenv("DECKS","6")),
-                    seed=int(os.getenv("SEED","42")) + int(time.time() % 1000),
-                    n_particles=int(os.getenv("PF_N","80")),
-                    sims_lik=max(1,int(os.getenv("PF_UPD_SIMS","36"))),
-                    resample_thr=float(os.getenv("PF_RESAMPLE","0.73")),
-                    backend=os.getenv("PF_BACKEND","mc"),
-                    dirichlet_eps=float(os.getenv("PF_DIR_EPS","0.012")),
-                )
+                log.exception("Failed to initialise OutcomePF; falling back to dummy model")
             except Exception:
-                sess["pf"] = _DummyPF()
-        return sess["pf"]
-    return _DummyPF()
+                pass
+
+    pf = sess.get("pf")
+    if pf is None:
+        sess["_pf_dummy"] = True
+        if isinstance(PF_STATUS, dict) and PF_STATUS.get("error") and not sess.get("_pf_error_msg"):
+            sess["_pf_error_msg"] = PF_STATUS["error"]
+        return _DummyPF()
+
+    sess.pop("_pf_dummy", None)
+    sess.pop("_pf_error_msg", None)
+    return pf
+
 
 # ----------------- Trial / Open -----------------
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
@@ -424,6 +451,10 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         f"建議下注金額：{bet_amt:,}",
         f"配注策略：{strat}",
     ]
+    if sess.get("_pf_dummy"):
+        warn = sess.get("_pf_error_msg") or (PF_STATUS.get("error") if isinstance(PF_STATUS, dict) else None)
+        detail = f"（{warn}）" if warn else ""
+        msg.append(f"⚠️ 預測引擎載入失敗，僅提供靜態機率{detail}".strip())
     if stats_display: msg.append(stats_display)
     msg.extend([
         "—",
