@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 pfilter.py — 粒子濾波/貝氏簡化器（強化版・含自動抖動強度計算）
-修補點：
-1) 動態和局範圍：加入 Beta 先驗 + EMA 平滑；樣本不足時保持原範圍
-2) PF/歷史視窗：使用較長視窗 + Dirichlet/Laplace 平滑，避免 0 機率
-3) 學習權重 pf_weight：依有效樣本量自動調整，與視窗一致
-4) 擾動策略：採用 Dirichlet 抖動（機率單純上），避免高斯剪裁偏差
-5) 新增 _compute_jitter_strength()：依樣本量與 PROB_JITTER, PROB_JITTER_SCALE 自動計算 alpha strength
+
+特性：
+1) 動態和局範圍：Beta 先驗 + EMA；樣本不足不動
+2) 歷史視窗與 PF：長視窗 + Dirichlet/Laplace 平滑，避免 0 機率
+3) learn 權重：依樣本量動態、受上限控制
+4) 擾動：Dirichlet 擾動（在機率單純上），避免高斯+clip 偏差
+5) _compute_jitter_strength()：依樣本量＆環境變數自動算 α 強度
+
+更新：
+- OutcomePF._dirichlet_jitter 的 α 公式改為：
+    α = clip(probs, EPS, 1.0) * strength
+  保持零避讓夾位（EPS）同時移除加性偏移（不再 +1）。
 """
 
 import os
@@ -47,18 +53,17 @@ DYNAMIC_TIE_RANGE = _env_flag("DYNAMIC_TIE_RANGE", "1")
 TIE_BETA_A = _env_float("TIE_BETA_A", "9.6")     # Beta 先驗：以 9.6% * 100 手的概念
 TIE_BETA_B = _env_float("TIE_BETA_B", "90.4")
 TIE_EMA_ALPHA = _env_float("TIE_EMA_ALPHA", "0.2")
-TIE_MIN_SAMPLES = _env_int("TIE_MIN_SAMPLES", "40")  # 样本不足時不動態調整
+TIE_MIN_SAMPLES = _env_int("TIE_MIN_SAMPLES", "40")  # 樣本不足時不動態調整
 TIE_DELTA = _env_float("TIE_DELTA", "0.35")          # ±35% 漂移範圍（較保守）
 
 # Indeps / history smoothing
 PROB_JITTER = _env_float("PROB_JITTER", "0.006")  # 抖動底強度（越小 → 越穩）
-# 抖動強度上限與樣本量縮放：新增兩個參數讓你在不改碼下可微調
-PROB_JITTER_SCALE = _env_float("PROB_JITTER_SCALE", "16.0")         # 樣本量縮放因子（n/scale）
-PROB_JITTER_STRENGTH_MAX = _env_float("PROB_JITTER_STRENGTH_MAX", "400.0")  # alpha 上限
+PROB_JITTER_SCALE = _env_float("PROB_JITTER_SCALE", "16.0")         # 樣本量縮放（n/scale）
+PROB_JITTER_STRENGTH_MAX = _env_float("PROB_JITTER_STRENGTH_MAX", "400.0")  # α 上限
 HISTORICAL_WEIGHT = _env_float("HISTORICAL_WEIGHT", "0.2")
 HIST_WIN = _env_int("HIST_WIN", "60")             # 歷史視窗（比 20 大，降噪）
 HIST_PSEUDO = _env_float("HIST_PSEUDO", "1.0")    # Laplace 偽計數
-HIST_WEIGHT_MAX = _env_float("HIST_WEIGHT_MAX", "0.35")  # indep混合上限
+HIST_WEIGHT_MAX = _env_float("HIST_WEIGHT_MAX", "0.35")  # indep 混合上限
 
 # Particle filter approx
 PF_WIN = _env_int("PF_WIN", "50")                 # PF 近似視窗長度（比 10 大）
@@ -168,9 +173,16 @@ class OutcomePF:
     def _dirichlet_jitter(self, probs: np.ndarray, strength: float = 120.0) -> np.ndarray:
         """
         在機率單純上做 Dirichlet 擾動，避免高斯 + clip 的結構性偏差。
-        strength 越大 → 抖動越小（α = probs * strength + 1）
+
+        新公式（無加性偏移）：
+            α = clip(probs, EPS, 1.0) * strength
+
+        說明：
+        - strength 越大 → 擾動越小
+        - 以 EPS 做零避讓夾位，避免 α 為 0
         """
-        alpha = np.clip(probs, EPS, 1.0) * strength + 1.0
+        s = float(max(EPS, strength))
+        alpha = np.clip(probs, EPS, 1.0) * s
         return self.rng.dirichlet(alpha)
 
     def _light_historical_update(self, probs: np.ndarray) -> np.ndarray:
