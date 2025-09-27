@@ -5,11 +5,20 @@ server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
 - 正確 EV：下注莊/閒時，和局=0 EV；BANKER_COMMISSION 套用
 - 觀望規則：EV門檻/和局風險/勝率差門檻/波動監測
 - 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
+
+本版修繕：
+- 試用流程修正：先 _start_trial 再驗證，避免新用戶被門檻阻擋
+- /health 回傳 pf_status
+- PF_STATUS 狀態追蹤與 Dummy 回退警示
+- 命中率修正：pending_pred 機制（上一局建議，下一局結果配對後才寫入統計）
+- 信心度/配注溫和化：避免飽和、乾淨落入低/中/高三段
 """
 
 import os, sys, re, time, json, logging
 from typing import Dict, Any
 import numpy as np
+
+log = logging.getLogger("bgs-server")
 
 # ----------------- Flask -----------------
 try:
@@ -32,7 +41,7 @@ if _has_flask:
 
     @app.get("/health")
     def health():
-        return jsonify(ok=True, ts=time.time(), msg="API normal", pf_status=PF_STATUS), msg="API normal"), 200
+        return jsonify(ok=True, ts=time.time(), msg="API normal", pf_status=PF_STATUS), 200
 else:
     class _DummyApp:
         def get(self, *a, **k):
@@ -71,8 +80,8 @@ os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
 os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
 
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.03")
-os.environ.setdefault("MAX_BET_PCT", "0.25")
+os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")  # 讓低信心能落在 2% 起
+os.environ.setdefault("MAX_BET_PCT", "0.35")       # 提高上限，避免一上來打頂
 os.environ.setdefault("BET_UNIT", "100")
 
 os.environ.setdefault("PROB_TEMP", "1.0")
@@ -87,24 +96,17 @@ os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
 
-os.environ.setdefault("PRIOR_B", "0.452")
-os.environ.setdefault("PRIOR_P", "0.452")
-os.environ.setdefault("PRIOR_T", "0.096")
-os.environ.setdefault("PRIOR_STRENGTH", "40")
-os.environ.setdefault("PF_DECAY", "0.985")
-os.environ.setdefault("PROB_JITTER", "0.006")
-os.environ.setdefault("HISTORICAL_WEIGHT", "0.2")
-
+# Tie (動態和局由 pfilter.py 控)
 os.environ.setdefault("TIE_MIN", "0.03")
 os.environ.setdefault("TIE_MAX", "0.18")
+os.environ.setdefault("TIE_MAX_CAP", "0.25")
+os.environ.setdefault("TIE_MIN_FLOOR", "0.01")
 os.environ.setdefault("DYNAMIC_TIE_RANGE", "1")
 os.environ.setdefault("TIE_BETA_A", "9.6")
 os.environ.setdefault("TIE_BETA_B", "90.4")
 os.environ.setdefault("TIE_EMA_ALPHA", "0.2")
 os.environ.setdefault("TIE_MIN_SAMPLES", "40")
 os.environ.setdefault("TIE_DELTA", "0.35")
-os.environ.setdefault("TIE_MAX_CAP", "0.25")
-os.environ.setdefault("TIE_MIN_FLOOR", "0.01")
 
 os.environ.setdefault("HIST_WIN", "60")
 os.environ.setdefault("HIST_PSEUDO", "1.0")
@@ -126,11 +128,12 @@ except Exception:
     except Exception:
         OutcomePF = None
 
+PF_STATUS = {"ready": OutcomePF is not None, "error": None}
+
 class _DummyPF:
     def update_outcome(self, outcome): pass
     def predict(self, **k): return np.array([0.458, 0.446, 0.096], dtype=np.float32)
     def update_point_history(self, p_pts, b_pts): pass
-
 
 def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
     """Get particle filter for the session, tracking failures explicitly."""
@@ -175,7 +178,6 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
     sess.pop("_pf_error_msg", None)
     return pf
 
-
 # ----------------- Trial / Open -----------------
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
 OPENCODE = os.getenv("OPENCODE", "aaa8881688")
@@ -196,14 +198,19 @@ def _set_user_info(user_id, info):
     SESS[user_id] = info
 
 def _is_trial_valid(user_id):
+    """若永久開通 or 試用中則允許；缺 trial_start 時交由 handler 先行 _start_trial 再驗證。"""
     info = _get_user_info(user_id)
-    if info.get("is_opened"): return True
-    if not info.get("trial_start"): return False
+    if info.get("is_opened"):  # 永久開通
+        return True
+    if not info.get("trial_start"):
+        # 這裡不直接拒絕；handler 會先 _start_trial 再重新驗證
+        return True
     return (_now() - int(info["trial_start"])) < TRIAL_SECONDS
 
 def _start_trial(user_id):
     info = _get_user_info(user_id)
-    if info.get("is_opened"): return
+    if info.get("is_opened"):
+        return
     if not info.get("trial_start"):
         info["trial_start"] = _now()
         _set_user_info(user_id, info)
@@ -222,11 +229,24 @@ def _left_trial_sec(user_id):
 
 # ----------------- Strategy helpers -----------------
 def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    selected_ev = ev_b if choice == "莊" else ev_p
-    base_conf = max(0, selected_ev) * 60
-    prob_adv = abs(pB - pP)
-    prob_bonus = min(0.5, prob_adv * 2.5)
-    return min(1.0, base_conf + prob_bonus)
+    """
+    溫和化信心度：讓 EV 與勝率差的貢獻更平滑，避免輕易飽和到 1.0。
+    - EV 正規化：以 6% EV 視為滿分；常見 1~3% EV 時只給中低權重
+    - 機率差正規化：以 30 個百分點差視為滿分
+    - 權重：EV 0.6、機率差 0.4；再做輕微壓縮，維持 0~1 區間
+    """
+    edge = max(ev_b, ev_p)            # 取最佳邊際 EV
+    diff = abs(pB - pP)               # 莊/閒機率差
+
+    edge_term = min(1.0, edge / 0.06) # 6% EV => 1.0
+    edge_term = edge_term ** 0.85     # 柔化
+
+    prob_term = min(1.0, diff / 0.30) # 30pp 差 => 1.0
+    prob_term = prob_term ** 0.9      # 柔化
+
+    raw = 0.6 * edge_term + 0.4 * prob_term
+    conf = max(0.0, min(1.0, raw ** 0.95))
+    return float(conf)
 
 def get_stats_display(sess):
     mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
@@ -281,7 +301,7 @@ def _reply(token, text, quick=None):
     except Exception as e:
         print("LINE reply_message error:", e)
 
-# —— 完全對齊你的歡迎文案 —— #
+# —— 歡迎文案 —— #
 def welcome_text(uid):
     left = _left_trial_sec(uid)
     return (
@@ -306,7 +326,7 @@ def welcome_text(uid):
         "(請直接輸入數字1-10)"
     )
 
-# —— 功能鍵（固定 ≤7） —— #
+# —— 功能鍵 —— #
 def settings_quickreply(sess) -> list:
     return [
         _qr_btn("選館別", "設定 館別"),
@@ -321,14 +341,16 @@ def settings_quickreply(sess) -> list:
 def halls_quickreply() -> list:
     return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
 
-# ----------------- Core Predict Flow -----------------
+# ----------------- 核心：讀點數並預測（含 pending 配對） -----------------
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
+    # 參數驗證
     if not (p_pts == 0 and b_pts == 0):
         if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
             return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
 
     pf = _get_pf_from_sess(sess)
 
+    # N 局：先更新實際結果
     if p_pts == b_pts and not (p_pts == 0 and b_pts == 0):
         try: pf.update_outcome(2)
         except Exception: pass
@@ -348,6 +370,38 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
             try: pf.update_outcome(outcome)
             except Exception: pass
 
+    # 將「上一局 pending 建議」與本局結果配對，才寫入歷史與統計
+    st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
+    if "pending_pred" in sess:
+        prev_pred = sess.pop("pending_pred")
+        prev_watch = bool(sess.pop("pending_watch", False))
+        prev_edge = float(sess.pop("pending_edge_ev", 0.0))
+        prev_bet_amt = int(sess.pop("pending_bet_amt", 0))
+        prev_ev_choice = sess.pop("pending_ev_choice", None)
+
+        # 寫入歷史（只在 pending 存在時入列，避免未配對寫入）
+        sess.setdefault("hist_pred", []).append("觀望" if prev_watch else (prev_ev_choice or prev_pred))
+        sess.setdefault("hist_real", []).append(real_label)
+        sess["hist_pred"] = sess["hist_pred"][-200:]
+        sess["hist_real"] = sess["hist_real"][-200:]
+
+        # 統計（只計入有下注且非和局）
+        if not prev_watch and real_label in ("莊","閒"):
+            st["bets"] += 1
+            st["sum_edge"] += float(prev_edge)
+            if (prev_ev_choice or prev_pred) == real_label:
+                if prev_ev_choice == "莊":
+                    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
+                    st["payout"] += int(round(prev_bet_amt * (1.0 - BCOMM)))
+                else:
+                    st["payout"] += int(prev_bet_amt)
+                st["wins"] += 1
+            else:
+                st["payout"] -= int(prev_bet_amt)
+        elif real_label == "和":
+            st["push"] += 1
+
+    # 產生新一局（N+1）建議
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_final = p_raw / np.sum(p_raw)
@@ -393,49 +447,51 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if (top2[0] - top2[1]) < enter_gap_min:
         watch = True; reasons.append("勝率差不足")
 
+    # ==== bet sizing start (溫和化、三段分佈) ====
     bankroll = int(sess.get("bankroll", 0))
-    bet_pct = 0.0; bet_amt = 0
+    bet_pct = 0.0
+    bet_amt = 0
+
     if not watch:
         conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_pct = 0.10 + (conf * 0.20)
         prob_diff = abs(pB - pP)
+
+        base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
+        base_ceiling = 0.28  # conf=1 的基底上限（未含 bump）
+
+        base_pct = base_floor + (base_ceiling - base_floor) * conf
+
+        bump = 0.0
         if prob_diff > 0.25:
-            base_pct = min(0.30, base_pct + min(0.12, conf * 0.15))
+            bump = 0.03
         elif prob_diff > 0.15:
-            base_pct = min(0.30, base_pct + min(0.08, conf * 0.10))
-        base_pct = max(float(os.getenv("MIN_BET_PCT_BASE","0.03")), base_pct)
-        base_pct = min(float(os.getenv("MAX_BET_PCT","0.25")), base_pct)
-        bet_pct = base_pct
+            bump = 0.015
+
+        bet_pct = base_pct + bump
+        bet_pct = max(base_floor, bet_pct)
+        bet_pct = min(float(os.getenv("MAX_BET_PCT", "0.35")), bet_pct)
+
         if bankroll > 0 and bet_pct > 0:
-            unit = int(os.getenv("BET_UNIT","100"))
+            unit = int(os.getenv("BET_UNIT", "100"))
             bet_amt = int(round(bankroll * bet_pct))
             bet_amt = max(0, int(round(bet_amt / unit)) * unit)
+    # ==== bet sizing end ====
 
-    st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    if real_label == "和":
-        st["push"] += 1
-    else:
-        if not watch:
-            st["bets"] += 1; st["sum_edge"] += float(edge_ev)
-            if ev_choice == real_label:
-                if real_label == "莊": st["payout"] += int(round(bet_amt * (1.0 - BCOMM)))
-                else:                 st["payout"] += int(bet_amt)
-                st["wins"] += 1
-            else:
-                st["payout"] -= int(bet_amt)
+    # 存入 pending（等待下一局配對）
+    sess["pending_pred"] = "觀望" if watch else ev_choice
+    sess["pending_watch"] = bool(watch)
+    sess["pending_edge_ev"] = float(edge_ev)
+    sess["pending_bet_amt"] = int(bet_amt)
+    sess["pending_ev_choice"] = ev_choice
 
-    pred_label = "觀望" if watch else ev_choice
-    sess.setdefault("hist_pred", []).append(pred_label)
-    sess.setdefault("hist_real", []).append(real_label)
-    sess["hist_pred"] = sess["hist_pred"][-200:]
-    sess["hist_real"] = sess["hist_real"][-200:]
+    # 顯示用
     sess["last_pts_text"] = _format_pts_text(p_pts, b_pts) if not (p_pts==0 and b_pts==0) else "上局結果: 和"
     sess["last_prob_gap"] = edge_ev
 
     stats_display = get_stats_display(sess)
     strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct<0.15 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct<0.25 else
+        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.15 else
+        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.25 else
         f"🟢 高信心配注 {bet_pct*100:.1f}%"
     )
 
@@ -487,6 +543,9 @@ def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
+    # 先啟動試用（避免新用戶被 _is_trial_valid 擋住）
+    _start_trial(user_id)
+
     # 開通
     if text.startswith("開通"):
         pwd = text[2:].strip()
@@ -495,12 +554,11 @@ def handle_message(event):
         _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
         return
 
-    # 試用檢查
+    # 試用檢查（這時一定已有 trial_start 或已永久開通）
     if not _is_trial_valid(user_id):
         _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
         return
 
-    _start_trial(user_id)
     sess = SESS.setdefault(user_id, {"bankroll": 0})
     sess["user_id"] = user_id
 
@@ -580,7 +638,7 @@ def handle_message(event):
 # ----------------- Run -----------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s)")
     log = logging.getLogger("bgs-server")
     log.info("Starting BGS-PF on port %s", port)
     app.run(host="0.0.0.0", port=port, debug=False)
