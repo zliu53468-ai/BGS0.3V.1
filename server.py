@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
+(含 LINE 降級防呆：LINE SDK 或金鑰缺失時改走 Dummy，不讓服務當機)
 相容強化版 pfilter.py：
 - 正確 EV：下注莊/閒時，和局=0 EV；BANKER_COMMISSION 套用
 - 觀望規則：EV門檻/和局風險/勝率差門檻/波動監測
 - 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
-
-本版修繕：
-- 試用流程修正：先 _start_trial 再驗證，避免新用戶被門檻阻擋
-- /health 回傳 pf_status
-- PF_STATUS 狀態追蹤與 Dummy 回退警示
-- 命中率修正：pending_pred 機制（上一局建議，下一局結果配對後才寫入統計）
-- 信心度/配注溫和化：避免飽和、乾淨落入低/中/高三段
+- 命中率修正：pending_pred（上一局建議，下一局結果配對後才寫入統計）
+- 信心度/配注溫和化：低/中/高三段
 """
 
 import os, sys, re, time, json, logging
@@ -38,10 +34,6 @@ if _has_flask:
     @app.get("/")
     def root():
         return "✅ BGS PF Server OK", 200
-
-    @app.get("/health")
-    def health():
-        return jsonify(ok=True, ts=time.time(), msg="API normal", pf_status=PF_STATUS), 200
 else:
     class _DummyApp:
         def get(self, *a, **k):
@@ -72,38 +64,30 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- Tunables / Defaults (server + pfilter 對齊) ----------
+# ---------- Tunables / Defaults ----------
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
 os.environ.setdefault("EDGE_ENTER_EV", "0.004")
 os.environ.setdefault("ENTER_GAP_MIN", "0.03")
 os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
 os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
-
 os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
 os.environ.setdefault("MAX_BET_PCT", "0.35")
 os.environ.setdefault("BET_UNIT", "100")
-
-# 機率平滑
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
-# === 與強化版 pfilter.py 對齊的重要參數 ===
+# === 與 pfilter.py 對齊 ===
 os.environ.setdefault("MODEL_MODE", "learn")   # indep | learn
 os.environ.setdefault("DECKS", "6")
-
-# 真 PF 參數（新版 pfilter 會從環境讀）
 os.environ.setdefault("PF_N", "120")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
-os.environ.setdefault("PF_KAPPA", "220.0")     # 狀態轉移濃度
-os.environ.setdefault("PF_REJUV", "220.0")     # 重採樣後再活化濃度
 os.environ.setdefault("PF_DIR_EPS", "0.012")
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("PF_STAB_FACTOR", "0.8") # 對應 pfilter 的 stability_factor
-
-# Tie (動態和局由 pfilter.py 控)
+os.environ.setdefault("PF_STAB_FACTOR", "0.8")
+# 動態和局（pfilter 控）
 os.environ.setdefault("TIE_MIN", "0.03")
 os.environ.setdefault("TIE_MAX", "0.18")
 os.environ.setdefault("TIE_MAX_CAP", "0.25")
@@ -114,8 +98,7 @@ os.environ.setdefault("TIE_BETA_B", "90.4")
 os.environ.setdefault("TIE_EMA_ALPHA", "0.2")
 os.environ.setdefault("TIE_MIN_SAMPLES", "40")
 os.environ.setdefault("TIE_DELTA", "0.35")
-
-# 歷史/權重平滑
+# 視窗/平滑
 os.environ.setdefault("HIST_WIN", "60")
 os.environ.setdefault("HIST_PSEUDO", "1.0")
 os.environ.setdefault("HIST_WEIGHT_MAX", "0.35")
@@ -193,42 +176,28 @@ OPENCODE = os.getenv("OPENCODE", "aaa8881688")
 ADMIN_LINE = os.getenv("ADMIN_LINE", "https://lin.ee/Dlm6Y3u")
 
 def _now(): return int(time.time())
-
 def _get_user_info(user_id):
     k = f"bgsu:{user_id}"
     if rcli:
         s = rcli.get(k)
         if s: return json.loads(s)
     return SESS.get(user_id, {})
-
 def _set_user_info(user_id, info):
     k = f"bgsu:{user_id}"
     if rcli: rcli.set(k, json.dumps(info), ex=86400)
     SESS[user_id] = info
-
 def _is_trial_valid(user_id):
-    """若永久開通 or 試用中則允許；缺 trial_start 時交由 handler 先行 _start_trial 再驗證。"""
     info = _get_user_info(user_id)
-    if info.get("is_opened"):  # 永久開通
-        return True
-    if not info.get("trial_start"):
-        # 這裡不直接拒絕；handler 會先 _start_trial 再重新驗證
-        return True
+    if info.get("is_opened"): return True
+    if not info.get("trial_start"): return True
     return (_now() - int(info["trial_start"])) < TRIAL_SECONDS
-
 def _start_trial(user_id):
     info = _get_user_info(user_id)
-    if info.get("is_opened"):
-        return
+    if info.get("is_opened"): return
     if not info.get("trial_start"):
-        info["trial_start"] = _now()
-        _set_user_info(user_id, info)
-
+        info["trial_start"] = _now(); _set_user_info(user_id, info)
 def _set_opened(user_id):
-    info = _get_user_info(user_id)
-    info["is_opened"] = True
-    _set_user_info(user_id, info)
-
+    info = _get_user_info(user_id); info["is_opened"] = True; _set_user_info(user_id, info)
 def _left_trial_sec(user_id):
     info = _get_user_info(user_id)
     if info.get("is_opened"): return "永久"
@@ -238,14 +207,7 @@ def _left_trial_sec(user_id):
 
 # ----------------- Strategy helpers -----------------
 def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """
-    溫和化信心度：讓 EV 與勝率差的貢獻更平滑，避免輕易飽和到 1.0。
-    - EV 正規化：以 6% EV 視為滿分；常見 1~3% EV 時只給中低權重
-    - 機率差正規化：以 30 個百分點差視為滿分
-    - 權重：EV 0.6、機率差 0.4；再做輕微壓縮，維持 0~1 區間
-    """
-    edge = max(ev_b, ev_p)
-    diff = abs(pB - pP)
+    edge = max(ev_b, ev_p); diff = abs(pB - pP)
     edge_term = min(1.0, edge / 0.06) ** 0.85
     prob_term = min(1.0, diff / 0.30) ** 0.9
     raw = 0.6 * edge_term + 0.4 * prob_term
@@ -258,8 +220,7 @@ def get_stats_display(sess):
     if not pred or not real: return "📊 數據收集中..."
     bet_pairs = [(p,r) for p,r in zip(pred,real) if r in ("莊","閒") and p in ("莊","閒")]
     if not bet_pairs: return "📊 尚未進行下注"
-    hit = sum(1 for p,r in bet_pairs if p==r)
-    total = len(bet_pairs)
+    hit = sum(1 for p,r in bet_pairs if p==r); total = len(bet_pairs)
     acc = 100.0 * hit / total
     if mode == "smart":
         if total >= 15: return f"🎯 近期勝率：{acc:.1f}%"
@@ -275,34 +236,75 @@ def _format_pts_text(p_pts, b_pts):
     if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
     return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
-# ----------------- LINE SDK -----------------
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
-    QuickReply, QuickReplyButton, MessageAction
-)
+# ----------------- LINE SDK（加上降級防呆） -----------------
+_has_line = True
+try:
+    from linebot import LineBotApi, WebhookHandler
+    from linebot.models import (
+        MessageEvent, TextMessage, TextSendMessage,
+        QuickReply, QuickReplyButton, MessageAction
+    )
+except Exception as e:
+    _has_line = False
+    LineBotApi = WebhookHandler = None
+    MessageEvent = TextMessage = TextSendMessage = QuickReply = QuickReplyButton = MessageAction = object
+    log.warning("LINE SDK not available, falling back to Dummy LINE mode: %s", e)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+if _has_line and LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
+    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
+    handler = WebhookHandler(LINE_CHANNEL_SECRET)
+    LINE_MODE = "real"
+else:
+    LINE_MODE = "dummy"
+
+    class _DummyHandler:
+        def add(self, *a, **k):
+            # decorator pass-through
+            def deco(f): return f
+            return deco
+        def handle(self, body, signature):
+            log.info("[DummyLINE] handle called")
+
+    class _DummyLineAPI:
+        def reply_message(self, token, message):
+            # message 可能是 TextSendMessage 或 list，盡量打印文字
+            try:
+                txt = message.text if hasattr(message, "text") else str(message)
+            except Exception:
+                txt = str(message)
+            log.info("[DummyLINE] reply: %s", txt)
+
+    handler = _DummyHandler()
+    line_bot_api = _DummyLineAPI()
+    log.warning("LINE credentials missing or SDK unavailable; running in Dummy LINE mode.")
 
 def _qr_btn(label, text):
-    return QuickReplyButton(action=MessageAction(label=label, text=text))
+    if LINE_MODE == "real":
+        return QuickReplyButton(action=MessageAction(label=label, text=text))
+    # Dummy: QuickReply 不會被真正送出，但保持結構方便 debug
+    return {"label": label, "text": text}
 
 def _reply(token, text, quick=None):
     try:
-        if quick:
-            line_bot_api.reply_message(
-                token,
-                TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
-            )
+        if LINE_MODE == "real":
+            if quick:
+                line_bot_api.reply_message(
+                    token,
+                    TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
+                )
+            else:
+                line_bot_api.reply_message(token, TextSendMessage(text=text))
         else:
-            line_bot_api.reply_message(token, TextSendMessage(text=text))
+            if quick:
+                log.info("[DummyLINE] reply with quick: %s | %s", text, quick)
+            else:
+                log.info("[DummyLINE] reply: %s", text)
     except Exception as e:
-        print("LINE reply_message error:", e)
+        log.error("LINE reply_message error: %s", e)
 
 # —— 歡迎文案 —— #
 def welcome_text(uid):
@@ -454,26 +456,16 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     bankroll = int(sess.get("bankroll", 0))
     bet_pct = 0.0
     bet_amt = 0
-
     if not watch:
         conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
         prob_diff = abs(pB - pP)
-
         base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
         base_ceiling = 0.28  # conf=1 的基底上限（未含 bump）
-
         base_pct = base_floor + (base_ceiling - base_floor) * conf
-
-        bump = 0.0
-        if prob_diff > 0.25:
-            bump = 0.03
-        elif prob_diff > 0.15:
-            bump = 0.015
-
+        bump = 0.03 if prob_diff > 0.25 else (0.015 if prob_diff > 0.15 else 0.0)
         bet_pct = base_pct + bump
         bet_pct = max(base_floor, bet_pct)
         bet_pct = min(float(os.getenv("MAX_BET_PCT", "0.35")), bet_pct)
-
         if bankroll > 0 and bet_pct > 0:
             unit = int(os.getenv("BET_UNIT", "100"))
             bet_amt = int(round(bankroll * bet_pct))
@@ -528,25 +520,36 @@ def _format_stats(sess):
     acc = (wins / bets * 100.0) if bets>0 else 0.0
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
-# ----------------- LINE webhook route -----------------
-@app.post("/line-webhook")
-def callback():
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except Exception as e:
-        print("LINE webhook error:", e)
-        return "bad request", 400
-    return "ok", 200
+# ----------------- HTTP routes -----------------
+if _has_flask:
+    @app.get("/health")
+    def health():
+        return jsonify(ok=True, ts=time.time(), msg="API normal",
+                       pf_status=PF_STATUS, line_mode=LINE_MODE), 200
 
-# ----------------- Handlers -----------------
-@handler.add(MessageEvent, message=TextMessage)
+    @app.post("/line-webhook")
+    def callback():
+        signature = request.headers.get('X-Line-Signature', '')
+        body = request.get_data(as_text=True)
+        try:
+            handler.handle(body, signature)
+        except Exception as e:
+            log.error("LINE webhook error: %s", e)
+            return "bad request", 400
+        return "ok", 200
+
+# ----------------- Line Handlers -----------------
+@handler.add()  # 在 dummy/real 下都會回傳裝飾器；dummy 直接 pass-through
 def handle_message(event):
-    user_id = event.source.user_id
-    text = event.message.text.strip()
+    # 在 Dummy 模式時，event 可能沒有這些屬性，做保護
+    user_id = getattr(getattr(event, "source", None), "user_id", "dummy-user")
+    text = getattr(getattr(event, "message", None), "text", "").strip()
 
-    # 先啟動試用（避免新用戶被 _is_trial_valid 擋住）
+    if not text:
+        # 非文本事件（加好友等），忽略
+        return
+
+    # 先啟動試用
     _start_trial(user_id)
 
     # 開通
@@ -554,12 +557,13 @@ def handle_message(event):
         pwd = text[2:].strip()
         reply = "✅ 已開通成功！" if pwd == OPENCODE else "❌ 開通碼錯誤，請重新輸入。"
         if pwd == OPENCODE: _set_opened(user_id)
-        _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
+        _reply(getattr(event, "reply_token", "dummy"), reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
         return
 
     # 試用檢查
     if not _is_trial_valid(user_id):
-        _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
+        _reply(getattr(event, "reply_token", "dummy"),
+               "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
         return
 
     sess = SESS.setdefault(user_id, {"bankroll": 0})
@@ -567,23 +571,23 @@ def handle_message(event):
 
     # 設定/快捷
     if text in ("設定","⋯","menu","Menu"):
-        _reply(event.reply_token, "⚙️ 設定選單：", quick=settings_quickreply(sess)); return
+        _reply(getattr(event, "reply_token", "dummy"), "⚙️ 設定選單：", quick=settings_quickreply(sess)); return
     if text == "查看統計":
-        _reply(event.reply_token, _format_stats(sess), quick=settings_quickreply(sess)); return
+        _reply(getattr(event, "reply_token", "dummy"), _format_stats(sess), quick=settings_quickreply(sess)); return
     if text == "試用剩餘":
-        _reply(event.reply_token, "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
+        _reply(getattr(event, "reply_token", "dummy"),
+               "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
     if text.startswith("顯示模式"):
         mode = text.replace("顯示模式","").strip().lower()
         if mode in ("smart","basic","none"):
             os.environ["STATS_DISPLAY"] = mode
-            _reply(event.reply_token, f"✅ 已切換顯示模式為 {mode}", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"), f"✅ 已切換顯示模式為 {mode}", quick=settings_quickreply(sess))
         else:
-            _reply(event.reply_token, "可選：smart / basic / none", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"), "可選：smart / basic / none", quick=settings_quickreply(sess))
         return
     if text == "重設":
         SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        # 修正：halls_quickreply 是零參數
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
+        _reply(getattr(event, "reply_token", "dummy"), "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
 
     # 館別 -> 桌號 -> 本金
     if not sess.get("hall_id"):
@@ -591,29 +595,38 @@ def handle_message(event):
             sess["hall_id"] = int(text)
             hall_map = ["WM", "PM", "DG", "SA", "KU", "歐博/卡利", "KG", "金利", "名人", "MT真人"]
             hall_name = hall_map[int(text)-1]
-            _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"),
+                   f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）",
+                   quick=settings_quickreply(sess))
         elif text == "設定 館別":
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=halls_quickreply())
+            _reply(getattr(event, "reply_token", "dummy"), "請選擇館別（1-10）：", quick=halls_quickreply())
         else:
-            _reply(event.reply_token, welcome_text(user_id), quick=halls_quickreply())
+            _reply(getattr(event, "reply_token", "dummy"), welcome_text(user_id), quick=halls_quickreply())
         return
 
     if not sess.get("table_id"):
         m = re.match(r"^[a-zA-Z]{2}\d{2}$", text)
         if m:
             sess["table_id"] = text.upper()
-            _reply(event.reply_token, f"✅ 已設桌號 [{sess['table_id']}]\n請輸入您的本金（例：5000）", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"),
+                   f"✅ 已設桌號 [{sess['table_id']}]\n請輸入您的本金（例：5000）",
+                   quick=settings_quickreply(sess))
         else:
-            _reply(event.reply_token, "請輸入正確格式的桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"),
+                   "請輸入正確格式的桌號（例：DG01，格式：2字母+2數字）",
+                   quick=settings_quickreply(sess))
         return
 
     if not sess.get("bankroll") or sess["bankroll"] <= 0:
         m = re.match(r"^(\d{3,7})$", text)
         if m:
             sess["bankroll"] = int(text)
-            _reply(event.reply_token, f"👍 已設定本金：{sess['bankroll']:,}\n請輸入上一局點數（例：65 / 和 / 閒6莊5），之後能連續傳手。", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"),
+                   f"👍 已設定本金：{sess['bankroll']:,}\n請輸入上一局點數（例：65 / 和 / 閒6莊5），之後能連續傳手。",
+                   quick=settings_quickreply(sess))
         else:
-            _reply(event.reply_token, "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
+            _reply(getattr(event, "reply_token", "dummy"),
+                   "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
         return
 
     # 連續模式
@@ -637,12 +650,15 @@ def handle_message(event):
     except Exception as e:
         reply = f"❌ 輸入格式有誤: {e}"
 
-    _reply(event.reply_token, reply, quick=settings_quickreply(sess))
+    _reply(getattr(event, "reply_token", "dummy"), reply, quick=settings_quickreply(sess))
 
 # ----------------- Run -----------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s)")
     log = logging.getLogger("bgs-server")
-    log.info("Starting BGS-PF on port %s", port)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    log.info("Starting BGS-PF on port %s (LINE_MODE=%s)", port, LINE_MODE)
+    if hasattr(app, "run"):
+        app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        print("Flask not available.")
