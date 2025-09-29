@@ -6,16 +6,18 @@ server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
 - 觀望規則：EV門檻/和局風險/勝率差門檻/波動監測
 - 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
 
-本版修繕（保留原UI/按鈕/文字）：
-- 僅在 LINE_MODE='real' 時綁定 @handler.add(MessageEvent, message=TextMessage)
-- 缺金鑰或 SDK 不可用時切到 dummy LINE，不影響啟動
-- /health 回傳 pf_status 與 line_mode
+本版微調（保持你原本 UI/文字）：
+- 只在 LINE_MODE='real' 綁定 @handler.add
+- 缺 LINE 金鑰或 SDK 時自動切到 dummy，不影響啟動
+- /health 回更多除錯欄位；新增 /version、/env/peek
+- 去除重複 helper 定義；predict 加強健檢與 fallback
 """
 
 import os, sys, re, time, json, logging
 from typing import Dict, Any
 import numpy as np
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
 # ----------------- Flask -----------------
@@ -59,7 +61,9 @@ if redis and REDIS_URL:
     try:
         rcli = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
         rcli.ping()
-    except Exception:
+        log.info("Connected Redis ok")
+    except Exception as e:
+        log.warning("Redis disabled: %s", e)
         rcli = None
 
 # ----------------- Session -----------------
@@ -82,9 +86,10 @@ os.environ.setdefault("BET_UNIT", "100")
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
-# === 與 pfilter.py 對齊的重要參數（保留你原先風格） ===
+# === 與 pfilter.py 對齊的重要參數 ===
 os.environ.setdefault("MODEL_MODE", "learn")   # indep | learn
 os.environ.setdefault("DECKS", "6")
+os.environ.setdefault("EXCLUDE_LAST_OUTCOME", "1")  # 與你目前 pfilter 預設一致
 
 # PF 參數
 os.environ.setdefault("PF_N", "120")
@@ -118,17 +123,22 @@ os.environ.setdefault("PF_WEIGHT_K", "80")
 
 # ----------------- PF Loader -----------------
 OutcomePF = None
+_pf_import_from = "none"
 try:
     from bgs.pfilter import OutcomePF
+    _pf_import_from = "bgs"
 except Exception:
     try:
         cur = os.path.dirname(os.path.abspath(__file__))
         if cur not in sys.path: sys.path.insert(0, cur)
         from pfilter import OutcomePF
+        _pf_import_from = "local"
     except Exception:
         OutcomePF = None
+        _pf_import_from = "none"
 
-PF_STATUS = {"ready": OutcomePF is not None, "error": None}
+PF_STATUS = {"ready": OutcomePF is not None, "error": None, "from": _pf_import_from}
+log.info("OutcomePF import: %s", PF_STATUS)
 
 class _DummyPF:
     def update_outcome(self, outcome): pass
@@ -140,7 +150,7 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
     global PF_STATUS
 
     if not OutcomePF:
-        PF_STATUS = {"ready": False, "error": "OutcomePF module missing"}
+        PF_STATUS = {"ready": False, "error": "OutcomePF module missing", "from": _pf_import_from}
         sess["_pf_dummy"] = True
         return _DummyPF()
 
@@ -156,17 +166,15 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
                 dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.012")),
                 stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.8")),
             )
-            PF_STATUS = {"ready": True, "error": None}
+            PF_STATUS = {"ready": True, "error": None, "from": _pf_import_from}
             sess.pop("_pf_dummy", None)
+            log.info("OutcomePF initialised for user %s", sess.get("user_id", "unknown"))
         except Exception as exc:
             sess["_pf_failed"] = True
             sess["_pf_dummy"] = True
             sess["_pf_error_msg"] = str(exc)
-            PF_STATUS = {"ready": False, "error": str(exc)}
-            try:
-                log.exception("Failed to initialise OutcomePF; falling back to dummy model")
-            except Exception:
-                pass
+            PF_STATUS = {"ready": False, "error": str(exc), "from": _pf_import_from}
+            log.exception("Failed to initialise OutcomePF; falling back to dummy model")
 
     pf = sess.get("pf")
     if pf is None:
@@ -266,7 +274,7 @@ def _format_pts_text(p_pts, b_pts):
     if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
     return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
-# ----------------- LINE SDK（保留原樣 UI；加上 real/dummy 切換） -----------------
+# ----------------- LINE SDK（real/dummy 切換） -----------------
 _has_line = True
 try:
     from linebot import LineBotApi, WebhookHandler
@@ -326,7 +334,7 @@ def _reply(token, text, quick=None):
         else:
             log.info("[DummyLINE] reply%s: %s", " (with quick)" if quick else "", text)
     except Exception as e:
-        print("LINE reply_message error:", e)
+        log.warning("LINE reply_message error: %s", e)
 
 # —— 歡迎文案 —— #
 def welcome_text(uid):
@@ -369,6 +377,16 @@ def halls_quickreply() -> list:
     return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
 
 # ----------------- 核心：讀點數並預測（含 pending 配對） -----------------
+def _safe_norm(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    if not np.isfinite(v).all() or v.ndim != 1 or v.size != 3:
+        raise ValueError("invalid probs")
+    v = np.clip(v, 1e-9, None)
+    s = v.sum()
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError("sum invalid")
+    return (v / s).astype(np.float32)
+
 def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
     # 參數驗證
     if not (p_pts == 0 and b_pts == 0):
@@ -430,18 +448,24 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
 
     # 產生新一局（N+1）建議
     sims_pred = int(os.getenv("PF_PRED_SIMS","30"))
-    p_raw = pf.predict(sims_per_particle=sims_pred)
-    p_final = p_raw / np.sum(p_raw)
+    try:
+        p_raw = pf.predict(sims_per_particle=sims_pred)
+        p_final = _safe_norm(p_raw)
+    except Exception as e:
+        log.warning("predict fallback due to %s", e)
+        # 保守 fallback：均勻 + 小幅度偏向歷史（保持和局在 guard rails 內）
+        p_final = np.array([0.45, 0.45, 0.10], dtype=np.float32)
 
     mode = os.getenv("MODEL_MODE","learn").strip().lower()
     if mode == "indep":
-        p_final = np.clip(p_final, 0.01, 0.98); p_final = p_final / np.sum(p_final)
+        p_final = np.clip(p_final, 0.01, 0.98); p_final = (p_final / np.sum(p_final)).astype(np.float32)
     else:
         p_temp = np.exp(np.log(np.clip(p_final,1e-9,1.0)) / float(os.getenv("PROB_TEMP","1.0")))
-        p_temp = p_temp / np.sum(p_temp)
+        p_temp = (p_temp / np.sum(p_temp)).astype(np.float32)
         alpha = float(os.getenv("PROB_SMA_ALPHA","0.60"))
         def ema(prev, cur, a): return cur if prev is None else a*cur + (1-a)*prev
-        sess["prob_sma"] = ema(sess.get("prob_sma"), p_temp, alpha)
+        prev_sma = sess.get("prob_sma")
+        sess["prob_sma"] = ema(prev_sma, p_temp, alpha)
         p_final = sess["prob_sma"] if sess["prob_sma"] is not None else p_temp
 
     pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
@@ -455,7 +479,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     if abs(ev_b - ev_p) < 0.005:
         ev_choice = "莊" if pB > pP else "閒"
         edge_ev = max(ev_b, ev_p) + 0.002
-    if np.isnan(p_final).any() or np.sum(p_final) < 0.99:
+    if not np.isfinite([pB, pP, pT]).all() or np.sum(p_final) < 0.99:
         ev_choice = "莊" if pB > pP else "閒"; edge_ev = 0.015
 
     watch, reasons = False, []
@@ -511,7 +535,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     sess["pending_bet_amt"] = int(bet_amt)
     sess["pending_ev_choice"] = ev_choice
 
-    # 顯示用（保持你的文字格式）
+    # 顯示用
     sess["last_pts_text"] = _format_pts_text(p_pts, b_pts) if not (p_pts==0 and b_pts==0) else "上局結果: 和"
     sess["last_prob_gap"] = edge_ev
 
@@ -556,8 +580,31 @@ def _format_stats(sess):
 if _has_flask:
     @app.get("/health")
     def health():
-        return jsonify(ok=True, ts=time.time(), msg="API normal", pf_status=PF_STATUS,
-                       line_mode=("real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy")), 200
+        return jsonify(
+            ok=True,
+            ts=time.time(),
+            msg="API normal",
+            pf_status=PF_STATUS,
+            line_mode=("real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy"),
+            exclude_last_outcome=os.getenv("EXCLUDE_LAST_OUTCOME", "0"),
+        ), 200
+
+    @app.get("/version")
+    def version():
+        return jsonify(
+            version=os.getenv("RELEASE", "local"),
+            commit=os.getenv("GIT_SHA", "unknown"),
+            from_path=PF_STATUS.get("from"),
+        ), 200
+
+    @app.get("/env/peek")
+    def env_peek():
+        keys = [
+            "MODEL_MODE","DECKS","PF_N","PF_RESAMPLE","PF_DIR_EPS","PF_PRED_SIMS",
+            "PF_STAB_FACTOR","EDGE_ENTER_EV","ENTER_GAP_MIN","TIE_MIN","TIE_MAX",
+            "EXCLUDE_LAST_OUTCOME"
+        ]
+        return jsonify({k: os.getenv(k) for k in keys}), 200
 
     @app.post("/line-webhook")
     def callback():
@@ -566,29 +613,9 @@ if _has_flask:
         try:
             handler.handle(body, signature)
         except Exception as e:
-            print("LINE webhook error:", e)
+            log.warning("LINE webhook error: %s", e)
             return "bad request", 400
         return "ok", 200
-
-# ----------------- Handlers -----------------
-def _qr_btn(label, text):
-    if LINE_MODE == "real":
-        return QuickReplyButton(action=MessageAction(label=label, text=text))
-    return {"label": label, "text": text}
-
-def settings_quickreply(sess) -> list:
-    return [
-        _qr_btn("選館別", "設定 館別"),
-        _qr_btn("查看統計", "查看統計"),
-        _qr_btn("試用剩餘", "試用剩餘"),
-        _qr_btn("顯示模式 smart", "顯示模式 smart"),
-        _qr_btn("顯示模式 basic", "顯示模式 basic"),
-        _qr_btn("顯示模式 none", "顯示模式 none"),
-        _qr_btn("重設流程", "重設"),
-    ]
-
-def halls_quickreply() -> list:
-    return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
 
 # ——— LINE 事件處理：只在 real 模式用裝飾器，dummy 模式以普通函式存在 ———
 def _handle_message_core(event):
@@ -697,8 +724,8 @@ if 'LINE_MODE' in globals() and LINE_MODE == "real":
 # ----------------- Run -----------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s)")
-    log = logging.getLogger("bgs-server")
-    log.info("Starting BGS-PF on port %s (LINE_MODE=%s)", port, "real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy")
+    log.info("Starting BGS-PF on port %s (LINE_MODE=%s, PF_FROM=%s)", port,
+             "real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy",
+             _pf_import_from)
     if hasattr(app, "run"):
         app.run(host="0.0.0.0", port=port, debug=False)
