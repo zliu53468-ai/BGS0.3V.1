@@ -92,7 +92,7 @@ DIRICHLET_EPS = _env_float("PF_DIR_EPS", "0.012")
 STABILITY_FACTOR = _env_float("PF_STAB_FACTOR", "0.8")
 
 # 點差偏置（只動 B/P）
-POINT_BIAS_ON = _env_flag("POINT_BIAS_ON", "1")
+POINT_BIAS_ON = _env_flag("POINT_BIAS_ON", "0")  # 修改為預設關閉，以避免過度跟隨上一手結果
 POINT_BIAS_K = _env_float("POINT_BIAS_K", "0.35")
 POINT_BIAS_MAX_SHIFT = _env_float("POINT_BIAS_MAX_SHIFT", "0.04")
 POINT_BIAS_MIN_GAP = _env_int("POINT_BIAS_MIN_GAP", "3")
