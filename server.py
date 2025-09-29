@@ -72,7 +72,7 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- Tunables / Defaults (server + pfilter對齊) ----------
+# ---------- Tunables / Defaults (server + pfilter 對齊) ----------
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
 os.environ.setdefault("EDGE_ENTER_EV", "0.004")
 os.environ.setdefault("ENTER_GAP_MIN", "0.03")
@@ -80,21 +80,28 @@ os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
 os.environ.setdefault("TIE_PROB_MAX", "0.20")
 os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
 
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")  # 讓低信心能落在 2% 起
-os.environ.setdefault("MAX_BET_PCT", "0.35")       # 提高上限，避免一上來打頂
+os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
+os.environ.setdefault("MAX_BET_PCT", "0.35")
 os.environ.setdefault("BET_UNIT", "100")
 
+# 機率平滑
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
-os.environ.setdefault("MODEL_MODE", "indep")   # indep | learn
+# === 與強化版 pfilter.py 對齊的重要參數 ===
+os.environ.setdefault("MODEL_MODE", "learn")   # indep | learn
 os.environ.setdefault("DECKS", "6")
-os.environ.setdefault("PF_N", "80")
+
+# 真 PF 參數（新版 pfilter 會從環境讀）
+os.environ.setdefault("PF_N", "120")
 os.environ.setdefault("PF_RESAMPLE", "0.73")
+os.environ.setdefault("PF_KAPPA", "220.0")     # 狀態轉移濃度
+os.environ.setdefault("PF_REJUV", "220.0")     # 重採樣後再活化濃度
 os.environ.setdefault("PF_DIR_EPS", "0.012")
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
+os.environ.setdefault("PF_STAB_FACTOR", "0.8") # 對應 pfilter 的 stability_factor
 
 # Tie (動態和局由 pfilter.py 控)
 os.environ.setdefault("TIE_MIN", "0.03")
@@ -108,6 +115,7 @@ os.environ.setdefault("TIE_EMA_ALPHA", "0.2")
 os.environ.setdefault("TIE_MIN_SAMPLES", "40")
 os.environ.setdefault("TIE_DELTA", "0.35")
 
+# 歷史/權重平滑
 os.environ.setdefault("HIST_WIN", "60")
 os.environ.setdefault("HIST_PSEUDO", "1.0")
 os.environ.setdefault("HIST_WEIGHT_MAX", "0.35")
@@ -149,11 +157,12 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
             sess["pf"] = OutcomePF(
                 decks=int(os.getenv("DECKS", "6")),
                 seed=int(os.getenv("SEED", "42")) + int(time.time() % 1000),
-                n_particles=int(os.getenv("PF_N", "80")),
+                n_particles=int(os.getenv("PF_N", "120")),
                 sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "36"))),
                 resample_thr=float(os.getenv("PF_RESAMPLE", "0.73")),
                 backend=os.getenv("PF_BACKEND", "mc"),
                 dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.012")),
+                stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.8")),
             )
             PF_STATUS = {"ready": True, "error": None}
             sess.pop("_pf_dummy", None)
@@ -235,18 +244,12 @@ def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
     - 機率差正規化：以 30 個百分點差視為滿分
     - 權重：EV 0.6、機率差 0.4；再做輕微壓縮，維持 0~1 區間
     """
-    edge = max(ev_b, ev_p)            # 取最佳邊際 EV
-    diff = abs(pB - pP)               # 莊/閒機率差
-
-    edge_term = min(1.0, edge / 0.06) # 6% EV => 1.0
-    edge_term = edge_term ** 0.85     # 柔化
-
-    prob_term = min(1.0, diff / 0.30) # 30pp 差 => 1.0
-    prob_term = prob_term ** 0.9      # 柔化
-
+    edge = max(ev_b, ev_p)
+    diff = abs(pB - pP)
+    edge_term = min(1.0, edge / 0.06) ** 0.85
+    prob_term = min(1.0, diff / 0.30) ** 0.9
     raw = 0.6 * edge_term + 0.4 * prob_term
-    conf = max(0.0, min(1.0, raw ** 0.95))
-    return float(conf)
+    return float(max(0.0, min(1.0, raw ** 0.95)))
 
 def get_stats_display(sess):
     mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
@@ -379,7 +382,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         prev_bet_amt = int(sess.pop("pending_bet_amt", 0))
         prev_ev_choice = sess.pop("pending_ev_choice", None)
 
-        # 寫入歷史（只在 pending 存在時入列，避免未配對寫入）
+        # 寫入歷史
         sess.setdefault("hist_pred", []).append("觀望" if prev_watch else (prev_ev_choice or prev_pred))
         sess.setdefault("hist_real", []).append(real_label)
         sess["hist_pred"] = sess["hist_pred"][-200:]
@@ -406,7 +409,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     p_raw = pf.predict(sims_per_particle=sims_pred)
     p_final = p_raw / np.sum(p_raw)
 
-    mode = os.getenv("MODEL_MODE","indep").strip().lower()
+    mode = os.getenv("MODEL_MODE","learn").strip().lower()
     if mode == "indep":
         p_final = np.clip(p_final, 0.01, 0.98); p_final = p_final / np.sum(p_final)
     else:
@@ -525,7 +528,7 @@ def _format_stats(sess):
     acc = (wins / bets * 100.0) if bets>0 else 0.0
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
-# ----------------- LINE webhook route (FIX 404) -----------------
+# ----------------- LINE webhook route -----------------
 @app.post("/line-webhook")
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
@@ -554,7 +557,7 @@ def handle_message(event):
         _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
         return
 
-    # 試用檢查（這時一定已有 trial_start 或已永久開通）
+    # 試用檢查
     if not _is_trial_valid(user_id):
         _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
         return
@@ -579,7 +582,7 @@ def handle_message(event):
         return
     if text == "重設":
         SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
+        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply(sess)); return
 
     # 館別 -> 桌號 -> 本金
     if not sess.get("hall_id"):
