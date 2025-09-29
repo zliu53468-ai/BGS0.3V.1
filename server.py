@@ -1,19 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
-相容強化版 pfilter.py：
-- 正確 EV：下注莊/閒時，和局=0 EV；BANKER_COMMISSION 套用
-- 觀望規則：EV門檻/和局風險/勝率差門檻/波動監測
-- 快速回覆按鈕：設定、選館別(1~10)、查看統計、試用剩餘、顯示模式切換、重設
-
-本版微調（保持你原本 UI/文字）：
-- 只在 LINE_MODE='real' 綁定 @handler.add
-- 缺 LINE 金鑰或 SDK 時自動切到 dummy，不影響啟動
-- /health 回更多除錯欄位；新增 /version、/env/peek
-- 去除重複 helper 定義；predict 加強健檢與 fallback
-
-修正版：調整 EV 選擇邏輯，在 EV 接近時 (差 < 0.005)，如果 pB > pP，優先選 "莊"，以減少偏向 "閒" 的情況，改善用戶體驗。
+修正版：與積極學習版本的 pfilter.py 完全對齊
+主要修正：
+1. 降低觀望門檻，讓模型更容易下注
+2. 調整環境變數與 pfilter.py 匹配
+3. 優化 EV 計算和選擇邏輯
+4. 增強學習響應性
 """
+
 import os, sys, re, time, json, logging
 from typing import Dict, Any
 import numpy as np
@@ -71,13 +66,15 @@ if redis and REDIS_URL:
 SESS: Dict[str, Dict[str, Any]] = {}
 SESSION_EXPIRE = 3600
 
-# ---------- Tunables / Defaults (server + pfilter 對齊) ----------
+# ---------- Tunables / Defaults (與積極學習 pfilter 對齊) ----------
 os.environ.setdefault("BANKER_COMMISSION", "0.05")
-os.environ.setdefault("EDGE_ENTER_EV", "0.004")
-os.environ.setdefault("ENTER_GAP_MIN", "0.03")
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.04")
-os.environ.setdefault("TIE_PROB_MAX", "0.20")
-os.environ.setdefault("STATS_DISPLAY", "smart")  # smart | basic | none
+
+# 重要：降低觀望門檻，讓模型更容易下注
+os.environ.setdefault("EDGE_ENTER_EV", "0.002")      # 從 0.004 降低
+os.environ.setdefault("ENTER_GAP_MIN", "0.02")       # 從 0.03 降低  
+os.environ.setdefault("WATCH_INSTAB_THRESH", "0.06") # 從 0.04 提高
+os.environ.setdefault("TIE_PROB_MAX", "0.25")        # 從 0.20 提高
+os.environ.setdefault("STATS_DISPLAY", "smart")      # smart | basic | none
 
 os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
 os.environ.setdefault("MAX_BET_PCT", "0.35")
@@ -87,40 +84,54 @@ os.environ.setdefault("BET_UNIT", "100")
 os.environ.setdefault("PROB_TEMP", "1.0")
 os.environ.setdefault("PROB_SMA_ALPHA", "0.60")
 
-# === 與 pfilter.py 對齊的重要參數 ===
+# === 與積極學習 pfilter.py 對齊的重要參數 ===
 os.environ.setdefault("MODEL_MODE", "learn")   # indep | learn
 os.environ.setdefault("DECKS", "6")
-os.environ.setdefault("EXCLUDE_LAST_OUTCOME", "1")  # 與你目前 pfilter 預設一致
+os.environ.setdefault("EXCLUDE_LAST_OUTCOME", "0")  # 重要：啟用即時學習
 
-# PF 參數
-os.environ.setdefault("PF_N", "120")
-os.environ.setdefault("PF_RESAMPLE", "0.73")
-os.environ.setdefault("PF_DIR_EPS", "0.012")
+# PF 參數（與積極學習版本對齊）
+os.environ.setdefault("PF_N", "100")           # 從 120 降低
+os.environ.setdefault("PF_RESAMPLE", "0.8")    # 從 0.73 提高
+os.environ.setdefault("PF_DIR_EPS", "0.008")   # 從 0.012 降低
 os.environ.setdefault("PF_BACKEND", "mc")
 os.environ.setdefault("PF_UPD_SIMS", "36")
 os.environ.setdefault("PF_PRED_SIMS", "30")
-os.environ.setdefault("PF_STAB_FACTOR", "0.8") # 對應 pfilter 的 stability_factor
+os.environ.setdefault("PF_STAB_FACTOR", "0.9") # 從 0.8 提高
 
-# Tie (動態和局由 pfilter.py 控)
-os.environ.setdefault("TIE_MIN", "0.03")
-os.environ.setdefault("TIE_MAX", "0.18")
-os.environ.setdefault("TIE_MAX_CAP", "0.25")
-os.environ.setdefault("TIE_MIN_FLOOR", "0.01")
+# 長期貝氏計數衰減（降低衰減速度）
+os.environ.setdefault("PF_DECAY", "0.992")     # 從 0.985 提高
+
+# Tie (動態和局 - 放寬範圍)
+os.environ.setdefault("TIE_MIN", "0.04")       # 從 0.03 提高
+os.environ.setdefault("TIE_MAX", "0.20")       # 從 0.18 提高
+os.environ.setdefault("TIE_MAX_CAP", "0.28")   # 從 0.25 提高
+os.environ.setdefault("TIE_MIN_FLOOR", "0.02") # 從 0.01 提高
 os.environ.setdefault("DYNAMIC_TIE_RANGE", "1")
-os.environ.setdefault("TIE_BETA_A", "9.6")
-os.environ.setdefault("TIE_BETA_B", "90.4")
-os.environ.setdefault("TIE_EMA_ALPHA", "0.2")
-os.environ.setdefault("TIE_MIN_SAMPLES", "40")
-os.environ.setdefault("TIE_DELTA", "0.35")
+os.environ.setdefault("TIE_BETA_A", "8.0")     # 從 9.6 降低
+os.environ.setdefault("TIE_BETA_B", "92.0")    # 從 90.4 提高
+os.environ.setdefault("TIE_EMA_ALPHA", "0.25") # 從 0.2 提高
+os.environ.setdefault("TIE_MIN_SAMPLES", "25") # 從 40 降低
+os.environ.setdefault("TIE_DELTA", "0.40")     # 從 0.35 提高
 
-# 歷史/權重平滑
-os.environ.setdefault("HIST_WIN", "60")
-os.environ.setdefault("HIST_PSEUDO", "1.0")
-os.environ.setdefault("HIST_WEIGHT_MAX", "0.35")
-os.environ.setdefault("PF_WIN", "50")
-os.environ.setdefault("PF_ALPHA", "0.5")
-os.environ.setdefault("PF_WEIGHT_MAX", "0.7")
-os.environ.setdefault("PF_WEIGHT_K", "80")
+# 歷史/權重平滑（增強學習能力）
+os.environ.setdefault("HIST_WIN", "35")        # 從 60 降低
+os.environ.setdefault("HIST_PSEUDO", "0.8")    # 從 1.0 降低
+os.environ.setdefault("HIST_WEIGHT_MAX", "0.40") # 從 0.35 提高
+os.environ.setdefault("PF_WIN", "30")          # 從 50 降低
+os.environ.setdefault("PF_ALPHA", "0.3")       # 從 0.5 降低
+os.environ.setdefault("PF_WEIGHT_MAX", "0.85") # 從 0.7 提高
+os.environ.setdefault("PF_WEIGHT_K", "25.0")   # 從 80.0 降低
+
+# 點差偏置（保持關閉）
+os.environ.setdefault("POINT_BIAS_ON", "0")
+
+# CUSUM guard（放寬限制）
+os.environ.setdefault("CUSUM_ON", "1")
+os.environ.setdefault("CUSUM_DECAY", "0.95")   # 從 0.92 提高
+os.environ.setdefault("CUSUM_DRIFT", "0.08")   # 從 0.18 降低
+os.environ.setdefault("CUSUM_THRESHOLD", "4.0") # 從 2.4 提高
+os.environ.setdefault("CUSUM_GAIN", "0.02")    # 從 0.06 降低
+os.environ.setdefault("CUSUM_MAX_SHIFT", "0.05") # 從 0.1 降低
 
 # ----------------- PF Loader -----------------
 OutcomePF = None
@@ -160,12 +171,12 @@ def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
             sess["pf"] = OutcomePF(
                 decks=int(os.getenv("DECKS", "6")),
                 seed=int(os.getenv("SEED", "42")) + int(time.time() % 1000),
-                n_particles=int(os.getenv("PF_N", "120")),
+                n_particles=int(os.getenv("PF_N", "100")),
                 sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "36"))),
-                resample_thr=float(os.getenv("PF_RESAMPLE", "0.73")),
+                resample_thr=float(os.getenv("PF_RESAMPLE", "0.8")),
                 backend=os.getenv("PF_BACKEND", "mc"),
-                dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.012")),
-                stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.8")),
+                dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.008")),
+                stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.9")),
             )
             PF_STATUS = {"ready": True, "error": None, "from": _pf_import_from}
             sess.pop("_pf_dummy", None)
@@ -489,17 +500,21 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         ev_choice = "莊" if pB > pP else "閒"; edge_ev = 0.015
 
     watch, reasons = False, []
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.004"))
+    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.002"))  # 使用新的較低門檻
     if edge_ev < EDGE_ENTER_EV:
         watch = True; reasons.append(f"EV優勢{edge_ev*100:.1f}%不足")
-    if pT > float(os.getenv("TIE_PROB_MAX","0.20")) and edge_ev < 0.015:
+    
+    TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.25"))  # 使用新的較高門檻
+    if pT > TIE_PROB_MAX and edge_ev < 0.015:
         watch = True; reasons.append("和局風險高")
+        
     last_gap = float(sess.get("last_prob_gap", 0.0))
-    instab = float(os.getenv("WATCH_INSTAB_THRESH","0.04"))
+    instab = float(os.getenv("WATCH_INSTAB_THRESH","0.06"))  # 使用新的較高門檻
     if abs(edge_ev - last_gap) > instab:
         if abs(edge_ev - last_gap) > (instab * 1.5):
             watch = True; reasons.append("勝率波動大")
-    enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.03"))
+            
+    enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.02"))  # 使用新的較低門檻
     top2 = sorted([pB, pP, pT], reverse=True)[:2]
     if (top2[0] - top2[1]) < enter_gap_min:
         watch = True; reasons.append("勝率差不足")
@@ -608,7 +623,7 @@ if _has_flask:
         keys = [
             "MODEL_MODE","DECKS","PF_N","PF_RESAMPLE","PF_DIR_EPS","PF_PRED_SIMS",
             "PF_STAB_FACTOR","EDGE_ENTER_EV","ENTER_GAP_MIN","TIE_MIN","TIE_MAX",
-            "EXCLUDE_LAST_OUTCOME"
+            "EXCLUDE_LAST_OUTCOME", "PF_DECAY", "POINT_BIAS_ON"
         ]
         return jsonify({k: os.getenv(k) for k in keys}), 200
 
