@@ -1,1851 +1,262 @@
-# -*- coding: utf-8 -*-
-"""
-server.py — BGS百家樂AI 獨立預測版本
-修正重點：
-1. 移除歷史依賴，每局獨立預測
-2. 簡化預測邏輯，專注於點數特徵
-3. 移除過度平滑和複雜的學習機制
-"""
 
-import os, sys, re, time, json, logging
-from typing import Dict, Any
-import numpy as np# -*- coding: utf-8 -*-
-"""
-server.py — BGS百家樂AI 平衡預測版本
-修正重點：
-1. 保留粒子滤波器但简化复杂度
-2. 每局预测相对独立，减少历史依赖
-3. 优化参数设置，提高响应性
-"""
+# server_pro.py — BGS 百家樂（專業版）
+# Deplete（扣牌）+ 粒子濾波 PF +（可選）XGB/LGB/RNN 融合
+# EV-first 決策 + 1/4 Kelly 倉控；與 server_lite.py 保持相同 API 介面
+# Author: 親愛的 x GPT-5 Thinking
 
-import os, sys, re, time, json, logging
-from typing import Dict, Any
+import os, time, re, csv, logging
+from typing import List, Optional, Dict, Tuple
 import numpy as np
+from flask import Flask, request, jsonify
 
+log = logging.getLogger("bgs-pro")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("bgs-server")
 
-# ----------------- Flask -----------------
-try:
-    from flask import Flask, request, jsonify
-    from flask_cors import CORS
-    _has_flask = True
-except Exception:
-    _has_flask = False
-    Flask = None
-    def jsonify(*_, **__): raise RuntimeError("Flask not available")
-    def CORS(*_, **__): pass
+# ====== 環境參數 ======
+SEED = int(os.getenv("SEED","42"))
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES","30"))  # 這支不做 LINE 試用控，只保留參數
+np.random.seed(SEED)
 
-if _has_flask:
-    app = Flask(__name__)
-    CORS(app)
+# Deplete / PF 參數
+DEPL_DECKS   = int(os.getenv("DEPL_DECKS", "8"))
+DEPL_SIMS    = int(os.getenv("DEPL_SIMS",  "30000"))
+PF_N         = int(os.getenv("PF_N", "200"))
+PF_UPD_SIMS  = int(os.getenv("PF_UPD_SIMS", "80"))
+PF_PRED_SIMS = int(os.getenv("PF_PRED_SIMS","220"))
+PF_RESAMPLE  = float(os.getenv("PF_RESAMPLE","0.5"))
+PF_DIR_ALPHA = float(os.getenv("PF_DIR_ALPHA","0.8"))
+PF_USE_EXACT = int(os.getenv("PF_USE_EXACT","0"))
 
-    @app.get("/")
-    def root():
-        return "✅ BGS PF Server OK", 200
-else:
-    class _DummyApp:
-        def get(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def post(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def run(self, *a, **k): print("Flask not installed; dummy app.")
-    app = _DummyApp()
+# Ensemble（可選）
+TEMP_XGB = float(os.getenv("TEMP_XGB", "0.9"))
+TEMP_LGB = float(os.getenv("TEMP_LGB", "0.9"))
+TEMP_RNN = float(os.getenv("TEMP_RNN", "0.8"))
+ENSEMBLE_WEIGHTS = os.getenv("ENSEMBLE_WEIGHTS", "xgb:0.3,lgb:0.3,rnn:0.4")
 
-# ----------------- Redis (optional) -----------------
-try:
-    import redis
-except Exception:
-    redis = None
+# 決策參數
+EDGE_ENTER   = float(os.getenv("EDGE_ENTER","0.03"))   # EV 進場門檻（抽水後）
+USE_KELLY    = int(os.getenv("USE_KELLY","1"))
+KELLY_FACTOR = float(os.getenv("KELLY_FACTOR","0.25")) # 1/4 Kelly
+MAX_BET_PCT  = float(os.getenv("MAX_BET_PCT","0.015")) # 單注上限（1.5%）
 
-REDIS_URL = os.getenv("REDIS_URL", "")
-rcli = None
-if redis and REDIS_URL:
+# ====== 模組載入 ======
+from bgs.deplete import DepleteMC
+from bgs.pfilter import OutcomePF
+
+# （可選）樹/深度模型：若檔案不存在就自動跳過
+XGB = None; LGBM = None; RNN = None
+def _load_xgb():
+    global XGB
     try:
-        rcli = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
-        rcli.ping()
-        log.info("Connected Redis ok")
+        import xgboost as xgb
+        path = os.getenv("XGB_OUT_PATH", "data/models/xgb.json")
+        if os.path.exists(path):
+            booster = xgb.Booster(); booster.load_model(path)
+            XGB = booster; log.info("[MODEL] XGB loaded")
     except Exception as e:
-        log.warning("Redis disabled: %s", e)
-        rcli = None
+        log.info("[MODEL] XGB not used: %s", e)
 
-# ----------------- Session -----------------
-SESS: Dict[str, Dict[str, Any]] = {}
-SESSION_EXPIRE = 3600
-
-# ---------- Tunables / Defaults (平衡預測版本) ----------
-os.environ.setdefault("BANKER_COMMISSION", "0.05")
-
-# 平衡預測參數
-os.environ.setdefault("EDGE_ENTER_EV", "0.0015")
-os.environ.setdefault("ENTER_GAP_MIN", "0.018")  
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.07")
-os.environ.setdefault("TIE_PROB_MAX", "0.28")
-os.environ.setdefault("STATS_DISPLAY", "smart")
-
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
-os.environ.setdefault("MAX_BET_PCT", "0.35")
-os.environ.setdefault("BET_UNIT", "100")
-
-# 平衡模式 - 輕度學習
-os.environ.setdefault("MODEL_MODE", "balanced")
-os.environ.setdefault("DECKS", "6")
-os.environ.setdefault("PF_N", "80")  # 減少粒子數
-os.environ.setdefault("PF_RESAMPLE", "0.75")
-os.environ.setdefault("PF_PRED_SIMS", "25")
-
-# ----------------- PF Loader -----------------
-OutcomePF = None
-_pf_import_from = "none"
-try:
-    from bgs.pfilter import OutcomePF
-    _pf_import_from = "bgs"
-except Exception:
+def _load_lgb():
+    global LGBM
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        if cur not in sys.path: sys.path.insert(0, cur)
-        from pfilter import OutcomePF
-        _pf_import_from = "local"
-    except Exception:
-        OutcomePF = None
-        _pf_import_from = "none"
+        import lightgbm as lgb
+        path = os.getenv("LGBM_OUT_PATH", "data/models/lgbm.txt")
+        if os.path.exists(path):
+            LGBM = lgb.Booster(model_file=path); log.info("[MODEL] LGBM loaded")
+    except Exception as e:
+        log.info("[MODEL] LGBM not used: %s", e)
 
-PF_STATUS = {"ready": OutcomePF is not None, "error": None, "from": _pf_import_from}
-log.info("OutcomePF import: %s", PF_STATUS)
+def _load_rnn():
+    global RNN
+    try:
+        import torch, torch.nn as nn
+        class TinyRNN(nn.Module):
+            def __init__(self, in_dim=3, hid=int(os.getenv("RNN_HIDDEN","32")), out_dim=3):
+                super().__init__(); self.gru = nn.GRU(in_dim, hid, 1, batch_first=True); self.fc = nn.Linear(hid, out_dim)
+            def forward(self, x): o,_ = self.gru(x); return self.fc(o[:,-1,:])
+        path = os.getenv("RNN_OUT_PATH", "data/models/rnn.pt")
+        if os.path.exists(path):
+            RNN = TinyRNN(); state = __import__("torch").load(path, map_location="cpu")
+            RNN.load_state_dict(state); RNN.eval(); log.info("[MODEL] RNN loaded")
+    except Exception as e:
+        log.info("[MODEL] RNN not used: %s", e)
 
-class _DummyPF:
-    def update_outcome(self, outcome): pass
-    def predict(self, **k): return np.array([0.458, 0.446, 0.096], dtype=np.float32)
-    def update_point_history(self, p_pts, b_pts): pass
+_load_xgb(); _load_lgb(); _load_rnn()
 
-def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
-    """Get particle filter for the session"""
-    global PF_STATUS
+# ====== 小工具 ======
+MAP = {"B":0,"P":1,"T":2,"莊":0,"閒":1,"和":2}
+INV = {0:"莊",1:"閒",2:"和"}
 
-    if not OutcomePF:
-        PF_STATUS = {"ready": False, "error": "OutcomePF module missing", "from": _pf_import_from}
-        sess["_pf_dummy"] = True
-        return _DummyPF()
+def parse_history(s: str) -> List[int]:
+    s = (s or "").strip().upper()
+    if not s: return []
+    s = s.replace("，"," ").replace("、"," ").replace("\u3000"," ")
+    toks = s.split()
+    seq = list(s) if (len(toks)==1 and len(s)<=20) else toks
+    out=[]
+    for t in seq:
+        t = t.strip().upper()
+        if t in MAP: out.append(MAP[t])
+    return out
 
-    if sess.get("pf") is None and not sess.get("_pf_failed"):
+def parse_last_hand_points(text: str):
+    if not text: return None
+    s = (text or "").strip().upper()
+    s = s.replace("：",":")
+    s = re.sub(r"\s+","",s)
+    m = re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*(?:和|TIE|DRAW)[:]?(\d)', s)
+    if m: d=int(m.group(1)); return (d,d)
+    if re.search(r'(?:上局結果|上局|LAST|PREV)?[:]*(?:和|TIE|DRAW)\b', s): return None
+    m = re.search(r'(?:閒|P)[:]?(\d).*?(?:莊|B)[:]?(\d)', s)
+    if m: return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r'(?:莊|B)[:]?(\d).*?(?:閒|P)[:]?(\d)', s)
+    if m: return (int(m.group(2)), int(m.group(1)))
+    return None
+
+def softmax_log(p: np.ndarray, temp: float=1.0) -> np.ndarray:
+    x = np.log(np.clip(p,1e-9,None)) / max(1e-9,temp)
+    x = x - x.max(); e = np.exp(x); return e / e.sum()
+
+def banker_ev(pB, pP): return 0.95*pB - pP  # tie 退回
+def player_ev(pB, pP): return pP - pB
+
+def kelly_fraction(p_win: float, payoff: float):
+    q = 1.0 - p_win; edge = p_win*payoff - q
+    return max(0.0, edge / max(1e-9,payoff))
+
+def bet_amount(bankroll:int, pct:float) -> int:
+    if bankroll<=0 or pct<=0: return 0
+    return int(round(bankroll*pct))
+
+# ====== 引擎 ======
+DEPL = DepleteMC(decks=DEPL_DECKS, seed=SEED)
+PF   = OutcomePF(decks=DEPL_DECKS, seed=SEED, n_particles=PF_N,
+                 sims_lik=PF_UPD_SIMS, resample_thr=PF_RESAMPLE,
+                 dirichlet_alpha=PF_DIR_ALPHA, use_exact=bool(PF_USE_EXACT))
+
+def _ensemble_probs(seq: List[int]) -> np.ndarray:
+    preds=[]; names=[]; W=[]
+    # Deplete
+    try:
+        p_depl = DEPL.predict(sims=DEPL_SIMS)
+        if p_depl is not None: preds.append(p_depl); names.append("DEPL"); W.append(0.5)
+    except Exception as e:
+        log.warning("Deplete predict failed: %s", e)
+    # PF
+    try:
+        p_pf = PF.predict(sims_per_particle=PF_PRED_SIMS)
+        if p_pf is not None: preds.append(p_pf); names.append("PF"); W.append(0.5)
+    except Exception as e:
+        log.warning("PF predict failed: %s", e)
+
+    # Optional XGB/LGB/RNN
+    feat = None
+    if XGB or LGBM:
+        from bgs.features import big_road_features as _brf  # 如果沒有此檔，請關閉或自行提供
         try:
-            sess["pf"] = OutcomePF(
-                decks=int(os.getenv("DECKS", "6")),
-                seed=int(os.getenv("SEED", "42")) + int(time.time() % 1000),
-                n_particles=int(os.getenv("PF_N", "80")),  # 減少粒子數
-                sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "25"))),
-                resample_thr=float(os.getenv("PF_RESAMPLE", "0.75")),
-                backend=os.getenv("PF_BACKEND", "mc"),
-                dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.01")),
-                stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.85")),
-            )
-            PF_STATUS = {"ready": True, "error": None, "from": _pf_import_from}
-            sess.pop("_pf_dummy", None)
-            log.info("OutcomePF initialised for user %s", sess.get("user_id", "unknown"))
-        except Exception as exc:
-            sess["_pf_failed"] = True
-            sess["_pf_dummy"] = True
-            sess["_pf_error_msg"] = str(exc)
-            PF_STATUS = {"ready": False, "error": str(exc), "from": _pf_import_from}
-            log.exception("Failed to initialise OutcomePF; falling back to dummy model")
+            feat = _brf(seq).reshape(1,-1)
+        except Exception:
+            feat = None
+    if XGB and feat is not None:
+        import xgboost as xgb
+        try:
+            px = XGB.predict(xgb.DMatrix(feat))[0]; preds.append(softmax_log(np.array(px), TEMP_XGB)); names.append("XGB"); W.append(0.0)
+        except Exception as e: log.info("XGB skip: %s", e)
+    if LGBM and feat is not None:
+        try:
+            pl = LGBM.predict(feat)[0]; preds.append(softmax_log(np.array(pl), TEMP_LGB)); names.append("LGBM"); W.append(0.0)
+        except Exception as e: log.info("LGBM skip: %s", e)
+    if RNN:
+        try:
+            import torch
+            sub = seq[-128:] if len(seq)>128 else seq[:]
+            L=len(sub); oh=np.zeros((1,L,3),dtype=np.float32)
+            for i,v in enumerate(sub):
+                if v in (0,1,2): oh[0,i,v]=1.0
+            x = torch.from_numpy(oh)
+            with torch.no_grad():
+                logits=RNN(x)
+                pr = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            preds.append(softmax_log(pr, TEMP_RNN)); names.append("RNN"); W.append(0.0)
+        except Exception as e: log.info("RNN skip: %s", e)
 
-    pf = sess.get("pf")
-    if pf is None:
-        sess["_pf_dummy"] = True
-        if isinstance(PF_STATUS, dict) and PF_STATUS.get("error") and not sess.get("_pf_error_msg"):
-            sess["_pf_error_msg"] = PF_STATUS["error"]
-        return _DummyPF()
+    if not preds:
+        return np.array([0.45,0.45,0.10], dtype=np.float32)
+    P = np.stack(preds, axis=0); W = np.array(W, dtype=np.float32)
+    if W.sum() <= 0: W = np.ones(len(preds), dtype=np.float32)/len(preds)
+    W = W / W.sum()
+    p = (P * W[:,None]).sum(axis=0)
+    p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
+    return p.astype(np.float32)
 
-    sess.pop("_pf_dummy", None)
-    sess.pop("_pf_error_msg", None)
-    return pf
-
-# ----------------- Trial / Open -----------------
-TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
-OPENCODE = os.getenv("OPENCODE", "aaa8881688")
-ADMIN_LINE = os.getenv("ADMIN_LINE", "https://lin.ee/Dlm6Y3u")
-
-def _now(): return int(time.time())
-
-def _get_user_info(user_id):
-    k = f"bgsu:{user_id}"
-    if rcli:
-        s = rcli.get(k)
-        if s: return json.loads(s)
-    return SESS.get(user_id, {})
-
-def _set_user_info(user_id, info):
-    k = f"bgsu:{user_id}"
-    if rcli: rcli.set(k, json.dumps(info), ex=86400)
-    SESS[user_id] = info
-
-def _is_trial_valid(user_id):
-    """若永久開通 or 試用中則允許"""
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return True
-    if not info.get("trial_start"): return True
-    return (_now() - int(info["trial_start"])) < TRIAL_SECONDS
-
-def _start_trial(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return
-    if not info.get("trial_start"):
-        info["trial_start"] = _now()
-        _set_user_info(user_id, info)
-
-def _set_opened(user_id):
-    info = _get_user_info(user_id)
-    info["is_opened"] = True
-    _set_user_info(user_id, info)
-
-def _left_trial_sec(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return "永久"
-    if not info.get("trial_start"): return "尚未啟動"
-    left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
-    return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
-
-# ----------------- Strategy helpers -----------------
-def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """平衡信心度計算"""
-    edge = max(ev_b, ev_p)
-    diff = abs(pB - pP)
-    edge_term = min(1.0, edge / 0.06) ** 0.9
-    prob_term = min(1.0, diff / 0.30) ** 0.85
-    raw = 0.6 * edge_term + 0.4 * prob_term
-    return float(max(0.0, min(1.0, raw ** 0.9)))
-
-def get_stats_display(sess):
-    """統計顯示"""
-    mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
-    if mode == "none": return None
-    pred, real = sess.get("hist_pred", []), sess.get("hist_real", [])
-    if not pred or not real: return "📊 數據收集中..."
-    bet_pairs = [(p,r) for p,r in zip(pred,real) if r in ("莊","閒") and p in ("莊","閒")]
-    if not bet_pairs: return "📊 尚未進行下注"
-    hit = sum(1 for p,r in bet_pairs if p==r)
-    total = len(bet_pairs)
-    acc = 100.0 * hit / total
-    if mode == "smart":
-        if total >= 15: return f"🎯 近期勝率：{acc:.1f}%"
-        if total >= 5:  return f"🎯 當前勝率：{acc:.1f}% ({hit}/{total})"
-        return f"🎯 初始勝率：{acc:.1f}% ({hit}/{total})"
+def decide_bp(p: np.ndarray) -> Tuple[str, float, float, str]:
+    pB, pP, pT = float(p[0]), float(p[1]), float(p[2])
+    evB, evP = banker_ev(pB,pP), player_ev(pB,pP)
+    side = 0 if evB > evP else 1
+    ev_edge = max(evB, evP)
+    if ev_edge < EDGE_ENTER:
+        return ("觀望", ev_edge, 0.0, f"⚪ 優勢不足（門檻 {EDGE_ENTER:.3f}）")
+    if USE_KELLY:
+        win_p = pB if side==0 else pP
+        payoff = 0.95 if side==0 else 1.0
+        f = KELLY_FACTOR * kelly_fraction(win_p, payoff)
+        bet_pct = min(MAX_BET_PCT, float(max(0.0, f)))
+        reason = "🧠 EV優先｜📐 ¼-Kelly"
     else:
-        total_hands = len([r for r in real if r in ("莊","閒")])
-        watched = total_hands - total
-        base = f"📊 下注勝率：{acc:.1f}% ({hit}/{total})"
-        return f"{base} | 觀望：{watched}手" if watched>0 else base
+        if ev_edge >= 0.10: bet_pct = 0.25
+        elif ev_edge >= 0.07: bet_pct = 0.15
+        elif ev_edge >= 0.04: bet_pct = 0.10
+        else: bet_pct = 0.05
+        reason = "🧠 EV優先｜🪜 階梯配注"
+    return (INV[side], ev_edge, bet_pct, reason)
 
-def _format_pts_text(p_pts, b_pts):
-    if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
-    return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+# ====== 介面 ======
+app = Flask(__name__)
 
-# ----------------- 核心：平衡預測邏輯 -----------------
-def _safe_norm(v: np.ndarray) -> np.ndarray:
-    """安全正規化"""
-    v = np.asarray(v, dtype=np.float64)
-    if not np.isfinite(v).all() or v.ndim != 1 or v.size != 3:
-        raise ValueError("invalid probs")
-    v = np.clip(v, 1e-9, None)
-    s = v.sum()
-    if not np.isfinite(s) or s <= 0:
-        raise ValueError("sum invalid")
-    return (v / s).astype(np.float32)
+@app.get("/health")
+def health():
+    return jsonify(ok=True, ts=time.time(), engine="pro"), 200
 
-def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
-    # 參數驗證
-    if not (p_pts == 0 and b_pts == 0):
-        if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
-            return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
+@app.post("/predict")
+def predict():
+    data = request.get_json(silent=True) or {}
+    bankroll = int(float(data.get("bankroll") or 0))
+    seq = parse_history(str(data.get("history","")))
 
-    pf = _get_pf_from_sess(sess)
-
-    # 更新實際結果（輕度更新）
-    if p_pts == b_pts and not (p_pts == 0 and b_pts == 0):
-        try: pf.update_outcome(2)
-        except Exception: pass
-        real_label = "和"
-    elif p_pts == 0 and b_pts == 0:
-        try: pf.update_outcome(2)
-        except Exception: pass
-        real_label = "和"
-    else:
-        pf.update_point_history(p_pts, b_pts)
-        outcome = 1 if p_pts > b_pts else 0
-        real_label = "閒" if p_pts > b_pts else "莊"
-        # 單次更新，避免過度學習
-        try: pf.update_outcome(outcome)
-        except Exception: pass
-
-    # 處理上一局pending建議
-    st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    if "pending_pred" in sess:
-        prev_pred = sess.pop("pending_pred")
-        prev_watch = bool(sess.pop("pending_watch", False))
-        prev_edge = float(sess.pop("pending_edge_ev", 0.0))
-        prev_bet_amt = int(sess.pop("pending_bet_amt", 0))
-        prev_ev_choice = sess.pop("pending_ev_choice", None)
-
-        # 寫入歷史
-        sess.setdefault("hist_pred", []).append("觀望" if prev_watch else (prev_ev_choice or prev_pred))
-        sess.setdefault("hist_real", []).append(real_label)
-        sess["hist_pred"] = sess["hist_pred"][-150:]
-        sess["hist_real"] = sess["hist_real"][-150:]
-
-        # 統計
-        if not prev_watch and real_label in ("莊","閒"):
-            st["bets"] += 1
-            st["sum_edge"] += float(prev_edge)
-            if (prev_ev_choice or prev_pred) == real_label:
-                if prev_ev_choice == "莊":
-                    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-                    st["payout"] += int(round(prev_bet_amt * (1.0 - BCOMM)))
-                else:
-                    st["payout"] += int(prev_bet_amt)
-                st["wins"] += 1
-            else:
-                st["payout"] -= int(prev_bet_amt)
-        elif real_label == "和":
-            st["push"] += 1
-
-    # 產生新一局預測
-    sims_pred = int(os.getenv("PF_PRED_SIMS","25"))
-    try:
-        p_raw = pf.predict(sims_per_particle=sims_pred)
-        p_final = _safe_norm(p_raw)
-    except Exception as e:
-        log.warning("predict fallback due to %s", e)
-        # 保守fallback
-        p_final = np.array([0.458, 0.446, 0.096], dtype=np.float32)
-
-    # 輕度平滑
-    alpha = 0.7  # 較高的alpha，減少平滑
-    prev_sma = sess.get("prob_sma")
-    if prev_sma is None:
-        sess["prob_sma"] = p_final
-    else:
-        sess["prob_sma"] = alpha * p_final + (1 - alpha) * prev_sma
-    p_final = sess["prob_sma"]
-
-    pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
-
-    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-    ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
-    ev_p = pP * 1.0            - (1.0 - pP - pT)
-
-    # 選擇邏輯
-    ev_choice = "莊" if ev_b > ev_p else "閒"
-    edge_ev = max(ev_b, ev_p)
-    if abs(ev_b - ev_p) < 0.004:
-        if pB > pP:
-            ev_choice = "莊"
-            edge_ev = ev_b + 0.001
-        else:
-            ev_choice = "閒" 
-            edge_ev = ev_p + 0.001
-
-    # 平衡觀望條件
-    watch, reasons = False, []
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.0015"))
-    if edge_ev < EDGE_ENTER_EV:
-        watch = True; reasons.append(f"EV優勢不足")
-    
-    TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.28"))
-    if pT > TIE_PROB_MAX and edge_ev < 0.02:
-        watch = True; reasons.append("和局風險")
-        
-    enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.018"))
-    top2 = sorted([pB, pP, pT], reverse=True)[:2]
-    if (top2[0] - top2[1]) < enter_gap_min:
-        watch = True; reasons.append("勝率差不足")
-
-    # 下注金額計算
-    bankroll = int(sess.get("bankroll", 0))
-    bet_pct = 0.0
-    bet_amt = 0
-
-    if not watch:
-        conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
-        base_ceiling = 0.30
-        
-        base_pct = base_floor + (base_ceiling - base_floor) * conf
-        bet_pct = max(base_floor, min(float(os.getenv("MAX_BET_PCT", "0.35")), base_pct))
-
-        if bankroll > 0 and bet_pct > 0:
-            unit = int(os.getenv("BET_UNIT", "100"))
-            bet_amt = int(round(bankroll * bet_pct))
-            bet_amt = max(0, int(round(bet_amt / unit)) * unit)
-
-    # 存入pending
-    sess["pending_pred"] = "觀望" if watch else ev_choice
-    sess["pending_watch"] = bool(watch)
-    sess["pending_edge_ev"] = float(edge_ev)
-    sess["pending_bet_amt"] = int(bet_amt)
-    sess["pending_ev_choice"] = ev_choice
-
-    sess["last_pts_text"] = _format_pts_text(p_pts, b_pts) if not (p_pts==0 and b_pts==0) else "上局結果: 和"
-    sess["last_prob_gap"] = edge_ev
-
-    stats_display = get_stats_display(sess)
-    strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.15 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.25 else
-        f"🟢 高信心配注 {bet_pct*100:.1f}%"
-    )
-
-    msg = [
-        sess["last_pts_text"],
-        "開始平衡分析下局....",
-        "",
-        "【平衡預測結果】",
-        f"閒：{p_final[1]*100:.2f}%",
-        f"莊：{p_final[0]*100:.2f}%",
-        f"和：{p_final[2]*100:.2f}%", 
-        f"本次預測：{'觀望' if watch else ev_choice} (EV優勢: {edge_ev*100:.2f}%)",
-        f"建議下注金額：{bet_amt:,}",
-        f"配注策略：{strat}",
-    ]
-    
-    if sess.get("_pf_dummy"):
-        warn = sess.get("_pf_error_msg") or (PF_STATUS.get("error") if isinstance(PF_STATUS, dict) else None)
-        detail = f"（{warn}）" if warn else ""
-        msg.append(f"⚠️ 預測引擎載入失敗，僅提供靜態機率{detail}".strip())
-    if stats_display: msg.append(stats_display)
-    msg.extend([
-        "—",
-        "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
-        "⚙️ 輸入「設定」可開啟功能按鈕"
-    ])
-    return "\n".join(msg)
-
-def _format_stats(sess):
-    st = sess.get("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    bets, wins, push, payout = st["bets"], st["wins"], st["push"], st["payout"]
-    acc = (wins / bets * 100.0) if bets>0 else 0.0
-    return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
-
-# ----------------- LINE SDK -----------------
-_has_line = True
-try:
-    from linebot import LineBotApi, WebhookHandler
-    from linebot.models import (
-        MessageEvent, TextMessage, TextSendMessage,
-        QuickReply, QuickReplyButton, MessageAction
-    )
-except Exception as e:
-    _has_line = False
-    LineBotApi = WebhookHandler = None
-    MessageEvent = TextMessage = TextSendMessage = QuickReply = QuickReplyButton = MessageAction = object
-    log.warning("LINE SDK not available, falling back to Dummy LINE mode: %s", e)
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
-
-if _has_line and LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
-    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
-    handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    LINE_MODE = "real"
-else:
-    LINE_MODE = "dummy"
-    class _DummyHandler:
-        def add(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def handle(self, body, signature):
-            log.info("[DummyLINE] handle called")
-    class _DummyLineAPI:
-        def reply_message(self, token, message):
+    # 可選：從 last_pts 更新 Deplete / PF（能提升準確度）
+    lp = data.get("last_pts")
+    if lp:
+        pts = parse_last_hand_points(lp)
+        if pts is not None:
+            p_total, b_total = int(pts[0]), int(pts[1])
             try:
-                txt = message.text if hasattr(message, "text") else str(message)
-            except Exception:
-                txt = str(message)
-            log.info("[DummyLINE] reply: %s", txt)
-    handler = _DummyHandler()
-    line_bot_api = _DummyLineAPI()
-    log.warning("LINE credentials missing or SDK unavailable; running in Dummy LINE mode.")
+                DEPL.update_hand({"p_total": p_total, "b_total": b_total, "trials": 400})
+            except Exception as e:
+                log.warning("Deplete update failed: %s", e)
+            PF.update_outcome(1 if p_total>b_total else (0 if b_total>p_total else 2))
 
-def _qr_btn(label, text):
-    if LINE_MODE == "real":
-        return QuickReplyButton(action=MessageAction(label=label, text=text))
-    return {"label": label, "text": text}
+    p = _ensemble_probs(seq)
+    choice, ev_edge, bet_pct, reason = decide_bp(p)
+    amt = bet_amount(bankroll, bet_pct)
 
-def _reply(token, text, quick=None):
-    try:
-        if LINE_MODE == "real":
-            if quick:
-                line_bot_api.reply_message(
-                    token,
-                    TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
-                )
-            else:
-                line_bot_api.reply_message(token, TextSendMessage(text=text))
-        else:
-            log.info("[DummyLINE] reply%s: %s", " (with quick)" if quick else "", text)
-    except Exception as e:
-        log.warning("LINE reply_message error: %s", e)
-
-# —— 歡迎文案 —— #
-def welcome_text(uid):
-    left = _left_trial_sec(uid)
-    return (
-        "👋 歡迎使用 BGS AI 平衡預測系統！\n"
-        "【使用步驟】\n"
-        "1️⃣ 選擇館別（輸入 1~10）\n"
-        "2️⃣ 輸入桌號（例：DG01）\n"
-        "3️⃣ 輸入本金（例：5000）\n"
-        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）\n"
-        f"💾 試用剩餘：{left}\n\n"
-        "【請選擇遊戲館別】\n"
-        "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n"
-        "6. 歐博/卡利\n7. KG\n8. 金利\n9. 名人\n10. MT真人\n"
-        "(請直接輸入數字1-10)"
+    b_pct, p_pct = int(round(100*p[0])), int(round(100*p[1]))
+    evB, evP = banker_ev(float(p[0]), float(p[1])), player_ev(float(p[0]), float(p[1]))
+    msg = (
+        f"🎯 下一局建議：{choice}\n"
+        f"💰 建議注額：{amt:,}\n"
+        f"📊 機率｜莊 {b_pct}%｜閒 {p_pct}%｜和 {int(round(100*p[2]))}%\n"
+        f"📐 EV（抽水後）｜莊 {evB:.3f}｜閒 {evP:.3f}\n"
+        f"{reason}"
     )
 
-def settings_quickreply(sess) -> list:
-    return [
-        _qr_btn("選館別", "設定 館別"),
-        _qr_btn("查看統計", "查看統計"),
-        _qr_btn("試用剩餘", "試用剩餘"),
-        _qr_btn("重設流程", "重設"),
-    ]
+    return jsonify(
+        message=msg, engine="pro",
+        suggestion=choice, bet_pct=float(bet_pct), bet_amount=amt,
+        probabilities={"banker": float(p[0]), "player": float(p[1]), "tie": float(p[2])},
+        ev={"banker": float(evB), "player": float(evP)},
+    ), 200
 
-def halls_quickreply() -> list:
-    return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
-
-# ----------------- HTTP routes -----------------
-if _has_flask:
-    @app.get("/health")
-    def health():
-        return jsonify(
-            ok=True,
-            ts=time.time(),
-            msg="API normal - Balanced Mode",
-            pf_status=PF_STATUS,
-            line_mode=("real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy"),
-        ), 200
-
-    @app.get("/version")
-    def version():
-        return jsonify(
-            version=os.getenv("RELEASE", "local"),
-            commit=os.getenv("GIT_SHA", "unknown"),
-            mode="balanced"
-        ), 200
-
-    @app.post("/line-webhook")
-    def callback():
-        signature = request.headers.get('X-Line-Signature', '')
-        body = request.get_data(as_text=True)
-        try:
-            handler.handle(body, signature)
-        except Exception as e:
-            log.warning("LINE webhook error: %s", e)
-            return "bad request", 400
-        return "ok", 200
-
-# —— LINE 事件處理 ——
-def _handle_message_core(event):
-    user_id = getattr(getattr(event, "source", None), "user_id", None)
-    text = getattr(getattr(event, "message", None), "text", "")
-    if user_id is None: user_id = "dummy-user"
-    text = (text or "").strip()
-
-    _start_trial(user_id)
-
-    if text.startswith("開通"):
-        pwd = text[2:].strip()
-        reply = "✅ 已開通成功！" if pwd == OPENCODE else "❌ 開通碼錯誤，請重新輸入。"
-        if pwd == OPENCODE: _set_opened(user_id)
-        _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
-        return
-
-    if not _is_trial_valid(user_id):
-        _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
-        return
-
-    sess = SESS.setdefault(user_id, {"bankroll": 0})
-    sess["user_id"] = user_id
-
-    if text in ("設定","⋯","menu","Menu"):
-        _reply(event.reply_token, "⚙️ 設定選單：", quick=settings_quickreply(sess)); return
-    if text == "查看統計":
-        _reply(event.reply_token, _format_stats(sess), quick=settings_quickreply(sess)); return
-    if text == "試用剩餘":
-        _reply(event.reply_token, "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
-    if text == "重設":
-        SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
-
-    # 館別 -> 桌號 -> 本金
-    if not sess.get("hall_id"):
-        if text.isdigit() and 1 <= int(text) <= 10:
-            sess["hall_id"] = int(text)
-            hall_map = ["WM", "PM", "DG", "SA", "KU", "歐博/卡利", "KG", "金利", "名人", "MT真人"]
-            hall_name = hall_map[int(text)-1]
-            _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        elif text == "設定 館別":
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=halls_quickreply())
-        else:
-            _reply(event.reply_token, welcome_text(user_id), quick=halls_quickreply())
-        return
-
-    if not sess.get("table_id"):
-        m = re.match(r"^[a-zA-Z]{2}\d{2}$", text)
-        if m:
-            sess["table_id"] = text.upper()
-            _reply(event.reply_token, f"✅ 已設桌號 [{sess['table_id']}]\n請輸入您的本金（例：5000）", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        return
-
-    if not sess.get("bankroll") or sess["bankroll"] <= 0:
-        m = re.match(r"^(\d{3,7})$", text)
-        if m:
-            sess["bankroll"] = int(text)
-            _reply(event.reply_token, f"👍 已設定本金：{sess['bankroll']:,}\n請輸入上一局點數開始平衡預測", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
-        return
-
-    # 連續模式
-    try:
-        if text.strip() == "和":
-            reply = handle_points_and_predict(sess, 0, 0)
-        elif re.fullmatch(r"\d{2}", text):
-            p_pts, b_pts = int(text[0]), int(text[1])
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif re.search("閒(\d+).*莊(\d+)", text):
-            mm = re.search("閒(\d+).*莊(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(1)), int(mm.group(2)))
-        elif re.search("莊(\d+).*閒(\d+)", text):
-            mm = re.search("莊(\d+).*閒(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(2)), int(mm.group(1)))
-        else:
-            reply = "請輸入正確格式，例如 65（閒6莊5），或『閒6莊5／莊5閒6／和』"
-    except Exception as e:
-        reply = f"❌ 輸入格式有誤: {e}"
-
-    _reply(event.reply_token, reply, quick=settings_quickreply(sess))
-
-if 'LINE_MODE' in globals() and LINE_MODE == "real":
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_message(event):
-        _handle_message_core(event)
-
-# ----------------- Run -----------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    log.info("Starting BGS-Balanced on port %s (LINE_MODE=%s)", port,
-             "real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy")
-    if hasattr(app, "run"):
-        app.run(host="0.0.0.0", port=port, debug=False)# -*- coding: utf-8 -*-
-"""
-server.py — BGS百家樂AI 平衡預測版本
-修正重點：
-1. 保留粒子滤波器但简化复杂度
-2. 每局预测相对独立，减少历史依赖
-3. 优化参数设置，提高响应性
-"""
-
-import os, sys, re, time, json, logging
-from typing import Dict, Any
-import numpy as np
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("bgs-server")
-
-# ----------------- Flask -----------------
-try:
-    from flask import Flask, request, jsonify
-    from flask_cors import CORS
-    _has_flask = True
-except Exception:
-    _has_flask = False
-    Flask = None
-    def jsonify(*_, **__): raise RuntimeError("Flask not available")
-    def CORS(*_, **__): pass
-
-if _has_flask:
-    app = Flask(__name__)
-    CORS(app)
-
-    @app.get("/")
-    def root():
-        return "✅ BGS PF Server OK", 200
-else:
-    class _DummyApp:
-        def get(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def post(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def run(self, *a, **k): print("Flask not installed; dummy app.")
-    app = _DummyApp()
-
-# ----------------- Redis (optional) -----------------
-try:
-    import redis
-except Exception:
-    redis = None
-
-REDIS_URL = os.getenv("REDIS_URL", "")
-rcli = None
-if redis and REDIS_URL:
-    try:
-        rcli = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
-        rcli.ping()
-        log.info("Connected Redis ok")
-    except Exception as e:
-        log.warning("Redis disabled: %s", e)
-        rcli = None
-
-# ----------------- Session -----------------
-SESS: Dict[str, Dict[str, Any]] = {}
-SESSION_EXPIRE = 3600
-
-# ---------- Tunables / Defaults (平衡預測版本) ----------
-os.environ.setdefault("BANKER_COMMISSION", "0.05")
-
-# 平衡預測參數
-os.environ.setdefault("EDGE_ENTER_EV", "0.0015")
-os.environ.setdefault("ENTER_GAP_MIN", "0.018")  
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.07")
-os.environ.setdefault("TIE_PROB_MAX", "0.28")
-os.environ.setdefault("STATS_DISPLAY", "smart")
-
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
-os.environ.setdefault("MAX_BET_PCT", "0.35")
-os.environ.setdefault("BET_UNIT", "100")
-
-# 平衡模式 - 輕度學習
-os.environ.setdefault("MODEL_MODE", "balanced")
-os.environ.setdefault("DECKS", "6")
-os.environ.setdefault("PF_N", "80")  # 減少粒子數
-os.environ.setdefault("PF_RESAMPLE", "0.75")
-os.environ.setdefault("PF_PRED_SIMS", "25")
-
-# ----------------- PF Loader -----------------
-OutcomePF = None
-_pf_import_from = "none"
-try:
-    from bgs.pfilter import OutcomePF
-    _pf_import_from = "bgs"
-except Exception:
-    try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        if cur not in sys.path: sys.path.insert(0, cur)
-        from pfilter import OutcomePF
-        _pf_import_from = "local"
-    except Exception:
-        OutcomePF = None
-        _pf_import_from = "none"
-
-PF_STATUS = {"ready": OutcomePF is not None, "error": None, "from": _pf_import_from}
-log.info("OutcomePF import: %s", PF_STATUS)
-
-class _DummyPF:
-    def update_outcome(self, outcome): pass
-    def predict(self, **k): return np.array([0.458, 0.446, 0.096], dtype=np.float32)
-    def update_point_history(self, p_pts, b_pts): pass
-
-def _get_pf_from_sess(sess: Dict[str, Any]) -> Any:
-    """Get particle filter for the session"""
-    global PF_STATUS
-
-    if not OutcomePF:
-        PF_STATUS = {"ready": False, "error": "OutcomePF module missing", "from": _pf_import_from}
-        sess["_pf_dummy"] = True
-        return _DummyPF()
-
-    if sess.get("pf") is None and not sess.get("_pf_failed"):
-        try:
-            sess["pf"] = OutcomePF(
-                decks=int(os.getenv("DECKS", "6")),
-                seed=int(os.getenv("SEED", "42")) + int(time.time() % 1000),
-                n_particles=int(os.getenv("PF_N", "80")),  # 減少粒子數
-                sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "25"))),
-                resample_thr=float(os.getenv("PF_RESAMPLE", "0.75")),
-                backend=os.getenv("PF_BACKEND", "mc"),
-                dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.01")),
-                stability_factor=float(os.getenv("PF_STAB_FACTOR", "0.85")),
-            )
-            PF_STATUS = {"ready": True, "error": None, "from": _pf_import_from}
-            sess.pop("_pf_dummy", None)
-            log.info("OutcomePF initialised for user %s", sess.get("user_id", "unknown"))
-        except Exception as exc:
-            sess["_pf_failed"] = True
-            sess["_pf_dummy"] = True
-            sess["_pf_error_msg"] = str(exc)
-            PF_STATUS = {"ready": False, "error": str(exc), "from": _pf_import_from}
-            log.exception("Failed to initialise OutcomePF; falling back to dummy model")
-
-    pf = sess.get("pf")
-    if pf is None:
-        sess["_pf_dummy"] = True
-        if isinstance(PF_STATUS, dict) and PF_STATUS.get("error") and not sess.get("_pf_error_msg"):
-            sess["_pf_error_msg"] = PF_STATUS["error"]
-        return _DummyPF()
-
-    sess.pop("_pf_dummy", None)
-    sess.pop("_pf_error_msg", None)
-    return pf
-
-# ----------------- Trial / Open -----------------
-TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
-OPENCODE = os.getenv("OPENCODE", "aaa8881688")
-ADMIN_LINE = os.getenv("ADMIN_LINE", "https://lin.ee/Dlm6Y3u")
-
-def _now(): return int(time.time())
-
-def _get_user_info(user_id):
-    k = f"bgsu:{user_id}"
-    if rcli:
-        s = rcli.get(k)
-        if s: return json.loads(s)
-    return SESS.get(user_id, {})
-
-def _set_user_info(user_id, info):
-    k = f"bgsu:{user_id}"
-    if rcli: rcli.set(k, json.dumps(info), ex=86400)
-    SESS[user_id] = info
-
-def _is_trial_valid(user_id):
-    """若永久開通 or 試用中則允許"""
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return True
-    if not info.get("trial_start"): return True
-    return (_now() - int(info["trial_start"])) < TRIAL_SECONDS
-
-def _start_trial(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return
-    if not info.get("trial_start"):
-        info["trial_start"] = _now()
-        _set_user_info(user_id, info)
-
-def _set_opened(user_id):
-    info = _get_user_info(user_id)
-    info["is_opened"] = True
-    _set_user_info(user_id, info)
-
-def _left_trial_sec(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return "永久"
-    if not info.get("trial_start"): return "尚未啟動"
-    left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
-    return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
-
-# ----------------- Strategy helpers -----------------
-def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """平衡信心度計算"""
-    edge = max(ev_b, ev_p)
-    diff = abs(pB - pP)
-    edge_term = min(1.0, edge / 0.06) ** 0.9
-    prob_term = min(1.0, diff / 0.30) ** 0.85
-    raw = 0.6 * edge_term + 0.4 * prob_term
-    return float(max(0.0, min(1.0, raw ** 0.9)))
-
-def get_stats_display(sess):
-    """統計顯示"""
-    mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
-    if mode == "none": return None
-    pred, real = sess.get("hist_pred", []), sess.get("hist_real", [])
-    if not pred or not real: return "📊 數據收集中..."
-    bet_pairs = [(p,r) for p,r in zip(pred,real) if r in ("莊","閒") and p in ("莊","閒")]
-    if not bet_pairs: return "📊 尚未進行下注"
-    hit = sum(1 for p,r in bet_pairs if p==r)
-    total = len(bet_pairs)
-    acc = 100.0 * hit / total
-    if mode == "smart":
-        if total >= 15: return f"🎯 近期勝率：{acc:.1f}%"
-        if total >= 5:  return f"🎯 當前勝率：{acc:.1f}% ({hit}/{total})"
-        return f"🎯 初始勝率：{acc:.1f}% ({hit}/{total})"
-    else:
-        total_hands = len([r for r in real if r in ("莊","閒")])
-        watched = total_hands - total
-        base = f"📊 下注勝率：{acc:.1f}% ({hit}/{total})"
-        return f"{base} | 觀望：{watched}手" if watched>0 else base
-
-def _format_pts_text(p_pts, b_pts):
-    if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
-    return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
-
-# ----------------- 核心：平衡預測邏輯 -----------------
-def _safe_norm(v: np.ndarray) -> np.ndarray:
-    """安全正規化"""
-    v = np.asarray(v, dtype=np.float64)
-    if not np.isfinite(v).all() or v.ndim != 1 or v.size != 3:
-        raise ValueError("invalid probs")
-    v = np.clip(v, 1e-9, None)
-    s = v.sum()
-    if not np.isfinite(s) or s <= 0:
-        raise ValueError("sum invalid")
-    return (v / s).astype(np.float32)
-
-def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
-    # 參數驗證
-    if not (p_pts == 0 and b_pts == 0):
-        if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
-            return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
-
-    pf = _get_pf_from_sess(sess)
-
-    # 更新實際結果（輕度更新）
-    if p_pts == b_pts and not (p_pts == 0 and b_pts == 0):
-        try: pf.update_outcome(2)
-        except Exception: pass
-        real_label = "和"
-    elif p_pts == 0 and b_pts == 0:
-        try: pf.update_outcome(2)
-        except Exception: pass
-        real_label = "和"
-    else:
-        pf.update_point_history(p_pts, b_pts)
-        outcome = 1 if p_pts > b_pts else 0
-        real_label = "閒" if p_pts > b_pts else "莊"
-        # 單次更新，避免過度學習
-        try: pf.update_outcome(outcome)
-        except Exception: pass
-
-    # 處理上一局pending建議
-    st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    if "pending_pred" in sess:
-        prev_pred = sess.pop("pending_pred")
-        prev_watch = bool(sess.pop("pending_watch", False))
-        prev_edge = float(sess.pop("pending_edge_ev", 0.0))
-        prev_bet_amt = int(sess.pop("pending_bet_amt", 0))
-        prev_ev_choice = sess.pop("pending_ev_choice", None)
-
-        # 寫入歷史
-        sess.setdefault("hist_pred", []).append("觀望" if prev_watch else (prev_ev_choice or prev_pred))
-        sess.setdefault("hist_real", []).append(real_label)
-        sess["hist_pred"] = sess["hist_pred"][-150:]
-        sess["hist_real"] = sess["hist_real"][-150:]
-
-        # 統計
-        if not prev_watch and real_label in ("莊","閒"):
-            st["bets"] += 1
-            st["sum_edge"] += float(prev_edge)
-            if (prev_ev_choice or prev_pred) == real_label:
-                if prev_ev_choice == "莊":
-                    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-                    st["payout"] += int(round(prev_bet_amt * (1.0 - BCOMM)))
-                else:
-                    st["payout"] += int(prev_bet_amt)
-                st["wins"] += 1
-            else:
-                st["payout"] -= int(prev_bet_amt)
-        elif real_label == "和":
-            st["push"] += 1
-
-    # 產生新一局預測
-    sims_pred = int(os.getenv("PF_PRED_SIMS","25"))
-    try:
-        p_raw = pf.predict(sims_per_particle=sims_pred)
-        p_final = _safe_norm(p_raw)
-    except Exception as e:
-        log.warning("predict fallback due to %s", e)
-        # 保守fallback
-        p_final = np.array([0.458, 0.446, 0.096], dtype=np.float32)
-
-    # 輕度平滑
-    alpha = 0.7  # 較高的alpha，減少平滑
-    prev_sma = sess.get("prob_sma")
-    if prev_sma is None:
-        sess["prob_sma"] = p_final
-    else:
-        sess["prob_sma"] = alpha * p_final + (1 - alpha) * prev_sma
-    p_final = sess["prob_sma"]
-
-    pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
-
-    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-    ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
-    ev_p = pP * 1.0            - (1.0 - pP - pT)
-
-    # 選擇邏輯
-    ev_choice = "莊" if ev_b > ev_p else "閒"
-    edge_ev = max(ev_b, ev_p)
-    if abs(ev_b - ev_p) < 0.004:
-        if pB > pP:
-            ev_choice = "莊"
-            edge_ev = ev_b + 0.001
-        else:
-            ev_choice = "閒" 
-            edge_ev = ev_p + 0.001
-
-    # 平衡觀望條件
-    watch, reasons = False, []
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.0015"))
-    if edge_ev < EDGE_ENTER_EV:
-        watch = True; reasons.append(f"EV優勢不足")
-    
-    TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.28"))
-    if pT > TIE_PROB_MAX and edge_ev < 0.02:
-        watch = True; reasons.append("和局風險")
-        
-    enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.018"))
-    top2 = sorted([pB, pP, pT], reverse=True)[:2]
-    if (top2[0] - top2[1]) < enter_gap_min:
-        watch = True; reasons.append("勝率差不足")
-
-    # 下注金額計算
-    bankroll = int(sess.get("bankroll", 0))
-    bet_pct = 0.0
-    bet_amt = 0
-
-    if not watch:
-        conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
-        base_ceiling = 0.30
-        
-        base_pct = base_floor + (base_ceiling - base_floor) * conf
-        bet_pct = max(base_floor, min(float(os.getenv("MAX_BET_PCT", "0.35")), base_pct))
-
-        if bankroll > 0 and bet_pct > 0:
-            unit = int(os.getenv("BET_UNIT", "100"))
-            bet_amt = int(round(bankroll * bet_pct))
-            bet_amt = max(0, int(round(bet_amt / unit)) * unit)
-
-    # 存入pending
-    sess["pending_pred"] = "觀望" if watch else ev_choice
-    sess["pending_watch"] = bool(watch)
-    sess["pending_edge_ev"] = float(edge_ev)
-    sess["pending_bet_amt"] = int(bet_amt)
-    sess["pending_ev_choice"] = ev_choice
-
-    sess["last_pts_text"] = _format_pts_text(p_pts, b_pts) if not (p_pts==0 and b_pts==0) else "上局結果: 和"
-    sess["last_prob_gap"] = edge_ev
-
-    stats_display = get_stats_display(sess)
-    strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.15 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.25 else
-        f"🟢 高信心配注 {bet_pct*100:.1f}%"
-    )
-
-    msg = [
-        sess["last_pts_text"],
-        "開始平衡分析下局....",
-        "",
-        "【平衡預測結果】",
-        f"閒：{p_final[1]*100:.2f}%",
-        f"莊：{p_final[0]*100:.2f}%",
-        f"和：{p_final[2]*100:.2f}%", 
-        f"本次預測：{'觀望' if watch else ev_choice} (EV優勢: {edge_ev*100:.2f}%)",
-        f"建議下注金額：{bet_amt:,}",
-        f"配注策略：{strat}",
-    ]
-    
-    if sess.get("_pf_dummy"):
-        warn = sess.get("_pf_error_msg") or (PF_STATUS.get("error") if isinstance(PF_STATUS, dict) else None)
-        detail = f"（{warn}）" if warn else ""
-        msg.append(f"⚠️ 預測引擎載入失敗，僅提供靜態機率{detail}".strip())
-    if stats_display: msg.append(stats_display)
-    msg.extend([
-        "—",
-        "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
-        "⚙️ 輸入「設定」可開啟功能按鈕"
-    ])
-    return "\n".join(msg)
-
-def _format_stats(sess):
-    st = sess.get("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    bets, wins, push, payout = st["bets"], st["wins"], st["push"], st["payout"]
-    acc = (wins / bets * 100.0) if bets>0 else 0.0
-    return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
-
-# ----------------- LINE SDK -----------------
-_has_line = True
-try:
-    from linebot import LineBotApi, WebhookHandler
-    from linebot.models import (
-        MessageEvent, TextMessage, TextSendMessage,
-        QuickReply, QuickReplyButton, MessageAction
-    )
-except Exception as e:
-    _has_line = False
-    LineBotApi = WebhookHandler = None
-    MessageEvent = TextMessage = TextSendMessage = QuickReply = QuickReplyButton = MessageAction = object
-    log.warning("LINE SDK not available, falling back to Dummy LINE mode: %s", e)
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
-
-if _has_line and LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
-    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
-    handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    LINE_MODE = "real"
-else:
-    LINE_MODE = "dummy"
-    class _DummyHandler:
-        def add(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def handle(self, body, signature):
-            log.info("[DummyLINE] handle called")
-    class _DummyLineAPI:
-        def reply_message(self, token, message):
-            try:
-                txt = message.text if hasattr(message, "text") else str(message)
-            except Exception:
-                txt = str(message)
-            log.info("[DummyLINE] reply: %s", txt)
-    handler = _DummyHandler()
-    line_bot_api = _DummyLineAPI()
-    log.warning("LINE credentials missing or SDK unavailable; running in Dummy LINE mode.")
-
-def _qr_btn(label, text):
-    if LINE_MODE == "real":
-        return QuickReplyButton(action=MessageAction(label=label, text=text))
-    return {"label": label, "text": text}
-
-def _reply(token, text, quick=None):
-    try:
-        if LINE_MODE == "real":
-            if quick:
-                line_bot_api.reply_message(
-                    token,
-                    TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
-                )
-            else:
-                line_bot_api.reply_message(token, TextSendMessage(text=text))
-        else:
-            log.info("[DummyLINE] reply%s: %s", " (with quick)" if quick else "", text)
-    except Exception as e:
-        log.warning("LINE reply_message error: %s", e)
-
-# —— 歡迎文案 —— #
-def welcome_text(uid):
-    left = _left_trial_sec(uid)
-    return (
-        "👋 歡迎使用 BGS AI 平衡預測系統！\n"
-        "【使用步驟】\n"
-        "1️⃣ 選擇館別（輸入 1~10）\n"
-        "2️⃣ 輸入桌號（例：DG01）\n"
-        "3️⃣ 輸入本金（例：5000）\n"
-        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）\n"
-        f"💾 試用剩餘：{left}\n\n"
-        "【請選擇遊戲館別】\n"
-        "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n"
-        "6. 歐博/卡利\n7. KG\n8. 金利\n9. 名人\n10. MT真人\n"
-        "(請直接輸入數字1-10)"
-    )
-
-def settings_quickreply(sess) -> list:
-    return [
-        _qr_btn("選館別", "設定 館別"),
-        _qr_btn("查看統計", "查看統計"),
-        _qr_btn("試用剩餘", "試用剩餘"),
-        _qr_btn("重設流程", "重設"),
-    ]
-
-def halls_quickreply() -> list:
-    return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
-
-# ----------------- HTTP routes -----------------
-if _has_flask:
-    @app.get("/health")
-    def health():
-        return jsonify(
-            ok=True,
-            ts=time.time(),
-            msg="API normal - Balanced Mode",
-            pf_status=PF_STATUS,
-            line_mode=("real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy"),
-        ), 200
-
-    @app.get("/version")
-    def version():
-        return jsonify(
-            version=os.getenv("RELEASE", "local"),
-            commit=os.getenv("GIT_SHA", "unknown"),
-            mode="balanced"
-        ), 200
-
-    @app.post("/line-webhook")
-    def callback():
-        signature = request.headers.get('X-Line-Signature', '')
-        body = request.get_data(as_text=True)
-        try:
-            handler.handle(body, signature)
-        except Exception as e:
-            log.warning("LINE webhook error: %s", e)
-            return "bad request", 400
-        return "ok", 200
-
-# —— LINE 事件處理 ——
-def _handle_message_core(event):
-    user_id = getattr(getattr(event, "source", None), "user_id", None)
-    text = getattr(getattr(event, "message", None), "text", "")
-    if user_id is None: user_id = "dummy-user"
-    text = (text or "").strip()
-
-    _start_trial(user_id)
-
-    if text.startswith("開通"):
-        pwd = text[2:].strip()
-        reply = "✅ 已開通成功！" if pwd == OPENCODE else "❌ 開通碼錯誤，請重新輸入。"
-        if pwd == OPENCODE: _set_opened(user_id)
-        _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
-        return
-
-    if not _is_trial_valid(user_id):
-        _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
-        return
-
-    sess = SESS.setdefault(user_id, {"bankroll": 0})
-    sess["user_id"] = user_id
-
-    if text in ("設定","⋯","menu","Menu"):
-        _reply(event.reply_token, "⚙️ 設定選單：", quick=settings_quickreply(sess)); return
-    if text == "查看統計":
-        _reply(event.reply_token, _format_stats(sess), quick=settings_quickreply(sess)); return
-    if text == "試用剩餘":
-        _reply(event.reply_token, "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
-    if text == "重設":
-        SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
-
-    # 館別 -> 桌號 -> 本金
-    if not sess.get("hall_id"):
-        if text.isdigit() and 1 <= int(text) <= 10:
-            sess["hall_id"] = int(text)
-            hall_map = ["WM", "PM", "DG", "SA", "KU", "歐博/卡利", "KG", "金利", "名人", "MT真人"]
-            hall_name = hall_map[int(text)-1]
-            _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        elif text == "設定 館別":
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=halls_quickreply())
-        else:
-            _reply(event.reply_token, welcome_text(user_id), quick=halls_quickreply())
-        return
-
-    if not sess.get("table_id"):
-        m = re.match(r"^[a-zA-Z]{2}\d{2}$", text)
-        if m:
-            sess["table_id"] = text.upper()
-            _reply(event.reply_token, f"✅ 已設桌號 [{sess['table_id']}]\n請輸入您的本金（例：5000）", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        return
-
-    if not sess.get("bankroll") or sess["bankroll"] <= 0:
-        m = re.match(r"^(\d{3,7})$", text)
-        if m:
-            sess["bankroll"] = int(text)
-            _reply(event.reply_token, f"👍 已設定本金：{sess['bankroll']:,}\n請輸入上一局點數開始平衡預測", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
-        return
-
-    # 連續模式
-    try:
-        if text.strip() == "和":
-            reply = handle_points_and_predict(sess, 0, 0)
-        elif re.fullmatch(r"\d{2}", text):
-            p_pts, b_pts = int(text[0]), int(text[1])
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif re.search("閒(\d+).*莊(\d+)", text):
-            mm = re.search("閒(\d+).*莊(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(1)), int(mm.group(2)))
-        elif re.search("莊(\d+).*閒(\d+)", text):
-            mm = re.search("莊(\d+).*閒(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(2)), int(mm.group(1)))
-        else:
-            reply = "請輸入正確格式，例如 65（閒6莊5），或『閒6莊5／莊5閒6／和』"
-    except Exception as e:
-        reply = f"❌ 輸入格式有誤: {e}"
-
-    _reply(event.reply_token, reply, quick=settings_quickreply(sess))
-
-if 'LINE_MODE' in globals() and LINE_MODE == "real":
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_message(event):
-        _handle_message_core(event)
-
-# ----------------- Run -----------------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT","8000"))
-    log.info("Starting BGS-Balanced on port %s (LINE_MODE=%s)", port,
-             "real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy")
-    if hasattr(app, "run"):
-        app.run(host="0.0.0.0", port=port, debug=False)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("bgs-server")
-
-# ----------------- Flask -----------------
-try:
-    from flask import Flask, request, jsonify
-    from flask_cors import CORS
-    _has_flask = True
-except Exception:
-    _has_flask = False
-    Flask = None
-    def jsonify(*_, **__): raise RuntimeError("Flask not available")
-    def CORS(*_, **__): pass
-
-if _has_flask:
-    app = Flask(__name__)
-    CORS(app)
-
-    @app.get("/")
-    def root():
-        return "✅ BGS PF Server OK", 200
-else:
-    class _DummyApp:
-        def get(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def post(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def run(self, *a, **k): print("Flask not installed; dummy app.")
-    app = _DummyApp()
-
-# ----------------- Redis (optional) -----------------
-try:
-    import redis
-except Exception:
-    redis = None
-
-REDIS_URL = os.getenv("REDIS_URL", "")
-rcli = None
-if redis and REDIS_URL:
-    try:
-        rcli = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
-        rcli.ping()
-        log.info("Connected Redis ok")
-    except Exception as e:
-        log.warning("Redis disabled: %s", e)
-        rcli = None
-
-# ----------------- Session -----------------
-SESS: Dict[str, Dict[str, Any]] = {}
-SESSION_EXPIRE = 3600
-
-# ---------- Tunables / Defaults (獨立預測版本) ----------
-os.environ.setdefault("BANKER_COMMISSION", "0.05")
-
-# 獨立預測參數 - 降低觀望門檻
-os.environ.setdefault("EDGE_ENTER_EV", "0.001")
-os.environ.setdefault("ENTER_GAP_MIN", "0.015")  
-os.environ.setdefault("WATCH_INSTAB_THRESH", "0.08")
-os.environ.setdefault("TIE_PROB_MAX", "0.30")
-os.environ.setdefault("STATS_DISPLAY", "smart")
-
-os.environ.setdefault("MIN_BET_PCT_BASE", "0.02")
-os.environ.setdefault("MAX_BET_PCT", "0.35")
-os.environ.setdefault("BET_UNIT", "100")
-
-# 獨立預測模式
-os.environ.setdefault("MODEL_MODE", "independent")
-os.environ.setdefault("DECKS", "6")
-
-# ----------------- 獨立預測引擎 -----------------
-class IndependentPredictor:
-    """獨立預測引擎 - 每局獨立預測，不依賴歷史"""
-    
-    def __init__(self):
-        self.point_patterns = []
-        self.max_patterns = 5  # 只保留最近5局點數模式
-        
-    def update_points(self, p_pts: int, b_pts: int):
-        """記錄點數模式，用於短期趨勢分析"""
-        pattern = self._extract_pattern(p_pts, b_pts)
-        self.point_patterns.append(pattern)
-        if len(self.point_patterns) > self.max_patterns:
-            self.point_patterns.pop(0)
-    
-    def _extract_pattern(self, p_pts: int, b_pts: int) -> Dict[str, Any]:
-        """提取點數特徵"""
-        return {
-            'p_pts': p_pts,
-            'b_pts': b_pts,
-            'diff': abs(p_pts - b_pts),
-            'total': p_pts + b_pts,
-            'has_natural': p_pts >= 8 or b_pts >= 8,
-            'winner': 1 if p_pts > b_pts else 0 if p_pts < b_pts else 2
-        }
-    
-    def predict(self) -> np.ndarray:
-        """基於點數特徵的獨立預測"""
-        if not self.point_patterns:
-            # 無歷史數據時使用基準概率
-            return np.array([0.458, 0.446, 0.096], dtype=np.float32)
-        
-        # 分析最近點數模式
-        recent = self.point_patterns[-1]  # 只關注最近一局
-        diff = recent['diff']
-        total = recent['total']
-        has_natural = recent['has_natural']
-        
-        # 基於統計的獨立預測規則
-        if diff >= 6:
-            # 大點數差 - 傾向延續
-            if recent['winner'] == 1:  # 上局閒贏
-                return np.array([0.38, 0.57, 0.05], dtype=np.float32)
-            else:  # 上局莊贏
-                return np.array([0.57, 0.38, 0.05], dtype=np.float32)
-                
-        elif diff >= 4:
-            # 中等點數差 - 輕微傾向
-            if recent['winner'] == 1:
-                return np.array([0.42, 0.53, 0.05], dtype=np.float32)
-            else:
-                return np.array([0.53, 0.42, 0.05], dtype=np.float32)
-                
-        elif diff <= 1:
-            # 小點數差 - 傾向和局或均衡
-            if total <= 6:
-                return np.array([0.40, 0.40, 0.20], dtype=np.float32)
-            else:
-                return np.array([0.45, 0.45, 0.10], dtype=np.float32)
-                
-        else:
-            # 常規情況 - 輕微偏向莊家（考慮抽水）
-            return np.array([0.48, 0.47, 0.05], dtype=np.float32)
-
-def _get_predictor_from_sess(sess: Dict[str, Any]) -> IndependentPredictor:
-    """獲取獨立預測器"""
-    if sess.get("predictor") is None:
-        sess["predictor"] = IndependentPredictor()
-    return sess["predictor"]
-
-# ----------------- Trial / Open -----------------
-TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
-OPENCODE = os.getenv("OPENCODE", "aaa8881688")
-ADMIN_LINE = os.getenv("ADMIN_LINE", "https://lin.ee/Dlm6Y3u")
-
-def _now(): return int(time.time())
-
-def _get_user_info(user_id):
-    k = f"bgsu:{user_id}"
-    if rcli:
-        s = rcli.get(k)
-        if s: return json.loads(s)
-    return SESS.get(user_id, {})
-
-def _set_user_info(user_id, info):
-    k = f"bgsu:{user_id}"
-    if rcli: rcli.set(k, json.dumps(info), ex=86400)
-    SESS[user_id] = info
-
-def _is_trial_valid(user_id):
-    """若永久開通 or 試用中則允許"""
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return True
-    if not info.get("trial_start"): return True
-    return (_now() - int(info["trial_start"])) < TRIAL_SECONDS
-
-def _start_trial(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return
-    if not info.get("trial_start"):
-        info["trial_start"] = _now()
-        _set_user_info(user_id, info)
-
-def _set_opened(user_id):
-    info = _get_user_info(user_id)
-    info["is_opened"] = True
-    _set_user_info(user_id, info)
-
-def _left_trial_sec(user_id):
-    info = _get_user_info(user_id)
-    if info.get("is_opened"): return "永久"
-    if not info.get("trial_start"): return "尚未啟動"
-    left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
-    return f"{left//60} 分 {left%60} 秒" if left > 0 else "已到期"
-
-# ----------------- Strategy helpers -----------------
-def calculate_adjusted_confidence(ev_b, ev_p, pB, pP, choice):
-    """簡化信心度計算"""
-    edge = max(ev_b, ev_p)
-    diff = abs(pB - pP)
-    edge_term = min(1.0, edge / 0.06)
-    prob_term = min(1.0, diff / 0.30)
-    raw = 0.6 * edge_term + 0.4 * prob_term
-    return float(max(0.0, min(1.0, raw)))
-
-def get_stats_display(sess):
-    """簡化統計顯示"""
-    mode = os.getenv("STATS_DISPLAY", "smart").strip().lower()
-    if mode == "none": return None
-    pred, real = sess.get("hist_pred", []), sess.get("hist_real", [])
-    if not pred or not real: return "📊 數據收集中..."
-    bet_pairs = [(p,r) for p,r in zip(pred,real) if r in ("莊","閒") and p in ("莊","閒")]
-    if not bet_pairs: return "📊 尚未進行下注"
-    hit = sum(1 for p,r in bet_pairs if p==r)
-    total = len(bet_pairs)
-    acc = 100.0 * hit / total
-    return f"🎯 近期勝率：{acc:.1f}% ({hit}/{total})"
-
-def _format_pts_text(p_pts, b_pts):
-    if p_pts == b_pts: return f"上局結果: 和 {p_pts}"
-    return f"上局結果: 閒 {p_pts} 莊 {b_pts}"
-
-# ----------------- 核心：獨立預測邏輯 -----------------
-def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> str:
-    # 參數驗證
-    if not (p_pts == 0 and b_pts == 0):
-        if not (0 <= int(p_pts) <= 9 and 0 <= int(b_pts) <= 9):
-            return "❌ 點數數據異常（僅接受 0~9）。請重新輸入，例如：65 / 和 / 閒6莊5"
-
-    predictor = _get_predictor_from_sess(sess)
-    
-    # 記錄點數模式（只用於獨立預測，不依賴歷史）
-    if not (p_pts == 0 and b_pts == 0):
-        predictor.update_points(p_pts, b_pts)
-
-    # 處理上一局pending建議與結果配對
-    st = sess.setdefault("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    real_label = "和" if (p_pts == b_pts or (p_pts == 0 and b_pts == 0)) else ("閒" if p_pts > b_pts else "莊")
-    
-    if "pending_pred" in sess:
-        prev_pred = sess.pop("pending_pred")
-        prev_watch = bool(sess.pop("pending_watch", False))
-        prev_edge = float(sess.pop("pending_edge_ev", 0.0))
-        prev_bet_amt = int(sess.pop("pending_bet_amt", 0))
-        prev_ev_choice = sess.pop("pending_ev_choice", None)
-
-        # 寫入歷史（只用於顯示統計）
-        sess.setdefault("hist_pred", []).append("觀望" if prev_watch else (prev_ev_choice or prev_pred))
-        sess.setdefault("hist_real", []).append(real_label)
-        sess["hist_pred"] = sess["hist_pred"][-100:]
-        sess["hist_real"] = sess["hist_real"][-100:]
-
-        # 統計（只計入有下注且非和局）
-        if not prev_watch and real_label in ("莊","閒"):
-            st["bets"] += 1
-            st["sum_edge"] += float(prev_edge)
-            if (prev_ev_choice or prev_pred) == real_label:
-                if prev_ev_choice == "莊":
-                    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-                    st["payout"] += int(round(prev_bet_amt * (1.0 - BCOMM)))
-                else:
-                    st["payout"] += int(prev_bet_amt)
-                st["wins"] += 1
-            else:
-                st["payout"] -= int(prev_bet_amt)
-        elif real_label == "和":
-            st["push"] += 1
-
-    # 獨立預測下一局
-    p_final = predictor.predict()
-    pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
-
-    BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
-    ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
-    ev_p = pP * 1.0            - (1.0 - pP - pT)
-
-    # 簡化選擇邏輯
-    ev_choice = "莊" if ev_b > ev_p else "閒"
-    edge_ev = max(ev_b, ev_p)
-    
-    # 如果EV接近，基於概率選擇
-    if abs(ev_b - ev_p) < 0.003:
-        ev_choice = "莊" if pB > pP else "閒"
-
-    # 簡化觀望條件
-    watch = False
-    reasons = []
-    
-    EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.001"))
-    if edge_ev < EDGE_ENTER_EV:
-        watch = True
-        reasons.append(f"EV優勢不足")
-    
-    TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.30"))
-    if pT > TIE_PROB_MAX:
-        watch = True
-        reasons.append("和局機率高")
-        
-    enter_gap_min = float(os.getenv("ENTER_GAP_MIN","0.015"))
-    top2 = sorted([pB, pP, pT], reverse=True)[:2]
-    if (top2[0] - top2[1]) < enter_gap_min:
-        watch = True
-        reasons.append("勝率差不足")
-
-    # 下注金額計算
-    bankroll = int(sess.get("bankroll", 0))
-    bet_pct = 0.0
-    bet_amt = 0
-
-    if not watch:
-        conf = calculate_adjusted_confidence(ev_b, ev_p, pB, pP, ev_choice)
-        base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
-        base_ceiling = 0.28
-        
-        base_pct = base_floor + (base_ceiling - base_floor) * conf
-        bet_pct = max(base_floor, min(float(os.getenv("MAX_BET_PCT", "0.35")), base_pct))
-
-        if bankroll > 0 and bet_pct > 0:
-            unit = int(os.getenv("BET_UNIT", "100"))
-            bet_amt = int(round(bankroll * bet_pct))
-            bet_amt = max(0, int(round(bet_amt / unit)) * unit)
-
-    # 存入pending
-    sess["pending_pred"] = "觀望" if watch else ev_choice
-    sess["pending_watch"] = bool(watch)
-    sess["pending_edge_ev"] = float(edge_ev)
-    sess["pending_bet_amt"] = int(bet_amt)
-    sess["pending_ev_choice"] = ev_choice
-
-    # 顯示用
-    sess["last_pts_text"] = _format_pts_text(p_pts, b_pts) if not (p_pts==0 and b_pts==0) else "上局結果: 和"
-
-    stats_display = get_stats_display(sess)
-    strat = f"⚠️ 觀望（{'、'.join(reasons)}）" if watch else (
-        f"🟡 低信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.15 else
-        f"🟠 中信心配注 {bet_pct*100:.1f}%" if bet_pct < 0.25 else
-        f"🟢 高信心配注 {bet_pct*100:.1f}%"
-    )
-
-    msg = [
-        sess["last_pts_text"],
-        "開始獨立分析下局....",
-        "",
-        "【獨立預測結果】",
-        f"閒：{p_final[1]*100:.2f}%",
-        f"莊：{p_final[0]*100:.2f}%", 
-        f"和：{p_final[2]*100:.2f}%",
-        f"本次預測：{'觀望' if watch else ev_choice} (EV優勢: {edge_ev*100:.2f}%)",
-        f"建議下注金額：{bet_amt:,}",
-        f"配注策略：{strat}",
-    ]
-    
-    if stats_display: msg.append(stats_display)
-    msg.extend([
-        "—",
-        "🔁 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）",
-        "⚙️ 輸入「設定」可開啟功能按鈕"
-    ])
-    return "\n".join(msg)
-
-def _format_stats(sess):
-    st = sess.get("stats", {"bets":0,"wins":0,"push":0,"sum_edge":0.0,"payout":0})
-    bets, wins, push, payout = st["bets"], st["wins"], st["push"], st["payout"]
-    acc = (wins / bets * 100.0) if bets>0 else 0.0
-    return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
-
-# ----------------- LINE SDK -----------------
-_has_line = True
-try:
-    from linebot import LineBotApi, WebhookHandler
-    from linebot.models import (
-        MessageEvent, TextMessage, TextSendMessage,
-        QuickReply, QuickReplyButton, MessageAction
-    )
-except Exception as e:
-    _has_line = False
-    LineBotApi = WebhookHandler = None
-    MessageEvent = TextMessage = TextSendMessage = QuickReply = QuickReplyButton = MessageAction = object
-    log.warning("LINE SDK not available, falling back to Dummy LINE mode: %s", e)
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_TIMEOUT = float(os.getenv("LINE_TIMEOUT", "2.0"))
-
-if _has_line and LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET:
-    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN, timeout=LINE_TIMEOUT)
-    handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    LINE_MODE = "real"
-else:
-    LINE_MODE = "dummy"
-    class _DummyHandler:
-        def add(self, *a, **k):
-            def deco(f): return f
-            return deco
-        def handle(self, body, signature):
-            log.info("[DummyLINE] handle called")
-    class _DummyLineAPI:
-        def reply_message(self, token, message):
-            try:
-                txt = message.text if hasattr(message, "text") else str(message)
-            except Exception:
-                txt = str(message)
-            log.info("[DummyLINE] reply: %s", txt)
-    handler = _DummyHandler()
-    line_bot_api = _DummyLineAPI()
-    log.warning("LINE credentials missing or SDK unavailable; running in Dummy LINE mode.")
-
-def _qr_btn(label, text):
-    if LINE_MODE == "real":
-        return QuickReplyButton(action=MessageAction(label=label, text=text))
-    return {"label": label, "text": text}
-
-def _reply(token, text, quick=None):
-    try:
-        if LINE_MODE == "real":
-            if quick:
-                line_bot_api.reply_message(
-                    token,
-                    TextSendMessage(text=text, quick_reply=QuickReply(items=quick))
-                )
-            else:
-                line_bot_api.reply_message(token, TextSendMessage(text=text))
-        else:
-            log.info("[DummyLINE] reply%s: %s", " (with quick)" if quick else "", text)
-    except Exception as e:
-        log.warning("LINE reply_message error: %s", e)
-
-# —— 歡迎文案 —— #
-def welcome_text(uid):
-    left = _left_trial_sec(uid)
-    return (
-        "👋 歡迎使用 BGS AI 獨立預測系統！\n"
-        "【使用步驟】\n"
-        "1️⃣ 選擇館別（輸入 1~10）\n"
-        "2️⃣ 輸入桌號（例：DG01）\n"
-        "3️⃣ 輸入本金（例：5000）\n"
-        "4️⃣ 每局回報點數（例：65 / 和 / 閒6莊5）\n"
-        f"💾 試用剩餘：{left}\n\n"
-        "【請選擇遊戲館別】\n"
-        "1. WM\n2. PM\n3. DG\n4. SA\n5. KU\n"
-        "6. 歐博/卡利\n7. KG\n8. 金利\n9. 名人\n10. MT真人\n"
-        "(請直接輸入數字1-10)"
-    )
-
-def settings_quickreply(sess) -> list:
-    return [
-        _qr_btn("選館別", "設定 館別"),
-        _qr_btn("查看統計", "查看統計"),
-        _qr_btn("試用剩餘", "試用剩餘"),
-        _qr_btn("重設流程", "重設"),
-    ]
-
-def halls_quickreply() -> list:
-    return [_qr_btn(f"{i}", f"{i}") for i in range(1, 11)]
-
-# ----------------- HTTP routes -----------------
-if _has_flask:
-    @app.get("/health")
-    def health():
-        return jsonify(
-            ok=True,
-            ts=time.time(),
-            msg="API normal - Independent Mode",
-            line_mode=("real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy"),
-        ), 200
-
-    @app.get("/version")
-    def version():
-        return jsonify(
-            version=os.getenv("RELEASE", "local"),
-            commit=os.getenv("GIT_SHA", "unknown"),
-            mode="independent"
-        ), 200
-
-    @app.post("/line-webhook")
-    def callback():
-        signature = request.headers.get('X-Line-Signature', '')
-        body = request.get_data(as_text=True)
-        try:
-            handler.handle(body, signature)
-        except Exception as e:
-            log.warning("LINE webhook error: %s", e)
-            return "bad request", 400
-        return "ok", 200
-
-# —— LINE 事件處理 ——
-def _handle_message_core(event):
-    user_id = getattr(getattr(event, "source", None), "user_id", None)
-    text = getattr(getattr(event, "message", None), "text", "")
-    if user_id is None: user_id = "dummy-user"
-    text = (text or "").strip()
-
-    _start_trial(user_id)
-
-    if text.startswith("開通"):
-        pwd = text[2:].strip()
-        reply = "✅ 已開通成功！" if pwd == OPENCODE else "❌ 開通碼錯誤，請重新輸入。"
-        if pwd == OPENCODE: _set_opened(user_id)
-        _reply(event.reply_token, reply, quick=settings_quickreply(SESS.setdefault(user_id, {})))
-        return
-
-    if not _is_trial_valid(user_id):
-        _reply(event.reply_token, "⛔ 試用期已到\n📬 請聯繫管理員開通登入帳號\n👉 加入官方 LINE：{}".format(ADMIN_LINE))
-        return
-
-    sess = SESS.setdefault(user_id, {"bankroll": 0})
-    sess["user_id"] = user_id
-
-    if text in ("設定","⋯","menu","Menu"):
-        _reply(event.reply_token, "⚙️ 設定選單：", quick=settings_quickreply(sess)); return
-    if text == "查看統計":
-        _reply(event.reply_token, _format_stats(sess), quick=settings_quickreply(sess)); return
-    if text == "試用剩餘":
-        _reply(event.reply_token, "⏳ 試用剩餘：{}".format(_left_trial_sec(user_id)), quick=settings_quickreply(sess)); return
-    if text == "重設":
-        SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
-
-    # 館別 -> 桌號 -> 本金
-    if not sess.get("hall_id"):
-        if text.isdigit() and 1 <= int(text) <= 10:
-            sess["hall_id"] = int(text)
-            hall_map = ["WM", "PM", "DG", "SA", "KU", "歐博/卡利", "KG", "金利", "名人", "MT真人"]
-            hall_name = hall_map[int(text)-1]
-            _reply(event.reply_token, f"✅ 已選 [{hall_name}]\n請輸入桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        elif text == "設定 館別":
-            _reply(event.reply_token, "請選擇館別（1-10）：", quick=halls_quickreply())
-        else:
-            _reply(event.reply_token, welcome_text(user_id), quick=halls_quickreply())
-        return
-
-    if not sess.get("table_id"):
-        m = re.match(r"^[a-zA-Z]{2}\d{2}$", text)
-        if m:
-            sess["table_id"] = text.upper()
-            _reply(event.reply_token, f"✅ 已設桌號 [{sess['table_id']}]\n請輸入您的本金（例：5000）", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的桌號（例：DG01，格式：2字母+2數字）", quick=settings_quickreply(sess))
-        return
-
-    if not sess.get("bankroll") or sess["bankroll"] <= 0:
-        m = re.match(r"^(\d{3,7})$", text)
-        if m:
-            sess["bankroll"] = int(text)
-            _reply(event.reply_token, f"👍 已設定本金：{sess['bankroll']:,}\n請輸入上一局點數開始獨立預測", quick=settings_quickreply(sess))
-        else:
-            _reply(event.reply_token, "請輸入正確格式的本金（例：5000）", quick=settings_quickreply(sess))
-        return
-
-    # 連續模式
-    try:
-        if text.strip() == "和":
-            reply = handle_points_and_predict(sess, 0, 0)
-        elif re.fullmatch(r"\d{2}", text):
-            p_pts, b_pts = int(text[0]), int(text[1])
-            reply = handle_points_and_predict(sess, p_pts, b_pts)
-        elif re.search("閒(\d+).*莊(\d+)", text):
-            mm = re.search("閒(\d+).*莊(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(1)), int(mm.group(2)))
-        elif re.search("莊(\d+).*閒(\d+)", text):
-            mm = re.search("莊(\d+).*閒(\d+)", text)
-            reply = handle_points_and_predict(sess, int(mm.group(2)), int(mm.group(1)))
-        else:
-            reply = "請輸入正確格式，例如 65（閒6莊5），或『閒6莊5／莊5閒6／和』"
-    except Exception as e:
-        reply = f"❌ 輸入格式有誤: {e}"
-
-    _reply(event.reply_token, reply, quick=settings_quickreply(sess))
-
-if 'LINE_MODE' in globals() and LINE_MODE == "real":
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_message(event):
-        _handle_message_core(event)
-
-# ----------------- Run -----------------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT","8000"))
-    log.info("Starting BGS-Independent on port %s (LINE_MODE=%s)", port,
-             "real" if (LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET and _has_line) else "dummy")
-    if hasattr(app, "run"):
-        app.run(host="0.0.0.0", port=port, debug=False)
+    log.info("Starting PRO on %s", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
