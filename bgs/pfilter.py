@@ -1,199 +1,133 @@
-# -*- coding: utf-8 -*-
-"""
-pfilter.py — 平衡預測版本
-保留核心粒子滤波器但简化复杂度，提高响应性
-"""
 
-import os
+# bgs/pfilter.py — Outcome-only Particle Filter (clean version)
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List
-
-def _env_float(k: str, default: str) -> float:
-    try: return float(os.getenv(k, default))
-    except Exception: return float(default)
-
-def _env_int(k: str, default: str) -> int:
-    try: return int(os.getenv(k, default))
-    except Exception: return int(default)
-
-# 平衡參數
-PRIOR_B = _env_float("PRIOR_B", "0.458")
-PRIOR_P = _env_float("PRIOR_P", "0.446") 
-PRIOR_T = _env_float("PRIOR_T", "0.096")
-PRIOR_STRENGTH = _env_float("PRIOR_STRENGTH", "20")  # 降低先驗影響
-
-# 簡化學習參數
-PF_DECAY = _env_float("PF_DECAY", "0.985")  # 適中衰減
-HIST_WIN = _env_int("HIST_WIN", "25")  # 較短歷史窗口
-PF_WIN = _env_int("PF_WIN", "20")  # 較短PF窗口
-
-EPS = 1e-9
-
-class SimpleDirichletPF:
-    """簡化粒子滤波器"""
-    def __init__(
-        self,
-        prior: np.ndarray,
-        n_particles: int,
-        rng: np.random.Generator,
-    ):
-        self.rng = rng
-        self.n_particles = max(1, int(n_particles))
-        self.prior = np.clip(np.asarray(prior, dtype=np.float64), EPS, None)
-        self.prior = self.prior / self.prior.sum()
-        
-        # 初始化粒子
-        alpha = np.clip(self.prior * 15.0, EPS, None)  # 較弱的先驗
-        self.parts = self.rng.dirichlet(alpha, size=self.n_particles)
-        self.w = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
-        self.update_count = 0
-
-    def _ess(self) -> float:
-        s = np.sum(self.w ** 2)
-        return 1.0 / max(EPS, s)
-
-    def _resample(self):
-        n = self.n_particles
-        positions = (np.arange(n) + self.rng.random()) / n
-        cumsum = np.cumsum(self.w)
-        idx = np.zeros(n, dtype=int)
-        i = j = 0
-        while i < n:
-            if positions[i] < cumsum[j]:
-                idx[i] = j
-                i += 1
-            else:
-                j += 1
-        self.parts = self.parts[idx]
-        self.w.fill(1.0 / n)
-
-        # 輕度rejuvenation
-        alpha = np.clip(self.parts * 20.0 + 0.01, EPS, None)
-        for k in range(n):
-            self.parts[k] = self.rng.dirichlet(alpha[k])
-
-    def update(self, outcome: int):
-        if outcome not in (0, 1, 2):
-            return
-        
-        self.update_count += 1
-        
-        # 動態學習率
-        learning_rate = min(1.5, 1.0 + self.update_count / 80.0)
-        like = np.clip(self.parts[:, outcome], EPS, None) * learning_rate
-        
-        self.w *= like
-        self.w /= np.sum(self.w)
-
-        # 簡化重採樣條件
-        if (self._ess() / self.n_particles) < 0.7:
-            self._resample()
-
-    def predict(self) -> np.ndarray:
-        m = np.average(self.parts, axis=0, weights=self.w)
-        m = np.clip(m, EPS, None)
-        return (m / np.sum(m)).astype(np.float64)
 
 @dataclass
 class OutcomePF:
-    """平衡預測版本"""
-    decks: int = _env_int("DECKS", "6")
-    seed: int = _env_int("SEED", "42")
-    n_particles: int = _env_int("PF_N", "80")
-    sims_lik: int = _env_int("PF_UPD_SIMS", "25")
-    resample_thr: float = _env_float("PF_RESAMPLE", "0.75")
-    backend: str = "mc"
-    dirichlet_eps: float = _env_float("PF_DIR_EPS", "0.01")
-    stability_factor: float = _env_float("PF_STAB_FACTOR", "0.85")
+    decks: int = 8
+    seed: int = 42
+    n_particles: int = 200
+    sims_lik: int = 80
+    resample_thr: float = 0.5
+    dirichlet_alpha: float = 0.8
+    use_exact: bool = False  # 保留接口；此版以 MC 為主
 
     def __post_init__(self):
         self.rng = np.random.default_rng(self.seed)
-        self.prior = np.array([PRIOR_B, PRIOR_P, PRIOR_T], dtype=np.float64)
-        self.prior = self.prior / self.prior.sum()
+        # 10 桶：牌值 0..9 每值 4*decks*4 張，這裡用簡化：各值同數
+        per = 16 * self.decks  # 簡化桶數
+        base = np.full(10, per, dtype=np.float64)
+        prior = base + float(self.dirichlet_alpha)
+        self.p_counts = np.stack([
+            np.maximum(0, np.rint(self.rng.normal(loc=prior, scale=np.sqrt(prior)*0.05)).astype(np.int32))
+            for _ in range(self.n_particles)
+        ], axis=0)
+        self.weights = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
 
-        # 簡化計數器
-        self.counts = np.zeros(3, dtype=np.float64)
-        
-        # 短歷史窗口
-        self.history_window: List[int] = []
-        self.max_hist_len = max(HIST_WIN, PF_WIN, 50)  # 較短歷史
+    # ---- 抽樣/點數工具（簡化桶；0..9 直接當點數，10 視為 0） ----
+    def _draw_card(self, counts, rng):
+        tot = counts.sum()
+        if tot <= 0: return 0
+        i = rng.integers(0, tot)
+        # 手寫累積（為速度）
+        s = 0
+        for v in range(10):
+            s += counts[v]
+            if i < s:
+                counts[v] -= 1
+                return v
+        return 0
 
-        # 簡化粒子滤波器
-        self.pf = SimpleDirichletPF(
-            rng=self.rng,
-            prior=self.prior,
-            n_particles=self.n_particles,
-        )
+    @staticmethod
+    def _points_add(a, b):
+        return (int(a) + int(b)) % 10
+
+    def _third_player(self, p_sum):
+        return p_sum <= 5
+
+    def _third_banker(self, b_sum, p3):
+        # 近似：若玩家第三張存在且值高，莊多抽；否則按標準近似
+        if p3 is None:  # 玩家未抽
+            return b_sum <= 5
+        # 簡化近似（非逐條款枚舉，CPU-friendly）
+        if b_sum <= 2: return True
+        if b_sum == 3: return p3 != 8
+        if b_sum == 4: return p3 in (2,3,4,5,6,7)
+        if b_sum == 5: return p3 in (4,5,6,7)
+        if b_sum == 6: return p3 in (6,7)
+        return False
+
+    def _mc_prob(self, counts, sims):
+        wins = np.zeros(3, dtype=np.int64)
+        for _ in range(int(max(1, sims))):
+            tmp = counts.copy()
+            try:
+                P1 = self._draw_card(tmp, self.rng); P2 = self._draw_card(tmp, self.rng)
+                B1 = self._draw_card(tmp, self.rng); B2 = self._draw_card(tmp, self.rng)
+                p_sum = self._points_add(P1, P2); b_sum = self._points_add(B1, B2)
+                if (p_sum in (8,9)) or (b_sum in (8,9)):
+                    pass
+                else:
+                    P3 = None
+                    if self._third_player(p_sum):
+                        P3 = self._draw_card(tmp, self.rng); p_sum = self._points_add(p_sum, P3)
+                    if self._third_banker(b_sum, P3 if P3 is not None else None):
+                        B3 = self._draw_card(tmp, self.rng); b_sum = self._points_add(b_sum, B3)
+                if p_sum > b_sum: wins[1] += 1
+                elif b_sum > p_sum: wins[0] += 1
+                else: wins[2] += 1
+            except Exception:
+                continue
+        tot = int(wins.sum())
+        if tot == 0:
+            return np.array([0.45,0.45,0.10], dtype=np.float64)
+        p = wins / tot
+        p[2] = np.clip(p[2], 0.06, 0.20)
+        p = p / p.sum()
+        return p
+
+    # ---- 公開 API ----
+    def update_outcome(self, outcome: int):
+        # 替代真正扣牌：以 Dirichlet-狀態攪拌粒子
+        # outcome: 0=莊,1=閒,2=和 （和局：溫和擾動）
+        alpha = np.array([1.2, 1.2, 0.6])  # 偏向 B/P，和較小
+        if outcome in (0,1):
+            drift = 0.03 if outcome==0 else -0.03
+        else:
+            drift = 0.0
+        for i in range(self.n_particles):
+            noise = self.rng.normal(0, 0.02, size=10)
+            self.p_counts[i] = np.maximum(0, self.p_counts[i] + np.rint(noise*self.p_counts[i]).astype(np.int32))
+            # 輕微總量回復
+            tot = self.p_counts[i].sum()
+            target = int(16*self.decks*10)
+            if tot <= 0:
+                self.p_counts[i] = np.full(10, 16*self.decks, dtype=np.int32)
+            elif tot > 0 and abs(tot-target)/target > 0.1:
+                self.p_counts[i] = np.rint(self.p_counts[i] * (target/tot)).astype(np.int32)
+
+        # 權重退火
+        self.weights = (self.weights + 1e-12)
+        self.weights /= self.weights.sum()
+
+        # 視需要重採樣
+        neff = 1.0 / np.sum((self.weights**2))
+        if neff / len(self.weights) < self.resample_thr:
+            idx = self.rng.choice(len(self.weights), size=len(self.weights), replace=True, p=self.weights/self.weights.sum())
+            self.p_counts = self.p_counts[idx]
+            self.weights = np.ones_like(self.weights) / len(self.weights)
 
     def update_point_history(self, p_pts: int, b_pts: int):
-        """記錄點數歷史"""
-        # 簡化點數分析，只記錄基本信息
+        # 本簡化版不使用點數歷史；保留接口相容
         pass
 
-    def update_outcome(self, outcome: int):
-        """輕度更新"""
-        if outcome not in (0, 1, 2):
-            return
-
-        # 更新計數器（輕度衰減）
-        self.counts *= PF_DECAY
-        self.counts[outcome] += 1.0
-
-        # 更新粒子滤波器
-        self.pf.update(outcome)
-
-        # 更新歷史窗口
-        self.history_window.append(outcome)
-        if len(self.history_window) > self.max_hist_len:
-            self.history_window.pop(0)
-
-    def _light_historical_adjust(self, probs: np.ndarray) -> np.ndarray:
-        """輕度歷史調整"""
-        if len(self.history_window) < 5:  # 最少需要5個樣本
-            return probs
-            
-        # 只使用最近歷史
-        recent = self.history_window[-min(15, len(self.history_window)):]
-        n = len(recent)
-        
-        counts = np.array([
-            sum(1 for x in recent if x == 0),
-            sum(1 for x in recent if x == 1), 
-            sum(1 for x in recent if x == 2),
-        ], dtype=np.float64)
-        
-        # 計算歷史概率（輕度正則化）
-        hist_probs = (counts + 0.5) / max(EPS, (n + 1.5))
-        
-        # 動態權重：樣本越多權重越高，但最大不超過0.3
-        w = min(0.3, n / (n + 30.0))
-        
-        mixed = probs * (1 - w) + hist_probs * w
-        mixed = np.clip(mixed, EPS, None)
-        return mixed / mixed.sum()
-
-    def predict(self, sims_per_particle: int = 1) -> np.ndarray:
-        """平衡預測"""
-        # 1) 粒子滤波器預測
-        pf_probs = self.pf.predict()
-        
-        # 2) 貝葉斯後驗
-        post = self.prior * PRIOR_STRENGTH + self.counts
-        post = np.clip(post, EPS, None)
-        bayes_probs = post / post.sum()
-        
-        # 3) 結合兩者（PF權重較高）
-        n_pf = min(len(self.history_window), PF_WIN)
-        w_pf = min(0.8, 0.4 + (n_pf / (n_pf + 30.0)))  # PF權重0.4-0.8
-        
-        probs = pf_probs * w_pf + bayes_probs * (1 - w_pf)
-        
-        # 4) 輕度歷史調整
-        probs = self._light_historical_adjust(probs)
-        
-        # 5) 確保合理性
-        probs = np.clip(probs, 0.01, 0.98)
-        probs = probs / probs.sum()
-        
+    def predict(self, sims_per_particle: int = 120) -> np.ndarray:
+        probs = np.zeros(3, dtype=np.float64)
+        wsum = float(self.weights.sum())
+        if wsum <= 0: self.weights[:] = 1.0/len(self.weights); wsum = 1.0
+        for i in range(self.n_particles):
+            p = self._mc_prob(self.p_counts[i], sims_per_particle)
+            probs += float(self.weights[i]) * p
+        probs = np.clip(probs, 1e-9, None); probs = probs / probs.sum()
         return probs.astype(np.float32)
