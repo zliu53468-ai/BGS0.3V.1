@@ -582,7 +582,8 @@ def handle_message(event):
         return
     if text == "重設":
         SESS[user_id] = {"bankroll": 0, "user_id": user_id}
-        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply(sess)); return
+        # 修正：halls_quickreply 是零參數
+        _reply(event.reply_token, "✅ 已重設流程，請選擇館別：", quick=halls_quickreply()); return
 
     # 館別 -> 桌號 -> 本金
     if not sess.get("hall_id"):
