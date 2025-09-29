@@ -11,8 +11,9 @@ server.py — BGS百家樂AI 多步驟/館別桌號/本金/試用/永久帳號
 - 缺 LINE 金鑰或 SDK 時自動切到 dummy，不影響啟動
 - /health 回更多除錯欄位；新增 /version、/env/peek
 - 去除重複 helper 定義；predict 加強健檢與 fallback
-"""
 
+修正版：調整 EV 選擇邏輯，在 EV 接近時 (差 < 0.005)，如果 pB > pP，優先選 "莊"，以減少偏向 "閒" 的情況，改善用戶體驗。
+"""
 import os, sys, re, time, json, logging
 from typing import Dict, Any
 import numpy as np
@@ -474,11 +475,16 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
     ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
     ev_p = pP * 1.0            - (1.0 - pP - pT)
 
+    # 修正邏輯：如果 EV 接近 (差 < 0.005)，且 pB > pP，優先選 "莊"
     ev_choice = "莊" if ev_b > ev_p else "閒"
     edge_ev = max(ev_b, ev_p)
     if abs(ev_b - ev_p) < 0.005:
-        ev_choice = "莊" if pB > pP else "閒"
-        edge_ev = max(ev_b, ev_p) + 0.002
+        if pB > pP:
+            ev_choice = "莊"
+            edge_ev = ev_b + 0.002  # 輕微加權，維持 EV 正向
+        else:
+            ev_choice = "閒"
+            edge_ev = ev_p + 0.002
     if not np.isfinite([pB, pP, pT]).all() or np.sum(p_final) < 0.99:
         ev_choice = "莊" if pB > pP else "閒"; edge_ev = 0.015
 
