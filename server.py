@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-server.py — BGS百家樂AI（可一鍵覆蓋版本）
-重點：
-1) 維持你原本的流程/UI（QuickReply/卡片式文案/試用 30 分鐘）
-2) 預測與配注「完全分離」
-3) 修正「只押莊」：採用抽水後 EV + NEAR_EV 公平點判斷
-4) 粒子濾波 OutcomePF 初始化參數修正（不再傳入 backend / dirichlet_eps / stability_factor）
-5) 兩種模式：balanced(粒子濾波) / independent(單局規則)，以 .env 切換
+server.py — BGS百家樂AI（一鍵覆蓋版 • 修正 complex 比較錯誤）
+要點：
+1) 預測與配注分離（決策只看機率/EV；配注只看信心度）
+2) 修正偶發錯誤："< not supported between instances of 'complex' and 'float'"
+   - 任何模型輸出都會以 _safe_norm() 與 _to_float() 做「去複數 / 去 NaN / 取實部」處理
+3) 支援兩種模式：balanced(粒子濾波) / independent(單局規則) 以 .env 切換
+4) 試用 30 分鐘到期訊息＆按鈕選單（與你貼圖一致）
 """
 
 import os, sys, re, time, json, logging
@@ -206,6 +206,37 @@ def _left_trial_sec(user_id):
     left = TRIAL_SECONDS - (_now() - int(info["trial_start"]))
     return f"{max(0,left)//60} 分 {max(0,left)%60} 秒" if left > 0 else "已到期"
 
+# ----------------- 工具：安全轉浮點 / 正規化 -----------------
+def _to_float(x: Any) -> float:
+    """把任何 numpy/complex/None 轉成安全 float（取實部、去 NaN/Inf）"""
+    try:
+        if isinstance(x, complex): x = x.real
+        if hasattr(x, "dtype"):
+            x = np.real_if_close(x)
+            try: x = float(np.asarray(x).reshape(()))
+            except Exception: x = float(np.asarray(x).ravel()[0])
+        x = float(x)
+    except Exception:
+        x = 0.0
+    if not np.isfinite(x): x = 0.0
+    return x
+
+def _safe_norm(v) -> np.ndarray:
+    """把任何模型輸出規整為 3 維實數機率向量"""
+    try:
+        a = np.asarray(v)
+        a = np.real_if_close(a).astype(np.float64, copy=False)
+    except Exception:
+        a = np.array([0.458, 0.446, 0.096], dtype=np.float64)
+    if a.size < 3:
+        a = np.pad(a, (0, 3 - a.size), constant_values=1e-9)
+    a = a[:3]
+    a = np.nan_to_num(a, nan=1e-9, posinf=1.0, neginf=1e-9)
+    a = np.clip(a, 1e-9, None)
+    s = a.sum()
+    if s <= 0: a = np.array([0.458, 0.446, 0.096], dtype=np.float64); s = a.sum()
+    return (a / s).astype(np.float32)
+
 # ----------------- Independent Predictor（單局規則） -----------------
 class IndependentPredictor:
     def __init__(self): self.last = None
@@ -257,26 +288,23 @@ def _format_stats(sess):
     return f"📈 累計：下注 {bets}｜命中 {wins}（{acc:.1f}%）｜和 {push}｜盈虧 {payout}"
 
 # ----------------- 決策與配注（分離） -----------------
-def _safe_norm(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=np.float64)
-    v = np.clip(v, 1e-9, None)
-    s = v.sum()
-    return (v / s).astype(np.float32)
+def _choose_side_and_conf(pB_in, pP_in, pT_in) -> Dict[str, Any]:
+    # 統一轉安全 float（修正 complex/NaN/Inf）
+    pB = _to_float(pB_in); pP = _to_float(pP_in); pT = _to_float(pT_in)
 
-def _choose_side_and_conf(pB, pP, pT) -> Dict[str, Any]:
     BCOMM = float(os.getenv("BANKER_COMMISSION","0.05"))
     NEAR_EV = float(os.getenv("NEAR_EV","0.003"))
     EDGE_ENTER_EV = float(os.getenv("EDGE_ENTER_EV","0.0015"))
     ENTER_GAP_MIN = float(os.getenv("ENTER_GAP_MIN","0.018"))
     TIE_PROB_MAX = float(os.getenv("TIE_PROB_MAX","0.28"))
 
+    # EV（抽水後）與公平點處理
     ev_b = pB * (1.0 - BCOMM) - (1.0 - pB - pT)
     ev_p = pP * 1.0            - (1.0 - pP - pT)
 
-    # 公平點處理：EV 很接近時改看機率大小（避免長期偏莊）
     if abs(ev_b - ev_p) < NEAR_EV:
         ev_choice = "莊" if pB > pP else "閒"
-        edge_ev = max(ev_b, ev_p) + 0.001
+        edge_ev = max(ev_b, ev_p) + 0.001  # 逼近公平點時給一點點優勢
     else:
         ev_choice = "莊" if ev_b > ev_p else "閒"
         edge_ev = max(ev_b, ev_p)
@@ -296,10 +324,12 @@ def _choose_side_and_conf(pB, pP, pT) -> Dict[str, Any]:
     def calc_conf(ev_b, ev_p, pB, pP):
         edge = max(ev_b, ev_p)
         diff = abs(pB - pP)
-        edge_term = min(1.0, edge / 0.06) ** 0.9
-        prob_term = min(1.0, diff / 0.30) ** 0.85
+        edge_term = min(1.0, max(0.0, edge) / 0.06) ** 0.9
+        prob_term = min(1.0, max(0.0, diff) / 0.30) ** 0.85
         raw = 0.6 * edge_term + 0.4 * prob_term
-        return float(max(0.0, min(1.0, raw ** 0.9)))
+        val = float(max(0.0, min(1.0, raw ** 0.9)))
+        if not np.isfinite(val): val = 0.0
+        return val
 
     conf = calc_conf(ev_b, ev_p, pB, pP)
     base_floor = float(os.getenv("MIN_BET_PCT_BASE", "0.02"))
@@ -387,7 +417,7 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         elif real_label == "和":
             st["push"] += 1
 
-    # 產生下一局預測機率
+    # 產生下一局預測機率（重點：所有輸出走 _safe_norm）
     try:
         if model_mode == "balanced":
             pf = _get_pf_from_sess(sess)
@@ -400,16 +430,18 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         log.warning("predict fallback due to %s", e)
         p_final = np.array([0.458, 0.446, 0.096], dtype=np.float32)
 
-    # 輕度平滑（僅 balanced 用 / 或全域都可）
+    # 輕度平滑（確保是實數）
     alpha = 0.7
     prev_sma = sess.get("prob_sma")
     if prev_sma is None:
-        sess["prob_sma"] = p_final
+        sess["prob_sma"] = _safe_norm(p_final)
     else:
-        sess["prob_sma"] = alpha * p_final + (1 - alpha) * prev_sma
+        prev_sma = _safe_norm(prev_sma)
+        sess["prob_sma"] = _safe_norm(alpha * p_final + (1 - alpha) * prev_sma)
     p_final = sess["prob_sma"]
 
-    pB, pP, pT = float(p_final[0]), float(p_final[1]), float(p_final[2])
+    # 取安全 float
+    pB, pP, pT = _to_float(p_final[0]), _to_float(p_final[1]), _to_float(p_final[2])
 
     # 決策（不含配注）
     dec = _choose_side_and_conf(pB, pP, pT)
@@ -445,9 +477,9 @@ def handle_points_and_predict(sess: Dict[str,Any], p_pts: int, b_pts: int) -> st
         f"開始{'平衡' if model_mode=='balanced' else '獨立'}分析下局....",
         "",
         "【預測結果】",
-        f"閒：{p_final[1]*100:.2f}%",
-        f"莊：{p_final[0]*100:.2f}%",
-        f"和：{p_final[2]*100:.2f}%",
+        f"閒：{pP*100:.2f}%",
+        f"莊：{pB*100:.2f}%",
+        f"和：{pT*100:.2f}%",
         f"本次預測：{'觀望' if watch else ev_choice} (EV優勢: {edge_ev*100:.2f}%)",
         f"建議下注金額：{bet_amt:,}",
         f"配注策略：{strat}",
@@ -676,9 +708,13 @@ def _handle_message_core(event):
 
 # 綁定 handler（真實 LINE）
 if 'LINE_MODE' in globals() and LINE_MODE == "real":
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_message(event):
-        _handle_message_core(event)
+    try:
+        from linebot.models import MessageEvent, TextMessage
+        @handler.add(MessageEvent, message=TextMessage)
+        def handle_message(event):
+            _handle_message_core(event)
+    except Exception as e:
+        log.warning("LINE bind handler failed: %s", e)
 
 # ----------------- Run -----------------
 if __name__ == "__main__":
