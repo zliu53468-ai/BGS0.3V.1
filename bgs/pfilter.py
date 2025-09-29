@@ -1,9 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-pfilter.py — 粒子濾波/貝氏簡化器（最終版）
-- indep：長視窗 + Dirichlet 抖動
-- learn：SimpleDirichletPF（Dirichlet 狀態轉移 + ESS 重採樣 + 再活化）
-- 點數差偏置：僅在 B/P 子機率內重分配，T 不動（且在 Tie 夾取之後施加）
+pfilter.py — 粒子濾波/貝氏簡化器（強化版・含「排除上一手」與安全PF參數）
+
+重點：
+1) EXCLUDE_LAST_OUTCOME：預設開啟（1）。歷史視窗、長期計數、PF混合皆「不吃剛寫入的上一手」，
+   斷開「上一手 → 下一手」黏性，解決「常常跟上一手押同向」的觀感。
+2) SimpleDirichletPF 可接受 kappa / rejuvenate（相容 server 環境變數），即使目前未額外使用也不報錯。
+3) 動態和局：Beta先驗 + EMA 平滑；Tie 機率夾取有 guard rails 與 CAP。
+4) indep 模式：使用長視窗 + Laplace 平滑的歷史比例溫和混合 + Dirichlet 擾動（在 simplex 上）。
+5) learn 模式：PF（短期）與貝氏長期均值混合，權重隨近端樣本上升且有上限。
+6) 點數差偏置：只在 B/P 子空間重分配，Tie 不動；可用環境變數控制強度/門檻/衰減。
+
+注意：
+- 如要恢復「上一手立即影響下一手」，將 EXCLUDE_LAST_OUTCOME=0 即可。
 """
 
 import os
@@ -16,19 +25,15 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
 
 def _env_float(name: str, default: str) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        return float(default)
+    try: return float(os.getenv(name, default))
+    except: return float(default)
 
 def _env_int(name: str, default: str) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except Exception:
-        return int(default)
+    try: return int(os.getenv(name, default))
+    except: return int(default)
 
 # === Modes & priors ===
-MODEL_MODE = os.getenv("MODEL_MODE", "indep").strip().lower()  # indep | learn
+MODEL_MODE = os.getenv("MODEL_MODE", "learn").strip().lower()  # indep | learn
 PRIOR_B = _env_float("PRIOR_B", "0.452")
 PRIOR_P = _env_float("PRIOR_P", "0.452")
 PRIOR_T = _env_float("PRIOR_T", "0.096")
@@ -60,13 +65,16 @@ HIST_WIN = _env_int("HIST_WIN", "60")
 HIST_PSEUDO = _env_float("HIST_PSEUDO", "1.0")
 HIST_WEIGHT_MAX = _env_float("HIST_WEIGHT_MAX", "0.35")
 
+# 是否排除「上一手」對下一手的影響（建議預設開啟）
+EXCLUDE_LAST_OUTCOME = _env_flag("EXCLUDE_LAST_OUTCOME", "1")
+
 # Particle filter（learn 分支混合用權重）
 PF_WIN = _env_int("PF_WIN", "50")
 PF_ALPHA = _env_float("PF_ALPHA", "0.5")
 PF_WEIGHT_MAX = _env_float("PF_WEIGHT_MAX", "0.7")
 PF_WEIGHT_K = _env_float("PF_WEIGHT_K", "80.0")
 
-# ===== 真 PF 參數 =====
+# ===== 真 PF 參數（可從環境注入；若未用也相容）=====
 PF_N = _env_int("PF_N", "120")
 PF_RESAMPLE = _env_float("PF_RESAMPLE", "0.73")      # ESS/N 門檻
 PF_KAPPA = _env_float("PF_KAPPA", "220.0")           # 狀態轉移濃度（越大越穩）
@@ -76,117 +84,99 @@ STABILITY_FACTOR = _env_float("PF_STAB_FACTOR", "0.8")
 
 # ===== 點差偏置（只在 B/P 子空間）=====
 POINT_BIAS_ON          = _env_flag("POINT_BIAS_ON", "1")
-POINT_BIAS_K           = _env_float("POINT_BIAS_K", "0.35")     # tanh 斜率
-POINT_BIAS_MAX_SHIFT   = _env_float("POINT_BIAS_MAX_SHIFT", "0.06")  # P 相對位移上限
-POINT_BIAS_MIN_GAP     = _env_int("POINT_BIAS_MIN_GAP", "1")
-POINT_BIAS_DAMP_N      = _env_int("POINT_BIAS_DAMP_N", "20")
-POINT_BIAS_TIE_DAMP_AT = _env_float("POINT_BIAS_TIE_DAMP_AT", "0.14")
-POINT_BIAS_TIE_DAMP    = _env_float("POINT_BIAS_TIE_DAMP", "0.5")
+POINT_BIAS_K           = _env_float("POINT_BIAS_K", "0.35")          # tanh 斜率
+POINT_BIAS_MAX_SHIFT   = _env_float("POINT_BIAS_MAX_SHIFT", "0.04")  # 建議 0.04~0.06
+POINT_BIAS_MIN_GAP     = _env_int("POINT_BIAS_MIN_GAP", "3")         # 至少差 3 才啟動
+POINT_BIAS_DAMP_N      = _env_int("POINT_BIAS_DAMP_N", "20")         # 小樣本衰減門檻
+POINT_BIAS_TIE_DAMP_AT = _env_float("POINT_BIAS_TIE_DAMP_AT", "0.14")# 和局高時衰減
+POINT_BIAS_TIE_DAMP    = _env_float("POINT_BIAS_TIE_DAMP", "0.5")    # 衰減係數
 
 EPS = 1e-9
 
-# ============ SimpleDirichletPF ============
 
 class SimpleDirichletPF:
+    """輕量級 PF：粒子為 (B,P,T) simplex。用 Dirichlet 抖動保持在 simplex，
+    觀測時以對應 outcome 的機率加權，ESS 低於門檻則行系統式重採樣。
+    * 兼容 kappa / rejuvenate 兩個參數（目前僅儲存，未強制使用）。
     """
-    在單純形上的 PF：
-      - 狀態轉移：theta' ~ Dirichlet(kappa * theta)
-      - 權重更新：w *= theta'[obs]（用 log-weights）
-      - ESS 退化 → 系統化重採樣 + 再活化（Dirichlet(lam * theta)）
-    """
+
     def __init__(
         self,
-        rng: np.random.Generator,
         prior: np.ndarray,
         prior_strength: float,
         n_particles: int,
-        resample_thr: float,
-        kappa: float,
-        rejuvenate: float,
         dirichlet_eps: float,
         stability_factor: float,
+        resample_thr: float,
+        rng: np.random.Generator,
+        # 相容 server/env 的兩個參數（可選）
+        kappa: float | None = None,
+        rejuvenate: float | None = None,
     ):
         self.rng = rng
-        self.n_particles = int(max(2, n_particles))
-        self.resample_thr = float(np.clip(resample_thr, 0.05, 0.99))
-        self.kappa = float(max(1.0, kappa))
-        self.rejuvenate_alpha = float(max(50.0, rejuvenate))
+        self.n_particles = max(1, int(n_particles))
         self.dirichlet_eps = float(max(EPS, dirichlet_eps))
         self.stability_factor = float(np.clip(stability_factor, 0.05, 2.0))
+        self.resample_thr = float(np.clip(resample_thr, 0.05, 0.99))
+        self.base_strength = max(1.0, float(prior_strength))
 
-        p0 = np.clip(prior, EPS, 1.0)
-        p0 /= p0.sum()
-        alpha0 = p0 * float(max(3.0, prior_strength))
+        # 保存（目前未直接使用，保相容）
+        self.kappa = float(kappa) if kappa is not None else None
+        self.rejuvenate = float(rejuvenate) if rejuvenate is not None else None
 
-        self.particles = self.rng.dirichlet(alpha0, size=self.n_particles).astype(np.float32)
-        self.weights = np.full(self.n_particles, 1.0 / self.n_particles, dtype=np.float32)
+        alpha0 = np.clip(prior, EPS, 1.0) * self.base_strength
+        self.particles = self.rng.dirichlet(alpha0, size=self.n_particles)
+        self.weights = np.full(self.n_particles, 1.0 / self.n_particles)
         self.obs_count = 0
 
-    # ---- helpers ----
+    # ---- internal helpers -------------------------------------------------
     def _effective_sample_size(self) -> float:
-        w = self.weights.astype(np.float64)
-        return 1.0 / max(EPS, np.sum(w * w))
+        w = self.weights
+        return 1.0 / max(EPS, np.sum(np.square(w)))
 
     def _systematic_resample(self):
-        N = self.n_particles
-        positions = (self.rng.random() + np.arange(N)) / N
-        cdf = np.cumsum(self.weights, dtype=np.float64)
-        idx = np.searchsorted(cdf, positions, side="right")
-        idx = np.clip(idx, 0, N - 1)
-        self.particles = self.particles[idx]
-        self.weights.fill(1.0 / N)
+        positions = (self.rng.random() + np.arange(self.n_particles)) / self.n_particles
+        cumulative = np.cumsum(self.weights)
+        indexes = np.searchsorted(cumulative, positions, side="right")
+        indexes = np.clip(indexes, 0, self.n_particles - 1)
+        self.particles = self.particles[indexes]
+        self.weights.fill(1.0 / self.n_particles)
 
     def _jitter_strength(self) -> float:
-        # 隨觀測量逐步放大 Dirichlet α，避免早期過度分散
-        growth = 1.0 + min(5.0, self.obs_count / 60.0)
-        return max(1.0, self.kappa * self.stability_factor * growth)
+        # 隨觀測量增加放大 Dirichlet α，避免粒子雜散
+        growth = 1.0 + min(5.0, self.obs_count / 50.0)
+        return self.base_strength * self.stability_factor * growth
 
-    def _rejuvenate(self, lam: float = None):
-        lam = float(self._jitter_strength() if lam is None else lam)
-        lam = max(50.0, lam)
-        # 逐顆小幅 Dirichlet 抖動
-        for i in range(self.n_particles):
-            a = np.clip(self.particles[i], EPS, 1.0) * lam + self.dirichlet_eps
-            self.particles[i] = self.rng.dirichlet(a).astype(np.float32)
-
-    # ---- PF steps ----
+    # ---- particle filter steps -------------------------------------------
     def propagate(self):
-        strength = self._jitter_strength()
+        strength = max(1.0, self._jitter_strength())
         new_particles = np.empty_like(self.particles)
-        for i, theta in enumerate(self.particles):
-            a = np.clip(theta, EPS, 1.0) * strength + self.dirichlet_eps
-            new_particles[i] = self.rng.dirichlet(a)
-        self.particles = new_particles.astype(np.float32)
+        for i, particle in enumerate(self.particles):
+            alpha = np.clip(particle, EPS, 1.0) * strength + self.dirichlet_eps
+            new_particles[i] = self.rng.dirichlet(alpha)
+        self.particles = new_particles
 
     def update(self, outcome: int):
         if outcome not in (0, 1, 2):
             return
-        # 先做狀態轉移（PF 的 predict step）
-        self.propagate()
-
         self.obs_count += 1
-
-        like = np.clip(self.particles[:, outcome].astype(np.float64), EPS, 1.0)
-        # log-weights，避免長局下溢
-        logw = np.log(self.weights.astype(np.float64) + EPS) + np.log(like)
-        logw -= logw.max()
-        w = np.exp(logw)
-        w_sum = max(EPS, w.sum())
-        self.weights = (w / w_sum).astype(np.float32)
-
-        # ESS 退化 → 重採樣 + 再活化
-        if self._effective_sample_size() < self.resample_thr * self.n_particles:
+        likelihood = np.clip(self.particles[:, outcome], EPS, None)
+        self.weights *= likelihood
+        total = float(np.sum(self.weights))
+        if total <= 0:
+            self.weights.fill(1.0 / self.n_particles)
+        else:
+            self.weights /= total
+        ess = self._effective_sample_size()
+        if ess < self.resample_thr * self.n_particles:
             self._systematic_resample()
-            self._rejuvenate()
 
     def predict(self) -> np.ndarray:
-        # 不在這裡 propagate；單純回加權平均狀態
-        mean = (self.particles.astype(np.float64) * self.weights[:, None].astype(np.float64)).sum(axis=0)
-        mean = np.clip(mean, EPS, None)
-        mean = (mean / mean.sum()).astype(np.float32)
-        return mean
+        self.propagate()
+        weighted_mean = np.average(self.particles, weights=self.weights, axis=0)
+        weighted_mean = np.clip(weighted_mean, EPS, None)
+        return (weighted_mean / weighted_mean.sum()).astype(np.float64)
 
-# ============ OutcomePF（外部介面） ============
 
 @dataclass
 class OutcomePF:
@@ -212,10 +202,12 @@ class OutcomePF:
 
         # long-term counts for bayes posterior (learn 混合用)
         self.counts = np.zeros(3, dtype=np.float64)
+        self.counts_pre_update = self.counts.copy()   # 用於 EXCLUDE_LAST_OUTCOME
 
         # rolling window outcomes (0:B, 1:P, 2:T)
         self.history_window: List[int] = []
         self.max_hist_len = max(HIST_WIN, PF_WIN, 100)
+        self.last_outcome: Optional[int] = None
 
         # dynamic tie trackers
         self.t_ema = None
@@ -225,6 +217,7 @@ class OutcomePF:
 
         # 真 PF（僅 learn 使用）
         self.pf: Optional[SimpleDirichletPF] = None
+        self._pf_prediction_before_last: Optional[np.ndarray] = None
         if MODEL_MODE == "learn":
             self.pf = SimpleDirichletPF(
                 rng=self.rng,
@@ -237,6 +230,8 @@ class OutcomePF:
                 dirichlet_eps=self.dirichlet_eps,
                 stability_factor=self.stability_factor,
             )
+            # 預先填充一個 PF 預測，給 EXCLUDE_LAST_OUTCOME 使用
+            self._pf_prediction_before_last = self.pf.predict()
 
     # -------- external updates --------
     def update_point_history(self, p_pts: int, b_pts: int):
@@ -247,18 +242,27 @@ class OutcomePF:
         if outcome not in (0, 1, 2):
             return
 
+        self.last_outcome = outcome
+
         if MODEL_MODE == "learn":
+            # 長期貝氏計數（先衰減再加一）
             self.counts *= PF_DECAY
+            self.counts_pre_update = self.counts.copy()  # 記錄「尚未含本手」的狀態
             self.counts[outcome] += 1.0
+
+            # PF 更新（若要排除上一手在下一手的預測，先取一份 predict 緩存）
             if self.pf is not None:
+                if EXCLUDE_LAST_OUTCOME:
+                    # 這份快取代表「寫入本手 outcome 之前」PF 的看法
+                    self._pf_prediction_before_last = self.pf.predict()
                 self.pf.update(outcome)
 
-        # 滾動視窗
+        # 滾動視窗（此處照常寫入，但預測階段可選擇不取最後一筆）
         self.history_window.append(outcome)
         if len(self.history_window) > self.max_hist_len:
             self.history_window.pop(0)
 
-        # update tie trackers
+        # 動態和局跟蹤
         if DYNAMIC_TIE_RANGE:
             self._update_tie_trackers()
 
@@ -295,8 +299,34 @@ class OutcomePF:
         alpha = np.clip(probs, EPS, 1.0) * s
         return self.rng.dirichlet(alpha)
 
+    def _compute_jitter_strength(self) -> Optional[float]:
+        """
+        依樣本量自動調整擾動強度：樣本越多 → 抖動越小。回傳 alpha strength；
+        若不需要抖動則回傳 None。
+        """
+        if PROB_JITTER <= 0:
+            return None
+        base = max(50.0, min(PROB_JITTER_STRENGTH_MAX, 1.0 / max(1e-6, PROB_JITTER)))
+        n = len(self.history_window)
+        if n <= 0 or PROB_JITTER_SCALE <= 0:
+            return base
+        growth = 1.0 + min(4.0, n / PROB_JITTER_SCALE)  # 最多放大到 ~5x
+        strength = base * growth
+        return float(np.clip(strength, 50.0, PROB_JITTER_STRENGTH_MAX))
+
+    # 小工具：可控是否包含「最後一手」的視窗
+    def _get_history_window(self, limit: int, include_latest: bool = True) -> List[int]:
+        if limit <= 0:
+            window = self.history_window[:]
+        else:
+            window = self.history_window[-limit:]
+        if not include_latest and window:
+            window = window[:-1]
+        return window
+
     def _light_historical_update(self, probs: np.ndarray) -> np.ndarray:
-        window = self.history_window[-HIST_WIN:]
+        include_latest = not EXCLUDE_LAST_OUTCOME
+        window = self._get_history_window(HIST_WIN, include_latest=include_latest)
         n = len(window)
         if n == 0:
             return probs
@@ -312,9 +342,10 @@ class OutcomePF:
         mixed = np.clip(mixed, EPS, None)
         return mixed / mixed.sum()
 
-    # -------- 粒子近似（fallback 用；保留與舊版兼容） --------
+    # -------- 粒子近似（fallback；保與舊版兼容） --------
     def _particle_filter_predict(self) -> np.ndarray:
-        window = self.history_window[-PF_WIN:]
+        include_latest = not EXCLUDE_LAST_OUTCOME
+        window = self._get_history_window(PF_WIN, include_latest=include_latest)
         n = len(window)
         if n == 0:
             return self.prior.copy()
@@ -329,7 +360,9 @@ class OutcomePF:
         return post / post.sum()
 
     def _posterior_mean(self) -> np.ndarray:
-        post = self.prior * PRIOR_STRENGTH + self.counts
+        # 若排除上一手：使用寫入前的計數（counts_pre_update）
+        counts = self.counts_pre_update if EXCLUDE_LAST_OUTCOME else self.counts
+        post = self.prior * PRIOR_STRENGTH + counts
         post = np.clip(post, EPS, None)
         return post / post.sum()
 
@@ -344,7 +377,7 @@ class OutcomePF:
         if abs(gap) < POINT_BIAS_MIN_GAP:
             return probs
 
-        # 平滑偏置（最大位移上限）
+        # 平滑偏置（最大位移上限），僅在 B/P 子空間重分配
         bias = POINT_BIAS_MAX_SHIFT * np.tanh(POINT_BIAS_K * abs(gap))
         if gap < 0:
             bias = -bias
@@ -380,7 +413,11 @@ class OutcomePF:
                 probs = self._dirichlet_jitter(probs, strength)
         elif MODEL_MODE == "learn":
             if self.pf is not None:
-                pf_probs = self.pf.predict()
+                # 若排除上一手：優先使用「上一手更新前」的PF預測快取
+                if EXCLUDE_LAST_OUTCOME and (self._pf_prediction_before_last is not None):
+                    pf_probs = self._pf_prediction_before_last.copy()
+                else:
+                    pf_probs = self.pf.predict()
             else:
                 pf_probs = self._particle_filter_predict()
             bayes_probs = self._posterior_mean()
@@ -395,7 +432,6 @@ class OutcomePF:
             tie_min, tie_max = self.adaptive_tie_min, self.adaptive_tie_max
         else:
             tie_min, tie_max = TIE_MIN, TIE_MAX
-
         probs = np.clip(probs, EPS, None); probs /= probs.sum()
         probs[2] = np.clip(probs[2], tie_min, tie_max)
         probs = np.clip(probs, EPS, None); probs /= probs.sum()
@@ -404,14 +440,3 @@ class OutcomePF:
         probs = self._apply_point_bias(probs)
 
         return probs.astype(np.float32)
-
-    # -------- helpers --------
-    def _compute_jitter_strength(self) -> Optional[float]:
-        if PROB_JITTER <= 0:
-            return None
-        base = max(50.0, min(PROB_JITTER_STRENGTH_MAX, 1.0 / max(1e-6, PROB_JITTER)))
-        n = len(self.history_window)
-        if n <= 0 or PROB_JITTER_SCALE <= 0:
-            return float(base)
-        growth = 1.0 + min(4.0, n / PROB_JITTER_SCALE)
-        return float(np.clip(base * growth, 50.0, PROB_JITTER_STRENGTH_MAX))
