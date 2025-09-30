@@ -1,4 +1,4 @@
-# server.py — 純算牌 + 粒子濾波（ONLY 莊/閒建議｜EV含抽水｜¼-Kelly｜試用制｜卡片輸出｜支援和局回報｜加入導引清單）
+# server.py — 純算牌 + 粒子濾波（ONLY 莊/閒建議｜EV含抽水｜¼-Kelly｜試用制｜卡片輸出｜支援和局回報｜加入導引清單｜FSM修正）
 # Author: 親愛的 x GPT-5 Thinking
 
 import os, logging, time, csv, pathlib, re
@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
 # ==== 基本設定 ====
-VERSION = "bgs-deplete-pf-2025-09-30"
+VERSION = "bgs-deplete-pf-2025-09-30-fsm"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -32,7 +32,7 @@ INV = {0:"莊", 1:"閒", 2:"和"}
 def parse_history(s: str) -> List[int]:
     s = (s or "").strip().upper()
     if not s: return []
-    s = s.replace("，"," ").replace("、"," ").replace("\u3000"," ")
+    s = s.replace("﹐","，").replace("，"," ").replace("、"," ").replace("\u3000"," ")
     toks = s.split()
     seq = list(s) if (len(toks) == 1 and len(s) <= 12) else toks
     out = []
@@ -83,7 +83,17 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "")
 SESS: Dict[str, Dict[str, object]] = {}
 def _init_user(uid:str):
     now = int(time.time())
-    SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": now, "premium": False}
+    SESS[uid] = {
+        "bankroll": 0,
+        "seq": [],
+        "trial_start": now,
+        "premium": False,
+        "stage": "hall",        # FSM：hall -> table -> bankroll -> points
+        "hall_name": None,
+        "hall_code": None,
+        "table": None,
+        "last_pts_text": None,
+    }
 
 def validate_activation_code(code: str) -> bool:
     return bool(ADMIN_ACTIVATION_SECRET) and bool(code) and (code == ADMIN_ACTIVATION_SECRET)
@@ -142,7 +152,7 @@ PF   = OutcomePF(
         seed=SEED,
         n_particles=PF_N,
         sims_lik=PF_UPD_SIMS,
-        resample_thr=PF_RESAMPLE,          # 修正：正確參數
+        resample_thr=PF_RESAMPLE,          # 正確參數
         dirichlet_alpha=PF_DIR_ALPHA,
         use_exact=bool(PF_USE_EXACT)
       )
@@ -343,13 +353,15 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         def on_text(event):
             uid = event.source.user_id; text = (event.message.text or "").strip()
             if uid not in SESS: _init_user(uid)
+            sess = SESS[uid]
             guard = trial_guard(uid)
             if guard:
                 line_api.reply_message(event.reply_token, TextSendMessage(text=guard)); return
 
             # 允許隨時重設導引
             if text in ["遊戲設定", "重設流程", "reset", "清空", "結束分析"]:
-                SESS[uid] = {"bankroll": 0, "seq": [], "trial_start": int(time.time()), "premium": SESS.get(uid,{}).get("premium", False)}
+                prem = sess.get("premium", False)
+                _init_user(uid); SESS[uid]["premium"] = prem
                 try:
                     line_api.reply_message(event.reply_token, [
                         TextSendMessage(text="✅ 已重設流程，請選擇館別："),
@@ -359,92 +371,113 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     log.warning("reset reply failed: %s", e)
                 return
 
+            # FSM：hall → table → bankroll → points
+            stage = sess.get("stage", "hall")
+
             # 步驟 1：選館（輸入 1~10）
-            if re.fullmatch(r"10|[1-9]", text):
-                name, code = HALL_MAP[text]
-                sess = SESS[uid]; sess["hall_name"] = name; sess["hall_code"] = code
-                line_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已選【{name}】\n請輸入桌號（例：DG01，格式：2字母+2數字）"))
-                return
+            if stage == "hall":
+                if re.fullmatch(r"10|[1-9]", text):
+                    name, code = HALL_MAP[text]
+                    sess["hall_name"] = name; sess["hall_code"] = code; sess["stage"] = "table"
+                    line_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已選【{name}】\n請輸入桌號（例：DG01，格式：2字母+2數字）"))
+                    return
+                else:
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="請輸入 1~10 選擇館別")) ; return
 
             # 步驟 2：桌號（兩字母+兩數字）
-            if TABLE_PATTERN.fullmatch(text.upper()):
-                SESS[uid]["table"] = text.upper()
-                line_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已設桌號【{text.upper()}】\n請輸入您的本金（例：5000）"))
-                return
+            if stage == "table":
+                t = text.upper()
+                if TABLE_PATTERN.fullmatch(t):
+                    sess["table"] = t; sess["stage"] = "bankroll"
+                    line_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 已設桌號【{t}】\n請輸入您的本金（例：5000）"))
+                    return
+                else:
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="桌號格式錯誤，請輸入 2 字母 + 2 數字，例如 DG01")) ; return
 
-            # 步驟 3：本金（純數字）
-            if text.isdigit() and int(text) > 0:
-                SESS[uid]["bankroll"] = int(text)
+            # 步驟 3：本金（只在此階段接受純數字為本金）
+            if stage == "bankroll":
+                if text.isdigit() and int(text) > 0:
+                    sess["bankroll"] = int(text); sess["stage"] = "points"
+                    line_api.reply_message(event.reply_token, TextSendMessage(
+                        text=f"👍 已設定本金：{int(text):,}\n請輸入上一局點數開始分析（例如 65 / 閒6 莊5 / 和）"
+                    ))
+                    return
+                else:
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="請輸入純數字本金，例如 5000")) ; return
+
+            # 步驟 4：points（此階段的純數字不會被當作本金）
+            if stage == "points":
+                # 先嘗試解析點數/和局
+                pts = parse_last_hand_points(text)
+                if pts is not None or re.search(r'(?:和|TIE|DRAW)\b', text.upper()):
+                    if pts is not None:
+                        p_total, b_total = pts
+                        try:
+                            DEPL.update_hand({"p_total": p_total, "b_total": b_total, "trials": 400})
+                            last_outcome = 1 if p_total > b_total else (0 if b_total > p_total else 2)
+                            PF.update_outcome(last_outcome)
+                        except Exception as e:
+                            log.warning("deplete update(line) failed: %s", e)
+                        sess.setdefault("seq", []).append(last_outcome)
+                        sess["last_pts_text"] = f"上局結果: 閒 {p_total} 莊 {b_total}"
+                        line_api.reply_message(event.reply_token, TextSendMessage(
+                            text="讀取完成\n" + sess["last_pts_text"] + "\n開始平衡分析下局...."
+                        ))
+                        return
+                    else:
+                        PF.update_outcome(2)
+                        sess.setdefault("seq", []).append(2)
+                        sess["last_pts_text"] = "上局結果: 和局"
+                        line_api.reply_message(event.reply_token, TextSendMessage(
+                            text="讀取完成\n上局結果: 和局\n開始平衡分析下局...."
+                        ))
+                        return
+
+                # 也接受單字「莊/閒/和」純勝負
+                single = text.strip().upper()
+                if single in ("B","莊","BANKER"):
+                    PF.update_outcome(0); sess.setdefault("seq", []).append(0); sess["last_pts_text"]="上局結果: 莊勝"
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 莊勝\n開始平衡分析下局....")); return
+                if single in ("P","閒","PLAYER"):
+                    PF.update_outcome(1); sess.setdefault("seq", []).append(1); sess["last_pts_text"]="上局結果: 閒勝"
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 閒勝\n開始平衡分析下局....")); return
+                if single in ("T","和","TIE","DRAW"):
+                    PF.update_outcome(2); sess.setdefault("seq", []).append(2); sess["last_pts_text"]="上局結果: 和局"
+                    line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 和局\n開始平衡分析下局....")); return
+
+                # 觸發分析（維持原預測邏輯 & 卡片輸出）
+                if ("開始分析" in text) or (text in ["分析","開始","GO","go"]):
+                    p_depl = None; p_pf = None
+                    try: p_depl = DEPL.predict(sims=DEPL_SIMS)
+                    except Exception as e: log.warning("deplete predict failed: %s", e)
+                    try: p_pf   = PF.predict(sims_per_particle=PF_PRED_SIMS)
+                    except Exception as e: log.warning("pf predict failed: %s", e)
+
+                    if (p_depl is not None) and (p_pf is not None):
+                        p = 0.5 * p_depl + 0.5 * p_pf
+                        p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum(); engine_note="Mix"
+                    elif p_depl is not None:
+                        p = p_depl; engine_note = "Deplete"
+                    elif p_pf is not None:
+                        p = p_pf; engine_note = "PF"
+                    else:
+                        p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
+
+                    choice, edge, bet_pct, reason = decide_only_bp(p)
+                    msg = format_card_output(p, choice, sess.get("last_pts_text"))
+                    line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+                    return
+
+                # 其餘情況：提示導引
                 line_api.reply_message(event.reply_token, TextSendMessage(
-                    text=f"👍 已設定本金：{int(text):,}\n請輸入上一局點數開始分析"
+                    text="🧭 指令：回報點數（65/和/閒6 莊5）或輸入『開始分析』"
                 ))
                 return
 
-            # 步驟 4：點數 or 和局 → 進入分析
-            pts = parse_last_hand_points(text)
-            if pts is not None or re.search(r'(?:和|TIE|DRAW)\b', text.upper()):
-                if pts is not None:
-                    p_total, b_total = pts
-                    try:
-                        DEPL.update_hand({"p_total": p_total, "b_total": b_total, "trials": 400})
-                        last_outcome = 1 if p_total > b_total else (0 if b_total > p_total else 2)
-                        PF.update_outcome(last_outcome)
-                    except Exception as e:
-                        log.warning("deplete update(line) failed: %s", e)
-                    SESS[uid].setdefault("seq", []).append(last_outcome)
-                    SESS[uid]["last_pts_text"] = f"上局結果: 閒 {p_total} 莊 {b_total}"
-                    line_api.reply_message(event.reply_token, TextSendMessage(
-                        text="讀取完成\n" + SESS[uid]["last_pts_text"] + "\n開始平衡分析下局...."
-                    ))
-                    return
-                else:
-                    PF.update_outcome(2)
-                    SESS[uid].setdefault("seq", []).append(2)
-                    SESS[uid]["last_pts_text"] = "上局結果: 和局"
-                    line_api.reply_message(event.reply_token, TextSendMessage(
-                        text="讀取完成\n上局結果: 和局\n開始平衡分析下局...."
-                    ))
-                    return
-
-            # 保留「莊/閒/和」純勝負
-            single = text.strip().upper()
-            if single in ("B","莊","BANKER"):
-                PF.update_outcome(0); SESS[uid].setdefault("seq", []).append(0); SESS[uid]["last_pts_text"]="上局結果: 莊勝"
-                line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 莊勝\n開始平衡分析下局....")); return
-            if single in ("P","閒","PLAYER"):
-                PF.update_outcome(1); SESS[uid].setdefault("seq", []).append(1); SESS[uid]["last_pts_text"]="上局結果: 閒勝"
-                line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 閒勝\n開始平衡分析下局....")); return
-            if single in ("T","和","TIE","DRAW"):
-                PF.update_outcome(2); SESS[uid].setdefault("seq", []).append(2); SESS[uid]["last_pts_text"]="上局結果: 和局"
-                line_api.reply_message(event.reply_token, TextSendMessage(text="讀取完成\n上局結果: 和局\n開始平衡分析下局....")); return
-
-            # 觸發分析（維持原預測邏輯 & 卡片輸出）
-            if ("開始分析" in text) or (text in ["分析","開始","GO","go"]):
-                p_depl = None; p_pf = None
-                try: p_depl = DEPL.predict(sims=DEPL_SIMS)
-                except Exception as e: log.warning("deplete predict failed: %s", e)
-                try: p_pf   = PF.predict(sims_per_particle=PF_PRED_SIMS)
-                except Exception as e: log.warning("pf predict failed: %s", e)
-
-                if (p_depl is not None) and (p_pf is not None):
-                    p = 0.5 * p_depl + 0.5 * p_pf
-                    p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum(); engine_note="Mix"
-                elif p_depl is not None:
-                    p = p_depl; engine_note = "Deplete"
-                elif p_pf is not None:
-                    p = p_pf; engine_note = "PF"
-                else:
-                    p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
-
-                choice, edge, bet_pct, reason = decide_only_bp(p)
-                msg = format_card_output(p, choice, SESS[uid].get("last_pts_text"))
-                line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-                return
-
-            # 其餘情況：提示導引
-            line_api.reply_message(event.reply_token, TextSendMessage(
-                text="🧭 指令：輸入 1~10 選館 → DG01 桌號 → 5000 本金 → 回報點數（65/和/閒6 莊5）→『開始分析』"
-            ))
+            # 萬一沒有 stage：重設
+            _init_user(uid)
+            line_api.reply_message(event.reply_token, TextSendMessage(text="狀態已重設，請輸入 1~10 選擇館別。"))
+            return
 
         @app.post("/line-webhook")
         def line_webhook():
