@@ -1,15 +1,15 @@
 # server.py — 純算牌 + 粒子濾波（ONLY 莊/閒建議｜EV含抽水｜¼-Kelly｜試用制｜卡片輸出｜支援和局回報｜加入導引清單）
 # Author: 親愛的 x GPT-5 Thinking
-# Version: bgs-deplete-pf-2025-09-30-fix173 (balanced bias fix)
+# Version: bgs-deplete-pf-2025-09-30-fix174 (tie-enhanced, gap-reduced)
 
-import os, logging, time, csv, pathlib, re, random  # 加 random
+import os, logging, time, csv, pathlib, re, random
 from typing import List, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
 # ==== 基本設定 ====
-VERSION = "bgs-deplete-pf-2025-09-30-fix173"
+VERSION = "bgs-deplete-pf-2025-09-30-fix174"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -140,10 +140,9 @@ HALL_MAP = {
 TABLE_PATTERN = re.compile(r"^[A-Z]{2}\d{2}$")  # 例：DG01
 
 # ==== 算牌引擎 ====
-# (為了 Render 免費機穩定，給較輕量預設；你可用環境變數覆蓋)
 SEED = int(os.getenv("SEED","42"))
 DEPL_DECKS  = int(os.getenv("DEPL_DECKS", "8"))
-DEPL_SIMS   = int(os.getenv("DEPL_SIMS", "6000"))   # 輕量預設
+DEPL_SIMS   = int(os.getenv("DEPL_SIMS", "6000"))
 
 PF_N        = int(os.getenv("PF_N", "120"))
 PF_UPD_SIMS = int(os.getenv("PF_UPD_SIMS", "60"))
@@ -152,9 +151,8 @@ PF_RESAMPLE = float(os.getenv("PF_RESAMPLE", "0.5"))
 PF_DIR_ALPHA= float(os.getenv("PF_DIR_ALPHA", "0.8"))
 PF_USE_EXACT= int(os.getenv("PF_USE_EXACT", "0"))
 
-BIAS_CORRECT = float(os.getenv("BIAS_CORRECT", "0.0"))  # 新增：莊偏校正（預設0，設0.5微調閒+0.5%）
+BIAS_CORRECT = float(os.getenv("BIAS_CORRECT", "0.2"))  # 預設0.2，微調偏莊
 
-# 嘗試導入引擎模組，如果失敗則使用備用
 try:
     from bgs.deplete import DepleteMC
     from bgs.pfilter import OutcomePF
@@ -173,20 +171,19 @@ try:
 except ImportError as e:
     log.warning("Engine modules not available: %s", e)
     ENGINE_AVAILABLE = False
-    # 創建虛擬引擎
     class DummyEngine:
         def update_hand(self, *args, **kwargs): pass
         def update_outcome(self, *args, **kwargs): pass
         def predict(self, *args, **kwargs): 
-            return np.array([0.48, 0.50, 0.02], dtype=np.float32)  # 微調中性，防偏莊
+            return np.array([0.48, 0.50, 0.02], dtype=np.float32)
     DEPL = DummyEngine()
     PF = DummyEngine()
 
 # ==== 決策（僅莊/閒）====
-EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.05"))  # 調高到0.05，防微偏
+EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.04"))  # 降到0.04，平衡觀望
 USE_KELLY   = env_flag("USE_KELLY", 1)
-KELLY_FACTOR= float(os.getenv("KELLY_FACTOR", "0.25"))  # ¼-Kelly
-MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))  # 單注上限 1.5%
+KELLY_FACTOR= float(os.getenv("KELLY_FACTOR", "0.25"))
+MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
 
 LOG_DIR     = os.getenv("LOG_DIR", "logs")
 pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -196,7 +193,7 @@ if not os.path.exists(PRED_CSV):
         writer = csv.writer(f)
         writer.writerow([
             "ts","version","hands","pB","pP","pT","choice","edge",
-            "bet_pct","bankroll","bet_amt","engine","reason","hall","table"
+            "bet_pct","bankroll","bet_amt","engine","reason","hall","table","gap"
         ])
 
 # ---- EV / Kelly ----
@@ -216,34 +213,34 @@ def decide_only_bp(prob):
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     evB, evP = banker_ev(pB, pP), player_ev(pB, pP)
     side = 0 if evB > evP else 1
-    edge_prob = abs(pB - pP) * (1 - pT)  # 扣tie影響，減小微偏
-    final_edge = max(edge_prob, abs(evB - evP))
+    # 加強tie考量：純用EV，扣tie (1.2倍懲罰)
+    final_edge = abs(evB - evP) * (1 - pT * 1.2)
     
-    # 動態門檻：若pT>0.12，門檻上調
-    dyn_threshold = EDGE_ENTER + (0.02 if pT > 0.12 else 0)
+    # 動態門檻
+    dyn_threshold = EDGE_ENTER + (0.015 if pT > 0.12 else 0)
     if final_edge < dyn_threshold:
-        return ("觀望", final_edge, 0.0, f"⚪ 優勢不足（門檻 {dyn_threshold:.2f}）")
+        return ("觀望", final_edge, 0.0, f"⚪ 優勢不足（門檻 {dyn_threshold:.3f}，tie影響）")
     
-    # 加隨機擾動：小edge時50%觀望
-    if final_edge < 0.06 and random.random() < 0.5:
-        return ("觀望", final_edge, 0.0, f"⚪ 微優勢觀望（擾動）")
+    # 擾動升到60%
+    if final_edge < 0.05 and random.random() < 0.6:
+        return ("觀望", final_edge, 0.0, f"⚪ 微優勢觀望（tie擾動）")
     
     if USE_KELLY:
         f = KELLY_FACTOR * (kelly_fraction(pB, 0.95) if side==0 else kelly_fraction(pP, 1.0))
         bet_pct = min(MAX_BET_PCT, float(max(0.0, f)))
         reason = "🧠 純算牌｜📐 ¼-Kelly"
     else:
-        if final_edge >= 0.12: bet_pct = 0.25  # 調高階梯
-        elif final_edge >= 0.08: bet_pct = 0.15
-        elif final_edge >= 0.05: bet_pct = 0.10
+        if final_edge >= 0.10: bet_pct = 0.25
+        elif final_edge >= 0.07: bet_pct = 0.15
+        elif final_edge >= 0.06: bet_pct = 0.10  # 調高起點
         else: bet_pct = 0.05
         reason = "🧠 純算牌｜🪜 階梯式配注"
     return (INV[side], final_edge, bet_pct, reason)
 
-# ===== 卡片輸出（加bet額） =====
-def format_card_output(prob, choice, last_pts_text: Optional[str], bet_amt: int = 0):
-    b_pct = f"{prob[0]*100:.2f}%"
-    p_pct = f"{prob[1]*100:.2f}%"
+# ===== 卡片輸出（加EV） =====
+def format_card_output(prob, choice, last_pts_text: Optional[str], bet_amt: int = 0, evB: float = 0, evP: float = 0):
+    b_pct = f"{prob[0]*100:.1f}%"
+    p_pct = f"{prob[1]*100:.1f}%"
     header = []
     if last_pts_text:
         header = ["讀取完成", last_pts_text, "開始平衡分析下局....", ""]
@@ -251,7 +248,8 @@ def format_card_output(prob, choice, last_pts_text: Optional[str], bet_amt: int 
         "【預測結果】",
         f"閒：{p_pct}",
         f"莊：{b_pct}",
-        f"本次預測結果：{choice if choice!='觀望' else '觀'}"
+        f"本次預測結果：{choice if choice!='觀望' else '觀'}",
+        f"EV｜莊 {evB:.3f}｜閒 {evP:.3f}"
     ]
     if bet_amt > 0:
         block.append(f"💰 建議注額：{bet_amt:,}")
@@ -353,15 +351,21 @@ def predict_api():
 
     if (p_depl is not None) and (p_pf is not None):
         if pts is not None: 
-            w_depl, w_pf = 0.6, 0.4  # 降Deplete權重，平衡
+            w_depl, w_pf = 0.6, 0.4
             engine_note = "Mix(Deplete)"
         else:               
             w_depl, w_pf = 0.4, 0.6
             engine_note = "Mix(PF)"
         p = w_depl * p_depl + w_pf * p_pf
-        p[2] = np.clip(p[2], 0.08, 0.15)  # 調窄clip，減放大
+        p[2] = np.clip(p[2], 0.04, 0.16)  # 寬clip，減差距放大
         p = p / p.sum()
-        # 加偏校正
+        # pB cap 防極端偏
+        if p[0] > 0.51:
+            excess = p[0] - 0.51
+            p[0] = 0.51
+            p[1] += excess
+            p = p / p.sum()
+        # 偏校正
         if BIAS_CORRECT > 0:
             p[0] -= BIAS_CORRECT * 0.01
             p[1] += BIAS_CORRECT * 0.01
@@ -376,25 +380,27 @@ def predict_api():
 
     choice, edge, bet_pct, reason = decide_only_bp(p)
     amt = bet_amount(bankroll, bet_pct)
+    evB_val = banker_ev(float(p[0]), float(p[1]))
+    evP_val = player_ev(float(p[0]), float(p[1]))
+    gap = abs(p[0] - p[1])
 
-    # 加log追蹤
-    log.info(f"Predict: pB={p[0]:.3f}, pP={p[1]:.3f}, pT={p[2]:.3f}, choice={choice}, edge={edge:.3f}")
+    # 加log（含gap）
+    log.info(f"Predict: pB={p[0]:.3f}, pP={p[1]:.3f}, pT={p[2]:.3f}, gap={gap:.3f}, choice={choice}, edge={edge:.3f}")
 
     style = str(data.get("style","")).lower()
     if style == "card":
-        msg = format_card_output(p, choice, last_text, amt)
+        msg = format_card_output(p, choice, last_text, amt, evB_val, evP_val)
     else:
         b_pct, p_pct = int(round(100*p[0])), int(round(100*p[1]))
-        evB = banker_ev(float(p[0]), float(p[1])); evP = player_ev(float(p[0]), float(p[1]))
         msg = (
             f"🎯 下一局建議：{choice}\n"
             f"💰 建議注額：{amt:,}\n"
-            f"📊 機率｜莊 {b_pct}%｜閒 {p_pct}%\n"
-            f"📐 EV（抽水後）｜莊 {evB:.3f}｜閒 {evP:.3f}\n"
+            f"📊 機率｜莊 {b_pct}%｜閒 {p_pct}% (差距 {gap*100:.1f}%)\n"
+            f"📐 EV（抽水後）｜莊 {evB_val:.3f}｜閒 {evP_val:.3f}\n"
             f"🧭 {reason}｜引擎：{engine_note}"
         )
 
-    # 記錄（加hall/table）
+    # 記錄（加gap）
     try:
         bet_amt = bet_amount(bankroll, bet_pct)
         hall = data.get("hall", "")
@@ -405,7 +411,7 @@ def predict_api():
                 int(time.time()), VERSION, len(seq),
                 float(p[0]), float(p[1]), float(p[2]),
                 choice, float(edge), float(bet_pct), int(bankroll), int(bet_amt),
-                engine_note or "NA", reason, hall, table
+                engine_note or "NA", reason, hall, table, gap
             ])
     except Exception as e:
         log.warning("log_prediction failed: %s", e)
@@ -455,9 +461,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 keep_premium = sess.get("premium", False)
                 _init_user(uid)
                 SESS[uid]["premium"] = keep_premium
-                SESS[uid]["seq"] = []  # 清seq
-                SESS[uid]["last_pts_text"] = None  # 清last
-                SESS[uid]["bankroll"] = 0  # 清bankroll
+                SESS[uid]["seq"] = []
+                SESS[uid]["last_pts_text"] = None
+                SESS[uid]["bankroll"] = 0
                 try:
                     line_api.reply_message(event.reply_token, TextSendMessage(
                         text="✅ 已重設流程\n" + steps_menu_text(uid)
@@ -496,7 +502,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 return
 
             # 步驟 4：點數 or 和局 → 進入分析
-            if sess["step"] >= 3:  # 已設定本金後可接收點數
+            if sess["step"] >= 3:
                 pts = parse_last_hand_points(text)
                 if pts is not None:
                     p_total, b_total = pts
@@ -509,9 +515,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         log.warning("deplete update(line) failed: %s", e)
                     sess.setdefault("seq", []).append(last_outcome)
                     sess["last_pts_text"] = f"上局結果: 閒 {p_total} 莊 {b_total}"
-                    sess["step"] = 4  # 標記為可分析狀態
+                    sess["step"] = 4
                     
-                    # 立即進行分析（用最新bankroll）
+                    # 立即進行分析
                     bankroll = sess.get("bankroll", 0)
                     try:
                         p_depl = None; p_pf = None
@@ -523,7 +529,17 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         if p_depl is not None and p_pf is not None:
                             p = 0.5 * p_depl + 0.5 * p_pf
-                            p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
+                            p[2] = np.clip(p[2], 0.04, 0.16); p = p / p.sum()
+                            if p[0] > 0.51:
+                                excess = p[0] - 0.51
+                                p[0] = 0.51
+                                p[1] += excess
+                                p = p / p.sum()
+                            if BIAS_CORRECT > 0:
+                                p[0] -= BIAS_CORRECT * 0.01
+                                p[1] += BIAS_CORRECT * 0.01
+                                p = np.clip(p, 0, 1)
+                                p = p / p.sum()
                         elif p_depl is not None:
                             p = p_depl
                         elif p_pf is not None:
@@ -533,7 +549,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         choice, edge, bet_pct, reason = decide_only_bp(p)
                         amt = bet_amount(bankroll, bet_pct)
-                        msg = format_card_output(p, choice, sess["last_pts_text"], amt)
+                        evB_val = banker_ev(float(p[0]), float(p[1]))
+                        evP_val = player_ev(float(p[0]), float(p[1]))
+                        msg = format_card_output(p, choice, sess["last_pts_text"], amt, evB_val, evP_val)
                         line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                     except Exception as e:
                         log.warning("auto analysis failed: %s", e)
@@ -560,7 +578,17 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         if p_depl is not None and p_pf is not None:
                             p = 0.5 * p_depl + 0.5 * p_pf
-                            p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
+                            p[2] = np.clip(p[2], 0.04, 0.16); p = p / p.sum()
+                            if p[0] > 0.51:
+                                excess = p[0] - 0.51
+                                p[0] = 0.51
+                                p[1] += excess
+                                p = p / p.sum()
+                            if BIAS_CORRECT > 0:
+                                p[0] -= BIAS_CORRECT * 0.01
+                                p[1] += BIAS_CORRECT * 0.01
+                                p = np.clip(p, 0, 1)
+                                p = p / p.sum()
                         elif p_depl is not None:
                             p = p_depl
                         elif p_pf is not None:
@@ -570,7 +598,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         choice, edge, bet_pct, reason = decide_only_bp(p)
                         amt = bet_amount(bankroll, bet_pct)
-                        msg = format_card_output(p, choice, sess["last_pts_text"], amt)
+                        evB_val = banker_ev(float(p[0]), float(p[1]))
+                        evP_val = player_ev(float(p[0]), float(p[1]))
+                        msg = format_card_output(p, choice, sess["last_pts_text"], amt, evB_val, evP_val)
                         line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                     except Exception as e:
                         log.warning("auto analysis failed: %s", e)
@@ -634,7 +664,17 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                 if p_depl is not None and p_pf is not None:
                     p = 0.5 * p_depl + 0.5 * p_pf
-                    p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
+                    p[2] = np.clip(p[2], 0.04, 0.16); p = p / p.sum()
+                    if p[0] > 0.51:
+                        excess = p[0] - 0.51
+                        p[0] = 0.51
+                        p[1] += excess
+                        p = p / p.sum()
+                    if BIAS_CORRECT > 0:
+                        p[0] -= BIAS_CORRECT * 0.01
+                        p[1] += BIAS_CORRECT * 0.01
+                        p = np.clip(p, 0, 1)
+                        p = p / p.sum()
                     engine_note = "Mix"
                 elif p_depl is not None:
                     p = p_depl; engine_note = "Deplete"
@@ -645,7 +685,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                 choice, edge, bet_pct, reason = decide_only_bp(p)
                 amt = bet_amount(bankroll, bet_pct)
-                msg = format_card_output(p, choice, sess.get("last_pts_text"), amt)
+                evB_val = banker_ev(float(p[0]), float(p[1]))
+                evP_val = player_ev(float(p[0]), float(p[1]))
+                msg = format_card_output(p, choice, sess.get("last_pts_text"), amt, evB_val, evP_val)
                 line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                 return
 
