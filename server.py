@@ -1,5 +1,5 @@
 """
-server.py — 最終修正版（移除硬編碼限制，優化趨勢偏見）
+server.py — 最終修正版（減少趨勢追隨，信心度5%-40%本金投注，優化Render免費版）
 """
 
 import os
@@ -33,7 +33,7 @@ except Exception:
         return None
 
 # 版本號
-VERSION = "bgs-final-fixed-2025-10-01"
+VERSION = "bgs-final-fixed-2025-10-01-antitrend-v2"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -77,7 +77,7 @@ else:
         log.warning("REDIS_URL not set. Using in-memory session store.")
 
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
-SESSION_EXPIRE_SECONDS = 3600
+SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1200"))
 DEDUPE_TTL = 60
 
 def _rget(k: str) -> Optional[str]:
@@ -220,9 +220,9 @@ def trial_guard(sess: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ---------- Outcome PF (粒子過濾器) ----------
-log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s", 
-         os.getenv("PF_N", "200"), os.getenv("PF_UPD_SIMS", "80"), 
-         os.getenv("PF_PRED_SIMS", "20"), os.getenv("DECKS", "8"))
+log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s",
+         os.getenv("PF_N", "50"), os.getenv("PF_UPD_SIMS", "30"),
+         os.getenv("PF_PRED_SIMS", "5"), os.getenv("DECKS", "8"))
 
 os.environ['PF_BACKEND'] = 'mc'
 os.environ['SKIP_TIE_UPD'] = '1'
@@ -252,18 +252,18 @@ if OutcomePF:
         PF = OutcomePF(
             decks=int(os.getenv("DECKS", "8")),
             seed=int(os.getenv("SEED", "42")),
-            n_particles=int(os.getenv("PF_N", "200")),
-            sims_lik=int(os.getenv("PF_UPD_SIMS", "80")),
+            n_particles=int(os.getenv("PF_N", "50")),
+            sims_lik=int(os.getenv("PF_UPD_SIMS", "30")),
             resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
             backend=os.getenv("PF_BACKEND", "mc").lower(),
-            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.01")),
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05")),  # 提高平滑
         )
         pf_initialized = True
         log.info(
             "PF 初始化成功: n_particles=%s, sims_lik=%s, decks=%s (backend=%s)",
             PF.n_particles,
             getattr(PF, 'sims_lik', 'N/A'),
-            getattr(PF, 'decks', 'N/A'), 
+            getattr(PF, 'decks', 'N/A'),
             getattr(PF, 'backend', 'unknown'),
         )
     except Exception as e:
@@ -277,7 +277,7 @@ if not pf_initialized:
             self.win_counts = np.array([0.0, 0.0, 0.0])
             self.total_games = 0
             log.warning("使用 SmartDummyPF 備援模式 - 請檢查 OutcomePF 導入問題")
-            
+
         def update_outcome(self, outcome):
             if outcome in (0, 1, 2):
                 self.win_counts[outcome] += 1.0
@@ -291,7 +291,7 @@ if not pf_initialized:
                 base = self.win_counts / self.total_games
                 base = 0.7 * base + 0.3 * np.array([0.4586, 0.4462, 0.0952])
                 base = base / base.sum()
-                
+
             log.info("SmartDummyPF 預測: %s (基於 %s 場歷史)", base, self.total_games)
             return base.astype(np.float32)
 
@@ -304,9 +304,7 @@ if not pf_initialized:
 
 # ---------- 投注決策 ----------
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.05"))
-USE_KELLY = env_flag("USE_KELLY", 1)
-KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.2"))
-MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.02"))
+USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
 INV = {0: "莊", 1: "閒"}
@@ -317,44 +315,36 @@ def bet_amount(bankroll: int, pct: float) -> int:
     return int(round(bankroll * pct))
 
 def decide_only_bp(prob: np.ndarray, streak_count: int, last_outcome: Optional[int]) -> Tuple[str, float, float, str]:
-    pB, pP = float(prob[0]), float(prob[1])
-    
+    # 平滑機率以減少趨勢偏見
+    pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
+    theo_probs = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)  # 百家樂理論機率
+    smoothed_probs = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo_probs
+    smoothed_probs = smoothed_probs / smoothed_probs.sum()  # 重新正規化
+    pB, pP = smoothed_probs[0], smoothed_probs[1]
+
     evB, evP = 0.95 * pB - pP, pP - pB
-    
-    # 連勝檢測：若連續5局相同結果，降低該邊的EV以避免過度追隨趨勢
-    streak_adjust = 0.02 if streak_count >= 5 and last_outcome is not None else 0.0
+
+    # 連勝檢測：3局以上降低EV，減少趨勢追隨
+    streak_adjust = 0.03 if streak_count >= 3 and last_outcome is not None else 0.0
     if last_outcome == 0:
         evB -= streak_adjust
     elif last_outcome == 1:
         evP -= streak_adjust
-    
+
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
-    
+
     if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
-    
-    if USE_KELLY:
-        if side == 0:
-            b = 0.95
-            f = KELLY_FACTOR * ((pB * b - (1 - pB)) / b)
-        else:
-            b = 1.0
-            f = KELLY_FACTOR * ((pP * b - (1 - pP)) / b)
-        
-        bet_pct = min(MAX_BET_PCT, max(0.001, float(f)))
-        reason = f"Kelly配注(因子={KELLY_FACTOR})"
-    else:
-        if final_edge >= 0.10:
-            bet_pct = 0.015
-        elif final_edge >= 0.07:
-            bet_pct = 0.010
-        elif final_edge >= 0.05:
-            bet_pct = 0.007
-        else:
-            bet_pct = 0.005
-        reason = "階梯式配注"
-    
+
+    # 根據信心度（final_edge）計算投注比例，範圍5%到40%
+    max_edge = 0.15  # 假設最大信心度為0.15
+    min_bet_pct = 0.05  # 最低5%本金
+    max_bet_pct = 0.40  # 最高40%本金
+    bet_pct = min_bet_pct + (max_bet_pct - min_bet_pct) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
+    bet_pct = min(max_bet_pct, max(min_bet_pct, float(bet_pct)))  # 限制在5%-40%
+    reason = f"信心度配注({min_bet_pct*100:.0f}%~{max_bet_pct*100:.0f}%)"
+
     return (INV[side], final_edge, bet_pct, reason)
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
@@ -364,7 +354,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
-    
+
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
@@ -389,8 +379,8 @@ def root():
 @app.get("/health")
 def health():
     return jsonify(
-        ok=True, 
-        ts=time.time(), 
+        ok=True,
+        ts=time.time(),
         version=VERSION,
         pf_initialized=pf_initialized,
         pf_backend=getattr(PF, 'backend', 'unknown')
@@ -399,8 +389,8 @@ def health():
 @app.get("/healthz")
 def healthz():
     return jsonify(
-        ok=True, 
-        ts=time.time(), 
+        ok=True,
+        ts=time.time(),
         version=VERSION,
         pf_initialized=pf_initialized
     ), 200
@@ -455,16 +445,16 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
     start_time = time.time()
-    
+
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
-    
+
     # 更新連勝計數
     if sess.get("last_outcome") == outcome and outcome in (0, 1):
         sess["streak_count"] = sess.get("streak_count", 0) + 1
     else:
         sess["streak_count"] = 1 if outcome in (0, 1) else 0
     sess["last_outcome"] = outcome
-    
+
     if p_pts == b_pts:
         sess["last_pts_text"] = "上局結果: 和局"
     else:
@@ -474,25 +464,25 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
             log.info("勝局更新完成 (%s), 耗時: %.2fs", "閒勝" if outcome == 1 else "莊勝", time.time() - start_time)
         except Exception as e:
             log.warning("PF update err: %s", e)
-    
+
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
-        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "20")))
+        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
-        
+
         choice, edge, bet_pct, reason = decide_only_bp(p, sess["streak_count"], sess["last_outcome"])
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
-        
+
         msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         _reply(reply_token, msg)
         log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
-        
+
     except Exception as e:
         log.error("預測過程中錯誤: %s", e)
         _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
-    
+
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
 
@@ -523,7 +513,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 return
             uid = event.source.user_id
             raw = (event.message.text or "")
-            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
+            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
             sess = get_session(uid)
             try:
                 log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
@@ -650,6 +640,6 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)", 
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)",
              VERSION, port, CONTINUOUS_MODE, pf_initialized)
     app.run(host="0.0.0.0", port=port, debug=False)
