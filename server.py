@@ -1,5 +1,5 @@
 """
-server.py — 最終修正版（移除所有硬編碼限制）
+server.py — 最終修正版（移除硬編碼限制，優化趨勢偏見）
 """
 
 import os
@@ -13,27 +13,27 @@ from typing import Optional, Dict, Any, Tuple
 import numpy as np
 
 try:
-    import redis  # type: ignore
+    import redis
 except Exception:
-    redis = None  # type: ignore
+    redis = None
 
 try:
-    from flask import Flask, request, jsonify, abort  # type: ignore
-    from flask_cors import CORS  # type: ignore
+    from flask import Flask, request, jsonify, abort
+    from flask_cors import CORS
     _flask_available = True
 except Exception:
     _flask_available = False
-    Flask = None  # type: ignore
-    request = None  # type: ignore
-    def jsonify(*args, **kwargs):  # type: ignore
+    Flask = None
+    request = None
+    def jsonify(*args, **kwargs):
         raise RuntimeError("Flask is not available; jsonify cannot be used.")
-    def abort(*args, **kwargs):  # type: ignore
+    def abort(*args, **kwargs):
         raise RuntimeError("Flask is not available; abort cannot be used.")
-    def CORS(app):  # type: ignore
+    def CORS(app):
         return None
 
 # 版本號
-VERSION = "bgs-final-fixed-2025-09-17"
+VERSION = "bgs-final-fixed-2025-10-01"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -45,24 +45,24 @@ if _flask_available and Flask is not None:
     CORS(app)
 else:
     class _DummyApp:
-        def get(self, *args, **kwargs):  # type: ignore
+        def get(self, *args, **kwargs):
             def _decorator(func):
                 return func
             return _decorator
 
-        def post(self, *args, **kwargs):  # type: ignore
+        def post(self, *args, **kwargs):
             def _decorator(func):
                 return func
             return _decorator
 
-        def run(self, *args, **kwargs):  # type: ignore
+        def run(self, *args, **kwargs):
             log.warning("Flask not available; dummy app cannot run a server.")
 
     app = _DummyApp()
 
 # ---------- Redis 或記憶體 Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
-redis_client: Optional["redis.Redis"] = None  # type: ignore
+redis_client: Optional["redis.Redis"] = None
 if redis is not None and REDIS_URL:
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -132,6 +132,8 @@ def get_session(uid: str) -> Dict[str, Any]:
         "table": None,
         "last_pts_text": None,
         "table_no": None,
+        "streak_count": 0,
+        "last_outcome": None,
     }
 
 def save_session(uid: str, data: Dict[str, Any]):
@@ -193,7 +195,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     return None
 
 # ---------- 試用/授權 ----------
-TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "60"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
@@ -218,29 +220,23 @@ def trial_guard(sess: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ---------- Outcome PF (粒子過濾器) ----------
-# 重要修正：移除所有硬編碼參數覆蓋，完全使用環境變數
 log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s", 
-         os.getenv("PF_N", "100"), os.getenv("PF_UPD_SIMS", "50"), 
-         os.getenv("PF_PRED_SIMS", "10"), os.getenv("DECKS", "6"))
+         os.getenv("PF_N", "200"), os.getenv("PF_UPD_SIMS", "80"), 
+         os.getenv("PF_PRED_SIMS", "20"), os.getenv("DECKS", "8"))
 
-# 只設置後端類型，不覆蓋其他參數
-if not os.getenv('PF_BACKEND'):
-    os.environ['PF_BACKEND'] = 'mc'
-    log.info("設置預設 PF_BACKEND=mc")
+os.environ['PF_BACKEND'] = 'mc'
+os.environ['SKIP_TIE_UPD'] = '1'
 
-# 嘗試導入 OutcomePF
 OutcomePF = None
 PF = None
 pf_initialized = False
 
 try:
-    # 優先嘗試從 bgs.pfilter 導入
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
     log.info("成功從 bgs.pfilter 導入 OutcomePF")
 except Exception as e:
     try:
-        # 備用：從本地 pfilter 導入
         _cur_dir = os.path.dirname(os.path.abspath(__file__))
         if _cur_dir not in sys.path:
             sys.path.insert(0, _cur_dir)
@@ -251,18 +247,16 @@ except Exception as e:
         log.error("無法導入 OutcomePF: %s", pf_exc)
         OutcomePF = None
 
-# 初始化 PF
 if OutcomePF:
     try:
-        # 完全使用環境變數，不進行任何硬編碼覆蓋
         PF = OutcomePF(
-            decks=int(os.getenv("DECKS", "6")),
+            decks=int(os.getenv("DECKS", "8")),
             seed=int(os.getenv("SEED", "42")),
-            n_particles=int(os.getenv("PF_N", "100")),
-            sims_lik=int(os.getenv("PF_UPD_SIMS", "50")),
-            resample_thr=float(os.getenv("PF_RESAMPLE", "0.6")),
+            n_particles=int(os.getenv("PF_N", "200")),
+            sims_lik=int(os.getenv("PF_UPD_SIMS", "80")),
+            resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
             backend=os.getenv("PF_BACKEND", "mc").lower(),
-            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.01")),
         )
         pf_initialized = True
         log.info(
@@ -277,10 +271,8 @@ if OutcomePF:
         pf_initialized = False
         OutcomePF = None
 
-# 改進的 DummyPF - 不再使用固定 48/47/5
 if not pf_initialized:
     class SmartDummyPF:
-        """智能備援 PF，避免固定輸出問題"""
         def __init__(self):
             self.win_counts = np.array([0.0, 0.0, 0.0])
             self.total_games = 0
@@ -294,12 +286,9 @@ if not pf_initialized:
 
         def predict(self, **kwargs):
             if self.total_games == 0:
-                # 無歷史數據時使用理論值
                 base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
             else:
-                # 有歷史數據時基於實際勝率
                 base = self.win_counts / self.total_games
-                # 加入少量平滑避免極端值
                 base = 0.7 * base + 0.3 * np.array([0.4586, 0.4462, 0.0952])
                 base = base / base.sum()
                 
@@ -314,9 +303,9 @@ if not pf_initialized:
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.025"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.05"))
 USE_KELLY = env_flag("USE_KELLY", 1)
-KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.3"))
+KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.2"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.02"))
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
@@ -327,10 +316,17 @@ def bet_amount(bankroll: int, pct: float) -> int:
         return 0
     return int(round(bankroll * pct))
 
-def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
+def decide_only_bp(prob: np.ndarray, streak_count: int, last_outcome: Optional[int]) -> Tuple[str, float, float, str]:
     pB, pP = float(prob[0]), float(prob[1])
     
     evB, evP = 0.95 * pB - pP, pP - pB
+    
+    # 連勝檢測：若連續5局相同結果，降低該邊的EV以避免過度追隨趨勢
+    streak_adjust = 0.02 if streak_count >= 5 and last_outcome is not None else 0.0
+    if last_outcome == 0:
+        evB -= streak_adjust
+    elif last_outcome == 1:
+        evP -= streak_adjust
     
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
@@ -350,12 +346,10 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
         reason = f"Kelly配注(因子={KELLY_FACTOR})"
     else:
         if final_edge >= 0.10:
-            bet_pct = 0.020
-        elif final_edge >= 0.07:
             bet_pct = 0.015
-        elif final_edge >= 0.05:
+        elif final_edge >= 0.07:
             bet_pct = 0.010
-        elif final_edge >= 0.03:
+        elif final_edge >= 0.05:
             bet_pct = 0.007
         else:
             bet_pct = 0.005
@@ -462,18 +456,20 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
     start_time = time.time()
     
+    outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
+    
+    # 更新連勝計數
+    if sess.get("last_outcome") == outcome and outcome in (0, 1):
+        sess["streak_count"] = sess.get("streak_count", 0) + 1
+    else:
+        sess["streak_count"] = 1 if outcome in (0, 1) else 0
+    sess["last_outcome"] = outcome
+    
     if p_pts == b_pts:
         sess["last_pts_text"] = "上局結果: 和局"
-        try:
-            if int(os.getenv("SKIP_TIE_UPD", "0")) == 0:
-                PF.update_outcome(2)
-                log.info("和局更新完成, 耗時: %.2fs", time.time() - start_time)
-        except Exception as e:
-            log.warning("PF tie update err: %s", e)
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         try:
-            outcome = 1 if p_pts > b_pts else 0
             PF.update_outcome(outcome)
             log.info("勝局更新完成 (%s), 耗時: %.2fs", "閒勝" if outcome == 1 else "莊勝", time.time() - start_time)
         except Exception as e:
@@ -482,10 +478,10 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
-        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "10")))
+        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "20")))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
         
-        choice, edge, bet_pct, reason = decide_only_bp(p)
+        choice, edge, bet_pct, reason = decide_only_bp(p, sess["streak_count"], sess["last_outcome"])
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
         
