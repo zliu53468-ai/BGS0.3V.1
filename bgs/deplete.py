@@ -1,6 +1,6 @@
 """蒙地卡羅耗損近似 - 修正版
 
-移除硬編碼限制，確保環境變數能正確生效
+移除硬編碼限制，確保環境變數能正確生效，加入牌靴重置與計牌邏輯
 """
 
 from __future__ import annotations
@@ -56,16 +56,21 @@ class DepleteMC:
     def __post_init__(self):
         self.rng = np.random.default_rng(int(self.seed))
         self.counts = init_counts(int(self.decks))
+        self.initial_counts = self.counts.copy()
         self.recent_outcomes = []
         self.max_history = 20
+        self.cards_used = 0
+        self.shoe_reset_threshold = int(0.75 * self.decks * 52)
 
     def reset_shoe(self, decks: Optional[int] = None):
         if decks is not None:
             self.decks = int(decks)
         self.counts = init_counts(self.decks)
+        self.initial_counts = self.counts.copy()
         self.recent_outcomes.clear()
+        self.cards_used = 0
 
-    def _sample_outcome_only(self, outcome: int, trials: int = 300):
+    def _sample_outcome_only(self, outcome: int, trials: int = 500):
         exp_usage = np.zeros_like(self.counts, dtype=np.float64)
         success = 0
         
@@ -96,6 +101,7 @@ class DepleteMC:
                 if used.min() < 0:
                     continue
                 exp_usage += used; success += 1
+                self.cards_used += used.sum()
             except Exception:
                 continue
 
@@ -103,7 +109,11 @@ class DepleteMC:
             exp_usage = exp_usage / success
             self.counts = np.maximum(0, (self.counts - exp_usage).astype(np.int32))
 
-    def update_outcome(self, outcome: int, trials: int = 300):
+        # 檢查是否需要重置牌靴
+        if self.cards_used >= self.shoe_reset_threshold:
+            self.reset_shoe()
+
+    def update_outcome(self, outcome: int, trials: int = 500):
         if outcome not in (0, 1, 2):
             return
         
@@ -116,6 +126,15 @@ class DepleteMC:
     def predict(self, sims: int = 20000) -> np.ndarray:
         wins = np.zeros(3, dtype=np.int64)
         
+        # 計牌調整：根據剩餘牌計算莊/閒優勢
+        total_cards = self.counts.sum()
+        if total_cards > 0:
+            card_dist = self.counts / total_cards
+            banker_adjust = sum(card_dist[6:9]) * 0.02  # 高點數牌有利莊
+            player_adjust = sum(card_dist[1:4]) * 0.015  # 低點數牌有利閒
+        else:
+            banker_adjust = player_adjust = 0.0
+
         for _ in range(sims):
             tmp = self.counts.copy()
             try:
@@ -143,6 +162,8 @@ class DepleteMC:
             return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
 
         p = wins.astype(np.float64) / float(tot)
+        p[0] += banker_adjust
+        p[1] += player_adjust
         p = np.clip(p, 0.01, 0.99)
         p = p / p.sum()
         return p.astype(np.float32)
@@ -157,7 +178,7 @@ class OutcomePF:
         sims_lik: int = 80,
         resample_thr: float = 0.5,
         backend: str = "mc",
-        dirichlet_eps: float = 0.003,
+        dirichlet_eps: float = 0.01,
         **kwargs,
     ):
         self.backend = f"mc-deplete"
@@ -178,7 +199,7 @@ class OutcomePF:
         alpha = self.win_counts + self.dirichlet_eps
         base = alpha / alpha.sum()
 
-        out = 0.75 * mc_proba + 0.25 * base
+        out = 0.6 * mc_proba + 0.4 * base
         out = out / out.sum()
         
         return out.astype(np.float32)
