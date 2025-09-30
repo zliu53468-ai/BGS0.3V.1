@@ -1,4 +1,11 @@
-# bgs/deplete.py — 組成依賴蒙地卡羅（百家樂）｜與 server.py 相容
+"""蒙地卡羅耗損近似。
+
+這份模組僅在擁有充足 CPU 資源時才建議啟用，因為完整的
+``predict`` 會跑上萬局模擬。Render 免費環境預設仍使用
+`bgs.pfilter` 內的輕量 OutcomePF，只保留此檔以供進階實驗者
+在資源允許的情況下切換。
+"""
+
 # Author: 親愛的 x GPT-5 Thinking
 
 from __future__ import annotations
@@ -207,11 +214,24 @@ class DepleteMC:
 
         tot = int(wins.sum())
         if tot == 0:
-            return np.array([0.45, 0.45, 0.10], dtype=np.float32)
+            return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)  # 修正為標準百家樂理論值
 
         p = wins.astype(np.float64) / float(tot)
         # 綁定和局到合理區間，避免極端估計
-        p[2] = float(np.clip(p[2], 0.06, 0.20))
+        p[2] = float(np.clip(p[2], 0.06, 0.12))  # 縮小和局範圍
+        p = p / p.sum()
+        
+        # 確保莊閒機率不會過度偏斜，加入平衡機制
+        bp_ratio = p[0] / p[1] if p[1] > 0 else 1.0
+        if bp_ratio > 1.15:  # 莊機率過高
+            adjustment = (bp_ratio - 1.0) * 0.3
+            p[0] -= adjustment * 0.5
+            p[1] += adjustment * 0.5
+        elif bp_ratio < 0.87:  # 閒機率過高
+            adjustment = (1.0 - bp_ratio) * 0.3
+            p[0] += adjustment * 0.5
+            p[1] -= adjustment * 0.5
+            
         p = p / p.sum()
         return p.astype(np.float32)
 
@@ -259,7 +279,19 @@ class OutcomePF:
         alpha = self.win_counts + self.dirichlet_eps
         base = alpha / alpha.sum()
 
-        # 3) 混合，避免過度自信：MC 為主、外部Count為輔
+        # 3) 混合，避免過度自信：MC 為主、外部Count為輔，但加入平衡機制
         out = 0.75 * mc_proba + 0.25 * base
+        out = out / out.sum()
+        
+        # 最終平衡檢查：確保莊閒機率不會極端偏斜
+        if out[0] > 0.55:  # 莊機率過高
+            adjustment = (out[0] - 0.5) * 0.4
+            out[0] -= adjustment
+            out[1] += adjustment
+        elif out[1] > 0.55:  # 閒機率過高
+            adjustment = (out[1] - 0.5) * 0.4
+            out[1] -= adjustment
+            out[0] += adjustment
+            
         out = out / out.sum()
         return out.astype(np.float32)
