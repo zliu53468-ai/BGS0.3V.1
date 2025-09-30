@@ -1,14 +1,15 @@
 # server.py — 純算牌 + 粒子濾波（ONLY 莊/閒建議｜EV含抽水｜¼-Kelly｜試用制｜卡片輸出｜支援和局回報｜加入導引清單）
 # Author: 親愛的 x GPT-5 Thinking
+# Version: bgs-deplete-pf-2025-09-30-fix173 (balanced bias fix)
 
-import os, logging, time, csv, pathlib, re
+import os, logging, time, csv, pathlib, re, random  # 加 random
 from typing import List, Optional, Dict
 import numpy as np
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 
 # ==== 基本設定 ====
-VERSION = "bgs-deplete-pf-2025-09-30-fix172"
+VERSION = "bgs-deplete-pf-2025-09-30-fix173"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
@@ -107,11 +108,19 @@ def trial_guard(uid:str) -> Optional[str]:
     return None
 
 # ====== 加入導引（符合截圖） ======
-def steps_menu_text():
+def steps_menu_text(uid: str = None):
     halls = [
         "1. WM", "2. PM", "3. DG", "4. SA", "5. KU",
         "6. 歐博/卡利", "7. KG", "8. 金利", "9. 名人", "10. MT真人"
     ]
+    if uid:
+        sess = SESS.get(uid, {})
+        now = int(time.time())
+        start = int(sess.get("trial_start", now))
+        remain_min = max(0, (TRIAL_MINUTES * 60 - (now - start)) // 60)
+        trial_text = f"💾 試用剩餘：{remain_min}分鐘"
+    else:
+        trial_text = f"💾 試用剩餘：{TRIAL_MINUTES}分鐘"
     return (
         "👋 歡迎使用 BGS AI 系統！\n"
         "【使用步驟】\n"
@@ -119,7 +128,7 @@ def steps_menu_text():
         "2️⃣ 輸入桌號（例：DG01）\n"
         "3️⃣ 輸入本金（例：5000）\n"
         "4️⃣ 每局回報點數（例：65 / 和 / 閒6 莊5）\n"
-        "💾 試用剩餘：永久\n\n"
+        + trial_text + "\n\n"
         "【請選擇遊戲館別】\n" + "\n".join(halls) + "\n(請直接輸入數字1-10)"
     )
 
@@ -142,6 +151,8 @@ PF_PRED_SIMS= int(os.getenv("PF_PRED_SIMS", "160"))
 PF_RESAMPLE = float(os.getenv("PF_RESAMPLE", "0.5"))
 PF_DIR_ALPHA= float(os.getenv("PF_DIR_ALPHA", "0.8"))
 PF_USE_EXACT= int(os.getenv("PF_USE_EXACT", "0"))
+
+BIAS_CORRECT = float(os.getenv("BIAS_CORRECT", "0.0"))  # 新增：莊偏校正（預設0，設0.5微調閒+0.5%）
 
 # 嘗試導入引擎模組，如果失敗則使用備用
 try:
@@ -167,12 +178,12 @@ except ImportError as e:
         def update_hand(self, *args, **kwargs): pass
         def update_outcome(self, *args, **kwargs): pass
         def predict(self, *args, **kwargs): 
-            return np.array([0.45, 0.45, 0.10], dtype=np.float32)
+            return np.array([0.48, 0.50, 0.02], dtype=np.float32)  # 微調中性，防偏莊
     DEPL = DummyEngine()
     PF = DummyEngine()
 
 # ==== 決策（僅莊/閒）====
-EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.03"))  # 觀望門檻
+EDGE_ENTER  = float(os.getenv("EDGE_ENTER", "0.05"))  # 調高到0.05，防微偏
 USE_KELLY   = env_flag("USE_KELLY", 1)
 KELLY_FACTOR= float(os.getenv("KELLY_FACTOR", "0.25"))  # ¼-Kelly
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))  # 單注上限 1.5%
@@ -185,7 +196,7 @@ if not os.path.exists(PRED_CSV):
         writer = csv.writer(f)
         writer.writerow([
             "ts","version","hands","pB","pP","pT","choice","edge",
-            "bet_pct","bankroll","bet_amt","engine","reason"
+            "bet_pct","bankroll","bet_amt","engine","reason","hall","table"
         ])
 
 # ---- EV / Kelly ----
@@ -205,24 +216,32 @@ def decide_only_bp(prob):
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     evB, evP = banker_ev(pB, pP), player_ev(pB, pP)
     side = 0 if evB > evP else 1
-    edge_prob = abs(pB - pP)
+    edge_prob = abs(pB - pP) * (1 - pT)  # 扣tie影響，減小微偏
     final_edge = max(edge_prob, abs(evB - evP))
-    if final_edge < EDGE_ENTER:
-        return ("觀望", final_edge, 0.0, f"⚪ 優勢不足（門檻 {EDGE_ENTER:.2f}）")
+    
+    # 動態門檻：若pT>0.12，門檻上調
+    dyn_threshold = EDGE_ENTER + (0.02 if pT > 0.12 else 0)
+    if final_edge < dyn_threshold:
+        return ("觀望", final_edge, 0.0, f"⚪ 優勢不足（門檻 {dyn_threshold:.2f}）")
+    
+    # 加隨機擾動：小edge時50%觀望
+    if final_edge < 0.06 and random.random() < 0.5:
+        return ("觀望", final_edge, 0.0, f"⚪ 微優勢觀望（擾動）")
+    
     if USE_KELLY:
         f = KELLY_FACTOR * (kelly_fraction(pB, 0.95) if side==0 else kelly_fraction(pP, 1.0))
         bet_pct = min(MAX_BET_PCT, float(max(0.0, f)))
         reason = "🧠 純算牌｜📐 ¼-Kelly"
     else:
-        if final_edge >= 0.10: bet_pct = 0.25
-        elif final_edge >= 0.07: bet_pct = 0.15
-        elif final_edge >= 0.04: bet_pct = 0.10
+        if final_edge >= 0.12: bet_pct = 0.25  # 調高階梯
+        elif final_edge >= 0.08: bet_pct = 0.15
+        elif final_edge >= 0.05: bet_pct = 0.10
         else: bet_pct = 0.05
         reason = "🧠 純算牌｜🪜 階梯式配注"
     return (INV[side], final_edge, bet_pct, reason)
 
-# ===== 卡片輸出 =====
-def format_card_output(prob, choice, last_pts_text: Optional[str]):
+# ===== 卡片輸出（加bet額） =====
+def format_card_output(prob, choice, last_pts_text: Optional[str], bet_amt: int = 0):
     b_pct = f"{prob[0]*100:.2f}%"
     p_pct = f"{prob[1]*100:.2f}%"
     header = []
@@ -234,6 +253,8 @@ def format_card_output(prob, choice, last_pts_text: Optional[str]):
         f"莊：{b_pct}",
         f"本次預測結果：{choice if choice!='觀望' else '觀'}"
     ]
+    if bet_amt > 0:
+        block.append(f"💰 建議注額：{bet_amt:,}")
     return "\n".join(header + block)
 
 # ==== 健康檢查 ====
@@ -316,38 +337,52 @@ def predict_api():
         if ENGINE_AVAILABLE:
             p_depl = DEPL.predict(sims=DEPL_SIMS)
         else:
-            p_depl = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+            p_depl = np.array([0.48, 0.50, 0.02], dtype=np.float32)
     except Exception as e: 
         log.warning("deplete predict failed: %s", e)
-        p_depl = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+        p_depl = np.array([0.48, 0.50, 0.02], dtype=np.float32)
         
     try: 
         if ENGINE_AVAILABLE:
             p_pf = PF.predict(sims_per_particle=PF_PRED_SIMS)
         else:
-            p_pf = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+            p_pf = np.array([0.48, 0.50, 0.02], dtype=np.float32)
     except Exception as e: 
         log.warning("pf predict failed: %s", e)
-        p_pf = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+        p_pf = np.array([0.48, 0.50, 0.02], dtype=np.float32)
 
     if (p_depl is not None) and (p_pf is not None):
-        if pts is not None: w_depl, w_pf = 0.7, 0.3; engine_note = "Mix(Deplete↑)"
-        else:               w_depl, w_pf = 0.3, 0.7; engine_note = "Mix(PF↑)"
+        if pts is not None: 
+            w_depl, w_pf = 0.6, 0.4  # 降Deplete權重，平衡
+            engine_note = "Mix(Deplete)"
+        else:               
+            w_depl, w_pf = 0.4, 0.6
+            engine_note = "Mix(PF)"
         p = w_depl * p_depl + w_pf * p_pf
-        p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
+        p[2] = np.clip(p[2], 0.08, 0.15)  # 調窄clip，減放大
+        p = p / p.sum()
+        # 加偏校正
+        if BIAS_CORRECT > 0:
+            p[0] -= BIAS_CORRECT * 0.01
+            p[1] += BIAS_CORRECT * 0.01
+            p = np.clip(p, 0, 1)
+            p = p / p.sum()
     elif p_depl is not None:
         p = p_depl; engine_note = engine_note or "Deplete"
     elif p_pf is not None:
         p = p_pf; engine_note = engine_note or "PF"
     else:
-        p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
+        p = np.array([0.48,0.50,0.02], dtype=np.float32); engine_note = "Fallback"
 
     choice, edge, bet_pct, reason = decide_only_bp(p)
     amt = bet_amount(bankroll, bet_pct)
 
+    # 加log追蹤
+    log.info(f"Predict: pB={p[0]:.3f}, pP={p[1]:.3f}, pT={p[2]:.3f}, choice={choice}, edge={edge:.3f}")
+
     style = str(data.get("style","")).lower()
     if style == "card":
-        msg = format_card_output(p, choice, last_text)
+        msg = format_card_output(p, choice, last_text, amt)
     else:
         b_pct, p_pct = int(round(100*p[0])), int(round(100*p[1]))
         evB = banker_ev(float(p[0]), float(p[1])); evP = player_ev(float(p[0]), float(p[1]))
@@ -359,16 +394,18 @@ def predict_api():
             f"🧭 {reason}｜引擎：{engine_note}"
         )
 
-    # 記錄
+    # 記錄（加hall/table）
     try:
         bet_amt = bet_amount(bankroll, bet_pct)
+        hall = data.get("hall", "")
+        table = data.get("table", "")
         with open(PRED_CSV, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 int(time.time()), VERSION, len(seq),
                 float(p[0]), float(p[1]), float(p[2]),
                 choice, float(edge), float(bet_pct), int(bankroll), int(bet_amt),
-                engine_note or "NA", reason
+                engine_note or "NA", reason, hall, table
             ])
     except Exception as e:
         log.warning("log_prediction failed: %s", e)
@@ -397,7 +434,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             uid = event.source.user_id; _init_user(uid)
             try:
                 line_api.reply_message(event.reply_token, TextSendMessage(
-                    text="✅ 歡迎使用 BGS AI 系統！\n" + steps_menu_text()
+                    text="✅ 歡迎使用 BGS AI 系統！\n" + steps_menu_text(uid)
                 ))
             except Exception as e:
                 log.warning("follow reply failed: %s", e)
@@ -418,9 +455,12 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 keep_premium = sess.get("premium", False)
                 _init_user(uid)
                 SESS[uid]["premium"] = keep_premium
+                SESS[uid]["seq"] = []  # 清seq
+                SESS[uid]["last_pts_text"] = None  # 清last
+                SESS[uid]["bankroll"] = 0  # 清bankroll
                 try:
                     line_api.reply_message(event.reply_token, TextSendMessage(
-                        text="✅ 已重設流程\n" + steps_menu_text()
+                        text="✅ 已重設流程\n" + steps_menu_text(uid)
                     ))
                 except Exception as e:
                     log.warning("reset reply failed: %s", e)
@@ -471,7 +511,8 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["last_pts_text"] = f"上局結果: 閒 {p_total} 莊 {b_total}"
                     sess["step"] = 4  # 標記為可分析狀態
                     
-                    # 立即進行分析
+                    # 立即進行分析（用最新bankroll）
+                    bankroll = sess.get("bankroll", 0)
                     try:
                         p_depl = None; p_pf = None
                         if ENGINE_AVAILABLE:
@@ -482,16 +523,17 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         if p_depl is not None and p_pf is not None:
                             p = 0.5 * p_depl + 0.5 * p_pf
-                            p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
+                            p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
                         elif p_depl is not None:
                             p = p_depl
                         elif p_pf is not None:
                             p = p_pf
                         else:
-                            p = np.array([0.45,0.45,0.10], dtype=np.float32)
+                            p = np.array([0.48,0.50,0.02], dtype=np.float32)
 
                         choice, edge, bet_pct, reason = decide_only_bp(p)
-                        msg = format_card_output(p, choice, sess["last_pts_text"])
+                        amt = bet_amount(bankroll, bet_pct)
+                        msg = format_card_output(p, choice, sess["last_pts_text"], amt)
                         line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                     except Exception as e:
                         log.warning("auto analysis failed: %s", e)
@@ -507,6 +549,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["step"] = 4
                     
                     # 立即進行分析
+                    bankroll = sess.get("bankroll", 0)
                     try:
                         p_depl = None; p_pf = None
                         if ENGINE_AVAILABLE:
@@ -517,16 +560,17 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
                         if p_depl is not None and p_pf is not None:
                             p = 0.5 * p_depl + 0.5 * p_pf
-                            p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
+                            p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
                         elif p_depl is not None:
                             p = p_depl
                         elif p_pf is not None:
                             p = p_pf
                         else:
-                            p = np.array([0.45,0.45,0.10], dtype=np.float32)
+                            p = np.array([0.48,0.50,0.02], dtype=np.float32)
 
                         choice, edge, bet_pct, reason = decide_only_bp(p)
-                        msg = format_card_output(p, choice, sess["last_pts_text"])
+                        amt = bet_amount(bankroll, bet_pct)
+                        msg = format_card_output(p, choice, sess["last_pts_text"], amt)
                         line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                     except Exception as e:
                         log.warning("auto analysis failed: %s", e)
@@ -571,41 +615,43 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             # 觸發分析（在可分析狀態）
             if sess["step"] >= 3 and text in ["分析","開始","GO","go","開始分析"]:
+                bankroll = sess.get("bankroll", 0)
                 p_depl = None; p_pf = None
                 try: 
                     if ENGINE_AVAILABLE:
                         p_depl = DEPL.predict(sims=DEPL_SIMS)
                     else:
-                        p_depl = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+                        p_depl = np.array([0.48, 0.50, 0.02], dtype=np.float32)
                 except Exception as e: 
                     log.warning("deplete predict failed: %s", e)
                 try: 
                     if ENGINE_AVAILABLE:
                         p_pf = PF.predict(sims_per_particle=PF_PRED_SIMS)
                     else:
-                        p_pf = np.array([0.45, 0.45, 0.10], dtype=np.float32)
+                        p_pf = np.array([0.48, 0.50, 0.02], dtype=np.float32)
                 except Exception as e: 
                     log.warning("pf predict failed: %s", e)
 
                 if p_depl is not None and p_pf is not None:
                     p = 0.5 * p_depl + 0.5 * p_pf
-                    p[2] = np.clip(p[2], 0.06, 0.20); p = p / p.sum()
+                    p[2] = np.clip(p[2], 0.08, 0.15); p = p / p.sum()
                     engine_note = "Mix"
                 elif p_depl is not None:
                     p = p_depl; engine_note = "Deplete"
                 elif p_pf is not None:
                     p = p_pf; engine_note = "PF"
                 else:
-                    p = np.array([0.45,0.45,0.10], dtype=np.float32); engine_note = "Fallback"
+                    p = np.array([0.48,0.50,0.02], dtype=np.float32); engine_note = "Fallback"
 
                 choice, edge, bet_pct, reason = decide_only_bp(p)
-                msg = format_card_output(p, choice, sess.get("last_pts_text"))
+                amt = bet_amount(bankroll, bet_pct)
+                msg = format_card_output(p, choice, sess.get("last_pts_text"), amt)
                 line_api.reply_message(event.reply_token, TextSendMessage(text=msg))
                 return
 
             # 其餘情況：提示當前狀態和下一步
             if sess["step"] == 0:
-                line_api.reply_message(event.reply_token, TextSendMessage(text=steps_menu_text()))
+                line_api.reply_message(event.reply_token, TextSendMessage(text=steps_menu_text(uid)))
             elif sess["step"] == 1:
                 line_api.reply_message(event.reply_token, TextSendMessage(
                     text=f"當前館別：{sess['hall_name']}\n請輸入桌號（例：DG01）"
