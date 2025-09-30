@@ -1,139 +1,159 @@
-# bgs/pfilter.py — 修正版粒子濾波器
-"""修正版粒子濾波器，確保環境變數能正確生效，優化趨勢偏見"""
-
-from __future__ import annotations
-
-import random
-from dataclasses import dataclass
-from typing import List
-
+### bgs/pfilter.py
+```python
+import os
 import numpy as np
+from typing import Any, List, Tuple
 
-@dataclass
-class Particle:
-    p: np.ndarray
-    w: float
+# Environment-configurable parameters
+PF_RESAMPLE = float(os.getenv("PF_RESAMPLE", "0.3"))  # 重採樣門檻
+PF_DIR_EPS   = float(os.getenv("PF_DIR_EPS",   "0.1"))  # Dirichlet 平滑參數
+PF_N         = int(os.getenv("PF_N",             "120"))  # 粒子數量
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    v = np.clip(v, 1e-12, None)
-    s = float(v.sum())
-    return (v / s) if s > 0 else np.array([1/3, 1/3, 1/3], dtype=v.dtype)
-
-class OutcomePF:
-    """
-    與 server.py 相容的粒子濾波器
-    """
-    def __init__(
-        self,
-        decks: int = 8,
-        seed: int = 42,
-        n_particles: int = 200,
-        sims_lik: int = 80,
-        resample_thr: float = 0.5,
-        backend: str = "mc",
-        dirichlet_eps: float = 0.01,
-        **kwargs,
-    ) -> None:
-        self.decks = int(decks)
-        self.backend = str(backend).lower()
-        self.rng = np.random.default_rng(int(seed))
-        random.seed(int(seed))
-
-        self.n = int(n_particles)
-        self.n_particles = self.n
-        self.sims_lik = int(sims_lik)
-        self.resample_thr = float(resample_thr)
-        self.alpha0 = max(1e-6, float(dirichlet_eps))
-
-        self.counts = np.zeros(3, dtype=np.float64)
-        self.outcome_history = []
-        self.max_history = 50
-        self.streak_count = 0
+class ParticleFilter:
+    def __init__(self, n: int = PF_N):
+        self.n = n
+        self.particles = self.sample_from_prior_batch()
+        self.weights = np.ones(n) / n
+        self.round_count = 0
         self.last_outcome = None
+        self.streak_count = 0
 
-        self.particles: List[Particle] = []
-        base_prior = [self.alpha0] * 3
-        for _ in range(self.n):
-            p = self.rng.dirichlet(base_prior).astype(np.float64)
-            self.particles.append(Particle(p=p, w=1.0 / self.n))
+    def sample_from_prior(self) -> int:
+        # 假設均勻先驗：0=莊,1=閒,2=和
+        return np.random.choice([0,1,2])
 
-    def update_outcome(self, outcome: int) -> None:
-        if outcome not in (0, 1, 2):
-            return
-            
+    def sample_from_prior_batch(self) -> np.ndarray:
+        return np.random.choice([0,1,2], size=self.n)
+
+    def _normalize_weights(self):
+        total = np.sum(self.weights)
+        if total > 0:
+            self.weights /= total
+
+    def _resample(self):
+        indices = np.random.choice(self.n, p=self.weights, size=self.n)
+        self.particles = self.particles[indices]
+        self.weights = np.ones(self.n) / self.n
+
+    def update(self, outcome: int):
         # 更新連勝計數
-        if outcome == self.last_outcome and outcome in (0, 1):
+        if outcome == self.last_outcome and outcome in (0,1):
             self.streak_count += 1
         else:
-            self.streak_count = 1 if outcome in (0, 1) else 0
+            self.streak_count = 0
         self.last_outcome = outcome
-            
-        self.outcome_history.append(outcome)
-        if len(self.outcome_history) > self.max_history:
-            self.outcome_history.pop(0)
-            
-        self.counts[outcome] += 1.0
 
-        w = np.fromiter((max(1e-12, pt.p[outcome]) for pt in self.particles), 
-                        dtype=np.float64, count=self.n)
-        w_sum = float(w.sum())
-        w = (w / w_sum) if w_sum > 0 else np.full(self.n, 1.0 / self.n, dtype=np.float64)
+        # 權重更新 (示意)
+        likelihood = np.where(self.particles == outcome, 1.0, PF_DIR_EPS)
+        self.weights *= likelihood
+        self._normalize_weights()
 
-        for i, weight in enumerate(w):
-            self.particles[i].w = float(weight)
-
-        ess = 1.0 / float((w ** 2).sum())
-        if ess / self.n < self.resample_thr:
+        # 計算 ESS
+        ess = 1.0 / np.sum(self.weights**2)
+        if ess / self.n < PF_RESAMPLE:
             self._resample()
 
-        alpha_base = self.alpha0 + self.counts
-        for particle in self.particles:
-            particle.p = self.rng.dirichlet(alpha_base).astype(np.float64)
+        # 隨機重啟機制：每隔 10 局，重置 20% 粒子
+        self.round_count += 1
+        if self.round_count % 10 == 0:
+            num_rej = int(self.n * 0.2)
+            idx = np.random.choice(self.n, num_rej, replace=False)
+            for i in idx:
+                self.particles[i] = self.sample_from_prior()
+            self._normalize_weights()
 
-    def _resample(self) -> None:
-        weights = np.array([particle.w for particle in self.particles], dtype=np.float64)
-        total = float(weights.sum())
-        if total <= 0:
-            weights.fill(1.0 / self.n)
-        else:
-            weights /= total
-        
-        indices = self._systematic_resample(weights)
-        new_particles = []
-        for i in indices:
-            new_particles.append(Particle(p=self.particles[i].p.copy(), w=1.0 / self.n))
-        self.particles = new_particles
+    def predict(self) -> Tuple[float, float, float]:
+        # 根據權重統計概率
+        probs = []
+        for outcome in [0,1,2]:
+            mask = self.particles == outcome
+            probs.append(np.sum(self.weights[mask]))
+        return tuple(probs)
+```  
 
-    def _systematic_resample(self, weights: np.ndarray) -> np.ndarray:
-        n = len(weights)
-        positions = (np.arange(n) + self.rng.random()) / n
-        cumulative_sum = np.cumsum(weights)
-        cumulative_sum[-1] = 1.0
-        return np.searchsorted(cumulative_sum, positions)
+### deplete.py
+```python
+import numpy as np
+from dataclasses import dataclass
 
-    def predict(self, sims_per_particle: int = 0) -> np.ndarray:
-        ps = np.stack([particle.p for particle in self.particles], axis=0)
-        ws = np.array([particle.w for particle in self.particles], dtype=np.float64)
-        ws = ws / max(1e-12, float(ws.sum()))
-        mix = (ps * ws[:, None]).sum(axis=0)
+# Monte Carlo deplete 模組示意
+@dataclass
+class DepleteMC:
+    counts: np.ndarray
+    rng: np.random.Generator
+    trials: int = 1000  # 增加到 1000
 
-        theoretical_base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float64)
-        
-        total_obs = float(self.counts.sum())
-        if total_obs < 20 or self.streak_count >= 5:
-            mix_weight = 0.2
-        else:
-            mix_weight = 0.5
-            
-        out = mix_weight * mix + (1 - mix_weight) * theoretical_base
-        out = _normalize(out)
-            
-        return out.astype(np.float32)
+    def simulate(self) -> None:
+        # 直接示意：隨機取樣 outcomes
+        outcomes = np.random.choice([0,1,2], size=self.trials)
+        success = np.sum(outcomes != -1) or 1
+        exp_usage = np.zeros_like(self.counts, dtype=float)
+        # ... 填入真實模擬邏輯 ...
+        # 保留更多隨機性，只扣 50%
+        usage = (exp_usage / success) * 0.5
+        self.counts = np.maximum(0, self.counts - usage)
+```  
 
-    @property
-    def sims_lik(self) -> int:
-        return self._sims_lik
+### server.py
+```python
+import os
+import math
+from flask import Flask, request, jsonify
+from bgs.pfilter import ParticleFilter
+from deplete import DepleteMC
 
-    @sims_lik.setter
-    def sims_lik(self, value: int):
-        self._sims_lik = value
+app = Flask(__name__)
+
+# 平滑與趨勢懲罰設定
+SMOOTH_ALPHA = float(os.getenv("SMOOTH_ALPHA", "0.4"))
+THEO_ALPHA   = float(os.getenv("THEO_ALPHA",   "0.6"))
+STREAK_THRESH = int(os.getenv("STREAK_THRESH", "2"))
+STREAK_PENALTY = float(os.getenv("STREAK_PENALTY", "0.08"))
+HOUSE_EDGE = float(os.getenv("HOUSE_EDGE", "0.010"))  # 1%
+
+pf = ParticleFilter()
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.json or {}
+    last_outcome = data.get('last_outcome')  # 0,1,2
+    pf.update(last_outcome)
+
+    # 粒子濾波器理論概率
+    pred_probs = pf.predict()
+    # 假設固定理論概率
+    theo_probs = (0.4585, 0.4463, 0.0952)
+
+    # 平滑混合
+    smoothed = tuple(
+        SMOOTH_ALPHA * p + THEO_ALPHA * t for p, t in zip(pred_probs, theo_probs)
+    )
+
+    # 計算 EV 並扣趨勢懲罰
+    evB = smoothed[0] - HOUSE_EDGE
+    evP = smoothed[1]
+    if pf.last_outcome == 0 and pf.streak_count >= STREAK_THRESH:
+        evB -= STREAK_PENALTY
+    if pf.last_outcome == 1 and pf.streak_count >= STREAK_THRESH:
+        evP -= STREAK_PENALTY
+
+    # 決策
+    if evB > evP and evB > 0:
+        decision = 'BANKER'
+    elif evP > evB and evP > 0:
+        decision = 'PLAYER'
+    else:
+        decision = 'PASS'
+
+    return jsonify({
+        'pred_probs': pred_probs,
+        'smoothed_probs': smoothed,
+        'evB': evB,
+        'evP': evP,
+        'decision': decision,
+        'streak_count': pf.streak_count
+    })
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
