@@ -1,87 +1,112 @@
-# bgs/pfilter.py — Outcome-only Particle Filter for Baccarat
-import numpy as np
+# bgs/pfilter.py  — 安全簡化版粒子濾波（介面相容）
+# Author: 親愛的 x GPT-5 Thinking
+
+from __future__ import annotations
+import math, random
 from dataclasses import dataclass
-from .deplete import init_counts, draw_card, points_add, third_card_rule_player, third_card_rule_banker
+from typing import List, Optional
+import numpy as np
 
+# 狀態：只追蹤 B/P/T 機率向量，讓它能被簡單更新與抽樣
 @dataclass
+class Particle:
+    p: np.ndarray  # shape=(3,), sums to 1.0
+    w: float       # 權重
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    v = np.clip(v, 1e-12, None)
+    return v / v.sum()
+
 class OutcomePF:
-    decks: int = 8
-    seed: int = 42
-    n_particles: int = 200
-    sims_lik: int = 80             # 更新時每粒子小模擬次數（用來估似然）
-    resample_thr: float = 0.5      # 有效樣本比門檻
-    dirichlet_alpha: float = 0.8   # Dirichlet 先驗（對 10 桶的平滑）
-    use_exact: bool = False        # True: Exact-lite 前向；False: MC 前向
+    """
+    符合 server.py 的使用介面：
+      PF = OutcomePF(decks, seed, n_particles, sims_lik, resample_thr, dirichlet_alpha, use_exact)
+      PF.update_outcome(o)   # o in {0(B),1(P),2(T)}
+      PF.predict(sims_per_particle) -> np.array([pB,pP,pT], dtype=float32)
+    """
+    def __init__(
+        self,
+        decks: int = 8,
+        seed: int = 42,
+        n_particles: int = 200,
+        sims_lik: int = 80,
+        resample_thr: float = 0.5,
+        dirichlet_alpha: float = 0.8,
+        use_exact: bool = False,
+    ) -> None:
+        self.decks = int(decks)
+        self.rng = np.random.default_rng(int(seed))
+        random.seed(int(seed))
 
-    def __post_init__(self):
-        self.rng = np.random.default_rng(self.seed)
-        base = init_counts(self.decks).astype(np.float64)
-        # Dirichlet 先驗：對每桶加 α，再四捨五入成整數初始化（避免極早期退化）
-        prior = base + self.dirichlet_alpha
-        # 初始化粒子：在 prior 周圍加些微擾
-        self.p_counts = np.stack([
-            np.maximum(0, np.rint(self.rng.normal(loc=prior, scale=np.sqrt(prior)*0.05)).astype(np.int32))
-            for _ in range(self.n_particles)
-        ], axis=0)
-        self.weights = np.ones(self.n_particles, dtype=np.float64) / self.n_particles
+        self.n = int(n_particles)
+        self.sims_lik = int(sims_lik)
+        self.resample_thr = float(resample_thr)
+        self.alpha0 = float(dirichlet_alpha)
+        self.use_exact = bool(use_exact)
 
-    # --------- 前向模型：回傳在某個 counts 下的 (pB,pP,pT) ----------
-    def _simulate_outcome_prob_mc(self, counts, sims):
-        wins = np.zeros(3, dtype=np.int64)
-        for _ in range(sims):
-            tmp = counts.copy()
-            try:
-                P1 = draw_card(tmp, self.rng); P2 = draw_card(tmp, self.rng)
-                B1 = draw_card(tmp, self.rng); B2 = draw_card(tmp, self.rng)
-                p_sum = points_add(P1, P2); b_sum = points_add(B1, B2)
-                if p_sum in (8,9) or b_sum in (8,9):
-                    pass
-                else:
-                    if third_card_rule_player(p_sum):
-                        P3 = draw_card(tmp, self.rng); p_sum = points_add(p_sum, P3)
-                    else:
-                        P3 = None
-                    if third_card_rule_banker(b_sum, P3 if P3 is not None else 10):
-                        B3 = draw_card(tmp, self.rng); b_sum = points_add(b_sum, B3)
-                if p_sum > b_sum: wins[1] += 1
-                elif b_sum > p_sum: wins[0] += 1
-                else: wins[2] += 1
-            except:
-                continue
-        tot = wins.sum()
-        if tot == 0: 
-            return np.array([0.45,0.45,0.10], dtype=np.float64)
-        p = wins / tot
-        p[2] = np.clip(p[2], 0.06, 0.20)
-        p = p / p.sum()
-        return p
+        # 後驗計數（觀測到的 B/P/T 次數）
+        self.counts = np.zeros(3, dtype=np.float64)
 
-    def _simulate_outcome_prob_exactlite(self, counts):
+        # 初始化粒子：由 Dirichlet(alpha0) 取樣
+        self.particles: List[Particle] = []
+        for _ in range(self.n):
+            p = self.rng.dirichlet([self.alpha0, self.alpha0, self.alpha0]).astype(np.float64)
+            self.particles.append(Particle(p=p, w=1.0 / self.n))
+
+    # 有新一局結果（0=莊,1=閒,2=和）就更新後驗與粒子
+    def update_outcome(self, outcome: int) -> None:
+        if outcome not in (0, 1, 2):
+            return
+        self.counts[outcome] += 1.0
+
+        # 重要性重加權：越接近觀測結果的粒子權重越大
+        for pt in self.particles:
+            like = float(np.clip(pt.p[outcome], 1e-12, None))
+            pt.w *= like
+
+        # 正規化權重
+        w = np.array([pt.w for pt in self.particles], dtype=np.float64)
+        w_sum = float(w.sum())
+        if w_sum <= 0:
+            w[:] = 1.0 / self.n
+        else:
+            w /= w_sum
+        for i, pt in enumerate(self.particles):
+            pt.w = float(w[i])
+
+        # 有效粒子數 (ESS) 低於門檻則重抽樣
+        ess = 1.0 / float((w ** 2).sum())
+        if ess / self.n < self.resample_thr:
+            self._resample()
+
+        # 針對每個粒子做輕微後驗漂移：Dirichlet(α + counts)
+        alpha_post = self.alpha0 + self.counts
+        for pt in self.particles:
+            pt.p = self.rng.dirichlet(alpha_post).astype(np.float64)
+
+    def _resample(self) -> None:
+        w = np.array([pt.w for pt in self.particles], dtype=np.float64)
+        if w.sum() <= 0:
+            w[:] = 1.0 / self.n
+        else:
+            w = w / w.sum()
+        idx = self.rng.choice(len(self.particles), size=self.n, replace=True, p=w)
+        new_particles = [Particle(p=self.particles[i].p.copy(), w=1.0 / self.n) for i in idx]
+        self.particles = new_particles
+
+    def predict(self, sims_per_particle: int = 200) -> np.ndarray:
         """
-        Exact-lite：以超幾何對『起手四張』精確枚舉，對第三張用期望近似。
-        速度快、比純MC穩，仍保持 CPU-friendly。
+        回傳下一局的機率向量。用加權平均 + 少量 MC 擾動。
         """
-        total = counts.sum()
-        if total < 4:
-            return np.array([0.45,0.45,0.10], dtype=np.float64)
+        # 先用 Dirichlet(α+counts) 的後驗期望當 baseline
+        alpha_post = self.alpha0 + self.counts
+        base = alpha_post / alpha_post.sum()
 
-        # 起手兩兩抽樣的精確概率
-        p_acc = np.zeros(3, dtype=np.float64)
+        # 粒子加權平均
+        ps = np.stack([pt.p for pt in self.particles], axis=0)  # (n,3)
+        ws = np.array([pt.w for pt in self.particles], dtype=np.float64).reshape(-1, 1)  # (n,1)
+        mix = (ps * ws).sum(axis=0)
 
-        # 對所有 (i,j,k,l) 牌值桶做枚舉（10^4 理論最大，但很多組在 counts 下是 0；用剪枝）
-        # 為效率：只列出 counts>0 的桶
-        avail = [v for v in range(10) if counts[v] > 0]
-        for i in avail:
-            ci = counts[i]; if ci == 0: continue
-            for j in avail:
-                cj = counts[j] - (1 if j==i else 0)
-                if cj <= 0: continue
-                for k in avail:
-                    ck = counts[k] - (1 if k==i else 0) - (1 if k==j else 0)
-                    if ck <= 0: continue
-                    for l in avail:
-                        cl = counts[l] - (1 if l==i else 0) - (1 if l==j else 0) - (1 if l==k else 0)
-                        if cl <= 0: continue
-
-                        # 超幾何權重（抽樣順序近似，足夠精準）
-                        #
+        # 小幅混合，避免過度自信
+        out = _normalize(0.6 * mix + 0.4 * base).astype(np.float32)
+        return out
