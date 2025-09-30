@@ -330,9 +330,9 @@ if OutcomePF:
             dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
         )
         log.info(
-            "PF 初始化成功: n_particles=%d, sims_lik=%d (backend=%s)",
-            PF.n_particles,
-            getattr(PF, "sims_lik", 0),
+            "PF 初始化成功: n_particles=%s, sims_lik=%s (backend=%s)",
+            getattr(PF, "n_particles", "-"),
+            getattr(PF, "sims_lik", "-"),
             getattr(PF, "backend", "unknown"),
         )
     except Exception as _e:
@@ -347,7 +347,7 @@ if not OutcomePF:
 
         def predict(self, **kwargs):
             log.info("DummyPF 預測")
-            return np.array([0.48, 0.47, 0.05], dtype=np.float32)
+            return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)  # 修正為標準百家樂理論值
 
         @property
         def backend(self):
@@ -377,30 +377,68 @@ def bet_amount(bankroll: int, pct: float) -> int:
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     """根據閒、莊機率，決定下注方向與邊際與下注比例。"""
     pB, pP = float(prob[0]), float(prob[1])
+    
+    # 平衡檢查：如果機率過度偏斜，強制調整
+    if abs(pB - pP) > 0.15:  # 機率差超過15%
+        # 向理論值靠攏
+        theoretical_ratio = 0.4586 / 0.4462  # 標準百家樂莊閒比
+        current_ratio = pB / pP if pP > 0 else 1.0
+        if current_ratio > theoretical_ratio * 1.3:
+            adjustment = (current_ratio - theoretical_ratio) * 0.3
+            pB -= adjustment * 0.5
+            pP += adjustment * 0.5
+        elif current_ratio < theoretical_ratio * 0.7:
+            adjustment = (theoretical_ratio - current_ratio) * 0.3
+            pB += adjustment * 0.5
+            pP -= adjustment * 0.5
+        
+        # 重新正規化
+        total_bp = pB + pP
+        pB = pB / total_bp * (1 - prob[2])
+        pP = pP / total_bp * (1 - prob[2])
+    
     evB, evP = 0.95 * pB - pP, pP - pB
+    
+    # 防止過度頻繁下注：提高進入門檻
+    effective_edge_enter = max(EDGE_ENTER, 0.025)  # 至少2.5%優勢
+    
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
-    if final_edge < EDGE_ENTER:
+    
+    if final_edge < effective_edge_enter:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
+    
+    # 動態調整Kelly因子：優勢越大，因子越小（更保守）
+    dynamic_kelly = KELLY_FACTOR
+    if final_edge > 0.08:
+        dynamic_kelly = KELLY_FACTOR * 0.5
+    elif final_edge > 0.05:
+        dynamic_kelly = KELLY_FACTOR * 0.7
+    
     if USE_KELLY:
         if side == 0:
             b = 0.95
-            f = KELLY_FACTOR * ((pB * b - (1 - pB)) / b)
+            f = dynamic_kelly * ((pB * b - (1 - pB)) / b)
         else:
             b = 1.0
-            f = KELLY_FACTOR * ((pP * b - (1 - pP)) / b)
-        bet_pct = min(MAX_BET_PCT, max(0.0, float(f)))
-        reason = "¼-Kelly"
+            f = dynamic_kelly * ((pP * b - (1 - pP)) / b)
+        
+        # 更保守的下注上限
+        conservative_max = min(MAX_BET_PCT, 0.01)  # 最多1%本金
+        bet_pct = min(conservative_max, max(0.0, float(f)))
+        reason = f"動態Kelly(因子={dynamic_kelly})"
     else:
+        # 階梯式配注，更保守的設定
         if final_edge >= 0.10:
-            bet_pct = 0.25
+            bet_pct = 0.015
         elif final_edge >= 0.07:
-            bet_pct = 0.15
+            bet_pct = 0.010
         elif final_edge >= 0.04:
-            bet_pct = 0.10
+            bet_pct = 0.007
         else:
-            bet_pct = 0.05
-        reason = "階梯式配注"
+            bet_pct = 0.005
+        reason = "保守階梯式配注"
+    
     return (INV[side], final_edge, bet_pct, reason)
 
 
@@ -412,11 +450,21 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
+    
+    # 顯示平衡狀態
+    balance_status = ""
+    bp_diff = abs(prob[0] - prob[1])
+    if bp_diff < 0.02:
+        balance_status = " (平衡)"
+    elif bp_diff > 0.08:
+        balance_status = " (偏斜)"
+    
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
         f"莊：{b_pct_txt}",
-        f"本次預測結果：{choice if choice != '觀望' else '觀'}",
+        f"和：{prob[2] * 100:.2f}%",
+        f"本次預測結果：{choice}{balance_status}",
         f"建議下注：{bet_amt:,}",
     ]
     if cont:
