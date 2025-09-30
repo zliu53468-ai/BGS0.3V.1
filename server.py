@@ -1,11 +1,5 @@
 """
-server.py — 連續模式修正版（Render 優化版）
-
-針對 Render 免費版資源限制進行優化：
-  - 強制設置輕量級粒子過濾器參數
-  - 添加詳細診斷日誌
-  - 優化錯誤處理防止卡死
-  - 備用 Dummy 模式確保基本功能
+server.py — 最終修正版（移除所有硬編碼限制）
 """
 
 import os
@@ -17,9 +11,7 @@ import json
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
-# Optional imports for optional dependencies.  Render free plans may not
-# have redis or Flask installed.  Wrap the imports in try/except blocks
-# and fall back to dummy objects when unavailable.
+
 try:
     import redis  # type: ignore
 except Exception:
@@ -38,33 +30,21 @@ except Exception:
     def abort(*args, **kwargs):  # type: ignore
         raise RuntimeError("Flask is not available; abort cannot be used.")
     def CORS(app):  # type: ignore
-        # no‑op when Flask is absent
         return None
 
-
 # 版本號
-VERSION = "bgs-pf-render-optimized-2025-09-17"
+VERSION = "bgs-final-fixed-2025-09-17"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 
-
 # ---------- Flask 初始化 ----------
 if _flask_available and Flask is not None:
-    # Initialise a real Flask application when Flask is installed
     app = Flask(__name__)
     CORS(app)
 else:
-    # Provide a dummy app object so that decorators do not raise
     class _DummyApp:
-        """Fallback for when Flask is not available.
-
-        Methods ``get`` and ``post`` return a decorator that simply
-        returns the wrapped function unchanged, allowing route
-        definitions to execute without a real server.  The ``run``
-        method logs a warning instead of starting a server.
-        """
         def get(self, *args, **kwargs):  # type: ignore
             def _decorator(func):
                 return func
@@ -80,7 +60,6 @@ else:
 
     app = _DummyApp()
 
-
 # ---------- Redis 或記憶體 Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
 redis_client: Optional["redis.Redis"] = None  # type: ignore
@@ -89,45 +68,36 @@ if redis is not None and REDIS_URL:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         log.info("Successfully connected to Redis.")
     except Exception as e:
-        # Fall back to in‑memory sessions if Redis connection fails
         redis_client = None
         log.error("Failed to connect to Redis: %s. Using in-memory session.", e)
 else:
-    # Either redis is not available or no URL provided
     if redis is None:
         log.warning("redis module not available; using in-memory session store.")
     elif not REDIS_URL:
         log.warning("REDIS_URL not set. Using in-memory session store.")
 
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
-SESSION_EXPIRE_SECONDS = 3600  # 1 小時
-DEDUPE_TTL = 60  # 相同事件去重秒數
-
+SESSION_EXPIRE_SECONDS = 3600
+DEDUPE_TTL = 60
 
 def _rget(k: str) -> Optional[str]:
-    """從 Redis 取值，失敗時回傳 None。"""
     try:
         return redis_client.get(k) if redis_client else None
     except Exception as e:
         log.warning("[Redis] GET err: %s", e)
         return None
 
-
 def _rset(k: str, v: str, ex: Optional[int] = None):
-    """設定 Redis 的值，選擇性設定過期時間。"""
     try:
         if redis_client:
             redis_client.set(k, v, ex=ex)
     except Exception as e:
         log.warning("[Redis] SET err: %s", e)
 
-
 def _rsetnx(k: str, v: str, ex: int) -> bool:
-    """只在鍵不存在時設定值，並設定過期時間；失敗或例外回 True 避免阻擋。"""
     try:
         if redis_client:
             return bool(redis_client.set(k, v, ex=ex, nx=True))
-        # fallback 模式下，若已存在則回 False
         if k in SESS_FALLBACK:
             return False
         SESS_FALLBACK[k] = {"v": v, "exp": time.time() + ex}
@@ -136,10 +106,7 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
         log.warning("[Redis] SETNX err: %s", e)
         return True
 
-
 def get_session(uid: str) -> Dict[str, Any]:
-    """取得或建立使用者 session。"""
-    # 先嘗試從 Redis 讀取
     if redis_client:
         j = _rget(f"bgs_session:{uid}")
         if j:
@@ -148,7 +115,6 @@ def get_session(uid: str) -> Dict[str, Any]:
             except Exception:
                 pass
     else:
-        # 清理過期的 fallback sessions
         now = time.time()
         for k in list(SESS_FALLBACK.keys()):
             v = SESS_FALLBACK.get(k)
@@ -156,7 +122,6 @@ def get_session(uid: str) -> Dict[str, Any]:
                 del SESS_FALLBACK[k]
         if uid in SESS_FALLBACK and "phase" in SESS_FALLBACK[uid]:
             return SESS_FALLBACK[uid]
-    # 新建 session
     nowi = int(time.time())
     return {
         "bankroll": 0,
@@ -169,17 +134,13 @@ def get_session(uid: str) -> Dict[str, Any]:
         "table_no": None,
     }
 
-
 def save_session(uid: str, data: Dict[str, Any]):
-    """儲存 session 至 Redis 或 fallback。"""
     if redis_client:
         _rset(f"bgs_session:{uid}", json.dumps(data), ex=SESSION_EXPIRE_SECONDS)
     else:
         SESS_FALLBACK[uid] = data
 
-
 def env_flag(name: str, default: int = 1) -> int:
-    """解析環境變數為布林 flag。"""
     val = os.getenv(name)
     if val is None:
         return 1 if default else 0
@@ -193,31 +154,21 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception:
         return 1 if default else 0
 
-
 # ---------- 解析上局點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
-    """
-    將輸入文字解析為上一局點數 (P_total, B_total)。
-    """
     if not text:
         return None
-    # 將全形數字與冒號替換為半形
     s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
-    # 移除零寬字元、BOM 與換行符號等控制字元
     s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
-    # 將全形空白 (\u3000) 轉為半形空白，避免影響正則匹配
     s = s.replace("\u3000", " ")
     u = s.upper().strip()
-    # 剝掉前綴『開始分析』，支援「開始分析47」這類輸入
     u = re.sub(r"^開始分析", "", u)
 
-    # 1) 判斷和局（TIE/DRAW/和9 這類）
     m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
     if m:
         d = m.group(1)
         return (int(d), int(d)) if d else (0, 0)
 
-    # 2) 閒/莊格式：支援繁體/簡體以及 B/P 縮寫
     m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
     if m:
         return (int(m.group(1)), int(m.group(2)))
@@ -225,8 +176,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if m:
         return (int(m.group(2)), int(m.group(1)))
 
-    # 3) 單字母快速回報（莊/閒/和），支援繁簡
-    # 移除所有半形與全形空白後判斷
     t = u.replace(" ", "").replace("\u3000", "")
     if t in ("B", "莊", "庄"):
         return (0, 1)
@@ -235,215 +184,186 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if t in ("T", "和"):
         return (0, 0)
 
-    # 4) 若包含英文字母（A-Z），視為桌號或其他指令，不解析為點數
     if re.search(r"[A-Z]", u):
         return None
 
-    # 5) 最後僅在輸入中恰好包含兩個數字時，視為點數 (先閒後莊)
     digits = re.findall(r"\d", u)
     if len(digits) == 2:
         return (int(digits[0]), int(digits[1]))
     return None
-
 
 # ---------- 試用/授權 ----------
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
-
 def validate_activation_code(code: str) -> bool:
-    """驗證管理員提供的開通密碼。"""
     if not code:
         return False
-    # 全形空白與冒號替換為半形
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
 
-
 def trial_left_minutes(sess: Dict[str, Any]) -> int:
-    """計算試用剩餘分鐘。若已開通 premium，回傳極大值。"""
     if sess.get("premium", False):
         return 9999
     now = int(time.time())
     used = (now - int(sess.get("trial_start", now))) // 60
     return max(0, TRIAL_MINUTES - used)
 
-
 def trial_guard(sess: Dict[str, Any]) -> Optional[str]:
-    """若試用已過期且未開通 premium，回傳警告文字。"""
     if sess.get("premium", False):
         return None
     if trial_left_minutes(sess) <= 0:
         return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
     return None
 
-
-try:
-    log.info("Activation secret loaded? %s (len=%d)", bool(ADMIN_ACTIVATION_SECRET), len(ADMIN_ACTIVATION_SECRET))
-except Exception:
-    pass
-
-
 # ---------- Outcome PF (粒子過濾器) ----------
-# 強制設置輕量級參數（針對 Render 免費版優化）
-os.environ['PF_N'] = '30'
-os.environ['PF_UPD_SIMS'] = '20'
-os.environ['PF_PRED_SIMS'] = '0'
-os.environ['DECKS'] = '6'
+# 重要修正：移除所有硬編碼參數覆蓋，完全使用環境變數
+log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s", 
+         os.getenv("PF_N", "100"), os.getenv("PF_UPD_SIMS", "50"), 
+         os.getenv("PF_PRED_SIMS", "10"), os.getenv("DECKS", "6"))
 
-# Default backend to Monte‑Carlo to greatly reduce computational burden on
-# resource‑constrained platforms.  If a caller explicitly sets
-# ``PF_BACKEND`` in the environment it will override this value.
+# 只設置後端類型，不覆蓋其他參數
 if not os.getenv('PF_BACKEND'):
     os.environ['PF_BACKEND'] = 'mc'
+    log.info("設置預設 PF_BACKEND=mc")
 
-log.info("強制設置 PF 參數: PF_N=30, PF_UPD_SIMS=20, PF_PRED_SIMS=0, DECKS=6")
+# 嘗試導入 OutcomePF
+OutcomePF = None
+PF = None
+pf_initialized = False
 
 try:
-    # Attempt to import OutcomePF from the ``bgs`` package first
-    from bgs.pfilter import OutcomePF  # type: ignore
-except Exception:
+    # 優先嘗試從 bgs.pfilter 導入
+    from bgs.pfilter import OutcomePF as RealOutcomePF
+    OutcomePF = RealOutcomePF
+    log.info("成功從 bgs.pfilter 導入 OutcomePF")
+except Exception as e:
     try:
-        # Fallback to a local ``pfilter`` module located in the same
-        # directory as this file.  When running outside of a package
-        # context, add the current directory to ``sys.path`` so that
-        # ``import pfilter`` resolves correctly.
+        # 備用：從本地 pfilter 導入
         _cur_dir = os.path.dirname(os.path.abspath(__file__))
         if _cur_dir not in sys.path:
             sys.path.insert(0, _cur_dir)
-        from pfilter import OutcomePF  # type: ignore
-        log.info("Imported OutcomePF from local pfilter module.")
-    except Exception as _pf_exc:
-        OutcomePF = None  # type: ignore
-        log.error("Could not import OutcomePF: %s", _pf_exc)
+        from pfilter import OutcomePF as LocalOutcomePF
+        OutcomePF = LocalOutcomePF
+        log.info("成功從本地 pfilter 導入 OutcomePF")
+    except Exception as pf_exc:
+        log.error("無法導入 OutcomePF: %s", pf_exc)
+        OutcomePF = None
 
+# 初始化 PF
 if OutcomePF:
     try:
+        # 完全使用環境變數，不進行任何硬編碼覆蓋
         PF = OutcomePF(
             decks=int(os.getenv("DECKS", "6")),
             seed=int(os.getenv("SEED", "42")),
-            n_particles=int(os.getenv("PF_N", "30")),
-            sims_lik=max(1, int(os.getenv("PF_UPD_SIMS", "20"))),
+            n_particles=int(os.getenv("PF_N", "100")),
+            sims_lik=int(os.getenv("PF_UPD_SIMS", "50")),
             resample_thr=float(os.getenv("PF_RESAMPLE", "0.6")),
             backend=os.getenv("PF_BACKEND", "mc").lower(),
             dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.003")),
         )
+        pf_initialized = True
         log.info(
-            "PF 初始化成功: n_particles=%s, sims_lik=%s (backend=%s)",
-            getattr(PF, "n_particles", "-"),
-            getattr(PF, "sims_lik", "-"),
-            getattr(PF, "backend", "unknown"),
+            "PF 初始化成功: n_particles=%s, sims_lik=%s, decks=%s (backend=%s)",
+            PF.n_particles,
+            getattr(PF, 'sims_lik', 'N/A'),
+            getattr(PF, 'decks', 'N/A'), 
+            getattr(PF, 'backend', 'unknown'),
         )
-    except Exception as _e:
-        log.error("Failed to initialise OutcomePF: %s", _e)
+    except Exception as e:
+        log.error("PF 初始化失敗: %s", e)
+        pf_initialized = False
         OutcomePF = None
 
-if not OutcomePF:
-    # Provide a minimal dummy PF implementation as a safety net
-    class DummyPF:
+# 改進的 DummyPF - 不再使用固定 48/47/5
+if not pf_initialized:
+    class SmartDummyPF:
+        """智能備援 PF，避免固定輸出問題"""
+        def __init__(self):
+            self.win_counts = np.array([0.0, 0.0, 0.0])
+            self.total_games = 0
+            log.warning("使用 SmartDummyPF 備援模式 - 請檢查 OutcomePF 導入問題")
+            
         def update_outcome(self, outcome):
-            log.info("DummyPF 更新: %s", outcome)
+            if outcome in (0, 1, 2):
+                self.win_counts[outcome] += 1.0
+                self.total_games += 1
+                log.info("SmartDummyPF 更新: outcome=%s, total_games=%s", outcome, self.total_games)
 
         def predict(self, **kwargs):
-            log.info("DummyPF 預測")
-            return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)  # 修正為標準百家樂理論值
+            if self.total_games == 0:
+                # 無歷史數據時使用理論值
+                base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+            else:
+                # 有歷史數據時基於實際勝率
+                base = self.win_counts / self.total_games
+                # 加入少量平滑避免極端值
+                base = 0.7 * base + 0.3 * np.array([0.4586, 0.4462, 0.0952])
+                base = base / base.sum()
+                
+            log.info("SmartDummyPF 預測: %s (基於 %s 場歷史)", base, self.total_games)
+            return base.astype(np.float32)
 
         @property
         def backend(self):
-            return "dummy"
+            return "smart-dummy"
 
-    PF = DummyPF()
-    log.info("使用 DummyPF 模式")
-
+    PF = SmartDummyPF()
+    log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.025"))
 USE_KELLY = env_flag("USE_KELLY", 1)
-KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.25"))
-MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.015"))
-CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)  # 1=連續模式；0=舊流程
+KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.3"))
+MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.02"))
+CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
-INV = {0: "莊", 1: "閒"}  # 添加缺失的 INV 映射
-
+INV = {0: "莊", 1: "閒"}
 
 def bet_amount(bankroll: int, pct: float) -> int:
-    """依本金與比例計算下注金額。"""
     if not bankroll or bankroll <= 0 or pct <= 0:
         return 0
     return int(round(bankroll * pct))
 
-
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
-    """根據閒、莊機率，決定下注方向與邊際與下注比例。"""
     pB, pP = float(prob[0]), float(prob[1])
     
-    # 平衡檢查：如果機率過度偏斜，強制調整
-    if abs(pB - pP) > 0.15:  # 機率差超過15%
-        # 向理論值靠攏
-        theoretical_ratio = 0.4586 / 0.4462  # 標準百家樂莊閒比
-        current_ratio = pB / pP if pP > 0 else 1.0
-        if current_ratio > theoretical_ratio * 1.3:
-            adjustment = (current_ratio - theoretical_ratio) * 0.3
-            pB -= adjustment * 0.5
-            pP += adjustment * 0.5
-        elif current_ratio < theoretical_ratio * 0.7:
-            adjustment = (theoretical_ratio - current_ratio) * 0.3
-            pB += adjustment * 0.5
-            pP -= adjustment * 0.5
-        
-        # 重新正規化
-        total_bp = pB + pP
-        pB = pB / total_bp * (1 - prob[2])
-        pP = pP / total_bp * (1 - prob[2])
-    
     evB, evP = 0.95 * pB - pP, pP - pB
-    
-    # 防止過度頻繁下注：提高進入門檻
-    effective_edge_enter = max(EDGE_ENTER, 0.025)  # 至少2.5%優勢
     
     side = 0 if evB > evP else 1
     final_edge = max(abs(evB), abs(evP))
     
-    if final_edge < effective_edge_enter:
+    if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
-    
-    # 動態調整Kelly因子：優勢越大，因子越小（更保守）
-    dynamic_kelly = KELLY_FACTOR
-    if final_edge > 0.08:
-        dynamic_kelly = KELLY_FACTOR * 0.5
-    elif final_edge > 0.05:
-        dynamic_kelly = KELLY_FACTOR * 0.7
     
     if USE_KELLY:
         if side == 0:
             b = 0.95
-            f = dynamic_kelly * ((pB * b - (1 - pB)) / b)
+            f = KELLY_FACTOR * ((pB * b - (1 - pB)) / b)
         else:
             b = 1.0
-            f = dynamic_kelly * ((pP * b - (1 - pP)) / b)
+            f = KELLY_FACTOR * ((pP * b - (1 - pP)) / b)
         
-        # 更保守的下注上限
-        conservative_max = min(MAX_BET_PCT, 0.01)  # 最多1%本金
-        bet_pct = min(conservative_max, max(0.0, float(f)))
-        reason = f"動態Kelly(因子={dynamic_kelly})"
+        bet_pct = min(MAX_BET_PCT, max(0.001, float(f)))
+        reason = f"Kelly配注(因子={KELLY_FACTOR})"
     else:
-        # 階梯式配注，更保守的設定
         if final_edge >= 0.10:
-            bet_pct = 0.015
+            bet_pct = 0.020
         elif final_edge >= 0.07:
+            bet_pct = 0.015
+        elif final_edge >= 0.05:
             bet_pct = 0.010
-        elif final_edge >= 0.04:
+        elif final_edge >= 0.03:
             bet_pct = 0.007
         else:
             bet_pct = 0.005
-        reason = "保守階梯式配注"
+        reason = "階梯式配注"
     
     return (INV[side], final_edge, bet_pct, reason)
 
-
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
-    """組合回覆文字。"""
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
     header: list[str] = []
@@ -451,26 +371,17 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         header.append(last_pts_text)
     header.append("開始分析下局....")
     
-    # 顯示平衡狀態
-    balance_status = ""
-    bp_diff = abs(prob[0] - prob[1])
-    if bp_diff < 0.02:
-        balance_status = " (平衡)"
-    elif bp_diff > 0.08:
-        balance_status = " (偏斜)"
-    
     block = [
         "【預測結果】",
         f"閒：{p_pct_txt}",
         f"莊：{b_pct_txt}",
         f"和：{prob[2] * 100:.2f}%",
-        f"本次預測結果：{choice}{balance_status}",
+        f"本次預測結果：{choice}",
         f"建議下注：{bet_amt:,}",
     ]
     if cont:
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
-
 
 # ---------- 健康檢查路由 ----------
 @app.get("/")
@@ -478,18 +389,27 @@ def root():
     ua = request.headers.get("User-Agent", "")
     if "UptimeRobot" in ua:
         return "OK", 200
-    return f"✅ BGS PF Server OK ({VERSION})", 200
-
+    status = "OK" if pf_initialized else "BACKUP_MODE"
+    return f"✅ BGS Server {status} ({VERSION})", 200
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, ts=time.time(), version=VERSION), 200
-
+    return jsonify(
+        ok=True, 
+        ts=time.time(), 
+        version=VERSION,
+        pf_initialized=pf_initialized,
+        pf_backend=getattr(PF, 'backend', 'unknown')
+    ), 200
 
 @app.get("/healthz")
 def healthz():
-    return jsonify(ok=True, ts=time.time(), version=VERSION), 200
-
+    return jsonify(
+        ok=True, 
+        ts=time.time(), 
+        version=VERSION,
+        pf_initialized=pf_initialized
+    ), 200
 
 # ---------- LINE Bot ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -498,18 +418,9 @@ line_api = None
 line_handler = None
 
 GAMES = {
-    "1": "WM",
-    "2": "PM",
-    "3": "DG",
-    "4": "SA",
-    "5": "KU",
-    "6": "歐博/卡利",
-    "7": "KG",
-    "8": "全利",
-    "9": "名人",
-    "10": "MT真人",
+    "1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU",
+    "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人",
 }
-
 
 def game_menu_text(left_min: int) -> str:
     lines = ["【請選擇遊戲館別】"]
@@ -518,7 +429,6 @@ def game_menu_text(left_min: int) -> str:
     lines.append("「請直接輸入數字選擇」")
     lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
     return "\n".join(lines)
-
 
 def _quick_buttons():
     try:
@@ -536,7 +446,6 @@ def _quick_buttons():
     except Exception:
         return None
 
-
 def _reply(token: str, text: str):
     from linebot.models import TextSendMessage
     try:
@@ -544,20 +453,15 @@ def _reply(token: str, text: str):
     except Exception as e:
         log.warning("[LINE] reply failed: %s", e)
 
-
 def _dedupe_event(event_id: Optional[str]) -> bool:
-    """避免處理重覆事件（LINE 會重送）。"""
     if not event_id:
         return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
-
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
-    """在連續模式或人工模式中處理點數並預測下一局。"""
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
     start_time = time.time()
     
-    # 更新上一局結果
     if p_pts == b_pts:
         sess["last_pts_text"] = "上局結果: 和局"
         try:
@@ -575,11 +479,10 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         except Exception as e:
             log.warning("PF update err: %s", e)
     
-    # 做預測
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
-        p = PF.predict(sims_per_particle=max(0, int(os.getenv("PF_PRED_SIMS", "0"))))
+        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "10")))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
         
         choice, edge, bet_pct, reason = decide_only_bp(p)
@@ -594,10 +497,8 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         log.error("預測過程中錯誤: %s", e)
         _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
     
-    # 若為連續模式，保持在 await_pts 狀態，方便下一局直接輸入點數
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
-
 
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
@@ -626,13 +527,11 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 return
             uid = event.source.user_id
             raw = (event.message.text or "")
-            # 將全形空白變半形並合併多個空白為一個
             text = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
             sess = get_session(uid)
             try:
                 log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
 
-                # --- 開通指令優先處理 ---
                 up = text.upper()
                 if up.startswith("開通") or up.startswith("ACTIVATE"):
                     after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
@@ -642,16 +541,13 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
-                # --- 試用守門 ---
                 guard = trial_guard(sess)
                 if guard:
                     _reply(event.reply_token, guard)
                     return
 
-                # --- 點數輸入：連續模式下，在任何階段先嘗試解析點數 ---
                 pts = parse_last_hand_points(raw)
                 if pts is not None:
-                    # 若尚未設定本金，提示先完成設定
                     if not sess.get("bankroll"):
                         _reply(event.reply_token, "請先完成『遊戲設定』與『本金設定』（例如輸入 5000），再回報點數。")
                         save_session(uid, sess)
@@ -660,7 +556,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
-                # --- 遊戲設定流程入口 ---
                 if up in ("遊戲設定", "設定", "SETUP", "GAME"):
                     sess["phase"] = "choose_game"
                     left = trial_left_minutes(sess)
@@ -676,7 +571,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 phase = sess.get("phase", "choose_game")
 
                 if phase == "choose_game":
-                    # 選擇館別
                     if re.fullmatch(r"([1-9]|10)", text):
                         sess["game"] = GAMES[text]
                         sess["phase"] = "choose_table"
@@ -685,7 +579,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         return
 
                 elif phase == "choose_table":
-                    # 設定桌號：格式為 2 英文 + 2 數字
                     t = re.sub(r"\s+", "", text).upper()
                     if re.fullmatch(r"[A-Z]{2}\d{2}", t):
                         sess["table"] = t
@@ -698,7 +591,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         return
 
                 elif phase == "await_bankroll":
-                    # 設定本金
                     if text.isdigit() and int(text) > 0:
                         sess["bankroll"] = int(text)
                         sess["phase"] = "await_pts"
@@ -712,7 +604,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         _reply(event.reply_token, "❌ 金額格式錯誤，請直接輸入正整數（例如: 5000）")
                         return
 
-                # --- 兼容舊流程：開始分析XY ---
                 norm = raw.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
                 norm = re.sub(r"\s+", "", norm)
                 m_ka = re.fullmatch(r"開始分析(\d)(\d)", norm)
@@ -721,7 +612,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
-                # --- 結束分析 / RESET ---
                 if up in ("結束分析", "清空", "RESET"):
                     premium = sess.get("premium", False)
                     start_ts = sess.get("trial_start", int(time.time()))
@@ -732,7 +622,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
-                # --- Fallback 提示 ---
                 _reply(
                     event.reply_token,
                     "指令無法辨識。\n📌 已啟用連續模式：直接輸入點數即可（例：65 / 和 / 閒6莊5）。\n或輸入『遊戲設定』。",
@@ -762,9 +651,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 else:
     log.warning("LINE credentials not set. LINE webhook will not be active.")
 
-
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s)", VERSION, port, CONTINUOUS_MODE)
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)", 
+             VERSION, port, CONTINUOUS_MODE, pf_initialized)
     app.run(host="0.0.0.0", port=port, debug=False)
