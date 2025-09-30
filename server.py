@@ -1,5 +1,10 @@
+# -*- coding: utf-8 -*-
 """
 server.py — 最終修正版（減少趨勢追隨，信心度5%-40%本金投注，優化Render免費版）
+【本次改動】
+- SMOOTH_ALPHA 0.7→0.4、THEO_ALPHA 0.3→0.6（平滑權重改為 0.4 * pred + 0.6 * theo）
+- STREAK_THRESH 3→2、STREAK_PENALTY 0.03→0.08（趨勢懲罰門檻降到 2 局、懲罰幅度 8%）
+其餘設定不變，可直接覆蓋。
 """
 
 import os
@@ -33,7 +38,14 @@ except Exception:
         return None
 
 # 版本號
-VERSION = "bgs-final-fixed-2025-10-01-antitrend-v2"
+VERSION = "bgs-final-fixed-2025-10-01-antitrend-v3"
+
+# ====== 新增常數（依照需求調整） ======
+SMOOTH_ALPHA = 0.4   # 來自模型的預測權重
+THEO_ALPHA   = 0.6   # 理論機率權重
+STREAK_THRESH  = 2   # 連勝門檻（含）
+STREAK_PENALTY = 0.08  # 超過門檻時對該方EV施加的懲罰
+# ======================================
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -315,17 +327,17 @@ def bet_amount(bankroll: int, pct: float) -> int:
     return int(round(bankroll * pct))
 
 def decide_only_bp(prob: np.ndarray, streak_count: int, last_outcome: Optional[int]) -> Tuple[str, float, float, str]:
-    # 平滑機率以減少趨勢偏見
+    # 平滑機率（改為 0.4 * pred + 0.6 * theo）
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     theo_probs = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)  # 百家樂理論機率
-    smoothed_probs = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo_probs
+    smoothed_probs = SMOOTH_ALPHA * np.array([pB, pP, pT]) + THEO_ALPHA * theo_probs
     smoothed_probs = smoothed_probs / smoothed_probs.sum()  # 重新正規化
     pB, pP = smoothed_probs[0], smoothed_probs[1]
 
     evB, evP = 0.95 * pB - pP, pP - pB
 
-    # 連勝檢測：3局以上降低EV，減少趨勢追隨
-    streak_adjust = 0.03 if streak_count >= 3 and last_outcome is not None else 0.0
+    # 連勝檢測：>= STREAK_THRESH 局對該方EV施加 STREAK_PENALTY 懲罰
+    streak_adjust = STREAK_PENALTY if streak_count >= STREAK_THRESH and last_outcome is not None else 0.0
     if last_outcome == 0:
         evB -= streak_adjust
     elif last_outcome == 1:
@@ -346,6 +358,7 @@ def decide_only_bp(prob: np.ndarray, streak_count: int, last_outcome: Optional[i
     reason = f"信心度配注({min_bet_pct*100:.0f}%~{max_bet_pct*100:.0f}%)"
 
     return (INV[side], final_edge, bet_pct, reason)
+
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
@@ -414,6 +427,7 @@ def game_menu_text(left_min: int) -> str:
     lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
     return "\n".join(lines)
 
+
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
@@ -430,6 +444,7 @@ def _quick_buttons():
     except Exception:
         return None
 
+
 def _reply(token: str, text: str):
     from linebot.models import TextSendMessage
     try:
@@ -437,10 +452,12 @@ def _reply(token: str, text: str):
     except Exception as e:
         log.warning("[LINE] reply failed: %s", e)
 
+
 def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id:
         return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
+
 
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
     log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
@@ -485,6 +502,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
 
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
+
 
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
