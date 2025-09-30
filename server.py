@@ -284,35 +284,75 @@ if OutcomePF:
         OutcomePF = None
 
 if not pf_initialized:
-    class SmartDummyPF:
-        def __init__(self):
-            self.win_counts = np.array([0.0, 0.0, 0.0])
-            self.total_games = 0
-            log.warning("使用 SmartDummyPF 備援模式 - 請檢查 OutcomePF 導入問題")
+    # 內建輕量 Dirichlet 濾波器，避免缺檔時落回過於陽春的 Dummy
+    import numpy as _np
 
-        def update_outcome(self, outcome):
-            if outcome in (0, 1, 2):
-                self.win_counts[outcome] += 1.0
-                self.total_games += 1
-                log.info("SmartDummyPF 更新: outcome=%s, total_games=%s", outcome, self.total_games)
-
-        def predict(self, **kwargs):
-            if self.total_games == 0:
-                base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            else:
-                base = self.win_counts / self.total_games
-                base = 0.7 * base + 0.3 * np.array([0.4586, 0.4462, 0.0952])
-                base = base / base.sum()
-
-            log.info("SmartDummyPF 預測: %s (基於 %s 場歷史)", base, self.total_games)
-            return base.astype(np.float32)
+    class DirichletLitePF:
+        def __init__(self, dirichlet_eps: float = 0.05, backend: str = "mc", **kwargs):
+            self._backend = f"dirichlet-lite({str(backend)})"
+            prior_strength = max(1.0, 100.0 * float(dirichlet_eps))
+            self.alpha = _np.array([0.4586, 0.4462, 0.0952], dtype=_np.float64) * prior_strength
+            self.total = float(self.alpha.sum())
+            # 與 server.py 預期屬性名相容
+            self.n_particles = int(kwargs.get("n_particles", 50))
+            self.decks = int(kwargs.get("decks", 8))
 
         @property
-        def backend(self):
-            return "smart-dummy"
+        def backend(self) -> str:
+            return self._backend
 
-    PF = SmartDummyPF()
-    log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
+        def update_outcome(self, outcome: int):
+            if outcome not in (0, 1, 2):
+                return
+            self.alpha[outcome] += 1.0
+            self.total += 1.0
+            self.alpha = _np.maximum(self.alpha * 0.995, 1e-6)  # 輕度衰減
+            self.total = float(self.alpha.sum())
+
+        def predict(self, sims_per_particle: int = 5):
+            probs = self.alpha / self.alpha.sum()
+            pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2])
+            # 夾緊和局機率
+            pT = float(_np.clip(pT, 0.01, 0.25))
+            scale = (1.0 - pT) / (pB + pP + 1e-12)
+            pB *= scale; pP *= scale
+            out = _np.array([pB, pP, pT], dtype=_np.float32)
+            out /= out.sum()
+            return out
+
+    # 若前述 OutcomePF 失敗，使用 DirichletLitePF；若再失敗才用 SmartDummy
+    try:
+        PF = DirichletLitePF(
+            decks=int(os.getenv("DECKS", "8")),
+            n_particles=int(os.getenv("PF_N", "50")),
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05")),
+            backend=os.getenv("PF_BACKEND", "mc").lower(),
+        )
+        pf_initialized = True
+        log.warning("PF 初始化失敗，改用內建 DirichletLitePF 備援模式")
+    except Exception as _e:
+        log.warning("DirichletLitePF 也啟動失敗：%s，最後改用 SmartDummyPF", _e)
+        class SmartDummyPF:
+            def __init__(self):
+                self.win_counts = _np.array([0.0, 0.0, 0.0])
+                self.total_games = 0
+            def update_outcome(self, outcome):
+                if outcome in (0, 1, 2):
+                    self.win_counts[outcome] += 1.0
+                    self.total_games += 1
+            def predict(self, **kwargs):
+                if self.total_games == 0:
+                    base = _np.array([0.4586, 0.4462, 0.0952], dtype=_np.float32)
+                else:
+                    base = self.win_counts / self.total_games
+                    base = 0.7 * base + 0.3 * _np.array([0.4586, 0.4462, 0.0952])
+                    base = base / base.sum()
+                return base.astype(_np.float32)
+            @property
+            def backend(self):
+                return "smart-dummy"
+        PF = SmartDummyPF()
+        log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.05"))
