@@ -1,3 +1,3 @@
-# bgs/__init__.py
-__all__ = ["pfilter", "deplete"]
-__version__ = "0.1.0"
+# -*- coding: utf-8 -*-
+# 讓 bgs 成為可匯入套件
+__all__ = ["pfilter"]
