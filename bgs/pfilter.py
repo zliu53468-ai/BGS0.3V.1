@@ -1,106 +1,129 @@
-# bgs/pfilter.py — 安全簡化版粒子濾波（介面相容 server.py）
+"""OutcomePF fallback匯出模組。
+
+在標準情境下，`server.py` 會從 :mod:`bgs.pfilter` 匯入真正的
+`OutcomePF` 粒子濾波器；但若部署環境無法把 `bgs` 套件放到
+`sys.path`（或是以單檔啟動），就會退回到本地的 `pfilter.py`。
+
+之前的版本只是一層 re-export，遇到上述情況仍然會匯入失敗，最後
+觸發 `DummyPF`，導致預測永遠是固定的 48%/47%/5%。為了讓備援生效，
+這裡在 re-export 失敗時會直接提供一份純粹的 `OutcomePF`
+實作，介面與 `bgs.pfilter.OutcomePF` 完全相容。
+"""
 from __future__ import annotations
-import random
-from dataclasses import dataclass
-from typing import List
-import numpy as np
 
-@dataclass
-class Particle:
-    p: np.ndarray   # shape=(3,), sum to 1
-    w: float        # weight
+from typing import TYPE_CHECKING
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    v = np.clip(v, 1e-12, None)
-    s = float(v.sum())
-    return (v / s) if s > 0 else np.array([1/3, 1/3, 1/3], dtype=v.dtype)
+try:  # 優先使用套件版本，功能完整且與 bgs 內部模組共用狀態
+    from bgs.pfilter import OutcomePF as _OutcomePF  # type: ignore
+except Exception:  # pragma: no cover - 僅在部署環境缺少 bgs 套件時觸發
+    import random
+    from dataclasses import dataclass
+    from typing import List
 
-class OutcomePF:
-    """
-    與 server.py 相容的介面：
-      OutcomePF(decks, seed, n_particles, sims_lik, resample_thr,
-                backend='mc', dirichlet_eps=0.003, **kwargs)
-      update_outcome(outcome)     # outcome ∈ {0(B),1(P),2(T)}
-      predict(sims_per_particle)  # 回傳 np.array([pB,pP,pT], dtype=float32)
-      backend 屬性（供 log 顯示）
-    """
-    def __init__(
-        self,
-        decks: int = 8,
-        seed: int = 42,
-        n_particles: int = 200,
-        sims_lik: int = 80,
-        resample_thr: float = 0.5,
-        backend: str = "mc",
-        dirichlet_eps: float = 0.003,
-        **kwargs,
-    ) -> None:
-        # 基本參數
-        self.decks = int(decks)                    # 目前未使用，保留相容
-        self.backend = str(backend).lower()        # 僅供紀錄/除錯
-        self.rng = np.random.default_rng(int(seed))
-        random.seed(int(seed))
+    import numpy as np
 
-        self.n = int(n_particles)
-        self.sims_lik = int(sims_lik)
-        self.resample_thr = float(resample_thr)
+    @dataclass
+    class _Particle:
+        p: np.ndarray  # shape=(3,), sum=1
+        w: float
 
-        # 把 server 傳入的 dirichlet_eps 直接當成 prior 濃度用（小=更發散）
-        self.alpha0 = max(1e-6, float(dirichlet_eps))
+    def _normalize(vec: np.ndarray) -> np.ndarray:
+        vec = np.clip(vec, 1e-12, None)
+        total = float(vec.sum())
+        if total <= 0:
+            return np.array([1 / 3, 1 / 3, 1 / 3], dtype=vec.dtype)
+        return vec / total
 
-        # 後驗計數（觀測到的 B/P/T 次數）
-        self.counts = np.zeros(3, dtype=np.float64)
+    class _OutcomePF:
+        """精簡版粒子濾波實作，介面與原版完全一致。"""
 
-        # 初始化粒子：Dirichlet(alpha0) 取樣
-        self.particles: List[Particle] = []
-        for _ in range(self.n):
-            p = self.rng.dirichlet([self.alpha0, self.alpha0, self.alpha0]).astype(np.float64)
-            self.particles.append(Particle(p=p, w=1.0 / self.n))
+        def __init__(
+            self,
+            decks: int = 8,
+            seed: int = 42,
+            n_particles: int = 200,
+            sims_lik: int = 80,
+            resample_thr: float = 0.5,
+            backend: str = "mc",
+            dirichlet_eps: float = 0.003,
+            **kwargs,
+        ) -> None:
+            self.decks = int(decks)
+            self.backend = str(backend).lower()
+            self.rng = np.random.default_rng(int(seed))
+            random.seed(int(seed))
 
-    # 新一局結果（0=莊,1=閒,2=和）
-    def update_outcome(self, outcome: int) -> None:
-        if outcome not in (0, 1, 2):
-            return
-        self.counts[outcome] += 1.0
+            self.n = max(1, int(n_particles))
+            self.n_particles = self.n  # 提供 server.py 所需的屬性
+            self.sims_lik = int(sims_lik)
+            self.resample_thr = float(resample_thr)
+            self.alpha0 = max(1e-6, float(dirichlet_eps))
 
-        # 重要性重加權（likelihood ~ 粒子對該 outcome 的機率）
-        w = np.fromiter((max(1e-12, pt.p[outcome]) for pt in self.particles), dtype=np.float64, count=self.n)
-        w_sum = float(w.sum())
-        w = (w / w_sum) if w_sum > 0 else np.full(self.n, 1.0 / self.n, dtype=np.float64)
-        for i, pt in enumerate(self.particles):
-            pt.w = float(w[i])
+            self.counts = np.zeros(3, dtype=np.float64)
+            self.particles: List[_Particle] = []
+            base_alpha = [self.alpha0] * 3
+            for _ in range(self.n):
+                p = self.rng.dirichlet(base_alpha).astype(np.float64)
+                self.particles.append(_Particle(p=p, w=1.0 / self.n))
 
-        # 有效粒子數 (ESS) 降到門檻以下就重採樣
-        ess = 1.0 / float((w ** 2).sum())
-        if ess / self.n < self.resample_thr:
-            self._resample()
+        def update_outcome(self, outcome: int) -> None:
+            if outcome not in (0, 1, 2):
+                return
+            self.counts[outcome] += 1.0
 
-        # 以 Dirichlet(alpha0 + counts) 重新抽樣每個粒子的機率向量（保守移動）
-        alpha_post = self.alpha0 + self.counts
-        for pt in self.particles:
-            pt.p = self.rng.dirichlet(alpha_post).astype(np.float64)
+            weights = np.fromiter(
+                (max(1e-12, particle.p[outcome]) for particle in self.particles),
+                dtype=np.float64,
+                count=self.n,
+            )
+            total = float(weights.sum())
+            if total > 0:
+                weights /= total
+            else:
+                weights.fill(1.0 / self.n)
 
-    def _resample(self) -> None:
-        w = np.array([pt.w for pt in self.particles], dtype=np.float64)
-        w_sum = float(w.sum())
-        if w_sum <= 0:
-            w = np.full(self.n, 1.0 / self.n, dtype=np.float64)
-        else:
-            w = w / w_sum
-        idx = self.rng.choice(self.n, size=self.n, replace=True, p=w)
-        self.particles = [Particle(p=self.particles[i].p.copy(), w=1.0 / self.n) for i in idx]
+            for particle, w in zip(self.particles, weights):
+                particle.w = float(w)
 
-    def predict(self, sims_per_particle: int = 0) -> np.ndarray:
-        # 後驗 baseline
-        alpha_post = self.alpha0 + self.counts
-        base = alpha_post / alpha_post.sum()
+            ess = 1.0 / float((weights ** 2).sum())
+            if ess / self.n < self.resample_thr:
+                self._resample()
 
-        # 粒子加權平均
-        ps = np.stack([pt.p for pt in self.particles], axis=0)           # (n,3)
-        ws = np.array([pt.w for pt in self.particles], dtype=np.float64) # (n,)
-        ws = ws / max(1e-12, float(ws.sum()))
-        mix = (ps * ws[:, None]).sum(axis=0)
+            alpha_post = self.alpha0 + self.counts
+            for particle in self.particles:
+                particle.p = self.rng.dirichlet(alpha_post).astype(np.float64)
 
-        # 混合 baseline，避免過度自信
-        out = _normalize(0.6 * mix + 0.4 * base).astype(np.float32)
-        return out
+        def _resample(self) -> None:
+            weights = np.array([particle.w for particle in self.particles], dtype=np.float64)
+            total = float(weights.sum())
+            if total <= 0:
+                weights.fill(1.0 / self.n)
+            else:
+                weights /= total
+            idx = self.rng.choice(self.n, size=self.n, replace=True, p=weights)
+            self.particles = [
+                _Particle(p=self.particles[i].p.copy(), w=1.0 / self.n)
+                for i in idx
+            ]
+
+        def predict(self, sims_per_particle: int = 0) -> np.ndarray:
+            alpha_post = self.alpha0 + self.counts
+            base = alpha_post / alpha_post.sum()
+
+            ps = np.stack([particle.p for particle in self.particles], axis=0)
+            ws = np.array([particle.w for particle in self.particles], dtype=np.float64)
+            ws = ws / max(1e-12, float(ws.sum()))
+            mix = (ps * ws[:, None]).sum(axis=0)
+
+            return _normalize(0.6 * mix + 0.4 * base).astype(np.float32)
+
+    OutcomePF = _OutcomePF
+else:  # 匯入成功時直接轉出原版類別
+    OutcomePF = _OutcomePF
+
+if TYPE_CHECKING:  # 僅供型別檢查工具使用
+    from typing import Type as _Type
+
+    _: _Type[_OutcomePF]
+
+__all__ = ["OutcomePF"]
