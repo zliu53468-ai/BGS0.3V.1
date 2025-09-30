@@ -1,5 +1,5 @@
 # bgs/pfilter.py — 修正版粒子濾波器
-"""修正版粒子濾波器，確保環境變數能正確生效"""
+"""修正版粒子濾波器，確保環境變數能正確生效，優化趨勢偏見"""
 
 from __future__ import annotations
 
@@ -31,10 +31,9 @@ class OutcomePF:
         sims_lik: int = 80,
         resample_thr: float = 0.5,
         backend: str = "mc",
-        dirichlet_eps: float = 0.003,
+        dirichlet_eps: float = 0.01,
         **kwargs,
     ) -> None:
-        # 使用傳入的參數，不進行硬編碼覆蓋
         self.decks = int(decks)
         self.backend = str(backend).lower()
         self.rng = np.random.default_rng(int(seed))
@@ -49,8 +48,9 @@ class OutcomePF:
         self.counts = np.zeros(3, dtype=np.float64)
         self.outcome_history = []
         self.max_history = 50
+        self.streak_count = 0
+        self.last_outcome = None
 
-        # 初始化粒子
         self.particles: List[Particle] = []
         base_prior = [self.alpha0] * 3
         for _ in range(self.n):
@@ -61,13 +61,19 @@ class OutcomePF:
         if outcome not in (0, 1, 2):
             return
             
+        # 更新連勝計數
+        if outcome == self.last_outcome and outcome in (0, 1):
+            self.streak_count += 1
+        else:
+            self.streak_count = 1 if outcome in (0, 1) else 0
+        self.last_outcome = outcome
+            
         self.outcome_history.append(outcome)
         if len(self.outcome_history) > self.max_history:
             self.outcome_history.pop(0)
             
         self.counts[outcome] += 1.0
 
-        # 重要性重加權
         w = np.fromiter((max(1e-12, pt.p[outcome]) for pt in self.particles), 
                         dtype=np.float64, count=self.n)
         w_sum = float(w.sum())
@@ -76,12 +82,10 @@ class OutcomePF:
         for i, weight in enumerate(w):
             self.particles[i].w = float(weight)
 
-        # 有效樣本數檢查與重採樣
         ess = 1.0 / float((w ** 2).sum())
         if ess / self.n < self.resample_thr:
             self._resample()
 
-        # 更新粒子狀態
         alpha_base = self.alpha0 + self.counts
         for particle in self.particles:
             particle.p = self.rng.dirichlet(alpha_base).astype(np.float64)
@@ -108,21 +112,18 @@ class OutcomePF:
         return np.searchsorted(cumulative_sum, positions)
 
     def predict(self, sims_per_particle: int = 0) -> np.ndarray:
-        # 粒子加權平均
         ps = np.stack([particle.p for particle in self.particles], axis=0)
         ws = np.array([particle.w for particle in self.particles], dtype=np.float64)
         ws = ws / max(1e-12, float(ws.sum()))
         mix = (ps * ws[:, None]).sum(axis=0)
 
-        # 使用理論基準值混合
         theoretical_base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float64)
         
-        # 根據歷史長度調整混合比例
         total_obs = float(self.counts.sum())
-        if total_obs < 10:
-            mix_weight = min(0.3, total_obs * 0.03)
+        if total_obs < 20 or self.streak_count >= 5:
+            mix_weight = 0.2
         else:
-            mix_weight = 0.6
+            mix_weight = 0.5
             
         out = mix_weight * mix + (1 - mix_weight) * theoretical_base
         out = _normalize(out)
