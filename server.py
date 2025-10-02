@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """server.py — Updated version for independent round predictions (no trend memory)"""
 import os
