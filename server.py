@@ -290,7 +290,6 @@ if not pf_initialized:
             pT = base[2]
             if pT < TIE_MIN:
                 # Increase tie prob to minimum and reduce others proportionally
-                excess = TIE_MIN - pT
                 base[2] = TIE_MIN
                 # Reduce B and P proportionally
                 scale = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
@@ -298,9 +297,8 @@ if not pf_initialized:
                 base[1] *= scale
             elif base[2] > TIE_MAX:
                 # Cap tie prob at max and increase others proportionally
-                deficit = base[2] - TIE_MAX
                 base[2] = TIE_MAX
-                scale = (1.0 - TIE_MAX) / (1.0 - (base[2] - deficit))
+                scale = (1.0 - TIE_MAX) / (1.0 - (base[2] - (base[2] - TIE_MAX)))
                 base[0] *= scale
                 base[1] *= scale
             return base.astype(np.float32)
@@ -511,6 +509,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             try:
                 log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
                 up = text.upper()
+                # Activation code
                 if up.startswith("開通") or up.startswith("ACTIVATE"):
                     after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                     ok = validate_activation_code(after)
@@ -519,18 +518,13 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
+                # Trial period guard
                 guard = trial_guard(sess)
                 if guard:
                     _reply(event.reply_token, guard)
                     return
 
-                # Parse points input
-                pts = parse_last_hand_points(text)
-                if pts and sess.get("bankroll"):
-                    _handle_points_and_predict(sess, pts[0], pts[1], event.reply_token)
-                    save_session(uid, sess)
-                    return
-
+                # End analysis / reset command
                 if up in ("結束分析", "清空", "RESET"):
                     premium = sess.get("premium", False)
                     start_ts = sess.get("trial_start", int(time.time()))
@@ -541,6 +535,69 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     save_session(uid, sess)
                     return
 
+                # Game settings command
+                if text == "遊戲設定" or up == "GAME SETTINGS":
+                    sess["phase"] = "choose_game"
+                    sess["game"] = None
+                    sess["table"] = None
+                    sess["table_no"] = None
+                    sess["bankroll"] = 0
+                    sess["streak_count"] = 0
+                    sess["last_outcome"] = None
+                    sess["last_pts_text"] = None
+                    menu = game_menu_text(trial_left_minutes(sess))
+                    _reply(event.reply_token, menu)
+                    save_session(uid, sess)
+                    return
+
+                # Game selection when waiting for game choice
+                if sess.get("phase") == "choose_game":
+                    choice_match = re.match(r"^\s*(\d+)", text)
+                    if choice_match:
+                        choice = choice_match.group(1)
+                        if choice in GAMES:
+                            sess["game"] = GAMES[choice]
+                            sess["phase"] = "input_bankroll"
+                            _reply(event.reply_token, f"🎰 已選擇遊戲館：{sess['game']}\n請輸入初始籌碼（金額）")
+                            save_session(uid, sess)
+                            return
+                        else:
+                            _reply(event.reply_token, "⚠️ 無效的選項，請輸入上列列出的數字。")
+                            return
+                    else:
+                        _reply(event.reply_token, "⚠️ 請直接輸入提供的數字來選擇遊戲館別。")
+                        return
+
+                # Initial bankroll input phase
+                if sess.get("phase") == "input_bankroll":
+                    amount_str = re.sub(r"[^\d]", "", text)
+                    if amount_str:
+                        try:
+                            amount = int(amount_str)
+                        except:
+                            amount = None
+                    else:
+                        amount = None
+                    if amount is None or amount <= 0:
+                        _reply(event.reply_token, "⚠️ 請輸入正確的數字金額。")
+                        return
+                    sess["bankroll"] = amount
+                    sess["phase"] = "await_pts"
+                    _reply(
+                        event.reply_token,
+                        f"✅ 設定完成！遊戲館：{sess.get('game')}，初始籌碼：{amount}。\n📌 連續模式已啟動：現在請直接輸入第一局點數進行分析（例：閒6莊5 或 65）。"
+                    )
+                    save_session(uid, sess)
+                    return
+
+                # Parse points input if session has bankroll set
+                pts = parse_last_hand_points(text)
+                if pts and sess.get("bankroll"):
+                    _handle_points_and_predict(sess, pts[0], pts[1], event.reply_token)
+                    save_session(uid, sess)
+                    return
+
+                # Unrecognized command fallback
                 _reply(
                     event.reply_token,
                     "指令無法辨識。\n📌 已啟用連續模式：直接輸入點數即可（例：65 / 和 / 閒6莊5）。\n或輸入『遊戲設定』。",
