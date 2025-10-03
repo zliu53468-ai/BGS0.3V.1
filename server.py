@@ -1,29 +1,16 @@
 # -*- coding: utf-8 -*-
-"""server.py — Updated version for independent round predictions (no memory)"""
+"""server.py - 更新版本：獨立局預測（無趨勢記憶）"""
 import os
 import sys
 import logging
 import time
 import re
 import json
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
+from deplete import init_counts, probs_after_points
 
-# --- deplete import shim: 同時支援 bgs/deplete.py 與根目錄 deplete.py ---
-try:
-    from bgs.deplete import init_counts, probs_after_points
-except ModuleNotFoundError:
-    try:
-        from deplete import init_counts, probs_after_points
-    except ModuleNotFoundError as e:
-        raise ImportError(
-            "找不到 deplete 模組。請確認：\n"
-            "1) 有 bgs/deplete.py，且 bgs/ 內存在 __init__.py（建議做法），或\n"
-            "2) deplete.py 與 server.py 在同一層。"
-        ) from e
-
-# ---------- Optional deps ----------
 try:
     import redis
 except Exception:
@@ -45,7 +32,7 @@ except Exception:
         return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-02+webhook-fallback+line-webhook-alias"
+VERSION = "bgs-independent-2025-10-02"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -58,10 +45,12 @@ if _flask_available and Flask is not None:
 else:
     class _DummyApp:
         def get(self, *args, **kwargs):
-            def _decorator(func): return func
+            def _decorator(func):
+                return func
             return _decorator
         def post(self, *args, **kwargs):
-            def _decorator(func): return func
+            def _decorator(func):
+                return func
             return _decorator
         def run(self, *args, **kwargs):
             log.warning("Flask not available; dummy app cannot run a server.")
@@ -122,7 +111,7 @@ def get_session(uid: str) -> Dict[str, Any]:
             except Exception:
                 pass
     else:
-        # Clean up expired fallback sessions
+        # 清理過期的 fallback session
         now = time.time()
         for k in list(SESS_FALLBACK.keys()):
             v = SESS_FALLBACK.get(k)
@@ -130,7 +119,7 @@ def get_session(uid: str) -> Dict[str, Any]:
                 del SESS_FALLBACK[k]
         if uid in SESS_FALLBACK and "phase" in SESS_FALLBACK[uid]:
             return SESS_FALLBACK[uid]
-    # Initialize a new session
+    # 初始化新的 session
     nowi = int(time.time())
     return {
         "bankroll": 0,
@@ -156,8 +145,10 @@ def env_flag(name: str, default: int = 1) -> int:
     if val is None:
         return 1 if default else 0
     v = str(val).strip().lower()
-    if v in ("1", "true", "t", "yes", "y", "on"): return 1
-    if v in ("0", "false", "f", "no", "n", "off"): return 0
+    if v in ("1", "true", "t", "yes", "y", "on"):
+        return 1
+    if v in ("0", "false", "f", "no", "n", "off"):
+        return 0
     try:
         return 1 if int(float(v)) != 0 else 0
     except Exception:
@@ -173,7 +164,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     u = s.upper().strip()
     u = re.sub(r"^開始分析", "", u)
 
-    # Parse special formats for tie or points
+    # 解析特殊格式（和局或具體點數）
     m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
     if m:
         d = m.group(1)
@@ -187,11 +178,11 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 
     t = u.replace(" ", "").replace("\u3000", "")
     if t in ("B", "莊", "庄"):
-        return (0, 1)  # Banker win (player 0, banker 1)
+        return (0, 1)  # 庄家勝利（閒0，莊1）
     if t in ("P", "閒", "闲"):
-        return (1, 0)  # Player win (player 1, banker 0)
+        return (1, 0)  # 閒家勝利（閒1，莊0）
     if t in ("T", "和"):
-        return (0, 0)  # Tie
+        return (0, 0)  # 和局
 
     if re.search(r"[A-Z]", u):
         return None
@@ -246,7 +237,7 @@ try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
     log.info("成功從 bgs.pfilter 導入 OutcomePF")
-except Exception:
+except Exception as e:
     try:
         _cur_dir = os.path.dirname(os.path.abspath(__file__))
         if _cur_dir not in sys.path:
@@ -283,27 +274,34 @@ if OutcomePF:
         OutcomePF = None
 
 if not pf_initialized:
+    # 備援模式: SmartDummyPF (獨立模式，不記錄歷史)
     class SmartDummyPF:
         def __init__(self):
             log.warning("使用 SmartDummyPF 備援模式 - 請檢查 OutcomePF 導入問題")
         def update_outcome(self, outcome):
+            # 獨立模式下不更新記憶
             return
         def predict(self, **kwargs) -> np.ndarray:
             base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+            # 先做軟化處理和基本概率
             base = base ** (1.0 / SOFT_TAU)
             base = base / base.sum()
             pT = base[2]
+            # 維護和平局機率上下限
             if pT < TIE_MIN:
                 base[2] = TIE_MIN
                 scale = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
-                base[0] *= scale; base[1] *= scale
-            elif base[2] > TIE_MAX:
+                base[0] *= scale
+                base[1] *= scale
+            elif pT > TIE_MAX:
                 base[2] = TIE_MAX
-                scale = (1.0 - TIE_MAX) / (1.0 - (base[2] - (base[2] - TIE_MAX)))
-                base[0] *= scale; base[1] *= scale
+                scale = (1.0 - TIE_MAX) / (1.0 - pT)
+                base[0] *= scale
+                base[1] *= scale
             return base.astype(np.float32)
         @property
-        def backend(self): return "smart-dummy"
+        def backend(self):
+            return "smart-dummy"
     PF = SmartDummyPF()
     pf_initialized = True
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
@@ -321,33 +319,37 @@ def bet_amount(bankroll: int, pct: float) -> int:
     return int(round(bankroll * pct))
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
+    # 平滑機率 (混合理論機率) 以減少隨機波動影響
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     theo_probs = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-    smoothed = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo_probs
-    smoothed = smoothed / smoothed.sum()
-    pB, pP = float(smoothed[0]), float(smoothed[1])
+    smoothed_probs = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo_probs
+    smoothed_probs = smoothed_probs / smoothed_probs.sum()
+    pB, pP = float(smoothed_probs[0]), float(smoothed_probs[1])
 
-    evB = 0.95 * pB - pP
-    evP = pP - pB
-    side = 0 if evB > evP else 1
+    evB = 0.95 * pB - pP  # Banker 賭注的期望值
+    evP = pP - pB        # Player 賭注的期望值
+
+    side = 0 if evB > evP else 1  # 選擇期望值較大的賭邊 (莊=0, 閒=1)
     final_edge = max(abs(evB), abs(evP))
 
     if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
 
-    max_edge = 0.15
+    # 根據信心度(final_edge)計算投注比例，範圍5%到40%
+    max_edge = 0.15  # 假設最大信心度為0.15
     min_bet_pct = 0.05
     max_bet_pct = 0.40
     bet_pct = min_bet_pct + (max_bet_pct - min_bet_pct) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
-    bet_pct = float(min(max_bet_pct, max(min_bet_pct, bet_pct)))
+    bet_pct = float(min(max_bet_pct, max(min_bet_pct, bet_pct)))  # 限制在5%-40%
     reason = f"信心度配注({int(min_bet_pct*100)}%~{int(max_bet_pct*100)}%)"
     return (INV[side], final_edge, bet_pct, reason)
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
-    header: list[str] = []
-    if last_pts_text: header.append(last_pts_text)
+    header: List[str] = []
+    if last_pts_text:
+        header.append(last_pts_text)
     header.append("開始分析下局....")
     block = [
         "預測結果",
@@ -361,7 +363,52 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
 
-# ----------（還原）LINE 快速按鈕 / 回覆 / 去重：必須在 Webhook 前面 ----------
+# ---------- 健康檢查路由 ----------
+@app.get("/")
+def root():
+    ua = request.headers.get("User-Agent", "")
+    if "UptimeRobot" in ua:
+        return "OK", 200
+    status = "OK" if pf_initialized else "BACKUP_MODE"
+    return f"✅ BGS Server {status} ({VERSION})", 200
+
+@app.get("/health")
+def health():
+    return jsonify(
+        ok=True,
+        ts=time.time(),
+        version=VERSION,
+        pf_initialized=pf_initialized,
+        pf_backend=getattr(PF, 'backend', 'unknown')
+    ), 200
+
+@app.get("/healthz")
+def healthz():
+    return jsonify(
+        ok=True,
+        ts=time.time(),
+        version=VERSION,
+        pf_initialized=pf_initialized
+    ), 200
+
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+line_api = None
+line_handler = None
+
+GAMES = {
+    "1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU",
+    "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人",
+}
+
+def game_menu_text(left_min: int) -> str:
+    lines = ["請選擇遊戲館別"]
+    for k in sorted(GAMES.keys(), key=lambda x: int(x)):
+        lines.append(f"{k}. {GAMES[k]}")
+    lines.append("「請直接輸入數字選擇」")
+    lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
+    return "\n".join(lines)
+
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
@@ -379,8 +426,8 @@ def _quick_buttons():
         return None
 
 def _reply(token: str, text: str):
+    from linebot.models import TextSendMessage
     try:
-        from linebot.models import TextSendMessage
         line_api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
     except Exception as e:
         log.warning("[LINE] reply failed: %s", e)
@@ -390,157 +437,38 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
         return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
-# ---------- 健康檢查 ----------
-@app.get("/")
-def root():
-    ua = request.headers.get("User-Agent", "")
-    if "UptimeRobot" in ua:
-        return "OK", 200
-    status = "OK" if pf_initialized else "BACKUP_MODE"
-    return f"✅ BGS Server {status} ({VERSION})", 200
+def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
+    log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
+    start_time = time.time()
 
-@app.get("/health")
-def health():
-    return jsonify(
-        ok=True, ts=time.time(), version=VERSION,
-        pf_initialized=pf_initialized, pf_backend=getattr(PF, 'backend', 'unknown')
-    ), 200
+    outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
 
-@app.get("/healthz")
-def healthz():
-    return jsonify(ok=True, ts=time.time(), version=VERSION, pf_initialized=pf_initialized), 200
+    if outcome == 2:
+        sess["last_pts_text"] = "上局結果: 和局"
+    else:
+        sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+    sess["last_outcome"] = outcome
+    sess["streak_count"] = 1 if outcome in (0, 1) else 0
+    sess["phase"] = "ready"
 
-# ---------- LINE Bot / Dummy 模式 ----------
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_MODE = "real" if (LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN) else "dummy"
-
-line_api = None
-line_handler = None
-
-if LINE_MODE == "real":
     try:
-        from linebot import LineBotApi, WebhookHandler
-        from linebot.exceptions import InvalidSignatureError
-        from linebot.models import MessageEvent, TextMessage
-        line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-        line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
-        log.info("LINE Webhook 啟用（real mode）")
+        predict_start = time.time()
+        # 每局獨立 (不更新歷史)
+        pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
+        log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
+        counts = init_counts()
+        dep_preds = probs_after_points(counts, p_pts, b_pts)
+        p = (pf_preds + dep_preds) * 0.5
 
-        # --- 共用處理：讓 /callback 與 /line-webhook 都走同一支 ---
-        def _handle_line_webhook_request():
-            signature = request.headers.get("X-Line-Signature", "")
-            body = request.get_data(as_text=True)
-            try:
-                line_handler.handle(body, signature)
-            except InvalidSignatureError:
-                log.warning("Invalid signature")
-                return "Bad signature", 400
-            return "OK", 200
-
-        @app.post("/callback")
-        def callback():
-            return _handle_line_webhook_request()
-
-        @app.post("/line-webhook")
-        def line_webhook_alias():
-            return _handle_line_webhook_request()
-
-        @line_handler.add(MessageEvent, message=TextMessage)
-        def on_text_message(event):
-            if not event or not event.message or not event.message.text:
-                return
-            uid = event.source.user_id if getattr(event, "source", None) else "no_uid"
-            if not _dedupe_event(event.message.id):
-                return
-            sess = get_session(uid)
-
-            txt = event.message.text.strip()
-            # 試用門
-            if txt.startswith("開通"):
-                code = txt.split("開通", 1)[-1].strip()
-                if validate_activation_code(code):
-                    sess["premium"] = True
-                    save_session(uid, sess)
-                    _reply(event.reply_token, "✅ 已開通永久版，歡迎使用！")
-                else:
-                    _reply(event.reply_token, "❌ 金鑰錯誤，請重新確認")
-                return
-
-            # 解析點數並預測
-            pts = parse_last_hand_points(txt)
-            if pts:
-                p_pts, b_pts = pts
-                gate = trial_guard(sess)
-                if gate:
-                    _reply(event.reply_token, gate)
-                    return
-                _handle_points_and_predict(sess, p_pts, b_pts, event.reply_token)
-                save_session(uid, sess)
-                return
-
-            # 其他指令（簡化）
-            if txt in ("遊戲設定", "開始分析"):
-                left = trial_left_minutes(sess)
-                _reply(event.reply_token, f"請回覆上局點數（例如：閒6 莊5 / 65 / 和）\n⏳ 試用剩餘 {left} 分鐘")
-                return
-
-            _reply(event.reply_token, "請輸入上局點數（例：65 / 和 / 閒6莊5），或輸入「遊戲設定」")
-
+        choice, edge, bet_pct, reason = decide_only_bp(p)
+        bankroll_now = int(sess.get("bankroll", 0))
+        bet_amt = bet_amount(bankroll_now, bet_pct)
+        msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+        _reply(reply_token, msg)
+        log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
     except Exception as e:
-        log.error("LINE Webhook 初始化失敗，切換為 dummy 模式: %s", e)
-        LINE_MODE = "dummy"
+        log.error("預測過程中錯誤: %s", e)
+        _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
 
-if LINE_MODE == "dummy":
-    log.info("LINE Webhook 未啟用（dummy mode）；提供 /predict 做測試")
-
-    @app.post("/predict")
-    def predict_api():
-        """
-        測試端點：POST JSON {"uid":"test","text":"閒6莊5"} 或 {"p":6,"b":5}
-        回傳與 LINE 相同的文字卡。
-        """
-        data = request.get_json(silent=True) or {}
-        uid = str(data.get("uid") or "test")
-        sess = get_session(uid)
-        # 試用門
-        gate = trial_guard(sess)
-        if gate:
-            return jsonify(ok=False, message=gate), 200
-
-        p_pts = data.get("p"); b_pts = data.get("b")
-        text = data.get("text")
-        if text and (p_pts is None or b_pts is None):
-            pts = parse_last_hand_points(str(text))
-            if pts: p_pts, b_pts = pts
-        if p_pts is None or b_pts is None:
-            return jsonify(ok=False, message="請提供 {p,b} 或 text（例如 '閒6莊5' 或 '65' 或 '和'）"), 400
-
-        try:
-            pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
-            counts = init_counts()
-            dep_preds = probs_after_points(counts, int(p_pts), int(b_pts))
-            p = (pf_preds + dep_preds) * 0.5
-
-            choice, edge, bet_pct, reason = decide_only_bp(p)
-            bankroll_now = int(sess.get("bankroll", 0))
-            bet_amt = bet_amount(bankroll_now, bet_pct)
-            msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
-
-            # 更新顯示資訊
-            if int(p_pts) == int(b_pts):
-                sess["last_pts_text"] = "上局結果: 和局"
-            else:
-                sess["last_pts_text"] = f"上局結果: 閒 {int(p_pts)} 莊 {int(b_pts)}"
-            sess["phase"] = "await_pts" if CONTINUOUS_MODE else "ready"
-            save_session(uid, sess)
-
-            return jsonify(ok=True, choice=choice, edge=edge, bet_pct=bet_pct, message=msg), 200
-        except Exception as e:
-            log.exception("predict error: %s", e)
-            return jsonify(ok=False, message="計算錯誤"), 500
-
-# ---- 方便本機啟動（Render 用 gunicorn 指令；本機可 python server.py）----
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))  # 本機沒有 PORT 就用 8000
-    app.run(host="0.0.0.0", port=port)
+    if CONTINUOUS_MODE:
+        sess["phase"] = "await_pts"
