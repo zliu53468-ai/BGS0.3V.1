@@ -361,6 +361,35 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
 
+# ----------（還原）LINE 快速按鈕 / 回覆 / 去重：必須在 Webhook 前面 ----------
+def _quick_buttons():
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        items = [
+            QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
+            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
+            QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
+            QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
+            QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
+        ]
+        if CONTINUOUS_MODE == 0:
+            items.insert(0, QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始分析")))
+        return QuickReply(items=items)
+    except Exception:
+        return None
+
+def _reply(token: str, text: str):
+    try:
+        from linebot.models import TextSendMessage
+        line_api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
+    except Exception as e:
+        log.warning("[LINE] reply failed: %s", e)
+
+def _dedupe_event(event_id: Optional[str]) -> bool:
+    if not event_id:
+        return True
+    return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
+
 # ---------- 健康檢查 ----------
 @app.get("/")
 def root():
@@ -413,7 +442,6 @@ if LINE_MODE == "real":
         def callback():
             return _handle_line_webhook_request()
 
-        # 你的 LINE 後台目前打的是這條路徑 → 直接映射同一處理器
         @app.post("/line-webhook")
         def line_webhook_alias():
             return _handle_line_webhook_request()
