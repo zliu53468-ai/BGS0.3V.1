@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — Updated version for independent round predictions (no trend memory)"""
+"""server.py — Updated version for independent round predictions (no memory)"""
 import os
 import sys
 import logging
@@ -9,7 +9,19 @@ import json
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
-from deplete import init_counts, probs_after_points
+
+# --- deplete import shim: 同時支援 bgs/deplete.py 與根目錄 deplete.py ---
+try:
+    from bgs.deplete import init_counts, probs_after_points
+except ModuleNotFoundError:
+    try:
+        from deplete import init_counts, probs_after_points
+    except ModuleNotFoundError as e:
+        raise ImportError(
+            "找不到 deplete 模組。請確認：\n"
+            "1) 有 bgs/deplete.py，且 bgs/ 內存在 __init__.py（建議做法），或\n"
+            "2) deplete.py 與 server.py 在同一層。"
+        ) from e
 
 try:
     import redis
