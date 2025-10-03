@@ -45,7 +45,7 @@ except Exception:
         return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-02+webhook-fallback"
+VERSION = "bgs-independent-2025-10-02+webhook-fallback+line-webhook-alias"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -361,7 +361,7 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
 
-# ---------- 基本健康檢查 ----------
+# ---------- 健康檢查 ----------
 @app.get("/")
 def root():
     ua = request.headers.get("User-Agent", "")
@@ -398,8 +398,8 @@ if LINE_MODE == "real":
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
         log.info("LINE Webhook 啟用（real mode）")
 
-        @app.post("/callback")
-        def callback():
+        # --- 共用處理：讓 /callback 與 /line-webhook 都走同一支 ---
+        def _handle_line_webhook_request():
             signature = request.headers.get("X-Line-Signature", "")
             body = request.get_data(as_text=True)
             try:
@@ -408,6 +408,15 @@ if LINE_MODE == "real":
                 log.warning("Invalid signature")
                 return "Bad signature", 400
             return "OK", 200
+
+        @app.post("/callback")
+        def callback():
+            return _handle_line_webhook_request()
+
+        # 你的 LINE 後台目前打的是這條路徑 → 直接映射同一處理器
+        @app.post("/line-webhook")
+        def line_webhook_alias():
+            return _handle_line_webhook_request()
 
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text_message(event):
