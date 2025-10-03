@@ -4,12 +4,12 @@ import os
 import numpy as np
 
 # Configuration from environment
-HISTORY_MODE = os.getenv("HISTORY_MODE", "0").lower() not in ("0", "false", "no")
+HISTORY_MODE = False
 # We assume SKIP_TIE_UPD and other parameters might be needed if history mode on
-SKIP_TIE_UPD = os.getenv("SKIP_TIE_UPD", "1").lower() not in ("0", "false", "no")
-SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
-TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
-TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
+SKIP_TIE_UPD = False
+SOFT_TAU = 1.4
+TIE_MIN = 0.07
+TIE_MAX = 0.12
 
 class OutcomePF:
     def __init__(self, decks: int = 8, seed: int = 42, n_particles: int = 50, 
