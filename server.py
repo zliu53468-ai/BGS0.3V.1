@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """server.py — Updated version for independent round predictions (no trend memory)"""
 import os
@@ -10,6 +9,7 @@ import json
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
+from deplete import init_counts, probs_after_points
 
 try:
     import redis
@@ -311,7 +311,7 @@ if not pf_initialized:
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.05"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
 USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
@@ -462,175 +462,21 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     try:
         predict_start = time.time()
         # Each prediction is independent (no history update)
-        p = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
+        pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
+        counts = init_counts()
+        dep_preds = probs_after_points(counts, p_pts, b_pts)
+        p = (pf_preds + dep_preds) * 0.5
 
         choice, edge, bet_pct, reason = decide_only_bp(p)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
         msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         _reply(reply_token, msg)
-        log.info("完整處理完成, 総耗時: %.2fs", time.time() - start_time)
+        log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
     except Exception as e:
         log.error("預測過程中錯誤: %s", e)
         _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
 
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
-
-if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
-    try:
-        from linebot import LineBotApi, WebhookHandler
-        from linebot.exceptions import InvalidSignatureError
-        from linebot.models import MessageEvent, TextMessage, FollowEvent
-
-        line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-        line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-        @line_handler.add(FollowEvent)
-        def on_follow(event):
-            if not _dedupe_event(getattr(event, "id", None)):
-                return
-            uid = event.source.user_id
-            sess = get_session(uid)
-            _reply(
-                event.reply_token,
-                "👋 歡迎！請輸入『遊戲設定』開始；已啟用連續模式，之後只需輸入點數（例：65 / 和 / 閒6莊5）即可自動預測。",
-            )
-            save_session(uid, sess)
-
-        @line_handler.add(MessageEvent, message=TextMessage)
-        def on_text(event):
-            if not _dedupe_event(getattr(event, "id", None)):
-                return
-            uid = event.source.user_id
-            raw = (event.message.text or "")
-            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
-            sess = get_session(uid)
-            try:
-                log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
-                up = text.upper()
-                # Activation code
-                if up.startswith("開通") or up.startswith("ACTIVATE"):
-                    after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
-                    ok = validate_activation_code(after)
-                    sess["premium"] = bool(ok)
-                    _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
-                    save_session(uid, sess)
-                    return
-
-                # Trial period guard
-                guard = trial_guard(sess)
-                if guard:
-                    _reply(event.reply_token, guard)
-                    return
-
-                # End analysis / reset command
-                if up in ("結束分析", "清空", "RESET"):
-                    premium = sess.get("premium", False)
-                    start_ts = sess.get("trial_start", int(time.time()))
-                    sess = get_session(uid)  # reset session data
-                    sess["premium"] = premium
-                    sess["trial_start"] = start_ts
-                    _reply(event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
-                    save_session(uid, sess)
-                    return
-
-                # Game settings command
-                if text == "遊戲設定" or up == "GAME SETTINGS":
-                    sess["phase"] = "choose_game"
-                    sess["game"] = None
-                    sess["table"] = None
-                    sess["table_no"] = None
-                    sess["bankroll"] = 0
-                    sess["streak_count"] = 0
-                    sess["last_outcome"] = None
-                    sess["last_pts_text"] = None
-                    menu = game_menu_text(trial_left_minutes(sess))
-                    _reply(event.reply_token, menu)
-                    save_session(uid, sess)
-                    return
-
-                # Game selection when waiting for game choice
-                if sess.get("phase") == "choose_game":
-                    choice_match = re.match(r"^\s*(\d+)", text)
-                    if choice_match:
-                        choice = choice_match.group(1)
-                        if choice in GAMES:
-                            sess["game"] = GAMES[choice]
-                            sess["phase"] = "input_bankroll"
-                            _reply(event.reply_token, f"🎰 已選擇遊戲館：{sess['game']}\n請輸入初始籌碼（金額）")
-                            save_session(uid, sess)
-                            return
-                        else:
-                            _reply(event.reply_token, "⚠️ 無效的選項，請輸入上列列出的數字。")
-                            return
-                    else:
-                        _reply(event.reply_token, "⚠️ 請直接輸入提供的數字來選擇遊戲館別。")
-                        return
-
-                # Initial bankroll input phase
-                if sess.get("phase") == "input_bankroll":
-                    amount_str = re.sub(r"[^\d]", "", text)
-                    if amount_str:
-                        try:
-                            amount = int(amount_str)
-                        except:
-                            amount = None
-                    else:
-                        amount = None
-                    if amount is None or amount <= 0:
-                        _reply(event.reply_token, "⚠️ 請輸入正確的數字金額。")
-                        return
-                    sess["bankroll"] = amount
-                    sess["phase"] = "await_pts"
-                    _reply(
-                        event.reply_token,
-                        f"✅ 設定完成！遊戲館：{sess.get('game')}，初始籌碼：{amount}。\n📌 連續模式已啟動：現在請直接輸入第一局點數進行分析（例：閒6莊5 或 65）。"
-                    )
-                    save_session(uid, sess)
-                    return
-
-                # Parse points input if session has bankroll set
-                pts = parse_last_hand_points(text)
-                if pts and sess.get("bankroll"):
-                    _handle_points_and_predict(sess, pts[0], pts[1], event.reply_token)
-                    save_session(uid, sess)
-                    return
-
-                # Unrecognized command fallback
-                _reply(
-                    event.reply_token,
-                    "指令無法辨識。\n📌 已啟用連續模式：直接輸入點數即可（例：65 / 和 / 閒6莊5）。\n或輸入『遊戲設定』。",
-                )
-            except Exception as e:
-                log.exception("on_text err: %s", e)
-                try:
-                    _reply(event.reply_token, "⚠️ 系統錯誤，稍後再試。")
-                except Exception:
-                    pass
-
-        @app.post("/line-webhook")
-        def line_webhook():
-            signature = request.headers.get("X-Line-Signature", "")
-            body = request.get_data(as_text=True)
-            try:
-                line_handler.handle(body, signature)
-            except InvalidSignatureError:
-                abort(400, "Invalid signature")
-            except Exception as e:
-                log.error("webhook error: %s", e)
-                abort(500)
-            return "OK", 200
-
-    except Exception as e:
-        log.warning("LINE not fully configured: %s", e)
-else:
-    log.warning("LINE credentials not set. LINE webhook will not be active.")
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized)
-    app.run(host="0.0.0.0", port=port, debug=False)
