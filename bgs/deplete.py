@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 組成依賴蒙地卡羅（Baccarat Shoe Monte Carlo）
-- 模擬次數預設 1000（原 500 → 1000）
-- 耗損只扣一半（deplete_factor=0.5），保留更多隨機性
-- 供 PF 或外層邏輯在需要時以『剩餘牌桶』推估下一局的 B/P/T 機率
+ - 模擬次數預設 1000（原 500 → 1000）
+ - 耗損程度調整 (deplete_factor=1.0)，默認完全耗損
+ - 若出現自然牌型時減少牌桶耗損程度
+ - 供 PF 或外層邏輯在需要時以『剩餘牌桶』推估下一局的 B/P/T 機率
 
 注意：此檔獨立於 PF，可單獨呼叫。
 """
@@ -51,30 +52,55 @@ class Hand:
     p1: int; p2: int; b1: int; b2: int
     p3: int = -1; b3: int = -1
 
-# 簡化之路：以常見抽第三張規則（略） — 實務足夠
-# 這裡採用近似版：若任一方總點 ≤ 5 則可能抽第三張；
-# 不精細套表（對模擬統計影響可忽略於 1000 次級別）
-
+# 完整百家樂補牌規則，包含自然牌型停牌與莊家依閒家第三張牌補牌條件
 def deal_hand(counts: np.ndarray, rng: np.random.Generator) -> Tuple[int,int]:
     # 初始牌
     p1 = draw_card(counts, rng); b1 = draw_card(counts, rng)
     p2 = draw_card(counts, rng); b2 = draw_card(counts, rng)
-    p = ( _pt(p1) + _pt(p2) ) % 10
-    b = ( _pt(b1) + _pt(b2) ) % 10
+    p = (_pt(p1) + _pt(p2)) % 10
+    b = (_pt(b1) + _pt(b2)) % 10
 
     # Natural 停牌
     if p >= 8 or b >= 8:
         return p, b
 
-    # Player 規則（簡化）：<=5 抽
+    # Player 規則
     if p <= 5:
         p3 = draw_card(counts, rng)
-        p = (p + _pt(p3)) % 10
+        p3_val = _pt(p3)
+        p = (p + p3_val) % 10
+        player_draw = True
+    else:
+        player_draw = False
 
-    # Banker 規則（簡化）：<=5 抽
-    if b <= 5:
-        b3 = draw_card(counts, rng)
-        b = (b + _pt(b3)) % 10
+    # Banker 規則
+    if not player_draw:
+        # Player stands with 6 or 7
+        if b <= 5:
+            b3 = draw_card(counts, rng)
+            b = (b + _pt(b3)) % 10
+    else:
+        # Player drew a third card, apply full banker drawing rules
+        if b <= 2:
+            b3 = draw_card(counts, rng)
+            b = (b + _pt(b3)) % 10
+        elif b == 3:
+            if p3_val != 8:
+                b3 = draw_card(counts, rng)
+                b = (b + _pt(b3)) % 10
+        elif b == 4:
+            if 2 <= p3_val <= 7:
+                b3 = draw_card(counts, rng)
+                b = (b + _pt(b3)) % 10
+        elif b == 5:
+            if 4 <= p3_val <= 7:
+                b3 = draw_card(counts, rng)
+                b = (b + _pt(b3)) % 10
+        elif b == 6:
+            if 6 <= p3_val <= 7:
+                b3 = draw_card(counts, rng)
+                b = (b + _pt(b3)) % 10
+        # if b >= 7, banker stands
 
     return p, b
 
@@ -107,7 +133,7 @@ def soften_deplete(counts: np.ndarray, p_pts: int, b_pts: int, factor: float = 0
     # 每方預期 2.5 張牌 → 估計 5 張左右
     total_est = 5
     gap = abs(int(p_pts) - int(b_pts))
-    # 以 gap 調整：gap 小 → 多扣 0 點桶；gap 大 → 多扣高點桶
+    # 以 gap 調整：gap 小 → 多扣 0 點桶；gap 大 → 多扣高點數桶
     w = np.ones(10, dtype=np.float64)
     w[TEN_BUCKET] += 0.6 * np.exp(-0.6 * gap)
     for v in range(1, 10):
@@ -124,7 +150,9 @@ def soften_deplete(counts: np.ndarray, p_pts: int, b_pts: int, factor: float = 0
 
 # --- pipeline：依最近點數更新後再模擬 ---
 def probs_after_points(base_counts: np.ndarray, p_pts: int, b_pts: int,
-                       sims: int = 1000, seed: int = 42, deplete_factor: float = 0.5) -> np.ndarray:
+                       sims: int = 1000, seed: int = 42, deplete_factor: float = 1.0) -> np.ndarray:
     c = base_counts.copy()
+    if p_pts >= 8 or b_pts >= 8:
+        deplete_factor = deplete_factor * 0.5
     soften_deplete(c, p_pts, b_pts, factor=deplete_factor)
     return simulate_probs(c, sims=sims, seed=seed)
