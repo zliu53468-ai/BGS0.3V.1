@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """server.py — Updated version for independent round predictions (no trend memory)"""
 import os
@@ -347,7 +348,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     bet_pct = min_bet_pct + (max_bet_pct - min_bet_pct) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
     bet_pct = float(min(max_bet_pct, max(min_bet_pct, bet_pct)))  # 限制在5%-40%
     reason = f"信心度配注({int(min_bet_pct*100)}%~{int(max_bet_pct*100)}%)"
-    return (INV[1 - side], final_edge, bet_pct, reason)
+    return (INV[side], final_edge, bet_pct, reason)
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
