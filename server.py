@@ -9,7 +9,30 @@ import json
 from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
-from deplete import init_counts, probs_after_points  # ← 加入 deplete 模型
+
+# --- 安全導入 deplete（有就用，沒有不會掛） ---
+DEPLETE_OK = False
+init_counts = None
+probs_after_points = None
+try:
+    # 1) 同目錄
+    from deplete import init_counts, probs_after_points  # type: ignore
+    DEPLETE_OK = True
+except Exception:
+    try:
+        # 2) 套件路徑（若你有包成 bgs.deplete）
+        from bgs.deplete import init_counts, probs_after_points  # type: ignore
+        DEPLETE_OK = True
+    except Exception:
+        # 3) 明確把目前目錄加進 sys.path 再試一次
+        try:
+            _cur_dir = os.path.dirname(os.path.abspath(__file__))
+            if _cur_dir not in sys.path:
+                sys.path.insert(0, _cur_dir)
+            from deplete import init_counts, probs_after_points  # type: ignore
+            DEPLETE_OK = True
+        except Exception:
+            DEPLETE_OK = False  # 仍找不到就先關閉 deplete 融合
 
 try:
     import redis
@@ -24,6 +47,7 @@ except Exception:
     _flask_available = False
     Flask = None
     request = None
+
     def jsonify(*args, **kwargs):
         raise RuntimeError("Flask is not available; jsonify cannot be used.")
     def abort(*args, **kwargs):
@@ -37,6 +61,9 @@ VERSION = "bgs-independent-2025-10-02"
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
+
+if not DEPLETE_OK:
+    log.warning("deplete 模組未找到；將以 PF 單模預測運行（功能不會中斷）。")
 
 # ---------- Flask 初始化 ----------
 if _flask_available and Flask is not None:
@@ -238,7 +265,7 @@ try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
     log.info("成功從 bgs.pfilter 導入 OutcomePF")
-except Exception as e:
+except Exception:
     try:
         _cur_dir = os.path.dirname(os.path.abspath(__file__))
         if _cur_dir not in sys.path:
@@ -264,7 +291,7 @@ if OutcomePF:
         pf_initialized = True
         log.info(
             "PF 初始化成功: n_particles=%s, sims_lik=%s, decks=%s (backend=%s)",
-            PF.n_particles,
+            getattr(PF, 'n_particles', 'N/A'),
             getattr(PF, 'sims_lik', 'N/A'),
             getattr(PF, 'decks', 'N/A'),
             getattr(PF, 'backend', 'unknown'),
@@ -288,18 +315,15 @@ if not pf_initialized:
             base = base ** (1.0 / SOFT_TAU)
             base = base / base.sum()
             # Enforce tie probability bounds
-            pT = base[2]
+            pT = float(base[2])
             if pT < TIE_MIN:
-                # Increase tie prob to minimum and reduce others proportionally
                 base[2] = TIE_MIN
-                # Reduce B and P proportionally
                 scale = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
                 base[0] *= scale
                 base[1] *= scale
             elif pT > TIE_MAX:
-                # Cap tie prob at max and reduce others proportionally（修正縮放公式）
                 base[2] = TIE_MAX
-                scale = (1.0 - TIE_MAX) / (1.0 - pT)
+                scale = (1.0 - TIE_MAX) / (1.0 - pT) if pT < 1.0 else 1.0
                 base[0] *= scale
                 base[1] *= scale
             return base.astype(np.float32)
@@ -311,7 +335,7 @@ if not pf_initialized:
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))  # ← 改回你要的 0.03
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))  # 依你的要求：預設 0.03
 USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
@@ -331,28 +355,28 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     pB, pP = float(smoothed_probs[0]), float(smoothed_probs[1])
 
     evB = 0.95 * pB - pP  # Banker bet expected value
-    evP = pP - pB        # Player bet expected value
+    evP = pP - pB         # Player bet expected value
 
     # 各局獨立，不做連勝/連敗懲罰
-    side = 0 if evB > evP else 1  # Choose side with higher EV (Banker=0 or Player=1)
+    side = 0 if evB > evP else 1  # Banker=0 or Player=1
     final_edge = max(abs(evB), abs(evP))
 
     if final_edge < EDGE_ENTER:
         return ("觀望", final_edge, 0.0, "⚪ 優勢不足")
 
-    # 根據信心度(final_edge)計算投注比例，範圍5%到40%
-    max_edge = 0.15  # 假設最大信心度為0.15
+    # 信心度配注（5%~40%）
+    max_edge = 0.15
     min_bet_pct = 0.05
     max_bet_pct = 0.40
     bet_pct = min_bet_pct + (max_bet_pct - min_bet_pct) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
-    bet_pct = float(min(max_bet_pct, max(min_bet_pct, bet_pct)))  # 限制在5%-40%
+    bet_pct = float(min(max_bet_pct, max(min_bet_pct, bet_pct)))
     reason = f"信心度配注({int(min_bet_pct*100)}%~{int(max_bet_pct*100)}%)"
     return (INV[side], final_edge, bet_pct, reason)
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
-    header: List[str] = []  # ← 相容舊版 typing
+    header: List[str] = []
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
@@ -444,7 +468,7 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
-    log.info("開始處理點數預測: 閒%d 莊%d", p_pts, b_pts)
+    log.info("開始處理點數預測: 閒%d 莊%d (deplete=%s)", p_pts, b_pts, DEPLETE_OK)
     start_time = time.time()
 
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
@@ -455,19 +479,25 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
     sess["last_outcome"] = outcome
-    sess["streak_count"] = 1 if outcome in (0, 1) else 0  # Reset or set 1 for a win/loss
+    sess["streak_count"] = 1 if outcome in (0, 1) else 0
 
     sess["phase"] = "ready"
     try:
         predict_start = time.time()
-        # Each prediction is independent (no history update)
+        # PF 預測（獨立模式，不寫回）
         pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
-        log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
+        log.info("PF 預測完成, 耗時: %.2fs", time.time() - predict_start)
 
-        # ← 新增：deplete 模型（依上一局點數）並融合
-        counts = init_counts(int(os.getenv("DECKS", "8")))
-        dep_preds = probs_after_points(counts, p_pts, b_pts, sims=1000, deplete_factor=1.0)
-        p = (pf_preds + dep_preds) * 0.5
+        p = pf_preds
+        # 有 deplete 才做 50/50 融合
+        if DEPLETE_OK and init_counts and probs_after_points:
+            try:
+                base_decks = int(os.getenv("DECKS", "8"))
+                counts = init_counts(base_decks)
+                dep_preds = probs_after_points(counts, p_pts, b_pts, sims=1000, deplete_factor=1.0)
+                p = (pf_preds + dep_preds) * 0.5
+            except Exception as e:
+                log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
         choice, edge, bet_pct, reason = decide_only_bp(p)
         bankroll_now = int(sess.get("bankroll", 0))
@@ -485,8 +515,8 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized)
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s)",
+             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
