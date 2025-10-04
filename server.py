@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py - 更新版本：獨立局預測（無趨勢記憶）"""
+"""server.py — Updated version for independent round predictions (no trend memory)"""
 import os
 import sys
 import logging
@@ -9,7 +9,7 @@ import json
 from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
-from deplete import init_counts, probs_after_points
+from deplete import init_counts, probs_after_points  # ← 加入 deplete 模型
 
 try:
     import redis
@@ -111,7 +111,7 @@ def get_session(uid: str) -> Dict[str, Any]:
             except Exception:
                 pass
     else:
-        # 清理過期的 fallback session
+        # Clean up expired fallback sessions
         now = time.time()
         for k in list(SESS_FALLBACK.keys()):
             v = SESS_FALLBACK.get(k)
@@ -119,7 +119,7 @@ def get_session(uid: str) -> Dict[str, Any]:
                 del SESS_FALLBACK[k]
         if uid in SESS_FALLBACK and "phase" in SESS_FALLBACK[uid]:
             return SESS_FALLBACK[uid]
-    # 初始化新的 session
+    # Initialize a new session
     nowi = int(time.time())
     return {
         "bankroll": 0,
@@ -164,7 +164,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     u = s.upper().strip()
     u = re.sub(r"^開始分析", "", u)
 
-    # 解析特殊格式（和局或具體點數）
+    # Parse special formats for tie or points
     m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
     if m:
         d = m.group(1)
@@ -178,11 +178,11 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 
     t = u.replace(" ", "").replace("\u3000", "")
     if t in ("B", "莊", "庄"):
-        return (0, 1)  # 庄家勝利（閒0，莊1）
+        return (0, 1)  # Banker win (player 0, banker 1)
     if t in ("P", "閒", "闲"):
-        return (1, 0)  # 閒家勝利（閒1，莊0）
+        return (1, 0)  # Player win (player 1, banker 0)
     if t in ("T", "和"):
-        return (0, 0)  # 和局
+        return (0, 0)  # Tie
 
     if re.search(r"[A-Z]", u):
         return None
@@ -222,6 +222,7 @@ log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s",
          os.getenv("PF_N", "50"), os.getenv("PF_UPD_SIMS", "30"),
          os.getenv("PF_PRED_SIMS", "5"), os.getenv("DECKS", "8"))
 
+# Ensure necessary controls are taken from environment or defaults
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
 SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
 SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
@@ -274,26 +275,29 @@ if OutcomePF:
         OutcomePF = None
 
 if not pf_initialized:
-    # 備援模式: SmartDummyPF (獨立模式，不記錄歷史)
+    # Backup mode: SmartDummyPF (no memory, always theoretical probabilities)
     class SmartDummyPF:
         def __init__(self):
             log.warning("使用 SmartDummyPF 備援模式 - 請檢查 OutcomePF 導入問題")
         def update_outcome(self, outcome):
-            # 獨立模式下不更新記憶
+            # No memory update in independent mode
             return
         def predict(self, **kwargs) -> np.ndarray:
             base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            # 先做軟化處理和基本概率
+            # Apply soft smoothing and tie compression to base probabilities
             base = base ** (1.0 / SOFT_TAU)
             base = base / base.sum()
+            # Enforce tie probability bounds
             pT = base[2]
-            # 維護和平局機率上下限
             if pT < TIE_MIN:
+                # Increase tie prob to minimum and reduce others proportionally
                 base[2] = TIE_MIN
+                # Reduce B and P proportionally
                 scale = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
                 base[0] *= scale
                 base[1] *= scale
             elif pT > TIE_MAX:
+                # Cap tie prob at max and reduce others proportionally（修正縮放公式）
                 base[2] = TIE_MAX
                 scale = (1.0 - TIE_MAX) / (1.0 - pT)
                 base[0] *= scale
@@ -307,7 +311,7 @@ if not pf_initialized:
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
 # ---------- 投注決策 ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))  # ← 改回你要的 0.03
 USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
@@ -326,10 +330,11 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     smoothed_probs = smoothed_probs / smoothed_probs.sum()
     pB, pP = float(smoothed_probs[0]), float(smoothed_probs[1])
 
-    evB = 0.95 * pB - pP  # Banker 賭注的期望值
-    evP = pP - pB        # Player 賭注的期望值
+    evB = 0.95 * pB - pP  # Banker bet expected value
+    evP = pP - pB        # Player bet expected value
 
-    side = 0 if evB > evP else 1  # 選擇期望值較大的賭邊 (莊=0, 閒=1)
+    # 各局獨立，不做連勝/連敗懲罰
+    side = 0 if evB > evP else 1  # Choose side with higher EV (Banker=0 or Player=1)
     final_edge = max(abs(evB), abs(evP))
 
     if final_edge < EDGE_ENTER:
@@ -347,7 +352,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
-    header: List[str] = []
+    header: List[str] = []  # ← 相容舊版 typing
     if last_pts_text:
         header.append(last_pts_text)
     header.append("開始分析下局....")
@@ -391,6 +396,7 @@ def healthz():
         pf_initialized=pf_initialized
     ), 200
 
+# ---------- LINE Bot ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 line_api = None
@@ -443,21 +449,24 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
 
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
 
+    # 更新上局結果資訊（各局獨立，不累積趨勢）
     if outcome == 2:
         sess["last_pts_text"] = "上局結果: 和局"
     else:
         sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
     sess["last_outcome"] = outcome
-    sess["streak_count"] = 1 if outcome in (0, 1) else 0
-    sess["phase"] = "ready"
+    sess["streak_count"] = 1 if outcome in (0, 1) else 0  # Reset or set 1 for a win/loss
 
+    sess["phase"] = "ready"
     try:
         predict_start = time.time()
-        # 每局獨立 (不更新歷史)
+        # Each prediction is independent (no history update)
         pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
         log.info("預測完成, 耗時: %.2fs", time.time() - predict_start)
-        counts = init_counts()
-        dep_preds = probs_after_points(counts, p_pts, b_pts)
+
+        # ← 新增：deplete 模型（依上一局點數）並融合
+        counts = init_counts(int(os.getenv("DECKS", "8")))
+        dep_preds = probs_after_points(counts, p_pts, b_pts, sims=1000, deplete_factor=1.0)
         p = (pf_preds + dep_preds) * 0.5
 
         choice, edge, bet_pct, reason = decide_only_bp(p)
@@ -472,3 +481,13 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
 
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
+
+# ---------- Main ----------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s)",
+             VERSION, port, CONTINUOUS_MODE, pf_initialized)
+    if _flask_available and Flask is not None:
+        app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        log.warning("Flask not available; cannot run HTTP server.")
