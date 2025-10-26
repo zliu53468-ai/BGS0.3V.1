@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """server.py — Updated version for independent round predictions (no trend memory)
 Patched by ChatGPT:
-- 新增以環境變數控制的觀望守門與配注上下限
-- 新增可讀的 debug 決策資訊
-- 觀望時的輸出改為「建議觀望（不下注）」
+- 新增 THEO_BLEND 環境變數：控制是否將模型機率與理論分佈混合（0.0=關閉）
+- 新增 smooth_probs()：決策與卡片顯示統一使用同一組機率（避免顯示與下注邏輯不一致）
+- 其它程式碼保持不變
 """
 import os
 import sys
@@ -14,6 +14,21 @@ import json
 from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
+
+# --- 新增：理論混合權重（0.0=關閉；建議 0.0~0.15）
+THEO_BLEND = float(os.getenv("THEO_BLEND", "0.0"))
+
+def smooth_probs(prob: np.ndarray) -> np.ndarray:
+    """
+    依 THEO_BLEND 將模型輸出機率與理論分佈混合，並正規化。
+    THEO_BLEND=0.0 時直接回傳原始 prob（不混合）。
+    """
+    if THEO_BLEND <= 0.0:
+        return prob
+    theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+    sm = (1.0 - THEO_BLEND) * prob + THEO_BLEND * theo
+    sm = sm / sm.sum()
+    return sm
 
 # --- 安全導入 deplete（有就用，沒有不會掛） ---
 DEPLETE_OK = False
@@ -54,7 +69,7 @@ except Exception:
     def CORS(app): return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-04+patched-obs-watch-sizer"
+VERSION = "bgs-independent-2025-10-04+blend-control"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -315,7 +330,7 @@ if not pf_initialized:
 
 # ---------- 決策參數（原有） ----------
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
-USE_KELLY = env_flag("USE_KELLY", 0)  # 目前沒用到（保留相容）
+USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
 # 決策模式與參數（原有）
@@ -325,16 +340,13 @@ PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))      # hybrid 門檻
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))       # hybrid EV 子門檻
 
 # ---------- 新增：可用環境變數控制的守門與配注 ----------
-# 信心門檻（用勝率大者當簡易 conf；若你以後有更精細 conf，可替換）
 MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))  # 低於此一律觀望
-QUIET_SMALLEdge   = env_flag("QUIET_SMALLEdge", 0)                   # 邊際略優也觀望
+QUIET_SMALLEdge   = env_flag("QUIET_SMALLEdge", 0)                    # 邊際略優也觀望
 
-# 配注上下限（百分比），與 edge 線性映射終點（滿格 edge）
-MIN_BET_PCT_ENV   = float(os.getenv("MIN_BET_PCT", "0.05"))          # 5%
-MAX_BET_PCT_ENV   = float(os.getenv("MAX_BET_PCT", "0.40"))          # 40%
-MAX_EDGE_SCALE    = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15")) # 當 final_edge 到這裡給滿注
+MIN_BET_PCT_ENV   = float(os.getenv("MIN_BET_PCT", "0.05"))           # 5%
+MAX_BET_PCT_ENV   = float(os.getenv("MAX_BET_PCT", "0.40"))           # 40%
+MAX_EDGE_SCALE    = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15"))  # final_edge 達此給滿注
 
-# Debug 日誌控制
 SHOW_CONF_DEBUG   = env_flag("SHOW_CONF_DEBUG", 1)
 LOG_DECISION      = env_flag("LOG_DECISION", 1)
 
@@ -355,17 +367,15 @@ def _decide_side_by_prob(pB: float, pP: float) -> int:
     return 0 if pB >= pP else 1
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
+    """
+    注意：這裡不再做固定 0.7/0.3 的理論混合。
+    誰要不要混合、混多少，已在外層用 smooth_probs() 決定並傳進來。
+    """
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
-
-    # 平滑（與理論混合）
-    theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-    sm = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo
-    sm = sm / sm.sum()
-    pB, pP, pT = float(sm[0]), float(sm[1]), float(sm[2])
 
     reason_parts: List[str] = []
 
-    # 三種決策模式，計算最終邊際(final_edge)與 side
+    # 三種決策模式
     if DECISION_MODE == "prob":
         side = _decide_side_by_prob(pB, pP)
         ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
@@ -391,26 +401,21 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason_parts.append(f"模式=ev (EV_B={evB:.4f}, EV_P={evP:.4f}, payout={BANKER_PAYOUT})")
 
-    # ------- 最終觀望守門（env 可控） -------
-    # 簡易信心：取勝率較大者（若你將來有 conf，替換掉此行即可）
+    # ------- 最終觀望守門 -------
     conf = max(pB, pP)
-
     if conf < MIN_CONF_FOR_ENTRY:
-        msg = f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.2f}"
-        reason_parts.append(msg)
+        reason_parts.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.2f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
 
     if final_edge < EDGE_ENTER:
-        msg = f"⚪ 優勢不足 edge={final_edge:.4f}<{EDGE_ENTER:.4f}"
-        reason_parts.append(msg)
+        reason_parts.append(f"⚪ 優勢不足 edge={final_edge:.4f}<{EDGE_ENTER:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
 
     if QUIET_SMALLEdge and final_edge < (EDGE_ENTER * 1.2):
-        msg = f"⚪ 邊際略優(quiet) edge={final_edge:.4f} < {EDGE_ENTER*1.2:.4f}"
-        reason_parts.append(msg)
+        reason_parts.append(f"⚪ 邊際略優(quiet) edge={final_edge:.4f}<{EDGE_ENTER*1.2:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
 
-    # ------- 配注（線性，env 可控） -------
+    # ------- 配注（線性） -------
     min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
     max_edge = max(EDGE_ENTER + 1e-6, MAX_EDGE_SCALE)
@@ -433,7 +438,6 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         f"莊：{b_pct_txt}",
         f"和：{prob[2] * 100:.2f}%",
     ]
-    # 改善：觀望時不要顯示「建議下注：0」
     if choice == "觀望":
         block.append("本次預測結果：觀望")
         block.append("建議觀望（不下注）")
@@ -538,10 +542,13 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
             except Exception as e:
                 log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
-        choice, edge, bet_pct, reason = decide_only_bp(p)
+        # 新增：決策與顯示統一使用 smooth 後的機率
+        p_use = smooth_probs(p)
+
+        choice, edge, bet_pct, reason = decide_only_bp(p_use)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
-        msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+        msg = format_output_card(p_use, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         _reply(reply_token, msg)
 
         if LOG_DECISION or SHOW_CONF_DEBUG:
@@ -694,8 +701,8 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE)
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, THEO_BLEND=%.3f)",
+             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE, THEO_BLEND)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
