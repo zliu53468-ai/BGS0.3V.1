@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""server.py — Updated version for independent round predictions (no trend memory)"""
+"""server.py — Updated version for independent round predictions (no trend memory)
+Patched by ChatGPT:
+- 新增以環境變數控制的觀望守門與配注上下限
+- 新增可讀的 debug 決策資訊
+- 觀望時的輸出改為「建議觀望（不下注）」
+"""
 import os
 import sys
 import logging
@@ -49,7 +54,7 @@ except Exception:
     def CORS(app): return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-04"
+VERSION = "bgs-independent-2025-10-04+patched-obs-watch-sizer"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -192,7 +197,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     return None
 
 # ---------- 永久試用鎖（綁 LINE user_id） ----------
-TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))  # 你可改成 30；預設 30 分鐘
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))  # 預設 30 分鐘
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
@@ -308,16 +313,30 @@ if not pf_initialized:
     pf_initialized = True
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
-# ---------- 決策參數 ----------
+# ---------- 決策參數（原有） ----------
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
-USE_KELLY = env_flag("USE_KELLY", 0)
+USE_KELLY = env_flag("USE_KELLY", 0)  # 目前沒用到（保留相容）
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
-# 新增：決策模式與參數
+# 決策模式與參數（原有）
 DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()  # ev | prob | hybrid
 BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))  # 莊抽水
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))      # hybrid 門檻
-MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))       # 需達到此 EV 才採用 EV 決策（配合 hybrid 用）
+MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))       # hybrid EV 子門檻
+
+# ---------- 新增：可用環境變數控制的守門與配注 ----------
+# 信心門檻（用勝率大者當簡易 conf；若你以後有更精細 conf，可替換）
+MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))  # 低於此一律觀望
+QUIET_SMALLEdge   = env_flag("QUIET_SMALLEdge", 0)                   # 邊際略優也觀望
+
+# 配注上下限（百分比），與 edge 線性映射終點（滿格 edge）
+MIN_BET_PCT_ENV   = float(os.getenv("MIN_BET_PCT", "0.05"))          # 5%
+MAX_BET_PCT_ENV   = float(os.getenv("MAX_BET_PCT", "0.40"))          # 40%
+MAX_EDGE_SCALE    = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15")) # 當 final_edge 到這裡給滿注
+
+# Debug 日誌控制
+SHOW_CONF_DEBUG   = env_flag("SHOW_CONF_DEBUG", 1)
+LOG_DECISION      = env_flag("LOG_DECISION", 1)
 
 INV = {0: "莊", 1: "閒"}
 
@@ -337,14 +356,16 @@ def _decide_side_by_prob(pB: float, pP: float) -> int:
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
+
     # 平滑（與理論混合）
     theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
     sm = 0.7 * np.array([pB, pP, pT]) + 0.3 * theo
     sm = sm / sm.sum()
     pB, pP, pT = float(sm[0]), float(sm[1]), float(sm[2])
 
-    # 三種決策模式
-    reason_parts = []
+    reason_parts: List[str] = []
+
+    # 三種決策模式，計算最終邊際(final_edge)與 side
     if DECISION_MODE == "prob":
         side = _decide_side_by_prob(pB, pP)
         ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
@@ -370,16 +391,34 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason_parts.append(f"模式=ev (EV_B={evB:.4f}, EV_P={evP:.4f}, payout={BANKER_PAYOUT})")
 
-    if final_edge < EDGE_ENTER:
-        return ("觀望", final_edge, 0.0, "⚪ 優勢不足; " + ", ".join(reason_parts))
+    # ------- 最終觀望守門（env 可控） -------
+    # 簡易信心：取勝率較大者（若你將來有 conf，替換掉此行即可）
+    conf = max(pB, pP)
 
-    # 信心度配注（5%~40%）
-    max_edge = 0.15
-    min_b = 0.05
-    max_b = 0.40
+    if conf < MIN_CONF_FOR_ENTRY:
+        msg = f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.2f}"
+        reason_parts.append(msg)
+        return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
+
+    if final_edge < EDGE_ENTER:
+        msg = f"⚪ 優勢不足 edge={final_edge:.4f}<{EDGE_ENTER:.4f}"
+        reason_parts.append(msg)
+        return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
+
+    if QUIET_SMALLEdge and final_edge < (EDGE_ENTER * 1.2):
+        msg = f"⚪ 邊際略優(quiet) edge={final_edge:.4f} < {EDGE_ENTER*1.2:.4f}"
+        reason_parts.append(msg)
+        return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
+
+    # ------- 配注（線性，env 可控） -------
+    min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
+    max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
+    max_edge = max(EDGE_ENTER + 1e-6, MAX_EDGE_SCALE)
+
     bet_pct = min_b + (max_b - min_b) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
-    reason_parts.append(f"信心度配注({int(min_b*100)}%~{int(max_b*100)}%)")
+
+    reason_parts.append(f"信心度配注({int(min_b*100)}%~{int(max_b*100)}%), conf={conf:.3f}")
     return (INV[side], final_edge, bet_pct, "; ".join(reason_parts))
 
 def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
@@ -393,9 +432,15 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         f"閒：{p_pct_txt}",
         f"莊：{b_pct_txt}",
         f"和：{prob[2] * 100:.2f}%",
-        f"本次預測結果：{choice}",
-        f"建議下注：{bet_amt:,}",
     ]
+    # 改善：觀望時不要顯示「建議下注：0」
+    if choice == "觀望":
+        block.append("本次預測結果：觀望")
+        block.append("建議觀望（不下注）")
+    else:
+        block.append(f"本次預測結果：{choice}")
+        block.append(f"建議下注：{bet_amt:,}")
+
     if cont:
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
@@ -498,7 +543,10 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         bet_amt = bet_amount(bankroll_now, bet_pct)
         msg = format_output_card(p, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         _reply(reply_token, msg)
-        log.info("決策: %s edge=%.4f pct=%.2f%% | %s", choice, edge, bet_pct*100, reason)
+
+        if LOG_DECISION or SHOW_CONF_DEBUG:
+            log.info("決策: %s edge=%.4f pct=%.2f%% | %s", choice, edge, bet_pct*100, reason)
+
         log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
     except Exception as e:
         log.error("預測過程中錯誤: %s", e)
@@ -508,6 +556,8 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         sess["phase"] = "await_pts"
 
 # ---- LINE Handler / Webhook ----
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
         from linebot import LineBotApi, WebhookHandler
