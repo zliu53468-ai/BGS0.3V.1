@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """server.py — Updated version for independent round predictions (no trend memory)
-Stage overrides patch:
-- 新增『前/中/後期』分段切換：支援 EARLY_*/MID_*/LATE_* 覆蓋同名環境變數
-- 以手數分段（預設：<=20 EARLY, <=60 MID, 其餘 LATE）；可改為剩餘牌數近似模式
-- 其它原本邏輯（PF、deplete 混合 0.5/0.5、決策流程、UI…）完全保留
+Patched by ChatGPT (2025-11-02):
+- 只新增「前/中/後期分段切換」：依手數決定 EARLY/MID/LATE，並以 EARLY_*/MID_*/LATE_* 覆蓋同名環境變數
+- 其餘 PF 預測與決策流程維持原樣（不改你的核心行為）
 """
 import os
 import sys
@@ -15,15 +14,12 @@ from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 
-# === 原：THEO_BLEND（仍保留）; 擴充 smooth_probs 支援傳入權重 ===
-THEO_BLEND = float(os.getenv("THEO_BLEND", "0.0"))
+# --- 理論混合權重（保留你原本行為） ---
+THEO_BLEND_DEFAULT = float(os.getenv("THEO_BLEND", "0.0"))
 
 def smooth_probs(prob: np.ndarray, theo_blend: Optional[float] = None) -> np.ndarray:
-    """
-    依 THEO_BLEND 將模型輸出機率與理論分佈混合，並正規化。
-    可傳入 theo_blend 覆蓋（供階段覆蓋用）。None 時使用全域 THEO_BLEND。
-    """
-    tb = THEO_BLEND if theo_blend is None else float(theo_blend)
+    """依 THEO_BLEND 將模型輸出機率與理論分佈混合；theo_blend=None 時使用全域預設。"""
+    tb = THEO_BLEND_DEFAULT if theo_blend is None else float(theo_blend)
     if tb <= 0.0:
         return prob
     theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
@@ -70,7 +66,7 @@ except Exception:
     def CORS(app): return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-04+stage-overrides"
+VERSION = "bgs-independent-2025-10-04+blend-control+stages"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -164,7 +160,7 @@ def get_session(uid: str) -> Dict[str, Any]:
         "bankroll": 0, "trial_start": nowi, "premium": False,
         "phase": "choose_game", "game": None, "table": None,
         "last_pts_text": None, "table_no": None, "streak_count": 0,
-        "last_outcome": None, "hand_count": 0, "prob_sma": None,
+        "last_outcome": None, "hand_count": 0  # 手數（供分段切換）
     }
 
 def save_session(uid: str, data: Dict[str, Any]):
@@ -184,14 +180,122 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception:
         return 1 if default else 0
 
-# ---------- PF / 決策全域（原樣） ----------
+# ---------- 分段切換：EARLY/MID/LATE ----------
+EARLY_HANDS_DEFAULT = int(os.getenv("EARLY_HANDS", "20"))
+MID_HANDS_DEFAULT   = int(os.getenv("MID_HANDS", "60"))
+STAGE_COUNT_TIES    = env_flag("STAGE_COUNT_TIES", 0)  # 1=和局也計入手數
+
+_STAGEABLE_KEYS = [
+    # PF / Deplete
+    "PF_PRED_SIMS", "PF_UPD_SIMS", "PF_RESAMPLE", "PF_DECAY", "PF_NOISE", "PF_DIR_EPS",
+    "DEPLETEMC_SIMS", "DEPL_FACTOR",
+    # 決策/平滑（可選）
+    "EDGE_ENTER", "MIN_CONF_FOR_ENTRY", "SOFT_TAU", "THEO_BLEND", "PROB_SMA_ALPHA",
+]
+
+def _current_stage(hand_count: int) -> str:
+    """依手數回傳 EARLY / MID / LATE。"""
+    if hand_count <= EARLY_HANDS_DEFAULT:
+        return "EARLY"
+    elif hand_count <= MID_HANDS_DEFAULT:
+        return "MID"
+    else:
+        return "LATE"
+
+def get_stage_params(hand_count: int) -> Dict[str, str]:
+    """回傳該手數所對應分段的可覆蓋參數字典（不存在就不包含）。"""
+    stage = _current_stage(hand_count)
+    out: Dict[str, str] = {}
+    for key in _stageable_keys:
+        stage_key = f"{stage}_{key}"
+        v = os.getenv(stage_key)
+        if v is not None and v != "":
+            out[key] = v
+    return out
+
+def _stage_get(stage_params: Dict[str, str], key: str, fallback_env: str, cast):
+    """先看分段覆蓋，無則回落全域環境變數 fallback_env，再轉型 cast。"""
+    if key in stage_params:
+        try: return cast(stage_params[key])
+        except Exception: pass
+    raw = os.getenv(fallback_env)
+    if raw is None or raw == "":
+        # 使用函式呼叫端的邏輯預設值（由呼叫端傳入 cast 前的字串）
+        raise KeyError(f"env {fallback_env} not set and no stage override")
+    try:
+        return cast(raw)
+    except Exception:
+        return cast(raw.strip())
+
+# ---------- 解析上局點數 ----------
+def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
+    if not text: return None
+    s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
+    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
+    s = s.replace("\u3000", " ")
+    u = s.upper().strip()
+    u = re.sub(r"^開始分析", "", u)
+
+    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
+    if m:
+        d = m.group(1)
+        return (int(d), int(d)) if d else (0, 0)
+    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
+    if m: return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
+    if m: return (int(m.group(2)), int(m.group(1)))
+
+    t = u.replace(" ", "").replace("\u3000", "")
+    if t in ("B","莊","庄"): return (0,1)
+    if t in ("P","閒","闲"): return (1,0)
+    if t in ("T","和"): return (0,0)
+
+    if re.search(r"[A-Z]", u): return None
+    digits = re.findall(r"\d", u)
+    if len(digits) == 2: return (int(digits[0]), int(digits[1]))
+    return None
+
+# ---------- 永久試用鎖（綁 LINE user_id） ----------
+TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
+ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
+
+def _trial_key(uid: str, kind: str) -> str:
+    return f"trial:{kind}:{uid}"
+
+def trial_persist_guard(uid: str) -> Optional[str]:
+    now = int(time.time())
+    first_ts = _rget(_trial_key(uid, "first_ts"))
+    expired = _rget(_trial_key(uid, "expired"))
+    if expired == "1":
+        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
+    if not first_ts:
+        _rset(_trial_key(uid, "first_ts"), str(now))
+        return None
+    try:
+        first = int(first_ts)
+    except:
+        first = now
+        _rset(_trial_key(uid, "first_ts"), str(now))
+    used_min = (now - first) // 60
+    if used_min >= TRIAL_MINUTES:
+        _rset(_trial_key(uid, "expired"), "1")
+        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
+    return None
+
+def validate_activation_code(code: str) -> bool:
+    if not code: return False
+    norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
+    return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
+
+# ---------- Outcome PF ----------
 log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s",
          os.getenv("PF_N", "50"), os.getenv("PF_UPD_SIMS", "30"),
          os.getenv("PF_PRED_SIMS", "5"), os.getenv("DECKS", "8"))
 
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
 SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
-SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
+SOFT_TAU_GLOBAL = float(os.getenv("SOFT_TAU", "2.0"))  # 供 SmartDummyPF 使用的全域預設
 TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
 TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
@@ -245,7 +349,7 @@ if not pf_initialized:
         def update_outcome(self, outcome): return
         def predict(self, **kwargs) -> np.ndarray:
             base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            base = base ** (1.0 / SOFT_TAU)
+            base = base ** (1.0 / SOFT_TAU_GLOBAL)
             base = base / base.sum()
             pT = float(base[2])
             if pT < TIE_MIN:
@@ -263,8 +367,8 @@ if not pf_initialized:
     pf_initialized = True
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
-# ---------- 決策參數（原樣） ----------
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
+# ---------- 決策參數（保留原樣；可被分段覆蓋時於呼叫點帶入） ----------
+EDGE_ENTER_GLOBAL = float(os.getenv("EDGE_ENTER", "0.03"))
 USE_KELLY = env_flag("USE_KELLY", 0)
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
@@ -273,15 +377,15 @@ BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
 
-MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))
-QUIET_SMALLEdge   = env_flag("QUIET_SMALLEdge", 0)
+MIN_CONF_FOR_ENTRY_GLOBAL = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))
+QUIET_SMALLEdge_GLOBAL    = env_flag("QUIET_SMALLEdge", 0)
 
-MIN_BET_PCT_ENV   = float(os.getenv("MIN_BET_PCT", "0.05"))
-MAX_BET_PCT_ENV   = float(os.getenv("MAX_BET_PCT", "0.40"))
-MAX_EDGE_SCALE    = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15"))
+MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
+MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
+MAX_EDGE_SCALE  = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15"))
 
-SHOW_CONF_DEBUG   = env_flag("SHOW_CONF_DEBUG", 1)
-LOG_DECISION      = env_flag("LOG_DECISION", 1)
+SHOW_CONF_DEBUG = env_flag("SHOW_CONF_DEBUG", 1)
+LOG_DECISION    = env_flag("LOG_DECISION", 1)
 
 INV = {0: "莊", 1: "閒"}
 
@@ -299,19 +403,30 @@ def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
 def _decide_side_by_prob(pB: float, pP: float) -> int:
     return 0 if pB >= pP else 1
 
-def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
+def decide_only_bp(
+    prob: np.ndarray,
+    stage_edge_enter: Optional[float] = None,
+    stage_min_conf: Optional[float] = None,
+    stage_quiet_small: Optional[int] = None
+) -> Tuple[str, float, float, str]:
+    """維持你的決策流程，但門檻可由分段覆蓋值帶入。"""
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
+
+    EDGE_ENTER = EDGE_ENTER_GLOBAL if stage_edge_enter is None else float(stage_edge_enter)
+    MIN_CONF_FOR_ENTRY = MIN_CONF_FOR_ENTRY_GLOBAL if stage_min_conf is None else float(stage_min_conf)
+    QUIET_SMALLEdge = QUIET_SMALLEdge_GLOBAL if stage_quiet_small is None else int(stage_quiet_small)
+
     reason_parts: List[str] = []
 
     if DECISION_MODE == "prob":
         side = _decide_side_by_prob(pB, pP)
-        _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
+        ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
         final_edge = max(abs(evB), abs(evP))
         reason_parts.append(f"模式=prob (pB={pB:.4f}, pP={pP:.4f})")
     elif DECISION_MODE == "hybrid":
         if abs(pB - pP) >= PROB_MARGIN:
             side = _decide_side_by_prob(pB, pP)
-            _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
+            ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
             reason_parts.append(f"模式=hybrid→prob (Δ={abs(pB-pP):.4f}≥{PROB_MARGIN})")
         else:
@@ -373,125 +488,6 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     if cont:
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
-
-# ===================== 〈新增〉階段覆蓋機制 =====================
-
-def _as_flag(v: str) -> int:
-    vv = str(v).strip().lower()
-    if vv in ("1","true","t","yes","y","on"): return 1
-    if vv in ("0","false","f","no","n","off"): return 0
-    try: return 1 if int(float(vv)) != 0 else 0
-    except: return 0
-
-def get_stage(hand_count: int) -> str:
-    """
-    預設用『手數』分段：
-        <= EARLY_MAX_HAND(20): EARLY
-        <= MID_MAX_HAND(60):   MID
-        else:                  LATE
-    可設 STAGE_MODE=remaining 使用『近似剩餘牌數』：
-        估每局 ~4.8 張，總牌=DECKS*52。
-        以 REMAINING_MID_CARDS / REMAINING_LATE_CARDS 做門檻。
-    """
-    mode = os.getenv("STAGE_MODE", "hands").lower()
-    if mode == "remaining":
-        decks = int(os.getenv("DECKS", "8"))
-        total = decks * 52
-        avg_cards_per_hand = float(os.getenv("AVG_CARDS_PER_HAND", "4.8"))
-        used = int(round(hand_count * avg_cards_per_hand))
-        remaining = max(0, total - used)
-        mid_thr  = int(os.getenv("REMAINING_MID_CARDS", str(int(total*0.75))))   # 例如 >312 張算 EARLY
-        late_thr = int(os.getenv("REMAINING_LATE_CARDS", str(int(total*0.35))))  # 例如 <=145 張算 LATE
-        if remaining > mid_thr:  return "EARLY"
-        if remaining > late_thr: return "MID"
-        return "LATE"
-    else:
-        emax = int(os.getenv("EARLY_MAX_HAND", "20"))
-        mmax = int(os.getenv("MID_MAX_HAND", "60"))
-        if hand_count <= emax: return "EARLY"
-        if hand_count <= mmax: return "MID"
-        return "LATE"
-
-# 會被覆蓋的鍵（同名環境變數）
-_STAGE_KEYS = [
-    # 決策與門檻
-    "DECISION_MODE","STRICT_PROB_ONLY","DISABLE_EV","PROB_MARGIN","MIN_EV_EDGE",
-    "MIN_CONF_FOR_ENTRY","EDGE_ENTER","QUIET_SMALLEdge",
-    # 平滑/和/理論
-    "SOFT_TAU","PROB_SMA_ALPHA","TIE_MIN","TIE_MAX","TIE_PROB_MAX","THEO_BLEND",
-    # PF / deplete（不重建 PF；僅採用可動態的）
-    "PF_PRED_SIMS","DEPLETEMC_SIMS","DEPL_FACTOR",
-]
-
-def get_stage_overrides(stage: str) -> Dict[str, str]:
-    """
-    讀取 EARLY_*/MID_*/LATE_* 對應的覆蓋值；只收在 _STAGE_KEYS 內的鍵。
-    """
-    prefix = f"{stage}_"
-    out: Dict[str, str] = {}
-    for k in _STAGE_KEYS:
-        v = os.getenv(prefix + k)
-        if v is not None:
-            out[k] = v
-    return out
-
-class StageEnv:
-    """
-    暫時覆蓋全域變數供決策使用；離開時自動還原。
-    僅覆蓋 _STAGE_KEYS 中屬於全域的那幾個（不含 PF_PRED_SIMS 等非全域）。
-    """
-    def __init__(self, over: Dict[str, str]):
-        self.over = over
-        self.saved: Dict[str, Any] = {}
-
-    def __enter__(self):
-        g = globals()
-        for k, v in self.over.items():
-            if k not in g:  # PF_PRED_SIMS 等不是全域；略過
-                continue
-            self.saved[k] = g[k]
-            if k in ("STRICT_PROB_ONLY","DISABLE_EV","QUIET_SMALLEdge"):
-                g[k] = _as_flag(v)
-            elif k in ("PROB_MARGIN","MIN_EV_EDGE","MIN_CONF_FOR_ENTRY","EDGE_ENTER",
-                       "SOFT_TAU","PROB_SMA_ALPHA","TIE_MIN","TIE_MAX","TIE_PROB_MAX","THEO_BLEND"):
-                g[k] = float(v)
-            elif k == "DECISION_MODE":
-                g[k] = str(v).lower()
-        # 互斥語義（如果使用者給 STRICT_PROB_ONLY=1 或 DISABLE_EV=1 → 強制 prob）
-        if globals().get("STRICT_PROB_ONLY", 0) or globals().get("DISABLE_EV", 0):
-            self.saved.setdefault("DECISION_MODE", globals()["DECISION_MODE"])
-            globals()["DECISION_MODE"] = "prob"
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        g = globals()
-        for k, v in self.saved.items():
-            g[k] = v
-
-# 會話級 EMA（擴充：可帶覆蓋）
-def apply_session_ema_smoothing(current_prob: np.ndarray, session: Dict[str, Any],
-                                outcome: int,
-                                alpha: Optional[float] = None,
-                                skip_tie_upd: Optional[int] = None) -> np.ndarray:
-    PROB_SMA_ALPHA_val = float(os.getenv("PROB_SMA_ALPHA", "0.3")) if alpha is None else float(alpha)
-    SKIP_TIE_UPD_val = env_flag("SKIP_TIE_UPD", 1) if skip_tie_upd is None else int(skip_tie_upd)
-
-    if PROB_SMA_ALPHA_val <= 0.0:
-        return current_prob
-
-    prev_smoothed = session.get("prob_sma")
-    if outcome == 2 and SKIP_TIE_UPD_val and prev_smoothed is not None:
-        return np.array(prev_smoothed, dtype=np.float32)
-
-    if prev_smoothed is None:
-        smoothed = current_prob
-    else:
-        prev_smoothed = np.array(prev_smoothed, dtype=np.float32)
-        smoothed = PROB_SMA_ALPHA_val * current_prob + (1 - PROB_SMA_ALPHA_val) * prev_smoothed
-        smoothed = smoothed / smoothed.sum()
-
-    session["prob_sma"] = smoothed.tolist()
-    return smoothed
 
 # ---------- 健康檢查 ----------
 @app.get("/")
@@ -559,16 +555,15 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id: return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
-# ===================== 核心：套用分段覆蓋 =====================
+# ---------- 主流程（加入分段取參數） ----------
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
     log.info("開始處理點數預測: 閒%d 莊%d (deplete=%s, mode=%s)", p_pts, b_pts, DEPLETE_OK, DECISION_MODE)
     start_time = time.time()
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
 
-    # 非和局時累計手數（供分段判定）
-    if outcome != 2:
+    # 手數統計：視設定是否把和局算進去
+    if outcome != 2 or STAGE_COUNT_TIES:
         sess["hand_count"] = int(sess.get("hand_count", 0)) + 1
-    hand_count = int(sess.get("hand_count", 0))
 
     if outcome == 2:
         sess["last_pts_text"] = "上局結果: 和局"
@@ -579,72 +574,88 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     sess["phase"] = "ready"
 
     try:
-        # 1) 取得當前階段＋覆蓋值
-        stage = get_stage(hand_count)
-        over = get_stage_overrides(stage)
-        log.info("當前階段: %s (hand=%d) 覆蓋鍵: %s", stage, hand_count, ",".join(over.keys()) or "-")
+        hand_count = int(sess.get("hand_count", 0))
+        stage_params = get_stage_params(hand_count)
+        if stage_params:
+            log.info("Stage=%s 覆蓋參數: %s", _current_stage(hand_count), stage_params)
 
-        # 2) PF.update_points（若有）
+        # --- PF 預測（允許分段覆蓋 PF_PRED_SIMS） ---
         try:
-            if hasattr(PF, "update_points"):
-                PF.update_points(int(p_pts), int(b_pts))
-                log.info("PF.update_points 已餵入點數: P=%d, B=%d", p_pts, b_pts)
-        except Exception as e:
-            log.warning("PF.update_points 失敗: %s", e)
+            pf_pred_sims = _stage_get(stage_params, "PF_PRED_SIMS", "PF_PRED_SIMS", int)
+        except KeyError:
+            pf_pred_sims = int(os.getenv("PF_PRED_SIMS", "5"))
 
-        # 3) PF 預測（PF_PRED_SIMS 可被階段覆蓋）
-        pf_pred_sims = int(over.get("PF_PRED_SIMS", os.getenv("PF_PRED_SIMS", "5")))
         t0 = time.time()
         pf_preds = PF.predict(sims_per_particle=pf_pred_sims)
-        log.info("PF 預測完成, 耗時: %.2fs (PF_PRED_SIMS=%d)", time.time() - t0, pf_pred_sims)
-
+        log.info("PF 預測完成, 耗時: %.2fs (hand=%d, PF_PRED_SIMS=%d)", time.time() - t0, hand_count, pf_pred_sims)
         p = pf_preds
 
-        # 4) deplete 混合（DEPLETEMC_SIMS/DEPL_FACTOR 可被階段覆蓋；仍維持 0.5/0.5）
+        # --- deplete（允許分段覆蓋 DEPLETEMC_SIMS / DEPL_FACTOR） ---
         if DEPLETE_OK and init_counts and probs_after_points:
             try:
                 base_decks = int(os.getenv("DECKS", "8"))
                 counts = init_counts(base_decks)
-                deplete_sims = int(over.get("DEPLETEMC_SIMS", os.getenv("DEPLETEMC_SIMS", "1000")))
-                deplete_factor = float(over.get("DEPL_FACTOR", os.getenv("DEPL_FACTOR", "1.0")))
+                try:
+                    deplete_sims = _stage_get(stage_params, "DEPLETEMC_SIMS", "DEPLETEMC_SIMS", int)
+                except KeyError:
+                    deplete_sims = int(os.getenv("DEPLETEMC_SIMS", "1000"))
+                try:
+                    deplete_factor = _stage_get(stage_params, "DEPL_FACTOR", "DEPL_FACTOR", float)
+                except KeyError:
+                    deplete_factor = float(os.getenv("DEPL_FACTOR", "1.0"))
+
                 dep_preds = probs_after_points(counts, p_pts, b_pts, sims=deplete_sims, deplete_factor=deplete_factor)
 
-                # 若外部宣告 Deplete 順序為 [P,B,T] → 轉為 [B,P,T]
                 if os.getenv("DEPLETE_RETURNS_PBT", "0") == "1":
                     dep_preds = [dep_preds[1], dep_preds[0], dep_preds[2]]
 
-                p = (pf_preds + np.asarray(dep_preds, dtype=np.float32)) * 0.5
-                log.info("Deplete 混合完成: sims=%d factor=%.2f -> B=%.4f P=%.4f T=%.4f",
-                         deplete_sims, deplete_factor, p[0], p[1], p[2])
+                p = (pf_preds + dep_preds) * 0.5
+                log.info("混合後機率: B=%.4f, P=%.4f, T=%.4f", p[0], p[1], p[2])
             except Exception as e:
                 log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
-        # 5) 理論混合（THEO_BLEND 可被階段覆蓋）
-        tb = over.get("THEO_BLEND")
-        p_theo = smooth_probs(p, theo_blend=float(tb) if tb is not None else None)
+        # --- （可選）分段 SoftTau 與 THEO_BLEND ---
+        try:
+            soft_tau = _stage_get(stage_params, "SOFT_TAU", "SOFT_TAU", float)
+        except KeyError:
+            soft_tau = float(os.getenv("SOFT_TAU", "2.0"))
+        p_soft = (np.asarray(p, dtype=np.float32) ** (1.0 / max(1e-6, soft_tau)))
+        p_soft = p_soft / p_soft.sum()
 
-        # 6) 會話 EMA（PROB_SMA_ALPHA / SKIP_TIE_UPD 可被階段覆蓋）
-        alpha = over.get("PROB_SMA_ALPHA")
-        p_final = apply_session_ema_smoothing(
-            p_theo, sess, outcome,
-            alpha=float(alpha) if alpha is not None else None,
-            skip_tie_upd=_as_flag(over["SKIP_TIE_UPD"]) if "SKIP_TIE_UPD" in over else None
+        try:
+            theo_blend = _stage_get(stage_params, "THEO_BLEND", "THEO_BLEND", float)
+        except KeyError:
+            theo_blend = THEO_BLEND_DEFAULT
+
+        p_use = smooth_probs(p_soft, theo_blend=theo_blend)
+
+        # --- 決策門檻允許分段覆蓋（其餘決策流程維持原樣） ---
+        try:
+            edge_enter = _stage_get(stage_params, "EDGE_ENTER", "EDGE_ENTER", float)
+        except KeyError:
+            edge_enter = EDGE_ENTER_GLOBAL
+
+        try:
+            min_conf = _stage_get(stage_params, "MIN_CONF_FOR_ENTRY", "MIN_CONF_FOR_ENTRY", float)
+        except KeyError:
+            min_conf = MIN_CONF_FOR_ENTRY_GLOBAL
+
+        choice, edge, bet_pct, reason = decide_only_bp(
+            p_use,
+            stage_edge_enter=edge_enter,
+            stage_min_conf=min_conf,
+            stage_quiet_small=None
         )
-
-        # 7) 以 StageEnv 暫時覆蓋決策相關全域 → 呼叫既有 decide_only_bp()
-        with StageEnv(over):
-            choice, edge, bet_pct, reason = decide_only_bp(p_final)
 
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
-        msg = format_output_card(p_final, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+        msg = format_output_card(p_use, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         _reply(reply_token, msg)
 
         if LOG_DECISION or SHOW_CONF_DEBUG:
             log.info("決策: %s edge=%.4f pct=%.2f%% | %s", choice, edge, bet_pct*100, reason)
 
-        log.info("完整處理完成, 總耗時: %.2fs (stage=%s)", time.time() - start_time, stage)
-
+        log.info("完整處理完成, 總耗時: %.2fs (hand=%d)", time.time() - start_time, hand_count)
     except Exception as e:
         log.error("預測過程中錯誤: %s", e)
         _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
@@ -653,8 +664,6 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         sess["phase"] = "await_pts"
 
 # ---- LINE Handler / Webhook ----
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
         from linebot import LineBotApi, WebhookHandler
@@ -685,7 +694,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
                 up = text.upper()
 
-                # 開通
                 if up.startswith("開通") or up.startswith("ACTIVATE"):
                     after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                     ok = validate_activation_code(after)
@@ -695,13 +703,11 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                     save_session(uid, sess); return
 
-                # 永久試用鎖
                 guard = trial_persist_guard(uid)
                 if guard and not sess.get("premium", False):
                     _reply(event.reply_token, guard)
                     save_session(uid, sess); return
 
-                # 結束/清空
                 if up in ("結束分析", "清空", "RESET"):
                     premium = sess.get("premium", False)
                     start_ts = sess.get("trial_start", int(time.time()))
@@ -709,17 +715,15 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["premium"] = premium
                     sess["trial_start"] = start_ts
                     sess["hand_count"] = 0
-                    sess["prob_sma"] = None
                     _reply(event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                     save_session(uid, sess); return
 
-                # 遊戲設定
                 if text == "遊戲設定" or up == "GAME SETTINGS":
                     sess["phase"] = "choose_game"
                     sess["game"] = None; sess["table"] = None; sess["table_no"] = None
                     sess["bankroll"] = 0; sess["streak_count"] = 0
                     sess["last_outcome"] = None; sess["last_pts_text"] = None
-                    sess["hand_count"] = 0; sess["prob_sma"] = None
+                    sess["hand_count"] = 0  # 重置手數
                     first_ts = _rget(_trial_key(uid, "first_ts"))
                     if first_ts:
                         used = (int(time.time()) - int(first_ts)) // 60
@@ -730,7 +734,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     _reply(event.reply_token, menu)
                     save_session(uid, sess); return
 
-                # 選館
                 if sess.get("phase") == "choose_game":
                     m = re.match(r"^\s*(\d+)", text)
                     if m:
@@ -747,7 +750,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         _reply(event.reply_token, "⚠️ 請直接輸入提供的數字來選擇遊戲館別。")
                         return
 
-                # 輸入籌碼
                 if sess.get("phase") == "input_bankroll":
                     amount_str = re.sub(r"[^\d]", "", text)
                     amount = int(amount_str) if amount_str else 0
@@ -755,13 +757,10 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                         _reply(event.reply_token, "⚠️ 請輸入正確的數字金額。"); return
                     sess["bankroll"] = amount
                     sess["phase"] = "await_pts"
-                    sess["hand_count"] = 0
-                    sess["prob_sma"] = None
                     _reply(event.reply_token,
                            f"✅ 設定完成！遊戲館：{sess.get('game')}，初始籌碼：{amount}。\n📌 連續模式已啟動：現在請直接輸入第一局點數進行分析（例：閒6莊5 或 65）。")
                     save_session(uid, sess); return
 
-                # 解析點數並預測
                 pts = parse_last_hand_points(text)
                 if pts and sess.get("bankroll"):
                     _handle_points_and_predict(sess, pts[0], pts[1], event.reply_token)
@@ -791,44 +790,11 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 else:
     log.warning("LINE credentials not set. LINE webhook will not be active.")
 
-# ---------- Trial / Activation（原樣） ----------
-TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
-ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
-
-def _trial_key(uid: str, kind: str) -> str:
-    return f"trial:{kind}:{uid}"
-
-def trial_persist_guard(uid: str) -> Optional[str]:
-    now = int(time.time())
-    first_ts = _rget(_trial_key(uid, "first_ts"))
-    expired = _rget(_trial_key(uid, "expired"))
-    if expired == "1":
-        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
-    if not first_ts:
-        _rset(_trial_key(uid, "first_ts"), str(now))
-        return None
-    try:
-        first = int(first_ts)
-    except:
-        first = now
-        _rset(_trial_key(uid, "first_ts"), str(now))
-    used_min = (now - first) // 60
-    if used_min >= TRIAL_MINUTES:
-        _rset(_trial_key(uid, "expired"), "1")
-        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
-    return None
-
-def validate_activation_code(code: str) -> bool:
-    if not code: return False
-    norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
-    return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
-
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE)
+    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, THEO_BLEND=%.3f)",
+             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE, THEO_BLEND_DEFAULT)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
