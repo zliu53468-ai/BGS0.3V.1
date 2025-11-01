@@ -593,6 +593,10 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
         # 使用階段特定的 PF_PRED_SIMS
         pf_pred_sims = int(stage_params.get("PF_PRED_SIMS", os.getenv("PF_PRED_SIMS", "5")))
         pf_preds = PF.predict(sims_per_particle=pf_pred_sims)
+        
+        # ★ 新增：檢查 PF 原始機率
+        log.info("PF原始機率: 莊=%.4f, 閒=%.4f, 和=%.4f", pf_preds[0], pf_preds[1], pf_preds[2])
+        
         log.info("PF 預測完成, 耗時: %.2fs (手數: %d, 階段 PF_PRED_SIMS: %d)", 
                 time.time() - t0, hand_count, pf_pred_sims)
         
@@ -608,16 +612,27 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
                 deplete_factor = float(stage_params.get("DEPL_FACTOR", os.getenv("DEPL_FACTOR", "1.0")))
                 
                 dep_preds = probs_after_points(counts, p_pts, b_pts, sims=deplete_sims, deplete_factor=deplete_factor)
+                
+                # ★ 新增：Deplete 機率順序修正
+                if os.getenv("DEPLETE_RETURNS_PBT", "0") == "1":
+                    # 如果 Deplete 返回 [P, B, T] 順序，轉換為 [B, P, T]
+                    dep_preds = [dep_preds[1], dep_preds[0], dep_preds[2]]
+                    log.info("Deplete機率(修正後): 莊=%.4f, 閒=%.4f, 和=%.4f", dep_preds[0], dep_preds[1], dep_preds[2])
+                else:
+                    log.info("Deplete機率: 莊=%.4f, 閒=%.4f, 和=%.4f", dep_preds[0], dep_preds[1], dep_preds[2])
+                
                 p = (pf_preds + dep_preds) * 0.5
-                log.debug("使用 Deplete 混合預測: sims=%d, factor=%.2f", deplete_sims, deplete_factor)
+                log.info("混合後機率: 莊=%.4f, 閒=%.4f, 和=%.4f", p[0], p[1], p[2])
             except Exception as e:
                 log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
         # 理論混合平滑
         p_theo = smooth_probs(p)
+        log.info("理論混合後: 莊=%.4f, 閒=%.4f, 和=%.4f", p_theo[0], p_theo[1], p_theo[2])
         
         # 會話級 EMA 平滑
         p_final = apply_session_ema_smoothing(p_theo, sess, outcome)
+        log.info("EMA平滑後: 莊=%.4f, 閒=%.4f, 和=%.4f", p_final[0], p_final[1], p_final[2])
 
         choice, edge, bet_pct, reason = decide_only_bp(p_final)
         bankroll_now = int(sess.get("bankroll", 0))
