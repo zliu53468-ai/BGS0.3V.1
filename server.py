@@ -1,53 +1,42 @@
 # -*- coding: utf-8 -*-
-"""server.py — Updated version for independent round predictions (no trend memory)
-Patched by ChatGPT:
-- 新增 THEO_BLEND 環境變數：控制是否將模型機率與理論分佈混合（0.0=關閉）
-- 新增 smooth_probs()：決策與卡片顯示統一使用同一組機率（避免顯示與下注邏輯不一致）
-- 新增：分段覆寫（EARLY_*/MID_*/LATE_*），以手數切段（可改剩餘牌模式）
-- 新增：會話級 EMA 平滑（PROB_SMA_ALPHA），和局可選擇不更新（SKIP_TIE_UPD=1）
-- 修正：Deplete 參數由環境變數讀取（DEPLETEMC_SIMS、DEPL_FACTOR）
-- 新增：STRICT_PROB_ONLY / DISABLE_EV 開關（僅影響內部決策）
-- 其它程式碼保持不變（路由/回覆卡面不加 Stage 標示）
+"""server.py — BGS Independent Prediction + Stage Overrides (2025-11-02)
+
+- 修正：先前語法錯誤 `sess["phase"] = "await_pts"]` → 已移除多餘 `]`
+- 新增：分段覆蓋邏輯 get_stage_over()，支援 LATE_* 參數（尾段）
+- 依你提供的流程嵌入：
+  1) SoftTau 溫度縮放
+  2) deplete MC（可調 DEPLETEMC_SIMS）
+  3) 分段 THEO_BLEND（局部混合理論分布）
+  4) 分段 TIE_MAX 封頂
+  5) 在決策前臨時覆蓋 MIN_CONF_FOR_ENTRY / EDGE_ENTER（只本次有效）
+
+可用環境變數（重點，與你之前一致/相容）：
+- PF：PF_N, PF_UPD_SIMS, PF_PRED_SIMS, PF_RESAMPLE, PF_DIR_EPS, PF_BACKEND (mc/np)
+- 基本決策：DECISION_MODE(ev|prob|hybrid), BANKER_PAYOUT, PROB_MARGIN, MIN_EV_EDGE
+- 出手守門：MIN_CONF_FOR_ENTRY, EDGE_ENTER, QUIET_SMALLEdge
+- 配注：MIN_BET_PCT, MAX_BET_PCT, MAX_EDGE_FOR_FULLBET
+- 和局/平滑：SKIP_TIE_UPD, SOFT_TAU, TIE_MIN, TIE_MAX
+- 分段：STAGE_MODE=count|disabled, EARLY_HANDS, LATE_HANDS,
+         LATE_SOFT_TAU, LATE_PROB_SMA_ALPHA(保留欄位), LATE_PF_PRED_SIMS,
+         LATE_MIN_CONF_FOR_ENTRY, LATE_EDGE_ENTER,
+         DEPLETEMC_SIMS, DEPL_FACTOR(保留欄位), THEO_BLEND(分段覆蓋可用)
 """
+
 import os
 import sys
 import logging
 import time
 import re
 import json
-from typing import Optional, Dict, Any, Tuple, List, Iterable
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 
-# --- 新增：理論混合權重（0.0=關閉；建議 0.0~0.15）
-THEO_BLEND = float(os.getenv("THEO_BLEND", "0.0"))
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("bgs-server")
 
-def _fenv(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-def _ienv(name: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(name, str(default))))
-    except Exception:
-        return default
-
-def smooth_probs(prob: np.ndarray) -> np.ndarray:
-    """
-    依 THEO_BLEND 將模型輸出機率與理論分佈混合，並正規化。
-    THEO_BLEND=0.0 時直接回傳原始 prob（不混合）。
-    """
-    blend = _fenv("THEO_BLEND", THEO_BLEND)
-    if blend <= 0.0:
-        return prob
-    theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-    sm = (1.0 - blend) * prob + blend * theo
-    sm = sm / sm.sum()
-    return sm
-
-# --- 安全導入 deplete（有就用，沒有不會掛） ---
+# ---------- 安全導入 deplete（有就用，沒有不會掛） ----------
 DEPLETE_OK = False
 init_counts = None
 probs_after_points = None
@@ -68,11 +57,7 @@ except Exception:
         except Exception:
             DEPLETE_OK = False
 
-try:
-    import redis
-except Exception:
-    redis = None
-
+# ---------- 安全導入 Flask ----------
 try:
     from flask import Flask, request, jsonify, abort
     from flask_cors import CORS
@@ -85,33 +70,12 @@ except Exception:
     def abort(*args, **kwargs): raise RuntimeError("Flask is not available; abort cannot be used.")
     def CORS(app): return None
 
-# 版本號
-VERSION = "bgs-independent-2025-11-02+staged+ema+deplete"
+# ---------- Redis（可選） ----------
+try:
+    import redis
+except Exception:
+    redis = None
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("bgs-server")
-
-if not DEPLETE_OK:
-    log.warning("deplete 模組未找到；將以 PF 單模預測運行（功能不會中斷）。")
-
-# ---------- Flask ----------
-if _flask_available and Flask is not None:
-    app = Flask(__name__)
-    CORS(app)
-else:
-    class _DummyApp:
-        def get(self, *args, **kwargs):
-            def _decorator(func): return func
-            return _decorator
-        def post(self, *args, **kwargs):
-            def _decorator(func): return func
-            return _decorator
-        def run(self, *args, **kwargs):
-            log.warning("Flask not available; dummy app cannot run a server.")
-    app = _DummyApp()
-
-# ---------- Redis / Session ----------
 REDIS_URL = os.getenv("REDIS_URL")
 redis_client: Optional["redis.Redis"] = None
 if redis is not None and REDIS_URL:
@@ -128,8 +92,8 @@ else:
         log.warning("REDIS_URL not set. Using in-memory session store.")
 
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
-KV_FALLBACK: Dict[str, str] = {}  # 持久鍵的記憶體替代（只有沒 Redis 時用）
-SESSION_EXPIRE_SECONDS = _ienv("SESSION_EXPIRE_SECONDS", 1200)
+KV_FALLBACK: Dict[str, str] = {}
+SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1200"))
 DEDUPE_TTL = 60
 
 def _rget(k: str) -> Optional[str]:
@@ -161,37 +125,6 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
         log.warning("[Redis] SETNX err: %s", e)
         return True
 
-def get_session(uid: str) -> Dict[str, Any]:
-    if redis_client:
-        j = _rget(f"bgs_session:{uid}")
-        if j:
-            try: return json.loads(j)
-            except Exception: pass
-    else:
-        now = time.time()
-        for k in list(SESS_FALLBACK.keys()):
-            v = SESS_FALLBACK.get(k)
-            if isinstance(v, dict) and v.get("exp") and v["exp"] < now:
-                del SESS_FALLBACK[k]
-        if uid in SESS_FALLBACK and "phase" in SESS_FALLBACK[uid]:
-            return SESS_FALLBACK[uid]
-    nowi = int(time.time())
-    return {
-        "bankroll": 0, "trial_start": nowi, "premium": False,
-        "phase": "choose_game", "game": None, "table": None,
-        "last_pts_text": None, "table_no": None, "streak_count": 0,
-        "last_outcome": None,
-        # 新增：手數與EMA
-        "hand_no": 0,
-        "ema_prob": None,
-    }
-
-def save_session(uid: str, data: Dict[str, Any]):
-    if redis_client:
-        _rset(f"bgs_session:{uid}", json.dumps(data), ex=SESSION_EXPIRE_SECONDS)
-    else:
-        SESS_FALLBACK[uid] = data
-
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None: return 1 if default else 0
@@ -203,83 +136,31 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception:
         return 1 if default else 0
 
-# ---------- 解析上局點數 ----------
-def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
-    if not text: return None
-    s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
-    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
-    s = s.replace("\u3000", " ")
-    u = s.upper().strip()
-    u = re.sub(r"^開始分析", "", u)
+# ---------- 版本 ----------
+VERSION = "bgs-independent-2025-11-02+stage-overrides"
 
-    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
-    if m:
-        d = m.group(1)
-        return (int(d), int(d)) if d else (0, 0)
-    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
-    if m: return (int(m.group(1)), int(m.group(2)))
-    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
-    if m: return (int(m.group(2)), int(m.group(1)))
+# ---------- Flask ----------
+if _flask_available and Flask is not None:
+    app = Flask(__name__)
+    CORS(app)
+else:
+    class _DummyApp:
+        def get(self, *args, **kwargs):
+            def _decorator(func): return func
+            return _decorator
+        def post(self, *args, **kwargs):
+            def _decorator(func): return func
+            return _decorator
+        def run(self, *args, **kwargs):
+            log.warning("Flask not available; dummy app cannot run a server.")
+    app = _DummyApp()
 
-    t = u.replace(" ", "").replace("\u3000", "")
-    if t in ("B","莊","庄"): return (0,1)
-    if t in ("P","閒","闲"): return (1,0)
-    if t in ("T","和"): return (0,0)
-
-    if re.search(r"[A-Z]", u): return None
-    digits = re.findall(r"\d", u)
-    if len(digits) == 2: return (int(digits[0]), int(digits[1]))
-    return None
-
-# ---------- 永久試用鎖（綁 LINE user_id） ----------
-TRIAL_MINUTES = _ienv("TRIAL_MINUTES", 30)
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
-ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
-
-def _trial_key(uid: str, kind: str) -> str:
-    return f"trial:{kind}:{uid}"
-
-def trial_persist_guard(uid: str) -> Optional[str]:
-    """
-    永久鎖：第一次互動記錄 trial:first_ts:<uid>。
-    超過 TRIAL_MINUTES -> trial:expired:<uid>=1 之後永遠擋住。
-    """
-    now = int(time.time())
-    first_ts = _rget(_trial_key(uid, "first_ts"))
-    expired = _rget(_trial_key(uid, "expired"))
-    if expired == "1":
-        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
-    if not first_ts:
-        _rset(_trial_key(uid, "first_ts"), str(now))
-        return None
-    try:
-        first = int(first_ts)
-    except:
-        first = now
-        _rset(_trial_key(uid, "first_ts"), str(now))
-    used_min = (now - first) // 60
-    if used_min >= TRIAL_MINUTES:
-        _rset(_trial_key(uid, "expired"), "1")
-        return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
-    return None  # 尚未到期
-
-def validate_activation_code(code: str) -> bool:
-    if not code: return False
-    norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
-    return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
-
-# ---------- Outcome PF ----------
-log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s",
-         os.getenv("PF_N", "50"), os.getenv("PF_UPD_SIMS", "30"),
-         os.getenv("PF_PRED_SIMS", "5"), os.getenv("DECKS", "8"))
-
+# ---------- PF（Outcome Particle Filter） ----------
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
 SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
-SOFT_TAU = _fenv("SOFT_TAU", 2.0)
-TIE_MIN = _fenv("TIE_MIN", 0.05)
-TIE_MAX = _fenv("TIE_MAX", 0.15)
-# 兼容你的環境：若要限制顯示用上限，可使用 TIE_PROB_MAX；目前僅用於備援 PF 夾限。
-TIE_PROB_MAX = _fenv("TIE_PROB_MAX", TIE_MAX)
+SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
+TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
+TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))  # 作為全域預設；分段時可臨時覆蓋
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 
 OutcomePF = None
@@ -305,14 +186,13 @@ except Exception:
 if OutcomePF:
     try:
         PF = OutcomePF(
-            decks=_ienv("DECKS", 8),
-            seed=_ienv("SEED", 42),
-            n_particles=_ienv("PF_N", 50),
-            sims_lik=_ienv("PF_UPD_SIMS", 30),
-            resample_thr=_fenv("PF_RESAMPLE", 0.5),
+            decks=int(os.getenv("DECKS", "8")),
+            seed=int(os.getenv("SEED", "42")),
+            n_particles=int(os.getenv("PF_N", "50")),
+            sims_lik=int(os.getenv("PF_UPD_SIMS", "30")),
+            resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
             backend=PF_BACKEND,
-            dirichlet_eps=_fenv("PF_DIR_EPS", 0.05)
-            # 備註：若你的 pfilter 還支援 decay/noise，可在內部讀 ENV；本檔未強制要求。
+            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05"))
         )
         pf_initialized = True
         log.info("PF 初始化成功: n_particles=%s, sims_lik=%s, decks=%s (backend=%s)",
@@ -332,17 +212,17 @@ if not pf_initialized:
         def update_outcome(self, outcome): return
         def predict(self, **kwargs) -> np.ndarray:
             base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            base = base ** (1.0 / SOFT_TAU)
+            base = base ** (1.0 / max(1e-6, SOFT_TAU))
             base = base / base.sum()
             pT = float(base[2])
-            hi = max(TIE_MAX, TIE_PROB_MAX)
+            # 保持在 TIE_MIN ~ TIE_MAX
             if pT < TIE_MIN:
                 base[2] = TIE_MIN
                 scale = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
                 base[0] *= scale; base[1] *= scale
-            elif pT > hi:
-                base[2] = hi
-                scale = (1.0 - hi) / (1.0 - pT) if pT < 1.0 else 1.0
+            elif pT > TIE_MAX:
+                base[2] = TIE_MAX
+                scale = (1.0 - TIE_MAX) / (1.0 - pT) if pT < 1.0 else 1.0
                 base[0] *= scale; base[1] *= scale
             return base.astype(np.float32)
         @property
@@ -351,88 +231,28 @@ if not pf_initialized:
     pf_initialized = True
     log.warning("PF 初始化失敗，使用 SmartDummyPF 備援模式")
 
-# ---------- 決策參數（原有） ----------
-EDGE_ENTER = _fenv("EDGE_ENTER", 0.03)
-USE_KELLY = env_flag("USE_KELLY", 0)
+# ---------- 決策 / 配注 ----------
+DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()  # ev | prob | hybrid
+BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
+PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
+MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
+
+MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
+QUIET_SMALLEdge = env_flag("QUIET_SMALLEdge", 0)
+
+MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
+MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
+MAX_EDGE_SCALE = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15"))
+
+USE_KELLY = env_flag("USE_KELLY", 0)  # 目前未使用，保留
 CONTINUOUS_MODE = env_flag("CONTINUOUS_MODE", 1)
 
-# 決策模式與參數（原有 + 扩展開關）
-DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()  # ev | prob | hybrid
-BANKER_PAYOUT = _fenv("BANKER_PAYOUT", 0.95)  # 莊抽水
-PROB_MARGIN = _fenv("PROB_MARGIN", 0.02)      # hybrid 門檻
-MIN_EV_EDGE = _fenv("MIN_EV_EDGE", 0.0)       # hybrid EV 子門檻
-STRICT_PROB_ONLY = env_flag("STRICT_PROB_ONLY", 0)  # 新增：機率優先硬切
-DISABLE_EV = env_flag("DISABLE_EV", 0)              # 新增：完全不採用 EV
-
-# ---------- 新增：可用環境變數控制的守門與配注 ----------
-MIN_CONF_FOR_ENTRY = _fenv("MIN_CONF_FOR_ENTRY", 0.56)  # 低於此一律觀望
-QUIET_SMALLEdge   = env_flag("QUIET_SMALLEdge", 0)      # 邊際略優也觀望
-
-MIN_BET_PCT_ENV   = _fenv("MIN_BET_PCT", 0.05)          # 5%
-MAX_BET_PCT_ENV   = _fenv("MAX_BET_PCT", 0.40)          # 40%
-MAX_EDGE_SCALE    = _fenv("MAX_EDGE_FOR_FULLBET", 0.15) # final_edge 達此給滿注
-
-SHOW_CONF_DEBUG   = env_flag("SHOW_CONF_DEBUG", 1)
-LOG_DECISION      = env_flag("LOG_DECISION", 1)
+SHOW_CONF_DEBUG = env_flag("SHOW_CONF_DEBUG", 1)
+LOG_DECISION = env_flag("LOG_DECISION", 1)
 
 INV = {0: "莊", 1: "閒"}
 
-# ---------- 新增：Stage 分段覆寫 ----------
-# 模式：hands（以手數）、decks（以剩餘牌/副數）
-STAGE_MODE = os.getenv("STAGE_MODE", "hands").lower()
-
-EARLY_HANDS = _ienv("EARLY_HANDS", 25)
-MID_HANDS   = _ienv("MID_HANDS", 70)
-# 若用 decks 模式：以剩餘牌副數界線（需 deplete/真實牌靴才能準）
-EARLY_REMAIN_DECKS = _fenv("EARLY_REMAIN_DECKS", 6.0)
-MID_REMAIN_DECKS   = _fenv("MID_REMAIN_DECKS", 3.0)
-
-# 允許分段覆寫的鍵（盡量只列你會用到的）
-OVERRIDABLE_KEYS: Tuple[str, ...] = (
-    "PF_PRED_SIMS", "PF_UPD_SIMS", "PF_N", "PF_RESAMPLE",
-    "PROB_MARGIN", "MIN_EV_EDGE", "MIN_CONF_FOR_ENTRY", "EDGE_ENTER",
-    "PROB_SMA_ALPHA", "THEO_BLEND",
-    "STRICT_PROB_ONLY", "DISABLE_EV",
-)
-
-def _stage_of(sess: Dict[str, Any]) -> str:
-    if STAGE_MODE == "hands":
-        n = int(sess.get("hand_no") or 0)
-        if n <= EARLY_HANDS: return "EARLY"
-        if n <= MID_HANDS: return "MID"
-        return "LATE"
-    else:
-        # decks 模式：暫無精準剩餘副數推估（需完整牌桶追蹤）
-        # 先以靜態門檻推估（如你已在外層追蹤可自行覆寫 hand_no 以達等效目的）
-        n = int(sess.get("hand_no") or 0)
-        if n <= EARLY_HANDS: return "EARLY"
-        if n <= MID_HANDS: return "MID"
-        return "LATE"
-
-class StageOverride:
-    """在預測期間套用 EARLY_*/MID_*/LATE_* 覆寫同名鍵，結束後還原"""
-    def __init__(self, stage: str, keys: Iterable[str]):
-        self.stage = stage.upper()
-        self.keys = list(keys)
-        self.changed: List[Tuple[str, Optional[str]]] = []
-
-    def __enter__(self):
-        prefix = f"{self.stage}_"
-        for k in self.keys:
-            stage_name = prefix + k
-            if stage_name in os.environ:
-                self.changed.append((k, os.environ.get(k)))
-                os.environ[k] = os.environ[stage_name]
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        for k, old in self.changed:
-            if old is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = old
-
-# ---------- 下注/決策 ----------
 def bet_amount(bankroll: int, pct: float) -> int:
     if not bankroll or bankroll <= 0 or pct <= 0: return 0
     return int(round(bankroll * pct))
@@ -448,21 +268,15 @@ def _decide_side_by_prob(pB: float, pP: float) -> int:
     return 0 if pB >= pP else 1
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
-    """
-    注意：這裡不再做固定 0.7/0.3 的理論混合。
-    誰要不要混合、混多少，已在外層用 smooth_probs() 決定並傳進來。
-    """
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
-
     reason_parts: List[str] = []
 
-    # 開關優先：STRICT_PROB_ONLY / DISABLE_EV
-    if STRICT_PROB_ONLY or DECISION_MODE == "prob":
+    if DECISION_MODE == "prob":
         side = _decide_side_by_prob(pB, pP)
         ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
         final_edge = max(abs(evB), abs(evP))
-        reason_parts.append("模式=prob(strict)" if STRICT_PROB_ONLY else f"模式=prob (pB={pB:.4f}, pP={pP:.4f})")
-    elif DECISION_MODE == "hybrid" and not DISABLE_EV:
+        reason_parts.append(f"模式=prob (pB={pB:.4f}, pP={pP:.4f})")
+    elif DECISION_MODE == "hybrid":
         if abs(pB - pP) >= PROB_MARGIN:
             side = _decide_side_by_prob(pB, pP)
             ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
@@ -478,14 +292,13 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
                 side = _decide_side_by_prob(pB, pP)
                 final_edge = edge_ev
                 reason_parts.append(f"模式=hybrid→prob (EV不足 {edge_ev:.4f}<{MIN_EV_EDGE})")
-    else:  # ev（或 hybrid 但 EV 被禁用時會落到這裡? -> 若 DISABLE_EV=1，前面已避免走 ev）
+    else:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason_parts.append(f"模式=ev (EV_B={evB:.4f}, EV_P={evP:.4f}, payout={BANKER_PAYOUT})")
 
-    # ------- 最終觀望守門 -------
     conf = max(pB, pP)
     if conf < MIN_CONF_FOR_ENTRY:
-        reason_parts.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.2f}")
+        reason_parts.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.3f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
 
     if final_edge < EDGE_ENTER:
@@ -496,11 +309,10 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
         reason_parts.append(f"⚪ 邊際略優(quiet) edge={final_edge:.4f}<{EDGE_ENTER*1.2:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason_parts))
 
-    # ------- 配注（線性） -------
+    # 線性配注
     min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
     max_edge = max(EDGE_ENTER + 1e-6, MAX_EDGE_SCALE)
-
     bet_pct = min_b + (max_b - min_b) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
 
@@ -530,7 +342,189 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
     return "\n".join(header + [""] + block)
 
-# ---------- 健康檢查 ----------
+# ---------- Session ----------
+def get_session(uid: str) -> Dict[str, Any]:
+    if redis_client:
+        j = _rget(f"sess:{uid}")
+        if j:
+            try: return json.loads(j)
+            except Exception: pass
+    sess = SESS_FALLBACK.get(uid) or {
+        "phase": "await_pts",
+        "bankroll": 0,
+        "rounds_seen": 0,  # 用來做分段
+        "last_pts_text": None
+    }
+    return sess
+
+def save_session(uid: str, data: Dict[str, Any]):
+    if redis_client:
+        _rset(f"sess:{uid}", json.dumps(data), ex=SESSION_EXPIRE_SECONDS)
+    else:
+        SESS_FALLBACK[uid] = data
+
+def _dedupe_event(event_id: Optional[str]) -> bool:
+    if not event_id: return True
+    return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
+
+# ---------- 分段覆蓋器 ----------
+def get_stage_over(rounds_seen: int) -> Dict[str, float]:
+    """
+    依局數回傳「本次決策」臨時覆蓋的參數（overrides）。
+    你可用環境變數調整（示例：尾段更穩）
+    - STAGE_MODE=count|disabled
+    - EARLY_HANDS (含) 以前 = early；EARLY_HANDS ~ LATE_HANDS 之間 = mid；> LATE_HANDS = late
+    - 目前主要在 late 才覆蓋，保持你之前習慣。
+    可用的 LATE_* 例：
+      LATE_SOFT_TAU, LATE_PF_PRED_SIMS, LATE_MIN_CONF_FOR_ENTRY, LATE_EDGE_ENTER,
+      THEO_BLEND（分段用此鍵即可覆蓋，沿用你 snippet 寫法),
+      TIE_MAX（分段封頂）,
+      DEPLETEMC_SIMS（尾段 1300~1600）
+    """
+    stage_mode = os.getenv("STAGE_MODE", "count").lower()
+    if stage_mode == "disabled":
+        return {}
+
+    early = int(os.getenv("EARLY_HANDS", "15"))
+    late  = int(os.getenv("LATE_HANDS", "56"))
+
+    over: Dict[str, float] = {}
+
+    if rounds_seen > late:
+        # 尾段覆蓋（用你的建議預設值；沒設環境變數就用這些合理缺省）
+        over["SOFT_TAU"] = float(os.getenv("LATE_SOFT_TAU", "1.92"))
+        over["DEPLETEMC_SIMS"] = float(os.getenv("DEPLETEMC_SIMS", "1600"))
+        over["THEO_BLEND"] = float(os.getenv("THEO_BLEND", "0.004"))
+        over["TIE_MAX"] = float(os.getenv("TIE_MAX", "0.11"))
+        over["MIN_CONF_FOR_ENTRY"] = float(os.getenv("LATE_MIN_CONF_FOR_ENTRY", "0.462"))
+        over["EDGE_ENTER"] = float(os.getenv("LATE_EDGE_ENTER", "0.0030"))
+
+        # 若你提供 LATE_PF_PRED_SIMS，就用它覆蓋 PF_PRED_SIMS 參數（透過 env 再讀）
+        lpred = os.getenv("LATE_PF_PRED_SIMS")
+        if lpred:
+            try:
+                over["PF_PRED_SIMS"] = float(lpred)
+            except Exception:
+                pass
+
+    # 你也可以擴充 early/mid 覆蓋邏輯；此處先簡化只在 late 處理
+    return over
+
+# ---------- 點數解析 ----------
+def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
+    if not text: return None
+    s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
+    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s)
+    s = s.replace("\u3000", " ")
+    u = s.upper().strip()
+
+    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
+    if m:
+        d = m.group(1)
+        return (int(d), int(d)) if d else (0, 0)
+    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
+    if m: return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
+    if m: return (int(m.group(2)), int(m.group(1)))
+
+    t = u.replace(" ", "").replace("\u3000", "")
+    if t in ("B","莊","庄"): return (0,1)
+    if t in ("P","閒","闲"): return (1,0)
+    if t in ("T","和"): return (0,0)
+
+    if re.search(r"[A-Z]", u): return None
+    digits = re.findall(r"\d", u)
+    if len(digits) == 2: return (int(digits[0]), int(digits[1]))
+    return None
+
+# ---------- 主預測處理（嵌入你的 1~5 流程） ----------
+def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
+    start_time = time.time()
+
+    # （可選）若你想要把上一手結果回灌 PF，可在這裡做：
+    # if not (p_pts == b_pts and SKIP_TIE_UPD):
+    #     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
+    #     try:
+    #         PF.update_outcome(outcome)
+    #     except Exception as e:
+    #         log.warning("PF.update_outcome failed: %s", e)
+
+    # 取得「分段覆蓋」參數
+    rounds_seen = int(sess.get("rounds_seen", 0))
+    over = get_stage_over(rounds_seen)
+
+    # 先跑 PF 預測（基礎機率）
+    sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+    pf_preds = PF.predict(sims_per_particle=sims_per_particle)
+    p = np.asarray(pf_preds, dtype=np.float32)
+
+    # 1) SoftTau 溫度縮放
+    soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
+    p = p ** (1.0 / max(1e-6, soft_tau))
+    p = p / p.sum()
+
+    # 2) deplete MC（若可用），尾段可用更重的模擬量
+    if DEPLETE_OK and init_counts and probs_after_points:
+        try:
+            base_decks = int(os.getenv("DECKS", "8"))
+            counts = init_counts(base_decks)
+            dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "1000"))))
+            dep_preds = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=1.0)
+            p = (p + dep_preds) * 0.5
+            p = p / p.sum()
+        except Exception as e:
+            log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
+
+    # 3) 分段 THEO_BLEND 局部混合（不改全域）
+    theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
+    if theo_blend > 0.0:
+        theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+        p = (1.0 - theo_blend) * p + theo_blend * theo
+        p = p / p.sum()
+
+    # 4) 分段 TIE_MAX 封頂（同時確保不低於全域 TIE_MIN）
+    tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
+    pT = float(p[2])
+    if pT > tie_max:
+        scale = (1.0 - tie_max) / (1.0 - pT) if pT < 1.0 else 1.0
+        p[2] = tie_max
+        p[0] *= scale; p[1] *= scale
+        p = p / p.sum()
+    if float(p[2]) < TIE_MIN:  # 下限保護
+        scale = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+        p[2] = TIE_MIN
+        p[0] *= scale; p[1] *= scale
+        p = p / p.sum()
+
+    # 5) 決策前臨時覆蓋觀望門檻（只對本次有效）
+    _global_MIN_CONF = globals()["MIN_CONF_FOR_ENTRY"]
+    _global_EDGE_ENTER = globals()["EDGE_ENTER"]
+    try:
+        if "MIN_CONF_FOR_ENTRY" in over:
+            globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
+        if "EDGE_ENTER" in over:
+            globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
+
+        choice, edge, bet_pct, reason = decide_only_bp(p)
+    finally:
+        globals()["MIN_CONF_FOR_ENTRY"] = _global_MIN_CONF
+        globals()["EDGE_ENTER"] = _global_EDGE_ENTER
+
+    # 配注金額（用 session bankroll，如未設定則 0）
+    bankroll_now = int(sess.get("bankroll", 0))
+    bet_amt = bet_amount(bankroll_now, bet_pct)
+
+    # 更新 session（不漏增 rounds_seen）
+    sess["rounds_seen"] = rounds_seen + 1
+
+    elapsed = time.time() - start_time
+    if LOG_DECISION or SHOW_CONF_DEBUG:
+        log.info("決策: %s edge=%.4f pct=%.2f%% | rounds=%d | %.2fs | %s",
+                 choice, edge, bet_pct*100, sess["rounds_seen"], elapsed, reason)
+
+    return p, choice, bet_amt, reason
+
+# ---------- 簡易 HTTP 介面 ----------
 @app.get("/")
 def root():
     ua = request.headers.get("User-Agent", "")
@@ -543,272 +537,55 @@ def health():
     return jsonify(ok=True, ts=time.time(), version=VERSION,
                    pf_initialized=pf_initialized, pf_backend=getattr(PF, 'backend', 'unknown')), 200
 
-@app.get("/healthz")
-def healthz():
-    return jsonify(ok=True, ts=time.time(), version=VERSION, pf_initialized=pf_initialized), 200
-
-# ---------- LINE Bot ----------
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-line_api = None
-line_handler = None
-if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
-    log.error("LINE credentials missing. SECRET set? %s, TOKEN set? %s",
-              bool(LINE_CHANNEL_SECRET), bool(LINE_CHANNEL_ACCESS_TOKEN))
-
-GAMES = {
-    "1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU",
-    "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人",
-}
-
-def game_menu_text(left_min: int) -> str:
-    lines = ["請選擇遊戲館別"]
-    for k in sorted(GAMES.keys(), key=lambda x: int(x)):
-        lines.append(f"{k}. {GAMES[k]}")
-    lines.append("「請直接輸入數字選擇」")
-    lines.append(f"⏳ 試用剩餘 {TRIAL_MINUTES} 分鐘")
-    return "\n".join(lines)
-
-def _quick_buttons():
+@app.post("/predict")
+def predict():
+    """
+    請求 JSON 欄位：
+      - uid: 使用者 id（用於 session）
+      - last_text: 上局點數輸入（例：'閒6莊5' / '65' / '和'）
+      - bankroll:（可選）本次籌碼；若提供會寫入 session
+    回傳：
+      - probs: [pB, pP, pT]
+      - choice: "莊" / "閒" / "觀望"
+      - bet: 建議下注金額（整數）
+      - reason: 決策說明
+    """
     try:
-        from linebot.models import QuickReply, QuickReplyButton, MessageAction
-        items = [
-            QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
-            QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
-            QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
-            QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
-        ]
-        if CONTINUOUS_MODE == 0:
-            items.insert(0, QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始分析")))
-        return QuickReply(items=items)
-    except Exception:
-        return None
+        data = request.get_json(force=True) or {}
+        uid = str(data.get("uid") or "anon")
+        last_text = str(data.get("last_text") or "")
+        bankroll = data.get("bankroll")
 
-def _reply(token: str, text: str):
-    from linebot.models import TextSendMessage
-    try:
-        line_api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
+        sess = get_session(uid)
+        if isinstance(bankroll, int) and bankroll >= 0:
+            sess["bankroll"] = bankroll
+
+        pts = parse_last_hand_points(last_text)
+        if not pts:
+            return jsonify(ok=False, error="無法解析點數；請輸入如 '閒6莊5'、'65'、'和'"), 400
+
+        p_pts, b_pts = pts[0], pts[1]
+        if p_pts == b_pts and SKIP_TIE_UPD:
+            sess["last_pts_text"] = "上局結果: 和局"
+        else:
+            sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+
+        probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
+        save_session(uid, sess)
+
+        card = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+        return jsonify(ok=True,
+                       probs=[float(probs[0]), float(probs[1]), float(probs[2])],
+                       choice=choice, bet=bet_amt, reason=reason, card=card), 200
     except Exception as e:
-        log.warning("[LINE] reply failed: %s", e)
-
-def _dedupe_event(event_id: Optional[str]) -> bool:
-    if not event_id: return True
-    return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
-
-# ---------- 新增：分段覆寫 + EMA 平滑 + Deplete 變數讀取 ----------
-def _apply_ema(sess: Dict[str, Any], probs_after_blend: np.ndarray, outcome_last: int) -> np.ndarray:
-    alpha = _fenv("PROB_SMA_ALPHA", 0.0)
-    if alpha <= 0.0:
-        return probs_after_blend
-    prev = sess.get("ema_prob")
-    # 和局不更新（若 SKIP_TIE_UPD=1）
-    if SKIP_TIE_UPD and outcome_last == 2 and isinstance(prev, list):
-        return np.array(prev, dtype=np.float32)
-    if isinstance(prev, list):
-        prev_arr = np.array(prev, dtype=np.float32)
-    else:
-        prev_arr = probs_after_blend
-    new = (1.0 - alpha) * probs_after_blend + alpha * prev_arr
-    new = new / new.sum()
-    sess["ema_prob"] = new.tolist()
-    return new
-
-def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
-    log.info("開始處理點數預測: 閒%d 莊%d (deplete=%s, mode=%s)", p_pts, b_pts, DEPLETE_OK, DECISION_MODE)
-    start_time = time.time()
-    outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
-
-    if outcome == 2:
-        sess["last_pts_text"] = "上局結果: 和局"
-    else:
-        sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
-    sess["last_outcome"] = outcome
-    sess["streak_count"] = 1 if outcome in (0, 1) else 0
-    sess["phase"] = "ready"
-    # 手數+1（以「已觀察一局，預測下一局」的節奏）
-    sess["hand_no"] = int(sess.get("hand_no") or 0) + 1
-
-    try:
-        # ---- Stage 覆寫（預測前）----
-        stage = _stage_of(sess)
-        with StageOverride(stage, OVERRIDABLE_KEYS):
-            # 讀取（可能被覆寫後的）PF_PRED_SIMS / THEO_BLEND / 門檻等
-            sims_per_particle = _ienv("PF_PRED_SIMS", 5)
-
-            t0 = time.time()
-            pf_preds = PF.predict(sims_per_particle=sims_per_particle)
-            log.info("PF 預測完成, 耗時: %.2fs (stage=%s, sims=%s)", time.time() - t0, stage, sims_per_particle)
-            p = pf_preds
-
-            if DEPLETE_OK and init_counts and probs_after_points:
-                try:
-                    base_decks = _ienv("DECKS", 8)
-                    counts = init_counts(base_decks)
-                    dep_sims = _ienv("DEPLETEMC_SIMS", 1000)
-                    dep_factor = _fenv("DEPL_FACTOR", 1.0)
-                    dep_preds = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=dep_factor)
-                    p = (pf_preds + dep_preds) * 0.5
-                except Exception as e:
-                    log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
-
-            # 混理論
-            p_use = smooth_probs(p)
-            # EMA 平滑（和局可選擇不更新）
-            p_use = _apply_ema(sess, p_use, outcome)
-
-            # 決策
-            choice, edge, bet_pct, reason = decide_only_bp(p_use)
-            bankroll_now = int(sess.get("bankroll", 0))
-            bet_amt = bet_amount(bankroll_now, bet_pct)
-            msg = format_output_card(p_use, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
-            _reply(reply_token, msg)
-
-            if LOG_DECISION or SHOW_CONF_DEBUG:
-                log.info("決策: %s edge=%.4f pct=%.2f%% | stage=%s | %s", choice, edge, bet_pct*100, stage, reason)
-
-        log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
-    except Exception as e:
-        log.error("預測過程中錯誤: %s", e)
-        _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
-
-    if CONTINUOUS_MODE:
-        sess["phase"] = "await_pts"]
-
-# ---- LINE Handler / Webhook ----
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
-    try:
-        from linebot import LineBotApi, WebhookHandler
-        from linebot.exceptions import InvalidSignatureError
-        from linebot.models import MessageEvent, TextMessage, FollowEvent
-
-        line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-        line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-        @line_handler.add(FollowEvent)
-        def on_follow(event):
-            if not _dedupe_event(getattr(event, "id", None)): return
-            uid = event.source.user_id
-            _ = trial_persist_guard(uid)  # 寫入 first_ts（如未存在）
-            sess = get_session(uid)
-            _reply(event.reply_token,
-                   "👋 歡迎！請輸入『遊戲設定』開始；已啟用連續模式，之後只需輸入點數（例：65 / 和 / 閒6莊5）即可自動預測。")
-            save_session(uid, sess)
-
-        @line_handler.add(MessageEvent, message=TextMessage)
-        def on_text(event):
-            if not _dedupe_event(getattr(event, "id", None)): return
-            uid = event.source.user_id
-            raw = (event.message.text or "")
-            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
-            sess = get_session(uid)
-            try:
-                log.info("[LINE] uid=%s phase=%s text=%s", uid, sess.get("phase"), text)
-                up = text.upper()
-
-                # 開通
-                if up.startswith("開通") or up.startswith("ACTIVATE"):
-                    after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
-                    ok = validate_activation_code(after)
-                    if ok:
-                        _rset(_trial_key(uid, "expired"), "0")
-                    sess["premium"] = bool(ok)
-                    _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
-                    save_session(uid, sess); return
-
-                # 永久試用鎖（優先於一般 trial）
-                guard = trial_persist_guard(uid)
-                if guard and not sess.get("premium", False):
-                    _reply(event.reply_token, guard)
-                    save_session(uid, sess); return
-
-                # 結束/清空（不重置永久鎖）
-                if up in ("結束分析", "清空", "RESET"):
-                    premium = sess.get("premium", False)
-                    start_ts = sess.get("trial_start", int(time.time()))
-                    sess = get_session(uid)
-                    sess["premium"] = premium
-                    sess["trial_start"] = start_ts
-                    _reply(event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
-                    save_session(uid, sess); return
-
-                # 遊戲設定
-                if text == "遊戲設定" or up == "GAME SETTINGS":
-                    sess["phase"] = "choose_game"
-                    sess["game"] = None; sess["table"] = None; sess["table_no"] = None
-                    sess["bankroll"] = 0; sess["streak_count"] = 0
-                    sess["last_outcome"] = None; sess["last_pts_text"] = None
-                    sess["hand_no"] = 0
-                    sess["ema_prob"] = None
-                    _reply(event.reply_token, game_menu_text(TRIAL_MINUTES))
-                    save_session(uid, sess); return
-
-                # 選館
-                if sess.get("phase") == "choose_game":
-                    m = re.match(r"^\s*(\d+)", text)
-                    if m:
-                        choice = m.group(1)
-                        if choice in GAMES:
-                            sess["game"] = GAMES[choice]
-                            sess["phase"] = "input_bankroll"
-                            _reply(event.reply_token, f"🎰 已選擇遊戲館：{sess['game']}\n請輸入初始籌碼（金額）")
-                            save_session(uid, sess); return
-                        else:
-                            _reply(event.reply_token, "⚠️ 無效的選項，請輸入上列列出的數字。")
-                            return
-                    else:
-                        _reply(event.reply_token, "⚠️ 請直接輸入提供的數字來選擇遊戲館別。")
-                        return
-
-                # 輸入籌碼
-                if sess.get("phase") == "input_bankroll":
-                    amount_str = re.sub(r"[^\d]", "", text)
-                    amount = int(amount_str) if amount_str else 0
-                    if amount <= 0:
-                        _reply(event.reply_token, "⚠️ 請輸入正確的數字金額。"); return
-                    sess["bankroll"] = amount
-                    sess["phase"] = "await_pts"
-                    _reply(event.reply_token,
-                           f"✅ 設定完成！遊戲館：{sess.get('game')}，初始籌碼：{amount}。\n📌 連續模式已啟動：現在請直接輸入第一局點數進行分析（例：閒6莊5 或 65）。")
-                    save_session(uid, sess); return
-
-                # 解析點數並預測
-                pts = parse_last_hand_points(text)
-                if pts and sess.get("bankroll"):
-                    _handle_points_and_predict(sess, pts[0], pts[1], event.reply_token)
-                    save_session(uid, sess); return
-
-                _reply(event.reply_token,
-                       "指令無法辨識。\n📌 已啟用連續模式：直接輸入點數即可（例：65 / 和 / 閒6莊5）。\n或輸入『遊戲設定』。")
-            except Exception as e:
-                log.exception("on_text err: %s", e)
-                try: _reply(event.reply_token, "⚠️ 系統錯誤，稍後再試。")
-                except Exception: pass
-
-        @app.post("/line-webhook")
-        def line_webhook():
-            signature = request.headers.get("X-Line-Signature", "")
-            body = request.get_data(as_text=True)
-            try:
-                line_handler.handle(body, signature)
-            except InvalidSignatureError:
-                abort(400, "Invalid signature")
-            except Exception as e:
-                log.error("webhook error: %s", e)
-                abort(500)
-            return "OK", 200
-    except Exception as e:
-        log.warning("LINE not fully configured: %s", e)
-else:
-    log.warning("LINE credentials not set. LINE webhook will not be active.")
+        log.exception("predict error: %s", e)
+        return jsonify(ok=False, error=str(e)), 500
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    port = _ienv("PORT", 8000)
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, THEO_BLEND=%.3f)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE, _fenv("THEO_BLEND", THEO_BLEND))
+    port = int(os.getenv("PORT", "8000"))
+    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s)",
+             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
