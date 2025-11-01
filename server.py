@@ -3,7 +3,9 @@
 Patched by ChatGPT:
 - 新增 THEO_BLEND 環境變數：控制是否將模型機率與理論分佈混合（0.0=關閉）
 - 新增 smooth_probs()：決策與卡片顯示統一使用同一組機率（避免顯示與下注邏輯不一致）
-- 其它程式碼保持不變
+- 新增 Stage 分段切換（EARLY/MID/LATE），支援 <STAGE>_KEY 覆蓋
+- 新增 會話級機率 EMA 平滑（PROB_SMA_ALPHA），和局可選擇不更新（SKIP_TIE_UPD）
+- Deplete 讀取 DEPLETEMC_SIMS / DEPL_FACTOR 環境變數
 """
 import os
 import sys
@@ -17,17 +19,31 @@ import numpy as np
 
 # --- 新增：理論混合權重（0.0=關閉；建議 0.0~0.15）
 THEO_BLEND = float(os.getenv("THEO_BLEND", "0.0"))
+PROB_SMA_ALPHA = float(os.getenv("PROB_SMA_ALPHA", "0.0"))  # 0.0=關閉；建議 0.25~0.35
+SKIP_TIE_UPD = 1 if str(os.getenv("SKIP_TIE_UPD", "1")).lower() in ("1","true","y","yes","on") else 0
 
-def smooth_probs(prob: np.ndarray) -> np.ndarray:
-    """
-    依 THEO_BLEND 將模型輸出機率與理論分佈混合，並正規化。
-    THEO_BLEND=0.0 時直接回傳原始 prob（不混合）。
-    """
+def _theo_mix(prob: np.ndarray) -> np.ndarray:
     if THEO_BLEND <= 0.0:
         return prob
     theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
     sm = (1.0 - THEO_BLEND) * prob + THEO_BLEND * theo
     sm = sm / sm.sum()
+    return sm
+
+def _ema_update(prev: Optional[np.ndarray], now: np.ndarray, alpha: float) -> np.ndarray:
+    if alpha <= 0.0 or prev is None:
+        return now
+    out = alpha * now + (1.0 - alpha) * prev
+    s = out.sum()
+    if s > 0:
+        out = out / s
+    return out.astype(np.float32)
+
+def smooth_probs(prob: np.ndarray) -> np.ndarray:
+    """
+    先做 THEO_BLEND，再做會話級 EMA 平滑（若有設定 PROB_SMA_ALPHA）
+    """
+    sm = _theo_mix(prob.astype(np.float32))
     return sm
 
 # --- 安全導入 deplete（有就用，沒有不會掛） ---
@@ -69,7 +85,7 @@ except Exception:
     def CORS(app): return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-04+blend-control"
+VERSION = "bgs-independent-2025-11-02+blend-stage-ema"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -164,6 +180,10 @@ def get_session(uid: str) -> Dict[str, Any]:
         "phase": "choose_game", "game": None, "table": None,
         "last_pts_text": None, "table_no": None, "streak_count": 0,
         "last_outcome": None,
+        # 會話級預測平滑用（上一手的平滑後機率）
+        "_last_probs": None,
+        "hand_idx": 0,
+        "_stage": "MID",
     }
 
 def save_session(uid: str, data: Dict[str, Any]):
@@ -182,6 +202,33 @@ def env_flag(name: str, default: int = 1) -> int:
         return 1 if int(float(v)) != 0 else 0
     except Exception:
         return 1 if default else 0
+
+# ---------- 分段切換（手數 or 剩餘牌） ----------
+STAGE_MODE = os.getenv("STAGE_MODE", "count")  # count | remain
+EARLY_HANDS = int(os.getenv("EARLY_HANDS", "15"))
+LATE_HANDS  = int(os.getenv("LATE_HANDS",  "56"))
+REMAIN_LATE = int(os.getenv("REMAIN_LATE", "120"))  # 若你有剩餘牌估計可用
+
+def _stage_from_count(idx: int) -> str:
+    if idx <= EARLY_HANDS: return "EARLY"
+    if idx >= LATE_HANDS:  return "LATE"
+    return "MID"
+
+def _current_stage(sess: Dict[str, Any], remaining_cards: Optional[int] = None) -> str:
+    if STAGE_MODE == "remain" and remaining_cards is not None:
+        if remaining_cards <= REMAIN_LATE:
+            return "LATE"
+        idx = int(sess.get("hand_idx", 0))
+        return _stage_from_count(idx)
+    idx = int(sess.get("hand_idx", 0))
+    return _stage_from_count(idx)
+
+def _env_stage_get(sess: Dict[str, Any], key: str, default: str) -> str:
+    """
+    讀取 <STAGE>_KEY，若無則讀 KEY，若仍無則用 default
+    """
+    stage = sess.get("_stage", "MID")
+    return os.getenv(f"{stage}_{key}", os.getenv(key, default))
 
 # ---------- 解析上局點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
@@ -220,10 +267,6 @@ def _trial_key(uid: str, kind: str) -> str:
     return f"trial:{kind}:{uid}"
 
 def trial_persist_guard(uid: str) -> Optional[str]:
-    """
-    永久鎖：第一次互動記錄 trial:first_ts:<uid>。
-    超過 TRIAL_MINUTES -> trial:expired:<uid>=1 之後永遠擋住。
-    """
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
@@ -238,7 +281,6 @@ def trial_persist_guard(uid: str) -> Optional[str]:
         first = now
         _rset(_trial_key(uid, "first_ts"), str(now))
     used_min = (now - first) // 60
-    left = max(0, TRIAL_MINUTES - used_min)
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
         return f"⛔ 試用已到期\n📬 請聯繫管理員：{ADMIN_CONTACT}\n🔐 在此輸入：開通 你的密碼"
@@ -255,7 +297,6 @@ log.info("載入 PF 參數: PF_N=%s, PF_UPD_SIMS=%s, PF_PRED_SIMS=%s, DECKS=%s",
          os.getenv("PF_PRED_SIMS", "5"), os.getenv("DECKS", "8"))
 
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
-SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
 SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
 TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
 TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
@@ -338,6 +379,8 @@ DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()  # ev | prob | hybrid
 BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))  # 莊抽水
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))      # hybrid 門檻
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))       # hybrid EV 子門檻
+STRICT_PROB_ONLY = env_flag("STRICT_PROB_ONLY", 0)
+DISABLE_EV = env_flag("DISABLE_EV", 0)
 
 # ---------- 新增：可用環境變數控制的守門與配注 ----------
 MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))  # 低於此一律觀望
@@ -368,28 +411,34 @@ def _decide_side_by_prob(pB: float, pP: float) -> int:
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     """
-    注意：這裡不再做固定 0.7/0.3 的理論混合。
-    誰要不要混合、混多少，已在外層用 smooth_probs() 決定並傳進來。
+    誰要不要混合、混多少，已在外層用平滑管線決定並傳進來。
     """
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
 
     reason_parts: List[str] = []
 
     # 三種決策模式
-    if DECISION_MODE == "prob":
+    mode = DECISION_MODE
+    if STRICT_PROB_ONLY:  # 強制只看機率
+        mode = "prob"
+    if DISABLE_EV and mode != "prob":
+        # 禁用 EV 時，hybrid/ev 都退化走機率
+        mode = "prob"
+
+    if mode == "prob":
         side = _decide_side_by_prob(pB, pP)
-        ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
-        final_edge = max(abs(evB), abs(evP))  # 用 EV 的幅度當作 edge 指標
+        _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
+        final_edge = max(abs(evB), abs(evP))  # 用 EV 幅度當作 edge 指標做配注尺度
         reason_parts.append(f"模式=prob (pB={pB:.4f}, pP={pP:.4f})")
-    elif DECISION_MODE == "hybrid":
+    elif mode == "hybrid":
         if abs(pB - pP) >= PROB_MARGIN:
             side = _decide_side_by_prob(pB, pP)
-            ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
+            _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
             reason_parts.append(f"模式=hybrid→prob (Δ={abs(pB-pP):.4f}≥{PROB_MARGIN})")
         else:
             ev_side, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
-            if edge_ev >= MIN_EV_EDGE:
+            if edge_ev >= MIN_EV_EDGE and not DISABLE_EV:
                 side = ev_side
                 final_edge = edge_ev
                 reason_parts.append(f"模式=hybrid→ev (edge={edge_ev:.4f}≥{MIN_EV_EDGE})")
@@ -426,7 +475,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     reason_parts.append(f"信心度配注({int(min_b*100)}%~{int(max_b*100)}%), conf={conf:.3f}")
     return (INV[side], final_edge, bet_pct, "; ".join(reason_parts))
 
-def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
+def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool, stage: str) -> str:
     b_pct_txt = f"{prob[0] * 100:.2f}%"
     p_pct_txt = f"{prob[1] * 100:.2f}%"
     header: List[str] = []
@@ -444,6 +493,8 @@ def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[st
     else:
         block.append(f"本次預測結果：{choice}")
         block.append(f"建議下注：{bet_amt:,}")
+
+    block.append(f"Stage：{stage}")  # 顯示目前分段
 
     if cont:
         block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
@@ -520,6 +571,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     start_time = time.time()
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
 
+    # 顯示上局文字
     if outcome == 2:
         sess["last_pts_text"] = "上局結果: 和局"
     else:
@@ -528,36 +580,92 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     sess["streak_count"] = 1 if outcome in (0, 1) else 0
     sess["phase"] = "ready"
 
+    # 手數累計 + 判定分段
+    sess["hand_idx"] = int(sess.get("hand_idx", 0)) + 1
+    stage = _current_stage(sess, remaining_cards=None)
+    sess["_stage"] = stage
+
     try:
+        # ====== 動態載入 Stage 參數（預測前覆寫，預測後還原） ======
+        global MIN_CONF_FOR_ENTRY, EDGE_ENTER, QUIET_SMALLEdge
+        global SOFT_TAU, PROB_SMA_ALPHA
+        global PF_BACKEND  # 僅供 log
+        global PF  # PF 實例不重建，只調用 predict 的 sims
+
+        # 可分段的 PF 調整（僅用於 predict 的 sims_per_particle）
+        pred_sims_stage = int(_env_stage_get(sess, "PF_PRED_SIMS", os.getenv("PF_PRED_SIMS", "5")))
+
+        _bak = {
+            "MIN_CONF_FOR_ENTRY": MIN_CONF_FOR_ENTRY,
+            "EDGE_ENTER": EDGE_ENTER,
+            "QUIET_SMALLEdge": QUIET_SMALLEdge,
+            "SOFT_TAU": SOFT_TAU,
+            "PROB_SMA_ALPHA": PROB_SMA_ALPHA,
+        }
+        MIN_CONF_FOR_ENTRY = float(_env_stage_get(sess, "MIN_CONF_FOR_ENTRY", str(MIN_CONF_FOR_ENTRY)))
+        EDGE_ENTER         = float(_env_stage_get(sess, "EDGE_ENTER",         str(EDGE_ENTER)))
+        QUIET_SMALLEdge    = 1 if _env_stage_get(sess, "QUIET_SMALLEdge", "0").lower() in ("1","true","y","yes","on") else 0
+        SOFT_TAU           = float(_env_stage_get(sess, "SOFT_TAU",           str(SOFT_TAU)))
+        PROB_SMA_ALPHA     = float(_env_stage_get(sess, "PROB_SMA_ALPHA",     str(PROB_SMA_ALPHA)))
+
+        # ====== PF 預測 ======
         t0 = time.time()
-        pf_preds = PF.predict(sims_per_particle=int(os.getenv("PF_PRED_SIMS", "5")))
-        log.info("PF 預測完成, 耗時: %.2fs", time.time() - t0)
+        pf_preds = PF.predict(sims_per_particle=pred_sims_stage)
+        log.info("PF 預測完成, 耗時: %.2fs (stage=%s, sims=%s)", time.time() - t0, stage, pred_sims_stage)
         p = pf_preds
+
+        # ====== Deplete 模擬與融合（如可用） ======
         if DEPLETE_OK and init_counts and probs_after_points:
             try:
                 base_decks = int(os.getenv("DECKS", "8"))
                 counts = init_counts(base_decks)
-                dep_preds = probs_after_points(counts, p_pts, b_pts, sims=1000, deplete_factor=1.0)
+                DEPLETE_SIMS   = int(os.getenv("DEPLETEMC_SIMS", "1000"))
+                DEPLETE_FACTOR = float(os.getenv("DEPL_FACTOR",   "1.0"))
+                dep_preds = probs_after_points(counts, p_pts, b_pts, sims=DEPLETE_SIMS, deplete_factor=DEPLETE_FACTOR)
                 p = (pf_preds + dep_preds) * 0.5
             except Exception as e:
                 log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
-        # 新增：決策與顯示統一使用 smooth 後的機率
+        # ====== 機率平滑（理論混合 + 會話級 EMA） ======
         p_use = smooth_probs(p)
+        # 會話級 EMA：和局後若 SKIP_TIE_UPD=1 則不上寫 _last_probs
+        last_probs = sess.get("_last_probs", None)
+        if isinstance(last_probs, list):
+            try:
+                last_probs = np.array(last_probs, dtype=np.float32)
+            except Exception:
+                last_probs = None
+        p_use = _ema_update(last_probs, p_use, PROB_SMA_ALPHA)
 
+        # ====== 決策與配注 ======
         choice, edge, bet_pct, reason = decide_only_bp(p_use)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
-        msg = format_output_card(p_use, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
+
+        # 儲存 EMA 狀態（若不是和局或允許更新）
+        if not (SKIP_TIE_UPD and outcome == 2):
+            sess["_last_probs"] = p_use.tolist()
+
+        msg = format_output_card(p_use, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE), stage=stage)
         _reply(reply_token, msg)
 
         if LOG_DECISION or SHOW_CONF_DEBUG:
-            log.info("決策: %s edge=%.4f pct=%.2f%% | %s", choice, edge, bet_pct*100, reason)
+            log.info("決策: %s edge=%.4f pct=%.2f%% | stage=%s | %s",
+                     choice, edge, bet_pct*100, stage, reason)
 
-        log.info("完整處理完成, 總耗時: %.2fs", time.time() - start_time)
     except Exception as e:
         log.error("預測過程中錯誤: %s", e)
-        _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
+        try:
+            _reply(reply_token, "⚠️ 預計算錯誤，請稍後再試")
+        except Exception:
+            pass
+    finally:
+        # 還原全域參數
+        MIN_CONF_FOR_ENTRY = _bak["MIN_CONF_FOR_ENTRY"]
+        EDGE_ENTER         = _bak["EDGE_ENTER"]
+        QUIET_SMALLEdge    = _bak["QUIET_SMALLEdge"]
+        SOFT_TAU           = _bak["SOFT_TAU"]
+        PROB_SMA_ALPHA     = _bak["PROB_SMA_ALPHA"]
 
     if CONTINUOUS_MODE:
         sess["phase"] = "await_pts"
@@ -578,8 +686,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         def on_follow(event):
             if not _dedupe_event(getattr(event, "id", None)): return
             uid = event.source.user_id
-            # 註冊永久試用鎖的開端
-            _ = trial_persist_guard(uid)  # 寫入 first_ts（如未存在）
+            _ = trial_persist_guard(uid)  # 註冊 first_ts
             sess = get_session(uid)
             _reply(event.reply_token,
                    "👋 歡迎！請輸入『遊戲設定』開始；已啟用連續模式，之後只需輸入點數（例：65 / 和 / 閒6莊5）即可自動預測。")
@@ -601,18 +708,18 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                     ok = validate_activation_code(after)
                     if ok:
-                        _rset(_trial_key(uid, "expired"), "0")  # 開通後清除 expired（放行）
+                        _rset(_trial_key(uid, "expired"), "0")
                     sess["premium"] = bool(ok)
                     _reply(event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                     save_session(uid, sess); return
 
-                # 永久試用鎖（優先於一般 trial）
+                # 永久試用鎖
                 guard = trial_persist_guard(uid)
                 if guard and not sess.get("premium", False):
                     _reply(event.reply_token, guard)
                     save_session(uid, sess); return
 
-                # 結束/清空（不重置永久鎖）
+                # 結束/清空
                 if up in ("結束分析", "清空", "RESET"):
                     premium = sess.get("premium", False)
                     start_ts = sess.get("trial_start", int(time.time()))
@@ -628,7 +735,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                     sess["game"] = None; sess["table"] = None; sess["table_no"] = None
                     sess["bankroll"] = 0; sess["streak_count"] = 0
                     sess["last_outcome"] = None; sess["last_pts_text"] = None
-                    # 顯示剩餘分鐘（持久鎖）
+                    sess["_last_probs"] = None
+                    sess["hand_idx"] = 0
+                    sess["_stage"] = "MID"
                     first_ts = _rget(_trial_key(uid, "first_ts"))
                     if first_ts:
                         used = (int(time.time()) - int(first_ts)) // 60
@@ -701,8 +810,10 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, THEO_BLEND=%.3f)",
-             VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE, THEO_BLEND)
+    log.info(
+        "Starting %s on port %s (CONTINUOUS_MODE=%s, PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, THEO_BLEND=%.3f, STAGE_MODE=%s)",
+        VERSION, port, CONTINUOUS_MODE, pf_initialized, DEPLETE_OK, DECISION_MODE, THEO_BLEND, STAGE_MODE
+    )
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
