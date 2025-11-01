@@ -3,7 +3,7 @@
 Patched by ChatGPT:
 - 新增 THEO_BLEND 環境變數：控制是否將模型機率與理論分佈混合（0.0=關閉）
 - 新增 smooth_probs()：決策與卡片顯示統一使用同一組機率（避免顯示與下注邏輯不一致）
-- 其它程式碼保持不變
+- 修正 _handle_points_and_predict：優先以「上一局點數」更新 PF 並以 PF 為主、Deplete 為輔；避免見莊打莊/見閒打閒
 """
 import os
 import sys
@@ -69,7 +69,7 @@ except Exception:
     def CORS(app): return None
 
 # 版本號
-VERSION = "bgs-independent-2025-10-04+stage-switching+smoothing"
+VERSION = "bgs-independent-2025-11-02+pf-points-feed+weights"
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -189,40 +189,40 @@ def get_stage_params(hand_count: int) -> Dict[str, str]:
     if hand_count <= 20:
         stage = "EARLY"
     elif hand_count <= 60:
-        stage = "MID" 
+        stage = "MID"
     else:
         stage = "LATE"
-    
+
     params = {}
     # 可被階段覆蓋的參數列表
     stageable_params = [
-        "PF_PRED_SIMS", "PF_UPD_SIMS", "PF_RESAMPLE", "PF_DECAY", 
+        "PF_PRED_SIMS", "PF_UPD_SIMS", "PF_RESAMPLE", "PF_DECAY",
         "PF_NOISE", "PF_DIR_EPS", "DEPLETEMC_SIMS", "DEPL_FACTOR"
     ]
-    
+
     for param in stageable_params:
         stage_key = f"{stage}_{param}"
         if stage_key in os.environ:
             params[param] = os.getenv(stage_key)
         else:
             params[param] = os.getenv(param)
-    
+
     return params
 
 def apply_session_ema_smoothing(current_prob: np.ndarray, session: Dict[str, Any], outcome: int) -> np.ndarray:
     """會話級 EMA 平滑：使用 PROB_SMA_ALPHA 進行指數移動平均"""
     PROB_SMA_ALPHA = float(os.getenv("PROB_SMA_ALPHA", "0.3"))
     SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
-    
+
     if PROB_SMA_ALPHA <= 0.0:
         return current_prob
-    
+
     prev_smoothed = session.get("prob_sma")
-    
+
     # 如果是和局且設定跳過更新，則返回上一個平滑值
     if outcome == 2 and SKIP_TIE_UPD and prev_smoothed is not None:
         return np.array(prev_smoothed, dtype=np.float32)
-    
+
     if prev_smoothed is None:
         # 第一次，直接使用當前機率
         smoothed = current_prob
@@ -230,7 +230,7 @@ def apply_session_ema_smoothing(current_prob: np.ndarray, session: Dict[str, Any
         prev_smoothed = np.array(prev_smoothed, dtype=np.float32)
         smoothed = PROB_SMA_ALPHA * current_prob + (1 - PROB_SMA_ALPHA) * prev_smoothed
         smoothed = smoothed / smoothed.sum()  # 重新正規化
-    
+
     # 更新會話中的平滑機率
     session["prob_sma"] = smoothed.tolist()
     return smoothed
@@ -567,15 +567,17 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id: return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
+# ---------- 核心：點數→PF→(Deplete)→混合→後處理→決策 ----------
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, reply_token: str):
     log.info("開始處理點數預測: 閒%d 莊%d (deplete=%s, mode=%s)", p_pts, b_pts, DEPLETE_OK, DECISION_MODE)
     start_time = time.time()
     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
 
-    # --- 新增：更新手數計數（非和局時增加） ---
+    # --- 更新手數（和局不+1） ---
     if outcome != 2:
-        sess["hand_count"] = sess.get("hand_count", 0) + 1
-    
+        sess["hand_count"] = int(sess.get("hand_count", 0)) + 1
+
+    # UI 記錄
     if outcome == 2:
         sess["last_pts_text"] = "上局結果: 和局"
     else:
@@ -585,55 +587,86 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int, rep
     sess["phase"] = "ready"
 
     try:
-        # --- 新增：獲取階段參數 ---
-        hand_count = sess.get("hand_count", 0)
+        hand_count = int(sess.get("hand_count", 0))
         stage_params = get_stage_params(hand_count)
-        
-        t0 = time.time()
-        # 使用階段特定的 PF_PRED_SIMS
-        pf_pred_sims = int(stage_params.get("PF_PRED_SIMS", os.getenv("PF_PRED_SIMS", "5")))
-        pf_preds = PF.predict(sims_per_particle=pf_pred_sims)
-        
-        # ★ 新增：檢查 PF 原始機率
+
+        # ---------- 餵 PF 的策略 ----------
+        feed_mode = (os.getenv("PF_FEED_MODE", "points") or "points").lower()  # points|outcome|none
+
+        # 權重（PF/Deplete）
+        try:
+            pf_w = float(os.getenv("PF_WEIGHT", "0.7"))
+            dep_w = float(os.getenv("DEPLETE_WEIGHT", "0.3"))
+        except Exception:
+            pf_w, dep_w = 0.7, 0.3
+        s = max(1e-9, pf_w + dep_w)
+        pf_w, dep_w = pf_w / s, dep_w / s
+
+        # ---------- 先更新 PF 狀態（首選 points） ----------
+        try:
+            if feed_mode == "points" and hasattr(PF, "update_points"):
+                PF.update_points(int(p_pts), int(b_pts))
+                log.info("PF.update_points 已餵入: P=%d, B=%d", p_pts, b_pts)
+            elif feed_mode == "outcome" and hasattr(PF, "update_outcome"):
+                PF.update_outcome(outcome)
+                log.info("PF.update_outcome 已餵入: outcome=%d", outcome)
+            else:
+                log.info("PF 狀態未更新 (feed_mode=%s)", feed_mode)
+        except Exception as e:
+            log.warning("PF 更新狀態失敗(feed=%s)：%s", feed_mode, e)
+
+        # ---------- PF 預測 ----------
+        try:
+            pf_pred_sims = int(stage_params.get("PF_PRED_SIMS", os.getenv("PF_PRED_SIMS", "5")) or "5")
+        except Exception:
+            pf_pred_sims = int(os.getenv("PF_PRED_SIMS", "5"))
+
+        # 優先嘗試帶 obs_pts（若 OutcomePF 支援）
+        try:
+            pf_preds = PF.predict(sims_per_particle=pf_pred_sims, obs_pts=(int(p_pts), int(b_pts)))
+            log.info("PF.predict(obs_pts) 成功")
+        except TypeError:
+            pf_preds = PF.predict(sims_per_particle=pf_pred_sims)
+            log.info("PF.predict(obs_pts) 不支援，使用一般 predict")
+        except Exception as e:
+            log.warning("PF.predict 失敗，使用備援先驗：%s", e)
+            pf_preds = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+
+        pf_preds = np.asarray(pf_preds, dtype=np.float32)
+        ps = float(pf_preds.sum())
+        if ps > 0: pf_preds /= ps
         log.info("PF原始機率: 莊=%.4f, 閒=%.4f, 和=%.4f", pf_preds[0], pf_preds[1], pf_preds[2])
-        
-        log.info("PF 預測完成, 耗時: %.2fs (手數: %d, 階段 PF_PRED_SIMS: %d)", 
-                time.time() - t0, hand_count, pf_pred_sims)
-        
-        p = pf_preds
-        
-        # --- 修改：使用階段特定的 Deplete 參數 ---
-        if DEPLETE_OK and init_counts and probs_after_points:
+
+        # ---------- Deplete（可選，作為輔助） ----------
+        mix = pf_preds.copy()
+        if DEPLETE_OK and init_counts and probs_after_points and dep_w > 1e-6:
             try:
                 base_decks = int(os.getenv("DECKS", "8"))
                 counts = init_counts(base_decks)
-                # 使用階段特定的 DEPLETEMC_SIMS 和 DEPL_FACTOR
-                deplete_sims = int(stage_params.get("DEPLETEMC_SIMS", os.getenv("DEPLETEMC_SIMS", "1000")))
-                deplete_factor = float(stage_params.get("DEPL_FACTOR", os.getenv("DEPL_FACTOR", "1.0")))
-                
-                dep_preds = probs_after_points(counts, p_pts, b_pts, sims=deplete_sims, deplete_factor=deplete_factor)
-                
-                # ★ 新增：Deplete 機率順序修正
-                if os.getenv("DEPLETE_RETURNS_PBT", "0") == "1":
-                    # 如果 Deplete 返回 [P, B, T] 順序，轉換為 [B, P, T]
-                    dep_preds = [dep_preds[1], dep_preds[0], dep_preds[2]]
-                    log.info("Deplete機率(修正後): 莊=%.4f, 閒=%.4f, 和=%.4f", dep_preds[0], dep_preds[1], dep_preds[2])
-                else:
-                    log.info("Deplete機率: 莊=%.4f, 閒=%.4f, 和=%.4f", dep_preds[0], dep_preds[1], dep_preds[2])
-                
-                p = (pf_preds + dep_preds) * 0.5
-                log.info("混合後機率: 莊=%.4f, 閒=%.4f, 和=%.4f", p[0], p[1], p[2])
+                deplete_sims = int(stage_params.get("DEPLETEMC_SIMS", os.getenv("DEPLETEMC_SIMS", "1000")) or "1000")
+                deplete_factor = float(stage_params.get("DEPL_FACTOR", os.getenv("DEPL_FACTOR", "1.0")) or "1.0")
+
+                dep = probs_after_points(counts, int(p_pts), int(b_pts),
+                                         sims=deplete_sims, deplete_factor=deplete_factor)
+                dep = np.asarray(dep, dtype=np.float32)
+                # 你的 deplete 若回 [P,B,T]，需轉為 [B,P,T]
+                if (os.getenv("DEPLETE_RETURNS_PBT", "0") or "0").lower() in ("1","true","yes","on"):
+                    dep = dep[[1, 0, 2]]
+                ds = float(dep.sum())
+                if ds > 0: dep /= ds
+                log.info("Deplete機率: 莊=%.4f, 閒=%.4f, 和=%.4f", dep[0], dep[1], dep[2])
+
+                mix = pf_w * pf_preds + dep_w * dep
+                mix /= max(1e-9, mix.sum())
+                log.info("PF/Deplete混合(%.2f/%.2f): 莊=%.4f, 閒=%.4f, 和=%.4f", pf_w, dep_w, mix[0], mix[1], mix[2])
             except Exception as e:
                 log.warning("Deplete 模擬失敗，改用 PF 單模：%s", e)
 
-        # 理論混合平滑
-        p_theo = smooth_probs(p)
-        log.info("理論混合後: 莊=%.4f, 閒=%.4f, 和=%.4f", p_theo[0], p_theo[1], p_theo[2])
-        
-        # 會話級 EMA 平滑
+        # ---------- 後處理：THEO_BLEND → 會話 EMA ----------
+        p_theo  = smooth_probs(mix)
         p_final = apply_session_ema_smoothing(p_theo, sess, outcome)
-        log.info("EMA平滑後: 莊=%.4f, 閒=%.4f, 和=%.4f", p_final[0], p_final[1], p_final[2])
 
+        # ---------- 決策 & 回覆 ----------
         choice, edge, bet_pct, reason = decide_only_bp(p_final)
         bankroll_now = int(sess.get("bankroll", 0))
         bet_amt = bet_amount(bankroll_now, bet_pct)
