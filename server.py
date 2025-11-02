@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow (2025-11-02)
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03)
 
 【這版做了什麼】
-- 還原你的「完整 LINE 互動流程」：試用鎖、開通信碼、館別選單、快速按鈕、連續輸入點數
-- 分段覆蓋：EARLY / MID / LATE 三段皆可用 *_SOFT_TAU、*_PF_PRED_SIMS、*_MIN_CONF_FOR_ENTRY、
-            *_EDGE_ENTER、*_TIE_MAX、*_THEO_BLEND、*_DEPLETEMC_SIMS、*_DEPL_FACTOR
-- 保留：THEO_BLEND、TIE_MAX 封頂、臨時覆蓋守門門檻
-- 保留：POST /predict 自測 API
+- 保留你的「完整 LINE 互動流程」：試用鎖、開通信碼、館別選單、快速按鈕、連續輸入點數
+- 保留/整合：分段覆蓋（尾房強化）、THEO_BLEND、TIE_MAX 封頂、臨時覆蓋守門門檻、POST /predict 自測 API
+- 新增「相容模式」與 deplete 開關：
+    COMPAT_MODE=1 → 完整回到「純 PF、獨立回合」：不分段、不混理論、不封頂和局、不用 deplete
+    DEPL_ENABLE=0 → 即使有 deplete 模組也不會啟用
 """
 
 import os, sys, logging, time, re, json
@@ -110,7 +110,7 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception: return 1 if default else 0
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-02+stage+LINE-full"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -220,6 +220,10 @@ LOG_DECISION = env_flag("LOG_DECISION", 1)
 
 INV = {0: "莊", 1: "閒"}
 
+# ---- Compatibility switches ----
+COMPAT_MODE = int(os.getenv("COMPAT_MODE", "0"))  # 1 = 回到純 PF、獨立回合（無分段/理論混合/TIE封頂/deplete）
+DEPL_ENABLE = int(os.getenv("DEPL_ENABLE", "0"))  # 1 = 允許 deplete；0 = 禁用
+
 def bet_amount(bankroll: int, pct: float) -> int:
     if not bankroll or bankroll <= 0 or pct <= 0: return 0
     return int(round(bankroll * pct))
@@ -241,7 +245,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     if DECISION_MODE == "prob":
         side = _decide_side_by_prob(pB, pP)
         _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
-        final_edge = max(abs(evB), abs(evP)); reason.append("模式=prob")
+        final_edge = max(abs(evB), abs(evP)); reason.append(f"模式=prob")
     elif DECISION_MODE == "hybrid":
         if abs(pB - pP) >= PROB_MARGIN:
             side = _decide_side_by_prob(pB, pP)
@@ -301,7 +305,7 @@ def get_session(uid: str) -> Dict[str, Any]:
             try: return json.loads(j)
             except Exception: pass
     return SESS_FALLBACK.get(uid) or {
-        "phase":"await_pts","bankroll":0,"rounds_seen":0,"last_pts_text":None,"premium":False,"trial_start":int(time.time())
+        "phase":"await_pts","bankroll":0,"rounds_seen":0,"last_pts_text":None,"premium":False
     }
 
 def save_session(uid: str, data: Dict[str, Any]):
@@ -312,49 +316,26 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id: return True
     return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
 
-# ---------- 三段分段覆蓋 ----------
-def _pick_stage(prefix: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    def put(key_env: str, key_out: str):
-        v = os.getenv(key_env)
-        if v is not None and v != "":
-            try: out[key_out] = float(v)
-            except: pass
-    put(f"{prefix}_SOFT_TAU", "SOFT_TAU")
-    put(f"{prefix}_PF_PRED_SIMS", "PF_PRED_SIMS")
-    put(f"{prefix}_MIN_CONF_FOR_ENTRY", "MIN_CONF_FOR_ENTRY")
-    put(f"{prefix}_EDGE_ENTER", "EDGE_ENTER")
-    put(f"{prefix}_TIE_MAX", "TIE_MAX")
-    put(f"{prefix}_THEO_BLEND", "THEO_BLEND")
-    put(f"{prefix}_DEPLETEMC_SIMS", "DEPLETEMC_SIMS")
-    put(f"{prefix}_DEPL_FACTOR", "DEPL_FACTOR")
-    return out
-
+# ---------- 分段覆蓋 ----------
 def get_stage_over(rounds_seen: int) -> Dict[str, float]:
+    # 相容模式：完全關閉分段覆蓋
+    if COMPAT_MODE == 1:
+        return {}
     if os.getenv("STAGE_MODE","count").lower() == "disabled": return {}
-    early = int(os.getenv("EARLY_HANDS","15"))
     late  = int(os.getenv("LATE_HANDS","56"))
-
-    if rounds_seen <= early:
-        return _pick_stage("EARLY")
-    elif rounds_seen <= late:
-        return _pick_stage("MID")
-    else:
-        over = _pick_stage("LATE")
-        # 預設尾段缺省值（若未設環境變數）
-        if "SOFT_TAU" not in over:          over["SOFT_TAU"] = float(os.getenv("LATE_SOFT_TAU","1.92"))
-        if "DEPLETEMC_SIMS" not in over:    over["DEPLETEMC_SIMS"] = float(os.getenv("DEPLETEMC_SIMS","1600"))
-        if "THEO_BLEND" not in over:        over["THEO_BLEND"] = float(os.getenv("THEO_BLEND","0.004"))
-        if "TIE_MAX" not in over:           over["TIE_MAX"] = float(os.getenv("TIE_MAX","0.11"))
-        if "MIN_CONF_FOR_ENTRY" not in over:over["MIN_CONF_FOR_ENTRY"] = float(os.getenv("LATE_MIN_CONF_FOR_ENTRY","0.462"))
-        if "EDGE_ENTER" not in over:        over["EDGE_ENTER"] = float(os.getenv("LATE_EDGE_ENTER","0.0030"))
-        if "DEPL_FACTOR" not in over:       over["DEPL_FACTOR"] = float(os.getenv("DEPL_FACTOR","1.0"))
-        # 兼容舊鍵
+    over: Dict[str,float] = {}
+    if rounds_seen > late:
+        over["SOFT_TAU"] = float(os.getenv("LATE_SOFT_TAU","1.92"))
+        over["DEPLETEMC_SIMS"] = float(os.getenv("DEPLETEMC_SIMS","1600"))
+        over["THEO_BLEND"] = float(os.getenv("THEO_BLEND","0.004"))
+        over["TIE_MAX"] = float(os.getenv("TIE_MAX","0.11"))
+        over["MIN_CONF_FOR_ENTRY"] = float(os.getenv("LATE_MIN_CONF_FOR_ENTRY","0.462"))
+        over["EDGE_ENTER"] = float(os.getenv("LATE_EDGE_ENTER","0.0030"))
         lpred = os.getenv("LATE_PF_PRED_SIMS")
-        if lpred and "PF_PRED_SIMS" not in over:
+        if lpred:
             try: over["PF_PRED_SIMS"] = float(lpred)
-            except: pass
-        return over
+            except Exception: pass
+    return over
 
 # ---------- 解析點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
@@ -363,9 +344,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
     s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]","",s).replace("\u3000"," ")
     u = s.upper().strip()
     m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
-    if m:
-        d = m.group(1)
-        return (int(d),int(d)) if d else (0,0)
+    if m: d = m.group(1); return (int(d),int(d)) if d else (0,0)
     m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
     if m: return (int(m.group(1)), int(m.group(2)))
     m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
@@ -384,44 +363,47 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
+    # 先跑 PF 預測（基礎機率）
     sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS","5"))))
     p = np.asarray(PF.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
 
-    # 1) SoftTau 溫度縮放
+    # 1) SoftTau 溫度縮放（相容模式也保留，只用全域或覆蓋值）
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU","2.0"))))
     p = p ** (1.0/max(1e-6,soft_tau)); p = p / p.sum()
 
-    # 2) deplete MC（若可用）；支援每段 DEPLETEMC_SIMS / DEPL_FACTOR
-    if DEPLETE_OK and init_counts and probs_after_points:
+    # 2) deplete MC（若允許且可用；相容模式=1 時直接跳過）
+    if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
             counts = init_counts(int(os.getenv("DECKS","8")))
             dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS","1000"))))
-            depl_factor = float(over.get("DEPL_FACTOR", float(os.getenv("DEPL_FACTOR","1.0"))))
-            dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=depl_factor)
+            dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=1.0)
             p = (p + dep) * 0.5; p = p / p.sum()
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
 
-    # 3) 分段 THEO_BLEND（局部混合理論分布）
-    theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND","0.0"))))
-    if theo_blend>0.0:
-        theo = np.array([0.4586,0.4462,0.0952], dtype=np.float32)
-        p = (1.0-theo_blend)*p + theo_blend*theo; p = p / p.sum()
+    # 3) THEO_BLEND（只有非相容模式才啟用）
+    if COMPAT_MODE == 0:
+        theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND","0.0"))))
+        if theo_blend>0.0:
+            theo = np.array([0.4586,0.4462,0.0952], dtype=np.float32)
+            p = (1.0-theo_blend)*p + theo_blend*theo; p = p / p.sum()
 
-    # 4) 分段 TIE_MAX 封頂 + 全域 TIE_MIN 下限
-    tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
-    if p[2] > tie_max:
-        sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-        p[2] = tie_max; p[0]*=sc; p[1]*=sc; p = p / p.sum()
-    if p[2] < TIE_MIN:
-        sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-        p[2] = TIE_MIN; p[0]*=sc; p[1]*=sc; p = p / p.sum()
+    # 4) TIE_MAX 封頂（只有非相容模式才啟用；同時下限保護 TIE_MIN）
+    if COMPAT_MODE == 0:
+        tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
+        if p[2] > tie_max:
+            sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+            p[2] = tie_max; p[0]*=sc; p[1]*=sc; p = p / p.sum()
+        if p[2] < TIE_MIN:
+            sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+            p[2] = TIE_MIN; p[0]*=sc; p[1]*=sc; p = p / p.sum()
 
-    # 5) 決策前臨時覆蓋觀望門檻（只對本次有效）
+    # 5) 決策前臨時覆蓋（只非相容模式才會有 over 的 MIN_CONF/EDGE_ENTER）
     _MIN_CONF, _EDGE_ENTER = MIN_CONF_FOR_ENTRY, EDGE_ENTER
     try:
-        if "MIN_CONF_FOR_ENTRY" in over: globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
-        if "EDGE_ENTER" in over: globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
+        if COMPAT_MODE == 0:
+            if "MIN_CONF_FOR_ENTRY" in over: globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
+            if "EDGE_ENTER" in over:        globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
         choice, edge, bet_pct, reason = decide_only_bp(p)
     finally:
         globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
@@ -638,8 +620,8 @@ else:
 # ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
-    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s)",
-             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE)
+    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s)",
+             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
