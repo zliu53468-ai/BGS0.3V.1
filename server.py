@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent Prediction + Stage Overrides (2025-11-02)
+"""server.py — BGS Independent Prediction + Stage Overrides (2025-11-02, with LINE webhook)
 
+變更摘要：
 - 修正：先前語法錯誤 `sess["phase"] = "await_pts"]` → 已移除多餘 `]`
 - 新增：分段覆蓋邏輯 get_stage_over()，支援 LATE_* 參數（尾段）
-- 依你提供的流程嵌入：
-  1) SoftTau 溫度縮放
-  2) deplete MC（可調 DEPLETEMC_SIMS）
-  3) 分段 THEO_BLEND（局部混合理論分布）
-  4) 分段 TIE_MAX 封頂
-  5) 在決策前臨時覆蓋 MIN_CONF_FOR_ENTRY / EDGE_ENTER（只本次有效）
+- 新增：LINE Bot (minimal) webhook 與簡化互動流程（/line-webhook）
+- 保留：POST /predict 自測 API、不更動你的 PF/決策核心流程
 
-可用環境變數（重點，與你之前一致/相容）：
-- PF：PF_N, PF_UPD_SIMS, PF_PRED_SIMS, PF_RESAMPLE, PF_DIR_EPS, PF_BACKEND (mc/np)
+可用環境變數（與你舊版相容）：
+- PF：PF_N, PF_UPD_SIMS, PF_PRED_SIMS, PF_RESAMPLE, PF_DIR_EPS, PF_BACKEND(mc/np)
 - 基本決策：DECISION_MODE(ev|prob|hybrid), BANKER_PAYOUT, PROB_MARGIN, MIN_EV_EDGE
 - 出手守門：MIN_CONF_FOR_ENTRY, EDGE_ENTER, QUIET_SMALLEdge
 - 配注：MIN_BET_PCT, MAX_BET_PCT, MAX_EDGE_FOR_FULLBET
 - 和局/平滑：SKIP_TIE_UPD, SOFT_TAU, TIE_MIN, TIE_MAX
 - 分段：STAGE_MODE=count|disabled, EARLY_HANDS, LATE_HANDS,
-         LATE_SOFT_TAU, LATE_PROB_SMA_ALPHA(保留欄位), LATE_PF_PRED_SIMS,
+         LATE_SOFT_TAU, LATE_PF_PRED_SIMS,
          LATE_MIN_CONF_FOR_ENTRY, LATE_EDGE_ENTER,
-         DEPLETEMC_SIMS, DEPL_FACTOR(保留欄位), THEO_BLEND(分段覆蓋可用)
+         DEPLETEMC_SIMS, THEO_BLEND(分段局部混合), TIE_MAX(分段封頂)
+- LINE：LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
 """
 
 import os
@@ -137,7 +135,7 @@ def env_flag(name: str, default: int = 1) -> int:
         return 1 if default else 0
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-02+stage-overrides"
+VERSION = "bgs-independent-2025-11-02+stage-overrides+line"
 
 # ---------- Flask ----------
 if _flask_available and Flask is not None:
@@ -371,15 +369,6 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
 def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     """
     依局數回傳「本次決策」臨時覆蓋的參數（overrides）。
-    你可用環境變數調整（示例：尾段更穩）
-    - STAGE_MODE=count|disabled
-    - EARLY_HANDS (含) 以前 = early；EARLY_HANDS ~ LATE_HANDS 之間 = mid；> LATE_HANDS = late
-    - 目前主要在 late 才覆蓋，保持你之前習慣。
-    可用的 LATE_* 例：
-      LATE_SOFT_TAU, LATE_PF_PRED_SIMS, LATE_MIN_CONF_FOR_ENTRY, LATE_EDGE_ENTER,
-      THEO_BLEND（分段用此鍵即可覆蓋，沿用你 snippet 寫法),
-      TIE_MAX（分段封頂）,
-      DEPLETEMC_SIMS（尾段 1300~1600）
     """
     stage_mode = os.getenv("STAGE_MODE", "count").lower()
     if stage_mode == "disabled":
@@ -391,15 +380,13 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     over: Dict[str, float] = {}
 
     if rounds_seen > late:
-        # 尾段覆蓋（用你的建議預設值；沒設環境變數就用這些合理缺省）
+        # 尾段覆蓋（若未給環境值則使用這些缺省）
         over["SOFT_TAU"] = float(os.getenv("LATE_SOFT_TAU", "1.92"))
         over["DEPLETEMC_SIMS"] = float(os.getenv("DEPLETEMC_SIMS", "1600"))
         over["THEO_BLEND"] = float(os.getenv("THEO_BLEND", "0.004"))
         over["TIE_MAX"] = float(os.getenv("TIE_MAX", "0.11"))
         over["MIN_CONF_FOR_ENTRY"] = float(os.getenv("LATE_MIN_CONF_FOR_ENTRY", "0.462"))
         over["EDGE_ENTER"] = float(os.getenv("LATE_EDGE_ENTER", "0.0030"))
-
-        # 若你提供 LATE_PF_PRED_SIMS，就用它覆蓋 PF_PRED_SIMS 參數（透過 env 再讀）
         lpred = os.getenv("LATE_PF_PRED_SIMS")
         if lpred:
             try:
@@ -407,7 +394,7 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
             except Exception:
                 pass
 
-    # 你也可以擴充 early/mid 覆蓋邏輯；此處先簡化只在 late 處理
+    # 可擴充 early/mid 覆蓋；此處先簡化只在 late 處理
     return over
 
 # ---------- 點數解析 ----------
@@ -437,17 +424,9 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if len(digits) == 2: return (int(digits[0]), int(digits[1]))
     return None
 
-# ---------- 主預測處理（嵌入你的 1~5 流程） ----------
+# ---------- 主預測處理（嵌入 1~5 流程） ----------
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     start_time = time.time()
-
-    # （可選）若你想要把上一手結果回灌 PF，可在這裡做：
-    # if not (p_pts == b_pts and SKIP_TIE_UPD):
-    #     outcome = 2 if p_pts == b_pts else (1 if p_pts > b_pts else 0)
-    #     try:
-    #         PF.update_outcome(outcome)
-    #     except Exception as e:
-    #         log.warning("PF.update_outcome failed: %s", e)
 
     # 取得「分段覆蓋」參數
     rounds_seen = int(sess.get("rounds_seen", 0))
@@ -510,11 +489,9 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
         globals()["MIN_CONF_FOR_ENTRY"] = _global_MIN_CONF
         globals()["EDGE_ENTER"] = _global_EDGE_ENTER
 
-    # 配注金額（用 session bankroll，如未設定則 0）
     bankroll_now = int(sess.get("bankroll", 0))
     bet_amt = bet_amount(bankroll_now, bet_pct)
 
-    # 更新 session（不漏增 rounds_seen）
     sess["rounds_seen"] = rounds_seen + 1
 
     elapsed = time.time() - start_time
@@ -580,6 +557,87 @@ def predict():
     except Exception as e:
         log.exception("predict error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
+
+# ---------- LINE Bot (minimal) ----------
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+line_api = None
+line_handler = None
+
+if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
+    try:
+        from linebot import LineBotApi, WebhookHandler
+        from linebot.exceptions import InvalidSignatureError
+        from linebot.models import MessageEvent, TextMessage, TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+
+        line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+        line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+        def _qr():
+            try:
+                return QuickReply(items=[
+                    QuickReplyButton(action=MessageAction(label="遊戲設定", text="遊戲設定")),
+                    QuickReplyButton(action=MessageAction(label="報莊勝", text="B")),
+                    QuickReplyButton(action=MessageAction(label="報閒勝", text="P")),
+                    QuickReplyButton(action=MessageAction(label="報和局", text="T")),
+                ])
+            except Exception:
+                return None
+
+        @line_handler.add(MessageEvent, message=TextMessage)
+        def on_text(event):
+            uid = event.source.user_id
+            raw = (event.message.text or "").strip()
+            sess = get_session(uid)
+
+            if raw == "遊戲設定":
+                sess["bankroll"] = sess.get("bankroll", 0)
+                sess["rounds_seen"] = 0
+                save_session(uid, sess)
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="設定完成，請直接輸入點數（如：閒6莊5 / 65 / 和）", quick_reply=_qr())
+                )
+                return
+
+            pts = parse_last_hand_points(raw)
+            if not pts:
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="格式無法辨識，請輸入：閒6莊5 / 65 / 和", quick_reply=_qr())
+                )
+                return
+
+            p_pts, b_pts = pts
+            if p_pts == b_pts and SKIP_TIE_UPD:
+                last_txt = "上局結果: 和局"
+            else:
+                last_txt = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+            sess["last_pts_text"] = last_txt
+
+            probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
+            save_session(uid, sess)
+            card = format_output_card(probs, choice, last_txt, bet_amt, cont=bool(CONTINUOUS_MODE))
+            line_api.reply_message(event.reply_token, TextSendMessage(text=card, quick_reply=_qr()))
+
+        @app.post("/line-webhook")
+        def line_webhook():
+            signature = request.headers.get("X-Line-Signature", "")
+            body = request.get_data(as_text=True)
+            try:
+                line_handler.handle(body, signature)
+            except InvalidSignatureError:
+                abort(400, "Invalid signature")
+            except Exception as e:
+                log.error("webhook error: %s", e)
+                abort(500)
+            return "OK", 200
+
+        log.info("LINE webhook enabled")
+    except Exception as e:
+        log.warning("LINE not fully configured: %s", e)
+else:
+    log.warning("LINE credentials missing; LINE webhook disabled.")
 
 # ---------- Main ----------
 if __name__ == "__main__":
