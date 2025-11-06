@@ -1,93 +1,143 @@
-# -*- coding: utf-8 -*-
-"""pfilter.py — Outcome Particle Filter (independent mode)"""
 import os
 import numpy as np
 
-# Configuration from environment
-HISTORY_MODE = False
-# We assume SKIP_TIE_UPD and other parameters might be needed if history mode on
-SKIP_TIE_UPD = False
-SOFT_TAU = 1.4
-TIE_MIN = 0.07
-TIE_MAX = 0.12
+def _stage_bounds():
+    early_end = int(os.getenv("EARLY_HANDS", "20"))
+    mid_end   = int(os.getenv("MID_HANDS",   os.getenv("LATE_HANDS", "56")))
+    return early_end, mid_end
+
+def _stage_prefix(rounds_seen: int | None) -> str:
+    if rounds_seen is None: return ""
+    e_end, m_end = _stage_bounds()
+    if rounds_seen < e_end: return "EARLY_"
+    elif rounds_seen < m_end: return "MID_"
+    else: return "LATE_"
 
 class OutcomePF:
-    def __init__(self, decks: int = 8, seed: int = 42, n_particles: int = 50, 
-                 sims_lik: int = 30, resample_thr: float = 0.5, 
-                 backend: str = "mc", dirichlet_eps: float = 0.05):
-        # Initialize random seed for reproducibility
-        np.random.seed(seed)
+    def __init__(self, decks: int, seed: int = None, 
+                 n_particles: int = 1000, sims_lik: int = 100, 
+                 resample_thr: float = 0.5, backend: str = 'numpy', 
+                 dirichlet_eps: float = 1e-6):
+        # 初始化參數
         self.decks = decks
         self.n_particles = n_particles
         self.sims_lik = sims_lik
-        self._backend = backend
-        # If history mode (not default), initialize outcome counts with a small prior
-        if HISTORY_MODE:
-            # Use theoretical probabilities as a prior distribution
-            base_probs = np.array([0.4586, 0.4462, 0.0952], dtype=np.float64)
-            # Scale prior counts so initial probabilities align with theoretical
-            prior_weight = 1.0
-            self._counts = prior_weight * base_probs  # fractional prior counts
-            self._total = prior_weight
-        else:
-            self._counts = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-            self._total = 0.0
+        self.resample_thr = resample_thr
+        self.backend = backend
+        self.dirichlet_eps = dirichlet_eps
+        mode = os.getenv('HISTORY_MODE', '0')
+        self.history_mode = int(mode) if mode.isdigit() else 0
+        if seed is not None:
+            np.random.seed(seed)
+        # 基礎牌靴
+        self.base_counts = self._init_card_counts(decks)
+        # 粒子
+        self.particles = [self.base_counts.copy() for _ in range(n_particles)]
+        self.weights = np.ones(n_particles, dtype=np.float64) / n_particles
 
-    @property
-    def backend(self) -> str:
-        return f"{self._backend}-local"
+    def _init_card_counts(self, decks: int):
+        counts = {0: 16 * decks}
+        for point in range(1, 10):
+            counts[point] = 4 * decks
+        return counts
+
+    def _simulate_round(self, counts):
+        # 以 counts 展開成列，用於抽樣
+        card_values = []
+        for value, count in counts.items():
+            card_values.extend([value] * count)
+        card_values = np.array(card_values, dtype=np.int8)
+
+        draws = np.random.choice(card_values, size=4, replace=False)
+        temp_counts = counts.copy()
+        for val in draws:
+            temp_counts[val] -= 1
+
+        player_total = (draws[0] + draws[2]) % 10
+        banker_total = (draws[1] + draws[3]) % 10
+
+        player_natural = player_total in (8, 9)
+        banker_natural = banker_total in (8, 9)
+        player_third = None
+        banker_third = None
+        if not (player_natural or banker_natural):
+            if player_total <= 5:
+                player_third = np.random.choice(
+                    np.array([val for val, cnt in temp_counts.items() for _ in range(cnt)]), 
+                    replace=False
+                )
+                temp_counts[player_third] -= 1
+                player_total = (player_total + player_third) % 10
+            if banker_total <= 5:
+                draw_flag = False
+                if player_third is None:
+                    draw_flag = True
+                else:
+                    pt = player_third % 10
+                    if banker_total <= 2: draw_flag = True
+                    elif banker_total == 3 and pt != 8: draw_flag = True
+                    elif banker_total == 4 and 2 <= pt <= 7: draw_flag = True
+                    elif banker_total == 5 and 4 <= pt <= 7: draw_flag = True
+                    elif banker_total == 6 and pt in (6, 7): draw_flag = True
+                if draw_flag:
+                    banker_third = np.random.choice(
+                        np.array([val for val, cnt in temp_counts.items() for _ in range(cnt)]), 
+                        replace=False
+                    )
+                    temp_counts[banker_third] -= 1
+                    banker_total = (banker_total + banker_third) % 10
+
+        if player_total > banker_total: return 1
+        elif player_total < banker_total: return 0
+        else: return 2
+
+    def predict(self, sims_per_particle: int = None, rounds_seen: int | None = None) -> np.ndarray:
+        """
+        若 sims_per_particle 明確傳入：直接用（與既有 server 呼叫相容）
+        否則：依 rounds_seen 自動吃 EARLY_/MID_/LATE_PF_PRED_SIMS，最後退回 PF_PRED_SIMS（預設 5）
+        """
+        if sims_per_particle is None:
+            try:
+                sims_per_particle = int(os.getenv("PF_PRED_SIMS", "5"))
+            except:
+                sims_per_particle = 5
+            prefix = _stage_prefix(rounds_seen)
+            if prefix:
+                sp = os.getenv(prefix + "PF_PRED_SIMS")
+                if sp not in (None, ""):
+                    try: sims_per_particle = int(float(sp))
+                    except: pass
+
+        total_prob = np.zeros(3, dtype=np.float64)
+        for i, counts in enumerate(self.particles):
+            outcomes = [self._simulate_round(counts) for _ in range(int(sims_per_particle))]
+            outcomes = np.array(outcomes, dtype=np.int8)
+            total_prob[0] += self.weights[i] * (outcomes == 0).mean()
+            total_prob[1] += self.weights[i] * (outcomes == 1).mean()
+            total_prob[2] += self.weights[i] * (outcomes == 2).mean()
+        total = total_prob.sum()
+        if total > 0:
+            total_prob /= total
+        return total_prob.astype(np.float32)
 
     def update_outcome(self, outcome: int):
-        """Update the filter with the actual outcome (0=莊, 1=閒, 2=和). 
-        In independent mode, this does nothing unless history mode is enabled."""
-        if not HISTORY_MODE:
-            # Independent mode: ignore outcome updates
+        if self.history_mode == 0:
             return
-        if outcome == 2 and SKIP_TIE_UPD:
-            # Skip tie updates if configured
+        if outcome == 2 and bool(int(os.getenv('SKIP_TIE_UPD', '0'))):
             return
-        if outcome in (0, 1, 2):
-            # Update outcome counts and total
-            self._counts[outcome] += 1.0
-            self._total += 1.0
-            # Log update for debugging
-            try:
-                import logging
-                logging.getLogger("bgs-server").info("OutcomePF 更新: outcome=%s, total_games=%s", outcome, int(self._total))
-            except Exception:
-                pass
-
-    def predict(self, sims_per_particle: int = 5) -> np.ndarray:
-        """Predict outcome probabilities for the next round."""
-        if HISTORY_MODE and self._total > 0:
-            # If history mode, use the learned distribution (with smoothing) for prediction
-            probs = self._counts / self._total
-        else:
-            # If no history or no outcomes observed, use theoretical base probabilities
-            probs = np.array([0.4586, 0.4462, 0.0952], dtype=np.float64)
-        # Monte Carlo sampling to introduce variability (simulate draws)
-        total_simulations = self.n_particles * sims_per_particle
-        counts = np.random.multinomial(total_simulations, probs)
-        pred = counts.astype(np.float64) / total_simulations
-        # Apply output smoothing (soft_tau)
-        pred = pred ** (1.0 / SOFT_TAU)
-        pred = pred / pred.sum()
-        # Apply tie probability compression
-        pT = pred[2]
-        if pT < TIE_MIN:
-            pred[2] = TIE_MIN
-            scale = (1.0 - TIE_MIN) / (pred[0] + pred[1]) if (pred[0] + pred[1]) > 0 else 1.0
-            pred[0] *= scale
-            pred[1] *= scale
-        elif pT > TIE_MAX:
-            pred[2] = TIE_MAX
-            scale = (1.0 - TIE_MAX) / (pred[0] + pred[1]) if (pred[0] + pred[1]) > 0 else 1.0
-            pred[0] *= scale
-            pred[1] *= scale
-        # Log prediction for debugging
-        try:
-            import logging
-            logging.getLogger("bgs-server").info("OutcomePF 預測: %s (基於 %s 場歷史)", pred, int(self._total))
-        except Exception:
-            pass
-        return pred.astype(np.float32)
+        N = self.n_particles
+        new_weights = np.zeros(N, dtype=np.float64)
+        for i, counts in enumerate(self.particles):
+            outcomes = [self._simulate_round(counts) for _ in range(self.sims_lik)]
+            match_count = sum(1 for o in outcomes if o == outcome)
+            likelihood = (match_count + self.dirichlet_eps) / (self.sims_lik + 3 * self.dirichlet_eps)
+            new_weights[i] = self.weights[i] * likelihood
+        s = new_weights.sum()
+        if s == 0: new_weights[:] = 1.0 / N
+        else: new_weights /= s
+        self.weights = new_weights
+        ess = 1.0 / np.sum(self.weights**2)
+        if ess < self.resample_thr * N:
+            idx = np.random.choice(np.arange(N), size=N, p=self.weights)
+            self.particles = [self.particles[j].copy() for j in idx]
+            self.weights.fill(1.0 / N)
