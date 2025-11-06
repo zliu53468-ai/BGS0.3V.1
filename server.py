@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03)
 
-【這版做了什麼】
+這版做了什麼
 - 保留你的「完整 LINE 互動流程」：試用鎖、開通信碼、館別選單、快速按鈕、連續輸入點數
 - 保留/整合：分段覆蓋（尾房強化）、THEO_BLEND、TIE_MAX 封頂、臨時覆蓋守門門檻、POST /predict 自測 API
 - 新增「相容模式」與 deplete 開關：
@@ -276,66 +276,49 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
     max_edge = max(EDGE_ENTER + 1e-6, MAX_EDGE_SCALE)
     bet_pct = min_b + (max_b - min_b) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
-    reason.append(f"配注{int(min_b*100)}%~{int(max_b*100)}% conf={conf:.3f}")
-    return (INV[side], final_edge, bet_pct, "; ".join(reason))
+    side_label = INV.get(side, "莊")
+    reason.append(f"🔻 {side_label} 勝率={100.0 * (pB if side==0 else pP):.1f}%")
 
-def format_output_card(prob: np.ndarray, choice: str, last_pts_text: Optional[str], bet_amt: int, cont: bool) -> str:
-    b_pct_txt = f"{prob[0] * 100:.2f}%"; p_pct_txt = f"{prob[1] * 100:.2f}%"
-    header: List[str] = []
-    if last_pts_text: header.append(last_pts_text)
-    header.append("開始分析下局....")
-    block = [
-        "預測結果",
-        f"閒：{p_pct_txt}",
-        f"莊：{b_pct_txt}",
-        f"和：{prob[2] * 100:.2f}%",
-    ]
-    if choice == "觀望":
-        block.append("本次預測結果：觀望"); block.append("建議觀望（不下注）")
-    else:
-        block.append(f"本次預測結果：{choice}"); block.append(f"建議下注：{bet_amt:,}")
-    if cont: block.append("\n📌 連續模式：請直接輸入下一局點數（例：65 / 和 / 閒6莊5）")
-    return "\n".join(header + [""] + block)
+    return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
 
-# ---------- Session ----------
-def get_session(uid: str) -> Dict[str, Any]:
-    if redis_client:
-        j = _rget(f"sess:{uid}")
-        if j:
-            try: return json.loads(j)
-            except Exception: pass
-    return SESS_FALLBACK.get(uid) or {
-        "phase":"await_pts","bankroll":0,"rounds_seen":0,"last_pts_text":None,"premium":False
-    }
+# --- 三段工具：只影響 get_stage_over 的讀取，不碰其餘流程 ---
+def _stage_bounds():
+    early_end = int(os.getenv("EARLY_HANDS", "20"))  # [0, early_end)
+    mid_end   = int(os.getenv("MID_HANDS",   os.getenv("LATE_HANDS", "56")))  # [early_end, mid_end)
+    return early_end, mid_end
 
-def save_session(uid: str, data: Dict[str, Any]):
-    if redis_client: _rset(f"sess:{uid}", json.dumps(data), ex=SESSION_EXPIRE_SECONDS)
-    else: SESS_FALLBACK[uid] = data
+def _stage_prefix(rounds_seen: int) -> str:
+    e_end, m_end = _stage_bounds()
+    if rounds_seen < e_end: return "EARLY_"
+    elif rounds_seen < m_end: return "MID_"
+    else: return "LATE_"
 
-def _dedupe_event(event_id: Optional[str]) -> bool:
-    if not event_id: return True
-    return _rsetnx(f"dedupe:{event_id}", "1", DEDUPE_TTL)
-
-# ---------- 分段覆蓋 ----------
 def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     # 相容模式：完全關閉分段覆蓋
     if COMPAT_MODE == 1:
         return {}
     if os.getenv("STAGE_MODE","count").lower() == "disabled": return {}
-    late  = int(os.getenv("LATE_HANDS","56"))
     over: Dict[str,float] = {}
-    if rounds_seen > late:
-        over["SOFT_TAU"] = float(os.getenv("LATE_SOFT_TAU","1.92"))
-        over["DEPLETEMC_SIMS"] = float(os.getenv("DEPLETEMC_SIMS","1600"))
-        over["THEO_BLEND"] = float(os.getenv("THEO_BLEND","0.004"))
-        over["TIE_MAX"] = float(os.getenv("TIE_MAX","0.11"))
-        over["MIN_CONF_FOR_ENTRY"] = float(os.getenv("LATE_MIN_CONF_FOR_ENTRY","0.462"))
-        over["EDGE_ENTER"] = float(os.getenv("LATE_EDGE_ENTER","0.0030"))
-        lpred = os.getenv("LATE_PF_PRED_SIMS")
-        if lpred:
-            try: over["PF_PRED_SIMS"] = float(lpred)
-            except Exception: pass
+    prefix = _stage_prefix(rounds_seen)
+
+    # 支援的鍵（與你原有 over 機制一致）
+    keys = ["SOFT_TAU","THEO_BLEND","TIE_MAX",
+            "MIN_CONF_FOR_ENTRY","EDGE_ENTER",
+            "PF_PRED_SIMS","DEPLETEMC_SIMS"]
+    for k in keys:
+        v = os.getenv(prefix + k)
+        if v not in (None, ""):
+            try: over[k] = float(v)
+            except: pass
+
+    # 兼容你舊版只設 LATE_* 的行為（保留優先權）
+    if prefix == "LATE_":
+        late_dep = os.getenv("LATE_DEPLETEMC_SIMS")
+        if late_dep:
+            try: over["DEPLETEMC_SIMS"] = float(late_dep)
+            except: pass
     return over
+# --- 三段工具結束 ---
 
 # ---------- 解析點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
@@ -369,7 +352,7 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
 
     # 1) SoftTau 溫度縮放（相容模式也保留，只用全域或覆蓋值）
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU","2.0"))))
-    p = p ** (1.0/max(1e-6,soft_tau)); p = p / p.sum()
+    p = p ** (1.0/max(1e-6, soft_tau)); p = p / p.sum()
 
     # 2) deplete MC（若允許且可用；相容模式=1 時直接跳過）
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
@@ -384,19 +367,19 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
     # 3) THEO_BLEND（只有非相容模式才啟用）
     if COMPAT_MODE == 0:
         theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND","0.0"))))
-        if theo_blend>0.0:
+        if theo_blend > 0.0:
             theo = np.array([0.4586,0.4462,0.0952], dtype=np.float32)
-            p = (1.0-theo_blend)*p + theo_blend*theo; p = p / p.sum()
+            p = (1.0 - theo_blend)*p + theo_blend*theo; p = p / p.sum()
 
     # 4) TIE_MAX 封頂（只有非相容模式才啟用；同時下限保護 TIE_MIN）
     if COMPAT_MODE == 0:
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
         if p[2] > tie_max:
             sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-            p[2] = tie_max; p[0]*=sc; p[1]*=sc; p = p / p.sum()
+            p[2] = tie_max; p[0] *= sc; p[1] *= sc; p = p / p.sum()
         if p[2] < TIE_MIN:
             sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-            p[2] = TIE_MIN; p[0]*=sc; p[1]*=sc; p = p / p.sum()
+            p[2] = TIE_MIN; p[0] *= sc; p[1] *= sc; p = p / p.sum()
 
     # 5) 決策前臨時覆蓋（只非相容模式才會有 over 的 MIN_CONF/EDGE_ENTER）
     _MIN_CONF, _EDGE_ENTER = MIN_CONF_FOR_ENTRY, EDGE_ENTER
@@ -428,7 +411,8 @@ def root():
 @app.get("/health")
 def health():
     return jsonify(ok=True, ts=time.time(), version=VERSION,
-                   pf_initialized=pf_initialized, pf_backend=getattr(PF,'backend','unknown')), 200
+                   pf_initialized=pf_initialized,
+                   pf_backend=getattr(PF,'backend','unknown')), 200
 
 @app.post("/predict")
 def predict():
@@ -438,19 +422,19 @@ def predict():
         last_text = str(data.get("last_text") or "")
         bankroll = data.get("bankroll")
         sess = get_session(uid)
-        if isinstance(bankroll,int) and bankroll>=0: sess["bankroll"] = bankroll
+        if isinstance(bankroll,int) and bankroll >= 0: sess["bankroll"] = bankroll
 
         pts = parse_last_hand_points(last_text)
         if not pts: return jsonify(ok=False, error="無法解析點數；請輸入 '閒6莊5' / '65' / '和'"), 400
 
         p_pts, b_pts = pts
-        sess["last_pts_text"] = "上局結果: 和局" if (p_pts==b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+        sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
         save_session(uid, sess)
         card = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         return jsonify(ok=True,
-            probs=[float(probs[0]), float(probs[1]), float(probs[2])],
-            choice=choice, bet=bet_amt, reason=reason, card=card), 200
+                       probs=[float(probs[0]), float(probs[1]), float(probs[2])],
+                       choice=choice, bet=bet_amt, reason=reason, card=card), 200
     except Exception as e:
         log.exception("predict error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
@@ -488,7 +472,7 @@ def validate_activation_code(code: str) -> bool:
 GAMES = {"1":"WM","2":"PM","3":"DG","4":"SA","5":"KU","6":"歐博/卡利","7":"KG","8":"全利","9":"名人","10":"MT真人"}
 def game_menu_text(left_min: int) -> str:
     lines = ["請選擇遊戲館別"]
-    for k in sorted(GAMES.keys(), key=lambda x:int(x)): lines.append(f"{k}. {GAMES[k]}")
+    for k in sorted(GAMES.keys(), key=lambda x: int(x)): lines.append(f"{k}. {GAMES[k]}")
     lines.append("「請直接輸入數字選擇」"); lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
     return "\n".join(lines)
 
@@ -545,7 +529,6 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
-                if ok: _rset(_trial_key(uid,"expired"), "0")
                 sess["premium"] = bool(ok)
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess); return
@@ -565,7 +548,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
             # 遊戲設定 → 選館 → 輸入籌碼
             if text == "遊戲設定" or up == "GAME SETTINGS":
-                sess["phase"] = "choose_game"; sess["game"]=None; sess["table"]=None; sess["bankroll"]=0
+                sess["phase"] = "choose_game"; sess["game"] = None; sess["table"] = None; sess["bankroll"] = 0
                 first_ts = _rget(_trial_key(uid,"first_ts"))
                 left = max(0, TRIAL_MINUTES - ((int(time.time())-int(first_ts))//60)) if first_ts else TRIAL_MINUTES
                 _reply(line_api, event.reply_token, game_menu_text(left)); save_session(uid, sess); return
@@ -573,7 +556,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
             if sess.get("phase") == "choose_game":
                 m = re.match(r"^\s*(\d+)", text)
                 if m and (m.group(1) in GAMES):
-                    sess["game"] = GAMES[m.group(1)]; sess["phase"]="input_bankroll"
+                    sess["game"] = GAMES[m.group(1)]; sess["phase"] = "input_bankroll"
                     _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）"); save_session(uid, sess); return
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。"); return
 
@@ -581,16 +564,16 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
                 num = re.sub(r"[^\d]","", text)
                 amt = int(num) if num else 0
                 if amt <= 0: _reply(line_api, event.reply_token, "⚠️ 請輸入正整數金額。"); return
-                sess["bankroll"] = amt; sess["phase"]="await_pts"
+                sess["bankroll"] = amt; sess["phase"] = "await_pts"
                 _reply(line_api, event.reply_token,
                        f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：閒6莊5 / 65 / 和）")
                 save_session(uid, sess); return
 
             # 解析點數與預測
             pts = parse_last_hand_points(text)
-            if pts and sess.get("bankroll",0)>=0:
+            if pts and sess.get("bankroll",0) >= 0:
                 p_pts, b_pts = pts
-                sess["last_pts_text"] = "上局結果: 和局" if (p_pts==b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+                sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
                 probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
                 save_session(uid, sess)
                 msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
