@@ -109,6 +109,16 @@ def env_flag(name: str, default: int = 1) -> int:
     try: return 1 if int(float(v)) != 0 else 0
     except Exception: return 1 if default else 0
 
+# [PATCH] 事件去重，修正 `_dedupe_event` 未定義錯誤 --------------------------
+def _dedupe_event(event_id: Optional[str]) -> bool:
+    """避免 LINE webhook 同一事件重複處理；返回 True 表示首次處理。"""
+    if not event_id:
+        return True
+    key = f"dedupe:{event_id}"
+    # 使用 Redis/記憶體做 60s 去重
+    return _rsetnx(key, "1", ex=DEDUPE_TTL)
+# -------------------------------------------------------------------------
+
 # ---------- 版本 ----------
 VERSION = "bgs-independent-2025-11-03+stage+LINE+compat"
 
@@ -281,7 +291,7 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
 
     return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
 
-# --- 三段工具：只影響 get_stage_over 的讀取，不碰其餘流程 ---
+# [PATCH] 三段環境變數覆蓋：EARLY_/MID_/LATE_ ------------------------------
 def _stage_bounds():
     early_end = int(os.getenv("EARLY_HANDS", "20"))  # [0, early_end)
     mid_end   = int(os.getenv("MID_HANDS",   os.getenv("LATE_HANDS", "56")))  # [early_end, mid_end)
@@ -301,24 +311,28 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     over: Dict[str,float] = {}
     prefix = _stage_prefix(rounds_seen)
 
-    # 支援的鍵（與你原有 over 機制一致）
-    keys = ["SOFT_TAU","THEO_BLEND","TIE_MAX",
-            "MIN_CONF_FOR_ENTRY","EDGE_ENTER",
-            "PF_PRED_SIMS","DEPLETEMC_SIMS"]
+    # 支援覆蓋的鍵
+    keys = [
+        "SOFT_TAU", "THEO_BLEND", "TIE_MAX",
+        "MIN_CONF_FOR_ENTRY", "EDGE_ENTER",
+        "PF_PRED_SIMS", "DEPLETEMC_SIMS"
+    ]
     for k in keys:
         v = os.getenv(prefix + k)
         if v not in (None, ""):
-            try: over[k] = float(v)
-            except: pass
+            try:
+                over[k] = float(v)
+            except:
+                pass
 
-    # 兼容你舊版只設 LATE_* 的行為（保留優先權）
+    # 兼容舊版只設 LATE_DEPLETEMC_SIMS 的情況
     if prefix == "LATE_":
         late_dep = os.getenv("LATE_DEPLETEMC_SIMS")
         if late_dep:
             try: over["DEPLETEMC_SIMS"] = float(late_dep)
             except: pass
     return over
-# --- 三段工具結束 ---
+# -------------------------------------------------------------------------
 
 # ---------- 解析點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
