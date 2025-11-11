@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03)
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)
 
-這版做了什麼
-- 保留「完整 LINE 互動流程」：試用鎖、開通信碼、館別選單、快速按鈕、連續輸入點數
-- 保留/整合：分段覆蓋（尾段強化）、THEO_BLEND、TIE_MAX 封頂、臨時覆蓋門檻、POST /predict 自測 API
-- 相容模式/開關：COMPAT_MODE、DEPL_ENABLE
-- ★ 補丁：EV_NEUTRAL、PROB_BIAS_B2P（決策層反偏莊）
-- ★ 補丁：/line-webhook 路由永遠註冊，不再 404（未配置時回 400）
+這版做了什麼（僅小幅補丁，不動你原本流程/介面）
+- 保留「完整 LINE 互動流程」與所有既有開關
+- 維持 /line-webhook 永遠註冊（未配置回 400）
+- ✦ 補丁：預測「效能保護」與「安全上限」
+  * 新增 PRED_SIMS_CAP（預設 10）→ 對 PF_PRED_SIMS 做上限，避免卡死
+  * 依 PF_N 自動下修 sims（PF_N≥300→至多7；PF_N≥350→至多5）
+  * 允許 __OPTIONS__ /line-webhook（避免外部探測造成雜訊）
+- ✦ 補丁：回覆失敗（Invalid reply token）降噪記錄，不中斷流程
+- ✦ 補丁：numpy 設為忽略 underflow/overflow 警示
+
+其餘邏輯（分段覆蓋、THEO_BLEND、TIE_MAX、deplete、配注/決策、API 與 UI 卡片）完全保留
 """
 
 import os, sys, logging, time, re, json
@@ -16,6 +21,9 @@ import numpy as np
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
+
+# 安靜數值警示（避免 PF 大量運算噪聲）
+np.seterr(all="ignore")
 
 # ---------- 安全導入 deplete ----------
 DEPLETE_OK = False
@@ -171,7 +179,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     return "\n".join(lines)
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -183,6 +191,9 @@ else:
             def _d(f): return f
             return _d
         def post(self, *a, **k):
+            def _d(f): return f
+            return _d
+        def options(self, *a, **k):
             def _d(f): return f
             return _d
         def run(self, *a, **k):
@@ -393,6 +404,22 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
             except: pass
     return over
 
+# ---------- 預測效能保護 ----------
+def _tuned_pred_sims(base: int) -> int:
+    """對分段 PF_PRED_SIMS 套安全上限，並依 PF_N 自動下修，避免卡頓。"""
+    try:
+        cap = int(float(os.getenv("PRED_SIMS_CAP", "10")))
+    except Exception:
+        cap = 10
+    n = max(1, min(int(base), cap))
+    try:
+        n_particles = int(getattr(PF, 'n_particles', 200))
+        if n_particles >= 350 and n > 5: n = 5
+        elif n_particles >= 300 and n > 7: n = 7
+    except Exception:
+        pass
+    return max(1, n)
+
 # ---------- 解析點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int,int]]:
     if not text: return None
@@ -420,7 +447,10 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
+    # 取分段/環境 PF_PRED_SIMS，套用效能保護
     sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS","5"))))
+    sims_per_particle = _tuned_pred_sims(sims_per_particle)
+
     p = np.asarray(PF.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
 
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU","2.0"))))
@@ -463,8 +493,8 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
     sess["rounds_seen"] = rounds_seen + 1
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d | %s",
-                 choice, edge, bet_pct*100, sess["rounds_seen"], reason)
+        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d | %s",
+                 choice, edge, bet_pct*100, sess["rounds_seen"], sims_per_particle, reason)
     return p, choice, bet_amt, reason
 
 # ---------- LINE：完整互動 ----------
@@ -522,7 +552,11 @@ def _reply(api, token: str, text: str):
     try:
         api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
     except Exception as e:
-        log.warning("[LINE] reply failed: %s", e)
+        # 常見：Invalid reply token（重試/超時/探測），降噪為 info
+        if "Invalid reply token" in str(e):
+            log.info("[LINE] reply skipped (invalid token, likely retry): %s", e)
+        else:
+            log.warning("[LINE] reply failed: %s", e)
 
 # 初始化 line_handler，但 /line-webhook 路由會「永遠」註冊
 line_api = None
@@ -626,6 +660,11 @@ def line_webhook():
         line_handler.handle(body, signature)
     except Exception as e:
         log.error("webhook error: %s", e); abort(500)
+    return "OK", 200
+
+# 允許 OPTIONS（部分監測/代理會送出）
+@app.options("/line-webhook")
+def line_webhook_options():
     return "OK", 200
 
 # ---------- 簡易 HTTP ----------
