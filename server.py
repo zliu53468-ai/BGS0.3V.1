@@ -662,10 +662,14 @@ def line_webhook():
         log.error("webhook error: %s", e); abort(500)
     return "OK", 200
 
-# 允許 OPTIONS（部分監測/代理會送出）
-@app.options("/line-webhook")
+# 允許 OPTIONS（正確 Flask 寫法，避免 AttributeError）
+@app.route("/line-webhook", methods=["OPTIONS"])
 def line_webhook_options():
-    return "OK", 200
+    return ("", 204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Line-Signature",
+    })
 
 # ---------- 簡易 HTTP ----------
 @app.get("/")
