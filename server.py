@@ -296,6 +296,17 @@ INV = {0: "莊", 1: "閒"}
 COMPAT_MODE = int(os.getenv("COMPAT_MODE", "0"))  # 1 = 回到純 PF（無分段/理論/TIE封頂/deplete）
 DEPL_ENABLE = int(os.getenv("DEPL_ENABLE", "0"))  # 1 = 允許 deplete；0 = 禁用
 
+# ---- Deplete 精修參數 ----
+DEPL_FACTOR = float(os.getenv("DEPL_FACTOR", "0.60"))  # 全域基礎影響因子
+DEPL_STAGE_MODE = os.getenv("DEPL_STAGE_MODE", "depth").lower()
+
+EARLY_DEPL_SCALE = float(os.getenv("EARLY_DEPL_SCALE", "0.2"))
+MID_DEPL_SCALE   = float(os.getenv("MID_DEPL_SCALE",   "0.6"))
+LATE_DEPL_SCALE  = float(os.getenv("LATE_DEPL_SCALE",  "0.9"))
+
+# 單局最大可位移機率（防止 deplete 一口把機率拉太誇張）
+MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.10"))
+
 # ---- PATCH: 反偏莊控制 ----
 EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))           # 1 → prob 分支用 payout-aware 比較（0.95*pB vs pP）
 PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0")) # 機率在莊->閒微移（只動 B/P）
@@ -404,6 +415,33 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
             except: pass
     return over
 
+def _depl_stage_scale(rounds_seen: int) -> float:
+    """
+    根據 rounds_seen 回傳這一局 deplete 的階段縮放係數。
+    """
+    prefix = _stage_prefix(rounds_seen)
+    if prefix == "EARLY_":
+        return EARLY_DEPL_SCALE
+    elif prefix == "MID_":
+        return MID_DEPL_SCALE
+    else:
+        return LATE_DEPL_SCALE
+
+def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.ndarray:
+    """
+    限制單局最大位移，避免 deplete 讓機率跳太兇。
+    """
+    max_shift = max(0.0, float(max_shift))
+    p_old = old_p.astype(float).copy()
+    p_new = new_p.astype(float).copy()
+    delta = p_new - p_old
+    delta = np.clip(delta, -max_shift, max_shift)
+    p_safe = p_old + delta
+    s = float(p_safe.sum())
+    if s > 0:
+        p_safe /= s
+    return p_safe.astype(np.float32)
+
 # ---------- 預測效能保護 ----------
 def _tuned_pred_sims(base: int) -> int:
     """對分段 PF_PRED_SIMS 套安全上限，並依 PF_N 自動下修，避免卡頓。"""
@@ -458,10 +496,39 @@ def _handle_points_and_predict(sess: Dict[str,Any], p_pts:int, b_pts:int) -> Tup
 
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
-            counts = init_counts(int(os.getenv("DECKS","8")))
-            dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS","1000"))))
-            dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=1.0)
-            p = (p + dep) * 0.5; p = p / p.sum()
+            stage_scale = _depl_stage_scale(rounds_seen)
+            raw_alpha = DEPL_FACTOR * stage_scale
+            alpha = max(0.0, min(0.55, float(raw_alpha)))  # 最多約 55% 交給 deplete
+
+            if alpha > 0.0:
+                counts = init_counts(int(os.getenv("DECKS","8")))
+                dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS","18"))))
+
+                dep = probs_after_points(
+                    counts,
+                    p_pts,
+                    b_pts,
+                    sims=dep_sims,
+                    deplete_factor=alpha
+                )
+
+                dep = np.asarray(dep, dtype=np.float32)
+
+                depT = float(dep[2])
+                if depT < TIE_MIN:
+                    dep[2] = TIE_MIN
+                    sc = (1.0 - TIE_MIN) / (1.0 - depT) if depT < 1.0 else 1.0
+                    dep[0] *= sc; dep[1] *= sc
+                elif depT > TIE_MAX:
+                    dep[2] = TIE_MAX
+                    sc = (1.0 - TIE_MAX) / (1.0 - depT) if depT < 1.0 else 1.0
+                    dep[0] *= sc; dep[1] *= sc
+                dep = dep / dep.sum()
+
+                mix = (1.0 - alpha) * p + alpha * dep
+                mix = mix / mix.sum()
+
+                p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
 
