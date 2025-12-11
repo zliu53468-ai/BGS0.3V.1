@@ -481,7 +481,8 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     prefix = _stage_prefix(rounds_seen)
     keys = ["SOFT_TAU", "THEO_BLEND", "TIE_MAX",
             "MIN_CONF_FOR_ENTRY", "EDGE_ENTER",
-            "PF_PRED_SIMS", "DEPLETEMC_SIMS"]
+            "PF_PRED_SIMS", "DEPLETEMC_SIMS",
+            "PF_UPD_SIMS"]  # ★ 增加 PF_UPD_SIMS 分段覆蓋
     for k in keys:
         v = os.getenv(prefix + k)
         if v not in (None, ""):
@@ -583,6 +584,16 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
+
+    # ★ 分段 / 全域 PF_UPD_SIMS：動態調整 PF.sims_lik（更新模擬次數）
+    try:
+        upd_sims_val = over.get("PF_UPD_SIMS")
+        if upd_sims_val is None:
+            upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+        if hasattr(PF, "sims_lik"):
+            PF.sims_lik = int(float(upd_sims_val))
+    except Exception as e:
+        log.warning("stage PF_UPD_SIMS apply failed: %s", e)
 
     # 取分段/環境 PF_PRED_SIMS，套用效能保護
     sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
