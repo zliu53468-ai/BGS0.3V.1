@@ -224,19 +224,16 @@ else:
         def get(self, *a, **k):
             def _d(f):
                 return f
-
             return _d
 
         def post(self, *a, **k):
             def _d(f):
                 return f
-
             return _d
 
         def options(self, *a, **k):
             def _d(f):
                 return f
-
             return _d
 
         def run(self, *a, **k):
@@ -936,13 +933,14 @@ try:
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
-# ★ 路由「永遠」註冊：避免 404
-@app.post("/line-webhook")
-def line_webhook():
-    # 若 line_handler 尚未就緒，回 400 而不是 404
+
+# ---------- Webhook 共用處理函式 ----------
+def _handle_line_webhook():
+    """共用的 LINE webhook 處理邏輯，提供 /line-webhook 與 /callback 使用。"""
     if 'line_handler' not in globals() or line_handler is None:
         log.error("webhook called but LINE handler not ready (missing credentials?)")
         abort(400, "LINE handler not ready")
+
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
@@ -953,9 +951,30 @@ def line_webhook():
     return "OK", 200
 
 
+# ★ 路由「永遠」註冊：避免 404
+@app.post("/line-webhook")
+def line_webhook():
+    return _handle_line_webhook()
+
+
 # 允許 OPTIONS（正確 Flask 寫法，避免 AttributeError）
 @app.route("/line-webhook", methods=["OPTIONS"])
 def line_webhook_options():
+    return ("", 204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-Line-Signature",
+    })
+
+
+# ★ 兼容舊教學：/callback 也可以當作 LINE Webhook
+@app.post("/callback")
+def line_webhook_callback():
+    return _handle_line_webhook()
+
+
+@app.route("/callback", methods=["OPTIONS"])
+def line_webhook_callback_options():
     return ("", 204, {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
