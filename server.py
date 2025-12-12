@@ -149,6 +149,26 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     return _rsetnx(key, "1", ex=DEDUPE_TTL)
 
 
+# ---------- Premium（永久開通） ----------
+def _premium_key(uid: str) -> str:
+    return f"premium:{uid}"
+
+
+def is_premium(uid: str) -> bool:
+    """檢查此 UID 是否已永久開通。"""
+    if not uid:
+        return False
+    val = _rget(_premium_key(uid))
+    return val == "1"
+
+
+def set_premium(uid: str, flag: bool = True) -> None:
+    """設定永久開通狀態；flag=True 表示永久開通。"""
+    if not uid:
+        return
+    _rset(_premium_key(uid), "1" if flag else "0")
+
+
 # ---------- 簡易 Session 層 ----------
 def _sess_key(uid: str) -> str:
     return f"sess:{uid}"
@@ -161,18 +181,25 @@ def get_session(uid: str) -> Dict[str, Any]:
         if redis_client:
             raw = redis_client.get(_sess_key(uid))
             if raw:
-                return json.loads(raw)
+                sess = json.loads(raw)
+                # 若外部 premium key 已經是 True，確保 session 也同步
+                if is_premium(uid):
+                    sess["premium"] = True
+                return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
+            if is_premium(uid):
+                sess["premium"] = True
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
+    # 新 session：premium 依據永久開通狀態決定
     sess = {
         "phase": "await_pts",
         "bankroll": 0,
         "rounds_seen": 0,
         "last_pts_text": None,
-        "premium": False,
+        "premium": is_premium(uid),
         "trial_start": int(time.time()),
     }
     save_session(uid, sess)
@@ -697,23 +724,39 @@ def _trial_key(uid: str, kind: str) -> str:
 
 
 def trial_persist_guard(uid: str) -> Optional[str]:
+    """
+    試用鎖：
+    - 若已永久開通 (premium:{uid}=1)，永遠直接放行
+    - 否則一人一次；expired=1 後即使封鎖/解除也不會重置
+    """
+    # 已永久開通 → 不再檢查試用
+    if is_premium(uid):
+        return None
+
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
+
+    # 已經標記過過期 → 永久鎖定
     if expired == "1":
         return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+
+    # 第一次使用 → 建立 first_ts
     if not first_ts:
         _rset(_trial_key(uid, "first_ts"), str(now))
         return None
+
     try:
         first = int(first_ts)
     except:
         first = now
         _rset(_trial_key(uid, "first_ts"), str(now))
+
     used_min = (now - first) // 60
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
         return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+
     return None
 
 
@@ -839,12 +882,14 @@ try:
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
-                sess["premium"] = bool(ok)
+                if ok:
+                    sess["premium"] = True
+                    set_premium(uid, True)
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess)
                 return
 
-            # 試用鎖
+            # 試用鎖（若已永久開通，trial_persist_guard 會直接放行）
             guard = trial_persist_guard(uid)
             if guard and not sess.get("premium", False):
                 _reply(line_api, event.reply_token, guard)
@@ -853,7 +898,7 @@ try:
 
             # 清空
             if up in ("結束分析", "清空", "RESET"):
-                premium = sess.get("premium", False)
+                premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts}
