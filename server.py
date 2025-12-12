@@ -12,6 +12,10 @@
 - ✦ 補丁：numpy 設為忽略 underflow/overflow 警示
 - ✦ 補丁：LINE 重運算改成「快速 reply + 背景 thread push_message」
 - ✦ 補丁：新增 /ping 給 UptimeRobot 專用
+
+# ★ 2025-12-12 PATCH
+- ✦ 補丁：LINE 429（月額度到達）「自動停推播」+ heavy 結果改存 session，可用「查詢」拿結果
+- ✦ 補丁：初次 Follow（加好友）一定回「試用剩餘 X 分鐘（預設 30 分鐘）」
 """
 
 import os, sys, logging, time, re, json, threading
@@ -201,6 +205,9 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_pts_text": None,
         "premium": is_premium(uid),
         "trial_start": int(time.time()),
+        # ★ heavy 結果暫存（供「查詢」）
+        "last_card": None,
+        "last_card_ts": None,
     }
     save_session(uid, sess)
     return sess
@@ -240,7 +247,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -723,6 +730,35 @@ TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
+# ★ 429 止血：可用 env 控制（預設開）
+LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
+LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))  # 預設 30 天
+_PUSH_BLOCK_UNTIL = 0  # 本次服務運行期間的推播封鎖時間戳
+
+
+def _can_push() -> bool:
+    global _PUSH_BLOCK_UNTIL
+    if LINE_PUSH_ENABLE != 1:
+        return False
+    return int(time.time()) >= int(_PUSH_BLOCK_UNTIL)
+
+
+def _block_push(reason: str):
+    global _PUSH_BLOCK_UNTIL
+    _PUSH_BLOCK_UNTIL = int(time.time()) + int(LINE_PUSH_COOLDOWN_SECONDS)
+    log.warning("[LINE] push disabled temporarily: %s (block_until=%s)", reason, _PUSH_BLOCK_UNTIL)
+
+
+def _looks_like_429(e: Exception) -> bool:
+    s = str(e)
+    if "status_code=429" in s:
+        return True
+    if "reached your monthly limit" in s.lower():
+        return True
+    if "You have reached your monthly limit" in s:
+        return True
+    return False
+
 
 def _trial_key(uid: str, kind: str) -> str:
     return f"trial:{kind}:{uid}"
@@ -815,6 +851,8 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
     """
     背景執行重度 PF + Deplete，完成後用 push_message 推送結果。
     避免在 webhook 同步階段耗時過長導致 replyToken 失效。
+
+    ★ PATCH：若 push 配額用完（429），自動停推播並把結果存 session，改用「查詢」拿結果。
     """
     if line_api is None:
         log.warning("[heavy] line_api is None, skip heavy prediction.")
@@ -831,18 +869,29 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
         probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
-        save_session(uid, sess)
 
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
 
-        try:
-            line_api.push_message(
-                uid,
-                TextSendMessage(text=msg, quick_reply=_quick_buttons())
-            )
-        except Exception as e:
-            log.warning("[LINE] push failed (heavy): %s", e)
+        # ★ 存起來（供「查詢」）
+        sess["last_card"] = msg
+        sess["last_card_ts"] = int(time.time())
+        save_session(uid, sess)
+
+        # ★ 可推播才推（否則就讓用戶用「查詢」拿）
+        if _can_push():
+            try:
+                line_api.push_message(
+                    uid,
+                    TextSendMessage(text=msg, quick_reply=_quick_buttons())
+                )
+            except Exception as e:
+                # 429：立刻止血，避免 logs 一直刷
+                if _looks_like_429(e):
+                    _block_push("429 monthly limit reached")
+                log.warning("[LINE] push failed (heavy): %s", e)
+        else:
+            log.info("[LINE] push skipped (disabled/blocked). User can use '查詢' to get last result.")
 
     except Exception as e:
         log.exception("[heavy] prediction failed: %s", e)
@@ -872,6 +921,14 @@ try:
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
 
+            # ★ PATCH：Follow 時同步 trial_start，確保顯示/計算一致
+            first_ts = _rget(_trial_key(uid, "first_ts"))
+            if first_ts:
+                try:
+                    sess["trial_start"] = int(first_ts)
+                except Exception:
+                    pass
+
             # 已永久開通
             if sess.get("premium", False) or is_premium(uid):
                 msg = (
@@ -879,24 +936,19 @@ try:
                     "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
                 )
             else:
-                # 尚未開通：判斷試用是否可用
+                # ★ PATCH：初次加入好友一定顯示試用剩餘（若到期才顯示到期）
                 if guard_msg:
-                    # guard_msg 已經是「試用到期」提示字串
                     msg = guard_msg
                 else:
-                    # 試用中或剛建立第一次試用時間 → 顯示剩餘分鐘
-                    first_ts = _rget(_trial_key(uid, "first_ts"))
-                    if first_ts:
-                        try:
-                            first = int(first_ts)
-                            used_min = max(0, (int(time.time()) - first) // 60)
-                            left = max(0, TRIAL_MINUTES - used_min)
-                        except Exception:
-                            left = TRIAL_MINUTES
-                    else:
+                    # 只要未到期：一定顯示剩餘分鐘（初次 = 30）
+                    try:
+                        ft = int(first_ts) if first_ts else int(time.time())
+                        used_min = max(0, (int(time.time()) - ft) // 60)
+                        left = max(0, TRIAL_MINUTES - used_min)
+                    except Exception:
                         left = TRIAL_MINUTES
                     msg = (
-                        f"👋 歡迎！你有 {left} 分鐘免費試用。\n"
+                        f"👋 歡迎！你有 {left} 分鐘免費試用（共 {TRIAL_MINUTES} 分鐘）。\n"
                         "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
                     )
 
@@ -912,6 +964,16 @@ try:
             text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
             sess = get_session(uid)
             up = text.upper()
+
+            # ★ PATCH：查詢上次 heavy 結果
+            if up in ("查詢", "QUERY"):
+                last = sess.get("last_card")
+                if last:
+                    _reply(line_api, event.reply_token, str(last))
+                else:
+                    _reply(line_api, event.reply_token, "目前沒有可查詢的結果。\n📌 請先輸入點數（例：65 / 和 / 閒6莊5）。")
+                save_session(uid, sess)
+                return
 
             # 開通
             if up.startswith("開通") or up.startswith("ACTIVATE"):
@@ -936,7 +998,8 @@ try:
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
-                        "last_pts_text": None, "premium": premium, "trial_start": start_ts}
+                        "last_pts_text": None, "premium": premium, "trial_start": start_ts,
+                        "last_card": None, "last_card_ts": None}
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
@@ -987,14 +1050,16 @@ try:
                 p_pts, b_pts = pts
 
                 # 先快速回覆，立刻用掉 reply_token，避免被重度運算拖到過期
+                # ★ PATCH：避免承諾一定會推播（因為可能 429），改成提示可用「查詢」
                 _reply(
                     line_api,
                     event.reply_token,
-                    "✅ 已收到上一局結果，AI 正在計算此手走勢，稍後會推播建議給你。"
+                    "✅ 已收到上一局結果，AI 正在計算。\n"
+                    "📌 計算完成後若推播可用會自動推送；若沒收到請輸入『查詢』取得最新結果。"
                 )
                 save_session(uid, sess)
 
-                # 背景 thread 做重運算，完成後 push_message 給用戶
+                # 背景 thread 做重運算，完成後 push_message 給用戶（若被 429 會自動止血並改存結果）
                 try:
                     threading.Thread(
                         target=_push_heavy_prediction,
