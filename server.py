@@ -610,6 +610,25 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
+    # ===== PATCH: 將上一局結果餵回 PF（predict 前必須 update）=====
+    try:
+        if hasattr(PF, "update_outcome"):
+            if (p_pts == b_pts):  # tie
+                if not SKIP_TIE_UPD:
+                    try:
+                        PF.update_outcome(2)  # 常見編碼：0=B,1=P,2=T
+                    except Exception:
+                        PF.update_outcome("T")
+            else:
+                outcome = 0 if b_pts > p_pts else 1  # 0=莊勝, 1=閒勝
+                try:
+                    PF.update_outcome(outcome)
+                except Exception:
+                    PF.update_outcome("B" if outcome == 0 else "P")
+    except Exception as e:
+        log.warning("PF.update_outcome failed: %s", e)
+    # ===== PATCH END =====
+
     try:
         upd_sims_val = over.get("PF_UPD_SIMS")
         if upd_sims_val is None:
