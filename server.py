@@ -16,6 +16,7 @@
 # ★ 2025-12-12 PATCH
 - ✦ 補丁：LINE 429（月額度到達）「自動停推播」+ heavy 結果改存 session，可用「查詢」拿結果
 - ✦ 補丁：初次 Follow（加好友）一定回「試用剩餘 X 分鐘（預設 30 分鐘）」
+- ✦ 補丁：Quick Reply 多一顆「查詢 🔎」按鈕
 """
 
 import os, sys, logging, time, re, json, threading
@@ -247,7 +248,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+querybtn"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -510,7 +511,6 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
         return {}
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
-    # ★ 已加入 PROB_MARGIN 分段覆蓋
     keys = ["SOFT_TAU", "THEO_BLEND", "TIE_MAX",
             "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
             "PF_PRED_SIMS", "DEPLETEMC_SIMS",
@@ -533,9 +533,6 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
 
 
 def _depl_stage_scale(rounds_seen: int) -> float:
-    """
-    根據 rounds_seen 回傳這一局 deplete 的階段縮放係數。
-    """
     prefix = _stage_prefix(rounds_seen)
     if prefix == "EARLY_":
         return EARLY_DEPL_SCALE
@@ -546,9 +543,6 @@ def _depl_stage_scale(rounds_seen: int) -> float:
 
 
 def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.ndarray:
-    """
-    限制單局最大位移，避免 deplete 讓機率跳太兇。
-    """
     max_shift = max(0.0, float(max_shift))
     p_old = old_p.astype(float).copy()
     p_new = new_p.astype(float).copy()
@@ -563,7 +557,6 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 
 # ---------- 預測效能保護 ----------
 def _tuned_pred_sims(base: int) -> int:
-    """對分段 PF_PRED_SIMS 套安全上限，並依 PF_N 自動下修，避免卡頓。"""
     try:
         cap = int(float(os.getenv("PRED_SIMS_CAP", "10")))
     except Exception:
@@ -617,7 +610,6 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
-    # ★ 分段 / 全域 PF_UPD_SIMS：動態調整 PF.sims_lik（更新模擬次數）
     try:
         upd_sims_val = over.get("PF_UPD_SIMS")
         if upd_sims_val is None:
@@ -627,7 +619,6 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
     except Exception as e:
         log.warning("stage PF_UPD_SIMS apply failed: %s", e)
 
-    # 取分段/環境 PF_PRED_SIMS，套用效能保護
     sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
     sims_per_particle = _tuned_pred_sims(sims_per_particle)
 
@@ -641,7 +632,7 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
         try:
             stage_scale = _depl_stage_scale(rounds_seen)
             raw_alpha = DEPL_FACTOR * stage_scale
-            alpha = max(0.0, min(0.55, float(raw_alpha)))  # 最多約 55% 交給 deplete
+            alpha = max(0.0, min(0.55, float(raw_alpha)))
 
             if alpha > 0.0:
                 counts = init_counts(int(os.getenv("DECKS", "8")))
@@ -698,7 +689,6 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
             p[1] *= sc
             p = p / p.sum()
 
-    # ★ 將 PROB_MARGIN 也納入分段覆蓋（暫時覆蓋全域，決策後還原）
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
@@ -732,8 +722,8 @@ ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
 # ★ 429 止血：可用 env 控制（預設開）
 LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
-LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))  # 預設 30 天
-_PUSH_BLOCK_UNTIL = 0  # 本次服務運行期間的推播封鎖時間戳
+LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))
+_PUSH_BLOCK_UNTIL = 0
 
 
 def _can_push() -> bool:
@@ -765,12 +755,6 @@ def _trial_key(uid: str, kind: str) -> str:
 
 
 def trial_persist_guard(uid: str) -> Optional[str]:
-    """
-    試用鎖：
-    - 若已永久開通 (premium:{uid}=1)，永遠直接放行
-    - 否則一人一次；expired=1 後即使封鎖/解除也不會重置
-    """
-    # 已永久開通 → 不再檢查試用
     if is_premium(uid):
         return None
 
@@ -778,11 +762,9 @@ def trial_persist_guard(uid: str) -> Optional[str]:
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
 
-    # 已經標記過過期 → 永久鎖定
     if expired == "1":
         return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
 
-    # 第一次使用 → 建立 first_ts
     if not first_ts:
         _rset(_trial_key(uid, "first_ts"), str(now))
         return None
@@ -826,6 +808,7 @@ def _quick_buttons():
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
         return QuickReply(items=[
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
+            QuickReplyButton(action=MessageAction(label="查詢 🔎", text="查詢")),  # ★ PATCH：新增查詢按鈕
             QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
             QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
             QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
@@ -840,7 +823,6 @@ def _reply(api, token: str, text: str):
     try:
         api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
     except Exception as e:
-        # 常見：Invalid reply token（重試/超時/探測），降噪為 info
         if "Invalid reply token" in str(e):
             log.info("[LINE] reply skipped (invalid token, likely retry): %s", e)
         else:
@@ -848,12 +830,6 @@ def _reply(api, token: str, text: str):
 
 
 def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
-    """
-    背景執行重度 PF + Deplete，完成後用 push_message 推送結果。
-    避免在 webhook 同步階段耗時過長導致 replyToken 失效。
-
-    ★ PATCH：若 push 配額用完（429），自動停推播並把結果存 session，改用「查詢」拿結果。
-    """
     if line_api is None:
         log.warning("[heavy] line_api is None, skip heavy prediction.")
         return
@@ -873,12 +849,10 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
 
-        # ★ 存起來（供「查詢」）
         sess["last_card"] = msg
         sess["last_card_ts"] = int(time.time())
         save_session(uid, sess)
 
-        # ★ 可推播才推（否則就讓用戶用「查詢」拿）
         if _can_push():
             try:
                 line_api.push_message(
@@ -886,7 +860,6 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
                     TextSendMessage(text=msg, quick_reply=_quick_buttons())
                 )
             except Exception as e:
-                # 429：立刻止血，避免 logs 一直刷
                 if _looks_like_429(e):
                     _block_push("429 monthly limit reached")
                 log.warning("[LINE] push failed (heavy): %s", e)
@@ -900,7 +873,6 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
         log.info("[heavy] prediction done in %.2fs (uid=%s)", elapsed, uid)
 
 
-# 初始化 line_handler，但 /line-webhook 路由會「永遠」註冊
 line_api = None
 line_handler = None
 try:
@@ -917,11 +889,9 @@ try:
                 return
             uid = event.source.user_id
 
-            # 試用鎖 + 取得 session（session 會自動帶入 premium 狀態）
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
 
-            # ★ PATCH：Follow 時同步 trial_start，確保顯示/計算一致
             first_ts = _rget(_trial_key(uid, "first_ts"))
             if first_ts:
                 try:
@@ -929,18 +899,15 @@ try:
                 except Exception:
                     pass
 
-            # 已永久開通
             if sess.get("premium", False) or is_premium(uid):
                 msg = (
                     "👋 歡迎回來，已是永久開通用戶。\n"
                     "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
                 )
             else:
-                # ★ PATCH：初次加入好友一定顯示試用剩餘（若到期才顯示到期）
                 if guard_msg:
                     msg = guard_msg
                 else:
-                    # 只要未到期：一定顯示剩餘分鐘（初次 = 30）
                     try:
                         ft = int(first_ts) if first_ts else int(time.time())
                         used_min = max(0, (int(time.time()) - ft) // 60)
@@ -965,7 +932,6 @@ try:
             sess = get_session(uid)
             up = text.upper()
 
-            # ★ PATCH：查詢上次 heavy 結果
             if up in ("查詢", "QUERY"):
                 last = sess.get("last_card")
                 if last:
@@ -975,7 +941,6 @@ try:
                 save_session(uid, sess)
                 return
 
-            # 開通
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
@@ -986,14 +951,12 @@ try:
                 save_session(uid, sess)
                 return
 
-            # 試用鎖（若已永久開通，trial_persist_guard 會直接放行）
             guard = trial_persist_guard(uid)
             if guard and not sess.get("premium", False):
                 _reply(line_api, event.reply_token, guard)
                 save_session(uid, sess)
                 return
 
-            # 清空
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
@@ -1004,7 +967,6 @@ try:
                 save_session(uid, sess)
                 return
 
-            # 遊戲設定 → 選館 → 籌碼
             if text == "遊戲設定" or up == "GAME SETTINGS":
                 sess["phase"] = "choose_game"
                 sess["game"] = None
@@ -1044,22 +1006,18 @@ try:
                 save_session(uid, sess)
                 return
 
-            # 解析點數與預測：改成「快速回覆 + 背景 heavy thread 推播」
             pts = parse_last_hand_points(text)
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
 
-                # 先快速回覆，立刻用掉 reply_token，避免被重度運算拖到過期
-                # ★ PATCH：避免承諾一定會推播（因為可能 429），改成提示可用「查詢」
                 _reply(
                     line_api,
                     event.reply_token,
                     "✅ 已收到上一局結果，AI 正在計算。\n"
-                    "📌 計算完成後若推播可用會自動推送；若沒收到請輸入『查詢』取得最新結果。"
+                    "📌 計算完成後若推播可用會自動推送；若沒收到請點『查詢 🔎』取得最新結果。"
                 )
                 save_session(uid, sess)
 
-                # 背景 thread 做重運算，完成後 push_message 給用戶（若被 429 會自動止血並改存結果）
                 try:
                     threading.Thread(
                         target=_push_heavy_prediction,
@@ -1079,9 +1037,7 @@ except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
 
-# ---------- Webhook 共用處理函式 ----------
 def _handle_line_webhook():
-    """共用的 LINE webhook 處理邏輯，提供 /line-webhook 與 /callback 使用。"""
     if 'line_handler' not in globals() or line_handler is None:
         log.error("webhook called but LINE handler not ready (missing credentials?)")
         abort(400, "LINE handler not ready")
@@ -1096,13 +1052,11 @@ def _handle_line_webhook():
     return "OK", 200
 
 
-# ★ 路由「永遠」註冊：避免 404
 @app.post("/line-webhook")
 def line_webhook():
     return _handle_line_webhook()
 
 
-# 允許 OPTIONS（正確 Flask 寫法，避免 AttributeError）
 @app.route("/line-webhook", methods=["OPTIONS"])
 def line_webhook_options():
     return ("", 204, {
@@ -1112,7 +1066,6 @@ def line_webhook_options():
     })
 
 
-# ★ 兼容舊教學：/callback 也可以當作 LINE Webhook
 @app.post("/callback")
 def line_webhook_callback():
     return _handle_line_webhook()
@@ -1127,7 +1080,6 @@ def line_webhook_callback_options():
     })
 
 
-# ---------- 簡易 HTTP ----------
 @app.get("/")
 def root():
     ua = request.headers.get("User-Agent", "")
@@ -1146,7 +1098,6 @@ def health():
 
 @app.get("/ping")
 def ping():
-    """給 UptimeRobot / 其他 keep-alive 服務專用的輕量健康檢查。"""
     return "OK", 200
 
 
@@ -1178,7 +1129,6 @@ def predict():
         return jsonify(ok=False, error=str(e)), 500
 
 
-# ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s)",
