@@ -384,7 +384,7 @@ EARLY_DEPL_SCALE = float(os.getenv("EARLY_DEPL_SCALE", "0.2"))
 MID_DEPL_SCALE = float(os.getenv("MID_DEPL_SCALE", "0.6"))
 LATE_DEPL_SCALE = float(os.getenv("LATE_DEPL_SCALE", "0.9"))
 
-# 單局最大可位移機率（防止 deplete 一口把機率拉太誇張）
+# 單局最大可位移機率（防止 deplete 讓機率跳太誇張）
 MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.10"))
 
 # ---- PATCH: 反偏莊控制 ----
@@ -503,10 +503,11 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
         return {}
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
+    # ★ 已加入 PROB_MARGIN 分段覆蓋
     keys = ["SOFT_TAU", "THEO_BLEND", "TIE_MAX",
-            "MIN_CONF_FOR_ENTRY", "EDGE_ENTER",
+            "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
             "PF_PRED_SIMS", "DEPLETEMC_SIMS",
-            "PF_UPD_SIMS"]  # ★ 增加 PF_UPD_SIMS 分段覆蓋
+            "PF_UPD_SIMS"]
     for k in keys:
         v = os.getenv(prefix + k)
         if v not in (None, ""):
@@ -690,17 +691,21 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
             p[1] *= sc
             p = p / p.sum()
 
-    _MIN_CONF, _EDGE_ENTER = MIN_CONF_FOR_ENTRY, EDGE_ENTER
+    # ★ 將 PROB_MARGIN 也納入分段覆蓋（暫時覆蓋全域，決策後還原）
+    _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
             if "MIN_CONF_FOR_ENTRY" in over:
                 globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
             if "EDGE_ENTER" in over:
                 globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
+            if "PROB_MARGIN" in over:
+                globals()["PROB_MARGIN"] = float(over["PROB_MARGIN"])
         choice, edge, bet_pct, reason = decide_only_bp(p)
     finally:
         globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
         globals()["EDGE_ENTER"] = _EDGE_ENTER
+        globals()["PROB_MARGIN"] = _PROB_MARGIN
 
     bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
     sess["rounds_seen"] = rounds_seen + 1
@@ -862,10 +867,40 @@ try:
             if not _dedupe_event(getattr(event, "id", None)):
                 return
             uid = event.source.user_id
-            _ = trial_persist_guard(uid)
+
+            # 試用鎖 + 取得 session（session 會自動帶入 premium 狀態）
+            guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
-            _reply(line_api, event.reply_token,
-                   "👋 歡迎！輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。")
+
+            # 已永久開通
+            if sess.get("premium", False) or is_premium(uid):
+                msg = (
+                    "👋 歡迎回來，已是永久開通用戶。\n"
+                    "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
+                )
+            else:
+                # 尚未開通：判斷試用是否可用
+                if guard_msg:
+                    # guard_msg 已經是「試用到期」提示字串
+                    msg = guard_msg
+                else:
+                    # 試用中或剛建立第一次試用時間 → 顯示剩餘分鐘
+                    first_ts = _rget(_trial_key(uid, "first_ts"))
+                    if first_ts:
+                        try:
+                            first = int(first_ts)
+                            used_min = max(0, (int(time.time()) - first) // 60)
+                            left = max(0, TRIAL_MINUTES - used_min)
+                        except Exception:
+                            left = TRIAL_MINUTES
+                    else:
+                        left = TRIAL_MINUTES
+                    msg = (
+                        f"👋 歡迎！你有 {left} 分鐘免費試用。\n"
+                        "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
+                    )
+
+            _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
 
         @line_handler.add(MessageEvent, message=TextMessage)
