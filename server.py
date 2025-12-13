@@ -56,6 +56,13 @@
 - ✦ 新增：PF_STATEFUL
   * PF_STATEFUL=1（預設）：維持「每 UID 一個 PF 狀態」並 update_outcome → 連續學習
   * PF_STATEFUL=0：每次預測都 new 一個 PF（不 update_outcome）→ 每一局/每一次請求完全獨立（不記憶）
+
+# ★ 2025-12-14 PATCH (PROB-DECIDE-SAFETY)
+- ✦ 修正：避免「DECISION_MODE=prob 但沒真的純機率」導致 莊勝率較高卻叫下閒
+  * 新增 PROB_FORCE_PURE_IN_PROB_MODE（預設 1）
+    - 當 DECISION_MODE=prob 時，若你沒設定 PROB_PURE_MODE，會自動強制純機率
+    - 並在決策時計算層面自動關閉 EV_NEUTRAL（避免 payout-aware 介入）
+  * 決策層增加一致性自檢：若「純機率」模式仍出現 pB>pP 但選閒 → 強制改選莊並打警告 log
 """
 
 import os, sys, logging, time, re, json, threading
@@ -326,7 +333,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -362,11 +369,11 @@ TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
 TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 
-# ★ 新增：可控的和局封頂 + debug
+# ★ 可控的和局封頂 + debug
 TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)   # 1=維持封頂，0=不封頂（避免卡 15%）
 SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)   # 1=log 印封頂前後機率
 
-# ★ 新增：PF 是否有狀態（是否記憶上一局）
+# ★ PF 是否有狀態（是否記憶上一局）
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)         # 1=per-uid stateful；0=每次 new PF（完全獨立）
 
 OutcomePF = None
@@ -419,7 +426,7 @@ class SmartDummyPF:
         return "smart-dummy"
 
 
-# ===== PATCH: PF per-UID store + lock (thread-safe) =====
+# ===== PF per-UID store + lock (thread-safe) =====
 _PF_STORE: Dict[str, Any] = {}
 _PF_LOCKS: Dict[str, threading.Lock] = {}
 _PF_STORE_GUARD = threading.Lock()
@@ -471,7 +478,7 @@ def reset_pf_for_uid(uid: str) -> None:
     with _PF_STORE_GUARD:
         if uid in _PF_STORE:
             _PF_STORE.pop(uid, None)
-# ===== PATCH END =====
+# ===== END =====
 
 pf_initialized = True if (OutcomePF is not None) else True
 
@@ -513,8 +520,12 @@ MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.10"))
 EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))
 PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))
 
-# ★ 新增：DECISION_MODE=prob 時可強制「純機率」
+# ★ DECISION_MODE=prob 時可強制「純機率」
 PROB_PURE_MODE = int(os.getenv("PROB_PURE_MODE", "0"))  # 1=純機率(pB>=pP選莊)，0=沿用既有邏輯
+
+# ★ PATCH: prob 模式自動強制純機率（避免你忘了設 PROB_PURE_MODE）
+# - 預設 1：DECISION_MODE=prob 時，若你沒設 PROB_PURE_MODE → 自動視為純機率
+PROB_FORCE_PURE_IN_PROB_MODE = env_flag("PROB_FORCE_PURE_IN_PROB_MODE", 1)
 
 
 def bet_amount(bankroll: int, pct: float) -> int:
@@ -531,20 +542,67 @@ def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
     return side, final_edge, evB, evP
 
 
-def _decide_side_by_prob(pB: float, pP: float) -> int:
-    # ★ PROB_PURE_MODE：永遠用純機率比較
-    if PROB_PURE_MODE == 1:
+def _effective_prob_flags(over: Dict[str, float]) -> Tuple[int, int, List[str]]:
+    """
+    回傳 (eff_prob_pure, eff_ev_neutral, notes[])
+    - 若 DECISION_MODE=prob 且 PROB_FORCE_PURE_IN_PROB_MODE=1：
+        * 當 PROB_PURE_MODE 沒明確設定為 1/0（或為 0）時，也會強制用純機率（eff_prob_pure=1）
+        * 並且決策層面關閉 payout-aware（eff_ev_neutral=0）
+    """
+    notes: List[str] = []
+
+    # 允許三段覆蓋（若有）
+    eff_prob_pure = PROB_PURE_MODE
+    eff_ev_neutral = EV_NEUTRAL
+
+    try:
+        if "PROB_PURE_MODE" in over:
+            eff_prob_pure = int(float(over["PROB_PURE_MODE"]))
+    except Exception:
+        pass
+    try:
+        if "EV_NEUTRAL" in over:
+            eff_ev_neutral = int(float(over["EV_NEUTRAL"]))
+    except Exception:
+        pass
+
+    if DECISION_MODE == "prob" and PROB_FORCE_PURE_IN_PROB_MODE == 1:
+        # 只要 prob 模式，就把決策層固定為「純機率」
+        if eff_prob_pure != 1:
+            notes.append("FORCE_PURE(prob 模式自動純機率)")
+        eff_prob_pure = 1
+
+        # 並在決策層面直接關掉 payout-aware（避免莊勝率高卻叫下閒）
+        if eff_ev_neutral != 0:
+            notes.append("FORCE_EV_NEUTRAL_OFF(prob 純機率關閉 payout-aware)")
+        eff_ev_neutral = 0
+
+    return eff_prob_pure, eff_ev_neutral, notes
+
+
+def _decide_side_by_prob(pB: float, pP: float, eff_prob_pure: int, eff_ev_neutral: int) -> int:
+    # eff_prob_pure=1：永遠用純機率比較
+    if int(eff_prob_pure) == 1:
         return 0 if pB >= pP else 1
-    # 既有：EV_NEUTRAL=1 時用 payout-aware
-    if EV_NEUTRAL == 1:
+    # payout-aware（莊被打折）
+    if int(eff_ev_neutral) == 1:
         return 0 if (BANKER_PAYOUT * pB) >= pP else 1
     return 0 if pB >= pP else 1
 
 
-def _apply_prob_bias(prob: np.ndarray) -> np.ndarray:
-    b2p = max(0.0, PROB_BIAS_B2P)
+def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
+    # 允許三段覆蓋 PROB_BIAS_B2P
+    b2p = PROB_BIAS_B2P
+    try:
+        if "PROB_BIAS_B2P" in over:
+            b2p = float(over["PROB_BIAS_B2P"])
+    except Exception:
+        pass
+
+    b2p = max(0.0, float(b2p))
     if b2p <= 0.0:
         return prob
+
     p = prob.copy()
     shift = min(float(p[0]), b2p)
     if shift > 0:
@@ -557,22 +615,33 @@ def _apply_prob_bias(prob: np.ndarray) -> np.ndarray:
     return p
 
 
-def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
-    # ★ PROB-BIAS-DISPLAY-FIX：不在這裡套用 bias（避免顯示與決策不一致 / 避免雙重偏移）
+def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float, float, str]:
+    # 不在這裡套用 bias（避免顯示與決策不一致 / 避免雙重偏移）
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     reason: List[str] = []
 
+    eff_prob_pure, eff_ev_neutral, notes = _effective_prob_flags(over)
+    if notes:
+        reason.extend(notes)
+
     if DECISION_MODE == "prob":
-        side = _decide_side_by_prob(pB, pP)
+        side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
         _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
         final_edge = max(abs(evB), abs(evP))
-        reason.append("模式=prob")
+        reason.append(f"模式=prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
+
+        # ★ 自檢防呆：純機率下不應出現 pB>pP 但選閒
+        if int(eff_prob_pure) == 1 and pB > pP and side == 1:
+            side = 0
+            reason.append("⚠️ FIX: pure_prob 但選到閒→強制改莊")
+            log.warning("[DECIDE-FIX] pure_prob conflict detected (pB=%.4f>pP=%.4f) forced to BANKER", pB, pP)
+
     elif DECISION_MODE == "hybrid":
         if abs(pB - pP) >= PROB_MARGIN:
-            side = _decide_side_by_prob(pB, pP)
+            side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
             _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
-            reason.append("模式=hybrid→prob")
+            reason.append(f"模式=hybrid→prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
         else:
             s2, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
             if edge_ev >= MIN_EV_EDGE:
@@ -580,9 +649,9 @@ def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
                 final_edge = edge_ev
                 reason.append("模式=hybrid→ev")
             else:
-                side = _decide_side_by_prob(pB, pP)
+                side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
                 final_edge = edge_ev
-                reason.append("模式=hybrid→prob(EV不足)")
+                reason.append(f"模式=hybrid→prob(EV不足)(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
     else:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason.append("模式=ev")
@@ -630,25 +699,32 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
         return {}
     if os.getenv("STAGE_MODE", "count").lower() == "disabled":
         return {}
+
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
-    keys = ["SOFT_TAU", "THEO_BLEND", "TIE_MAX",
-            "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
-            "PF_PRED_SIMS", "DEPLETEMC_SIMS",
-            "PF_UPD_SIMS"]
+
+    # ★ PATCH：允許三段覆蓋決策關鍵參數（可選）
+    keys = [
+        "SOFT_TAU", "THEO_BLEND", "TIE_MAX",
+        "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
+        "PF_PRED_SIMS", "DEPLETEMC_SIMS", "PF_UPD_SIMS",
+        "PROB_PURE_MODE", "EV_NEUTRAL", "PROB_BIAS_B2P",
+    ]
+
     for k in keys:
         v = os.getenv(prefix + k)
         if v not in (None, ""):
             try:
                 over[k] = float(v)
-            except:
+            except Exception:
                 pass
+
     if prefix == "LATE_":
         late_dep = os.getenv("LATE_DEPLETEMC_SIMS")
         if late_dep:
             try:
                 over["DEPLETEMC_SIMS"] = float(late_dep)
-            except:
+            except Exception:
                 pass
     return over
 
@@ -786,7 +862,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
         p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
 
-    # (鎖外) 後處理：不需要鎖
+    # 後處理：不需要鎖
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
@@ -840,7 +916,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
 
-        # ★ TIE_CAP_ENABLE：可關閉「和局封頂」避免卡 15%
+        # TIE_CAP_ENABLE：可關閉「和局封頂」避免卡 15%
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
         if TIE_CAP_ENABLE == 1:
             if p[2] > tie_max:
@@ -861,8 +937,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
 
-    # ★ PROB-BIAS-DISPLAY-FIX：在這裡一次套用，讓「顯示」與「決策」一致
-    p = _apply_prob_bias(p)
+    # ★ 在這裡一次套用 bias，讓「顯示」與「決策」一致
+    p = _apply_prob_bias(p, over)
 
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
@@ -873,7 +949,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
             if "PROB_MARGIN" in over:
                 globals()["PROB_MARGIN"] = float(over["PROB_MARGIN"])
-        choice, edge, bet_pct, reason = decide_only_bp(p)
+
+        choice, edge, bet_pct, reason = decide_only_bp(p, over)
     finally:
         globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
         globals()["EDGE_ENTER"] = _EDGE_ENTER
@@ -883,10 +960,12 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     sess["rounds_seen"] = rounds_seen + 1
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s stateful=%s | %s",
-                 choice, edge, bet_pct * 100, sess["rounds_seen"],
-                 int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))),
-                 uid, PF_STATEFUL, reason)
+        log.info(
+            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s stateful=%s | %s",
+            choice, edge, bet_pct * 100, sess["rounds_seen"],
+            int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))),
+            uid, PF_STATEFUL, reason
+        )
     return p, choice, bet_amt, reason
 
 
@@ -960,11 +1039,10 @@ def trial_persist_guard(uid: str) -> Optional[str]:
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
 
-    # ===== TRIAL-FIX: expired=1 但 first_ts 不存在 → 視為髒資料，清掉 expired =====
+    # TRIAL-FIX: expired=1 但 first_ts 不存在 → 視為髒資料，清掉 expired
     if expired == "1" and not first_ts:
         _rset(_trial_key(uid, "expired"), "0")
         expired = None
-    # ===== END =====
 
     if not first_ts:
         # 新用戶：寫入 first_ts 並確保 expired 被清掉
@@ -982,11 +1060,10 @@ def trial_persist_guard(uid: str) -> Optional[str]:
 
     used_min = (now - first) // 60
 
-    # ===== TRIAL-FIX: expired=1 但其實還沒到期 → 自動修正 =====
+    # TRIAL-FIX: expired=1 但其實還沒到期 → 自動修正
     if expired == "1" and used_min < TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "0")
         expired = None
-    # ===== END =====
 
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
@@ -1128,7 +1205,7 @@ try:
                 save_session(uid, sess)
                 return
 
-            # ===== TRIAL-FIX: 加好友當下，若 first_ts 不存在 → 強制建立並清 expired =====
+            # TRIAL-FIX: 加好友當下，若 first_ts 不存在 → 強制建立並清 expired
             now = int(time.time())
             ft_key = _trial_key(uid, "first_ts")
             ex_key = _trial_key(uid, "expired")
@@ -1147,7 +1224,6 @@ try:
                     _rset(ft_key, str(now))
                     _rset(ex_key, "0")
                     first_ts = str(now)
-            # ===== END =====
 
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
@@ -1355,10 +1431,15 @@ def root():
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, ts=time.time(), version=VERSION,
-                   pf_initialized=pf_initialized,
-                   pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
-                   pf_stateful=bool(PF_STATEFUL)), 200
+    return jsonify(
+        ok=True,
+        ts=time.time(),
+        version=VERSION,
+        pf_initialized=pf_initialized,
+        pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
+        pf_stateful=bool(PF_STATEFUL),
+        prob_force_pure_in_prob_mode=bool(PROB_FORCE_PURE_IN_PROB_MODE),
+    ), 200
 
 
 @app.get("/ping")
@@ -1386,9 +1467,11 @@ def predict():
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
         save_session(uid, sess)
         card = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
-        return jsonify(ok=True,
-                       probs=[float(probs[0]), float(probs[1]), float(probs[2])],
-                       choice=choice, bet=bet_amt, reason=reason, card=card), 200
+        return jsonify(
+            ok=True,
+            probs=[float(probs[0]), float(probs[1]), float(probs[2])],
+            choice=choice, bet=bet_amt, reason=reason, card=card
+        ), 200
     except Exception as e:
         log.exception("predict error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
@@ -1400,8 +1483,14 @@ if __name__ == "__main__":
         log.warning("PF backend: smart-dummy (OutcomePF import failed). If probs look repeated, check deployment paths.")
     else:
         log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
-    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, PF_STATEFUL=%s, TIE_CAP_ENABLE=%s)",
-             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE, PF_STATEFUL, TIE_CAP_ENABLE)
+
+    log.info(
+        "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
+        "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f)",
+        VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
+        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P)
+    )
+
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
