@@ -23,6 +23,13 @@
   * 改為「每個 UID 一個 PF 狀態」（記憶體 store）
   * 同一 UID 的 update+predict 加鎖，避免 thread race
   * RESET 時同步清除該 UID PF 狀態
+
+# ★ 2025-12-13 PATCH (FIX-REPEAT)
+- ✦ 修正：LINE dedupe 取錯欄位導致同事件被重複處理（重送 webhook 會重算同一把）
+  * 使用 webhook_event_id / message.id 作為 dedupe key
+- ✦ 修正：背景 heavy 計算尚未完成時，按「查詢」會回上一把（造成「重複前幾把」體感）
+  * 新增 pending / pending_seq：收到新點數先標記 pending 並清空 last_card
+  * 查詢遇到 pending 回「計算中」；heavy 完成後再寫入 last_card 並解除 pending
 """
 
 import os, sys, logging, time, re, json, threading
@@ -160,6 +167,38 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
     return _rsetnx(key, "1", ex=DEDUPE_TTL)
 
 
+# ===== PATCH: 正確抽取 LINE event id（避免 dedupe 失效） =====
+def _extract_line_event_id(event: Any) -> Optional[str]:
+    """
+    LINE SDK 常見可用：
+    - event.webhook_event_id（最準）
+    - event.message.id（MessageEvent）
+    - event.delivery_context / 其他：不保證
+    """
+    try:
+        eid = getattr(event, "webhook_event_id", None)
+        if eid:
+            return str(eid)
+    except Exception:
+        pass
+    try:
+        msg = getattr(event, "message", None)
+        mid = getattr(msg, "id", None) if msg is not None else None
+        if mid:
+            return str(mid)
+    except Exception:
+        pass
+    try:
+        # 兼容你舊的寫法（若某些 SDK 真的有 id）
+        eid2 = getattr(event, "id", None)
+        if eid2:
+            return str(eid2)
+    except Exception:
+        pass
+    return None
+# ===== PATCH END =====
+
+
 # ---------- Premium（永久開通） ----------
 def _premium_key(uid: str) -> str:
     return f"premium:{uid}"
@@ -196,11 +235,23 @@ def get_session(uid: str) -> Dict[str, Any]:
                 # 若外部 premium key 已經是 True，確保 session 也同步
                 if is_premium(uid):
                     sess["premium"] = True
+                # ===== PATCH: 確保新欄位存在（舊 session 相容） =====
+                if "pending" not in sess:
+                    sess["pending"] = False
+                if "pending_seq" not in sess:
+                    sess["pending_seq"] = 0
+                # ===== PATCH END =====
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
             if is_premium(uid):
                 sess["premium"] = True
+            # ===== PATCH: 確保新欄位存在（舊 session 相容） =====
+            if "pending" not in sess:
+                sess["pending"] = False
+            if "pending_seq" not in sess:
+                sess["pending_seq"] = 0
+            # ===== PATCH END =====
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
@@ -215,6 +266,10 @@ def get_session(uid: str) -> Dict[str, Any]:
         # ★ heavy 結果暫存（供「查詢」）
         "last_card": None,
         "last_card_ts": None,
+        # ===== PATCH: pending 狀態（避免查詢拿到上一把）=====
+        "pending": False,
+        "pending_seq": 0,
+        # ===== PATCH END =====
     }
     save_session(uid, sess)
     return sess
@@ -254,7 +309,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+querybtn"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+querybtn+repeatfix"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -313,6 +368,7 @@ except Exception:
 class SmartDummyPF:
     def __init__(self):
         log.warning("使用 SmartDummyPF 備援模式")
+        log.warning("⚠️ OutcomePF unavailable → SmartDummyPF fallback (PROBS MAY LOOK STATIC)")
 
     def update_outcome(self, outcome):
         return
@@ -891,7 +947,7 @@ def _reply(api, token: str, text: str):
             log.warning("[LINE] reply failed: %s", e)
 
 
-def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
+def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
     if line_api is None:
         log.warning("[heavy] line_api is None, skip heavy prediction.")
         return
@@ -911,8 +967,17 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
 
-        sess["last_card"] = msg
-        sess["last_card_ts"] = int(time.time())
+        # ===== PATCH: 只允許最新 seq 寫入（避免 out-of-order 覆寫造成像重播）=====
+        cur_seq = int(sess.get("pending_seq", 0))
+        if cur_seq == int(seq):
+            sess["last_card"] = msg
+            sess["last_card_ts"] = int(time.time())
+            sess["pending"] = False
+        else:
+            # 舊 thread 完成了，但已不是最新請求，避免覆蓋
+            log.info("[heavy] stale seq=%s (cur_seq=%s) skip write-back", seq, cur_seq)
+        # ===== PATCH END =====
+
         save_session(uid, sess)
 
         if _can_push():
@@ -932,7 +997,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
         log.exception("[heavy] prediction failed: %s", e)
     finally:
         elapsed = time.time() - start
-        log.info("[heavy] prediction done in %.2fs (uid=%s)", elapsed, uid)
+        log.info("[heavy] prediction done in %.2fs (uid=%s, seq=%s)", elapsed, uid, seq)
 
 
 line_api = None
@@ -947,7 +1012,7 @@ try:
 
         @line_handler.add(FollowEvent)
         def on_follow(event):
-            if not _dedupe_event(getattr(event, "id", None)):
+            if not _dedupe_event(_extract_line_event_id(event)):
                 return
             uid = event.source.user_id
 
@@ -986,7 +1051,7 @@ try:
 
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):
-            if not _dedupe_event(getattr(event, "id", None)):
+            if not _dedupe_event(_extract_line_event_id(event)):
                 return
             uid = event.source.user_id
             raw = (event.message.text or "")
@@ -995,6 +1060,12 @@ try:
             up = text.upper()
 
             if up in ("查詢", "QUERY"):
+                # ===== PATCH: 若計算中，不回上一把，避免「重複前幾把」體感 =====
+                if bool(sess.get("pending", False)):
+                    _reply(line_api, event.reply_token, "⏳ AI 計算中，請稍候 1–2 秒再點『查詢 🔎』。")
+                    save_session(uid, sess)
+                    return
+                # ===== PATCH END =====
                 last = sess.get("last_card")
                 if last:
                     _reply(line_api, event.reply_token, str(last))
@@ -1024,7 +1095,11 @@ try:
                 start_ts = sess.get("trial_start", int(time.time()))
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
-                        "last_card": None, "last_card_ts": None}
+                        "last_card": None, "last_card_ts": None,
+                        # ===== PATCH: reset 同步清 pending =====
+                        "pending": False, "pending_seq": 0
+                        # ===== PATCH END =====
+                        }
                 # ===== PATCH: reset 也要清除該 UID PF 狀態 =====
                 try:
                     reset_pf_for_uid(uid)
@@ -1084,12 +1159,20 @@ try:
                     "✅ 已收到上一局結果，AI 正在計算。\n"
                     "📌 計算完成後若推播可用會自動推送；若沒收到請點『查詢 🔎』取得最新結果。"
                 )
+
+                # ===== PATCH: 收到新點數→標記 pending + 清掉 last_card（避免查詢拿舊的）=====
+                sess["pending"] = True
+                sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
+                seq = int(sess["pending_seq"])
+                sess["last_card"] = None
+                sess["last_card_ts"] = None
+                # ===== PATCH END =====
                 save_session(uid, sess)
 
                 try:
                     threading.Thread(
                         target=_push_heavy_prediction,
-                        args=(uid, p_pts, b_pts),
+                        args=(uid, p_pts, b_pts, seq),
                         daemon=True,
                     ).start()
                 except Exception as e:
@@ -1199,6 +1282,12 @@ def predict():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
+    # ===== PATCH: 啟動時明確 log PF backend 狀態 =====
+    if OutcomePF is None:
+        log.warning("PF backend: smart-dummy (OutcomePF import failed). If probs look repeated, check deployment paths.")
+    else:
+        log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
+    # ===== PATCH END =====
     log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s)",
              VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE)
     if _flask_available and Flask is not None:
