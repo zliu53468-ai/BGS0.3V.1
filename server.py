@@ -31,6 +31,31 @@
   * Quick Reply 不再顯示「查詢」
   * 不再處理「查詢 / QUERY」文字指令
   * 收到點數的提示文字不再引導使用者「查詢」
+
+# ★ 2025-12-13 PATCH (TRIAL-FIX)
+- ✦ 修正：新加入好友不該直接顯示「試用已到期」
+  * FollowEvent 若 first_ts 不存在 → 強制寫入 first_ts 並清掉 expired
+  * expired=1 但 first_ts 不存在/或其實未到期 → 視為髒資料，自動清掉 expired
+  * 新增 TRIAL_NAMESPACE（預設 default）避免不同 Bot/不同專案共用同一組 trial key
+
+# ★ 2025-12-13 PATCH (BLOCK-TRIAL + PROB-BIAS-DISPLAY-FIX + TIE-CAP-CTRL + PROB-PURE)
+- ✦ 新增：封鎖(Unfollow) 即永久失效試用（blocked=1）
+  * UnfollowEvent → 寫入 trial:blocked=1 並標記 expired=1
+  * blocked=1 且非 premium → 直接視為到期必須開通
+  * 開通成功 → 自動解除 blocked
+- ✦ 修正：顯示機率與決策機率不一致（造成「莊較高卻叫下閒」）
+  * PROB_BIAS_B2P 改為在 _handle_points_and_predict() 一次套用
+  * decide_only_bp 不再二次套用 bias
+- ✦ 新增：TIE_CAP_ENABLE / SHOW_RAW_PROBS
+  * 可關閉「和局封頂」以避免長期卡在 15%
+  * 可在 log 印出封頂前後機率方便抓問題
+- ✦ 新增：PROB_PURE_MODE
+  * DECISION_MODE=prob 時可強制「純機率」(pB>=pP 選莊)，避免 payout-aware 造成看起來反直覺
+
+# ★ 2025-12-14 PATCH (STATELESS-PF)
+- ✦ 新增：PF_STATEFUL
+  * PF_STATEFUL=1（預設）：維持「每 UID 一個 PF 狀態」並 update_outcome → 連續學習
+  * PF_STATEFUL=0：每次預測都 new 一個 PF（不 update_outcome）→ 每一局/每一次請求完全獨立（不記憶）
 """
 
 import os, sys, logging, time, re, json, threading
@@ -174,7 +199,7 @@ def _extract_line_event_id(event: Any) -> Optional[str]:
     LINE SDK 常見可用：
     - event.webhook_event_id（最準）
     - event.message.id（MessageEvent）
-    - event.delivery_context / 其他：不保證
+    - event.id（有時候會有）
     """
     try:
         eid = getattr(event, "webhook_event_id", None)
@@ -190,7 +215,6 @@ def _extract_line_event_id(event: Any) -> Optional[str]:
     except Exception:
         pass
     try:
-        # 兼容你舊的寫法（若某些 SDK 真的有 id）
         eid2 = getattr(event, "id", None)
         if eid2:
             return str(eid2)
@@ -233,30 +257,25 @@ def get_session(uid: str) -> Dict[str, Any]:
             raw = redis_client.get(_sess_key(uid))
             if raw:
                 sess = json.loads(raw)
-                # 若外部 premium key 已經是 True，確保 session 也同步
                 if is_premium(uid):
                     sess["premium"] = True
-                # ===== 相容：保留欄位（即使移除查詢也不影響）=====
                 if "pending" not in sess:
                     sess["pending"] = False
                 if "pending_seq" not in sess:
                     sess["pending_seq"] = 0
-                # ===== END =====
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
             if is_premium(uid):
                 sess["premium"] = True
-            # ===== 相容：保留欄位（即使移除查詢也不影響）=====
             if "pending" not in sess:
                 sess["pending"] = False
             if "pending_seq" not in sess:
                 sess["pending_seq"] = 0
-            # ===== END =====
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
-    # 新 session：premium 依據永久開通狀態決定
+
     sess = {
         "phase": "await_pts",
         "bankroll": 0,
@@ -264,7 +283,6 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_pts_text": None,
         "premium": is_premium(uid),
         "trial_start": int(time.time()),
-        # heavy 結果暫存（原本供查詢；移除查詢後仍保留不影響）
         "last_card": None,
         "last_card_ts": None,
         "pending": False,
@@ -308,7 +326,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+removequery"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -344,6 +362,13 @@ TIE_MIN = float(os.getenv("TIE_MIN", "0.05"))
 TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 
+# ★ 新增：可控的和局封頂 + debug
+TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)   # 1=維持封頂，0=不封頂（避免卡 15%）
+SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)   # 1=log 印封頂前後機率
+
+# ★ 新增：PF 是否有狀態（是否記憶上一局）
+PF_STATEFUL = env_flag("PF_STATEFUL", 1)         # 1=per-uid stateful；0=每次 new PF（完全獨立）
+
 OutcomePF = None
 pf_initialized = False
 
@@ -363,7 +388,7 @@ except Exception:
         log.error("無法導入 OutcomePF: %s", pf_exc)
         OutcomePF = None
 
-# ---- 重要：SmartDummyPF 仍保留（無 PF 時 fallback） ----
+
 class SmartDummyPF:
     def __init__(self):
         log.warning("使用 SmartDummyPF 備援模式")
@@ -399,6 +424,7 @@ _PF_STORE: Dict[str, Any] = {}
 _PF_LOCKS: Dict[str, threading.Lock] = {}
 _PF_STORE_GUARD = threading.Lock()
 
+
 def _get_uid_lock(uid: str) -> threading.Lock:
     if not uid:
         uid = "anon"
@@ -408,6 +434,7 @@ def _get_uid_lock(uid: str) -> threading.Lock:
             lk = threading.Lock()
             _PF_LOCKS[uid] = lk
         return lk
+
 
 def _build_new_pf() -> Any:
     if OutcomePF is None:
@@ -421,6 +448,7 @@ def _build_new_pf() -> Any:
         backend=PF_BACKEND,
         dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05"))
     )
+
 
 def get_pf_for_uid(uid: str) -> Any:
     if not uid:
@@ -436,6 +464,7 @@ def get_pf_for_uid(uid: str) -> Any:
             _PF_STORE[uid] = pf
         return pf
 
+
 def reset_pf_for_uid(uid: str) -> None:
     if not uid:
         uid = "anon"
@@ -444,10 +473,7 @@ def reset_pf_for_uid(uid: str) -> None:
             _PF_STORE.pop(uid, None)
 # ===== PATCH END =====
 
-
-# 這裡保持原本的 pf_initialized 行為（供 /health 顯示）
-# 只要 OutcomePF 能導入，我們就視為 OK；實例會在 per-uid 取用時建立
-pf_initialized = True if (OutcomePF is not None) else True  # fallback 也算可用
+pf_initialized = True if (OutcomePF is not None) else True
 
 
 # ---------- 決策 / 配注 ----------
@@ -472,24 +498,23 @@ LOG_DECISION = env_flag("LOG_DECISION", 1)
 
 INV = {0: "莊", 1: "閒"}
 
-# ---- Compatibility switches ----
-COMPAT_MODE = int(os.getenv("COMPAT_MODE", "0"))  # 1 = 回到純 PF（無分段/理論/TIE封頂/deplete）
-DEPL_ENABLE = int(os.getenv("DEPL_ENABLE", "0"))  # 1 = 允許 deplete；0 = 禁用
+COMPAT_MODE = int(os.getenv("COMPAT_MODE", "0"))
+DEPL_ENABLE = int(os.getenv("DEPL_ENABLE", "0"))
 
-# ---- Deplete 精修參數 ----
-DEPL_FACTOR = float(os.getenv("DEPL_FACTOR", "0.60"))  # 全域基礎影響因子
+DEPL_FACTOR = float(os.getenv("DEPL_FACTOR", "0.60"))
 DEPL_STAGE_MODE = os.getenv("DEPL_STAGE_MODE", "depth").lower()
 
 EARLY_DEPL_SCALE = float(os.getenv("EARLY_DEPL_SCALE", "0.2"))
 MID_DEPL_SCALE = float(os.getenv("MID_DEPL_SCALE", "0.6"))
 LATE_DEPL_SCALE = float(os.getenv("LATE_DEPL_SCALE", "0.9"))
 
-# 單局最大可位移機率（防止 deplete 讓機率跳太誇張）
 MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.10"))
 
-# ---- PATCH: 反偏莊控制 ----
-EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))  # 1 → prob 分支用 payout-aware 比較（0.95*pB vs pP）
-PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))  # 機率在莊->閒微移（只動 B/P）
+EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))
+PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))
+
+# ★ 新增：DECISION_MODE=prob 時可強制「純機率」
+PROB_PURE_MODE = int(os.getenv("PROB_PURE_MODE", "0"))  # 1=純機率(pB>=pP選莊)，0=沿用既有邏輯
 
 
 def bet_amount(bankroll: int, pct: float) -> int:
@@ -507,6 +532,10 @@ def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
 
 
 def _decide_side_by_prob(pB: float, pP: float) -> int:
+    # ★ PROB_PURE_MODE：永遠用純機率比較
+    if PROB_PURE_MODE == 1:
+        return 0 if pB >= pP else 1
+    # 既有：EV_NEUTRAL=1 時用 payout-aware
     if EV_NEUTRAL == 1:
         return 0 if (BANKER_PAYOUT * pB) >= pP else 1
     return 0 if pB >= pP else 1
@@ -529,7 +558,7 @@ def _apply_prob_bias(prob: np.ndarray) -> np.ndarray:
 
 
 def decide_only_bp(prob: np.ndarray) -> Tuple[str, float, float, str]:
-    prob = _apply_prob_bias(prob)
+    # ★ PROB-BIAS-DISPLAY-FIX：不在這裡套用 bias（避免顯示與決策不一致 / 避免雙重偏移）
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     reason: List[str] = []
 
@@ -702,30 +731,48 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
-    pf_obj = get_pf_for_uid(uid)
-    lk = _get_uid_lock(uid)
-
-    # 同一 UID：update + predict 必須鎖住，避免 thread 競態造成方向鎖死
-    with lk:
-        # 將上一局結果餵回 PF（predict 前必須 update）
-        try:
-            if hasattr(pf_obj, "update_outcome"):
-                if (p_pts == b_pts):  # tie
-                    if not SKIP_TIE_UPD:
+    # ★ STATELESS-PF：PF_STATEFUL=0 → 每次都 new，一次預測一次丟（不記憶）
+    if PF_STATEFUL == 1:
+        pf_obj = get_pf_for_uid(uid)
+        lk = _get_uid_lock(uid)
+        with lk:
+            try:
+                if hasattr(pf_obj, "update_outcome"):
+                    if (p_pts == b_pts):
+                        if not SKIP_TIE_UPD:
+                            try:
+                                pf_obj.update_outcome(2)
+                            except Exception:
+                                pf_obj.update_outcome("T")
+                    else:
+                        outcome = 0 if b_pts > p_pts else 1
                         try:
-                            pf_obj.update_outcome(2)  # 常見：0=B,1=P,2=T
+                            pf_obj.update_outcome(outcome)
                         except Exception:
-                            pf_obj.update_outcome("T")
-                else:
-                    outcome = 0 if b_pts > p_pts else 1  # 0=莊勝, 1=閒勝
-                    try:
-                        pf_obj.update_outcome(outcome)
-                    except Exception:
-                        pf_obj.update_outcome("B" if outcome == 0 else "P")
-        except Exception as e:
-            log.warning("PF.update_outcome failed: %s", e)
+                            pf_obj.update_outcome("B" if outcome == 0 else "P")
+            except Exception as e:
+                log.warning("PF.update_outcome failed: %s", e)
 
-        # stage PF_UPD_SIMS apply
+            try:
+                upd_sims_val = over.get("PF_UPD_SIMS")
+                if upd_sims_val is None:
+                    upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+                if hasattr(pf_obj, "sims_lik"):
+                    pf_obj.sims_lik = int(float(upd_sims_val))
+            except Exception as e:
+                log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+
+            sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+            sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
+            p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+    else:
+        # 完全獨立：不 update_outcome、不用 per-uid store、不需要 lock
+        try:
+            pf_obj = _build_new_pf()
+        except Exception as e:
+            log.error("PF 初始化失敗(stateless): %s", e)
+            pf_obj = SmartDummyPF()
+
         try:
             upd_sims_val = over.get("PF_UPD_SIMS")
             if upd_sims_val is None:
@@ -733,11 +780,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             if hasattr(pf_obj, "sims_lik"):
                 pf_obj.sims_lik = int(float(upd_sims_val))
         except Exception as e:
-            log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+            log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
 
         sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
         sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
-
         p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
 
     # (鎖外) 後處理：不需要鎖
@@ -762,7 +808,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     sims=dep_sims,
                     deplete_factor=alpha
                 )
-
                 dep = np.asarray(dep, dtype=np.float32)
 
                 depT = float(dep[2])
@@ -780,7 +825,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
                 mix = (1.0 - alpha) * p + alpha * dep
                 mix = mix / mix.sum()
-
                 p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
@@ -792,19 +836,33 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             p = (1.0 - theo_blend) * p + theo_blend * theo
             p = p / p.sum()
 
+        if SHOW_RAW_PROBS:
+            log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+
+        # ★ TIE_CAP_ENABLE：可關閉「和局封頂」避免卡 15%
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
-        if p[2] > tie_max:
-            sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-            p[2] = tie_max
-            p[0] *= sc
-            p[1] *= sc
-            p = p / p.sum()
+        if TIE_CAP_ENABLE == 1:
+            if p[2] > tie_max:
+                sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+                p[2] = tie_max
+                p[0] *= sc
+                p[1] *= sc
+                p = p / p.sum()
+
         if p[2] < TIE_MIN:
             sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
             p[2] = TIE_MIN
             p[0] *= sc
             p[1] *= sc
             p = p / p.sum()
+
+        if SHOW_RAW_PROBS:
+            log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+
+    # ★ PROB-BIAS-DISPLAY-FIX：在這裡一次套用，讓「顯示」與「決策」一致
+    p = _apply_prob_bias(p)
 
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
@@ -825,19 +883,24 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     sess["rounds_seen"] = rounds_seen + 1
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s | %s",
-                 choice, edge, bet_pct * 100, sess["rounds_seen"], int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))), uid, reason)
+        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s stateful=%s | %s",
+                 choice, edge, bet_pct * 100, sess["rounds_seen"],
+                 int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))),
+                 uid, PF_STATEFUL, reason)
     return p, choice, bet_amt, reason
 
 
 # ---------- LINE：完整互動 ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 ADMIN_ACTIVATION_SECRET = os.getenv("ADMIN_ACTIVATION_SECRET", "aaa8881688")
 
-# ★ 429 止血：可用 env 控制（預設開）
+# ★ TRIAL namespace（避免不同 bot 共用 trial key）
+TRIAL_NAMESPACE = os.getenv("TRIAL_NAMESPACE", "default").strip() or "default"
+
 LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
 LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))
 _PUSH_BLOCK_UNTIL = 0
@@ -868,33 +931,68 @@ def _looks_like_429(e: Exception) -> bool:
 
 
 def _trial_key(uid: str, kind: str) -> str:
-    return f"trial:{kind}:{uid}"
+    # ★ namespace：避免不同 Bot/不同部署共用同一組 trial keys
+    return f"trial:{TRIAL_NAMESPACE}:{kind}:{uid}"
+
+
+# ★ BLOCK-TRIAL：封鎖即永久失效試用
+def _trial_block_key(uid: str) -> str:
+    return _trial_key(uid, "blocked")
+
+
+def is_trial_blocked(uid: str) -> bool:
+    return _rget(_trial_block_key(uid)) == "1"
+
+
+def set_trial_blocked(uid: str, flag: bool = True) -> None:
+    _rset(_trial_block_key(uid), "1" if flag else "0")
 
 
 def trial_persist_guard(uid: str) -> Optional[str]:
     if is_premium(uid):
         return None
 
+    # ★ BLOCK-TRIAL：曾封鎖 → 永久失效（除非開通）
+    if is_trial_blocked(uid):
+        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
 
-    if expired == "1":
-        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+    # ===== TRIAL-FIX: expired=1 但 first_ts 不存在 → 視為髒資料，清掉 expired =====
+    if expired == "1" and not first_ts:
+        _rset(_trial_key(uid, "expired"), "0")
+        expired = None
+    # ===== END =====
 
     if not first_ts:
+        # 新用戶：寫入 first_ts 並確保 expired 被清掉
         _rset(_trial_key(uid, "first_ts"), str(now))
+        _rset(_trial_key(uid, "expired"), "0")
         return None
 
     try:
         first = int(first_ts)
-    except:
+    except Exception:
         first = now
         _rset(_trial_key(uid, "first_ts"), str(now))
+        _rset(_trial_key(uid, "expired"), "0")
+        return None
 
     used_min = (now - first) // 60
+
+    # ===== TRIAL-FIX: expired=1 但其實還沒到期 → 自動修正 =====
+    if expired == "1" and used_min < TRIAL_MINUTES:
+        _rset(_trial_key(uid, "expired"), "0")
+        expired = None
+    # ===== END =====
+
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
+        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+
+    if expired == "1":
         return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
 
     return None
@@ -923,7 +1021,6 @@ def game_menu_text(left_min: int) -> str:
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
-        # ★ REMOVE-QUERY：移除「查詢」按鈕（其餘不動）
         return QuickReply(items=[
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
             QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
@@ -966,7 +1063,6 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
 
-        # 只允許最新 seq 寫入（避免 out-of-order 覆寫造成像重播）
         cur_seq = int(sess.get("pending_seq", 0))
         if cur_seq == int(seq):
             sess["last_card"] = msg
@@ -1001,11 +1097,23 @@ line_api = None
 line_handler = None
 try:
     from linebot import LineBotApi, WebhookHandler
-    from linebot.exceptions import InvalidSignatureError
-    from linebot.models import MessageEvent, TextMessage, FollowEvent
+    from linebot.models import MessageEvent, TextMessage, FollowEvent, UnfollowEvent
     if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+        @line_handler.add(UnfollowEvent)
+        def on_unfollow(event):
+            # ★ BLOCK-TRIAL：封鎖/取消好友 → 永久失效試用
+            if not _dedupe_event(_extract_line_event_id(event)):
+                return
+            try:
+                uid = event.source.user_id
+                set_trial_blocked(uid, True)
+                _rset(_trial_key(uid, "expired"), "1")
+                log.info("[TRIAL] user unfollowed -> blocked=1 expired=1 uid=%s", uid)
+            except Exception as e:
+                log.warning("[TRIAL] unfollow handler error: %s", e)
 
         @line_handler.add(FollowEvent)
         def on_follow(event):
@@ -1013,15 +1121,41 @@ try:
                 return
             uid = event.source.user_id
 
+            # ★ 若曾封鎖 → 直接視為到期（不重給試用）
+            if (not is_premium(uid)) and is_trial_blocked(uid):
+                sess = get_session(uid)
+                _reply(line_api, event.reply_token, f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼")
+                save_session(uid, sess)
+                return
+
+            # ===== TRIAL-FIX: 加好友當下，若 first_ts 不存在 → 強制建立並清 expired =====
+            now = int(time.time())
+            ft_key = _trial_key(uid, "first_ts")
+            ex_key = _trial_key(uid, "expired")
+            first_ts = _rget(ft_key)
+            if not first_ts:
+                _rset(ft_key, str(now))
+                _rset(ex_key, "0")
+                first_ts = str(now)
+            else:
+                try:
+                    first = int(first_ts)
+                    used_min = (now - first) // 60
+                    if _rget(ex_key) == "1" and used_min < TRIAL_MINUTES:
+                        _rset(ex_key, "0")
+                except Exception:
+                    _rset(ft_key, str(now))
+                    _rset(ex_key, "0")
+                    first_ts = str(now)
+            # ===== END =====
+
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
 
-            first_ts = _rget(_trial_key(uid, "first_ts"))
-            if first_ts:
-                try:
-                    sess["trial_start"] = int(first_ts)
-                except Exception:
-                    pass
+            try:
+                sess["trial_start"] = int(first_ts) if first_ts else int(time.time())
+            except Exception:
+                pass
 
             if sess.get("premium", False) or is_premium(uid):
                 msg = (
@@ -1056,15 +1190,17 @@ try:
             sess = get_session(uid)
             up = text.upper()
 
-            # ★ REMOVE-QUERY：不再處理「查詢 / QUERY」
-            # （避免浪費用量；也避免在 push 不可用時產生額外回話）
-
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
                 if ok:
                     sess["premium"] = True
                     set_premium(uid, True)
+                    # ★ BLOCK-TRIAL：開通成功 → 解除 blocked
+                    try:
+                        set_trial_blocked(uid, False)
+                    except Exception:
+                        pass
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess)
                 return
@@ -1139,7 +1275,6 @@ try:
                     "✅ 已收到上一局結果，AI 正在計算。"
                 )
 
-                # 收到新點數→標記 pending（即使不提供查詢也不影響；保留相容）
                 sess["pending"] = True
                 sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
                 seq = int(sess["pending_seq"])
@@ -1222,7 +1357,8 @@ def root():
 def health():
     return jsonify(ok=True, ts=time.time(), version=VERSION,
                    pf_initialized=pf_initialized,
-                   pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy")), 200
+                   pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
+                   pf_stateful=bool(PF_STATEFUL)), 200
 
 
 @app.get("/ping")
@@ -1264,8 +1400,8 @@ if __name__ == "__main__":
         log.warning("PF backend: smart-dummy (OutcomePF import failed). If probs look repeated, check deployment paths.")
     else:
         log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
-    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s)",
-             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE)
+    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, PF_STATEFUL=%s, TIE_CAP_ENABLE=%s)",
+             VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE, PF_STATEFUL, TIE_CAP_ENABLE)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
