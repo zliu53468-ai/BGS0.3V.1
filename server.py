@@ -17,6 +17,12 @@
 - ✦ 補丁：LINE 429（月額度到達）「自動停推播」+ heavy 結果改存 session，可用「查詢」拿結果
 - ✦ 補丁：初次 Follow（加好友）一定回「試用剩餘 X 分鐘（預設 30 分鐘）」
 - ✦ 補丁：Quick Reply 多一顆「查詢 🔎」按鈕
+
+# ★ 2025-12-13 PATCH (FIX)
+- ✦ 修正：PF 狀態不應全域共用（會導致方向黏住/多用戶互相污染）
+  * 改為「每個 UID 一個 PF 狀態」（記憶體 store）
+  * 同一 UID 的 update+predict 加鎖，避免 thread race
+  * RESET 時同步清除該 UID PF 狀態
 """
 
 import os, sys, logging, time, re, json, threading
@@ -285,7 +291,6 @@ TIE_MAX = float(os.getenv("TIE_MAX", "0.15"))
 HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 
 OutcomePF = None
-PF = None
 pf_initialized = False
 
 try:
@@ -304,59 +309,91 @@ except Exception:
         log.error("無法導入 OutcomePF: %s", pf_exc)
         OutcomePF = None
 
-if OutcomePF:
-    try:
-        PF = OutcomePF(
-            decks=int(os.getenv("DECKS", "8")),
-            seed=int(os.getenv("SEED", "42")),
-            n_particles=int(os.getenv("PF_N", "50")),
-            sims_lik=int(os.getenv("PF_UPD_SIMS", "30")),
-            resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
-            backend=PF_BACKEND,
-            dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05"))
-        )
-        pf_initialized = True
-        log.info("PF 初始化成功: n_particles=%s, sims_lik=%s, decks=%s (backend=%s)",
-                 getattr(PF, 'n_particles', 'N/A'),
-                 getattr(PF, 'sims_lik', 'N/A'),
-                 getattr(PF, 'decks', 'N/A'),
-                 getattr(PF, 'backend', 'unknown'))
-    except Exception as e:
-        log.error("PF 初始化失敗: %s", e)
-        pf_initialized = False
-        OutcomePF = None
+# ---- 重要：SmartDummyPF 仍保留（無 PF 時 fallback） ----
+class SmartDummyPF:
+    def __init__(self):
+        log.warning("使用 SmartDummyPF 備援模式")
 
-if not pf_initialized:
-    class SmartDummyPF:
-        def __init__(self):
-            log.warning("使用 SmartDummyPF 備援模式")
+    def update_outcome(self, outcome):
+        return
 
-        def update_outcome(self, outcome):
-            return
+    def predict(self, **kwargs) -> np.ndarray:
+        base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+        base = base ** (1.0 / max(1e-6, SOFT_TAU))
+        base = base / base.sum()
+        pT = float(base[2])
+        if pT < TIE_MIN:
+            base[2] = TIE_MIN
+            sc = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
+            base[0] *= sc
+            base[1] *= sc
+        elif pT > TIE_MAX:
+            base[2] = TIE_MAX
+            sc = (1.0 - TIE_MAX) / (1.0 - pT) if pT < 1.0 else 1.0
+            base[0] *= sc
+            base[1] *= sc
+        return base.astype(np.float32)
 
-        def predict(self, **kwargs) -> np.ndarray:
-            base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            base = base ** (1.0 / max(1e-6, SOFT_TAU))
-            base = base / base.sum()
-            pT = float(base[2])
-            if pT < TIE_MIN:
-                base[2] = TIE_MIN
-                sc = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
-                base[0] *= sc
-                base[1] *= sc
-            elif pT > TIE_MAX:
-                base[2] = TIE_MAX
-                sc = (1.0 - TIE_MAX) / (1.0 - pT) if pT < 1.0 else 1.0
-                base[0] *= sc
-                base[1] *= sc
-            return base.astype(np.float32)
+    @property
+    def backend(self):
+        return "smart-dummy"
 
-        @property
-        def backend(self):
-            return "smart-dummy"
 
-    PF = SmartDummyPF()
-    pf_initialized = True
+# ===== PATCH: PF per-UID store + lock (thread-safe) =====
+_PF_STORE: Dict[str, Any] = {}
+_PF_LOCKS: Dict[str, threading.Lock] = {}
+_PF_STORE_GUARD = threading.Lock()
+
+def _get_uid_lock(uid: str) -> threading.Lock:
+    if not uid:
+        uid = "anon"
+    with _PF_STORE_GUARD:
+        lk = _PF_LOCKS.get(uid)
+        if lk is None:
+            lk = threading.Lock()
+            _PF_LOCKS[uid] = lk
+        return lk
+
+def _build_new_pf() -> Any:
+    if OutcomePF is None:
+        return SmartDummyPF()
+    return OutcomePF(
+        decks=int(os.getenv("DECKS", "8")),
+        seed=int(os.getenv("SEED", "42")),
+        n_particles=int(os.getenv("PF_N", "50")),
+        sims_lik=int(os.getenv("PF_UPD_SIMS", "30")),
+        resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
+        backend=PF_BACKEND,
+        dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05"))
+    )
+
+def get_pf_for_uid(uid: str) -> Any:
+    if not uid:
+        uid = "anon"
+    with _PF_STORE_GUARD:
+        pf = _PF_STORE.get(uid)
+        if pf is None:
+            try:
+                pf = _build_new_pf()
+            except Exception as e:
+                log.error("PF 初始化失敗(per-uid): %s", e)
+                pf = SmartDummyPF()
+            _PF_STORE[uid] = pf
+        return pf
+
+def reset_pf_for_uid(uid: str) -> None:
+    if not uid:
+        uid = "anon"
+    with _PF_STORE_GUARD:
+        if uid in _PF_STORE:
+            _PF_STORE.pop(uid, None)
+# ===== PATCH END =====
+
+
+# 這裡保持原本的 pf_initialized 行為（供 /health 顯示）
+# 只要 OutcomePF 能導入，我們就視為 OK；實例會在 per-uid 取用時建立
+pf_initialized = True if (OutcomePF is not None) else True  # fallback 也算可用
+
 
 # ---------- 決策 / 配注 ----------
 DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()  # ev | prob | hybrid
@@ -556,14 +593,14 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 
 
 # ---------- 預測效能保護 ----------
-def _tuned_pred_sims(base: int) -> int:
+def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
     try:
         cap = int(float(os.getenv("PRED_SIMS_CAP", "10")))
     except Exception:
         cap = 10
     n = max(1, min(int(base), cap))
     try:
-        n_particles = int(getattr(PF, 'n_particles', 200))
+        n_particles = int(getattr(pf_obj, 'n_particles', 200))
         if n_particles >= 350 and n > 5:
             n = 5
         elif n_particles >= 300 and n > 7:
@@ -606,43 +643,49 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 
 
 # ---------- 主預測 ----------
-def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
+def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
-    # ===== PATCH: 將上一局結果餵回 PF（predict 前必須 update）=====
-    try:
-        if hasattr(PF, "update_outcome"):
-            if (p_pts == b_pts):  # tie
-                if not SKIP_TIE_UPD:
+    pf_obj = get_pf_for_uid(uid)
+    lk = _get_uid_lock(uid)
+
+    # 同一 UID：update + predict 必須鎖住，避免 thread 競態造成方向鎖死
+    with lk:
+        # 將上一局結果餵回 PF（predict 前必須 update）
+        try:
+            if hasattr(pf_obj, "update_outcome"):
+                if (p_pts == b_pts):  # tie
+                    if not SKIP_TIE_UPD:
+                        try:
+                            pf_obj.update_outcome(2)  # 常見：0=B,1=P,2=T
+                        except Exception:
+                            pf_obj.update_outcome("T")
+                else:
+                    outcome = 0 if b_pts > p_pts else 1  # 0=莊勝, 1=閒勝
                     try:
-                        PF.update_outcome(2)  # 常見編碼：0=B,1=P,2=T
+                        pf_obj.update_outcome(outcome)
                     except Exception:
-                        PF.update_outcome("T")
-            else:
-                outcome = 0 if b_pts > p_pts else 1  # 0=莊勝, 1=閒勝
-                try:
-                    PF.update_outcome(outcome)
-                except Exception:
-                    PF.update_outcome("B" if outcome == 0 else "P")
-    except Exception as e:
-        log.warning("PF.update_outcome failed: %s", e)
-    # ===== PATCH END =====
+                        pf_obj.update_outcome("B" if outcome == 0 else "P")
+        except Exception as e:
+            log.warning("PF.update_outcome failed: %s", e)
 
-    try:
-        upd_sims_val = over.get("PF_UPD_SIMS")
-        if upd_sims_val is None:
-            upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
-        if hasattr(PF, "sims_lik"):
-            PF.sims_lik = int(float(upd_sims_val))
-    except Exception as e:
-        log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+        # stage PF_UPD_SIMS apply
+        try:
+            upd_sims_val = over.get("PF_UPD_SIMS")
+            if upd_sims_val is None:
+                upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+            if hasattr(pf_obj, "sims_lik"):
+                pf_obj.sims_lik = int(float(upd_sims_val))
+        except Exception as e:
+            log.warning("stage PF_UPD_SIMS apply failed: %s", e)
 
-    sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
-    sims_per_particle = _tuned_pred_sims(sims_per_particle)
+        sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+        sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
 
-    p = np.asarray(PF.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+        p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
 
+    # (鎖外) 後處理：不需要鎖
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
@@ -727,8 +770,8 @@ def _handle_points_and_predict(sess: Dict[str, Any], p_pts: int, b_pts: int) -> 
     sess["rounds_seen"] = rounds_seen + 1
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d | %s",
-                 choice, edge, bet_pct * 100, sess["rounds_seen"], sims_per_particle, reason)
+        log.info("決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s | %s",
+                 choice, edge, bet_pct * 100, sess["rounds_seen"], int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))), uid, reason)
     return p, choice, bet_amt, reason
 
 
@@ -863,7 +906,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int):
         else:
             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
 
-        probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
+        probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
 
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
@@ -982,6 +1025,12 @@ try:
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
                         "last_card": None, "last_card_ts": None}
+                # ===== PATCH: reset 也要清除該 UID PF 狀態 =====
+                try:
+                    reset_pf_for_uid(uid)
+                except Exception:
+                    pass
+                # ===== PATCH END =====
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
@@ -1112,7 +1161,7 @@ def root():
 def health():
     return jsonify(ok=True, ts=time.time(), version=VERSION,
                    pf_initialized=pf_initialized,
-                   pf_backend=getattr(PF, 'backend', 'unknown')), 200
+                   pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy")), 200
 
 
 @app.get("/ping")
@@ -1137,7 +1186,7 @@ def predict():
 
         p_pts, b_pts = pts
         sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
-        probs, choice, bet_amt, reason = _handle_points_and_predict(sess, p_pts, b_pts)
+        probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
         save_session(uid, sess)
         card = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         return jsonify(ok=True,
