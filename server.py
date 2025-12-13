@@ -14,9 +14,7 @@
 - ✦ 補丁：新增 /ping 給 UptimeRobot 專用
 
 # ★ 2025-12-12 PATCH
-- ✦ 補丁：LINE 429（月額度到達）「自動停推播」+ heavy 結果改存 session，可用「查詢」拿結果
-- ✦ 補丁：初次 Follow（加好友）一定回「試用剩餘 X 分鐘（預設 30 分鐘）」
-- ✦ 補丁：Quick Reply 多一顆「查詢 🔎」按鈕
+- ✦ 補丁：LINE 429（月額度到達）「自動停推播」+ heavy 結果改存 session（原本可用「查詢」拿結果）
 
 # ★ 2025-12-13 PATCH (FIX)
 - ✦ 修正：PF 狀態不應全域共用（會導致方向黏住/多用戶互相污染）
@@ -27,9 +25,12 @@
 # ★ 2025-12-13 PATCH (FIX-REPEAT)
 - ✦ 修正：LINE dedupe 取錯欄位導致同事件被重複處理（重送 webhook 會重算同一把）
   * 使用 webhook_event_id / message.id 作為 dedupe key
-- ✦ 修正：背景 heavy 計算尚未完成時，按「查詢」會回上一把（造成「重複前幾把」體感）
-  * 新增 pending / pending_seq：收到新點數先標記 pending 並清空 last_card
-  * 查詢遇到 pending 回「計算中」；heavy 完成後再寫入 last_card 並解除 pending
+
+# ★ 2025-12-13 PATCH (REMOVE-QUERY)
+- ✦ 移除：「查詢」按鈕與指令回覆（避免浪費 LINE 用量）
+  * Quick Reply 不再顯示「查詢」
+  * 不再處理「查詢 / QUERY」文字指令
+  * 收到點數的提示文字不再引導使用者「查詢」
 """
 
 import os, sys, logging, time, re, json, threading
@@ -235,23 +236,23 @@ def get_session(uid: str) -> Dict[str, Any]:
                 # 若外部 premium key 已經是 True，確保 session 也同步
                 if is_premium(uid):
                     sess["premium"] = True
-                # ===== PATCH: 確保新欄位存在（舊 session 相容） =====
+                # ===== 相容：保留欄位（即使移除查詢也不影響）=====
                 if "pending" not in sess:
                     sess["pending"] = False
                 if "pending_seq" not in sess:
                     sess["pending_seq"] = 0
-                # ===== PATCH END =====
+                # ===== END =====
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
             if is_premium(uid):
                 sess["premium"] = True
-            # ===== PATCH: 確保新欄位存在（舊 session 相容） =====
+            # ===== 相容：保留欄位（即使移除查詢也不影響）=====
             if "pending" not in sess:
                 sess["pending"] = False
             if "pending_seq" not in sess:
                 sess["pending_seq"] = 0
-            # ===== PATCH END =====
+            # ===== END =====
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
@@ -263,13 +264,11 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_pts_text": None,
         "premium": is_premium(uid),
         "trial_start": int(time.time()),
-        # ★ heavy 結果暫存（供「查詢」）
+        # heavy 結果暫存（原本供查詢；移除查詢後仍保留不影響）
         "last_card": None,
         "last_card_ts": None,
-        # ===== PATCH: pending 狀態（避免查詢拿到上一把）=====
         "pending": False,
         "pending_seq": 0,
-        # ===== PATCH END =====
     }
     save_session(uid, sess)
     return sess
@@ -309,7 +308,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+querybtn+repeatfix"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+probfix+perfguard+bgpush+429patch+followtrialfix+removequery"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -924,9 +923,9 @@ def game_menu_text(left_min: int) -> str:
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        # ★ REMOVE-QUERY：移除「查詢」按鈕（其餘不動）
         return QuickReply(items=[
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action=MessageAction(label="查詢 🔎", text="查詢")),  # ★ PATCH：新增查詢按鈕
             QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
             QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
             QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
@@ -967,16 +966,14 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
                                  cont=bool(CONTINUOUS_MODE))
 
-        # ===== PATCH: 只允許最新 seq 寫入（避免 out-of-order 覆寫造成像重播）=====
+        # 只允許最新 seq 寫入（避免 out-of-order 覆寫造成像重播）
         cur_seq = int(sess.get("pending_seq", 0))
         if cur_seq == int(seq):
             sess["last_card"] = msg
             sess["last_card_ts"] = int(time.time())
             sess["pending"] = False
         else:
-            # 舊 thread 完成了，但已不是最新請求，避免覆蓋
             log.info("[heavy] stale seq=%s (cur_seq=%s) skip write-back", seq, cur_seq)
-        # ===== PATCH END =====
 
         save_session(uid, sess)
 
@@ -991,7 +988,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
                     _block_push("429 monthly limit reached")
                 log.warning("[LINE] push failed (heavy): %s", e)
         else:
-            log.info("[LINE] push skipped (disabled/blocked). User can use '查詢' to get last result.")
+            log.info("[LINE] push skipped (disabled/blocked).")
 
     except Exception as e:
         log.exception("[heavy] prediction failed: %s", e)
@@ -1059,20 +1056,8 @@ try:
             sess = get_session(uid)
             up = text.upper()
 
-            if up in ("查詢", "QUERY"):
-                # ===== PATCH: 若計算中，不回上一把，避免「重複前幾把」體感 =====
-                if bool(sess.get("pending", False)):
-                    _reply(line_api, event.reply_token, "⏳ AI 計算中，請稍候 1–2 秒再點『查詢 🔎』。")
-                    save_session(uid, sess)
-                    return
-                # ===== PATCH END =====
-                last = sess.get("last_card")
-                if last:
-                    _reply(line_api, event.reply_token, str(last))
-                else:
-                    _reply(line_api, event.reply_token, "目前沒有可查詢的結果。\n📌 請先輸入點數（例：65 / 和 / 閒6莊5）。")
-                save_session(uid, sess)
-                return
+            # ★ REMOVE-QUERY：不再處理「查詢 / QUERY」
+            # （避免浪費用量；也避免在 push 不可用時產生額外回話）
 
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
@@ -1096,16 +1081,11 @@ try:
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
                         "last_card": None, "last_card_ts": None,
-                        # ===== PATCH: reset 同步清 pending =====
-                        "pending": False, "pending_seq": 0
-                        # ===== PATCH END =====
-                        }
-                # ===== PATCH: reset 也要清除該 UID PF 狀態 =====
+                        "pending": False, "pending_seq": 0}
                 try:
                     reset_pf_for_uid(uid)
                 except Exception:
                     pass
-                # ===== PATCH END =====
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
@@ -1156,17 +1136,15 @@ try:
                 _reply(
                     line_api,
                     event.reply_token,
-                    "✅ 已收到上一局結果，AI 正在計算。\n"
-                    "📌 計算完成後若推播可用會自動推送；若沒收到請點『查詢 🔎』取得最新結果。"
+                    "✅ 已收到上一局結果，AI 正在計算。"
                 )
 
-                # ===== PATCH: 收到新點數→標記 pending + 清掉 last_card（避免查詢拿舊的）=====
+                # 收到新點數→標記 pending（即使不提供查詢也不影響；保留相容）
                 sess["pending"] = True
                 sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
                 seq = int(sess["pending_seq"])
                 sess["last_card"] = None
                 sess["last_card_ts"] = None
-                # ===== PATCH END =====
                 save_session(uid, sess)
 
                 try:
@@ -1282,12 +1260,10 @@ def predict():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    # ===== PATCH: 啟動時明確 log PF backend 狀態 =====
     if OutcomePF is None:
         log.warning("PF backend: smart-dummy (OutcomePF import failed). If probs look repeated, check deployment paths.")
     else:
         log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
-    # ===== PATCH END =====
     log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s)",
              VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE)
     if _flask_available and Flask is not None:
