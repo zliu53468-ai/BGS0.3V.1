@@ -63,6 +63,12 @@
     - 當 DECISION_MODE=prob 時，若你沒設定 PROB_PURE_MODE，會自動強制純機率
     - 並在決策時計算層面自動關閉 EV_NEUTRAL（避免 payout-aware 介入）
   * 決策層增加一致性自檢：若「純機率」模式仍出現 pB>pP 但選閒 → 強制改選莊並打警告 log
+
+# ★ 2025-12-14 PATCH (LINE-NO-STUCK)
+- ✦ 修正：避免 LINE push 被 blocked/disabled 時，使用者卡在「AI 正在計算」
+  * 新增 LINE_ASYNC_HEAVY（預設 1）
+  * 若 _can_push()=False（push 被擋）→ 改為「直接在 webhook 同一次 reply 回傳最終結果」
+  * push 可用時維持原本「快速 reply + 背景 thread push」行為
 """
 
 import os, sys, logging, time, re, json, threading
@@ -333,7 +339,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -805,16 +811,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
 # Debug/Test utilities
 # --------------------------------------------------
 def test_deplete_biases() -> None:
-    """
-    Utility function to examine potential biases introduced by the deplete
-    simulation. This function prints out banker/ player/ tie probabilities
-    for a series of preset point combinations along with the difference
-    (banker minus player) and which side is higher. The number of Monte
-    Carlo simulations is deliberately large to reduce variance (defaults
-    to 10,000 but can be overridden via the environment variable
-    DEPLETEMC_SIMS). You can invoke this function manually from a
-    Python REPL or within your own diagnostic scripts.
-    """
     if not DEPLETE_OK or init_counts is None or probs_after_points is None:
         log.warning("test_deplete_biases called but deplete support is unavailable")
         return
@@ -822,7 +818,6 @@ def test_deplete_biases() -> None:
         decks = int(os.getenv("DECKS", "8"))
         counts = init_counts(decks)
         sims_env = os.getenv("DEPLETEMC_SIMS")
-        # If DEPLETEMC_SIMS is not set in the environment, use a large default
         sims = int(float(sims_env)) if sims_env else 10000
         deplete_factor = float(os.getenv("DEPL_FACTOR", "0.60"))
         scenarios = [
@@ -854,33 +849,19 @@ def test_deplete_biases() -> None:
 
 
 def debug_card_distribution() -> None:
-    """
-    Utility function to print out the distribution of card values within
-    the current shoe. This can help verify that the initial deck setup
-    is balanced and does not inadvertently favour banker or player. The
-    function groups cards by their Baccarat point values (with J/Q/K
-    treated as 10) and logs both the absolute counts and the percentage
-    of the total deck. Invoke this manually from a REPL or diagnostic
-    script. It does not modify any state.
-    """
     if not DEPLETE_OK or init_counts is None:
         log.warning("debug_card_distribution called but deplete support is unavailable")
         return
     try:
         decks = int(os.getenv("DECKS", "8"))
         counts = init_counts(decks)
-        # counts may be dict-like or list-like depending on implementation
         total_cards = sum(counts.values()) if isinstance(counts, dict) else sum(counts)
         point_cards: Dict[int, int] = {}
-        # iterate through card counts and accumulate by point value
         if isinstance(counts, dict):
             iterable = counts.items()
         else:
-            # list/tuple of counts indexed by card value (1-13 or 0-12)
             iterable = enumerate(counts)
         for card_value, count in iterable:
-            # Convert card faces to Baccarat points (J/Q/K count as 10)
-            # Note: Some implementations index from 0; ensure values > 0 map correctly
             try:
                 val = int(card_value)
             except Exception:
@@ -900,13 +881,10 @@ def debug_card_distribution() -> None:
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
-    # ----- Debug: prepare holders for probability snapshots -----
-    # pf_probs will hold the raw PF prediction probabilities (before softening)
-    # soft_probs will hold probabilities after softening by SOFT_TAU
+
     pf_probs: Optional[np.ndarray] = None
     soft_probs: Optional[np.ndarray] = None
 
-    # ★ STATELESS-PF：PF_STATEFUL=0 → 每次都 new，一次預測一次丟（不記憶）
     if PF_STATEFUL == 1:
         pf_obj = get_pf_for_uid(uid)
         lk = _get_uid_lock(uid)
@@ -940,10 +918,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
             sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
             p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
-            # Capture raw PF prediction probabilities for debugging
             pf_probs = p.copy()
     else:
-        # 完全獨立：不 update_outcome、不用 per-uid store、不需要 lock
         try:
             pf_obj = _build_new_pf()
         except Exception as e:
@@ -962,14 +938,11 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
         sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
         p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
-        # Capture raw PF prediction probabilities for debugging
         pf_probs = p.copy()
 
-    # 後處理：不需要鎖
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
-    # Capture softened probabilities and emit debug logs
     soft_probs = p.copy()
     if SHOW_RAW_PROBS:
         try:
@@ -986,7 +959,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             alpha = max(0.0, min(0.55, float(raw_alpha)))
 
             if alpha > 0.0:
-                # Capture probabilities before applying deplete for debugging
                 before_deplete = p.copy()
                 if SHOW_RAW_PROBS:
                     log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
@@ -1018,7 +990,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 mix = (1.0 - alpha) * p + alpha * dep
                 mix = mix / mix.sum()
                 p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
-                # Capture probabilities after deplete and log effect
                 after_deplete = p.copy()
                 if SHOW_RAW_PROBS:
                     log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
@@ -1046,11 +1017,9 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
 
-        # TIE_CAP_ENABLE：可關閉「和局封頂」避免卡 15%
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
         if TIE_CAP_ENABLE == 1:
             if p[2] > tie_max:
-                # Capture probabilities before tie cap for debugging
                 if SHOW_RAW_PROBS:
                     before_tiecap = p.copy()
                 sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
@@ -1058,7 +1027,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 p[0] *= sc
                 p[1] *= sc
                 p = p / p.sum()
-                # Capture probabilities after tie cap and log
                 if SHOW_RAW_PROBS:
                     after_tiecap = p.copy()
                     log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
@@ -1122,6 +1090,11 @@ LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
 LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))
 _PUSH_BLOCK_UNTIL = 0
 
+# ===== PATCH: 避免卡「正在計算」 =====
+# - 若 push 被擋（429/disabled）時，改成「同步 reply 最終結果」不走 background push
+LINE_ASYNC_HEAVY = env_flag("LINE_ASYNC_HEAVY", 1)
+# ===== PATCH END =====
+
 
 def _can_push() -> bool:
     global _PUSH_BLOCK_UNTIL
@@ -1166,19 +1139,9 @@ def set_trial_blocked(uid: str, flag: bool = True) -> None:
 
 
 def trial_persist_guard(uid: str) -> Optional[str]:
-    """
-    檢查試用狀態並返回適當的提示訊息。
-
-    - 若用戶已開通，返回 None。
-    - 若曾封鎖，回傳強調帳號曾被封鎖並說明如何重新啟用。
-    - 若試用時間已用完，提示試用已結束並提供開通方式與正確格式示例。
-    - 若有 expired 標記但未到期或資料髒，會自動修正。
-    - 若尚在試用期內或沒有任何限制，返回 None。
-    """
     if is_premium(uid):
         return None
 
-    # ★ BLOCK-TRIAL：曾封鎖 → 永久失效（除非開通）
     if is_trial_blocked(uid):
         return (
             f"⛔ 試用已到期（帳號曾被封鎖）\n"
@@ -1191,13 +1154,11 @@ def trial_persist_guard(uid: str) -> Optional[str]:
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
 
-    # TRIAL-FIX: expired=1 但 first_ts 不存在 → 視為髒資料，清掉 expired
     if expired == "1" and not first_ts:
         _rset(_trial_key(uid, "expired"), "0")
         expired = None
 
     if not first_ts:
-        # 新用戶：寫入 first_ts 並確保 expired 被清掉
         _rset(_trial_key(uid, "first_ts"), str(now))
         _rset(_trial_key(uid, "expired"), "0")
         return None
@@ -1212,7 +1173,6 @@ def trial_persist_guard(uid: str) -> Optional[str]:
 
     used_min = (now - first) // 60
 
-    # TRIAL-FIX: expired=1 但其實還沒到期 → 自動修正
     if expired == "1" and used_min < TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "0")
         expired = None
@@ -1344,7 +1304,6 @@ try:
 
         @line_handler.add(UnfollowEvent)
         def on_unfollow(event):
-            # ★ BLOCK-TRIAL：封鎖/取消好友 → 永久失效試用
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
             try:
@@ -1361,10 +1320,8 @@ try:
                 return
             uid = event.source.user_id
 
-            # ★ 若曾封鎖 → 直接視為到期（不重給試用）
             if (not is_premium(uid)) and is_trial_blocked(uid):
                 sess = get_session(uid)
-                # 取得更詳盡的 trial 提示訊息（包括範例格式）
                 guard_msg = trial_persist_guard(uid)
                 msg = guard_msg if guard_msg else (
                     f"⛔ 試用已到期\n"
@@ -1376,7 +1333,6 @@ try:
                 save_session(uid, sess)
                 return
 
-            # TRIAL-FIX: 加好友當下，若 first_ts 不存在 → 強制建立並清 expired
             now = int(time.time())
             ft_key = _trial_key(uid, "first_ts")
             ex_key = _trial_key(uid, "expired")
@@ -1443,7 +1399,6 @@ try:
                 if ok:
                     sess["premium"] = True
                     set_premium(uid, True)
-                    # ★ BLOCK-TRIAL：開通成功 → 解除 blocked
                     try:
                         set_trial_blocked(uid, False)
                     except Exception:
@@ -1516,28 +1471,57 @@ try:
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
 
-                _reply(
-                    line_api,
-                    event.reply_token,
-                    "✅ 已收到上一局結果，AI 正在計算。"
-                )
+                # ===== PATCH (LINE-NO-STUCK) =====
+                # 若 push 被擋/disabled（_can_push()=False）時：
+                # - 不走「先回正在計算 + 背景 push」
+                # - 直接同步算完並用同一個 reply_token 回最終結果（避免永遠卡住）
+                # push 可用且你允許 async 時，才維持原本行為
+                if (LINE_ASYNC_HEAVY == 1) and _can_push():
+                    _reply(
+                        line_api,
+                        event.reply_token,
+                        "✅ 已收到上一局結果，AI 正在計算。"
+                    )
 
-                sess["pending"] = True
-                sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
-                seq = int(sess["pending_seq"])
-                sess["last_card"] = None
-                sess["last_card_ts"] = None
-                save_session(uid, sess)
+                    sess["pending"] = True
+                    sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
+                    seq = int(sess["pending_seq"])
+                    sess["last_card"] = None
+                    sess["last_card_ts"] = None
+                    save_session(uid, sess)
 
-                try:
-                    threading.Thread(
-                        target=_push_heavy_prediction,
-                        args=(uid, p_pts, b_pts, seq),
-                        daemon=True,
-                    ).start()
-                except Exception as e:
-                    log.exception("failed to spawn heavy prediction thread: %s", e)
-                return
+                    try:
+                        threading.Thread(
+                            target=_push_heavy_prediction,
+                            args=(uid, p_pts, b_pts, seq),
+                            daemon=True,
+                        ).start()
+                    except Exception as e:
+                        log.exception("failed to spawn heavy prediction thread: %s", e)
+                    return
+                else:
+                    # push 不可用（或你關掉 async）→ 直接回最終結果
+                    try:
+                        if (p_pts == b_pts and SKIP_TIE_UPD):
+                            sess["last_pts_text"] = "上局結果: 和局"
+                        else:
+                            sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+
+                        probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
+                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
+                                                 cont=bool(CONTINUOUS_MODE))
+
+                        sess["last_card"] = msg
+                        sess["last_card_ts"] = int(time.time())
+                        sess["pending"] = False
+                        save_session(uid, sess)
+
+                        _reply(line_api, event.reply_token, msg)
+                    except Exception as e:
+                        log.exception("[LINE] sync predict failed: %s", e)
+                        _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
+                    return
+                # ===== PATCH END =====
 
             _reply(
                 line_api,
@@ -1610,6 +1594,8 @@ def health():
         pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
         pf_stateful=bool(PF_STATEFUL),
         prob_force_pure_in_prob_mode=bool(PROB_FORCE_PURE_IN_PROB_MODE),
+        line_async_heavy=bool(LINE_ASYNC_HEAVY),
+        line_can_push=bool(_can_push()),
     ), 200
 
 
@@ -1657,9 +1643,11 @@ if __name__ == "__main__":
 
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
-        "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f)",
+        "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
+        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
-        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P)
+        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
+        LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE
     )
 
     if _flask_available and Flask is not None:
