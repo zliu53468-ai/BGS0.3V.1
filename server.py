@@ -34,7 +34,7 @@
 
 # ★ 2025-12-13 PATCH (TRIAL-FIX)
 - ✦ 修正：新加入好友不該直接顯示「試用已到期」
-  * FollowEvent 若 first_ts 不存在 → 強制寫入 first_ts 並清掉 expired
+  * FollowEvent 若 first_ts 不存在 → 強制寫入 first_ts 並清 expired
   * expired=1 但 first_ts 不存在/或其實未到期 → 視為髒資料，自動清掉 expired
   * 新增 TRIAL_NAMESPACE（預設 default）避免不同 Bot/不同專案共用同一組 trial key
 
@@ -801,11 +801,110 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (int(d[0]), int(d[1]))
     return None
 
+# --------------------------------------------------
+# Debug/Test utilities
+# --------------------------------------------------
+def test_deplete_biases() -> None:
+    """
+    Utility function to examine potential biases introduced by the deplete
+    simulation. This function prints out banker/ player/ tie probabilities
+    for a series of preset point combinations along with the difference
+    (banker minus player) and which side is higher. The number of Monte
+    Carlo simulations is deliberately large to reduce variance (defaults
+    to 10,000 but can be overridden via the environment variable
+    DEPLETEMC_SIMS). You can invoke this function manually from a
+    Python REPL or within your own diagnostic scripts.
+    """
+    if not DEPLETE_OK or init_counts is None or probs_after_points is None:
+        log.warning("test_deplete_biases called but deplete support is unavailable")
+        return
+    try:
+        decks = int(os.getenv("DECKS", "8"))
+        counts = init_counts(decks)
+        sims_env = os.getenv("DEPLETEMC_SIMS")
+        # If DEPLETEMC_SIMS is not set in the environment, use a large default
+        sims = int(float(sims_env)) if sims_env else 10000
+        deplete_factor = float(os.getenv("DEPL_FACTOR", "0.60"))
+        scenarios = [
+            ("開局", 0, 0),
+            ("閒贏1點", 1, 0),
+            ("莊贏1點", 0, 1),
+            ("平手1點", 1, 1),
+            ("閒贏6點", 6, 0),
+            ("莊贏6點", 0, 6),
+        ]
+        log.info("=== Deplete 偏差測試 (sims=%d, factor=%.2f) ===", sims, deplete_factor)
+        for name, p_pts, b_pts in scenarios:
+            try:
+                probs = probs_after_points(counts, p_pts, b_pts, sims=sims, deplete_factor=deplete_factor)
+                if not isinstance(probs, (list, tuple, np.ndarray)) or len(probs) < 2:
+                    log.info("%s: unexpected deplete result %s", name, probs)
+                    continue
+                pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2] if len(probs) > 2 else 0.0)
+                diff = pB - pP
+                bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
+                log.info(
+                    "%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)",
+                    name, pB, pP, pT, diff, bias
+                )
+            except Exception as ex:
+                log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
+    except Exception as ex:
+        log.warning("test_deplete_biases error: %s", ex)
+
+
+def debug_card_distribution() -> None:
+    """
+    Utility function to print out the distribution of card values within
+    the current shoe. This can help verify that the initial deck setup
+    is balanced and does not inadvertently favour banker or player. The
+    function groups cards by their Baccarat point values (with J/Q/K
+    treated as 10) and logs both the absolute counts and the percentage
+    of the total deck. Invoke this manually from a REPL or diagnostic
+    script. It does not modify any state.
+    """
+    if not DEPLETE_OK or init_counts is None:
+        log.warning("debug_card_distribution called but deplete support is unavailable")
+        return
+    try:
+        decks = int(os.getenv("DECKS", "8"))
+        counts = init_counts(decks)
+        # counts may be dict-like or list-like depending on implementation
+        total_cards = sum(counts.values()) if isinstance(counts, dict) else sum(counts)
+        point_cards: Dict[int, int] = {}
+        # iterate through card counts and accumulate by point value
+        if isinstance(counts, dict):
+            iterable = counts.items()
+        else:
+            # list/tuple of counts indexed by card value (1-13 or 0-12)
+            iterable = enumerate(counts)
+        for card_value, count in iterable:
+            # Convert card faces to Baccarat points (J/Q/K count as 10)
+            # Note: Some implementations index from 0; ensure values > 0 map correctly
+            try:
+                val = int(card_value)
+            except Exception:
+                continue
+            point = min(10, val if val > 0 else 10)
+            point_cards[point] = point_cards.get(point, 0) + int(count)
+        log.info("牌組分布:")
+        for point in sorted(point_cards.keys()):
+            cnt = point_cards[point]
+            pct = (cnt / total_cards * 100.0) if total_cards else 0.0
+            log.info("  點數 %s: %s 張 (%.1f%%)", point, cnt, pct)
+    except Exception as ex:
+        log.warning("debug_card_distribution error: %s", ex)
+
 
 # ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
+    # ----- Debug: prepare holders for probability snapshots -----
+    # pf_probs will hold the raw PF prediction probabilities (before softening)
+    # soft_probs will hold probabilities after softening by SOFT_TAU
+    pf_probs: Optional[np.ndarray] = None
+    soft_probs: Optional[np.ndarray] = None
 
     # ★ STATELESS-PF：PF_STATEFUL=0 → 每次都 new，一次預測一次丟（不記憶）
     if PF_STATEFUL == 1:
@@ -841,6 +940,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
             sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
             p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+            # Capture raw PF prediction probabilities for debugging
+            pf_probs = p.copy()
     else:
         # 完全獨立：不 update_outcome、不用 per-uid store、不需要 lock
         try:
@@ -861,11 +962,22 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
         sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
         p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+        # Capture raw PF prediction probabilities for debugging
+        pf_probs = p.copy()
 
     # 後處理：不需要鎖
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
+    # Capture softened probabilities and emit debug logs
+    soft_probs = p.copy()
+    if SHOW_RAW_PROBS:
+        try:
+            if pf_probs is not None:
+                log.info("[DEBUG-PF] PF原始: 莊=%.4f, 閒=%.4f", float(pf_probs[0]), float(pf_probs[1]))
+                log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
+        except Exception:
+            pass
 
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
@@ -874,6 +986,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             alpha = max(0.0, min(0.55, float(raw_alpha)))
 
             if alpha > 0.0:
+                # Capture probabilities before applying deplete for debugging
+                before_deplete = p.copy()
+                if SHOW_RAW_PROBS:
+                    log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
                 counts = init_counts(int(os.getenv("DECKS", "8")))
                 dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
 
@@ -902,15 +1018,29 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 mix = (1.0 - alpha) * p + alpha * dep
                 mix = mix / mix.sum()
                 p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
+                # Capture probabilities after deplete and log effect
+                after_deplete = p.copy()
+                if SHOW_RAW_PROBS:
+                    log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
+                    delta_B = float(after_deplete[0] - before_deplete[0])
+                    delta_P = float(after_deplete[1] - before_deplete[1])
+                    log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
+                    log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
 
     if COMPAT_MODE == 0:
         theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
         if theo_blend > 0.0:
+            if SHOW_RAW_PROBS:
+                before_theo = p.copy()
             theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
             p = (1.0 - theo_blend) * p + theo_blend * theo
             p = p / p.sum()
+            if SHOW_RAW_PROBS:
+                after_theo = p.copy()
+                log.info("[DEBUG-B4-THEO] 理論混合前: 莊=%.4f, 閒=%.4f", float(before_theo[0]), float(before_theo[1]))
+                log.info("[DEBUG-AFT-THEO] 理論混合後: 莊=%.4f, 閒=%.4f", float(after_theo[0]), float(after_theo[1]))
 
         if SHOW_RAW_PROBS:
             log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
@@ -920,11 +1050,19 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
         if TIE_CAP_ENABLE == 1:
             if p[2] > tie_max:
+                # Capture probabilities before tie cap for debugging
+                if SHOW_RAW_PROBS:
+                    before_tiecap = p.copy()
                 sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
                 p[2] = tie_max
                 p[0] *= sc
                 p[1] *= sc
                 p = p / p.sum()
+                # Capture probabilities after tie cap and log
+                if SHOW_RAW_PROBS:
+                    after_tiecap = p.copy()
+                    log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
+                    log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
 
         if p[2] < TIE_MIN:
             sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
@@ -1028,12 +1166,26 @@ def set_trial_blocked(uid: str, flag: bool = True) -> None:
 
 
 def trial_persist_guard(uid: str) -> Optional[str]:
+    """
+    檢查試用狀態並返回適當的提示訊息。
+
+    - 若用戶已開通，返回 None。
+    - 若曾封鎖，回傳強調帳號曾被封鎖並說明如何重新啟用。
+    - 若試用時間已用完，提示試用已結束並提供開通方式與正確格式示例。
+    - 若有 expired 標記但未到期或資料髒，會自動修正。
+    - 若尚在試用期內或沒有任何限制，返回 None。
+    """
     if is_premium(uid):
         return None
 
     # ★ BLOCK-TRIAL：曾封鎖 → 永久失效（除非開通）
     if is_trial_blocked(uid):
-        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+        return (
+            f"⛔ 試用已到期（帳號曾被封鎖）\n"
+            f"🔐 如需重新啟用，請輸入：開通 你的密碼\n"
+            f"👉 範例：開通 abc123\n"
+            f"📞 或聯繫：{ADMIN_CONTACT}"
+        )
 
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
@@ -1067,10 +1219,21 @@ def trial_persist_guard(uid: str) -> Optional[str]:
 
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
-        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+        return (
+            f"⏰ 免費試用 {TRIAL_MINUTES} 分鐘已用完\n"
+            f"🎯 想繼續使用嗎？\n"
+            f"🔐 請輸入：開通 你的專屬密碼\n"
+            f"👉 正確格式：開通 [密碼]\n"
+            f"📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+        )
 
     if expired == "1":
-        return f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼"
+        return (
+            f"⛔ 試用已到期\n"
+            f"🔐 請輸入：開通 你的專屬密碼\n"
+            f"👉 正確格式：開通 [密碼]\n"
+            f"📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+        )
 
     return None
 
@@ -1201,7 +1364,15 @@ try:
             # ★ 若曾封鎖 → 直接視為到期（不重給試用）
             if (not is_premium(uid)) and is_trial_blocked(uid):
                 sess = get_session(uid)
-                _reply(line_api, event.reply_token, f"⛔ 試用已到期\n📬 請聯繫：{ADMIN_CONTACT}\n🔐 輸入：開通 你的密碼")
+                # 取得更詳盡的 trial 提示訊息（包括範例格式）
+                guard_msg = trial_persist_guard(uid)
+                msg = guard_msg if guard_msg else (
+                    f"⛔ 試用已到期\n"
+                    f"🔐 請輸入：開通 你的密碼\n"
+                    f"👉 正確格式：開通 [密碼]\n"
+                    f"📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+                )
+                _reply(line_api, event.reply_token, msg)
                 save_session(uid, sess)
                 return
 
