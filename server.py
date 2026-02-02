@@ -69,6 +69,11 @@
   * 新增 LINE_ASYNC_HEAVY（預設 1）
   * 若 _can_push()=False（push 被擋）→ 改為「直接在 webhook 同一次 reply 回傳最終結果」
   * push 可用時維持原本「快速 reply + 背景 thread push」行為
+
+# ★ 2026-02-02 PATCH (PRED-SIMS-CAP-80 + LOG-FIX)
+- ✦ 修正：PRED_SIMS_CAP 預設改 80
+- ✦ 修正：移除 PF_N>=300 強制砍到 7/5 的硬限制（改為可控上限）
+- ✦ 修正：log 顯示實際 sims_used（避免以為跑 80 其實被 guard 壓掉）
 """
 
 import os, sys, logging, time, re, json, threading
@@ -339,7 +344,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
 
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -760,20 +765,38 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 
 # ---------- 預測效能保護 ----------
 def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
+    """
+    目的：
+    - 讓你可以把 PF_PRED_SIMS 拉高（例如 40~80），同時避免極端值卡死
+    - PRED_SIMS_CAP 預設 80（你可用 env 控制）
+    - 對高粒子數（PF_N）只做「可控上限」，不再硬砍到 7/5
+    """
+    # ① 全域硬上限（你可以用 env 調整）
     try:
-        cap = int(float(os.getenv("PRED_SIMS_CAP", "10")))
+        cap = int(float(os.getenv("PRED_SIMS_CAP", "80")))
     except Exception:
-        cap = 10
-    n = max(1, min(int(base), cap))
+        cap = 80
+
+    n = max(1, min(int(base), int(cap)))
+
+    # ② 針對高 PF_N 的保護上限（可用 env 控制）
     try:
-        n_particles = int(getattr(pf_obj, 'n_particles', 200))
-        if n_particles >= 350 and n > 5:
-            n = 5
-        elif n_particles >= 300 and n > 7:
-            n = 7
+        n_particles = int(getattr(pf_obj, "n_particles", 0) or 0)
+
+        # 你可自行調整：
+        # - PF_N>=300 時：最多 PRED_SIMS_MAX_PF300（預設 35）
+        # - PF_N>=350 時：最多 PRED_SIMS_MAX_PF350（預設 25）
+        max_pf300 = int(float(os.getenv("PRED_SIMS_MAX_PF300", "35")))
+        max_pf350 = int(float(os.getenv("PRED_SIMS_MAX_PF350", "25")))
+
+        if n_particles >= 350:
+            n = min(n, max(1, max_pf350))
+        elif n_particles >= 300:
+            n = min(n, max(1, max_pf300))
     except Exception:
         pass
-    return max(1, n)
+
+    return max(1, int(n))
 
 
 # ---------- 解析點數 ----------
@@ -885,6 +908,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     pf_probs: Optional[np.ndarray] = None
     soft_probs: Optional[np.ndarray] = None
 
+    # ★ PATCH：記錄 base vs used（讓 log 顯示你真的跑多少 sims）
+    sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+    sims_used = sims_base  # 會被 _tuned_pred_sims 覆蓋
+
     if PF_STATEFUL == 1:
         pf_obj = get_pf_for_uid(uid)
         lk = _get_uid_lock(uid)
@@ -915,9 +942,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             except Exception as e:
                 log.warning("stage PF_UPD_SIMS apply failed: %s", e)
 
-            sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
-            sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
-            p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+            sims_used = _tuned_pred_sims(sims_base, pf_obj)
+            p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
             pf_probs = p.copy()
     else:
         try:
@@ -935,9 +961,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         except Exception as e:
             log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
 
-        sims_per_particle = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
-        sims_per_particle = _tuned_pred_sims(sims_per_particle, pf_obj)
-        p = np.asarray(pf_obj.predict(sims_per_particle=sims_per_particle), dtype=np.float32)
+        sims_used = _tuned_pred_sims(sims_base, pf_obj)
+        p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
         pf_probs = p.copy()
 
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
@@ -1067,9 +1092,9 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
-            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims=%d uid=%s stateful=%s | %s",
+            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
             choice, edge, bet_pct * 100, sess["rounds_seen"],
-            int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5")))),
+            int(sims_base), int(sims_used),
             uid, PF_STATEFUL, reason
         )
     return p, choice, bet_amt, reason
@@ -1644,10 +1669,13 @@ if __name__ == "__main__":
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
         "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
-        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s)",
+        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
         PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
-        LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE
+        LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
+        os.getenv("PRED_SIMS_CAP", "80"),
+        os.getenv("PRED_SIMS_MAX_PF300", "35"),
+        os.getenv("PRED_SIMS_MAX_PF350", "25"),
     )
 
     if _flask_available and Flask is not None:
