@@ -769,7 +769,11 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
     目的：
     - 讓你可以把 PF_PRED_SIMS 拉高（例如 40~80），同時避免極端值卡死
     - PRED_SIMS_CAP 預設 80（你可用 env 控制）
-    - 對高粒子數（PF_N）只做「可控上限」，不再硬砍到 7/5
+    - 第二層 guard 可用 env 開關關閉，或自訂 PF_N>=300/350 時的上限
+      * PRED_GUARD_ENABLE：1=啟用(預設)；0=完全不壓制
+      * PRED_GUARD_300_CAP：PF_N>=300 的上限（預設沿用 PRED_SIMS_MAX_PF300 或 35）
+      * PRED_GUARD_350_CAP：PF_N>=350 的上限（預設沿用 PRED_SIMS_MAX_PF350 或 25）
+      * （兼容舊變數）PRED_SIMS_MAX_PF300 / PRED_SIMS_MAX_PF350 仍可用
     """
     # ① 全域硬上限（你可以用 env 調整）
     try:
@@ -779,20 +783,37 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
 
     n = max(1, min(int(base), int(cap)))
 
-    # ② 針對高 PF_N 的保護上限（可用 env 控制）
+    # ② 針對高 PF_N 的保護上限（可控開關）
+    guard_enable = env_flag("PRED_GUARD_ENABLE", 1)  # 1=啟用(預設), 0=不壓制
+    if guard_enable != 1:
+        return max(1, int(n))
+
     try:
         n_particles = int(getattr(pf_obj, "n_particles", 0) or 0)
 
-        # 你可自行調整：
-        # - PF_N>=300 時：最多 PRED_SIMS_MAX_PF300（預設 35）
-        # - PF_N>=350 時：最多 PRED_SIMS_MAX_PF350（預設 25）
-        max_pf300 = int(float(os.getenv("PRED_SIMS_MAX_PF300", "35")))
-        max_pf350 = int(float(os.getenv("PRED_SIMS_MAX_PF350", "25")))
+        # 兼容：新變數優先，其次沿用舊變數
+        def _get_int_env(primary: str, fallback: str, default_val: int) -> int:
+            v = os.getenv(primary)
+            if v not in (None, ""):
+                try:
+                    return int(float(v))
+                except Exception:
+                    pass
+            v2 = os.getenv(fallback)
+            if v2 not in (None, ""):
+                try:
+                    return int(float(v2))
+                except Exception:
+                    pass
+            return int(default_val)
+
+        max_pf300 = _get_int_env("PRED_GUARD_300_CAP", "PRED_SIMS_MAX_PF300", 35)
+        max_pf350 = _get_int_env("PRED_GUARD_350_CAP", "PRED_SIMS_MAX_PF350", 25)
 
         if n_particles >= 350:
-            n = min(n, max(1, max_pf350))
+            n = min(n, max(1, int(max_pf350)))
         elif n_particles >= 300:
-            n = min(n, max(1, max_pf300))
+            n = min(n, max(1, int(max_pf300)))
     except Exception:
         pass
 
