@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- 
 """server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)
 
 這版做了什麼（僅小幅補丁，不動你原本流程/介面）
@@ -79,6 +79,38 @@
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
+
+# ===== PATTERN MODEL PATCH START =====
+try:
+    from pattern import PatternModel
+except Exception:
+    PatternModel = None
+
+PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
+PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.25"))
+PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "12"))
+
+_PATTERN_STORE: Dict[str, Any] = {}
+_PATTERN_GUARD = threading.Lock()
+
+
+def get_pattern_for_uid(uid: str):
+    if not uid:
+        uid = "anon"
+    with _PATTERN_GUARD:
+        m = _PATTERN_STORE.get(uid)
+        if m is None and PatternModel:
+            m = PatternModel(PATTERN_LOOKBACK)
+            _PATTERN_STORE[uid] = m
+        return m
+
+
+def reset_pattern_for_uid(uid: str):
+    if not uid:
+        uid = "anon"
+    with _PATTERN_GUARD:
+        _PATTERN_STORE.pop(uid, None)
+# ===== PATTERN MODEL PATCH END =====
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -1092,6 +1124,25 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     # ★ 在這裡一次套用 bias，讓「顯示」與「決策」一致
     p = _apply_prob_bias(p, over)
 
+    # ===== PATTERN FUSION PATCH START =====
+    if PATTERN_ENABLE == 1 and PatternModel is not None:
+        try:
+            pat = get_pattern_for_uid(uid)
+            if pat:
+                # 更新 pattern 狀態
+                if p_pts == b_pts:
+                    pat.update(2)
+                else:
+                    pat.update(0 if b_pts > p_pts else 1)
+
+                pat_prob = pat.predict()
+                w = max(0.0, min(1.0, PATTERN_WEIGHT))
+                p = (1.0 - w) * p + w * pat_prob
+                p = p / p.sum()
+        except Exception as e:
+            log.warning("pattern fusion failed: %s", e)
+    # ===== PATTERN FUSION PATCH END =====
+
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
@@ -1459,6 +1510,44 @@ try:
                 save_session(uid, sess)
                 return
 
+            # ===== HISTORY INPUT PATCH START =====
+            hist_match = re.fullmatch(r"[BPTHbpht]{6,30}", text)
+            if hist_match:
+                seq = []
+                for c in text.upper():
+                    if c == "B":
+                        seq.append(0)
+                    elif c == "P":
+                        seq.append(1)
+                    else:
+                        seq.append(2)
+
+                # reset PF
+                try:
+                    reset_pf_for_uid(uid)
+                except Exception:
+                    pass
+
+                # reset pattern
+                try:
+                    reset_pattern_for_uid(uid)
+                    pat = get_pattern_for_uid(uid)
+                    if pat:
+                        pat.load_history(seq)
+                except Exception:
+                    pass
+
+                sess["rounds_seen"] = len(seq)
+                save_session(uid, sess)
+
+                _reply(
+                    line_api,
+                    event.reply_token,
+                    "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5"
+                )
+                return
+            # ===== HISTORY INPUT PATCH END =====
+
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
@@ -1468,6 +1557,7 @@ try:
                         "pending": False, "pending_seq": 0}
                 try:
                     reset_pf_for_uid(uid)
+                    reset_pattern_for_uid(uid)
                 except Exception:
                     pass
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
@@ -1690,13 +1780,15 @@ if __name__ == "__main__":
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
         "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
-        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
+        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s, "
+        "PATTERN_ENABLE=%s, PATTERN_WEIGHT=%.2f, PATTERN_LOOKBACK=%s)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
         PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
         LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
         os.getenv("PRED_SIMS_CAP", "80"),
         os.getenv("PRED_SIMS_MAX_PF300", "35"),
         os.getenv("PRED_SIMS_MAX_PF350", "25"),
+        PATTERN_ENABLE, PATTERN_WEIGHT, PATTERN_LOOKBACK,
     )
 
     if _flask_available and Flask is not None:
