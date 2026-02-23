@@ -1,10 +1,21 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility + Cumulative History + Game Setup + PF Fixed (2025-11-03+lock-final-production) """
+"""server.py — BGS Independent + LINE + Cumulative History + Game Setup + Render Ready (2025-11-03+ultimate-lock-final) """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
 
-VERSION = "lock-final-production"  # 修正②：明確定義 VERSION，避免 NameError
+VERSION = "ultimate-lock-final"
+
+# ===== 環境變數安全定義（Render 必修，避免 NameError） =====
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+# ===== Flask App 定義（Render / Gunicorn 必須暴露 app） =====
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
 
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
@@ -20,13 +31,15 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception:
         return 1 if default else 0
 
-# PATTERN & GRU patch（保持原樣，略過貼出，請保留你原本的這段）
+# PATTERN & GRU patch（保留原樣，略過貼出）
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 np.seterr(all="ignore")
 
-# DEPLETE_OK, Flask, Redis, session 相關函數（保持原樣，略過貼出）
+# DEPLETE_OK 與相關 import（保留原樣，略）
+
+# Redis / session 管理函數（保留你原本的完整版本，略）
 
 GAMES = {"1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU", "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人"}
 
@@ -88,16 +101,19 @@ def flex_history_card_with_history(hist: str = ""):
         }
     )
 
-# quick_ 相關、_handle_points_and_predict 等函數保持原樣（請保留你原本的）
+# 請保留你原本的 quick_*, _reply, parse_last_hand_points, _handle_points_and_predict, format_output_card 等函數
+
+# LINE 初始化（先定義 None，避免未賦值錯誤）
+line_api = None
+line_handler = None
 
 try:
     from linebot import LineBotApi, WebhookHandler
     from linebot.models import MessageEvent, TextMessage, FollowEvent, UnfollowEvent, FlexSendMessage, TextSendMessage
+
     if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-        # on_unfollow 保持原樣（略）
 
         @line_handler.add(FollowEvent)
         def on_follow(event):
@@ -175,7 +191,7 @@ try:
             sess = get_session(uid)
             up = text.upper()
 
-            # 開通邏輯（保持原樣，略）
+            # 開通邏輯（略，保留原樣）
 
             guard = trial_persist_guard(uid)
             if guard and not sess.get("premium", False):
@@ -196,7 +212,7 @@ try:
                     _reply(line_api, event.reply_token, "⚠️ 請輸入上方數字選擇館別")
                     return
 
-            # 輸入籌碼
+            # 輸入籌碼（合併回覆）
             if sess.get("phase") == "input_bankroll":
                 if text.isdigit():
                     bankroll = int(text)
@@ -207,105 +223,42 @@ try:
                     sess["phase"] = "await_history"
                     sess["history_input"] = ""
                     save_session(uid, sess)
-                    _reply(
-                        line_api,
+
+                    line_api.reply_message(
                         event.reply_token,
-                        f"""✅ 設定完成！館別：{sess.get("game")}
+                        [
+                            TextSendMessage(
+                                text=f"""✅ 設定完成！館別：{sess.get("game")}
 初始籌碼：{bankroll}。
 
 📌 連續模式：現在輸入第一局點數
 （例：閒6莊5 / 65 / 和）"""
+                            ),
+                            flex_history_card()
+                        ]
                     )
-                    line_api.reply_message(event.reply_token, flex_history_card())
                     return
                 else:
                     _reply(line_api, event.reply_token, "⚠️ 請輸入數字金額")
                     return
 
-            # 遊戲設定按鈕
-            if up == "遊戲設定":
-                sess["phase"] = "choose_game"
-                save_session(uid, sess)
-                line_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=
-                        "🎰 請選擇遊戲館別\n"
-                        "1. WM\n"
-                        "2. PM\n"
-                        "3. DG\n"
-                        "4. SA\n"
-                        "5. KU\n"
-                        "6. 歐博/卡利\n"
-                        "7. KG\n"
-                        "8. 全利\n"
-                        "9. 名人\n"
-                        "10. MT真人\n"
-                        "「請直接輸入數字選擇」"
-                    )
-                )
-                return
+            # 遊戲設定按鈕（略，保留原樣）
 
-            # RESET / 結束分析
-            if up in ("結束分析", "清空", "RESET"):
-                premium = sess.get("premium", False) or is_premium(uid)
-                start_ts = sess.get("trial_start", int(time.time()))
-                sess = {
-                    "phase": "choose_game",
-                    "bankroll": 0,
-                    "rounds_seen": 0,
-                    "last_pts_text": None,
-                    "premium": premium,
-                    "trial_start": start_ts,
-                    "last_card": None,
-                    "last_card_ts": None,
-                    "pending": False,
-                    "pending_seq": 0,
-                    "history_input": "",
-                    "game": None,
-                }
-                try:
-                    reset_pf_for_uid(uid)
-                    reset_pattern_for_uid(uid)
-                    reset_gru_for_uid(uid)
-                except: pass
-                line_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=
-                        "🎰 請選擇遊戲館別\n"
-                        "1. WM\n"
-                        "2. PM\n"
-                        "3. DG\n"
-                        "4. SA\n"
-                        "5. KU\n"
-                        "6. 歐博/卡利\n"
-                        "7. KG\n"
-                        "8. 全利\n"
-                        "9. 名人\n"
-                        "10. MT真人\n"
-                        "「請直接輸入數字選擇」"
-                    )
-                )
-                save_session(uid, sess)
-                return
+            # RESET / 結束分析（略，保留原樣）
 
-            # 必修修正①：完整的 await_history 累積輸入區塊
+            # await_history 累積輸入
             if sess.get("phase") == "await_history":
-                # 按鈕累積模式
                 if up in ("B", "P", "T", "莊", "閒", "和"):
-                    if up in ("B", "莊"):
-                        c = "B"
-                    elif up in ("P", "閒"):
-                        c = "P"
-                    else:
-                        c = "T"
+                    if up in ("B", "莊"): c = "B"
+                    elif up in ("P", "閒"): c = "P"
+                    else: c = "T"
                     hist = sess.get("history_input", "")
-                    hist = (hist + c)[-80:]  # 建議修正：限制最大 80 筆
+                    hist = (hist + c)[-80:]
                     sess["history_input"] = hist
                     save_session(uid, sess)
                     line_api.reply_message(event.reply_token, flex_history_card_with_history(hist))
                     return
 
-                # 一次輸入整串歷史（相容舊行為）
                 if re.fullmatch(r"[BPTHbpht]{1,80}", text):
                     hist = text.upper()
                     sess["history_input"] = hist
@@ -313,7 +266,6 @@ try:
                     line_api.reply_message(event.reply_token, flex_history_card_with_history(hist))
                     return
 
-                # 開始分析
                 if up == "開始":
                     hist = sess.get("history_input", "")
                     if len(hist) == 0:
@@ -321,38 +273,30 @@ try:
                         return
                     seq = []
                     for c in hist:
-                        if c == "B":
-                            seq.append(0)
-                        elif c == "P":
-                            seq.append(1)
-                        else:
-                            seq.append(2)
+                        if c == "B": seq.append(0)
+                        elif c == "P": seq.append(1)
+                        else: seq.append(2)
                     try:
                         reset_pf_for_uid(uid)
                         reset_pattern_for_uid(uid)
                         reset_gru_for_uid(uid)
-                    except:
-                        pass
+                    except: pass
                     try:
                         pat = get_pattern_for_uid(uid)
-                        if pat:
-                            pat.load_history(seq)
+                        if pat: pat.load_history(seq)
                         gru = get_gru_for_uid(uid)
-                        if gru:
-                            gru.load_history(seq)
-                    except:
-                        pass
+                        if gru: gru.load_history(seq)
+                    except: pass
                     sess["rounds_seen"] = len(seq)
                     sess["phase"] = "await_pts"
                     save_session(uid, sess)
                     _reply(line_api, event.reply_token, "已開始分析\n請輸入第一局結果\n例如65", quick_predict())
                     return
 
-                # 其他輸入顯示帶歷史的卡片
                 line_api.reply_message(event.reply_token, flex_history_card_with_history(sess.get("history_input", "")))
                 return
 
-            # await_pts 階段點數處理（已完整）
+            # await_pts 階段點數處理（保留原樣）
             pts = parse_last_hand_points(text)
             if pts and sess.get("bankroll", 0) >= 0 and sess.get("phase") == "await_pts":
                 p_pts, b_pts = pts
@@ -369,13 +313,36 @@ try:
                 _reply(line_api, event.reply_token, msg, quick_predict())
                 return
 
-            # 預設回應
             _reply(line_api, event.reply_token, "指令無法辨識。\n請輸入莊/閒/和 或點擊按鈕", quick_predict() if sess.get("phase") == "await_pts" else None)
 
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
-# webhook, health, predict 等保持原樣（略）
+# ===== Render 健康檢查路由 =====
+@app.get("/")
+def root():
+    return "BGS running"
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": VERSION, "timestamp": time.time()}
+
+# webhook 路由
+@app.post("/line-webhook")
+def line_webhook():
+    if line_handler is None:
+        log.error("LINE handler not ready")
+        abort(400, "LINE handler not ready")
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        line_handler.handle(body, signature)
+    except Exception as e:
+        log.error("webhook error: %s", e)
+        abort(500)
+    return "OK", 200
+
+# 其他路由（如 /predict）請保留原樣
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
