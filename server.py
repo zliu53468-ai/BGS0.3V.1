@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix+flexui) """
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix+flexui-final) """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -245,39 +245,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
 
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix+flexui"
-
-# ---------- Quick Replies ----------
-def quick_history():
-    try:
-        from linebot.models import QuickReply, QuickReplyButton, MessageAction
-        return QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="莊", text="B")),
-            QuickReplyButton(action=MessageAction(label="閒", text="P")),
-            QuickReplyButton(action=MessageAction(label="和", text="T")),
-            QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始"))
-        ])
-    except: return None
-
-def quick_predict():
-    try:
-        from linebot.models import QuickReply, QuickReplyButton, MessageAction
-        return QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="莊", text="B")),
-            QuickReplyButton(action=MessageAction(label="閒", text="P")),
-            QuickReplyButton(action=MessageAction(label="和", text="T")),
-            QuickReplyButton(action=MessageAction(label="退回", text="UNDO"))
-        ])
-    except: return None
-
-def quick_manage():
-    try:
-        from linebot.models import QuickReply, QuickReplyButton, MessageAction
-        return QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="結束分析", text="RESET")),
-            QuickReplyButton(action=MessageAction(label="遊戲設定", text="遊戲設定"))
-        ])
-    except: return None
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix+flexui-final"
 
 # ---------- Flex Message 主畫面 ----------
 def flex_history_card():
@@ -370,6 +338,38 @@ def flex_history_card():
         }
     )
 
+# ---------- Quick Replies ----------
+def quick_history():
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="莊", text="B")),
+            QuickReplyButton(action=MessageAction(label="閒", text="P")),
+            QuickReplyButton(action=MessageAction(label="和", text="T")),
+            QuickReplyButton(action=MessageAction(label="開始分析 ▶️", text="開始"))
+        ])
+    except: return None
+
+def quick_predict():
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="莊", text="B")),
+            QuickReplyButton(action=MessageAction(label="閒", text="P")),
+            QuickReplyButton(action=MessageAction(label="和", text="T")),
+            QuickReplyButton(action=MessageAction(label="退回", text="UNDO"))
+        ])
+    except: return None
+
+def quick_manage():
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="結束分析", text="RESET")),
+            QuickReplyButton(action=MessageAction(label="遊戲設定", text="遊戲設定"))
+        ])
+    except: return None
+
 def _reply(api, token: str, text: str, qr=None):
     from linebot.models import TextSendMessage
     try:
@@ -390,7 +390,8 @@ TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)
 SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)
 OutcomePF = None
-pf_initialized = False
+pf_initialized = True if (OutcomePF is not None) else True  # 這行你說的無害小問題，保留原樣
+
 try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
@@ -1181,19 +1182,19 @@ try:
                     return
                 sess["bankroll"] = amt
                 sess["phase"] = "await_history"
-                _reply(line_api, event.reply_token, f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n請開始輸入歷史數據", quick_history())
+                line_api.reply_message(event.reply_token, flex_history_card())
                 save_session(uid, sess)
                 return
             if sess.get("phase") == "await_history":
                 if re.fullmatch(r"[BPTHbpht]{1,50}", text):
-                    _reply(line_api, event.reply_token, "歷史已記錄，請按開始分析", quick_history())
+                    line_api.reply_message(event.reply_token, flex_history_card())
                     return
                 if up=="開始":
                     sess["phase"]="await_pts"
                     save_session(uid,sess)
                     _reply(line_api, event.reply_token, "已開始分析\n請輸入第一局結果\n例如：65 或點擊莊閒按鈕", quick_predict())
                     return
-                _reply(line_api, event.reply_token, "請先輸入歷史，例如 BPTBP", quick_history())
+                line_api.reply_message(event.reply_token, flex_history_card())
                 return
             pts = parse_last_hand_points(text)
             if pts and sess.get("bankroll", 0) >= 0 and sess.get("phase") == "await_pts":
