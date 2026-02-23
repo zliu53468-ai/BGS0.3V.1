@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix+flexui-final) """
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix+flexui-final+cumulative-history) """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -132,6 +132,7 @@ def _rget(k: str) -> Optional[str]:
     except Exception as e:
         log.warning("[Redis] GET err: %s", e)
         return None
+
 def _rset(k: str, v: str, ex: Optional[int] = None):
     try:
         if redis_client:
@@ -140,6 +141,7 @@ def _rset(k: str, v: str, ex: Optional[int] = None):
             KV_FALLBACK[k] = v
     except Exception as e:
         log.warning("[Redis] SET err: %s", e)
+
 def _rsetnx(k: str, v: str, ex: int) -> bool:
     try:
         if redis_client:
@@ -157,6 +159,7 @@ def _dedupe_event(event_id: Optional[str]) -> bool:
         return True
     key = f"dedupe:{event_id}"
     return _rsetnx(key, "1", ex=DEDUPE_TTL)
+
 def _extract_line_event_id(event: Any) -> Optional[str]:
     try:
         eid = getattr(event, "webhook_event_id", None)
@@ -175,16 +178,19 @@ def _extract_line_event_id(event: Any) -> Optional[str]:
 
 def _premium_key(uid: str) -> str:
     return f"premium:{uid}"
+
 def is_premium(uid: str) -> bool:
     if not uid: return False
     val = _rget(_premium_key(uid))
     return val == "1"
+
 def set_premium(uid: str, flag: bool = True) -> None:
     if not uid: return
     _rset(_premium_key(uid), "1" if flag else "0")
 
 def _sess_key(uid: str) -> str:
     return f"sess:{uid}"
+
 def get_session(uid: str) -> Dict[str, Any]:
     if not uid: uid = "anon"
     try:
@@ -195,12 +201,14 @@ def get_session(uid: str) -> Dict[str, Any]:
                 if is_premium(uid): sess["premium"] = True
                 if "pending" not in sess: sess["pending"] = False
                 if "pending_seq" not in sess: sess["pending_seq"] = 0
+                if "history_input" not in sess: sess["history_input"] = ""
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
             if is_premium(uid): sess["premium"] = True
             if "pending" not in sess: sess["pending"] = False
             if "pending_seq" not in sess: sess["pending_seq"] = 0
+            if "history_input" not in sess: sess["history_input"] = ""
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
@@ -215,9 +223,11 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_card_ts": None,
         "pending": False,
         "pending_seq": 0,
+        "history_input": "",  # 新增：累積歷史輸入
     }
     save_session(uid, sess)
     return sess
+
 def save_session(uid: str, sess: Dict[str, Any]) -> None:
     if not uid: uid = "anon"
     try:
@@ -245,7 +255,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
 
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix+flexui-final"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix+flexui-final+cumulative-history"
 
 # ---------- Flex Message 主畫面 ----------
 def flex_history_card():
@@ -271,6 +281,106 @@ def flex_history_card():
                         "wrap": True,
                         "size": "sm"
                     },
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "sm",
+                        "contents": [
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "莊",
+                                    "text": "B"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "閒",
+                                    "text": "P"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "和",
+                                    "text": "T"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "sm",
+                        "contents": [
+                            {
+                                "type": "button",
+                                "style": "secondary",
+                                "action": {
+                                    "type": "message",
+                                    "label": "開始分析",
+                                    "text": "開始"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "secondary",
+                                "action": {
+                                    "type": "message",
+                                    "label": "結束分析",
+                                    "text": "RESET"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+
+def flex_history_card_with_history(hist: str = ""):
+    from linebot.models import FlexSendMessage
+    show_text = " ".join(list(hist)) if hist else "（尚未輸入）"
+    return FlexSendMessage(
+        alt_text="輸入歷史中...",
+        contents={
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "🤖 正在輸入歷史數據",
+                        "weight": "bold",
+                        "size": "lg"
+                    },
+                    {
+                        "type": "text",
+                        "text": f"目前歷史：{show_text}",
+                        "wrap": True,
+                        "size": "md",
+                        "color": "#333333"
+                    },
+                    {
+                        "type": "text",
+                        "text": "繼續點擊莊/閒/和，或按「開始分析」開始預測",
+                        "wrap": True,
+                        "size": "sm",
+                        "color": "#666666"
+                    },
+                    # 按鈕區
                     {
                         "type": "box",
                         "layout": "horizontal",
@@ -390,7 +500,6 @@ TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)
 SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)
 OutcomePF = None
-pf_initialized = True if (OutcomePF is not None) else True  # 這行你說的無害小問題，保留原樣
 
 try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
@@ -445,6 +554,7 @@ def _get_uid_lock(uid: str) -> threading.Lock:
             lk = threading.Lock()
         _PF_LOCKS[uid] = lk
     return lk
+
 def _build_new_pf() -> Any:
     if OutcomePF is None:
         return SmartDummyPF()
@@ -457,6 +567,7 @@ def _build_new_pf() -> Any:
         backend=PF_BACKEND,
         dirichlet_eps=float(os.getenv("PF_DIR_EPS", "0.05"))
     )
+
 def get_pf_for_uid(uid: str) -> Any:
     if not uid: uid = "anon"
     with _PF_STORE_GUARD:
@@ -469,11 +580,13 @@ def get_pf_for_uid(uid: str) -> Any:
                 pf = SmartDummyPF()
             _PF_STORE[uid] = pf
         return pf
+
 def reset_pf_for_uid(uid: str) -> None:
     if not uid: uid = "anon"
     with _PF_STORE_GUARD:
         if uid in _PF_STORE:
             _PF_STORE.pop(uid, None)
+
 pf_initialized = True if (OutcomePF is not None) else True
 
 DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()
@@ -617,11 +730,13 @@ def _stage_bounds():
     early_end = int(os.getenv("EARLY_HANDS", "20"))
     mid_end = int(os.getenv("MID_HANDS", os.getenv("LATE_HANDS", "56")))
     return early_end, mid_end
+
 def _stage_prefix(rounds_seen: int) -> str:
     e_end, m_end = _stage_bounds()
     if rounds_seen < e_end: return "EARLY_"
     elif rounds_seen < m_end: return "MID_"
     else: return "LATE_"
+
 def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     if COMPAT_MODE == 1: return {}
     if os.getenv("STAGE_MODE", "count").lower() == "disabled": return {}
@@ -639,11 +754,13 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
             try: over["DEPLETEMC_SIMS"] = float(late_dep)
             except: pass
     return over
+
 def _depl_stage_scale(rounds_seen: int) -> float:
     prefix = _stage_prefix(rounds_seen)
     if prefix == "EARLY_": return EARLY_DEPL_SCALE
     elif prefix == "MID_": return MID_DEPL_SCALE
     else: return LATE_DEPL_SCALE
+
 def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.ndarray:
     max_shift = max(0.0, float(max_shift))
     p_old = old_p.astype(float).copy()
@@ -851,7 +968,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 p = p / p.sum()
         except Exception as e:
             log.warning("pattern fusion failed: %s", e)
-    # ===== GRU Fusion + META (Production) =====
     if GRU_ENABLE==1 and GRUModel is not None:
         try:
             gru=get_gru_for_uid(uid)
@@ -911,10 +1027,12 @@ def _can_push() -> bool:
     global _PUSH_BLOCK_UNTIL
     if LINE_PUSH_ENABLE != 1: return False
     return int(time.time()) >= int(_PUSH_BLOCK_UNTIL)
+
 def _block_push(reason: str):
     global _PUSH_BLOCK_UNTIL
     _PUSH_BLOCK_UNTIL = int(time.time()) + int(LINE_PUSH_COOLDOWN_SECONDS)
     log.warning("[LINE] push disabled temporarily: %s (block_until=%s)", reason, _PUSH_BLOCK_UNTIL)
+
 def _looks_like_429(e: Exception) -> bool:
     s = str(e)
     if "status_code=429" in s: return True
@@ -924,12 +1042,16 @@ def _looks_like_429(e: Exception) -> bool:
 
 def _trial_key(uid: str, kind: str) -> str:
     return f"trial:{TRIAL_NAMESPACE}:{kind}:{uid}"
+
 def _trial_block_key(uid: str) -> str:
     return _trial_key(uid, "blocked")
+
 def is_trial_blocked(uid: str) -> bool:
     return _rget(_trial_block_key(uid)) == "1"
+
 def set_trial_blocked(uid: str, flag: bool = True) -> None:
     _rset(_trial_block_key(uid), "1" if flag else "0")
+
 def trial_persist_guard(uid: str) -> Optional[str]:
     if is_premium(uid): return None
     if is_trial_blocked(uid):
@@ -965,6 +1087,7 @@ def validate_activation_code(code: str) -> bool:
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
 
 GAMES = {"1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU", "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人"}
+
 def game_menu_text(left_min: int) -> str:
     lines = ["請選擇遊戲館別"]
     for k in sorted(GAMES.keys(), key=lambda x: int(x)):
@@ -1059,6 +1182,7 @@ try:
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
             sess["phase"] = "await_history"
+            sess["history_input"] = ""  # 重置累積歷史
             try: sess["trial_start"] = int(first_ts) if first_ts else int(time.time())
             except: pass
             if sess.get("premium", False) or is_premium(uid):
@@ -1099,102 +1223,124 @@ try:
                 _reply(line_api, event.reply_token, guard)
                 save_session(uid, sess)
                 return
-            if up=="UNDO":
-                try:
-                    gru=get_gru_for_uid(uid)
-                    if gru: gru.undo()
-                    pat=get_pattern_for_uid(uid)
-                    if pat:
-                        if hasattr(pat,"undo"): pat.undo()
-                        elif hasattr(pat,"history"):
-                            if len(pat.history)>0: pat.history.pop()
-                    if sess["rounds_seen"]>0: sess["rounds_seen"]-=1
-                    save_session(uid,sess)
-                    _reply(line_api, event.reply_token, f"已退回上一局\n目前局數: {sess['rounds_seen']}", quick_predict())
-                except Exception as e:
-                    log.warning("undo error %s",e)
+            if up == "UNDO":
+                if sess.get("phase") == "await_history":
+                    hist = sess.get("history_input", "")
+                    if hist:
+                        sess["history_input"] = hist[:-1]
+                        save_session(uid, sess)
+                        line_api.reply_message(event.reply_token, flex_history_card_with_history(sess["history_input"]))
+                    else:
+                        _reply(line_api, event.reply_token, "沒有歷史可以退回")
+                else:
+                    # await_pts 階段的 UNDO 邏輯保持原樣
+                    try:
+                        gru = get_gru_for_uid(uid)
+                        if gru: gru.undo()
+                        pat = get_pattern_for_uid(uid)
+                        if pat:
+                            if hasattr(pat, "undo"): pat.undo()
+                            elif hasattr(pat, "history"):
+                                if len(pat.history) > 0: pat.history.pop()
+                        if sess["rounds_seen"] > 0: sess["rounds_seen"] -= 1
+                        save_session(uid, sess)
+                        _reply(line_api, event.reply_token, f"已退回上一局\n目前局數: {sess['rounds_seen']}", quick_predict())
+                    except Exception as e:
+                        log.warning("undo error %s", e)
                 return
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
-                sess = {"phase": "await_history", "bankroll": 0, "rounds_seen": 0, "last_pts_text": None, "premium": premium, "trial_start": start_ts, "last_card": None, "last_card_ts": None, "pending": False, "pending_seq": 0}
+                sess = {
+                    "phase": "await_history",
+                    "bankroll": 0,
+                    "rounds_seen": 0,
+                    "last_pts_text": None,
+                    "premium": premium,
+                    "trial_start": start_ts,
+                    "last_card": None,
+                    "last_card_ts": None,
+                    "pending": False,
+                    "pending_seq": 0,
+                    "history_input": ""
+                }
                 try:
                     reset_pf_for_uid(uid)
                     reset_pattern_for_uid(uid)
                     reset_gru_for_uid(uid)
                 except: pass
-                line_api.reply_message(event.reply_token, flex_history_card())
-                save_session(uid, sess)
-                return
-            hist_match = re.fullmatch(r"[BPTHbpht]{1,50}", text)
-            if hist_match:
-                seq=[]
-                for c in text.upper():
-                    if c=="B": seq.append(0)
-                    elif c=="P": seq.append(1)
-                    else: seq.append(2)
-                try:
-                    reset_pf_for_uid(uid)
-                    reset_pattern_for_uid(uid)
-                    reset_gru_for_uid(uid)
-                except: pass
-                try:
-                    pat=get_pattern_for_uid(uid)
-                    if pat: pat.load_history(seq)
-                    gru=get_gru_for_uid(uid)
-                    if gru: gru.load_history(seq)
-                except: pass
-                sess["rounds_seen"]=len(seq)
-                sess["phase"] = "await_history"
-                save_session(uid,sess)
-                line_api.reply_message(event.reply_token, flex_history_card())
-                return
-            if up=="開始":
-                sess["phase"]="await_pts"
-                save_session(uid,sess)
-                _reply(line_api, event.reply_token, "已開始分析\n請輸入第一局結果\n例如：65 或點擊莊閒按鈕", quick_predict())
-                return
-            if text == "遊戲設定" or up == "GAME SETTINGS":
-                sess["phase"] = "choose_game"
-                sess["game"] = None
-                sess["table"] = None
-                sess["bankroll"] = 0
-                first_ts = _rget(_trial_key(uid, "first_ts"))
-                left = max(0, TRIAL_MINUTES - ((int(time.time()) - int(first_ts)) // 60)) if first_ts else TRIAL_MINUTES
-                _reply(line_api, event.reply_token, game_menu_text(left))
-                save_session(uid, sess)
-                return
-            if sess.get("phase") == "choose_game":
-                m = re.match(r"^\s*(\d+)", text)
-                if m and (m.group(1) in GAMES):
-                    sess["game"] = GAMES[m.group(1)]
-                    sess["phase"] = "input_bankroll"
-                    _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
-                    save_session(uid, sess)
-                    return
-                _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
-                return
-            if sess.get("phase") == "input_bankroll":
-                num = re.sub(r"[^\d]", "", text)
-                amt = int(num) if num else 0
-                if amt <= 0:
-                    _reply(line_api, event.reply_token, "⚠️ 請輸入正整數金額。")
-                    return
-                sess["bankroll"] = amt
-                sess["phase"] = "await_history"
                 line_api.reply_message(event.reply_token, flex_history_card())
                 save_session(uid, sess)
                 return
             if sess.get("phase") == "await_history":
-                if re.fullmatch(r"[BPTHbpht]{1,50}", text):
-                    line_api.reply_message(event.reply_token, flex_history_card())
+                # 按鈕累積歷史
+                if up in ("B", "P", "T", "莊", "閒", "和"):
+                    if up in ("B", "莊"):
+                        c = "B"
+                    elif up in ("P", "閒"):
+                        c = "P"
+                    else:
+                        c = "T"
+                    hist = sess.get("history_input", "")
+                    hist += c
+                    sess["history_input"] = hist
+                    save_session(uid, sess)
+                    line_api.reply_message(event.reply_token, flex_history_card_with_history(hist))
                     return
-                if up=="開始":
-                    sess["phase"]="await_pts"
-                    save_session(uid,sess)
+                # 一次輸入整串歷史（相容舊行為）
+                hist_match = re.fullmatch(r"[BPTHbpht]{1,50}", text)
+                if hist_match:
+                    hist = text.upper()
+                    seq = []
+                    for c in hist:
+                        if c == "B": seq.append(0)
+                        elif c == "P": seq.append(1)
+                        else: seq.append(2)
+                    try:
+                        reset_pf_for_uid(uid)
+                        reset_pattern_for_uid(uid)
+                        reset_gru_for_uid(uid)
+                    except: pass
+                    try:
+                        pat = get_pattern_for_uid(uid)
+                        if pat: pat.load_history(seq)
+                        gru = get_gru_for_uid(uid)
+                        if gru: gru.load_history(seq)
+                    except: pass
+                    sess["rounds_seen"] = len(seq)
+                    sess["history_input"] = hist
+                    save_session(uid, sess)
+                    line_api.reply_message(event.reply_token, flex_history_card_with_history(hist))
+                    return
+                # 開始分析
+                if up == "開始":
+                    hist = sess.get("history_input", "")
+                    if len(hist) == 0:
+                        _reply(line_api, event.reply_token, "請先輸入至少一筆歷史（莊/閒/和）")
+                        return
+                    seq = []
+                    for c in hist:
+                        if c == "B": seq.append(0)
+                        elif c == "P": seq.append(1)
+                        else: seq.append(2)
+                    try:
+                        reset_pf_for_uid(uid)
+                        reset_pattern_for_uid(uid)
+                        reset_gru_for_uid(uid)
+                    except: pass
+                    try:
+                        pat = get_pattern_for_uid(uid)
+                        if pat: pat.load_history(seq)
+                        gru = get_gru_for_uid(uid)
+                        if gru: gru.load_history(seq)
+                    except: pass
+                    sess["rounds_seen"] = len(seq)
+                    sess["phase"] = "await_pts"
+                    save_session(uid, sess)
                     _reply(line_api, event.reply_token, "已開始分析\n請輸入第一局結果\n例如：65 或點擊莊閒按鈕", quick_predict())
                     return
-                line_api.reply_message(event.reply_token, flex_history_card())
+                # 其他情況，重新顯示卡片
+                line_api.reply_message(event.reply_token, flex_history_card_with_history(sess.get("history_input", "")))
                 return
             pts = parse_last_hand_points(text)
             if pts and sess.get("bankroll", 0) >= 0 and sess.get("phase") == "await_pts":
@@ -1249,12 +1395,15 @@ def _handle_line_webhook():
 @app.post("/line-webhook")
 def line_webhook():
     return _handle_line_webhook()
+
 @app.route("/line-webhook", methods=["OPTIONS"])
 def line_webhook_options():
     return ("", 204, {"Access-Control-Allow-Origin": "*","Access-Control-Allow-Methods": "POST, OPTIONS","Access-Control-Allow-Headers": "Content-Type, X-Line-Signature"})
+
 @app.post("/callback")
 def line_webhook_callback():
     return _handle_line_webhook()
+
 @app.route("/callback", methods=["OPTIONS"])
 def line_webhook_callback_options():
     return ("", 204, {"Access-Control-Allow-Origin": "*","Access-Control-Allow-Methods": "POST, OPTIONS","Access-Control-Allow-Headers": "Content-Type, X-Line-Signature"})
@@ -1265,12 +1414,15 @@ def root():
     if "UptimeRobot" in ua: return "OK", 200
     st = "OK" if pf_initialized else "BACKUP_MODE"
     return f"✅ BGS Server {st} ({VERSION})", 200
+
 @app.get("/health")
 def health():
     return jsonify(ok=True, ts=time.time(), version=VERSION, pf_initialized=pf_initialized, pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"), pf_stateful=bool(PF_STATEFUL), prob_force_pure_in_prob_mode=bool(PROB_FORCE_PURE_IN_PROB_MODE), line_async_heavy=bool(LINE_ASYNC_HEAVY), line_can_push=bool(_can_push())), 200
+
 @app.get("/ping")
 def ping():
     return "OK", 200
+
 @app.post("/predict")
 def predict():
     try:
