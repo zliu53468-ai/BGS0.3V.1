@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)
-"""
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard) """
+
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -25,11 +25,9 @@ try:
     from pattern import PatternModel
 except Exception:
     PatternModel = None
-
 PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
 PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.25"))
 PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "12"))
-
 _PATTERN_STORE: Dict[str, Any] = {}
 _PATTERN_GUARD = threading.Lock()
 
@@ -40,15 +38,38 @@ def get_pattern_for_uid(uid: str):
         m = _PATTERN_STORE.get(uid)
         if m is None and PatternModel:
             m = PatternModel(PATTERN_LOOKBACK)
-            _PATTERN_STORE[uid] = m
-        return m
+        _PATTERN_STORE[uid] = m
+    return m
 
 def reset_pattern_for_uid(uid: str):
     if not uid:
         uid = "anon"
     with _PATTERN_GUARD:
         _PATTERN_STORE.pop(uid, None)
+
 # ===== PATTERN MODEL PATCH END =====
+# ===== GRU MODEL PATCH START =====
+try:
+    from gru_model import GRUModel
+except:
+    GRUModel=None
+GRU_ENABLE=1
+GRU_WEIGHT=0.20
+_GRU_STORE={}
+_GRU_GUARD=threading.Lock()
+def get_gru_for_uid(uid):
+    if not uid: uid="anon"
+    with _GRU_GUARD:
+        g=_GRU_STORE.get(uid)
+        if g is None and GRUModel:
+            g=GRUModel()
+        _GRU_STORE[uid]=g
+    return g
+def reset_gru_for_uid(uid):
+    if not uid: uid="anon"
+    with _GRU_GUARD:
+        _GRU_STORE.pop(uid,None)
+# ===== GRU MODEL PATCH END =====
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -60,18 +81,18 @@ DEPLETE_OK = False
 init_counts = None
 probs_after_points = None
 try:
-    from deplete import init_counts, probs_after_points # type: ignore
+    from deplete import init_counts, probs_after_points  # type: ignore
     DEPLETE_OK = True
 except Exception:
     try:
-        from bgs.deplete import init_counts, probs_after_points # type: ignore
+        from bgs.deplete import init_counts, probs_after_points  # type: ignore
         DEPLETE_OK = True
     except Exception:
         try:
             _cur_dir = os.path.dirname(os.path.abspath(__file__))
             if _cur_dir not in sys.path:
                 sys.path.insert(0, _cur_dir)
-            from deplete import init_counts, probs_after_points # type: ignore
+            from deplete import init_counts, probs_after_points  # type: ignore
             DEPLETE_OK = True
         except Exception:
             DEPLETE_OK = False
@@ -83,14 +104,17 @@ try:
     _flask_available = True
 except Exception:
     _flask_available = False
-    Flask = None
-    request = None
-    def jsonify(*args, **kwargs):
-        raise RuntimeError("Flask not available")
-    def abort(*args, **kwargs):
-        raise RuntimeError("Flask not available")
-    def CORS(app):
-        return None
+Flask = None
+request = None
+
+def jsonify(*args, **kwargs):
+    raise RuntimeError("Flask not available")
+
+def abort(*args, **kwargs):
+    raise RuntimeError("Flask not available")
+
+def CORS(app):
+    return None
 
 # ---------- Redis（可選） ----------
 try:
@@ -111,7 +135,6 @@ else:
         log.warning("redis module not available; using in-memory session store.")
     elif not REDIS_URL:
         log.warning("REDIS_URL not set. Using in-memory session store.")
-
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
 KV_FALLBACK: Dict[str, str] = {}
 SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1200"))
@@ -251,8 +274,7 @@ def save_session(uid: str, sess: Dict[str, Any]) -> None:
         log.warning("save_session error: %s", e)
 
 # ---------- UI 卡片 ----------
-def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
-                       bet_amt: int, cont: bool = True) -> str:
+def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], bet_amt: int, cont: bool = True) -> str:
     pB, pP, pT = [float(x) for x in probs]
     lines = []
     if last_pts:
@@ -262,8 +284,8 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
         lines.append("建議：觀望 👀")
     else:
         lines.append(f"建議：下 {choice} 🎯")
-        if bet_amt and bet_amt > 0:
-            lines.append(f"配注：{bet_amt}")
+    if bet_amt and bet_amt > 0:
+        lines.append(f"配注：{bet_amt}")
     if cont:
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
@@ -281,16 +303,20 @@ else:
             def _d(f):
                 return f
             return _d
+
         def post(self, *a, **k):
             def _d(f):
                 return f
             return _d
+
         def options(self, *a, **k):
             def _d(f):
                 return f
             return _d
+
         def run(self, *a, **k):
             log.warning("Flask not available; cannot run HTTP server.")
+
     app = _DummyApp()
 
 # ---------- PF（Outcome PF） ----------
@@ -303,7 +329,6 @@ HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)
 SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)
-
 OutcomePF = None
 pf_initialized = False
 try:
@@ -326,8 +351,10 @@ class SmartDummyPF:
     def __init__(self):
         log.warning("使用 SmartDummyPF 備援模式")
         log.warning("⚠️ OutcomePF unavailable → SmartDummyPF fallback (PROBS MAY LOOK STATIC)")
+
     def update_outcome(self, outcome):
         return
+
     def predict(self, **kwargs) -> np.ndarray:
         base = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
         base = base ** (1.0 / max(1e-6, SOFT_TAU))
@@ -344,6 +371,7 @@ class SmartDummyPF:
             base[0] *= sc
             base[1] *= sc
         return base.astype(np.float32)
+
     @property
     def backend(self):
         return "smart-dummy"
@@ -359,8 +387,8 @@ def _get_uid_lock(uid: str) -> threading.Lock:
         lk = _PF_LOCKS.get(uid)
         if lk is None:
             lk = threading.Lock()
-            _PF_LOCKS[uid] = lk
-        return lk
+        _PF_LOCKS[uid] = lk
+    return lk
 
 def _build_new_pf() -> Any:
     if OutcomePF is None:
@@ -485,9 +513,9 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
         p[0] -= shift
         remBP = max(1e-8, 1.0 - float(p[2]))
         p[1] = min(remBP, float(p[1]) + shift)
-        s = p.sum()
-        if s > 0:
-            p /= s
+    s = p.sum()
+    if s > 0:
+        p /= s
     return p
 
 def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float, float, str]:
@@ -566,10 +594,18 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
     keys = [
-        "SOFT_TAU", "THEO_BLEND", "TIE_MAX",
-        "MIN_CONF_FOR_ENTRY", "EDGE_ENTER", "PROB_MARGIN",
-        "PF_PRED_SIMS", "DEPLETEMC_SIMS", "PF_UPD_SIMS",
-        "PROB_PURE_MODE", "EV_NEUTRAL", "PROB_BIAS_B2P",
+        "SOFT_TAU",
+        "THEO_BLEND",
+        "TIE_MAX",
+        "MIN_CONF_FOR_ENTRY",
+        "EDGE_ENTER",
+        "PROB_MARGIN",
+        "PF_PRED_SIMS",
+        "DEPLETEMC_SIMS",
+        "PF_UPD_SIMS",
+        "PROB_PURE_MODE",
+        "EV_NEUTRAL",
+        "PROB_BIAS_B2P",
     ]
     for k in keys:
         v = os.getenv(prefix + k)
@@ -620,6 +656,7 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
         return max(1, int(n))
     try:
         n_particles = int(getattr(pf_obj, "n_particles", 0) or 0)
+
         def _get_int_env(primary: str, fallback: str, default_val: int) -> int:
             v = os.getenv(primary)
             if v not in (None, ""):
@@ -634,6 +671,7 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
                 except Exception:
                     pass
             return int(default_val)
+
         max_pf300 = _get_int_env("PRED_GUARD_300_CAP", "PRED_SIMS_MAX_PF300", 35)
         max_pf350 = _get_int_env("PRED_GUARD_350_CAP", "PRED_SIMS_MAX_PF350", 25)
         if n_particles >= 350:
@@ -706,7 +744,12 @@ def test_deplete_biases() -> None:
                 bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
                 log.info(
                     "%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)",
-                    name, pB, pP, pT, diff, bias
+                    name,
+                    pB,
+                    pP,
+                    pT,
+                    diff,
+                    bias
                 )
             except Exception as ex:
                 log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
@@ -805,7 +848,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         try:
             if pf_probs is not None:
                 log.info("[DEBUG-PF] PF原始: 莊=%.4f, 閒=%.4f", float(pf_probs[0]), float(pf_probs[1]))
-                log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
+            log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
         except Exception:
             pass
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
@@ -845,10 +888,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 after_deplete = p.copy()
                 if SHOW_RAW_PROBS:
                     log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
-                    delta_B = float(after_deplete[0] - before_deplete[0])
-                    delta_P = float(after_deplete[1] - before_deplete[1])
-                    log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
-                    log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
+                delta_B = float(after_deplete[0] - before_deplete[0])
+                delta_P = float(after_deplete[1] - before_deplete[1])
+                log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
+                log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
     if COMPAT_MODE == 0:
@@ -863,32 +906,30 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 after_theo = p.copy()
                 log.info("[DEBUG-B4-THEO] 理論混合前: 莊=%.4f, 閒=%.4f", float(before_theo[0]), float(before_theo[1]))
                 log.info("[DEBUG-AFT-THEO] 理論混合後: 莊=%.4f, 閒=%.4f", float(after_theo[0]), float(after_theo[1]))
-        if SHOW_RAW_PROBS:
-            log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
-                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
-        tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
-        if TIE_CAP_ENABLE == 1:
-            if p[2] > tie_max:
-                if SHOW_RAW_PROBS:
-                    before_tiecap = p.copy()
-                sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-                p[2] = tie_max
-                p[0] *= sc
-                p[1] *= sc
-                p = p / p.sum()
-                if SHOW_RAW_PROBS:
-                    after_tiecap = p.copy()
-                    log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
-                    log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
+    if SHOW_RAW_PROBS:
+        log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)", float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+    tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
+    if TIE_CAP_ENABLE == 1:
+        if p[2] > tie_max:
+            if SHOW_RAW_PROBS:
+                before_tiecap = p.copy()
+            sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+            p[2] = tie_max
+            p[0] *= sc
+            p[1] *= sc
+            p = p / p.sum()
+            if SHOW_RAW_PROBS:
+                after_tiecap = p.copy()
+                log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
+                log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
         if p[2] < TIE_MIN:
             sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
             p[2] = TIE_MIN
             p[0] *= sc
             p[1] *= sc
             p = p / p.sum()
-        if SHOW_RAW_PROBS:
-            log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
-                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+    if SHOW_RAW_PROBS:
+        log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)", float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
     p = _apply_prob_bias(p, over)
     if PATTERN_ENABLE == 1 and PatternModel is not None:
         try:
@@ -904,6 +945,29 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 p = p / p.sum()
         except Exception as e:
             log.warning("pattern fusion failed: %s", e)
+    # ===== GRU Fusion + META =====
+    if GRU_ENABLE==1 and GRUModel is not None:
+        try:
+            gru=get_gru_for_uid(uid)
+            if p_pts==b_pts:
+                gru.update(2)
+            else:
+                gru.update(0 if b_pts>p_pts else 1)
+            gru_prob=gru.predict()
+            meta=gru.meta_state()
+            if meta=="TREND":
+                scale=1.3
+            elif meta=="CHOP":
+                scale=1.1
+            else:
+                scale=1.0
+            w=GRU_WEIGHT*scale
+            w=max(0,min(0.35,w))
+            p=(1-w)*p+w*gru_prob
+            p=p/p.sum()
+            log.info("GRU META=%s weight=%.3f",meta,w)
+        except Exception as e:
+            log.warning("gru fusion failed %s",e)
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
@@ -923,9 +987,15 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
             "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
-            choice, edge, bet_pct * 100, sess["rounds_seen"],
-            int(sims_base), int(sims_used),
-            uid, PF_STATEFUL, reason
+            choice,
+            edge,
+            bet_pct * 100,
+            sess["rounds_seen"],
+            int(sims_base),
+            int(sims_used),
+            uid,
+            PF_STATEFUL,
+            reason
         )
     return p, choice, bet_amt, reason
 
@@ -998,9 +1068,9 @@ def trial_persist_guard(uid: str) -> Optional[str]:
         first = int(first_ts)
     except Exception:
         first = now
-        _rset(_trial_key(uid, "first_ts"), str(now))
-        _rset(_trial_key(uid, "expired"), "0")
-        return None
+    _rset(_trial_key(uid, "first_ts"), str(now))
+    _rset(_trial_key(uid, "expired"), "0")
+    return None
     used_min = (now - first) // 60
     if expired == "1" and used_min < TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "0")
@@ -1029,8 +1099,7 @@ def validate_activation_code(code: str) -> bool:
     norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and (norm == ADMIN_ACTIVATION_SECRET)
 
-GAMES = {"1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU", "6": "歐博/卡利", "7": "KG", "8": "全利",
-         "9": "名人", "10": "MT真人"}
+GAMES = {"1": "WM", "2": "PM", "3": "DG", "4": "SA", "5": "KU", "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人"}
 
 def game_menu_text(left_min: int) -> str:
     lines = ["請選擇遊戲館別"]
@@ -1042,13 +1111,23 @@ def game_menu_text(left_min: int) -> str:
 
 def _quick_buttons():
     try:
-        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        from linebot.models import QuickReply,QuickReplyButton,MessageAction
         return QuickReply(items=[
-            QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
-            QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
-            QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
-            QuickReplyButton(action=MessageAction(label="報閒勝 🅿️", text="P")),
-            QuickReplyButton(action=MessageAction(label="報和局 ⚪", text="T")),
+            QuickReplyButton(
+                action=MessageAction(label="開始分析 ▶️",text="開始")
+            ),
+            QuickReplyButton(
+                action=MessageAction(label="莊",text="B")
+            ),
+            QuickReplyButton(
+                action=MessageAction(label="閒",text="P")
+            ),
+            QuickReplyButton(
+                action=MessageAction(label="和",text="T")
+            ),
+            QuickReplyButton(
+                action=MessageAction(label="退回",text="UNDO")
+            )
         ])
     except Exception:
         return None
@@ -1076,8 +1155,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         else:
             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                 cont=bool(CONTINUOUS_MODE))
+        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         cur_seq = int(sess.get("pending_seq", 0))
         if cur_seq == int(seq):
             sess["last_card"] = msg
@@ -1215,16 +1293,33 @@ try:
                 _reply(line_api, event.reply_token, guard)
                 save_session(uid, sess)
                 return
+            if up=="UNDO":
+                try:
+                    gru=get_gru_for_uid(uid)
+                    if gru: gru.undo()
+                    pat=get_pattern_for_uid(uid)
+                    if pat:
+                        if hasattr(pat,"undo"): pat.undo()
+                        elif hasattr(pat,"history"):
+                            if len(pat.history)>0: pat.history.pop()
+                    if sess["rounds_seen"]>0: sess["rounds_seen"]-=1
+                    save_session(uid,sess)
+                    _reply(
+                        line_api,
+                        event.reply_token,
+                        f"已退回上一局\n目前局數: {sess['rounds_seen']}"
+                    )
+                except Exception as e:
+                    log.warning("undo error %s",e)
+                return
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
-                sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
-                        "last_pts_text": None, "premium": premium, "trial_start": start_ts,
-                        "last_card": None, "last_card_ts": None,
-                        "pending": False, "pending_seq": 0}
+                sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0, "last_pts_text": None, "premium": premium, "trial_start": start_ts, "last_card": None, "last_card_ts": None, "pending": False, "pending_seq": 0}
                 try:
                     reset_pf_for_uid(uid)
                     reset_pattern_for_uid(uid)
+                    reset_gru_for_uid(uid)
                 except Exception:
                     pass
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
@@ -1232,34 +1327,60 @@ try:
                 return
             hist_match = re.fullmatch(r"[BPTHbpht]{6,30}", text)
             if hist_match:
-                seq = []
+                seq=[]
                 for c in text.upper():
-                    if c == "B":
-                        seq.append(0)
-                    elif c == "P":
-                        seq.append(1)
-                    else:
-                        seq.append(2)
+                    if c=="B": seq.append(0)
+                    elif c=="P": seq.append(1)
+                    else: seq.append(2)
                 try:
                     reset_pf_for_uid(uid)
-                except Exception:
-                    pass
-                try:
                     reset_pattern_for_uid(uid)
-                    pat = get_pattern_for_uid(uid)
-                    if pat:
-                        pat.load_history(seq)
-                except Exception:
-                    pass
-                sess["rounds_seen"] = len(seq)
-                save_session(uid, sess)
+                    reset_gru_for_uid(uid)
+                except: pass
+                try:
+                    pat=get_pattern_for_uid(uid)
+                    if pat: pat.load_history(seq)
+                    gru=get_gru_for_uid(uid)
+                    if gru: gru.load_history(seq)
+                except: pass
+                sess["rounds_seen"]=len(seq)
+                save_session(uid,sess)
+                from linebot.models import QuickReply,QuickReplyButton,MessageAction,TextSendMessage
+                qr=QuickReply(items=[
+                    QuickReplyButton(
+                        action=MessageAction(label="開始分析 ▶️",text="開始")
+                    ),
+                    QuickReplyButton(
+                        action=MessageAction(label="莊",text="B")
+                    ),
+                    QuickReplyButton(
+                        action=MessageAction(label="閒",text="P")
+                    ),
+                    QuickReplyButton(
+                        action=MessageAction(label="和",text="T")
+                    ),
+                    QuickReplyButton(
+                        action=MessageAction(label="退回",text="UNDO")
+                    )
+                ])
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        text= "歷史規律載入完成\n請點擊開始分析",
+                        quick_reply=qr
+                    )
+                )
+                return
+            up = text.upper()
+            if up=="開始":
+                sess["phase"]="await_pts"
+                save_session(uid,sess)
                 _reply(
                     line_api,
                     event.reply_token,
-                    "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5"
+                    "已開始分析\n請輸入第一局結果\n例如：65 或點擊莊閒按鈕"
                 )
                 return
-            pts = parse_last_hand_points(text)
             if text == "遊戲設定" or up == "GAME SETTINGS":
                 sess["phase"] = "choose_game"
                 sess["game"] = None
@@ -1275,8 +1396,7 @@ try:
                 if m and (m.group(1) in GAMES):
                     sess["game"] = GAMES[m.group(1)]
                     sess["phase"] = "input_bankroll"
-                    _reply(line_api, event.reply_token,
-                           f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
+                    _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
                     save_session(uid, sess)
                     return
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
@@ -1292,10 +1412,11 @@ try:
                 _reply(
                     line_api,
                     event.reply_token,
-                    f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：閒6莊5 / 65 / 和）"
+                    f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：65 / 和 / 閒6莊5）"
                 )
                 save_session(uid, sess)
                 return
+            pts = parse_last_hand_points(text)
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
                 if (LINE_ASYNC_HEAVY == 1) and _can_push():
@@ -1326,8 +1447,7 @@ try:
                         else:
                             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
                         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                                 cont=bool(CONTINUOUS_MODE))
+                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
                         sess["last_card"] = msg
                         sess["last_card_ts"] = int(time.time())
                         sess["pending"] = False
@@ -1429,7 +1549,10 @@ def predict():
         return jsonify(
             ok=True,
             probs=[float(probs[0]), float(probs[1]), float(probs[2])],
-            choice=choice, bet=bet_amt, reason=reason, card=card
+            choice=choice,
+            bet=bet_amt,
+            reason=reason,
+            card=card
         ), 200
     except Exception as e:
         log.exception("predict error: %s", e)
@@ -1445,9 +1568,22 @@ if __name__ == "__main__":
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
         "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
         "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
-        VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
-        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
-        LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
+        VERSION,
+        port,
+        pf_initialized,
+        DEPLETE_OK,
+        DECISION_MODE,
+        COMPAT_MODE,
+        DEPL_ENABLE,
+        TRIAL_NAMESPACE,
+        PF_STATEFUL,
+        TIE_CAP_ENABLE,
+        PROB_FORCE_PURE_IN_PROB_MODE,
+        PROB_PURE_MODE,
+        EV_NEUTRAL,
+        float(PROB_BIAS_B2P),
+        LINE_ASYNC_HEAVY,
+        LINE_PUSH_ENABLE,
         os.getenv("PRED_SIMS_CAP", "80"),
         os.getenv("PRED_SIMS_MAX_PF300", "35"),
         os.getenv("PRED_SIMS_MAX_PF350", "25"),
