@@ -1,16 +1,23 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Ultimate FINAL LOCK"""
+"""BGS FINAL LOCK VERSION"""
 
 import os
 import time
 import logging
 import re
-import random
 
 VERSION="FINAL-LOCK"
 
 LINE_CHANNEL_SECRET=os.getenv("LINE_CHANNEL_SECRET","")
 LINE_CHANNEL_ACCESS_TOKEN=os.getenv("LINE_CHANNEL_ACCESS_TOKEN","")
+
+# 開通碼使用 Render 環境變數
+OPEN_PASSWORD=os.getenv("OPEN_PASSWORD","")
+
+# 官方客服
+ADMIN_CONTACT="@jins888"
+
+TRIAL_MINUTES=30
 
 from flask import Flask,request,abort
 from flask_cors import CORS
@@ -21,12 +28,13 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 log=logging.getLogger("bgs")
 
-
-########################################
+##################################################
 # SESSION
-########################################
+##################################################
 
 SESS={}
+TRIAL_DB={}
+PREMIUM_DB={}
 
 def get_session(uid):
 
@@ -34,69 +42,92 @@ def get_session(uid):
 
         SESS[uid]={
 
-            "phase":"choose_game",
-            "bankroll":0,
-            "history_input":"",
+            "phase":"idle",
             "game":None,
-            "trial_start":time.time()
+            "bankroll":0,
+            "history_input":""
 
         }
 
     return SESS[uid]
 
 
-def save_session(uid,sess):
+##################################################
+# 試用系統（LINE ID永久鎖）
+##################################################
 
-    SESS[uid]=sess
+def trial_left(uid):
+
+    if uid in PREMIUM_DB:
+        return 9999
+
+    now=int(time.time())
+
+    if uid not in TRIAL_DB:
+        TRIAL_DB[uid]=now
+
+    used=(now-TRIAL_DB[uid])//60
+
+    return max(0,TRIAL_MINUTES-used)
 
 
+def trial_guard(uid):
 
-########################################
-# TRIAL LOCK (永久鎖LINE ID)
-########################################
+    if uid in PREMIUM_DB:
+        return None
 
-TRIAL_MINUTES=30
-TRIAL_USED={}
+    left=trial_left(uid)
 
-def trial_persist_guard(uid):
+    if left<=0:
+
+        return f"""⛔試用已到期
+
+🔐輸入：
+開通 密碼
+
+📞聯繫官方LINE：
+{ADMIN_CONTACT}
+"""
+
+    return None
+
+
+##################################################
+# Dedup
+##################################################
+
+DEDUP={}
+
+def dedupe(eid):
+
+    if not eid:
+        return True
 
     now=time.time()
 
-    if uid in TRIAL_USED:
+    if eid in DEDUP:
 
-        return "⛔ 試用已到期\n請聯繫管理員"
+        if now-DEDUP[eid]<60:
+            return False
 
-    sess=get_session(uid)
+    DEDUP[eid]=now
 
-    start=sess["trial_start"]
-
-    used=(now-start)/60
-
-    if used>TRIAL_MINUTES:
-
-        TRIAL_USED[uid]=True
-
-        return "⛔ 試用已到期\n請聯繫管理員"
-
-    left=int(TRIAL_MINUTES-used)
-
-    return f"⏳ 試用剩餘 {left} 分鐘"
+    return True
 
 
+##################################################
+# Flex UI
+##################################################
 
-########################################
-# FLEX UI
-########################################
-
-def flex_card(hist):
+def flex_history(hist=""):
 
     from linebot.models import FlexSendMessage
 
-    show=" ".join(list(hist)) if hist else "尚未輸入"
+    show=" ".join(hist) if hist else "尚未輸入"
 
     return FlexSendMessage(
 
-        alt_text="輸入歷史",
+        alt_text="history",
 
         contents={
 
@@ -105,6 +136,7 @@ def flex_card(hist):
             "body":{
 
                 "type":"box",
+
                 "layout":"vertical",
 
                 "contents":[
@@ -112,8 +144,8 @@ def flex_card(hist):
                 {
                 "type":"text",
                 "text":"🤖 請開始輸入歷史數據",
-                "size":"lg",
-                "weight":"bold"
+                "weight":"bold",
+                "size":"lg"
                 },
 
                 {
@@ -137,9 +169,11 @@ def flex_card(hist):
                 "action":{"type":"message","label":"和","text":"T"}}
 
                 ]
+
                 },
 
                 {
+
                 "type":"box",
                 "layout":"horizontal",
                 "contents":[
@@ -154,6 +188,7 @@ def flex_card(hist):
                 "action":{"type":"message","label":"遊戲設定","text":"遊戲設定"}}
 
                 ]
+
                 }
 
                 ]
@@ -165,324 +200,240 @@ def flex_card(hist):
     )
 
 
-########################################
-# PF ENGINE
-########################################
+##################################################
+# PF輸出（舊版格式）
+##################################################
 
-def pf_predict(bankroll):
+def pf_output(p,b):
 
-    p_b=round(random.uniform(0.40,0.55),3)
-    p_p=round(random.uniform(0.30,0.45),3)
-    p_t=round(1-p_b-p_p,3)
+ banker=round(40+p%10,1)
+ player=round(40+b%10,1)
+ tie=round(100-banker-player,1)
 
-    confidence=max(p_b,p_p)
+ conf=max(banker,player)
 
-    ##################################
-    # 觀望守則
-    ##################################
+ if conf<45:
+  return "觀望"
 
-    if confidence<0.45:
+ if banker>player:
+  bet="莊"
+ else:
+  bet="閒"
 
-        return "觀望",0,p_b,p_p,p_t
+ amount=int(conf*10)
 
+ return f"""上局結果：閒 {p} 莊 {b}
 
-    ##################################
-    # 配注 = 信心比例
-    ##################################
+機率 | 莊 {banker}% | 閒 {player}%
+| 和 {tie}%
 
-    ratio=(confidence-0.40)*2
+建議：下{bet} 🎯
+配注：{amount}
 
-    bet=int(bankroll*ratio)
-
-    if p_b>p_p:
-
-        return "莊",bet,p_b,p_p,p_t
-
-    else:
-
-        return "閒",bet,p_b,p_p,p_t
+(輸入下一局點數：例如65)
+"""
 
 
-########################################
-# LINE INIT
-########################################
+##################################################
+# LINE
+##################################################
 
 line_api=None
 line_handler=None
 
 try:
 
-    from linebot import LineBotApi,WebhookHandler
-    from linebot.models import MessageEvent,TextMessage,FollowEvent,TextSendMessage
+ from linebot import LineBotApi,WebhookHandler
+ from linebot.models import *
 
+ line_api=LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+ line_handler=WebhookHandler(LINE_CHANNEL_SECRET)
 
-    if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
-        line_api=LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-        line_handler=WebhookHandler(LINE_CHANNEL_SECRET)
+ @line_handler.add(MessageEvent,message=TextMessage)
+ def msg(event):
 
+  uid=event.source.user_id
 
-        @line_handler.add(FollowEvent)
-        def follow(event):
+  if not dedupe(event.message.id):
+   return
 
-            uid=event.source.user_id
+  text=event.message.text.strip()
 
-            sess=get_session(uid)
+  sess=get_session(uid)
 
-            save_session(uid,sess)
 
-            trial=trial_persist_guard(uid)
+  ################ 開通 ################
 
-            line_api.reply_message(
+  if text.startswith("開通"):
 
-            event.reply_token,
+   pw=text.split()[-1]
 
-            TextSendMessage(
+   if pw==OPEN_PASSWORD:
 
-f"""🎰 請選擇遊戲館別
+    PREMIUM_DB[uid]=1
 
-1 WM
-2 PM
-3 DG
-4 SA
-5 KU
-6 歐博
-7 KG
-8 全利
-9 名人
-10 MT真人
+    line_api.reply_message(event.reply_token,
+    TextSendMessage(text="✅已永久開通"))
 
-{trial}"""
-)
-)
+    return
 
 
-        @line_handler.add(MessageEvent,message=TextMessage)
-        def text(event):
+  ################ 試用 ################
 
-            uid=event.source.user_id
+  guard=trial_guard(uid)
 
-            sess=get_session(uid)
+  if guard:
 
-            text=event.message.text.strip()
+   line_api.reply_message(event.reply_token,
+   TextSendMessage(text=guard))
 
+   return
 
-            ################################
-            # 試用鎖
-            ################################
 
-            guard=trial_persist_guard(uid)
+  ################ 遊戲設定 ################
 
-            if "試用已到期" in guard:
+  if text=="遊戲設定":
 
-                line_api.reply_message(event.reply_token,
-                TextSendMessage(text=guard))
+   sess["phase"]="choose"
 
-                return
+   line_api.reply_message(event.reply_token,
+   TextSendMessage(text=f"""請選擇遊戲館別
 
+1. WM
+2. PM
+3. DG
+4. SA
+5. KU
+6. 歐博/卡利
+7. KG
+8. 全利
+9. 名人
+10. MT真人
 
-            ################################
-            # RESET
-            ################################
+試用剩餘 {trial_left(uid)} 分鐘（共30分鐘）
+"""))
 
-            if text=="RESET":
+   return
 
-                sess["phase"]="choose_game"
 
-                save_session(uid,sess)
+  ################ RESET ################
 
-                line_api.reply_message(
+  if text in ["RESET","結束分析"]:
 
-                event.reply_token,
+   SESS.pop(uid,None)
 
-                TextSendMessage(text="重新開始\n輸入館別")
+   line_api.reply_message(event.reply_token,
+   TextSendMessage(text="已重置\n輸入遊戲設定開始"))
 
-                )
+   return
 
-                return
 
+  ################ 館別 ################
 
-            ################################
-            # 遊戲設定
-            ################################
+  if sess["phase"]=="choose":
 
-            if text=="遊戲設定":
+   sess["game"]=text
+   sess["phase"]="bankroll"
 
-                sess["phase"]="choose_game"
+   line_api.reply_message(event.reply_token,
+   TextSendMessage(text=f"🎰已選擇：{text}\n請輸入初始籌碼"))
 
-                save_session(uid,sess)
+   return
 
-                line_api.reply_message(
 
-                event.reply_token,
+  ################ 籌碼 ################
 
-                TextSendMessage(text="輸入館別")
+  if sess["phase"]=="bankroll":
 
-                )
+   if text.isdigit():
 
-                return
+    sess["bankroll"]=int(text)
+    sess["phase"]="history"
 
+    line_api.reply_message(event.reply_token,
+    flex_history())
 
-            ################################
-            # 館別
-            ################################
+    return
 
-            if sess["phase"]=="choose_game":
 
-                sess["game"]=text
+  ################ 歷史 ################
 
-                sess["phase"]="input_bankroll"
+  if sess["phase"]=="history":
 
-                save_session(uid,sess)
+   if text in ["B","P","T"]:
 
-                line_api.reply_message(
+    sess["history_input"]+=text
 
-                event.reply_token,
+    line_api.reply_message(event.reply_token,
+    flex_history(sess["history_input"]))
 
-                TextSendMessage(text="輸入本金"))
+    return
 
-                return
 
+   if text=="開始":
 
-            ################################
-            # 本金
-            ################################
+    sess["phase"]="pf"
 
-            if sess["phase"]=="input_bankroll":
+    line_api.reply_message(event.reply_token,
+    TextSendMessage(text="""歷史載入完成
+History loaded
 
-                if text.isdigit():
+請輸入下一局點數
+例如：65 / 和 / 閒6莊5"""))
 
-                    sess["bankroll"]=int(text)
+    return
 
-                    sess["phase"]="await_history"
 
-                    save_session(uid,sess)
+  ################ PF ################
 
-                    line_api.reply_message(
-                    event.reply_token,
-                    flex_card("")
-                    )
+  if sess["phase"]=="pf":
 
-                    return
+   if re.match("^[0-9]{2}$",text):
 
+    p=int(text[0])
+    b=int(text[1])
 
-            ################################
-            # 歷史輸入
-            ################################
+    line_api.reply_message(event.reply_token,
+    TextSendMessage(text=pf_output(p,b)))
 
-            if sess["phase"]=="await_history":
-
-                if text in ["B","P","T"]:
-
-                    hist=sess["history_input"]+text
-
-                    sess["history_input"]=hist
-
-                    save_session(uid,sess)
-
-                    line_api.reply_message(
-                    event.reply_token,
-                    flex_card(hist)
-                    )
-
-                    return
-
-
-                if text=="開始":
-
-                    sess["phase"]="await_pts"
-
-                    save_session(uid,sess)
-
-                    line_api.reply_message(
-
-                    event.reply_token,
-
-                    TextSendMessage(text="輸入65")
-
-                    )
-
-                    return
-
-
-            ################################
-            # PF
-            ################################
-
-            if sess["phase"]=="await_pts":
-
-                if re.match("^[0-9]{2}$",text):
-
-                    p=int(text[0])
-                    b=int(text[1])
-
-                    last=f"上局結果: 閒 {p} 莊 {b}"
-
-                    choice,bet,pb,pp,pt=pf_predict(sess["bankroll"])
-
-                    msg=f"""{last}
-
-機率 | 莊 {pb*100:.1f}% | 閒 {pp*100:.1f}% | 和 {pt*100:.1f}%
-
-建議：{choice} 🎯
-配注：{bet}"""
-
-                    line_api.reply_message(
-
-                    event.reply_token,
-
-                    TextSendMessage(text=msg)
-                    )
-
-                    return
-
+    return
 
 
 except Exception as e:
 
-    log.warning(e)
+ log.warning(e)
 
 
-
-########################################
+##################################################
 # WEBHOOK
-########################################
+##################################################
 
 @app.post("/line-webhook")
 
 def webhook():
 
-    signature=request.headers.get("X-Line-Signature")
+ signature=request.headers.get("X-Line-Signature")
 
-    body=request.get_data(as_text=True)
+ body=request.get_data(as_text=True)
 
-    line_handler.handle(body,signature)
+ line_handler.handle(body,signature)
 
-    return "OK"
+ return "OK"
 
-
-
-########################################
-# HEALTH
-########################################
 
 @app.get("/")
 def root():
-    return "running"
+ return "running"
 
 
 @app.get("/health")
 def health():
-    return VERSION
+ return VERSION
 
-
-
-########################################
-# LOCAL
-########################################
 
 if __name__=="__main__":
 
-    port=int(os.getenv("PORT",8000))
+ port=int(os.getenv("PORT",8000))
 
-    app.run(host="0.0.0.0",port=port)
+ app.run(host="0.0.0.0",port=port)
