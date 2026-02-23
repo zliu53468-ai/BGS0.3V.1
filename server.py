@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix) """
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard+production-final+storefix+uifix+flexui) """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -245,7 +245,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
 
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+production-final+storefix+uifix+flexui"
 
 # ---------- Quick Replies ----------
 def quick_history():
@@ -278,6 +278,97 @@ def quick_manage():
             QuickReplyButton(action=MessageAction(label="遊戲設定", text="遊戲設定"))
         ])
     except: return None
+
+# ---------- Flex Message 主畫面 ----------
+def flex_history_card():
+    from linebot.models import FlexSendMessage
+    return FlexSendMessage(
+        alt_text="請開始輸入歷史數據",
+        contents={
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "md",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "🤖 請開始輸入歷史數據",
+                        "weight": "bold",
+                        "size": "lg"
+                    },
+                    {
+                        "type": "text",
+                        "text": "先輸入莊/閒/和；按「開始分析」才會給出下注建議。",
+                        "wrap": True,
+                        "size": "sm"
+                    },
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "sm",
+                        "contents": [
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "莊",
+                                    "text": "B"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "閒",
+                                    "text": "P"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "primary",
+                                "color": "#00C300",
+                                "action": {
+                                    "type": "message",
+                                    "label": "和",
+                                    "text": "T"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "spacing": "sm",
+                        "contents": [
+                            {
+                                "type": "button",
+                                "style": "secondary",
+                                "action": {
+                                    "type": "message",
+                                    "label": "開始分析",
+                                    "text": "開始"
+                                }
+                            },
+                            {
+                                "type": "button",
+                                "style": "secondary",
+                                "action": {
+                                    "type": "message",
+                                    "label": "結束分析",
+                                    "text": "RESET"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    )
 
 def _reply(api, token: str, text: str, qr=None):
     from linebot.models import TextSendMessage
@@ -921,7 +1012,7 @@ line_api = None
 line_handler = None
 try:
     from linebot import LineBotApi, WebhookHandler
-    from linebot.models import MessageEvent, TextMessage, FollowEvent, UnfollowEvent
+    from linebot.models import MessageEvent, TextMessage, FollowEvent, UnfollowEvent, FlexSendMessage
     if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -943,7 +1034,7 @@ try:
                 sess = get_session(uid)
                 guard_msg = trial_persist_guard(uid)
                 msg = guard_msg if guard_msg else (f"⛔ 試用已到期\n🔐 請輸入：開通 你的密碼\n👉 正確格式：開通 [密碼]\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}")
-                _reply(line_api, event.reply_token, msg)
+                line_api.reply_message(event.reply_token, FlexSendMessage(alt_text="試用已到期", contents={"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": msg, "wrap": True}]}}))
                 save_session(uid, sess)
                 return
             now = int(time.time())
@@ -981,7 +1072,7 @@ try:
                         left = max(0, TRIAL_MINUTES - used_min)
                     except: left = TRIAL_MINUTES
                     msg = f"👋 歡迎！你有 {left} 分鐘免費試用。\n請開始輸入歷史數據"
-            _reply(line_api, event.reply_token, "請開始輸入歷史數據\n先輸入莊/閒/和；按「開始分析」才會給出下注建議。", quick_history())
+            line_api.reply_message(event.reply_token, flex_history_card())
             save_session(uid, sess)
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):
@@ -1031,7 +1122,7 @@ try:
                     reset_pattern_for_uid(uid)
                     reset_gru_for_uid(uid)
                 except: pass
-                _reply(line_api, event.reply_token, "🧹 已清空。請開始輸入歷史數據", quick_history())
+                line_api.reply_message(event.reply_token, flex_history_card())
                 save_session(uid, sess)
                 return
             hist_match = re.fullmatch(r"[BPTHbpht]{1,50}", text)
@@ -1055,7 +1146,7 @@ try:
                 sess["rounds_seen"]=len(seq)
                 sess["phase"] = "await_history"
                 save_session(uid,sess)
-                _reply(line_api, event.reply_token, "歷史規律載入完成\n請點擊開始分析", quick_history())
+                line_api.reply_message(event.reply_token, flex_history_card())
                 return
             if up=="開始":
                 sess["phase"]="await_pts"
