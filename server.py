@@ -22,14 +22,12 @@ def env_flag(name: str, default: int = 1) -> int:
 
 # ===== PATTERN MODEL PATCH START =====
 try:
-    from pattern import PatternModel
+    from pattern import PatternModel   # 優先使用你最新的 pattern.py
 except Exception:
-    # 最新版 HybridGRU（Meta + Pattern規律 + Particle Ensemble）
-    # 完全相容原有介面，支援直接輸入 "PBPTPBPBPT..." 字串
+    # 備用 HybridGRU（完全相容）
     class GRUModel:
         def __init__(self, lookback=40):
             self.history = deque(maxlen=lookback)
-            # ============== 可調參數（你之後可自行調整） ==============
             self.trend_threshold = 2.45
             self.chop_threshold = 0.64
             self.trend_boost = 0.105
@@ -77,7 +75,6 @@ except Exception:
             if len(self.history) < 8:
                 return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
 
-            # 三模型 ensemble（讓玩家感覺更專業）
             meta_probs = self._meta_predict()
             pattern_probs = self.detect_pattern()
             pf_probs = self.particle_predict()
@@ -159,8 +156,8 @@ except Exception:
     PatternModel = GRUModel
 
 PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
-PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.25"))
-PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "12"))
+PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.40"))   # 已幫你調高
+PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "40"))   # 已改成40
 
 _PATTERN_STORE: Dict[str, Any] = {}
 _PATTERN_GUARD = threading.Lock()
@@ -279,7 +276,6 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
         log.warning("[Redis] SETNX err: %s", e)
         return True
 
-# 以下為原本其餘程式碼（完全不變）
 # ---------- 事件去重 ----------
 def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id:
