@@ -53,9 +53,28 @@ class HybridGRUModel:
         meta_probs = self._meta_predict()
         pattern_probs = self.detect_pattern()
         pf_probs = self.particle_predict()
-        final = (meta_probs * 0.42 + pattern_probs * 0.38 + pf_probs * 0.20)
+
+        # PF防守觸發：當最近5局出現4局相同，放大PF權重
+        if len(self.history) >= 5:
+            recent = list(self.history)[-5:]
+            if recent.count(recent[-1]) >= 4:
+                pf_probs = pf_probs * 1.25
+                pf_probs = pf_probs / pf_probs.sum()
+
+        # 融合權重調整（PF提升至0.35，降低Meta與Pattern權重）
+        final = (
+            meta_probs * 0.35 +
+            pattern_probs * 0.30 +
+            pf_probs * 0.35
+        )
+
+        # 優化Tie機率強制調整：確保B/P比例正確歸一化
         if final[2] < 0.088:
+            scale = (1 - 0.092) / (final[0] + final[1])
+            final[0] *= scale
+            final[1] *= scale
             final[2] = 0.092
+
         final = final / final.sum()
         return final.astype(np.float32)
 
@@ -107,15 +126,19 @@ class HybridGRUModel:
 
     def particle_predict(self):
         particles = []
+        # PF粒子生成：擴大偏置範圍，使PF具備真正反轉能力
         for _ in range(12):
-            bias = np.random.normal(0, 0.025)
-            particles.append([0.46 + bias, 0.44 - bias, 0.10])
+            bias = np.random.normal(0, 0.06)          # 標準差0.06
+            particles.append([0.45 + bias, 0.45 - bias, 0.10])   # 對稱均值0.45/0.45
+
         weights = np.ones(12)
         if len(self.history) >= 6:
             recent = np.array(self.history)[-6:]
             for i, p in enumerate(particles):
                 pred = np.argmax(p)
-                weights[i] = np.sum(recent == pred) / 6 + 0.12
+                match_rate = np.sum(recent == pred) / 6
+                # 最終PF權重計算：使用非線性變換提升防守敏感度
+                weights[i] = (1 - match_rate)**1.6 + 0.08
         weights /= weights.sum()
         final = np.average(particles, axis=0, weights=weights)
         return np.clip(final, 0.02, 0.96)
