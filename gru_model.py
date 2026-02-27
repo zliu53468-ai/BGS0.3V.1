@@ -54,18 +54,40 @@ class HybridGRUModel:
         pattern_probs = self.detect_pattern()
         pf_probs = self.particle_predict()
 
-        # PF防守觸發：當最近5局出現4局相同，放大PF權重
+        # PF防守觸發：當最近5局出現4局相同，放大PF權重（倍率1.4，且對Tie略為壓抑）
         if len(self.history) >= 5:
             recent = list(self.history)[-5:]
             if recent.count(recent[-1]) >= 4:
-                pf_probs = pf_probs * 1.25
+                pf_probs = pf_probs * 1.4
+                pf_probs[2] *= 0.9          # 不放大Tie
                 pf_probs = pf_probs / pf_probs.sum()
 
-        # 融合權重調整（PF提升至0.35，降低Meta與Pattern權重）
+        # 判斷是否為真正的尾盤混沌狀態（需同時滿足高切換率）
+        state = self.meta_state()
+        tail_mode = False
+        if state == "CHAOS" and len(self.history) >= 30:
+            # 檢查最近12局的切換率是否高於0.60（原0.55，優化後提高至0.60）
+            recent_arr = np.array(self.history)[-12:]
+            switches = np.sum(np.diff(recent_arr) != 0)
+            switch_rate = switches / 11
+            if switch_rate > 0.60:
+                tail_mode = True
+
+        if tail_mode:
+            # 尾盤模式：PF權重50%，其餘各25%
+            meta_weight = 0.25
+            pattern_weight = 0.25
+            pf_weight = 0.50
+        else:
+            # 一般模式
+            meta_weight = 0.35
+            pattern_weight = 0.30
+            pf_weight = 0.35
+
         final = (
-            meta_probs * 0.35 +
-            pattern_probs * 0.30 +
-            pf_probs * 0.35
+            meta_probs * meta_weight +
+            pattern_probs * pattern_weight +
+            pf_probs * pf_weight
         )
 
         # 優化Tie機率強制調整：確保B/P比例正確歸一化
@@ -126,18 +148,19 @@ class HybridGRUModel:
 
     def particle_predict(self):
         particles = []
-        # PF粒子生成：擴大偏置範圍，使PF具備真正反轉能力
-        for _ in range(12):
-            bias = np.random.normal(0, 0.06)          # 標準差0.06
-            particles.append([0.45 + bias, 0.45 - bias, 0.10])   # 對稱均值0.45/0.45
+        # PF粒子生成：粒子數18，且對每個粒子的pB/pP進行clip防止極端值
+        for _ in range(18):
+            bias = np.random.normal(0, 0.06)
+            pB = np.clip(0.45 + bias, 0.05, 0.90)
+            pP = np.clip(0.45 - bias, 0.05, 0.90)
+            particles.append([pB, pP, 0.10])
 
-        weights = np.ones(12)
+        weights = np.ones(18)
         if len(self.history) >= 6:
             recent = np.array(self.history)[-6:]
             for i, p in enumerate(particles):
                 pred = np.argmax(p)
                 match_rate = np.sum(recent == pred) / 6
-                # 最終PF權重計算：使用非線性變換提升防守敏感度
                 weights[i] = (1 - match_rate)**1.6 + 0.08
         weights /= weights.sum()
         final = np.average(particles, axis=0, weights=weights)
