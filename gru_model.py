@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 from collections import deque
+from real_gru_model import GRUPredictor   # 導入真正的 GRU 模型
 
 class HybridGRUModel:
     def __init__(self, lookback=40):
         self.history = deque(maxlen=lookback)
+        # 初始化真正 GRU 模型
+        self.gru_model = GRUPredictor()
         self.trend_threshold = 2.85
         self.chop_threshold = 0.68
         self.trend_boost = 0.032
@@ -53,6 +56,10 @@ class HybridGRUModel:
         meta_probs = self._meta_predict()
         pattern_probs = self.detect_pattern()
         pf_probs = self.particle_predict()
+        # 取得真正 GRU 模型的預測，並加上安全限制
+        gru_probs = self.gru_model.predict(list(self.history))
+        gru_probs = np.clip(gru_probs, 0.05, 0.90)
+        gru_probs = gru_probs / gru_probs.sum()
 
         # PF防守觸發：當最近5局出現4局相同，放大PF權重（倍率1.4，且對Tie略為壓抑）
         if len(self.history) >= 5:
@@ -66,36 +73,46 @@ class HybridGRUModel:
         state = self.meta_state()
         tail_mode = False
         if state == "CHAOS" and len(self.history) >= 30:
-            # 檢查最近12局的切換率是否高於0.60（原0.55，優化後提高至0.60）
+            # 檢查最近12局的切換率是否高於0.58
             recent_arr = np.array(self.history)[-12:]
             switches = np.sum(np.diff(recent_arr) != 0)
             switch_rate = switches / 11
-            if switch_rate > 0.60:
+            if switch_rate > 0.58:
                 tail_mode = True
 
+        # 四模型融合（根據 tail_mode 使用不同權重，已優化）
         if tail_mode:
-            # 尾盤模式：PF權重50%，其餘各25%
-            meta_weight = 0.25
-            pattern_weight = 0.25
-            pf_weight = 0.50
+            final = (
+                meta_probs * 0.18 +
+                pattern_probs * 0.18 +
+                pf_probs * 0.34 +
+                gru_probs * 0.30
+            )
         else:
-            # 一般模式
-            meta_weight = 0.35
-            pattern_weight = 0.30
-            pf_weight = 0.35
+            final = (
+                meta_probs * 0.28 +
+                pattern_probs * 0.22 +
+                pf_probs * 0.28 +
+                gru_probs * 0.22
+            )
 
-        final = (
-            meta_probs * meta_weight +
-            pattern_probs * pattern_weight +
-            pf_probs * pf_weight
-        )
+        # 低信心過濾：只在非尾盤模式且B/P差異過小時，改為PF主導
+        bp_diff = abs(final[0] - final[1])
+        if bp_diff < 0.06 and not tail_mode:
+            final = (
+                meta_probs * 0.20 +
+                pattern_probs * 0.20 +
+                pf_probs * 0.60
+            )
 
-        # 優化Tie機率強制調整：確保B/P比例正確歸一化
+        # 優化Tie機率強制調整：確保B/P比例正確歸一化（加入防除零）
         if final[2] < 0.088:
-            scale = (1 - 0.092) / (final[0] + final[1])
-            final[0] *= scale
-            final[1] *= scale
-            final[2] = 0.092
+            bp_sum = final[0] + final[1]
+            if bp_sum > 0:
+                scale = (1 - 0.092) / bp_sum
+                final[0] *= scale
+                final[1] *= scale
+                final[2] = 0.092
 
         final = final / final.sum()
         return final.astype(np.float32)
@@ -148,9 +165,9 @@ class HybridGRUModel:
 
     def particle_predict(self):
         particles = []
-        # PF粒子生成：粒子數18，且對每個粒子的pB/pP進行clip防止極端值
+        # PF粒子生成：粒子數18，偏差標準差0.07
         for _ in range(18):
-            bias = np.random.normal(0, 0.06)
+            bias = np.random.normal(0, 0.07)
             pB = np.clip(0.45 + bias, 0.05, 0.90)
             pP = np.clip(0.45 - bias, 0.05, 0.90)
             particles.append([pB, pP, 0.10])
