@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)"""
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard + 點擊式歷史輸入)"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
-from collections import deque   # GRU 需要
+from collections import deque
 
-# 先定義 env_flag，避免頂層呼叫時 NameError
+# env_flag
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None:
@@ -22,9 +22,8 @@ def env_flag(name: str, default: int = 1) -> int:
 
 # ===== PATTERN MODEL PATCH START =====
 try:
-    from pattern import PatternModel   # 優先使用你最新的 pattern.py
+    from pattern import PatternModel
 except Exception:
-    # 備用 HybridGRU（完全相容）
     class GRUModel:
         def __init__(self, lookback=40):
             self.history = deque(maxlen=lookback)
@@ -156,8 +155,8 @@ except Exception:
     PatternModel = GRUModel
 
 PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
-PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.40"))   # 已幫你調高
-PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "40"))   # 已改成40
+PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.40"))
+PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "40"))
 
 _PATTERN_STORE: Dict[str, Any] = {}
 _PATTERN_GUARD = threading.Lock()
@@ -178,6 +177,21 @@ def reset_pattern_for_uid(uid: str):
     with _PATTERN_GUARD:
         _PATTERN_STORE.pop(uid, None)
 # ===== PATTERN MODEL PATCH END =====
+
+# ---------- 點擊式歷史輸入專用函數 ----------
+def get_history_buttons(temp_history: List[int]) -> Any:
+    try:
+        from linebot.models import QuickReply, QuickReplyButton, MessageAction
+        current = ''.join(['莊' if x==0 else '閒' if x==1 else '和' for x in temp_history]) or "（尚未輸入）"
+        return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="莊", text="莊")),
+            QuickReplyButton(action=MessageAction(label="閒", text="閒")),
+            QuickReplyButton(action=MessageAction(label="和", text="和")),
+            QuickReplyButton(action=MessageAction(label="刪除上一筆", text="刪除上一筆")),
+            QuickReplyButton(action=MessageAction(label="完成輸入", text="完成輸入")),
+        ])
+    except Exception:
+        return None
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -251,8 +265,7 @@ def _rget(k: str) -> Optional[str]:
         if redis_client:
             return redis_client.get(k)
         return KV_FALLBACK.get(k)
-    except Exception as e:
-        log.warning("[Redis] GET err: %s", e)
+    except Exception:
         return None
 
 def _rset(k: str, v: str, ex: Optional[int] = None):
@@ -261,8 +274,8 @@ def _rset(k: str, v: str, ex: Optional[int] = None):
             redis_client.set(k, v, ex=ex)
         else:
             KV_FALLBACK[k] = v
-    except Exception as e:
-        log.warning("[Redis] SET err: %s", e)
+    except Exception:
+        pass
 
 def _rsetnx(k: str, v: str, ex: int) -> bool:
     try:
@@ -272,8 +285,7 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
             return False
         KV_FALLBACK[k] = v
         return True
-    except Exception as e:
-        log.warning("[Redis] SETNX err: %s", e)
+    except Exception:
         return True
 
 # ---------- 事件去重 ----------
@@ -338,6 +350,10 @@ def get_session(uid: str) -> Dict[str, Any]:
                     sess["pending"] = False
                 if "pending_seq" not in sess:
                     sess["pending_seq"] = 0
+                if "history_mode" not in sess:
+                    sess["history_mode"] = False
+                if "temp_history" not in sess:
+                    sess["temp_history"] = []
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
@@ -347,9 +363,13 @@ def get_session(uid: str) -> Dict[str, Any]:
                 sess["pending"] = False
             if "pending_seq" not in sess:
                 sess["pending_seq"] = 0
+            if "history_mode" not in sess:
+                sess["history_mode"] = False
+            if "temp_history" not in sess:
+                sess["temp_history"] = []
             return sess
-    except Exception as e:
-        log.warning("get_session error: %s", e)
+    except Exception:
+        pass
     sess = {
         "phase": "await_pts",
         "bankroll": 0,
@@ -361,6 +381,8 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_card_ts": None,
         "pending": False,
         "pending_seq": 0,
+        "history_mode": False,
+        "temp_history": [],
     }
     save_session(uid, sess)
     return sess
@@ -375,8 +397,8 @@ def save_session(uid: str, sess: Dict[str, Any]) -> None:
         else:
             SESS_FALLBACK[uid] = sess
             KV_FALLBACK[_sess_key(uid) + ":ttl"] = str(int(time.time()) + SESSION_EXPIRE_SECONDS)
-    except Exception as e:
-        log.warning("save_session error: %s", e)
+    except Exception:
+        pass
 
 # ---------- UI 卡片 ----------
 def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
@@ -397,7 +419,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     return "\n".join(lines)
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+clickhistory"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -406,16 +428,13 @@ if _flask_available and Flask is not None:
 else:
     class _DummyApp:
         def get(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def post(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def options(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def run(self, *a, **k):
             log.warning("Flask not available; cannot run HTTP server.")
@@ -803,72 +822,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (int(d[0]), int(d[1]))
     return None
 
-# Debug utilities
-def test_deplete_biases() -> None:
-    if not DEPLETE_OK or init_counts is None or probs_after_points is None:
-        log.warning("test_deplete_biases called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        sims_env = os.getenv("DEPLETEMC_SIMS")
-        sims = int(float(sims_env)) if sims_env else 10000
-        deplete_factor = float(os.getenv("DEPL_FACTOR", "0.60"))
-        scenarios = [
-            ("開局", 0, 0),
-            ("閒贏1點", 1, 0),
-            ("莊贏1點", 0, 1),
-            ("平手1點", 1, 1),
-            ("閒贏6點", 6, 0),
-            ("莊贏6點", 0, 6),
-        ]
-        log.info("=== Deplete 偏差測試 (sims=%d, factor=%.2f) ===", sims, deplete_factor)
-        for name, p_pts, b_pts in scenarios:
-            try:
-                probs = probs_after_points(counts, p_pts, b_pts, sims=sims, deplete_factor=deplete_factor)
-                if not isinstance(probs, (list, tuple, np.ndarray)) or len(probs) < 2:
-                    log.info("%s: unexpected deplete result %s", name, probs)
-                    continue
-                pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2] if len(probs) > 2 else 0.0)
-                diff = pB - pP
-                bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
-                log.info(
-                    "%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)",
-                    name, pB, pP, pT, diff, bias
-                )
-            except Exception as ex:
-                log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
-    except Exception as ex:
-        log.warning("test_deplete_biases error: %s", ex)
-
-def debug_card_distribution() -> None:
-    if not DEPLETE_OK or init_counts is None:
-        log.warning("debug_card_distribution called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        total_cards = sum(counts.values()) if isinstance(counts, dict) else sum(counts)
-        point_cards: Dict[int, int] = {}
-        if isinstance(counts, dict):
-            iterable = counts.items()
-        else:
-            iterable = enumerate(counts)
-        for card_value, count in iterable:
-            try:
-                val = int(card_value)
-            except Exception:
-                continue
-            point = min(10, val if val > 0 else 10)
-            point_cards[point] = point_cards.get(point, 0) + int(count)
-        log.info("牌組分布:")
-        for point in sorted(point_cards.keys()):
-            cnt = point_cards[point]
-            pct = (cnt / total_cards * 100.0) if total_cards else 0.0
-            log.info(" 點數 %s: %s 張 (%.1f%%)", point, cnt, pct)
-    except Exception as ex:
-        log.warning("debug_card_distribution error: %s", ex)
-
 # ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
@@ -1168,10 +1121,12 @@ def game_menu_text(left_min: int) -> str:
     lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
     return "\n".join(lines)
 
+# ---------- 點擊式按鈕 ----------
 def _quick_buttons():
     try:
         from linebot.models import QuickReply, QuickReplyButton, MessageAction
         return QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="載入歷史 📜", text="載入歷史")),
             QuickReplyButton(action=MessageAction(label="遊戲設定 🎮", text="遊戲設定")),
             QuickReplyButton(action=MessageAction(label="結束分析 🧹", text="結束分析")),
             QuickReplyButton(action=MessageAction(label="報莊勝 🅱️", text="B")),
@@ -1181,10 +1136,10 @@ def _quick_buttons():
     except Exception:
         return None
 
-def _reply(api, token: str, text: str):
+def _reply(api, token: str, text: str, quick_reply=None):
     from linebot.models import TextSendMessage
     try:
-        api.reply_message(token, TextSendMessage(text=text, quick_reply=_quick_buttons()))
+        api.reply_message(token, TextSendMessage(text=text, quick_reply=quick_reply))
     except Exception as e:
         if "Invalid reply token" in str(e):
             log.info("[LINE] reply skipped (invalid token, likely retry): %s", e)
@@ -1193,7 +1148,6 @@ def _reply(api, token: str, text: str):
 
 def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
     if line_api is None:
-        log.warning("[heavy] line_api is None, skip heavy prediction.")
         return
     start = time.time()
     try:
@@ -1204,28 +1158,19 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         else:
             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                 cont=bool(CONTINUOUS_MODE))
+        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         cur_seq = int(sess.get("pending_seq", 0))
         if cur_seq == int(seq):
             sess["last_card"] = msg
             sess["last_card_ts"] = int(time.time())
             sess["pending"] = False
-        else:
-            log.info("[heavy] stale seq=%s (cur_seq=%s) skip write-back", seq, cur_seq)
         save_session(uid, sess)
         if _can_push():
             try:
-                line_api.push_message(
-                    uid,
-                    TextSendMessage(text=msg, quick_reply=_quick_buttons())
-                )
+                line_api.push_message(uid, TextSendMessage(text=msg, quick_reply=_quick_buttons()))
             except Exception as e:
                 if _looks_like_429(e):
-                    _block_push("429 monthly limit reached")
-                log.warning("[LINE] push failed (heavy): %s", e)
-        else:
-            log.info("[LINE] push skipped (disabled/blocked).")
+                    _block_push("429 limit")
     except Exception as e:
         log.exception("[heavy] prediction failed: %s", e)
     finally:
@@ -1249,9 +1194,8 @@ try:
                 uid = event.source.user_id
                 set_trial_blocked(uid, True)
                 _rset(_trial_key(uid, "expired"), "1")
-                log.info("[TRIAL] user unfollowed -> blocked=1 expired=1 uid=%s", uid)
-            except Exception as e:
-                log.warning("[TRIAL] unfollow handler error: %s", e)
+            except Exception:
+                pass
 
         @line_handler.add(FollowEvent)
         def on_follow(event):
@@ -1261,12 +1205,7 @@ try:
             if (not is_premium(uid)) and is_trial_blocked(uid):
                 sess = get_session(uid)
                 guard_msg = trial_persist_guard(uid)
-                msg = guard_msg if guard_msg else (
-                    f"⛔ 試用已到期\n"
-                    f"🔐 請輸入：開通 你的密碼\n"
-                    f"👉 正確格式：開通 [密碼]\n"
-                    f"📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
-                )
+                msg = guard_msg if guard_msg else f"⛔ 試用已到期\n🔐 請輸入：開通 你的密碼\n📞 聯繫：{ADMIN_CONTACT}"
                 _reply(line_api, event.reply_token, msg)
                 save_session(uid, sess)
                 return
@@ -1277,42 +1216,16 @@ try:
             if not first_ts:
                 _rset(ft_key, str(now))
                 _rset(ex_key, "0")
-                first_ts = str(now)
-            else:
-                try:
-                    first = int(first_ts)
-                    used_min = (now - first) // 60
-                    if _rget(ex_key) == "1" and used_min < TRIAL_MINUTES:
-                        _rset(ex_key, "0")
-                except Exception:
-                    _rset(ft_key, str(now))
-                    _rset(ex_key, "0")
-                    first_ts = str(now)
             guard_msg = trial_persist_guard(uid)
             sess = get_session(uid)
-            try:
-                sess["trial_start"] = int(first_ts) if first_ts else int(time.time())
-            except Exception:
-                pass
             if sess.get("premium", False) or is_premium(uid):
-                msg = (
-                    "👋 歡迎回來，已是永久開通用戶。\n"
-                    "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
-                )
+                msg = "👋 歡迎回來，已是永久開通用戶。\n輸入『遊戲設定』開始"
             else:
                 if guard_msg:
                     msg = guard_msg
                 else:
-                    try:
-                        ft = int(first_ts) if first_ts else int(time.time())
-                        used_min = max(0, (int(time.time()) - ft) // 60)
-                        left = max(0, TRIAL_MINUTES - used_min)
-                    except Exception:
-                        left = TRIAL_MINUTES
-                    msg = (
-                        f"👋 歡迎！你有 {left} 分鐘免費試用（共 {TRIAL_MINUTES} 分鐘）。\n"
-                        "輸入『遊戲設定』開始；連續模式啟動後只需輸入點數（例：65 / 和 / 閒6莊5）即可預測。"
-                    )
+                    left = max(0, TRIAL_MINUTES - ((now - int(first_ts)) // 60)) if first_ts else TRIAL_MINUTES
+                    msg = f"👋 歡迎！你有 {left} 分鐘免費試用。\n輸入『遊戲設定』開始"
             _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
 
@@ -1321,20 +1234,57 @@ try:
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
             uid = event.source.user_id
-            raw = (event.message.text or "")
-            text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
+            text = (event.message.text or "").strip()
             sess = get_session(uid)
             up = text.upper()
+
+            # ==================== 點擊式歷史輸入 ====================
+            if text == "載入歷史" or sess.get("history_mode", False):
+                if not sess.get("history_mode", False):
+                    sess["history_mode"] = True
+                    sess["temp_history"] = []
+                # 處理按鈕點擊
+                if text in ["莊", "B", "0"]:
+                    sess["temp_history"].append(0)
+                elif text in ["閒", "P", "1"]:
+                    sess["temp_history"].append(1)
+                elif text in ["和", "T", "2"]:
+                    sess["temp_history"].append(2)
+                elif text == "刪除上一筆":
+                    if sess["temp_history"]:
+                        sess["temp_history"].pop()
+                elif text == "完成輸入":
+                    seq = sess.get("temp_history", [])
+                    if seq:
+                        try:
+                            reset_pf_for_uid(uid)
+                            reset_pattern_for_uid(uid)
+                            pat = get_pattern_for_uid(uid)
+                            if pat:
+                                pat.load_history(seq)
+                        except Exception:
+                            pass
+                        sess["rounds_seen"] = len(seq)
+                        sess["history_mode"] = False
+                        _reply(line_api, event.reply_token, f"✅ 歷史載入完成！共 {len(seq)} 手\n請輸入下一局點數")
+                        save_session(uid, sess)
+                        return
+                # 更新顯示卡
+                current = ''.join(['莊' if x==0 else '閒' if x==1 else '和' for x in sess.get("temp_history", [])]) or "（尚未輸入）"
+                msg = f"目前已輸入歷史：\n{current}\n\n請繼續點擊莊/閒/和，或點擊完成輸入"
+                buttons = get_history_buttons(sess.get("temp_history", []))
+                _reply(line_api, event.reply_token, msg, quick_reply=buttons)
+                save_session(uid, sess)
+                return
+            # ==================== 結束 ====================
+
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
                 if ok:
                     sess["premium"] = True
                     set_premium(uid, True)
-                    try:
-                        set_trial_blocked(uid, False)
-                    except Exception:
-                        pass
+                    set_trial_blocked(uid, False)
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess)
                 return
@@ -1349,7 +1299,8 @@ try:
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
                         "last_card": None, "last_card_ts": None,
-                        "pending": False, "pending_seq": 0}
+                        "pending": False, "pending_seq": 0,
+                        "history_mode": False, "temp_history": []}
                 try:
                     reset_pf_for_uid(uid)
                     reset_pattern_for_uid(uid)
@@ -1358,35 +1309,7 @@ try:
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
-            hist_match = re.fullmatch(r"[BPTHbpht]{6,30}", text)
-            if hist_match:
-                seq = []
-                for c in text.upper():
-                    if c == "B":
-                        seq.append(0)
-                    elif c == "P":
-                        seq.append(1)
-                    else:
-                        seq.append(2)
-                try:
-                    reset_pf_for_uid(uid)
-                except Exception:
-                    pass
-                try:
-                    reset_pattern_for_uid(uid)
-                    pat = get_pattern_for_uid(uid)
-                    if pat:
-                        pat.load_history(seq)
-                except Exception:
-                    pass
-                sess["rounds_seen"] = len(seq)
-                save_session(uid, sess)
-                _reply(
-                    line_api,
-                    event.reply_token,
-                    "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5"
-                )
-                return
+
             pts = parse_last_hand_points(text)
             if text == "遊戲設定" or up == "GAME SETTINGS":
                 sess["phase"] = "choose_game"
@@ -1403,8 +1326,7 @@ try:
                 if m and (m.group(1) in GAMES):
                     sess["game"] = GAMES[m.group(1)]
                     sess["phase"] = "input_bankroll"
-                    _reply(line_api, event.reply_token,
-                           f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
+                    _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼")
                     save_session(uid, sess)
                     return
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
@@ -1417,35 +1339,21 @@ try:
                     return
                 sess["bankroll"] = amt
                 sess["phase"] = "await_pts"
-                _reply(
-                    line_api,
-                    event.reply_token,
-                    f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：閒6莊5 / 65 / 和）"
-                )
+                _reply(line_api, event.reply_token, f"✅ 設定完成！初始籌碼：{amt}。\n現在輸入第一局點數")
                 save_session(uid, sess)
                 return
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
                 if (LINE_ASYNC_HEAVY == 1) and _can_push():
-                    _reply(
-                        line_api,
-                        event.reply_token,
-                        "✅ 已收到上一局結果，AI 正在計算。"
-                    )
+                    _reply(line_api, event.reply_token, "✅ 已收到上一局結果，AI 正在計算。")
                     sess["pending"] = True
                     sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
                     seq = int(sess["pending_seq"])
-                    sess["last_card"] = None
-                    sess["last_card_ts"] = None
                     save_session(uid, sess)
                     try:
-                        threading.Thread(
-                            target=_push_heavy_prediction,
-                            args=(uid, p_pts, b_pts, seq),
-                            daemon=True,
-                        ).start()
-                    except Exception as e:
-                        log.exception("failed to spawn heavy prediction thread: %s", e)
+                        threading.Thread(target=_push_heavy_prediction, args=(uid, p_pts, b_pts, seq), daemon=True).start()
+                    except Exception:
+                        pass
                     return
                 else:
                     try:
@@ -1454,8 +1362,7 @@ try:
                         else:
                             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
                         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                                 cont=bool(CONTINUOUS_MODE))
+                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
                         sess["last_card"] = msg
                         sess["last_card_ts"] = int(time.time())
                         sess["pending"] = False
@@ -1463,12 +1370,12 @@ try:
                         _reply(line_api, event.reply_token, msg)
                     except Exception as e:
                         log.exception("[LINE] sync predict failed: %s", e)
-                        _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
+                        _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試。")
                     return
             _reply(
                 line_api,
                 event.reply_token,
-                "指令無法辨識。\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。"
+                "指令無法辨識。\n\n請點擊上方「載入歷史」按鈕，或直接輸入點數（例：65 / 和 / 閒6莊5）"
             )
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
@@ -1520,17 +1427,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return jsonify(
-        ok=True,
-        ts=time.time(),
-        version=VERSION,
-        pf_initialized=pf_initialized,
-        pf_backend=(PF_BACKEND if OutcomePF is not None else "smart-dummy"),
-        pf_stateful=bool(PF_STATEFUL),
-        prob_force_pure_in_prob_mode=bool(PROB_FORCE_PURE_IN_PROB_MODE),
-        line_async_heavy=bool(LINE_ASYNC_HEAVY),
-        line_can_push=bool(_can_push()),
-    ), 200
+    return jsonify(ok=True, ts=time.time(), version=VERSION, pf_initialized=pf_initialized), 200
 
 @app.get("/ping")
 def ping():
@@ -1548,38 +1445,20 @@ def predict():
             sess["bankroll"] = bankroll
         pts = parse_last_hand_points(last_text)
         if not pts:
-            return jsonify(ok=False, error="無法解析點數；請輸入 '閒6莊5' / '65' / '和'"), 400
+            return jsonify(ok=False, error="無法解析點數"), 400
         p_pts, b_pts = pts
         sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
         save_session(uid, sess)
         card = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
-        return jsonify(
-            ok=True,
-            probs=[float(probs[0]), float(probs[1]), float(probs[2])],
-            choice=choice, bet=bet_amt, reason=reason, card=card
-        ), 200
+        return jsonify(ok=True, probs=[float(probs[0]), float(probs[1]), float(probs[2])], choice=choice, bet=bet_amt, reason=reason, card=card), 200
     except Exception as e:
         log.exception("predict error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    if OutcomePF is None:
-        log.warning("PF backend: smart-dummy (OutcomePF import failed). If probs look repeated, check deployment paths.")
-    else:
-        log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
-    log.info(
-        "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
-        "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
-        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
-        VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
-        PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
-        LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
-        os.getenv("PRED_SIMS_CAP", "80"),
-        os.getenv("PRED_SIMS_MAX_PF300", "35"),
-        os.getenv("PRED_SIMS_MAX_PF350", "25"),
-    )
+    log.info("Starting %s on port %s", VERSION, port)
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
