@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)"""
 import os, sys, logging, time, re, json, threading
@@ -157,7 +156,7 @@ except Exception:
     PatternModel = GRUModel
 
 PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
-PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.40"))   # 已幫你調高
+PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.45"))   # 已調高至 0.45
 PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "40"))   # 已改成40
 
 _PATTERN_STORE: Dict[str, Any] = {}
@@ -1019,20 +1018,38 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
     p = _apply_prob_bias(p, over)
+
+    # ===== Pattern 融合（修正版：避免 look-ahead + 動態權重） =====
     if PATTERN_ENABLE == 1 and PatternModel is not None:
         try:
             pat = get_pattern_for_uid(uid)
             if pat:
+                # 1️⃣ 先用舊歷史預測（避免資料洩漏）
+                pat_prob = pat.predict()
+
+                # 2️⃣ 再更新本局結果
                 if p_pts == b_pts:
                     pat.update(2)
                 else:
                     pat.update(0 if b_pts > p_pts else 1)
-                pat_prob = pat.predict()
-                w = max(0.0, min(1.0, PATTERN_WEIGHT))
+
+                # 3️⃣ 動態權重（強趨勢時提高 Pattern 比重）
+                base_w = max(0.0, min(1.0, PATTERN_WEIGHT))
+                trend_strength = max(float(pat_prob[0]), float(pat_prob[1]))
+
+                if trend_strength > 0.62:
+                    w = min(0.55, base_w + 0.10)
+                else:
+                    w = base_w
+
+                # 4️⃣ 融合
                 p = (1.0 - w) * p + w * pat_prob
+                p = np.clip(p, 0.015, 0.97)
                 p = p / p.sum()
+
         except Exception as e:
             log.warning("pattern fusion failed: %s", e)
+
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
