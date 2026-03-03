@@ -1,5 +1,6 @@
+
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility + WinStreak + Stability + ContinuousPattern (2025-11-03+perf-guard+patch)"""
+"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -397,7 +398,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     return "\n".join(lines)
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80+winstreak+stability+continuous_pattern"
+VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -869,120 +870,192 @@ def debug_card_distribution() -> None:
     except Exception as ex:
         log.warning("debug_card_distribution error: %s", ex)
 
-# ---------- 主預測 (連續 Pattern 權重) ----------
+# ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
-
-    # ===== 正確 WinStreak 計算（平手不影響）=====
-    win_streak = sess.get("win_streak", 0)
-    prev_choice = sess.get("last_choice")  # 0=莊 1=閒
-
-    if b_pts != p_pts:                     # 只有分出勝負才更新 streak
-        actual = 0 if b_pts > p_pts else 1
-        if prev_choice is not None and actual == prev_choice:
-            win_streak += 1
-        else:
-            win_streak = 0
-        sess["win_streak"] = win_streak
-    # 平手時 streak 不變
-
-    # ===== PF 預測（原邏輯保留）=====
     over = get_stage_over(rounds_seen)
-    pf_obj = get_pf_for_uid(uid)
-    lk = _get_uid_lock(uid)
-
-    with lk:
-        if hasattr(pf_obj, "update_outcome"):
-            if p_pts == b_pts:
-                if not SKIP_TIE_UPD:
-                    pf_obj.update_outcome(2)
-            else:
-                outcome = 0 if b_pts > p_pts else 1
-                pf_obj.update_outcome(outcome)
-
-        sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+    pf_probs: Optional[np.ndarray] = None
+    soft_probs: Optional[np.ndarray] = None
+    sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+    sims_used = sims_base
+    if PF_STATEFUL == 1:
+        pf_obj = get_pf_for_uid(uid)
+        lk = _get_uid_lock(uid)
+        with lk:
+            try:
+                if hasattr(pf_obj, "update_outcome"):
+                    if (p_pts == b_pts):
+                        if not SKIP_TIE_UPD:
+                            try:
+                                pf_obj.update_outcome(2)
+                            except Exception:
+                                pf_obj.update_outcome("T")
+                    else:
+                        outcome = 0 if b_pts > p_pts else 1
+                        try:
+                            pf_obj.update_outcome(outcome)
+                        except Exception:
+                            pf_obj.update_outcome("B" if outcome == 0 else "P")
+            except Exception as e:
+                log.warning("PF.update_outcome failed: %s", e)
+            try:
+                upd_sims_val = over.get("PF_UPD_SIMS")
+                if upd_sims_val is None:
+                    upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+                if hasattr(pf_obj, "sims_lik"):
+                    pf_obj.sims_lik = int(float(upd_sims_val))
+            except Exception as e:
+                log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+            sims_used = _tuned_pred_sims(sims_base, pf_obj)
+            p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
+            pf_probs = p.copy()
+    else:
+        try:
+            pf_obj = _build_new_pf()
+        except Exception as e:
+            log.error("PF 初始化失敗(stateless): %s", e)
+            pf_obj = SmartDummyPF()
+        try:
+            upd_sims_val = over.get("PF_UPD_SIMS")
+            if upd_sims_val is None:
+                upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+            if hasattr(pf_obj, "sims_lik"):
+                pf_obj.sims_lik = int(float(upd_sims_val))
+        except Exception as e:
+            log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
         sims_used = _tuned_pred_sims(sims_base, pf_obj)
         p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
-
-    # ===== Soft =====
+        pf_probs = p.copy()
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
-
-    # ===== 先取得 Pattern 並更新歷史（用於 stability 計算）=====
-    pat = None
-    if PATTERN_ENABLE == 1 and PatternModel is not None:
-        pat = get_pattern_for_uid(uid)
-        if pat:
-            if p_pts == b_pts:
-                pat.update(2)
-            else:
-                pat.update(0 if b_pts > p_pts else 1)
-
-    # ===== 計算 Stability（使用 pat.history）=====
-    stability_score = 0.5
-    try:
-        if pat and hasattr(pat, "history"):
-            h = list(pat.history)
-            if len(h) >= 12:
-                switches = sum(1 for i in range(1, len(h)) if h[i] != h[i-1])
-                switch_rate = switches / len(h)
-
-                runs = []
-                cur = 1
-                for i in range(1, len(h)):
-                    if h[i] == h[i-1]:
-                        cur += 1
-                    else:
-                        runs.append(cur)
-                        cur = 1
-                runs.append(cur)
-                avg_run = float(np.mean(runs))
-
-                # 正規化穩定分數
-                stability_score = min(1.0, max(0.0, (avg_run / 4.0) * (1.0 - switch_rate)))
-    except Exception:
-        pass
-
-    if stability_score < 0.25:
-        sess["rounds_seen"] = rounds_seen + 1
-        sess["last_choice"] = None          # 觀望時清除上次預測，避免影響下一局連勝
-        return p, "觀望", 0, "⚪ 亂流區域強制觀望"
-
-    # ===== Pattern 融合（連續權重）=====
-    if pat is not None:
+    soft_probs = p.copy()
+    if SHOW_RAW_PROBS:
         try:
-            pat_prob = pat.predict()
-            # 連續權重：基礎權重 * (0.5 + stability_score)，再限制在 [0,1]
-            dynamic_weight = PATTERN_WEIGHT * (0.5 + stability_score)
-            dynamic_weight = max(0.0, min(1.0, dynamic_weight))
-            p = (1.0 - dynamic_weight) * p + dynamic_weight * pat_prob
+            if pf_probs is not None:
+                log.info("[DEBUG-PF] PF原始: 莊=%.4f, 閒=%.4f", float(pf_probs[0]), float(pf_probs[1]))
+                log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
+        except Exception:
+            pass
+    if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
+        try:
+            stage_scale = _depl_stage_scale(rounds_seen)
+            raw_alpha = DEPL_FACTOR * stage_scale
+            alpha = max(0.0, min(0.55, float(raw_alpha)))
+            if alpha > 0.0:
+                before_deplete = p.copy()
+                if SHOW_RAW_PROBS:
+                    log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
+                counts = init_counts(int(os.getenv("DECKS", "8")))
+                dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
+                dep = probs_after_points(
+                    counts,
+                    p_pts,
+                    b_pts,
+                    sims=dep_sims,
+                    deplete_factor=alpha
+                )
+                dep = np.asarray(dep, dtype=np.float32)
+                depT = float(dep[2])
+                if depT < TIE_MIN:
+                    dep[2] = TIE_MIN
+                    sc = (1.0 - TIE_MIN) / (1.0 - depT) if depT < 1.0 else 1.0
+                    dep[0] *= sc
+                    dep[1] *= sc
+                elif depT > TIE_MAX:
+                    dep[2] = TIE_MAX
+                    sc = (1.0 - TIE_MAX) / (1.0 - depT) if depT < 1.0 else 1.0
+                    dep[0] *= sc
+                    dep[1] *= sc
+                dep = dep / dep.sum()
+                mix = (1.0 - alpha) * p + alpha * dep
+                mix = mix / mix.sum()
+                p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
+                after_deplete = p.copy()
+                if SHOW_RAW_PROBS:
+                    log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
+                    delta_B = float(after_deplete[0] - before_deplete[0])
+                    delta_P = float(after_deplete[1] - before_deplete[1])
+                    log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
+                    log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
+        except Exception as e:
+            log.warning("Deplete 失敗，改 PF 單模：%s", e)
+    if COMPAT_MODE == 0:
+        theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
+        if theo_blend > 0.0:
+            if SHOW_RAW_PROBS:
+                before_theo = p.copy()
+            theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+            p = (1.0 - theo_blend) * p + theo_blend * theo
             p = p / p.sum()
+            if SHOW_RAW_PROBS:
+                after_theo = p.copy()
+                log.info("[DEBUG-B4-THEO] 理論混合前: 莊=%.4f, 閒=%.4f", float(before_theo[0]), float(before_theo[1]))
+                log.info("[DEBUG-AFT-THEO] 理論混合後: 莊=%.4f, 閒=%.4f", float(after_theo[0]), float(after_theo[1]))
+        if SHOW_RAW_PROBS:
+            log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+        tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
+        if TIE_CAP_ENABLE == 1:
+            if p[2] > tie_max:
+                if SHOW_RAW_PROBS:
+                    before_tiecap = p.copy()
+                sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+                p[2] = tie_max
+                p[0] *= sc
+                p[1] *= sc
+                p = p / p.sum()
+                if SHOW_RAW_PROBS:
+                    after_tiecap = p.copy()
+                    log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
+                    log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
+        if p[2] < TIE_MIN:
+            sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+            p[2] = TIE_MIN
+            p[0] *= sc
+            p[1] *= sc
+            p = p / p.sum()
+        if SHOW_RAW_PROBS:
+            log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+    p = _apply_prob_bias(p, over)
+    if PATTERN_ENABLE == 1 and PatternModel is not None:
+        try:
+            pat = get_pattern_for_uid(uid)
+            if pat:
+                if p_pts == b_pts:
+                    pat.update(2)
+                else:
+                    pat.update(0 if b_pts > p_pts else 1)
+                pat_prob = pat.predict()
+                w = max(0.0, min(1.0, PATTERN_WEIGHT))
+                p = (1.0 - w) * p + w * pat_prob
+                p = p / p.sum()
         except Exception as e:
             log.warning("pattern fusion failed: %s", e)
-
-    # ===== 決策 =====
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
+        if COMPAT_MODE == 0:
+            if "MIN_CONF_FOR_ENTRY" in over:
+                globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
+            if "EDGE_ENTER" in over:
+                globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
+            if "PROB_MARGIN" in over:
+                globals()["PROB_MARGIN"] = float(over["PROB_MARGIN"])
         choice, edge, bet_pct, reason = decide_only_bp(p, over)
     finally:
         globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
         globals()["EDGE_ENTER"] = _EDGE_ENTER
         globals()["PROB_MARGIN"] = _PROB_MARGIN
-
-    # ===== WinStreak 放大（現在是正確計算後才放大）=====
-    if choice != "觀望":
-        if win_streak >= 2:
-            bet_pct *= 1.35
-            bet_pct = min(1.0, bet_pct)
-
-        # 記錄本局預測，給下一局比對
-        sess["last_choice"] = 0 if choice == "莊" else 1
-
     bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
-
     sess["rounds_seen"] = rounds_seen + 1
-
+    if LOG_DECISION or SHOW_CONF_DEBUG:
+        log.info(
+            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
+            choice, edge, bet_pct * 100, sess["rounds_seen"],
+            int(sims_base), int(sims_used),
+            uid, PF_STATEFUL, reason
+        )
     return p, choice, bet_amt, reason
 
 # ---------- LINE：完整互動 ----------
