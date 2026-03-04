@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-優化版 pfilter.py — 已完整修正 backend + NoneType % 錯誤
+優化版 pfilter.py — 已修正抽牌錯誤 + backend + NoneType 防護
 """
 import os
 import numpy as np
@@ -22,7 +22,7 @@ class OutcomePF:
                  n_particles: int = 2000,
                  sims_lik: int = 300,
                  resample_thr: float = 0.4,
-                 backend: str = 'numpy',          # 必須保留，server.py 會傳這個參數
+                 backend: str = 'numpy',
                  dirichlet_eps: float = 1e-5):
         self.decks = decks
         self.n_particles = n_particles
@@ -33,40 +33,33 @@ class OutcomePF:
         self.lik_denom = sims_lik + 3 * dirichlet_eps
         if seed is not None:
             np.random.seed(seed)
-
-        # 使用固定形狀 NumPy 陣列
         self.base_counts = np.zeros(10, dtype=np.int32)
         self.base_counts[0] = 16 * decks
         self.base_counts[1:10] = 4 * decks
-        self.particles = np.tile(self.base_counts, (n_particles, 1))  # (n_particles, 10)
+        self.particles = np.tile(self.base_counts, (n_particles, 1))
         self.weights = np.ones(n_particles, dtype=np.float64) / n_particles
 
     def _simulate_round(self, counts: np.ndarray) -> int:
-        # 快速加權抽牌
-        probs = counts.astype(np.float64)
-        probs /= probs.sum() + 1e-12
-        draws = np.random.choice(10, size=4, replace=False, p=probs)
-        temp_counts = counts.copy()
-        for d in draws:
-            temp_counts[d] -= 1
-
+        temp = counts.copy()
+        draws = []
+        for _ in range(4):  # 逐張抽，允許重複點數
+            probs = temp.astype(np.float64)
+            probs /= probs.sum() + 1e-12
+            d = np.random.choice(10, p=probs)
+            temp[d] -= 1
+            draws.append(d)
         player_total = (draws[0] + draws[2]) % 10
         banker_total = (draws[1] + draws[3]) % 10
-
         if player_total in (8, 9) or banker_total in (8, 9):
             return 1 if player_total > banker_total else (0 if player_total < banker_total else 2)
-
         player_third = None
         if player_total <= 5:
-            probs_third = temp_counts.astype(np.float64)
+            probs_third = temp.astype(np.float64)
             probs_third /= probs_third.sum() + 1e-12
             player_third = np.random.choice(10, p=probs_third)
-            temp_counts[player_third] -= 1
+            temp[player_third] -= 1
             player_total = (player_total + player_third) % 10
-
-        # === 關鍵修正：防止 NoneType % 10 錯誤 ===
         pt = player_third % 10 if player_third is not None else -1
-
         banker_draw = False
         if banker_total <= 2:
             banker_draw = True
@@ -78,13 +71,11 @@ class OutcomePF:
             banker_draw = True
         elif banker_total == 6 and player_third is not None and pt in (6, 7):
             banker_draw = True
-
         if banker_draw:
-            probs_third = temp_counts.astype(np.float64)
+            probs_third = temp.astype(np.float64)
             probs_third /= probs_third.sum() + 1e-12
             banker_third = np.random.choice(10, p=probs_third)
             banker_total = (banker_total + banker_third) % 10
-
         return 1 if player_total > banker_total else (0 if player_total < banker_total else 2)
 
     def predict(self, sims_per_particle: int = None, rounds_seen: int | None = None) -> np.ndarray:
