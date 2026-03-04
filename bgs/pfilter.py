@@ -22,7 +22,7 @@ class OutcomePF:
                  n_particles: int = 2000,
                  sims_lik: int = 300,
                  resample_thr: float = 0.4,
-                 backend: str = 'numpy',          # 新增，接收 backend 參數
+                 backend: str = 'numpy',          # 修正：接收 backend 參數
                  dirichlet_eps: float = 1e-5):
         self.decks = decks
         self.n_particles = n_particles
@@ -37,7 +37,7 @@ class OutcomePF:
         self.base_counts = np.zeros(10, dtype=np.int32)
         self.base_counts[0] = 16 * decks
         self.base_counts[1:10] = 4 * decks
-        self.particles = np.tile(self.base_counts, (n_particles, 1)) # (n_particles, 10)
+        self.particles = np.tile(self.base_counts, (n_particles, 1))  # (n_particles, 10)
         self.weights = np.ones(n_particles, dtype=np.float64) / n_particles
 
     def _simulate_round(self, counts: np.ndarray) -> int:
@@ -60,15 +60,16 @@ class OutcomePF:
             temp_counts[player_third] -= 1
             player_total = (player_total + player_third) % 10
         banker_draw = False
+        pt = player_third % 10 if player_third is not None else -1
         if banker_total <= 2:
             banker_draw = True
-        elif banker_total == 3 and (player_third is None or player_third % 10 != 8):
+        elif banker_total == 3 and (player_third is None or pt != 8):
             banker_draw = True
-        elif banker_total == 4 and 2 <= (player_third % 10) <= 7:
+        elif banker_total == 4 and 2 <= pt <= 7:
             banker_draw = True
-        elif banker_total == 5 and 4 <= (player_third % 10) <= 7:
+        elif banker_total == 5 and 4 <= pt <= 7:
             banker_draw = True
-        elif banker_total == 6 and (player_third is not None and player_third % 10 in (6, 7)):
+        elif banker_total == 6 and player_third is not None and pt in (6, 7):
             banker_draw = True
         if banker_draw:
             probs_third = temp_counts.astype(np.float64)
