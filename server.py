@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Independent + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+perf-guard)"""
+"""server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+pure-pf-optimized) + 3 PATCHES"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
-from collections import deque   # GRU 需要
 
 # 先定義 env_flag，避免頂層呼叫時 NameError
 def env_flag(name: str, default: int = 1) -> int:
@@ -19,165 +18,6 @@ def env_flag(name: str, default: int = 1) -> int:
         return 1 if int(float(v)) != 0 else 0
     except Exception:
         return 1 if default else 0
-
-# ===== PATTERN MODEL PATCH START =====
-try:
-    from pattern import PatternModel   # 優先使用你最新的 pattern.py
-except Exception:
-    # 備用 HybridGRU（完全相容）
-    class GRUModel:
-        def __init__(self, lookback=40):
-            self.history = deque(maxlen=lookback)
-            self.trend_threshold = 2.45
-            self.chop_threshold = 0.64
-            self.trend_boost = 0.105
-            self.chop_boost = 0.085
-            self.chaos_boost = 0.045
-
-        def update(self, outcome):
-            if isinstance(outcome, str):
-                mapping = {'B':0, 'P':1, 'T':2, 'b':0, 'p':1, 't':2}
-                outcome = mapping.get(outcome.upper(), outcome)
-            self.history.append(outcome)
-
-        def load_history(self, seq):
-            self.history.clear()
-            for s in seq[-self.history.maxlen:]:
-                self.history.append(s)
-
-        def undo(self):
-            if len(self.history) > 0:
-                self.history.pop()
-
-        def meta_state(self):
-            if len(self.history) < 12:
-                return "CHAOS"
-            h = list(self.history)
-            switches = sum(1 for i in range(1, len(h)) if h[i] != h[i-1])
-            switch_rate = switches / len(h)
-            runs = []
-            cur = 1
-            for i in range(1, len(h)):
-                if h[i] == h[i-1]:
-                    cur += 1
-                else:
-                    runs.append(cur)
-                    cur = 1
-            runs.append(cur)
-            avg_run = np.mean(runs)
-            if avg_run >= self.trend_threshold:
-                return "TREND"
-            if switch_rate > self.chop_threshold:
-                return "CHOP"
-            return "CHAOS"
-
-        def predict(self):
-            if len(self.history) < 8:
-                return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-
-            meta_probs = self._meta_predict()
-            pattern_probs = self.detect_pattern()
-            pf_probs = self.particle_predict()
-
-            final = (meta_probs + pattern_probs + pf_probs) / 3.0
-            if final[2] < 0.085:
-                final[2] = 0.092
-            final = final / final.sum()
-            return final.astype(np.float32)
-
-        def _meta_predict(self):
-            h = np.array(self.history)
-            total = len(h)
-            pB = np.sum(h == 0) / total
-            pP = np.sum(h == 1) / total
-            pT = np.sum(h == 2) / total
-
-            streak = 1
-            last = h[-1]
-            for i in range(2, min(12, len(h))+1):
-                if h[-i] == last:
-                    streak += 1
-                else:
-                    break
-
-            state = self.meta_state()
-            if state == "TREND":
-                boost = self.trend_boost * (1 + (streak-2)*0.12)
-                if last == 0: pB += boost
-                elif last == 1: pP += boost
-                else: pB += boost*0.6
-            elif state == "CHOP":
-                if last == 0: pP += self.chop_boost
-                elif last == 1: pB += self.chop_boost
-                else: pT += self.chop_boost*0.8
-            else:
-                if last == 0: pB += self.chaos_boost
-                elif last == 1: pP += self.chaos_boost*0.9
-
-            probs = np.array([pB, pP, pT])
-            probs = np.clip(probs, 0.01, 0.98)
-            return probs / probs.sum()
-
-        def detect_pattern(self):
-            if len(self.history) < 8:
-                return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            h = np.array(self.history)
-            last3 = h[-3:]
-            pB, pP, pT = 0.45, 0.44, 0.11
-            if np.all(last3 == 0):
-                pB += 0.12
-            elif np.all(last3 == 1):
-                pP += 0.12
-            elif np.all(last3 == [0,1,0]) or np.all(last3 == [1,0,1]):
-                pB, pP = pP + 0.08, pB + 0.08
-            elif len(h) >= 5 and np.sum(h[-5:] == h[-1]) >= 4:
-                if h[-1] == 0:
-                    pB += 0.09
-                elif h[-1] == 1:
-                    pP += 0.09
-            probs = np.array([pB, pP, pT])
-            return probs / probs.sum()
-
-        def particle_predict(self):
-            particles = []
-            for _ in range(10):
-                bias = np.random.normal(0, 0.03)
-                particles.append([0.46 + bias, 0.44 - bias, 0.10])
-            weights = np.ones(10)
-            if len(self.history) >= 5:
-                recent = np.array(self.history)[-5:]
-                for i, p in enumerate(particles):
-                    pred = np.argmax(p)
-                    weights[i] = np.sum(recent == pred) / 5 + 0.1
-            weights /= weights.sum()
-            final = np.average(particles, axis=0, weights=weights)
-            return np.clip(final, 0.01, 0.98)
-
-    PatternModel = GRUModel
-
-PATTERN_ENABLE = env_flag("PATTERN_ENABLE", 1)
-PATTERN_WEIGHT = float(os.getenv("PATTERN_WEIGHT", "0.45"))   # 已調高至 0.45
-PATTERN_LOOKBACK = int(os.getenv("PATTERN_LOOKBACK", "40"))   # 已改成40
-
-_PATTERN_STORE: Dict[str, Any] = {}
-_PATTERN_GUARD = threading.Lock()
-
-def get_pattern_for_uid(uid: str):
-    if not uid:
-        uid = "anon"
-    with _PATTERN_GUARD:
-        m = _PATTERN_STORE.get(uid)
-        if m is None and PatternModel:
-            m = PatternModel(PATTERN_LOOKBACK)
-            _PATTERN_STORE[uid] = m
-        return m
-
-def reset_pattern_for_uid(uid: str):
-    if not uid:
-        uid = "anon"
-    with _PATTERN_GUARD:
-        _PATTERN_STORE.pop(uid, None)
-# ===== PATTERN MODEL PATCH END =====
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -240,7 +80,6 @@ else:
         log.warning("redis module not available; using in-memory session store.")
     elif not REDIS_URL:
         log.warning("REDIS_URL not set. Using in-memory session store.")
-
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
 KV_FALLBACK: Dict[str, str] = {}
 SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1200"))
@@ -397,7 +236,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     return "\n".join(lines)
 
 # ---------- 版本 ----------
-VERSION = "bgs-independent-2025-11-03+stage+LINE+compat+perfguard+bgpush+429patch+trialfix+blocktrial+probdisplayfix+tiecapprobpure+statelesspf+probdecidesafety+linenostuck+predsimscap80"
+VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+3patches"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -406,16 +245,13 @@ if _flask_available and Flask is not None:
 else:
     class _DummyApp:
         def get(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def post(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def options(self, *a, **k):
-            def _d(f):
-                return f
+            def _d(f): return f
             return _d
         def run(self, *a, **k):
             log.warning("Flask not available; cannot run HTTP server.")
@@ -431,7 +267,6 @@ HISTORY_MODE = env_flag("HISTORY_MODE", 0)
 TIE_CAP_ENABLE = env_flag("TIE_CAP_ENABLE", 1)
 SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)
-
 OutcomePF = None
 pf_initialized = False
 try:
@@ -496,7 +331,7 @@ def _build_new_pf() -> Any:
     return OutcomePF(
         decks=int(os.getenv("DECKS", "8")),
         seed=int(os.getenv("SEED", "42")),
-        n_particles=int(os.getenv("PF_N", "50")),
+        n_particles=int(os.getenv("PF_N", "220")),
         sims_lik=int(os.getenv("PF_UPD_SIMS", "30")),
         resample_thr=float(os.getenv("PF_RESAMPLE", "0.5")),
         backend=PF_BACKEND,
@@ -653,6 +488,10 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason.append("模式=ev")
     conf = max(pB, pP)
+    # PATCH 2: edge too small 過濾
+    edge = abs(pB - pP)
+    if edge < 0.012:
+        return ("觀望", edge, 0.0, "edge too small")
     if conf < MIN_CONF_FOR_ENTRY:
         reason.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.3f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
@@ -739,9 +578,9 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 # ---------- 預測效能保護 ----------
 def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
     try:
-        cap = int(float(os.getenv("PRED_SIMS_CAP", "80")))
+        cap = int(float(os.getenv("PRED_SIMS_CAP", "95")))
     except Exception:
-        cap = 80
+        cap = 95
     n = max(1, min(int(base), int(cap)))
     guard_enable = env_flag("PRED_GUARD_ENABLE", 1)
     if guard_enable != 1:
@@ -929,6 +768,11 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
     soft_probs = p.copy()
+    # PATCH 1: Bayesian smoothing
+    alpha = 0.08
+    theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+    p = (1 - alpha) * p + alpha * theo
+    p = p / p.sum()
     if SHOW_RAW_PROBS:
         try:
             if pf_probs is not None:
@@ -1018,38 +862,12 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
     p = _apply_prob_bias(p, over)
-
-    # ===== Pattern 融合（修正版：避免 look-ahead + 動態權重） =====
-    if PATTERN_ENABLE == 1 and PatternModel is not None:
-        try:
-            pat = get_pattern_for_uid(uid)
-            if pat:
-                # 1️⃣ 先用舊歷史預測（避免資料洩漏）
-                pat_prob = pat.predict()
-
-                # 2️⃣ 再更新本局結果
-                if p_pts == b_pts:
-                    pat.update(2)
-                else:
-                    pat.update(0 if b_pts > p_pts else 1)
-
-                # 3️⃣ 動態權重（強趨勢時提高 Pattern 比重）
-                base_w = max(0.0, min(1.0, PATTERN_WEIGHT))
-                trend_strength = max(float(pat_prob[0]), float(pat_prob[1]))
-
-                if trend_strength > 0.62:
-                    w = min(0.55, base_w + 0.10)
-                else:
-                    w = base_w
-
-                # 4️⃣ 融合
-                p = (1.0 - w) * p + w * pat_prob
-                p = np.clip(p, 0.015, 0.97)
-                p = p / p.sum()
-
-        except Exception as e:
-            log.warning("pattern fusion failed: %s", e)
-
+    # PATCH 3: anti-bias clamp
+    if abs(p[0] - p[1]) > 0.08:
+        mid = (p[0] + p[1]) / 2
+        p[0] = mid + (p[0]-mid)*0.6
+        p[1] = mid + (p[1]-mid)*0.6
+        p = p / p.sum()
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
@@ -1258,7 +1076,6 @@ try:
     if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
         @line_handler.add(UnfollowEvent)
         def on_unfollow(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1270,7 +1087,6 @@ try:
                 log.info("[TRIAL] user unfollowed -> blocked=1 expired=1 uid=%s", uid)
             except Exception as e:
                 log.warning("[TRIAL] unfollow handler error: %s", e)
-
         @line_handler.add(FollowEvent)
         def on_follow(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1333,7 +1149,6 @@ try:
                     )
             _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
-
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1370,7 +1185,6 @@ try:
                         "pending": False, "pending_seq": 0}
                 try:
                     reset_pf_for_uid(uid)
-                    reset_pattern_for_uid(uid)
                 except Exception:
                     pass
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
@@ -1388,13 +1202,6 @@ try:
                         seq.append(2)
                 try:
                     reset_pf_for_uid(uid)
-                except Exception:
-                    pass
-                try:
-                    reset_pattern_for_uid(uid)
-                    pat = get_pattern_for_uid(uid)
-                    if pat:
-                        pat.load_history(seq)
                 except Exception:
                     pass
                 sess["rounds_seen"] = len(seq)
@@ -1590,13 +1397,11 @@ if __name__ == "__main__":
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
         "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
-        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PRED_SIMS_MAX_PF300=%s, PRED_SIMS_MAX_PF350=%s)",
+        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PF_N=220)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
         PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
         LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
-        os.getenv("PRED_SIMS_CAP", "80"),
-        os.getenv("PRED_SIMS_MAX_PF300", "35"),
-        os.getenv("PRED_SIMS_MAX_PF350", "25"),
+        os.getenv("PRED_SIMS_CAP", "95"),
     )
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
