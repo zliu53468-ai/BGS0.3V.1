@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+pure-pf-optimized) + 3 PATCHES"""
+"""server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+pure-pf-optimized) + STABILITY PATCH"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
@@ -29,18 +29,18 @@ DEPLETE_OK = False
 init_counts = None
 probs_after_points = None
 try:
-    from deplete import init_counts, probs_after_points # type: ignore
+    from deplete import init_counts, probs_after_points  # type: ignore
     DEPLETE_OK = True
 except Exception:
     try:
-        from bgs.deplete import init_counts, probs_after_points # type: ignore
+        from bgs.deplete import init_counts, probs_after_points  # type: ignore
         DEPLETE_OK = True
     except Exception:
         try:
             _cur_dir = os.path.dirname(os.path.abspath(__file__))
             if _cur_dir not in sys.path:
                 sys.path.insert(0, _cur_dir)
-            from deplete import init_counts, probs_after_points # type: ignore
+            from deplete import init_counts, probs_after_points  # type: ignore
             DEPLETE_OK = True
         except Exception:
             DEPLETE_OK = False
@@ -66,6 +66,7 @@ try:
     import redis
 except Exception:
     redis = None
+
 REDIS_URL = os.getenv("REDIS_URL")
 redis_client: Optional["redis.Redis"] = None
 if redis is not None and REDIS_URL:
@@ -80,6 +81,7 @@ else:
         log.warning("redis module not available; using in-memory session store.")
     elif not REDIS_URL:
         log.warning("REDIS_URL not set. Using in-memory session store.")
+
 SESS_FALLBACK: Dict[str, Dict[str, Any]] = {}
 KV_FALLBACK: Dict[str, str] = {}
 SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "1200"))
@@ -236,7 +238,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     return "\n".join(lines)
 
 # ---------- 版本 ----------
-VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+3patches"
+VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+stability-patch"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -269,6 +271,7 @@ SHOW_RAW_PROBS = env_flag("SHOW_RAW_PROBS", 0)
 PF_STATEFUL = env_flag("PF_STATEFUL", 1)
 OutcomePF = None
 pf_initialized = False
+
 try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
@@ -315,6 +318,17 @@ _PF_STORE: Dict[str, Any] = {}
 _PF_LOCKS: Dict[str, threading.Lock] = {}
 _PF_STORE_GUARD = threading.Lock()
 
+# ===== SAFE FAST CACHE（只快取相同輸入，不跳過模型）=====
+RESULT_CACHE: Dict[str, Tuple[np.ndarray, str, int, str]] = {}
+RESULT_CACHE_KEY: Dict[str, str] = {}
+RESULT_CACHE_LOCK = threading.Lock()
+
+def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> str:
+    rounds_seen = int(sess.get("rounds_seen", 0))
+    bankroll = int(sess.get("bankroll", 0))
+    pf_stateful = int(PF_STATEFUL)
+    return f"{uid}|r={rounds_seen}|p={p_pts}|b={b_pts}|bank={bankroll}|stateful={pf_stateful}"
+
 def _get_uid_lock(uid: str) -> threading.Lock:
     if not uid:
         uid = "anon"
@@ -359,7 +373,7 @@ def reset_pf_for_uid(uid: str) -> None:
         if uid in _PF_STORE:
             _PF_STORE.pop(uid, None)
 
-pf_initialized = True if (OutcomePF is not None) else True
+pf_initialized = (OutcomePF is not None)
 
 # ---------- 決策 / 配注 ----------
 DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()
@@ -712,10 +726,19 @@ def debug_card_distribution() -> None:
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
+
+    # ===== SAFE CACHE 命中（同局面重送時直接回傳，不改變模型邏輯）=====
+    cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
+    with RESULT_CACHE_LOCK:
+        if RESULT_CACHE_KEY.get(uid) == cache_key and uid in RESULT_CACHE:
+            cached = RESULT_CACHE[uid]
+            return cached[0].copy(), cached[1], int(cached[2]), str(cached[3])
+
     pf_probs: Optional[np.ndarray] = None
     soft_probs: Optional[np.ndarray] = None
     sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
     sims_used = sims_base
+
     if PF_STATEFUL == 1:
         pf_obj = get_pf_for_uid(uid)
         lk = _get_uid_lock(uid)
@@ -764,15 +787,18 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         sims_used = _tuned_pred_sims(sims_base, pf_obj)
         p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
         pf_probs = p.copy()
+
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
     p = p ** (1.0 / max(1e-6, soft_tau))
     p = p / p.sum()
     soft_probs = p.copy()
+
     # PATCH 1: Bayesian smoothing
     alpha = 0.08
     theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
     p = (1 - alpha) * p + alpha * theo
     p = p / p.sum()
+
     if SHOW_RAW_PROBS:
         try:
             if pf_probs is not None:
@@ -780,6 +806,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
         except Exception:
             pass
+
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
             stage_scale = _depl_stage_scale(rounds_seen)
@@ -823,6 +850,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
+
     if COMPAT_MODE == 0:
         theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
         if theo_blend > 0.0:
@@ -861,13 +889,16 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         if SHOW_RAW_PROBS:
             log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
                      float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+
     p = _apply_prob_bias(p, over)
+
     # PATCH 3: anti-bias clamp
     if abs(p[0] - p[1]) > 0.08:
         mid = (p[0] + p[1]) / 2
-        p[0] = mid + (p[0]-mid)*0.6
-        p[1] = mid + (p[1]-mid)*0.6
+        p[0] = mid + (p[0] - mid) * 0.6
+        p[1] = mid + (p[1] - mid) * 0.6
         p = p / p.sum()
+
     _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
     try:
         if COMPAT_MODE == 0:
@@ -882,8 +913,10 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
         globals()["EDGE_ENTER"] = _EDGE_ENTER
         globals()["PROB_MARGIN"] = _PROB_MARGIN
+
     bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
     sess["rounds_seen"] = rounds_seen + 1
+
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
             "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
@@ -891,6 +924,12 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             int(sims_base), int(sims_used),
             uid, PF_STATEFUL, reason
         )
+
+    # ===== 存快取（關鍵）=====
+    with RESULT_CACHE_LOCK:
+        RESULT_CACHE[uid] = (p.copy(), choice, bet_amt, reason)
+        RESULT_CACHE_KEY[uid] = cache_key
+
     return p, choice, bet_amt, reason
 
 # ---------- LINE：完整互動 ----------
@@ -903,7 +942,7 @@ TRIAL_NAMESPACE = os.getenv("TRIAL_NAMESPACE", "default").strip() or "default"
 LINE_PUSH_ENABLE = env_flag("LINE_PUSH_ENABLE", 1)
 LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 * 24 * 3600)))
 _PUSH_BLOCK_UNTIL = 0
-LINE_ASYNC_HEAVY = env_flag("LINE_ASYNC_HEAVY", 1)
+LINE_ASYNC_HEAVY = env_flag("LINE_ASYNC_HEAVY", 0)
 
 def _can_push() -> bool:
     global _PUSH_BLOCK_UNTIL
@@ -1076,6 +1115,7 @@ try:
     if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
         line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
         @line_handler.add(UnfollowEvent)
         def on_unfollow(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1087,6 +1127,7 @@ try:
                 log.info("[TRIAL] user unfollowed -> blocked=1 expired=1 uid=%s", uid)
             except Exception as e:
                 log.warning("[TRIAL] unfollow handler error: %s", e)
+
         @line_handler.add(FollowEvent)
         def on_follow(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1149,6 +1190,7 @@ try:
                     )
             _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
+
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):
             if not _dedupe_event(_extract_line_event_id(event)):
@@ -1158,6 +1200,7 @@ try:
             text = re.sub(r"\s+", " ", raw.replace("\u3000", " ").strip())
             sess = get_session(uid)
             up = text.upper()
+
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
@@ -1171,11 +1214,13 @@ try:
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess)
                 return
+
             guard = trial_persist_guard(uid)
             if guard and not sess.get("premium", False):
                 _reply(line_api, event.reply_token, guard)
                 save_session(uid, sess)
                 return
+
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
@@ -1187,9 +1232,13 @@ try:
                     reset_pf_for_uid(uid)
                 except Exception:
                     pass
+                with RESULT_CACHE_LOCK:
+                    RESULT_CACHE.pop(uid, None)
+                    RESULT_CACHE_KEY.pop(uid, None)
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
+
             hist_match = re.fullmatch(r"[BPTHbpht]{6,30}", text)
             if hist_match:
                 seq = []
@@ -1204,6 +1253,9 @@ try:
                     reset_pf_for_uid(uid)
                 except Exception:
                     pass
+                with RESULT_CACHE_LOCK:
+                    RESULT_CACHE.pop(uid, None)
+                    RESULT_CACHE_KEY.pop(uid, None)
                 sess["rounds_seen"] = len(seq)
                 save_session(uid, sess)
                 _reply(
@@ -1212,6 +1264,7 @@ try:
                     "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5"
                 )
                 return
+
             pts = parse_last_hand_points(text)
             if text == "遊戲設定" or up == "GAME SETTINGS":
                 sess["phase"] = "choose_game"
@@ -1223,6 +1276,7 @@ try:
                 _reply(line_api, event.reply_token, game_menu_text(left))
                 save_session(uid, sess)
                 return
+
             if sess.get("phase") == "choose_game":
                 m = re.match(r"^\s*(\d+)", text)
                 if m and (m.group(1) in GAMES):
@@ -1234,6 +1288,7 @@ try:
                     return
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
                 return
+
             if sess.get("phase") == "input_bankroll":
                 num = re.sub(r"[^\d]", "", text)
                 amt = int(num) if num else 0
@@ -1249,6 +1304,7 @@ try:
                 )
                 save_session(uid, sess)
                 return
+
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
                 if (LINE_ASYNC_HEAVY == 1) and _can_push():
@@ -1290,6 +1346,7 @@ try:
                         log.exception("[LINE] sync predict failed: %s", e)
                         _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
                     return
+
             _reply(
                 line_api,
                 event.reply_token,
