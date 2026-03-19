@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility (2025-11-03+pure-pf-optimized) + STABILITY PATCH"""
+"""server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility + Stability + Advanced Control"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
 
-# 先定義 env_flag，避免頂層呼叫時 NameError
 def env_flag(name: str, default: int = 1) -> int:
     val = os.getenv(name)
     if val is None:
@@ -19,12 +18,11 @@ def env_flag(name: str, default: int = 1) -> int:
     except Exception:
         return 1 if default else 0
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 np.seterr(all="ignore")
 
-# ---------- 安全導入 deplete ----------
+# ---------- deplete ----------
 DEPLETE_OK = False
 init_counts = None
 probs_after_points = None
@@ -153,8 +151,7 @@ def _premium_key(uid: str) -> str:
 def is_premium(uid: str) -> bool:
     if not uid:
         return False
-    val = _rget(_premium_key(uid))
-    return val == "1"
+    return _rget(_premium_key(uid)) == "1"
 
 def set_premium(uid: str, flag: bool = True) -> None:
     if not uid:
@@ -175,19 +172,21 @@ def get_session(uid: str) -> Dict[str, Any]:
                 sess = json.loads(raw)
                 if is_premium(uid):
                     sess["premium"] = True
-                if "pending" not in sess:
-                    sess["pending"] = False
-                if "pending_seq" not in sess:
-                    sess["pending_seq"] = 0
+                sess.setdefault("pending", False)
+                sess.setdefault("pending_seq", 0)
+                sess.setdefault("loss_streak", 0)
+                sess.setdefault("adv_history", [])
+                sess.setdefault("last_choice", None)
                 return sess
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
             if is_premium(uid):
                 sess["premium"] = True
-            if "pending" not in sess:
-                sess["pending"] = False
-            if "pending_seq" not in sess:
-                sess["pending_seq"] = 0
+            sess.setdefault("pending", False)
+            sess.setdefault("pending_seq", 0)
+            sess.setdefault("loss_streak", 0)
+            sess.setdefault("adv_history", [])
+            sess.setdefault("last_choice", None)
             return sess
     except Exception as e:
         log.warning("get_session error: %s", e)
@@ -202,6 +201,9 @@ def get_session(uid: str) -> Dict[str, Any]:
         "last_card_ts": None,
         "pending": False,
         "pending_seq": 0,
+        "loss_streak": 0,
+        "adv_history": [],
+        "last_choice": None,
     }
     save_session(uid, sess)
     return sess
@@ -237,8 +239,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
 
-# ---------- 版本 ----------
-VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+stability-patch"
+VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+advanced-control"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -259,7 +260,7 @@ else:
             log.warning("Flask not available; cannot run HTTP server.")
     app = _DummyApp()
 
-# ---------- PF（Outcome PF） ----------
+# ---------- PF ----------
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
 SKIP_TIE_UPD = env_flag("SKIP_TIE_UPD", 1)
 SOFT_TAU = float(os.getenv("SOFT_TAU", "2.0"))
@@ -291,7 +292,7 @@ except Exception:
 class SmartDummyPF:
     def __init__(self):
         log.warning("使用 SmartDummyPF 備援模式")
-        log.warning("⚠️ OutcomePF unavailable → SmartDummyPF fallback (PROBS MAY LOOK STATIC)")
+        log.warning("⚠️ OutcomePF unavailable → SmartDummyPF fallback")
     def update_outcome(self, outcome):
         return
     def predict(self, **kwargs) -> np.ndarray:
@@ -318,7 +319,6 @@ _PF_STORE: Dict[str, Any] = {}
 _PF_LOCKS: Dict[str, threading.Lock] = {}
 _PF_STORE_GUARD = threading.Lock()
 
-# ===== SAFE FAST CACHE（只快取相同輸入，不跳過模型）=====
 RESULT_CACHE: Dict[str, Tuple[np.ndarray, str, int, str]] = {}
 RESULT_CACHE_KEY: Dict[str, str] = {}
 RESULT_CACHE_LOCK = threading.Lock()
@@ -510,7 +510,6 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason.append("模式=ev")
     conf = max(pB, pP)
-    # PATCH 2: edge too small 過濾
     edge = abs(pB - pP)
     if edge < 0.012:
         return ("觀望", edge, 0.0, "edge too small")
@@ -637,10 +636,7 @@ def _safe_predict_probs(pf_obj: Any, sims_used: int, uid: str) -> Tuple[np.ndarr
     try:
         p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
         if p.shape != (3,) or (not np.isfinite(p).all()) or float(p.sum()) <= 0:
-            raise ValueError(
-                f"invalid probs shape={getattr(p, 'shape', None)} "
-                f"sum={float(np.sum(p)) if hasattr(p, 'sum') else 'n/a'}"
-            )
+            raise ValueError(f"invalid probs shape={getattr(p, 'shape', None)} sum={float(np.sum(p))}")
         p = p / p.sum()
         return p.astype(np.float32), int(sims_used)
     except Exception as e:
@@ -687,7 +683,50 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (int(d[0]), int(d[1]))
     return None
 
-# Debug utilities
+# ---------- 進階策略控制器 ----------
+def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
+    history = sess.get("adv_history", [])
+    history.append(int(np.argmax(probs[:2])))
+    if len(history) > 20:
+        history.pop(0)
+    sess["adv_history"] = history
+
+    pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2])
+
+    # 轉折偵測
+    if len(history) >= 4:
+        if history[-1] != history[-2] and history[-2] == history[-3] == history[-4]:
+            return "OBSERVE", 0.03, "轉折保護"
+
+    # 連續同邊 anti-bias
+    if len(history) >= 5:
+        if all(x == history[-1] for x in history[-5:]):
+            if history[-1] == 0:
+                pB *= 0.85
+                pP *= 1.15
+            else:
+                pP *= 0.85
+                pB *= 1.15
+
+    probs2 = np.array([pB, pP, pT], dtype=np.float32)
+    probs2 /= probs2.sum()
+
+    # 波動偵測
+    if len(history) >= 6:
+        if np.std(history[-6:]) > 0.9:
+            return "OBSERVE", 0.025, "高波動"
+
+    loss = int(sess.get("loss_streak", 0))
+    if loss >= 3:
+        edge_enter = 0.025
+    elif abs(pB - pP) < 0.02:
+        edge_enter = 0.02
+    else:
+        edge_enter = 0.012
+
+    return probs2, edge_enter, "正常"
+
+# ---------- Debug ----------
 def test_deplete_biases() -> None:
     if not DEPLETE_OK or init_counts is None or probs_after_points is None:
         log.warning("test_deplete_biases called but deplete support is unavailable")
@@ -716,49 +755,17 @@ def test_deplete_biases() -> None:
                 pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2] if len(probs) > 2 else 0.0)
                 diff = pB - pP
                 bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
-                log.info(
-                    "%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)",
-                    name, pB, pP, pT, diff, bias
-                )
+                log.info("%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)", name, pB, pP, pT, diff, bias)
             except Exception as ex:
                 log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
     except Exception as ex:
         log.warning("test_deplete_biases error: %s", ex)
-
-def debug_card_distribution() -> None:
-    if not DEPLETE_OK or init_counts is None:
-        log.warning("debug_card_distribution called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        total_cards = sum(counts.values()) if isinstance(counts, dict) else sum(counts)
-        point_cards: Dict[int, int] = {}
-        if isinstance(counts, dict):
-            iterable = counts.items()
-        else:
-            iterable = enumerate(counts)
-        for card_value, count in iterable:
-            try:
-                val = int(card_value)
-            except Exception:
-                continue
-            point = min(10, val if val > 0 else 10)
-            point_cards[point] = point_cards.get(point, 0) + int(count)
-        log.info("牌組分布:")
-        for point in sorted(point_cards.keys()):
-            cnt = point_cards[point]
-            pct = (cnt / total_cards * 100.0) if total_cards else 0.0
-            log.info(" 點數 %s: %s 張 (%.1f%%)", point, cnt, pct)
-    except Exception as ex:
-        log.warning("debug_card_distribution error: %s", ex)
 
 # ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     rounds_seen = int(sess.get("rounds_seen", 0))
     over = get_stage_over(rounds_seen)
 
-    # ===== SAFE CACHE 命中（同局面重送時直接回傳，不改變模型邏輯）=====
     cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
     with RESULT_CACHE_LOCK:
         if RESULT_CACHE_KEY.get(uid) == cache_key and uid in RESULT_CACHE:
@@ -770,13 +777,21 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
     sims_used = sims_base
 
+    # 先用目前結果更新 loss streak（用上一輪建議去回頭檢查）
+    last_choice = sess.get("last_choice")
+    if last_choice in ("莊", "閒"):
+        if (last_choice == "莊" and p_pts > b_pts) or (last_choice == "閒" and b_pts > p_pts):
+            sess["loss_streak"] = int(sess.get("loss_streak", 0)) + 1
+        else:
+            sess["loss_streak"] = 0
+
     if PF_STATEFUL == 1:
         pf_obj = get_pf_for_uid(uid)
         lk = _get_uid_lock(uid)
         with lk:
             try:
                 if hasattr(pf_obj, "update_outcome"):
-                    if (p_pts == b_pts):
+                    if p_pts == b_pts:
                         if not SKIP_TIE_UPD:
                             try:
                                 pf_obj.update_outcome(2)
@@ -824,7 +839,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     p = p / p.sum()
     soft_probs = p.copy()
 
-    # PATCH 1: Bayesian smoothing
     alpha = 0.08
     theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
     p = (1 - alpha) * p + alpha * theo
@@ -849,13 +863,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
                 counts = init_counts(int(os.getenv("DECKS", "8")))
                 dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
-                dep = probs_after_points(
-                    counts,
-                    p_pts,
-                    b_pts,
-                    sims=dep_sims,
-                    deplete_factor=alpha
-                )
+                dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=alpha)
                 dep = np.asarray(dep, dtype=np.float32)
                 depT = float(dep[2])
                 if depT < TIE_MIN:
@@ -878,7 +886,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     delta_B = float(after_deplete[0] - before_deplete[0])
                     delta_P = float(after_deplete[1] - before_deplete[1])
                     log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
-                    log.info("[DEPLETE-EFFECT] 使莊 %s了機率", "增加" if delta_B > 0 else "減少")
         except Exception as e:
             log.warning("Deplete 失敗，改 PF 單模：%s", e)
 
@@ -923,30 +930,34 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     p = _apply_prob_bias(p, over)
 
-    # PATCH 3: anti-bias clamp
     if abs(p[0] - p[1]) > 0.08:
         mid = (p[0] + p[1]) / 2
         p[0] = mid + (p[0] - mid) * 0.6
         p[1] = mid + (p[1] - mid) * 0.6
         p = p / p.sum()
 
-    _MIN_CONF, _EDGE_ENTER, _PROB_MARGIN = MIN_CONF_FOR_ENTRY, EDGE_ENTER, PROB_MARGIN
-    try:
-        if COMPAT_MODE == 0:
-            if "MIN_CONF_FOR_ENTRY" in over:
-                globals()["MIN_CONF_FOR_ENTRY"] = float(over["MIN_CONF_FOR_ENTRY"])
-            if "EDGE_ENTER" in over:
-                globals()["EDGE_ENTER"] = float(over["EDGE_ENTER"])
-            if "PROB_MARGIN" in over:
-                globals()["PROB_MARGIN"] = float(over["PROB_MARGIN"])
-        choice, edge, bet_pct, reason = decide_only_bp(p, over)
-    finally:
-        globals()["MIN_CONF_FOR_ENTRY"] = _MIN_CONF
-        globals()["EDGE_ENTER"] = _EDGE_ENTER
-        globals()["PROB_MARGIN"] = _PROB_MARGIN
+    # 進階控制接入
+    ctrl = _advanced_control(sess, p)
+    if isinstance(ctrl[0], str):
+        choice = "觀望"
+        edge = 0.0
+        bet_pct = 0.0
+        reason = ctrl[2]
+    else:
+        p, dynamic_edge, ctrl_reason = ctrl
+        _EDGE_ENTER_BAK = EDGE_ENTER
+        try:
+            globals()["EDGE_ENTER"] = dynamic_edge
+            choice, edge, bet_pct, reason = decide_only_bp(p, over)
+        finally:
+            globals()["EDGE_ENTER"] = _EDGE_ENTER_BAK
+        reason = f"{reason} | {ctrl_reason}"
 
     bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
     sess["rounds_seen"] = rounds_seen + 1
+
+    # 連輸追蹤
+    sess["last_choice"] = choice
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
@@ -956,14 +967,13 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             uid, PF_STATEFUL, reason
         )
 
-    # ===== 存快取（關鍵）=====
     with RESULT_CACHE_LOCK:
         RESULT_CACHE[uid] = (p.copy(), choice, bet_amt, reason)
         RESULT_CACHE_KEY[uid] = cache_key
 
     return p, choice, bet_amt, reason
 
-# ---------- LINE：完整互動 ----------
+# ---------- LINE ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
@@ -1110,8 +1120,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         else:
             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                 cont=bool(CONTINUOUS_MODE))
+        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
         cur_seq = int(sess.get("pending_seq", 0))
         if cur_seq == int(seq):
             sess["last_card"] = msg
@@ -1122,10 +1131,7 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int):
         save_session(uid, sess)
         if _can_push():
             try:
-                line_api.push_message(
-                    uid,
-                    TextSendMessage(text=msg, quick_reply=_quick_buttons())
-                )
+                line_api.push_message(uid, TextSendMessage(text=msg, quick_reply=_quick_buttons()))
             except Exception as e:
                 if _looks_like_429(e):
                     _block_push("429 monthly limit reached")
@@ -1258,7 +1264,8 @@ try:
                 sess = {"phase": "await_pts", "bankroll": 0, "rounds_seen": 0,
                         "last_pts_text": None, "premium": premium, "trial_start": start_ts,
                         "last_card": None, "last_card_ts": None,
-                        "pending": False, "pending_seq": 0}
+                        "pending": False, "pending_seq": 0,
+                        "loss_streak": 0, "adv_history": [], "last_choice": None}
                 try:
                     reset_pf_for_uid(uid)
                 except Exception:
@@ -1285,11 +1292,7 @@ try:
                 _clear_prediction_cache(uid)
                 sess["rounds_seen"] = len(seq)
                 save_session(uid, sess)
-                _reply(
-                    line_api,
-                    event.reply_token,
-                    "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5"
-                )
+                _reply(line_api, event.reply_token, "歷史載入完成\nHistory loaded\n\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5")
                 return
 
             pts = parse_last_hand_points(text)
@@ -1309,8 +1312,7 @@ try:
                 if m and (m.group(1) in GAMES):
                     sess["game"] = GAMES[m.group(1)]
                     sess["phase"] = "input_bankroll"
-                    _reply(line_api, event.reply_token,
-                           f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
+                    _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
                     save_session(uid, sess)
                     return
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
@@ -1324,22 +1326,15 @@ try:
                     return
                 sess["bankroll"] = amt
                 sess["phase"] = "await_pts"
-                _reply(
-                    line_api,
-                    event.reply_token,
-                    f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：閒6莊5 / 65 / 和）"
-                )
+                _reply(line_api, event.reply_token,
+                       f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 連續模式：現在輸入第一局點數（例：閒6莊5 / 65 / 和）")
                 save_session(uid, sess)
                 return
 
             if pts and sess.get("bankroll", 0) >= 0:
                 p_pts, b_pts = pts
                 if (LINE_ASYNC_HEAVY == 1) and _can_push():
-                    _reply(
-                        line_api,
-                        event.reply_token,
-                        "✅ 已收到上一局結果，AI 正在計算。"
-                    )
+                    _reply(line_api, event.reply_token, "✅ 已收到上一局結果，AI 正在計算。")
                     sess["pending"] = True
                     sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
                     seq = int(sess["pending_seq"])
@@ -1347,11 +1342,7 @@ try:
                     sess["last_card_ts"] = None
                     save_session(uid, sess)
                     try:
-                        threading.Thread(
-                            target=_push_heavy_prediction,
-                            args=(uid, p_pts, b_pts, seq),
-                            daemon=True,
-                        ).start()
+                        threading.Thread(target=_push_heavy_prediction, args=(uid, p_pts, b_pts, seq), daemon=True).start()
                     except Exception as e:
                         log.exception("failed to spawn heavy prediction thread: %s", e)
                     return
@@ -1362,8 +1353,7 @@ try:
                         else:
                             sess["last_pts_text"] = f"上局結果: 閒 {p_pts} 莊 {b_pts}"
                         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                                 cont=bool(CONTINUOUS_MODE))
+                        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt, cont=bool(CONTINUOUS_MODE))
                         sess["last_card"] = msg
                         sess["last_card_ts"] = int(time.time())
                         sess["pending"] = False
@@ -1374,11 +1364,8 @@ try:
                         _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
                     return
 
-            _reply(
-                line_api,
-                event.reply_token,
-                "指令無法辨識。\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。"
-            )
+            _reply(line_api, event.reply_token,
+                   "指令無法辨識。\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。")
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
