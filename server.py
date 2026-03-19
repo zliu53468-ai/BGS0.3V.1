@@ -323,6 +323,13 @@ RESULT_CACHE: Dict[str, Tuple[np.ndarray, str, int, str]] = {}
 RESULT_CACHE_KEY: Dict[str, str] = {}
 RESULT_CACHE_LOCK = threading.Lock()
 
+def _clear_prediction_cache(uid: str) -> None:
+    if not uid:
+        uid = "anon"
+    with RESULT_CACHE_LOCK:
+        RESULT_CACHE.pop(uid, None)
+        RESULT_CACHE_KEY.pop(uid, None)
+
 def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> str:
     rounds_seen = int(sess.get("rounds_seen", 0))
     bankroll = int(sess.get("bankroll", 0))
@@ -372,6 +379,7 @@ def reset_pf_for_uid(uid: str) -> None:
     with _PF_STORE_GUARD:
         if uid in _PF_STORE:
             _PF_STORE.pop(uid, None)
+    _clear_prediction_cache(uid)
 
 pf_initialized = (OutcomePF is not None)
 
@@ -625,6 +633,29 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
         pass
     return max(1, int(n))
 
+def _safe_predict_probs(pf_obj: Any, sims_used: int, uid: str) -> Tuple[np.ndarray, int]:
+    try:
+        p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
+        if p.shape != (3,) or (not np.isfinite(p).all()) or float(p.sum()) <= 0:
+            raise ValueError(
+                f"invalid probs shape={getattr(p, 'shape', None)} "
+                f"sum={float(np.sum(p)) if hasattr(p, 'sum') else 'n/a'}"
+            )
+        p = p / p.sum()
+        return p.astype(np.float32), int(sims_used)
+    except Exception as e:
+        log.exception("PF.predict failed(uid=%s): %s", uid, e)
+        try:
+            fallback = SmartDummyPF().predict()
+            fallback = np.asarray(fallback, dtype=np.float32)
+            if fallback.shape != (3,) or (not np.isfinite(fallback).all()) or float(fallback.sum()) <= 0:
+                raise ValueError("SmartDummyPF fallback invalid")
+            fallback = fallback / fallback.sum()
+            return fallback.astype(np.float32), int(sims_used)
+        except Exception as e2:
+            log.exception("PF fallback predict failed(uid=%s): %s", uid, e2)
+            return np.array([0.4586, 0.4462, 0.0952], dtype=np.float32), int(sims_used)
+
 # ---------- 解析點數 ----------
 def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if not text:
@@ -768,7 +799,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             except Exception as e:
                 log.warning("stage PF_UPD_SIMS apply failed: %s", e)
             sims_used = _tuned_pred_sims(sims_base, pf_obj)
-            p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
+            p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
             pf_probs = p.copy()
     else:
         try:
@@ -785,7 +816,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         except Exception as e:
             log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
         sims_used = _tuned_pred_sims(sims_base, pf_obj)
-        p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
+        p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
         pf_probs = p.copy()
 
     soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
@@ -1232,9 +1263,7 @@ try:
                     reset_pf_for_uid(uid)
                 except Exception:
                     pass
-                with RESULT_CACHE_LOCK:
-                    RESULT_CACHE.pop(uid, None)
-                    RESULT_CACHE_KEY.pop(uid, None)
+                _clear_prediction_cache(uid)
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
@@ -1253,9 +1282,7 @@ try:
                     reset_pf_for_uid(uid)
                 except Exception:
                     pass
-                with RESULT_CACHE_LOCK:
-                    RESULT_CACHE.pop(uid, None)
-                    RESULT_CACHE_KEY.pop(uid, None)
+                _clear_prediction_cache(uid)
                 sess["rounds_seen"] = len(seq)
                 save_session(uid, sess)
                 _reply(
