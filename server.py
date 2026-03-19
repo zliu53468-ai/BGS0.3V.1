@@ -511,7 +511,7 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float
         reason.append("模式=ev")
     conf = max(pB, pP)
     edge = abs(pB - pP)
-    if edge < 0.012:
+    if edge < 0.008:
         return ("觀望", edge, 0.0, "edge too small")
     if conf < MIN_CONF_FOR_ENTRY:
         reason.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.3f}")
@@ -693,8 +693,8 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
 
     pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2])
 
-    # 轉折偵測
-    if len(history) >= 4:
+    # 轉折偵測（稍微放寬：至少有 5 筆再看）
+    if len(history) >= 5:
         if history[-1] != history[-2] and history[-2] == history[-3] == history[-4]:
             return "OBSERVE", 0.03, "轉折保護"
 
@@ -711,9 +711,9 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
     probs2 = np.array([pB, pP, pT], dtype=np.float32)
     probs2 /= probs2.sum()
 
-    # 波動偵測
+    # 波動偵測（放寬到 1.2，避免跳牌太容易觀望）
     if len(history) >= 6:
-        if np.std(history[-6:]) > 0.9:
+        if np.std(history[-6:]) > 1.2:
             return "OBSERVE", 0.025, "高波動"
 
     loss = int(sess.get("loss_streak", 0))
