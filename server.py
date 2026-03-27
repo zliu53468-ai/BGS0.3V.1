@@ -293,6 +293,7 @@ class SmartDummyPF:
     def __init__(self):
         log.warning("使用 SmartDummyPF 備援模式")
         log.warning("⚠️ OutcomePF unavailable → SmartDummyPF fallback")
+        log.warning("⚠️ 目前使用備援機率，若一直觀望請先確認 OutcomePF 是否成功載入")
     def update_outcome(self, outcome):
         return
     def predict(self, **kwargs) -> np.ndarray:
@@ -388,9 +389,9 @@ DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()
 BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
-MIN_CONF_FOR_ENTRY = 0.57
-EDGE_ENTER = 0.035
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.018"))   # 新增：最硬寫死觀望門檻
+MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.52"))
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.025"))
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.010"))
 QUIET_SMALLEdge = env_flag("QUIET_SMALLEdge", 0)
 MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
 MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
@@ -513,6 +514,12 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
     
     edge = abs(pB - pP)
     conf = max(pB, pP)
+
+    if LOG_DECISION or SHOW_CONF_DEBUG:
+        log.info(
+            "[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f conf=%.4f final_edge=%.4f effective_edge_enter=%.4f mode=%s",
+            pB, pP, pT, edge, conf, final_edge, effective_edge_enter, DECISION_MODE
+        )
 
     # 第一層：最硬觀望門檻（可透過環境變數調整）
     if edge < EDGE_MIN:
