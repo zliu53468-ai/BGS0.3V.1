@@ -228,7 +228,8 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
     lines = []
     if last_pts:
         lines.append(str(last_pts))
-    lines.append(f"機率｜莊 {pB*100:.1f}%｜閒 {pP*100:.1f}%｜和 {pT*100:.1f}%")
+    lines.append(f"機率｜莊 {pB*100:.2f}%｜閒 {pP*100:.2f}%｜和 {pT*100:.2f}%")
+    lines.append(f"差距｜莊閒 {abs(pB - pP) * 100:.2f}%")
     if choice == "觀望":
         lines.append("建議：觀望 👀")
     else:
@@ -389,9 +390,10 @@ DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()
 BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
-MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.52"))
+MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.50"))
 EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.025"))
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.010"))
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.003"))
+MICRO_EDGE_ENABLE = env_flag("MICRO_EDGE_ENABLE", 1)
 QUIET_SMALLEdge = env_flag("QUIET_SMALLEdge", 0)
 MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
 MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
@@ -521,16 +523,21 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
             pB, pP, pT, edge, conf, final_edge, effective_edge_enter, DECISION_MODE
         )
 
-    # 第一層：最硬觀望門檻（可透過環境變數調整）
+    # 允許微小差距也顯示並進場
+    if MICRO_EDGE_ENABLE == 1 and edge < 0.015:
+        side = 0 if pB > pP else 1
+        return (("莊" if side == 0 else "閒"), edge, 0.005, "極小訊號")
+    if MICRO_EDGE_ENABLE == 1 and edge < 0.03:
+        side = 0 if pB > pP else 1
+        return (("莊" if side == 0 else "閒"), edge, 0.01, "弱訊號")
+
+    # 第一層：最硬觀望門檻
     if edge < EDGE_MIN:
-        return ("觀望", edge, 0.0, f"低信號 edge<{EDGE_MIN}")
+        side = 0 if pB > pP else 1
+        return (("莊" if side == 0 else "閒"), edge, 0.005, "極弱訊號(測試單)")
 
     # 分級下注
-    if edge < 0.03:
-        side = 0 if pB > pP else 1
-        bet_pct = 0.01
-        return (("莊" if side == 0 else "閒"), edge, bet_pct, "弱訊號小注")
-    elif edge < 0.045:
+    if edge < 0.045:
         side = 0 if pB > pP else 1
         bet_pct = 0.03
         return (("莊" if side == 0 else "閒"), edge, bet_pct, "中訊號")
