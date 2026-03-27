@@ -388,8 +388,9 @@ DECISION_MODE = os.getenv("DECISION_MODE", "ev").lower()
 BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
 PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
 MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
-MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.56"))
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.03"))
+MIN_CONF_FOR_ENTRY = 0.57
+EDGE_ENTER = 0.035
+EDGE_MIN = float(os.getenv("EDGE_MIN", "0.018"))   # 新增：最硬寫死觀望門檻
 QUIET_SMALLEdge = env_flag("QUIET_SMALLEdge", 0)
 MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
 MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
@@ -401,12 +402,12 @@ LOG_DECISION = env_flag("LOG_DECISION", 1)
 INV = {0: "莊", 1: "閒"}
 COMPAT_MODE = int(os.getenv("COMPAT_MODE", "0"))
 DEPL_ENABLE = int(os.getenv("DEPL_ENABLE", "0"))
-DEPL_FACTOR = float(os.getenv("DEPL_FACTOR", "0.60"))
+DEPL_FACTOR = float(os.getenv("DEPL_FACTOR", "0.35"))
 DEPL_STAGE_MODE = os.getenv("DEPL_STAGE_MODE", "depth").lower()
 EARLY_DEPL_SCALE = float(os.getenv("EARLY_DEPL_SCALE", "0.2"))
 MID_DEPL_SCALE = float(os.getenv("MID_DEPL_SCALE", "0.6"))
 LATE_DEPL_SCALE = float(os.getenv("LATE_DEPL_SCALE", "0.9"))
-MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.10"))
+MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.03"))
 EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))
 PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))
 PROB_PURE_MODE = int(os.getenv("PROB_PURE_MODE", "0"))
@@ -475,7 +476,7 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
             p /= s
     return p
 
-def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float, float, str]:
+def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_enter: float) -> Tuple[str, float, float, str]:
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     reason: List[str] = []
     eff_prob_pure, eff_ev_neutral, notes = _effective_prob_flags(over)
@@ -509,24 +510,43 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float]) -> Tuple[str, float
     else:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason.append("模式=ev")
-    conf = max(pB, pP)
+    
     edge = abs(pB - pP)
-    if edge < 0.008:
-        return ("觀望", edge, 0.0, "edge too small")
+    conf = max(pB, pP)
+
+    # 第一層：最硬觀望門檻（可透過環境變數調整）
+    if edge < EDGE_MIN:
+        return ("觀望", edge, 0.0, f"低信號 edge<{EDGE_MIN}")
+
+    # 分級下注
+    if edge < 0.03:
+        side = 0 if pB > pP else 1
+        bet_pct = 0.01
+        return (("莊" if side == 0 else "閒"), edge, bet_pct, "弱訊號小注")
+    elif edge < 0.045:
+        side = 0 if pB > pP else 1
+        bet_pct = 0.03
+        return (("莊" if side == 0 else "閒"), edge, bet_pct, "中訊號")
+
+    # 第三層：信心門檻
     if conf < MIN_CONF_FOR_ENTRY:
         reason.append(f"⚪ 信心不足 conf={conf:.3f}<{MIN_CONF_FOR_ENTRY:.3f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
-    if final_edge < EDGE_ENTER:
-        reason.append(f"⚪ 優勢不足 edge={final_edge:.4f}<{EDGE_ENTER:.4f}")
+
+    # 第四層：有效邊緣門檻（已修正為 max 避免動態過低）
+    if final_edge < effective_edge_enter:
+        reason.append(f"⚪ 優勢不足 edge={final_edge:.4f}<{effective_edge_enter:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
+
     if QUIET_SMALLEdge and final_edge < (EDGE_ENTER * 1.2):
         reason.append("⚪ 邊際略優(quiet)")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
+
     min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
-    max_edge = max(EDGE_ENTER + 1e-6, MAX_EDGE_SCALE)
-    bet_pct = min_b + (max_b - min_b) * (final_edge - EDGE_ENTER) / (max_edge - EDGE_ENTER)
+    bet_pct = min_b + (max_b - min_b) * (edge / MAX_EDGE_SCALE)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
+
     side_label = INV.get(side, "莊")
     reason.append(f"🔻 {side_label} 勝率={100.0 * (pB if side==0 else pP):.1f}%")
     return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
@@ -693,12 +713,10 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
 
     pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2])
 
-    # 轉折偵測（稍微放寬：至少有 5 筆再看）
     if len(history) >= 5:
         if history[-1] != history[-2] and history[-2] == history[-3] == history[-4]:
-            return "OBSERVE", 0.03, "轉折保護"
+            return probs, 0.035, "轉折降權"
 
-    # 連續同邊 anti-bias
     if len(history) >= 5:
         if all(x == history[-1] for x in history[-5:]):
             if history[-1] == 0:
@@ -711,12 +729,17 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
     probs2 = np.array([pB, pP, pT], dtype=np.float32)
     probs2 /= probs2.sum()
 
-    # 波動偵測（放寬到 1.2，避免跳牌太容易觀望）
     if len(history) >= 6:
         if np.std(history[-6:]) > 1.2:
-            return "OBSERVE", 0.025, "高波動"
+            return probs2, 0.035, "高波動降權"
 
     loss = int(sess.get("loss_streak", 0))
+    if loss >= 3:
+        pB *= 0.92
+        pP *= 0.92
+        probs2 = np.array([pB, pP, pT], dtype=np.float32)
+        probs2 /= probs2.sum()
+
     if loss >= 3:
         edge_enter = 0.025
     elif abs(pB - pP) < 0.02:
@@ -725,41 +748,6 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
         edge_enter = 0.012
 
     return probs2, edge_enter, "正常"
-
-# ---------- Debug ----------
-def test_deplete_biases() -> None:
-    if not DEPLETE_OK or init_counts is None or probs_after_points is None:
-        log.warning("test_deplete_biases called but deplete support is unavailable")
-        return
-    try:
-        decks = int(os.getenv("DECKS", "8"))
-        counts = init_counts(decks)
-        sims_env = os.getenv("DEPLETEMC_SIMS")
-        sims = int(float(sims_env)) if sims_env else 10000
-        deplete_factor = float(os.getenv("DEPL_FACTOR", "0.60"))
-        scenarios = [
-            ("開局", 0, 0),
-            ("閒贏1點", 1, 0),
-            ("莊贏1點", 0, 1),
-            ("平手1點", 1, 1),
-            ("閒贏6點", 6, 0),
-            ("莊贏6點", 0, 6),
-        ]
-        log.info("=== Deplete 偏差測試 (sims=%d, factor=%.2f) ===", sims, deplete_factor)
-        for name, p_pts, b_pts in scenarios:
-            try:
-                probs = probs_after_points(counts, p_pts, b_pts, sims=sims, deplete_factor=deplete_factor)
-                if not isinstance(probs, (list, tuple, np.ndarray)) or len(probs) < 2:
-                    log.info("%s: unexpected deplete result %s", name, probs)
-                    continue
-                pB, pP, pT = float(probs[0]), float(probs[1]), float(probs[2] if len(probs) > 2 else 0.0)
-                diff = pB - pP
-                bias = "莊高" if diff > 0 else ("閒高" if diff < 0 else "平手")
-                log.info("%s: 莊=%.4f 閒=%.4f 和=%.4f | 差值=%.4f (%s)", name, pB, pP, pT, diff, bias)
-            except Exception as ex:
-                log.warning("test_deplete_biases scenario %s failed: %s", name, ex)
-    except Exception as ex:
-        log.warning("test_deplete_biases error: %s", ex)
 
 # ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
@@ -777,12 +765,15 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
     sims_used = sims_base
 
-    # 先用目前結果更新 loss streak（用上一輪建議去回頭檢查）
     last_choice = sess.get("last_choice")
     if last_choice in ("莊", "閒"):
-        if (last_choice == "莊" and p_pts > b_pts) or (last_choice == "閒" and b_pts > p_pts):
-            sess["loss_streak"] = int(sess.get("loss_streak", 0)) + 1
+        if last_choice == "莊":
+            win = (b_pts > p_pts)
         else:
+            win = (p_pts > b_pts)
+        if win is False:
+            sess["loss_streak"] = int(sess.get("loss_streak", 0)) + 1
+        elif win is True:
             sess["loss_streak"] = 0
 
     if PF_STATEFUL == 1:
@@ -854,16 +845,12 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
-            # ===== 動態補牌權重（關鍵補丁）=====
             stage_scale = _depl_stage_scale(rounds_seen)
-
             diff = abs(p_pts - b_pts)
             total = max(p_pts, b_pts)
 
-            # 基礎倍率
             base = DEPL_FACTOR * stage_scale
 
-            # === 補牌推估 ===
             if total <= 5:
                 adj = 1.15
             elif total == 6:
@@ -873,14 +860,16 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             else:
                 adj = 1.0
 
-            # === 差距修正 ===
             if diff >= 4:
                 adj *= 1.10
             elif diff <= 1:
                 adj *= 0.90
 
             raw_alpha = base * adj
-            alpha = max(0.0, min(0.55, float(raw_alpha)))
+            alpha = min(0.25, raw_alpha)
+
+            if abs(p_pts - b_pts) >= 5:
+                alpha *= 0.8
 
             if alpha > 0.0:
                 before_deplete = p.copy()
@@ -955,41 +944,27 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     p = _apply_prob_bias(p, over)
 
-    if abs(p[0] - p[1]) > 0.08:
+    if abs(p[0] - p[1]) > 0.12:
         mid = (p[0] + p[1]) / 2
-        p[0] = mid + (p[0] - mid) * 0.6
-        p[1] = mid + (p[1] - mid) * 0.6
+        p[0] = mid + (p[0] - mid) * 0.8
+        p[1] = mid + (p[1] - mid) * 0.8
         p = p / p.sum()
 
-    # 進階控制接入
-    ctrl = _advanced_control(sess, p)
-    if isinstance(ctrl[0], str):
-        choice = "觀望"
-        edge = 0.0
-        bet_pct = 0.0
-        reason = ctrl[2]
-    else:
-        p, dynamic_edge, ctrl_reason = ctrl
-        _EDGE_ENTER_BAK = EDGE_ENTER
-        try:
-            globals()["EDGE_ENTER"] = dynamic_edge
-            choice, edge, bet_pct, reason = decide_only_bp(p, over)
-        finally:
-            globals()["EDGE_ENTER"] = _EDGE_ENTER_BAK
-        reason = f"{reason} | {ctrl_reason}"
+    # 進階控制 + 修正有效門檻（避免動態過低）
+    p, dynamic_edge, ctrl_reason = _advanced_control(sess, p)
+    effective_edge_enter = max(EDGE_ENTER, dynamic_edge)   # 關鍵修正：取較大值
+
+    choice, edge, bet_pct, reason = decide_only_bp(p, over, effective_edge_enter)
+    reason = f"{reason} | {ctrl_reason}"
 
     bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
     sess["rounds_seen"] = rounds_seen + 1
-
-    # 連輸追蹤
     sess["last_choice"] = choice
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
-            "決策: %s edge=%.4f pct=%.2f%% rounds=%d sims_base=%d sims_used=%d uid=%s stateful=%s | %s",
-            choice, edge, bet_pct * 100, sess["rounds_seen"],
-            int(sims_base), int(sims_used),
-            uid, PF_STATEFUL, reason
+            "決策: %s edge=%.4f pct=%.2f%% eff_edge=%.4f rounds=%d uid=%s | %s",
+            choice, edge, bet_pct * 100, effective_edge_enter, sess["rounds_seen"], uid, reason
         )
 
     with RESULT_CACHE_LOCK:
@@ -998,7 +973,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     return p, choice, bet_amt, reason
 
-# ---------- LINE ----------
+# ---------- LINE 部分（完整保留，未更動） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
@@ -1493,11 +1468,11 @@ if __name__ == "__main__":
     log.info(
         "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, MODE=%s, COMPAT=%s, DEPL=%s, TRIAL_NS=%s, "
         "PF_STATEFUL=%s, TIE_CAP_ENABLE=%s, PROB_FORCE_PURE_IN_PROB_MODE=%s, PROB_PURE_MODE=%s, EV_NEUTRAL=%s, PROB_BIAS_B2P=%.6f, "
-        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PF_N=220)",
+        "LINE_ASYNC_HEAVY=%s, LINE_PUSH_ENABLE=%s, PRED_SIMS_CAP=%s, PF_N=220, EDGE_MIN=%.4f)",
         VERSION, port, pf_initialized, DEPLETE_OK, DECISION_MODE, COMPAT_MODE, DEPL_ENABLE, TRIAL_NAMESPACE,
         PF_STATEFUL, TIE_CAP_ENABLE, PROB_FORCE_PURE_IN_PROB_MODE, PROB_PURE_MODE, EV_NEUTRAL, float(PROB_BIAS_B2P),
         LINE_ASYNC_HEAVY, LINE_PUSH_ENABLE,
-        os.getenv("PRED_SIMS_CAP", "95"),
+        os.getenv("PRED_SIMS_CAP", "95"), EDGE_MIN
     )
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
