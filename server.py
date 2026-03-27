@@ -239,7 +239,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str],
         lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
     return "\n".join(lines)
 
-VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+advanced-control"
+VERSION = "bgs-pure-pf-deplete-2025-11-03+optimized+pattern-removed+PF220+advanced-control+dynamic-deplete"
 
 # ---------- Flask App ----------
 if _flask_available and Flask is not None:
@@ -854,9 +854,34 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
     if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
         try:
+            # ===== 動態補牌權重（關鍵補丁）=====
             stage_scale = _depl_stage_scale(rounds_seen)
-            raw_alpha = DEPL_FACTOR * stage_scale
+
+            diff = abs(p_pts - b_pts)
+            total = max(p_pts, b_pts)
+
+            # 基礎倍率
+            base = DEPL_FACTOR * stage_scale
+
+            # === 補牌推估 ===
+            if total <= 5:
+                adj = 1.15
+            elif total == 6:
+                adj = 0.95
+            elif total >= 7:
+                adj = 0.80
+            else:
+                adj = 1.0
+
+            # === 差距修正 ===
+            if diff >= 4:
+                adj *= 1.10
+            elif diff <= 1:
+                adj *= 0.90
+
+            raw_alpha = base * adj
             alpha = max(0.0, min(0.55, float(raw_alpha)))
+
             if alpha > 0.0:
                 before_deplete = p.copy()
                 if SHOW_RAW_PROBS:
