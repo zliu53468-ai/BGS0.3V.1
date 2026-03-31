@@ -319,20 +319,25 @@ class SmartDummyPF:
     def backend(self):
         return "smart-dummy"
 
-_PF_STORE: Dict[str, Any] = {}
-_PF_LOCKS: Dict[str, threading.Lock] = {}
-_PF_STORE_GUARD = threading.Lock()
+# ✅ 單一全域 PF（營運穩定版）
+_GLOBAL_PF = None
+_GLOBAL_PF_LOCK = threading.Lock()
+PREDICT_LOCK = threading.Lock()        # 防止 webhook 同時多請求
 
-RESULT_CACHE: Dict[str, Tuple[np.ndarray, str, int, str]] = {}
-RESULT_CACHE_KEY: Dict[str, str] = {}
-RESULT_CACHE_LOCK = threading.Lock()
+# ✅ KEEP ALIVE 只啟動一次（防線程洩漏）
+KEEP_ALIVE_STARTED = False
+KEEP_ALIVE_LOCK = threading.Lock()
+
+_RESULT_CACHE: Dict[str, Tuple[np.ndarray, str, int, str]] = {}
+_RESULT_CACHE_KEY: Dict[str, str] = {}
+_RESULT_CACHE_LOCK = threading.Lock()
 
 def _clear_prediction_cache(uid: str) -> None:
     if not uid:
         uid = "anon"
-    with RESULT_CACHE_LOCK:
-        RESULT_CACHE.pop(uid, None)
-        RESULT_CACHE_KEY.pop(uid, None)
+    with _RESULT_CACHE_LOCK:
+        _RESULT_CACHE.pop(uid, None)
+        _RESULT_CACHE_KEY.pop(uid, None)
 
 def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> str:
     rounds_seen = int(sess.get("rounds_seen", 0))
@@ -341,22 +346,31 @@ def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: in
     mode = str(sess.get("decision_mode") or os.getenv("DECISION_MODE", "hybrid")).lower()
     return f"{uid}|r={rounds_seen}|p={p_pts}|b={b_pts}|bank={bankroll}|stateful={pf_stateful}|mode={mode}"
 
+# ✅ 真正的 per-uid 鎖（用字典儲存）
+_UID_LOCKS: Dict[str, threading.Lock] = {}
+_UID_LOCKS_GUARD = threading.Lock()
+
 def _get_uid_lock(uid: str) -> threading.Lock:
     if not uid:
         uid = "anon"
-    with _PF_STORE_GUARD:
-        lk = _PF_LOCKS.get(uid)
-        if lk is None:
-            lk = threading.Lock()
-            _PF_LOCKS[uid] = lk
-        return lk
+    with _UID_LOCKS_GUARD:
+        if uid not in _UID_LOCKS:
+            _UID_LOCKS[uid] = threading.Lock()
+        return _UID_LOCKS[uid]
 
 def _build_new_pf() -> Any:
-    try:
-        threading.Thread(target=_self_keep_alive, daemon=True).start()
-        log.info("KEEP ALIVE thread started")
-    except Exception as e:
-        log.warning("KEEP ALIVE failed: %s", e)
+    global KEEP_ALIVE_STARTED
+
+    # ✅ 只啟動一次
+    if not KEEP_ALIVE_STARTED:
+        with KEEP_ALIVE_LOCK:
+            if not KEEP_ALIVE_STARTED:
+                try:
+                    threading.Thread(target=_self_keep_alive, daemon=True).start()
+                    KEEP_ALIVE_STARTED = True
+                    log.info("KEEP ALIVE thread started (ONLY ONCE)")
+                except Exception as e:
+                    log.warning("KEEP ALIVE failed: %s", e)
 
     if OutcomePF is None:
         return SmartDummyPF()
@@ -371,25 +385,20 @@ def _build_new_pf() -> Any:
     )
 
 def get_pf_for_uid(uid: str) -> Any:
-    if not uid:
-        uid = "anon"
-    with _PF_STORE_GUARD:
-        pf = _PF_STORE.get(uid)
-        if pf is None:
-            try:
-                pf = _build_new_pf()
-            except Exception as e:
-                log.error("PF 初始化失敗(per-uid): %s", e)
-                pf = SmartDummyPF()
-            _PF_STORE[uid] = pf
-        return pf
+    global _GLOBAL_PF
+    if _GLOBAL_PF is None:
+        with _GLOBAL_PF_LOCK:
+            if _GLOBAL_PF is None:
+                try:
+                    _GLOBAL_PF = _build_new_pf()
+                    log.info("GLOBAL PF initialized")
+                except Exception as e:
+                    log.error("GLOBAL PF init failed: %s", e)
+                    _GLOBAL_PF = SmartDummyPF()
+    return _GLOBAL_PF
 
 def reset_pf_for_uid(uid: str) -> None:
-    if not uid:
-        uid = "anon"
-    with _PF_STORE_GUARD:
-        if uid in _PF_STORE:
-            _PF_STORE.pop(uid, None)
+    # v2：不再重建 PF（避免效能炸裂）
     _clear_prediction_cache(uid)
 
 pf_initialized = (OutcomePF is not None)
@@ -544,7 +553,8 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
     if edge < EDGE_MIN:
         return ("觀望", final_edge, 0.0, "極弱訊號")
 
-    if MICRO_EDGE_ENABLE == 1 and edge < 0.03:
+    # ✅ 放寬 MICRO_EDGE 門檻：從 0.03 改為 0.018，讓更多差距能進入後續判斷
+    if MICRO_EDGE_ENABLE == 1 and edge < 0.018:
         return ("觀望", final_edge, 0.0, f"弱訊號({mode})")
 
     if conf < MIN_CONF_FOR_ENTRY:
@@ -767,53 +777,78 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
 
 # ---------- 主預測 ----------
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
-    rounds_seen = int(sess.get("rounds_seen", 0))
-    over = get_stage_over(rounds_seen)
-    mode = _current_decision_mode(over)
-    sess["decision_mode"] = mode
+    with PREDICT_LOCK:  # ✅ 防止同時多請求打爆
+        rounds_seen = int(sess.get("rounds_seen", 0))
+        over = get_stage_over(rounds_seen)
+        mode = _current_decision_mode(over)
+        sess["decision_mode"] = mode
 
-    cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
-    with RESULT_CACHE_LOCK:
-        if RESULT_CACHE_KEY.get(uid) == cache_key and uid in RESULT_CACHE:
-            cached = RESULT_CACHE[uid]
-            return cached[0].copy(), cached[1], int(cached[2]), str(cached[3])
+        cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
+        with _RESULT_CACHE_LOCK:
+            if _RESULT_CACHE_KEY.get(uid) == cache_key:
+                cached = _RESULT_CACHE.get(uid)
+                if cached:
+                    return cached[0].copy(), cached[1], int(cached[2]), str(cached[3])
 
-    pf_probs: Optional[np.ndarray] = None
-    soft_probs: Optional[np.ndarray] = None
-    sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
-    sims_used = sims_base
+        pf_probs: Optional[np.ndarray] = None
+        soft_probs: Optional[np.ndarray] = None
+        sims_base = int(over.get("PF_PRED_SIMS", float(os.getenv("PF_PRED_SIMS", "5"))))
+        sims_used = sims_base
 
-    last_choice = sess.get("last_choice")
-    if last_choice in ("莊", "閒"):
-        if last_choice == "莊":
-            win = (b_pts > p_pts)
-        else:
-            win = (p_pts > b_pts)
-        if win is False:
-            sess["loss_streak"] = int(sess.get("loss_streak", 0)) + 1
-        elif win is True:
-            sess["loss_streak"] = 0
+        last_choice = sess.get("last_choice")
+        if last_choice in ("莊", "閒"):
+            if last_choice == "莊":
+                win = (b_pts > p_pts)
+            else:
+                win = (p_pts > b_pts)
+            if win is False:
+                sess["loss_streak"] = int(sess.get("loss_streak", 0)) + 1
+            elif win is True:
+                sess["loss_streak"] = 0
 
-    if PF_STATEFUL == 1:
-        pf_obj = get_pf_for_uid(uid)
-        lk = _get_uid_lock(uid)
-        with lk:
-            try:
-                if hasattr(pf_obj, "update_outcome"):
-                    if p_pts == b_pts:
-                        if not SKIP_TIE_UPD:
+        if PF_STATEFUL == 1:
+            pf_obj = get_pf_for_uid(uid)
+            lk = _get_uid_lock(uid)
+            with lk:
+                try:
+                    if hasattr(pf_obj, "update_outcome"):
+                        if p_pts == b_pts:
+                            if not SKIP_TIE_UPD:
+                                try:
+                                    pf_obj.update_outcome(2)
+                                except Exception:
+                                    pf_obj.update_outcome("T")
+                        else:
+                            outcome = 0 if b_pts > p_pts else 1
                             try:
-                                pf_obj.update_outcome(2)
+                                pf_obj.update_outcome(outcome)
                             except Exception:
-                                pf_obj.update_outcome("T")
-                    else:
-                        outcome = 0 if b_pts > p_pts else 1
-                        try:
-                            pf_obj.update_outcome(outcome)
-                        except Exception:
-                            pf_obj.update_outcome("B" if outcome == 0 else "P")
+                                pf_obj.update_outcome("B" if outcome == 0 else "P")
+                except Exception as e:
+                    log.warning("PF.update_outcome failed: %s", e)
+                try:
+                    upd_sims_val = over.get("PF_UPD_SIMS")
+                    if upd_sims_val is None:
+                        upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
+                    if hasattr(pf_obj, "sims_lik"):
+                        pf_obj.sims_lik = int(float(upd_sims_val))
+                except Exception as e:
+                    log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+                sims_used = _tuned_pred_sims(sims_base, pf_obj)
+
+                start_time = time.time()
+                p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
+                if time.time() - start_time > 1.2:
+                    log.warning("⚠️ PF timeout fallback triggered")
+                    p = SmartDummyPF().predict()
+
+                pf_probs = p.copy()
+        else:
+            try:
+                pf_obj = _build_new_pf()
             except Exception as e:
-                log.warning("PF.update_outcome failed: %s", e)
+                log.error("PF 初始化失敗(stateless): %s", e)
+                pf_obj = SmartDummyPF()
             try:
                 upd_sims_val = over.get("PF_UPD_SIMS")
                 if upd_sims_val is None:
@@ -821,175 +856,159 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 if hasattr(pf_obj, "sims_lik"):
                     pf_obj.sims_lik = int(float(upd_sims_val))
             except Exception as e:
-                log.warning("stage PF_UPD_SIMS apply failed: %s", e)
+                log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
             sims_used = _tuned_pred_sims(sims_base, pf_obj)
             p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
             pf_probs = p.copy()
-    else:
-        try:
-            pf_obj = _build_new_pf()
-        except Exception as e:
-            log.error("PF 初始化失敗(stateless): %s", e)
-            pf_obj = SmartDummyPF()
-        try:
-            upd_sims_val = over.get("PF_UPD_SIMS")
-            if upd_sims_val is None:
-                upd_sims_val = float(os.getenv("PF_UPD_SIMS", "30"))
-            if hasattr(pf_obj, "sims_lik"):
-                pf_obj.sims_lik = int(float(upd_sims_val))
-        except Exception as e:
-            log.warning("stage PF_UPD_SIMS apply failed(stateless): %s", e)
-        sims_used = _tuned_pred_sims(sims_base, pf_obj)
-        p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
-        pf_probs = p.copy()
 
-    soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
-    p = p ** (1.0 / max(1e-6, soft_tau))
-    p = p / p.sum()
-    soft_probs = p.copy()
+        soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
+        p = p ** (1.0 / max(1e-6, soft_tau))
+        p = p / p.sum()
+        soft_probs = p.copy()
 
-    alpha = 0.08
-    theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-    p = (1 - alpha) * p + alpha * theo
-    p = p / p.sum()
+        alpha = 0.08
+        theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+        p = (1 - alpha) * p + alpha * theo
+        p = p / p.sum()
 
-    if SHOW_RAW_PROBS:
-        try:
-            if pf_probs is not None:
-                log.info("[DEBUG-PF] PF原始: 莊=%.4f, 閒=%.4f", float(pf_probs[0]), float(pf_probs[1]))
-                log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
-        except Exception:
-            pass
-
-    if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
-        try:
-            stage_scale = _depl_stage_scale(rounds_seen)
-            diff = abs(p_pts - b_pts)
-            total = max(p_pts, b_pts)
-
-            base = DEPL_FACTOR * stage_scale
-
-            if total <= 5:
-                adj = 1.15
-            elif total == 6:
-                adj = 0.95
-            elif total >= 7:
-                adj = 0.80
-            else:
-                adj = 1.0
-
-            if diff >= 4:
-                adj *= 1.10
-            elif diff <= 1:
-                adj *= 0.90
-
-            raw_alpha = base * adj
-            alpha = min(0.25, raw_alpha)
-
-            if abs(p_pts - b_pts) >= 5:
-                alpha *= 0.8
-
-            if alpha > 0.0:
-                before_deplete = p.copy()
-                if SHOW_RAW_PROBS:
-                    log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
-                counts = init_counts(int(os.getenv("DECKS", "8")))
-                dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
-                dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=alpha)
-                dep = np.asarray(dep, dtype=np.float32)
-                depT = float(dep[2])
-                if depT < TIE_MIN:
-                    dep[2] = TIE_MIN
-                    sc = (1.0 - TIE_MIN) / (1.0 - depT) if depT < 1.0 else 1.0
-                    dep[0] *= sc
-                    dep[1] *= sc
-                elif depT > TIE_MAX:
-                    dep[2] = TIE_MAX
-                    sc = (1.0 - TIE_MAX) / (1.0 - depT) if depT < 1.0 else 1.0
-                    dep[0] *= sc
-                    dep[1] *= sc
-                dep = dep / dep.sum()
-                mix = (1.0 - alpha) * p + alpha * dep
-                mix = mix / mix.sum()
-                p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
-                after_deplete = p.copy()
-                if SHOW_RAW_PROBS:
-                    log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
-                    delta_B = float(after_deplete[0] - before_deplete[0])
-                    delta_P = float(after_deplete[1] - before_deplete[1])
-                    log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
-        except Exception as e:
-            log.warning("Deplete 失敗，改 PF 單模：%s", e)
-
-    if COMPAT_MODE == 0:
-        theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
-        if theo_blend > 0.0:
-            if SHOW_RAW_PROBS:
-                before_theo = p.copy()
-            theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
-            p = (1.0 - theo_blend) * p + theo_blend * theo
-            p = p / p.sum()
-            if SHOW_RAW_PROBS:
-                after_theo = p.copy()
-                log.info("[DEBUG-B4-THEO] 理論混合前: 莊=%.4f, 閒=%.4f", float(before_theo[0]), float(before_theo[1]))
-                log.info("[DEBUG-AFT-THEO] 理論混合後: 莊=%.4f, 閒=%.4f", float(after_theo[0]), float(after_theo[1]))
         if SHOW_RAW_PROBS:
-            log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
-                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
-        tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
-        if TIE_CAP_ENABLE == 1:
-            if p[2] > tie_max:
+            try:
+                if pf_probs is not None:
+                    log.info("[DEBUG-PF] PF原始: 莊=%.4f, 閒=%.4f", float(pf_probs[0]), float(pf_probs[1]))
+                    log.info("[DEBUG-SOFT] 軟化後: 莊=%.4f, 閒=%.4f", float(soft_probs[0]), float(soft_probs[1]))
+            except Exception:
+                pass
+
+        if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
+            try:
+                stage_scale = _depl_stage_scale(rounds_seen)
+                diff = abs(p_pts - b_pts)
+                total = max(p_pts, b_pts)
+
+                base = DEPL_FACTOR * stage_scale
+
+                if total <= 5:
+                    adj = 1.15
+                elif total == 6:
+                    adj = 0.95
+                elif total >= 7:
+                    adj = 0.80
+                else:
+                    adj = 1.0
+
+                if diff >= 4:
+                    adj *= 1.10
+                elif diff <= 1:
+                    adj *= 0.90
+
+                raw_alpha = base * adj
+                alpha = min(0.25, raw_alpha)
+
+                if abs(p_pts - b_pts) >= 5:
+                    alpha *= 0.8
+
+                if alpha > 0.0:
+                    before_deplete = p.copy()
+                    if SHOW_RAW_PROBS:
+                        log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
+                    counts = init_counts(int(os.getenv("DECKS", "8")))
+                    dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
+                    dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=alpha)
+                    dep = np.asarray(dep, dtype=np.float32)
+                    depT = float(dep[2])
+                    if depT < TIE_MIN:
+                        dep[2] = TIE_MIN
+                        sc = (1.0 - TIE_MIN) / (1.0 - depT) if depT < 1.0 else 1.0
+                        dep[0] *= sc
+                        dep[1] *= sc
+                    elif depT > TIE_MAX:
+                        dep[2] = TIE_MAX
+                        sc = (1.0 - TIE_MAX) / (1.0 - depT) if depT < 1.0 else 1.0
+                        dep[0] *= sc
+                        dep[1] *= sc
+                    dep = dep / dep.sum()
+                    mix = (1.0 - alpha) * p + alpha * dep
+                    mix = mix / mix.sum()
+                    p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
+                    after_deplete = p.copy()
+                    if SHOW_RAW_PROBS:
+                        log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
+                        delta_B = float(after_deplete[0] - before_deplete[0])
+                        delta_P = float(after_deplete[1] - before_deplete[1])
+                        log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
+            except Exception as e:
+                log.warning("Deplete 失敗，改 PF 單模：%s", e)
+
+        if COMPAT_MODE == 0:
+            theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
+            if theo_blend > 0.0:
                 if SHOW_RAW_PROBS:
-                    before_tiecap = p.copy()
-                sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-                p[2] = tie_max
+                    before_theo = p.copy()
+                theo = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
+                p = (1.0 - theo_blend) * p + theo_blend * theo
+                p = p / p.sum()
+                if SHOW_RAW_PROBS:
+                    after_theo = p.copy()
+                    log.info("[DEBUG-B4-THEO] 理論混合前: 莊=%.4f, 閒=%.4f", float(before_theo[0]), float(before_theo[1]))
+                    log.info("[DEBUG-AFT-THEO] 理論混合後: 莊=%.4f, 閒=%.4f", float(after_theo[0]), float(after_theo[1]))
+            if SHOW_RAW_PROBS:
+                log.info("[PROBS] raw(after mix/theo) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                         float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+            tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
+            if TIE_CAP_ENABLE == 1:
+                if p[2] > tie_max:
+                    if SHOW_RAW_PROBS:
+                        before_tiecap = p.copy()
+                    sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+                    p[2] = tie_max
+                    p[0] *= sc
+                    p[1] *= sc
+                    p = p / p.sum()
+                    if SHOW_RAW_PROBS:
+                        after_tiecap = p.copy()
+                        log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
+                        log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
+            if p[2] < TIE_MIN:
+                sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
+                p[2] = TIE_MIN
                 p[0] *= sc
                 p[1] *= sc
                 p = p / p.sum()
-                if SHOW_RAW_PROBS:
-                    after_tiecap = p.copy()
-                    log.info("[DEBUG-B4-TIECAP] 和局封頂前: 莊=%.4f, 閒=%.4f", float(before_tiecap[0]), float(before_tiecap[1]))
-                    log.info("[DEBUG-AFT-TIECAP] 和局封頂後: 莊=%.4f, 閒=%.4f", float(after_tiecap[0]), float(after_tiecap[1]))
-        if p[2] < TIE_MIN:
-            sc = (1.0 - TIE_MIN) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
-            p[2] = TIE_MIN
-            p[0] *= sc
-            p[1] *= sc
+            if SHOW_RAW_PROBS:
+                log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
+                         float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
+
+        p = _apply_prob_bias(p, over)
+
+        if abs(p[0] - p[1]) > 0.12:
+            mid = (p[0] + p[1]) / 2
+            p[0] = mid + (p[0] - mid) * 0.8
+            p[1] = mid + (p[1] - mid) * 0.8
             p = p / p.sum()
-        if SHOW_RAW_PROBS:
-            log.info("[PROBS] final(after tie clamp) B=%.4f P=%.4f T=%.4f (uid=%s rounds=%s stateful=%s)",
-                     float(p[0]), float(p[1]), float(p[2]), uid, rounds_seen, PF_STATEFUL)
 
-    p = _apply_prob_bias(p, over)
+        # 進階控制 + 修正有效門檻（避免動態過低）
+        p, dynamic_edge, ctrl_reason = _advanced_control(sess, p)
+        # ✅ 修改 effective_edge_enter 計算：改用 dynamic_edge 與 EDGE_MIN 取大，避免被固定 EDGE_ENTER 拉高
+        effective_edge_enter = max(EDGE_MIN, dynamic_edge)
 
-    if abs(p[0] - p[1]) > 0.12:
-        mid = (p[0] + p[1]) / 2
-        p[0] = mid + (p[0] - mid) * 0.8
-        p[1] = mid + (p[1] - mid) * 0.8
-        p = p / p.sum()
+        choice, edge, bet_pct, reason = decide_only_bp(p, over, effective_edge_enter)
+        reason = f"{reason} | {ctrl_reason}"
 
-    # 進階控制 + 修正有效門檻（避免動態過低）
-    p, dynamic_edge, ctrl_reason = _advanced_control(sess, p)
-    effective_edge_enter = max(EDGE_ENTER, dynamic_edge)   # 關鍵修正：取較大值
+        bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
+        sess["rounds_seen"] = rounds_seen + 1
+        sess["last_choice"] = choice
 
-    choice, edge, bet_pct, reason = decide_only_bp(p, over, effective_edge_enter)
-    reason = f"{reason} | {ctrl_reason}"
+        if LOG_DECISION or SHOW_CONF_DEBUG:
+            log.info(
+                "決策: %s edge=%.4f pct=%.2f%% eff_edge=%.4f rounds=%d uid=%s | %s",
+                choice, edge, bet_pct * 100, effective_edge_enter, sess["rounds_seen"], uid, reason
+            )
 
-    bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
-    sess["rounds_seen"] = rounds_seen + 1
-    sess["last_choice"] = choice
+        with _RESULT_CACHE_LOCK:
+            _RESULT_CACHE[uid] = (p.copy(), choice, bet_amt, reason)
+            _RESULT_CACHE_KEY[uid] = cache_key
 
-    if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info(
-            "決策: %s edge=%.4f pct=%.2f%% eff_edge=%.4f rounds=%d uid=%s | %s",
-            choice, edge, bet_pct * 100, effective_edge_enter, sess["rounds_seen"], uid, reason
-        )
-
-    with RESULT_CACHE_LOCK:
-        RESULT_CACHE[uid] = (p.copy(), choice, bet_amt, reason)
-        RESULT_CACHE_KEY[uid] = cache_key
-
-    return p, choice, bet_amt, reason
+        return p, choice, bet_amt, reason
 
 # ---------- LINE 部分（完整保留，未更動） ----------
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
