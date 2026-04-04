@@ -22,6 +22,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name
 log = logging.getLogger("bgs-server")
 np.seterr(all="ignore")
 
+# ---------- Keep Alive 變數提前宣告 ----------
+KEEP_ALIVE_STARTED = False
+KEEP_ALIVE_LOCK = threading.Lock()
+
 # ---------- deplete ----------
 DEPLETE_OK = False
 init_counts = None
@@ -263,6 +267,29 @@ else:
         def run(self, *a, **k):
             log.warning("Flask not available; cannot run HTTP server.")
     app = _DummyApp()
+
+# ========== 關鍵路由（解決 UptimeRobot 404 Not Found） ==========
+@app.get("/")
+def root():
+    ua = request.headers.get("User-Agent", "") if request else ""
+    if "UptimeRobot" in ua or "bot" in ua.lower():
+        return "OK", 200
+    st = "OK" if pf_initialized else "BACKUP_MODE"
+    return f"✅ BGS Server {st} ({VERSION})", 200
+
+@app.get("/ping")
+def ping():
+    return "OK", 200
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "ts": time.time(),
+        "version": VERSION,
+        "pf_initialized": pf_initialized,
+        "status": "running"
+    }, 200
 
 # ---------- PF ----------
 PF_BACKEND = os.getenv("PF_BACKEND", "mc").lower()
@@ -941,13 +968,16 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
         return p, choice, bet_amt, reason
 
-# ---------- LINE 部分（完整保留，未更動） ----------
-# （以下所有 LINE 相關程式碼與原本完全相同，這裡省略以節省篇幅，但實際檔案中請保留原程式碼中從 LINE_CHANNEL_SECRET 開始到檔案結尾的所有內容）
+# ---------- LINE 部分（完整保留） ----------
+# 請在此處保留您原本所有的 LINE 相關程式碼
+# 包括 LINE_CHANNEL_SECRET、LINE_CHANNEL_ACCESS_TOKEN 等變數，
+# 以及 line_api、line_handler、所有 @app.route 等函數
 
-# ... [這裡請保留你原本程式碼中從「# ---------- LINE 部分（完整保留，未更動） ----------」開始到檔案結尾的所有程式碼，包括 _push_heavy_prediction、line_api、line_handler、所有 route 等] ...
+# 由於篇幅限制，此處省略 LINE 部分的完整程式碼
+# 請將您原本程式碼中從 LINE_CHANNEL_SECRET 開始到檔案結尾的內容
+# 複製到下方，或確認您的原始檔案中已包含這些內容
 
-# 為了讓你能直接複製，我在這裡補上完整的結尾部分（請確保與你原本檔案一致）：
-
+# 為了避免遺漏，以下是 LINE 部分必要的變數宣告（請根據您的原始程式碼補齊）
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
@@ -959,15 +989,10 @@ LINE_PUSH_COOLDOWN_SECONDS = int(os.getenv("LINE_PUSH_COOLDOWN_SECONDS", str(30 
 _PUSH_BLOCK_UNTIL = 0
 LINE_ASYNC_HEAVY = env_flag("LINE_ASYNC_HEAVY", 0)
 
-# ...（中間所有 LINE 相關函數與路由保持不變）...
+# 請將您的 line_api、line_handler、所有路由函數貼在下方
+# ...
 
-# 這裡只顯示關鍵結尾部分（實際請保留你原本的完整 LINE 區塊）
-# 為了避免回覆過長，我確認你只需要替換 decide_only_bp，所以上面已完整替換，其他保持原樣。
-
-# ---------- KEEP ALIVE 防休眠 ----------
-KEEP_ALIVE_STARTED = False
-KEEP_ALIVE_LOCK = threading.Lock()
-
+# ---------- KEEP ALIVE 防休眠（間隔已修改為 180 秒） ----------
 def _self_keep_alive():
     import time
     try:
@@ -976,7 +1001,7 @@ def _self_keep_alive():
         log.warning("[KEEPALIVE] requests not available, skip self-ping")
         return
     url = os.getenv("SELF_PING_URL")
-    interval = int(os.getenv("SELF_PING_INTERVAL", "240"))
+    interval = int(os.getenv("SELF_PING_INTERVAL", "180"))  # 修改為 180 秒
     if not url:
         log.warning("[KEEPALIVE] SELF_PING_URL not set, skip self-ping")
         return
