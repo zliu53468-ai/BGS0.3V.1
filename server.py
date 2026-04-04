@@ -459,58 +459,65 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
         if s > 0:
             p /= s
     return p
-def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_enter: float) -> Tuple[str, float, float, str]:
+
+# ---------- 补丁1：替换 decide_only_bp ----------
+def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_enter: float, p_pts: int, b_pts: int) -> Tuple[str, float, float, str]:
     mode = _current_decision_mode(over)
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
     reason: List[str] = []
     eff_prob_pure, eff_ev_neutral, notes = _effective_prob_flags(over, mode)
     if notes:
         reason.extend(notes)
+
+    point_diff = abs(p_pts - b_pts)   # 點數差距
+
     if mode == "prob":
         side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
         _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
         final_edge = max(abs(evB), abs(evP))
         reason.append(f"模式=prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
-        if int(eff_prob_pure) == 1 and pB > pP and side == 1:
-            side = 0
-            reason.append("⚠️ FIX: pure_prob 但選到閒→強制改莊")
-            log.warning("[DECIDE-FIX] pure_prob conflict detected (pB=%.4f>pP=%.4f) forced to BANKER", pB, pP)
     elif mode == "hybrid":
-        if abs(pB - pP) >= PROB_MARGIN:
+        edge = abs(pB - pP)
+        if edge >= PROB_MARGIN * 1.1:   # 大差距才走純機率
             side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
             _, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
-            reason.append(f"模式=hybrid→prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
+            reason.append(f"模式=hybrid→prob (大差距 {edge:.4f})")
         else:
+            # 先計算 EV 相關值
             s2, edge_ev, evB, evP = _decide_side_by_ev(pB, pP)
-            if edge_ev >= MIN_EV_EDGE:
+            final_edge = max(abs(evB), abs(evP))
+            # 小差距保護（你需要的部分）
+            if edge < 0.045 and point_diff <= 3:
+                if final_edge < 0.023:
+                    return ("觀望", final_edge, 0.0, f"點數接近(diff={point_diff}) + 差距小 → 強制觀望")
+            if evB > evP + MIN_EV_EDGE + 0.003:
                 side = s2
-                final_edge = edge_ev
-                reason.append("模式=hybrid→ev")
+                reason.append("模式=hybrid→ev (Banker 有優勢)")
             else:
-                return ("觀望", max(abs(evB), abs(evP)), 0.0, "模式=hybrid→觀望(EV不足)")
+                return ("觀望", final_edge, 0.0, "hybrid → 觀望 (EV不足 + 小差距)")
     else:
         side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
         reason.append("模式=ev")
+
     edge = abs(pB - pP)
-    conf = max(pB, pP)
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info(
-            "[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f conf=%.4f final_edge=%.4f effective_edge_enter=%.4f mode=%s",
-            pB, pP, pT, edge, conf, final_edge, effective_edge_enter, mode
-        )
-    # ⚠️ ❷ FIX: 單一門檻 + edge_enter 降至 0.006（解決 fallback 全觀望 + 少打問題）
+        log.info("[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f final_edge=%.4f point_diff=%d mode=%s",
+                 pB, pP, pT, edge, final_edge, point_diff, mode)
+
     if final_edge < effective_edge_enter:
         reason.append(f"⚪ 優勢不足 final_edge={final_edge:.4f}<{effective_edge_enter:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
-    # 計算注碼比例
+
     min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
     bet_pct = min_b + (max_b - min_b) * (edge / MAX_EDGE_SCALE)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
+
     side_label = INV.get(side, "莊")
     reason.append(f"🔻 {side_label} 勝率={100.0 * (pB if side==0 else pP):.1f}%")
     return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
+
 # ---------- 三段覆蓋 ----------
 def _stage_bounds():
     early_end = int(os.getenv("EARLY_HANDS", "20"))
@@ -656,7 +663,6 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (int(d[0]), int(d[1]))
     return None
 # ---------- 進階策略控制器 ----------
-# ⚠️ ❶+❷ FIX: 移除 hidden 壓制 + edge_enter 降至 0.006（解決 fallback 偏莊全觀望 + 少打問題）
 def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
     history = sess.get("adv_history", [])
     history.append(int(np.argmax(probs[:2])))
@@ -751,36 +757,44 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
         p = p ** (1.0 / max(1e-6, soft_tau))
         p = p / p.sum()
         soft_probs = p.copy()
+
+        # ---------- 补丁2：替换 Deplete 区块 ----------
         if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and init_counts and probs_after_points:
             try:
                 stage_scale = _depl_stage_scale(rounds_seen)
                 diff = abs(p_pts - b_pts)
                 total = max(p_pts, b_pts)
+
                 base = DEPL_FACTOR * stage_scale
-                if total <= 5:
-                    adj = 1.15
-                elif total == 6:
-                    adj = 0.95
-                elif total >= 7:
-                    adj = 0.80
+
+                # 加強版 Deplete：針對點數接近大力拉開差距
+                if diff <= 2:
+                    adj = 1.65
+                elif diff == 3 or diff == 4:
+                    adj = 1.38
+                elif diff >= 6:
+                    adj = 0.85
                 else:
-                    adj = 1.0
-                if diff >= 4:
-                    adj *= 1.10
-                elif diff <= 1:
-                    adj *= 0.90
+                    adj = 1.12
+
+                if total >= 7:
+                    adj *= 0.87
+                elif total <= 5:
+                    adj *= 1.22
+
                 raw_alpha = base * adj
-                alpha = min(0.25, raw_alpha)
-                if abs(p_pts - b_pts) >= 5:
-                    alpha *= 0.8
+                alpha = min(0.40, raw_alpha)
+
                 if alpha > 0.0:
                     before_deplete = p.copy()
                     if SHOW_RAW_PROBS:
                         log.info("[DEBUG-B4-DEPL] Deplete前: 莊=%.4f, 閒=%.4f", float(before_deplete[0]), float(before_deplete[1]))
+
                     counts = init_counts(int(os.getenv("DECKS", "8")))
-                    dep_sims = int(over.get("DEPLETEMC_SIMS", float(os.getenv("DEPLETEMC_SIMS", "18"))))
+                    dep_sims = int(over.get("DEPLETEMC_SIMS", 25))
                     dep = probs_after_points(counts, p_pts, b_pts, sims=dep_sims, deplete_factor=alpha)
                     dep = np.asarray(dep, dtype=np.float32)
+
                     depT = float(dep[2])
                     if depT < TIE_MIN:
                         dep[2] = TIE_MIN
@@ -792,18 +806,19 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                         sc = (1.0 - TIE_MAX) / (1.0 - depT) if depT < 1.0 else 1.0
                         dep[0] *= sc
                         dep[1] *= sc
+
                     dep = dep / dep.sum()
                     mix = (1.0 - alpha) * p + alpha * dep
                     mix = mix / mix.sum()
                     p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
+
                     after_deplete = p.copy()
                     if SHOW_RAW_PROBS:
-                        log.info("[DEBUG-AFT-DEPL] Deplete後: 莊=%.4f, 閒=%.4f", float(after_deplete[0]), float(after_deplete[1]))
-                        delta_B = float(after_deplete[0] - before_deplete[0])
-                        delta_P = float(after_deplete[1] - before_deplete[1])
-                        log.info("[DEPLETE-EFFECT] 莊變化: %+.4f, 閒變化: %+.4f", delta_B, delta_P)
+                        log.info("[DEPL-STRONG] diff=%d total=%d alpha=%.3f | B: %.4f→%.4f | P: %.4f→%.4f", 
+                                 diff, total, alpha, before_deplete[0], after_deplete[0], before_deplete[1], after_deplete[1])
             except Exception as e:
-                log.warning("Deplete 失敗，改 PF 單模：%s", e)
+                log.warning("Deplete 失敗: %s", e)
+
         if COMPAT_MODE == 0 and THEO_BLEND_FORCE_DISABLE != 1:
             theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
             if theo_blend > 0.0:
@@ -850,7 +865,8 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             p = p / p.sum()
         p, dynamic_edge, ctrl_reason = _advanced_control(sess, p)
         effective_edge_enter = dynamic_edge
-        choice, edge, bet_pct, reason = decide_only_bp(p, over, effective_edge_enter)
+        # 调用 decide_only_bp 时传入 p_pts, b_pts
+        choice, edge, bet_pct, reason = decide_only_bp(p, over, effective_edge_enter, p_pts, b_pts)
         reason = f"{reason} | {ctrl_reason}"
         bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
         sess["rounds_seen"] = rounds_seen + 1
