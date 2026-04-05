@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-ULTIMATE 55% STABLE pfilter.py（Render可跑 + 抗偏 + 自適應）
+CLEAN STABLE PFILTER (No anti-bias, No loss streak, No variance hack)
 """
 
-import os
 import numpy as np
 
 SAFE_PROBS = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
@@ -12,10 +11,10 @@ SAFE_PROBS = np.array([0.4586, 0.4462, 0.0952], dtype=np.float32)
 class OutcomePF:
 
     def __init__(self, decks, seed=42,
-                 n_particles=220,
-                 sims_lik=15,
+                 n_particles=200,
+                 sims_lik=10,
                  resample_thr=0.5,
-                 dirichlet_eps=0.04):
+                 dirichlet_eps=0.03):
 
         self.decks = int(decks)
         self.n_particles = int(n_particles)
@@ -32,11 +31,7 @@ class OutcomePF:
         self.particles = np.tile(base, (self.n_particles, 1))
         self.weights = np.full(self.n_particles, 1.0 / self.n_particles)
 
-        # 🔥 新增：行為記錄（核心）
-        self.history = []
-        self.loss_streak = 0
-
-    # ===== 抽牌 =====
+    # ===== 抽牌輔助 =====
     def _draw(self, counts):
         cum = np.cumsum(np.maximum(counts, 0), axis=1)
         total = cum[:, -1]
@@ -44,7 +39,7 @@ class OutcomePF:
         r = np.random.rand(len(counts)) * total
         return np.argmax(cum >= r[:, None], axis=1)
 
-    # ===== 單次模擬 =====
+    # ===== 核心模擬引擎 =====
     def _simulate_once(self, counts):
 
         draws = np.zeros((len(counts), 4), dtype=np.int32)
@@ -78,7 +73,7 @@ class OutcomePF:
 
         pt = np.full(len(idx), -1)
 
-        # 玩家第三張
+        # 玩家補牌
         need_p3 = sub_p <= 5
         if need_p3.any():
             d = self._draw(sub_counts[need_p3])
@@ -86,7 +81,7 @@ class OutcomePF:
             sub_counts[need_p3, d] -= 1
             pt[need_p3] = d
 
-        # 莊第三張
+        # 莊補牌規則
         draw_b = np.zeros(len(idx), dtype=bool)
         valid = pt != -1
 
@@ -108,15 +103,13 @@ class OutcomePF:
 
         return outcome
 
-    # ===== predict =====
-    def predict(self, sims_per_particle=None, rounds_seen=None):
+    # ===== 預測機率（無任何干預）=====
+    def predict(self, sims_per_particle=6):
 
         try:
-            sims = sims_per_particle or 6
-
             all_outcomes = []
 
-            for _ in range(sims):
+            for _ in range(sims_per_particle):
                 res = self._simulate_once(self.particles.copy())
                 all_outcomes.append(res)
 
@@ -127,37 +120,19 @@ class OutcomePF:
             for i in range(self.n_particles):
                 probs[i] = np.bincount(all_outcomes[i], minlength=3)
 
-            probs /= sims
+            probs /= sims_per_particle
 
             total = np.average(probs, axis=0, weights=self.weights)
 
             if not np.isfinite(total).all() or total.sum() <= 0:
                 return SAFE_PROBS
 
-            total /= total.sum()
+            return (total / total.sum()).astype(np.float32)
 
-            # ===== 🔥 波動偵測 =====
-            if len(self.history) >= 6:
-                recent = self.history[-6:]
-                variance = np.std(recent)
-                if variance > 0.9:
-                    total = total * 0.85 + SAFE_PROBS * 0.15
-
-            # ===== 🔥 anti-bias =====
-            diff = abs(total[0] - total[1])
-            if diff > 0.10:
-                mid = (total[0] + total[1]) / 2
-                total[0] = mid + (total[0] - mid) * 0.6
-                total[1] = mid + (total[1] - mid) * 0.6
-                total /= total.sum()
-
-            return total.astype(np.float32)
-
-        except Exception as e:
-            print("PF ERROR:", e)
+        except Exception:
             return SAFE_PROBS
 
-    # ===== update =====
+    # ===== 更新粒子權重（純 PF）=====
     def update_outcome(self, outcome):
 
         try:
@@ -165,11 +140,6 @@ class OutcomePF:
             elif outcome in ('P', 1): outcome = 1
             elif outcome in ('B', 0): outcome = 0
             else: return
-
-            # 記錄歷史（🔥核心）
-            self.history.append(outcome)
-            if len(self.history) > 50:
-                self.history.pop(0)
 
             sims = self._simulate_once(self.particles.copy())
 
@@ -186,17 +156,7 @@ class OutcomePF:
 
             self.weights = w / s
 
-            # ===== 🔥 連輸修正 =====
-            if match.mean() < 0.4:
-                self.loss_streak += 1
-            else:
-                self.loss_streak = 0
-
-            if self.loss_streak >= 3:
-                self.weights *= 0.7
-                self.weights /= self.weights.sum()
-
-            # ===== resample =====
+            # 有效樣本數重採樣
             ess = 1.0 / np.sum(self.weights ** 2)
 
             if ess < self.resample_thr * self.n_particles:
