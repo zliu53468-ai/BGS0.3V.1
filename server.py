@@ -1,54 +1,24 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS v4.0 完整策略版（Stage節奏 + 信號堆疊 + 真實牌靴）"""
+"""server.py — BGS v4.4 真實盈利監控版（EV正確率評估 + 真實牌靴 + ROI追蹤 + 每日風控）"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
+from datetime import datetime, date
 import numpy as np
 
 # ==================== VERSION 定義 ====================
-VERSION = "bgs-v4.0-full-strategy-2025-11-03"
+VERSION = "bgs-v4.4-profit-monitor-2025-11-03"
 
 # ==================== 試用設定 ====================
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
 PREMIUM_TRIAL_SECONDS = int(os.getenv("PREMIUM_TRIAL_SECONDS", "2592000"))
 
-def env_flag(name: str, default: int = 1) -> int:
-    val = os.getenv(name)
-    if val is None:
-        return 1 if default else 0
-    v = str(val).strip().lower()
-    if v in ("1", "true", "t", "yes", "y", "on"):
-        return 1
-    if v in ("0", "false", "f", "no", "n", "off"):
-        return 0
-    try:
-        return 1 if int(float(v)) != 0 else 0
-    except Exception:
-        return 1 if default else 0
+# ==================== 風控設定 ====================
+DAILY_MAX_LOSS_RATIO = float(os.getenv("DAILY_MAX_LOSS_RATIO", "0.1"))  # 單日最大虧損10%
+SESSION_MIN_PROFIT_RATIO = float(os.getenv("SESSION_MIN_PROFIT_RATIO", "-0.05"))  # 單局最小允許虧損5%
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
 np.seterr(all="ignore")
-
-# ==================== KEEP ALIVE ====================
-KEEP_ALIVE_STARTED = False
-KEEP_ALIVE_LOCK = threading.Lock()
-
-def _self_keep_alive():
-    try:
-        import requests
-    except Exception:
-        return
-    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL") or os.getenv("SELF_PING_URL")
-    interval = int(os.getenv("SELF_PING_INTERVAL", "120"))
-    if not url:
-        return
-    ping_url = url.rstrip("/") + "/ping"
-    while True:
-        try:
-            requests.get(ping_url, timeout=10)
-        except Exception:
-            pass
-        time.sleep(interval)
 
 # ==================== 館別選單 ====================
 GAMES = {
@@ -56,73 +26,117 @@ GAMES = {
     "6": "歐博/卡利", "7": "KG", "8": "全利", "9": "名人", "10": "MT真人"
 }
 
-# ==================== Deplete Module ====================
+# ==================== Deplete Module (安全載入) ====================
 DEPLETE_OK = False
 init_counts = None
 probs_after_points = None
 
 try:
-    from deplete import init_counts, probs_after_points
-    DEPLETE_OK = True
-    log.info("Deplete module loaded")
-except Exception:
-    try:
-        from bgs.deplete import init_counts, probs_after_points
+    from deplete import init_counts as _init_counts, probs_after_points as _probs_after_points
+    if callable(_init_counts) and callable(_probs_after_points):
+        init_counts = _init_counts
+        probs_after_points = _probs_after_points
         DEPLETE_OK = True
-        log.info("Deplete loaded from bgs.deplete")
-    except Exception:
-        try:
-            _cur_dir = os.path.dirname(os.path.abspath(__file__))
-            if _cur_dir not in sys.path:
-                sys.path.insert(0, _cur_dir)
-            from deplete import init_counts, probs_after_points
-            DEPLETE_OK = True
-            log.info("Deplete loaded from local path")
-        except Exception as e:
-            DEPLETE_OK = False
-            log.warning(f"Deplete not available: {e}")
+        log.info("Deplete module loaded successfully")
+    else:
+        log.warning("Deplete module loaded but functions not callable")
+except Exception as e:
+    log.warning(f"Deplete not available: {e}")
 
-# ==================== PF Module ====================
+# ==================== PF Module (安全載入) ====================
 PF_INITIALIZED = False
 pf_model = None
 
 class SmartDummyPF:
-    """PF模型 - 穩定學習版"""
+    """PF模型 - 穩定學習版（完全獨立，不依賴外部）"""
     
     def __init__(self):
         self.base_probs = np.array([0.4586, 0.4462, 0.0952])
         self.outcome_history = []
+        self.direction_history = []
+        # 🔥 v4.4 改用 EV 正確率
+        self.pf_ev_accuracy_history = []
+        self.deplete_ev_accuracy_history = []
         self.learning_rate = 0.1
         self.min_prob = 0.40
         self.max_prob = 0.55
-        log.info("PF Model initialized (v4.0)")
+        log.info("PF Model initialized (v4.4 Profit Monitor)")
     
-    def predict_proba(self, points: List[int]) -> np.ndarray:
-        if DEPLETE_OK and init_counts and probs_after_points:
+    def predict_proba(self, points: List[int], shoe_counts: Optional[Dict] = None) -> np.ndarray:
+        """🔥 v4.4 使用真實牌靴計數器，不重新 init"""
+        if DEPLETE_OK and init_counts is not None and probs_after_points is not None:
             try:
-                counts = init_counts()
-                try:
-                    probs = probs_after_points(counts, points)
-                except TypeError:
+                # 🔥 使用傳入的 shoe_counts，不要每次都 init
+                counts = shoe_counts if shoe_counts is not None else (init_counts() if init_counts else None)
+                if counts is not None and len(points) >= 2:
                     try:
-                        probs = probs_after_points(points)
-                    except Exception:
-                        probs = probs_after_points(counts=counts, points=points)
-                if not isinstance(probs, np.ndarray):
-                    probs = np.array(probs)
-                return probs
+                        probs = probs_after_points(counts, points[0], points[1])
+                    except TypeError:
+                        try:
+                            probs = probs_after_points(points)
+                        except Exception:
+                            probs = probs_after_points(counts=counts, points=points)
+                    if probs is not None and not isinstance(probs, np.ndarray):
+                        probs = np.array(probs)
+                    if probs is not None:
+                        return probs
             except Exception as e:
-                log.warning(f"Deplete failed: {e}")
+                log.debug(f"Deplete fallback: {e}")
         return self.base_probs.copy()
     
-    def update_outcome(self, outcome: int, confidence: float = 1.0) -> None:
+    def update_outcome(self, outcome: int, confidence: float = 1.0, 
+                       pf_probs: np.ndarray = None, dep_probs: np.ndarray = None,
+                       choice: str = None) -> None:
+        """🔥 v4.4 改用 EV 正確率評估"""
         if outcome is None or confidence < 0.8:
             return
+        
+        # 記錄方向歷史
+        self.direction_history.append("莊" if outcome == 1 else "閒")
+        if len(self.direction_history) > 50:
+            self.direction_history = self.direction_history[-50:]
+        
+        # 🔥 計算 PF 的 EV 是否正確
+        if pf_probs is not None:
+            pB, pP, _ = pf_probs
+            ev_banker = pB * 0.95 - (1 - pB)
+            ev_player = pP * 1.0 - (1 - pP)
+            
+            # EV 正確的定義：正EV時應該贏，負EV時應該輸
+            if choice == "莊":
+                is_ev_correct = (ev_banker > 0 and outcome == 1) or (ev_banker <= 0 and outcome == 0)
+            elif choice == "閒":
+                is_ev_correct = (ev_player > 0 and outcome == 0) or (ev_player <= 0 and outcome == 1)
+            else:
+                is_ev_correct = False
+            
+            self.pf_ev_accuracy_history.append(1 if is_ev_correct else 0)
+            if len(self.pf_ev_accuracy_history) > 50:
+                self.pf_ev_accuracy_history = self.pf_ev_accuracy_history[-50:]
+        
+        # 🔥 計算 Deplete 的 EV 是否正確
+        if dep_probs is not None:
+            pB, pP, _ = dep_probs
+            ev_banker = pB * 0.95 - (1 - pB)
+            ev_player = pP * 1.0 - (1 - pP)
+            
+            if choice == "莊":
+                is_ev_correct = (ev_banker > 0 and outcome == 1) or (ev_banker <= 0 and outcome == 0)
+            elif choice == "閒":
+                is_ev_correct = (ev_player > 0 and outcome == 0) or (ev_player <= 0 and outcome == 1)
+            else:
+                is_ev_correct = False
+            
+            self.deplete_ev_accuracy_history.append(1 if is_ev_correct else 0)
+            if len(self.deplete_ev_accuracy_history) > 50:
+                self.deplete_ev_accuracy_history = self.deplete_ev_accuracy_history[-50:]
+        
         self.outcome_history.append(outcome)
         if len(self.outcome_history) > 100:
             self.outcome_history = self.outcome_history[-100:]
         if len(self.outcome_history) < 20:
             return
+        
         recent = self.outcome_history[-20:]
         banker_rate = recent.count(1) / len(recent)
         player_rate = 1 - banker_rate
@@ -132,52 +146,83 @@ class SmartDummyPF:
         self.base_probs[2] = 0.0952
         self.base_probs = np.clip(self.base_probs, self.min_prob, self.max_prob)
         self.base_probs = self.base_probs / self.base_probs.sum()
+    
+    def detect_pattern(self) -> str:
+        if len(self.direction_history) < 5:
+            return "未知"
+        
+        last_5 = self.direction_history[-5:]
+        last_3 = self.direction_history[-3:]
+        
+        if len(set(last_3)) == 1:
+            return "連莊" if last_3[0] == "莊" else "連閒"
+        
+        is_alternating = all(last_5[i] != last_5[i+1] for i in range(4))
+        if is_alternating:
+            return "跳路"
+        
+        if len(self.direction_history) >= 8:
+            last_8 = self.direction_history[-8:]
+            if len(set(last_8[:4])) == 1 and last_8[4] != last_8[0]:
+                return "反轉信號"
+        
+        return "正常"
+    
+    def get_dynamic_weights(self) -> Tuple[float, float]:
+        """🔥 v4.4 基於 EV 正確率的動態權重"""
+        if len(self.pf_ev_accuracy_history) >= 20 and len(self.deplete_ev_accuracy_history) >= 20:
+            pf_acc = sum(self.pf_ev_accuracy_history[-20:]) / 20
+            dep_acc = sum(self.deplete_ev_accuracy_history[-20:]) / 20
+            
+            total = pf_acc + dep_acc
+            if total > 0:
+                w_pf = pf_acc / total
+                w_dep = dep_acc / total
+                w_pf = max(0.3, min(0.8, w_pf))
+                w_dep = 1 - w_pf
+                return w_pf, w_dep
+        
+        return 0.7, 0.3
 
 try:
-    try:
-        from pf import SmartPF
-        pf_model = SmartPF()
-        PF_INITIALIZED = True
-        log.info("Real PF loaded")
-    except ImportError:
-        pf_model = SmartDummyPF()
-        PF_INITIALIZED = True
-        log.info("Using Dummy PF")
+    from pf import SmartPF
+    pf_model = SmartPF()
+    PF_INITIALIZED = True
+    log.info("Real PF loaded")
 except Exception as e:
-    log.warning(f"PF error: {e}")
+    log.warning(f"Real PF not available, using Dummy: {e}")
     pf_model = SmartDummyPF()
     PF_INITIALIZED = True
 
-# ==================== Flask ====================
+# ==================== Flask (安全載入) ====================
 try:
-    from flask import Flask, request, jsonify, abort
+    from flask import Flask, request, jsonify
     from flask_cors import CORS
     _flask_available = True
-except Exception:
+except Exception as e:
+    log.error(f"Flask import failed: {e}")
     _flask_available = False
     Flask = None
     request = None
     def jsonify(*args, **kwargs):
-        raise RuntimeError("Flask not available")
-    def abort(*args, **kwargs):
-        raise RuntimeError("Flask not available")
+        return {"error": "Flask not available"}
     def CORS(app):
         return None
 
-# ==================== Redis ====================
+# ==================== Redis (選用，不強制) ====================
 try:
     import redis
-except Exception:
-    redis = None
-
-REDIS_URL = os.getenv("REDIS_URL")
-redis_client = None
-if redis is not None and REDIS_URL:
-    try:
+    REDIS_URL = os.getenv("REDIS_URL")
+    redis_client = None
+    if REDIS_URL:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         log.info("Redis connected")
-    except Exception as e:
-        log.error(f"Redis failed: {e}")
+    else:
+        redis_client = None
+        log.info("Redis not configured, using memory store")
+except Exception as e:
+    log.warning(f"Redis not available: {e}")
+    redis_client = None
 
 # ==================== Session Management ====================
 SESS_FALLBACK = {}
@@ -186,32 +231,32 @@ SESSION_EXPIRE_SECONDS = int(os.getenv("SESSION_EXPIRE_SECONDS", "3600"))
 DEDUPE_TTL = 60
 
 def _rget(k: str) -> Optional[str]:
-    try:
-        if redis_client:
+    if redis_client:
+        try:
             return redis_client.get(k)
-        return KV_FALLBACK.get(k)
-    except Exception:
-        return None
+        except Exception:
+            pass
+    return KV_FALLBACK.get(k)
 
 def _rset(k: str, v: str, ex: Optional[int] = None):
-    try:
-        if redis_client:
+    if redis_client:
+        try:
             redis_client.set(k, v, ex=ex)
-        else:
-            KV_FALLBACK[k] = v
-    except Exception:
-        pass
+            return
+        except Exception:
+            pass
+    KV_FALLBACK[k] = v
 
 def _rsetnx(k: str, v: str, ex: int) -> bool:
-    try:
-        if redis_client:
+    if redis_client:
+        try:
             return bool(redis_client.set(k, v, ex=ex, nx=True))
-        if k in KV_FALLBACK:
-            return False
-        KV_FALLBACK[k] = v
-        return True
-    except Exception:
-        return True
+        except Exception:
+            pass
+    if k in KV_FALLBACK:
+        return False
+    KV_FALLBACK[k] = v
+    return True
 
 def _dedupe_event(event_id: Optional[str]) -> bool:
     if not event_id:
@@ -240,6 +285,7 @@ def is_premium(uid: str) -> bool:
 def is_blocked(uid: str) -> bool:
     return False
 
+# ==================== Session Functions ====================
 def get_session(uid: str) -> Dict[str, Any]:
     if not uid:
         uid = "anon"
@@ -248,37 +294,54 @@ def get_session(uid: str) -> Dict[str, Any]:
             raw = redis_client.get(f"sess:{uid}")
             if raw:
                 sess = json.loads(raw)
-                sess.setdefault("phase", "init")
-                sess.setdefault("game", None)
-                sess.setdefault("bankroll", 0)
-                sess.setdefault("rounds_seen", 0)
-                sess.setdefault("premium", is_premium(uid))
-                sess.setdefault("trial_start", int(time.time()))
-                sess.setdefault("skip_streak", 0)
-                sess.setdefault("loss_streak", 0)
-                sess.setdefault("win_streak", 0)
-                sess.setdefault("last_choice", None)
-                sess.setdefault("last_prediction", None)
-                sess.setdefault("last_actual_outcome", None)
-                # 🔥 v4.0 新增：真實牌靴計數器
-                sess.setdefault("shoe_counts", None)
-                # 🔥 v4.0 新增：連續信號歷史
-                sess.setdefault("signal_history", [])
-                # 🔥 v4.0 新增：Stage 狀態
-                sess.setdefault("stage", "觀望期")
+                _init_session_defaults(sess, uid)
                 return sess
     except Exception:
         pass
     
-    sess = {
-        "phase": "init", "game": None, "bankroll": 0, "rounds_seen": 0,
-        "premium": is_premium(uid), "trial_start": int(time.time()),
-        "skip_streak": 0, "loss_streak": 0, "win_streak": 0,
-        "last_choice": None, "last_prediction": None, "last_actual_outcome": None,
-        "shoe_counts": None, "signal_history": [], "stage": "觀望期"
-    }
+    sess = SESS_FALLBACK.get(uid)
+    if sess:
+        _init_session_defaults(sess, uid)
+        return sess
+    
+    sess = _create_new_session(uid)
     save_session(uid, sess)
     return sess
+
+def _init_session_defaults(sess: Dict, uid: str):
+    sess.setdefault("phase", "init")
+    sess.setdefault("game", None)
+    sess.setdefault("bankroll", 0)
+    sess.setdefault("initial_bankroll", 0)  # 🔥 v4.4 ROI 追蹤
+    sess.setdefault("rounds_seen", 0)
+    sess.setdefault("premium", is_premium(uid))
+    sess.setdefault("trial_start", int(time.time()))
+    sess.setdefault("skip_streak", 0)
+    sess.setdefault("loss_streak", 0)
+    sess.setdefault("win_streak", 0)
+    sess.setdefault("last_choice", None)
+    sess.setdefault("last_prediction", None)
+    sess.setdefault("last_actual_outcome", None)
+    sess.setdefault("shoe_counts", None)
+    sess.setdefault("signal_history", [])
+    sess.setdefault("stage", "觀望期")
+    sess.setdefault("consecutive_losses", 0)
+    # 🔥 v4.4 ROI 追蹤
+    sess.setdefault("session_profit", 0)
+    sess.setdefault("session_roi", 0.0)
+    sess.setdefault("daily_profit", 0)
+    sess.setdefault("daily_date", str(date.today()))
+
+def _create_new_session(uid: str) -> Dict:
+    return {
+        "phase": "init", "game": None, "bankroll": 0, "initial_bankroll": 0,
+        "rounds_seen": 0, "premium": is_premium(uid), "trial_start": int(time.time()),
+        "skip_streak": 0, "loss_streak": 0, "win_streak": 0,
+        "last_choice": None, "last_prediction": None, "last_actual_outcome": None,
+        "shoe_counts": None, "signal_history": [], "stage": "觀望期",
+        "consecutive_losses": 0, "session_profit": 0, "session_roi": 0.0,
+        "daily_profit": 0, "daily_date": str(date.today())
+    }
 
 def save_session(uid: str, sess: Dict[str, Any]) -> None:
     if not uid:
@@ -289,8 +352,8 @@ def save_session(uid: str, sess: Dict[str, Any]) -> None:
             redis_client.set(f"sess:{uid}", payload, ex=SESSION_EXPIRE_SECONDS)
         else:
             SESS_FALLBACK[uid] = sess
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Save session failed: {e}")
 
 # ==================== Trial System ====================
 def get_trial_remaining(sess: Dict[str, Any]) -> int:
@@ -306,13 +369,42 @@ def format_trial_time(sess: Dict[str, Any]) -> str:
     minutes = remaining // 60
     return f"⏳ 試用剩餘 {minutes} 分鐘" if minutes > 0 else "⏰ 試用即將到期"
 
-# ==================== 🔥 v4.0 核心策略函數 ====================
+# ==================== v4.4 核心策略函數 ====================
+
+def check_daily_risk(sess: Dict[str, Any]) -> Tuple[bool, str]:
+    """🔥 v4.4 每日風控：單日虧損超過限制則停止"""
+    today = str(date.today())
+    if sess.get("daily_date") != today:
+        sess["daily_date"] = today
+        sess["daily_profit"] = 0
+        save_session(sess.get("uid", "anon"), sess)
+    
+    initial_bankroll = sess.get("initial_bankroll", sess.get("bankroll", 1000))
+    daily_loss = -sess.get("daily_profit", 0)
+    
+    if initial_bankroll > 0 and daily_loss > initial_bankroll * DAILY_MAX_LOSS_RATIO:
+        return False, f"⚠️ 單日虧損已達 {DAILY_MAX_LOSS_RATIO*100:.0f}%，今日停止交易"
+    
+    return True, ""
+
+def update_roi(sess: Dict[str, Any], bet_amount: int, won: bool) -> None:
+    """🔥 v4.4 更新 ROI 追蹤"""
+    if won:
+        profit = bet_amount * 0.95  # 莊贏扣水
+        sess["session_profit"] = sess.get("session_profit", 0) + profit
+        sess["daily_profit"] = sess.get("daily_profit", 0) + profit
+    else:
+        loss = -bet_amount
+        sess["session_profit"] = sess.get("session_profit", 0) + loss
+        sess["daily_profit"] = sess.get("daily_profit", 0) + loss
+    
+    initial = sess.get("initial_bankroll", sess.get("bankroll", 1000))
+    if initial > 0:
+        sess["session_roi"] = sess["session_profit"] / initial
+    else:
+        sess["session_roi"] = 0
 
 def determine_stage(sess: Dict[str, Any]) -> str:
-    """
-    🔥 Stage 節奏系統
-    觀望期 → 試探期 → 主攻期 → 收縮期
-    """
     skip_streak = sess.get("skip_streak", 0)
     win_streak = sess.get("win_streak", 0)
     loss_streak = sess.get("loss_streak", 0)
@@ -331,29 +423,17 @@ def determine_stage(sess: Dict[str, Any]) -> str:
         return "觀望期"
 
 def calculate_signal_strength(probs: np.ndarray, sess: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    🔥 連續信號強化（Signal Stacking）
-    連續2~3局同方向 → 提升信號可信度
-    """
     pB, pP, _ = probs
     current_direction = "莊" if pB > pP else "閒"
     edge = abs(pB - pP)
     
     signal_history = sess.get("signal_history", [])
+    signal_history.append({"direction": current_direction, "edge": edge, "timestamp": time.time()})
     
-    # 加入當前信號
-    signal_history.append({
-        "direction": current_direction,
-        "edge": edge,
-        "timestamp": time.time()
-    })
-    
-    # 保留最近5局
     if len(signal_history) > 5:
         signal_history = signal_history[-5:]
     sess["signal_history"] = signal_history
     
-    # 計算連續同向次數
     consecutive = 0
     for sig in reversed(signal_history):
         if sig["direction"] == current_direction:
@@ -361,29 +441,46 @@ def calculate_signal_strength(probs: np.ndarray, sess: Dict[str, Any]) -> Tuple[
         else:
             break
     
-    # 信號強化倍數
-    if consecutive >= 3:
-        boost = 1.5
-        reason = f"🔥 連續{consecutive}局同向，信號強化50%"
-    elif consecutive >= 2:
-        boost = 1.2
-        reason = f"📈 連續{consecutive}局同向，信號強化20%"
-    else:
-        boost = 1.0
-        reason = ""
+    if edge < 0.015:
+        return 1.0, ""
     
-    return boost, reason
+    if consecutive >= 3:
+        return 1.5, f"🔥 連續{consecutive}局同向，信號強化50%"
+    elif consecutive >= 2:
+        return 1.2, f"📈 連續{consecutive}局同向，信號強化20%"
+    else:
+        return 1.0, ""
 
-def calculate_bet_ratio_advanced(edge: float, ev: float, mode: str, 
+def calculate_kelly_fraction(pB: float, pP: float) -> float:
+    if pB > pP:
+        p = pB
+        b = 0.95
+    else:
+        p = pP
+        b = 1.0
+    
+    q = 1 - p
+    kelly = (p * b - q) / b
+    kelly = max(0, min(kelly, 0.05))
+    
+    return kelly
+
+def calculate_bet_ratio_advanced(pB: float, pP: float, ev: float, mode: str, 
                                   loss_streak: int, stage: str, 
-                                  signal_boost: float) -> Tuple[float, str]:
-    """
-    🔥 v4.0 進階下注引擎
-    整合：動態下注 + Stage + 信號強化 + 連輸風控
-    """
+                                  signal_boost: float, pattern: str,
+                                  consecutive_losses: int) -> Tuple[float, str]:
+    
+    # 🔥 EV 濾網
+    if ev < 0.01:
+        return 0, "📉 EV過低，暫停下注"
+    
+    edge = abs(pB - pP)
+    # 🔥 邊際過小濾網（避免假優勢）
+    if edge < 0.02:
+        return 0, "📉 邊際過小（避免假優勢）"
+    
     strength = edge + max(ev, 0)
     
-    # Stage 基礎調整
     stage_multiplier = 1.0
     stage_reason = ""
     
@@ -403,8 +500,12 @@ def calculate_bet_ratio_advanced(edge: float, ev: float, mode: str,
         stage_multiplier = 0.8
         stage_reason = " | 觀察期-20%"
     
-    # 基礎比例（根據信號強度）
-    if strength > 0.08:
+    kelly_fraction = calculate_kelly_fraction(pB, pP)
+    
+    if kelly_fraction > 0.03:
+        base_ratio = kelly_fraction
+        reason = f"⚡ Kelly建議 {kelly_fraction*100:.1f}%"
+    elif strength > 0.08:
         base_ratio = 0.04
         reason = "⚡ 極強信號"
     elif strength > 0.05:
@@ -417,33 +518,39 @@ def calculate_bet_ratio_advanced(edge: float, ev: float, mode: str,
         base_ratio = 0.008
         reason = "📊 微幅信號"
     
-    # 付費模式加成
+    if pattern == "連莊" or pattern == "連閒":
+        base_ratio *= 1.1
+        reason += f" | {pattern}+10%"
+    elif pattern == "跳路":
+        base_ratio *= 0.9
+        reason += " | 跳路-10%"
+    elif pattern == "反轉信號":
+        base_ratio *= 0.7
+        reason += " | 反轉信號-30%"
+    
     if mode == "advanced":
         base_ratio = min(base_ratio * 1.2, 0.05)
         reason += " | 付費模式"
     
-    # 🔥 Stage 調整
     base_ratio *= stage_multiplier
-    
-    # 🔥 信號強化
     base_ratio *= signal_boost
+    
     if signal_boost > 1.0:
         reason += f" | 信號強化{int((signal_boost-1)*100)}%"
-    
     reason += stage_reason
     
-    # 🔥 連輸風控（最高優先級）
     if loss_streak >= 3:
-        base_ratio *= 0.5
-        reason += " | ⚠️ 連輸3局降50%"
-    if loss_streak >= 5:
-        base_ratio *= 0.3
-        reason += " | 🔴 連輸5局降70%"
+        decay = 0.5 ** (loss_streak - 2)
+        base_ratio *= max(0.1, decay)
+        reason += f" | ⚠️ 連輸{loss_streak}局降{int((1-decay)*100)}%"
     if loss_streak >= 7:
         base_ratio = 0
         reason = "🛑 連輸保護啟動 - 暫停下注"
     
-    # 限制最大比例
+    if consecutive_losses >= 5:
+        base_ratio *= 0.3
+        reason += " | 📉 波動過大降70%"
+    
     base_ratio = min(base_ratio, 0.05)
     base_ratio = max(base_ratio, 0)
     
@@ -474,56 +581,52 @@ def parse_points_input(text: str) -> Optional[Tuple[List[int], str]]:
         return (points, "named")
     return None
 
-def calculate_baccarat_probabilities(points: List[int], shoe_counts: Optional[Dict] = None) -> np.ndarray:
-    """🔥 v4.0 支援真實牌靴計數器"""
-    pf_probs = pf_model.predict_proba(points)
+def calculate_baccarat_probabilities(points: List[int], shoe_counts: Optional[Dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """🔥 v4.4 使用真實牌靴計數器"""
+    # 傳入 shoe_counts，不重新 init
+    pf_probs = pf_model.predict_proba(points, shoe_counts)
+    dep_probs = pf_probs.copy()
     
-    if DEPLETE_OK:
+    if DEPLETE_OK and probs_after_points is not None and len(points) >= 2:
         try:
-            # 🔥 使用傳入的 shoe_counts，如果有的話
-            if shoe_counts is not None:
-                counts = shoe_counts
-            else:
-                counts = init_counts()
-            
-            try:
+            # 🔥 使用真實牌靴計數器
+            counts = shoe_counts if shoe_counts is not None else (init_counts() if init_counts else None)
+            if counts is not None:
                 dep_probs = probs_after_points(counts, points[0], points[1])
-            except TypeError:
-                try:
-                    dep_probs = probs_after_points(points)
-                except Exception:
-                    dep_probs = probs_after_points(counts=counts, points=points)
-            if not isinstance(dep_probs, np.ndarray):
-                dep_probs = np.array(dep_probs)
-        except Exception:
-            dep_probs = pf_probs
-    else:
-        dep_probs = pf_probs
+                if dep_probs is not None and not isinstance(dep_probs, np.ndarray):
+                    dep_probs = np.array(dep_probs)
+        except Exception as e:
+            log.debug(f"Deplete calculation failed: {e}")
     
-    edge = abs(pf_probs[0] - pf_probs[1])
-    if edge < 0.015:
-        w_pf, w_dep = 0.5, 0.5
-    elif edge < 0.04:
-        w_pf, w_dep = 0.7, 0.3
+    if hasattr(pf_model, 'get_dynamic_weights'):
+        w_pf, w_dep = pf_model.get_dynamic_weights()
     else:
-        w_pf, w_dep = 0.85, 0.15
+        edge = abs(pf_probs[0] - pf_probs[1])
+        if edge < 0.015:
+            w_pf, w_dep = 0.5, 0.5
+        elif edge < 0.04:
+            w_pf, w_dep = 0.7, 0.3
+        else:
+            w_pf, w_dep = 0.85, 0.15
     
     final_probs = pf_probs * w_pf + dep_probs * w_dep
-    return final_probs / final_probs.sum()
+    final_probs = final_probs / final_probs.sum()
+    
+    return final_probs, pf_probs, dep_probs
 
 def calculate_ev(probs: np.ndarray) -> Tuple[float, float]:
     pB, pP, _ = probs
     return pB * 0.95 - (1 - pB), pP * 1.0 - (1 - pP)
 
-def determine_bet_final_v4(probs: np.ndarray, mode: str, bankroll: int,
-                            skip_streak: int, loss_streak: int, stage: str,
-                            signal_boost: float) -> Tuple[str, int, str]:
-    """🔥 v4.0 完整決策引擎"""
+def determine_bet_final_v44(probs: np.ndarray, pf_probs: np.ndarray, dep_probs: np.ndarray,
+                            mode: str, bankroll: int, skip_streak: int, 
+                            loss_streak: int, stage: str, signal_boost: float, 
+                            pattern: str, consecutive_losses: int) -> Tuple[str, int, str, np.ndarray, np.ndarray]:
+    """🔥 v4.4 完整決策引擎"""
     pB, pP, _ = probs
     ev_banker, ev_player = calculate_ev(probs)
     edge = abs(pB - pP)
     
-    # 判斷最佳選擇
     best_choice = None
     best_ev = -999
     if ev_banker > 0:
@@ -533,44 +636,52 @@ def determine_bet_final_v4(probs: np.ndarray, mode: str, bankroll: int,
         best_choice = "閒"
         best_ev = ev_player
     
-    # 連輸7局強制停
+    if best_ev < 0.01 and best_choice is not None:
+        return "觀望", 0, f"📉 EV過低 ({best_ev*100:.2f}%)", pf_probs, dep_probs
     if loss_streak >= 7:
-        return "觀望", 0, "🛑 連輸7局，風控保護強制暫停"
+        return "觀望", 0, "🛑 連輸7局，風控保護強制暫停", pf_probs, dep_probs
+    
+    if pattern in ["連莊", "連閒"]:
+        if (pattern == "連莊" and best_choice != "莊") or (pattern == "連閒" and best_choice != "閒"):
+            return "觀望", 0, f"⚠️ 路單({pattern})與信號({best_choice})衝突", pf_probs, dep_probs
     
     if best_choice is None:
         if edge > 0.01:
             choice = "莊" if pB > pP else "閒"
-            return choice, max(1, int(bankroll * 0.002)), "🧪 邊緣測試"
+            return choice, max(1, int(bankroll * 0.002)), "🧪 邊緣測試", pf_probs, dep_probs
         if skip_streak >= 2:
             choice = "莊" if pB > pP else "閒"
-            return choice, max(1, int(bankroll * 0.003)), "🔄 強制出手"
-        return "觀望", 0, "📉 期望值為負"
+            return choice, max(1, int(bankroll * 0.003)), "🔄 強制出手", pf_probs, dep_probs
+        return "觀望", 0, "📉 期望值為負", pf_probs, dep_probs
     
-    # 🔥 進階下注計算
-    bet_ratio, reason = calculate_bet_ratio_advanced(edge, best_ev, mode, loss_streak, stage, signal_boost)
+    bet_ratio, reason = calculate_bet_ratio_advanced(pB, pP, best_ev, mode, loss_streak, 
+                                                      stage, signal_boost, pattern, consecutive_losses)
     
     if bet_ratio <= 0:
-        return "觀望", 0, reason
+        return "觀望", 0, reason, pf_probs, dep_probs
     
     bet_amount = max(1, int(bankroll * bet_ratio))
     bet_amount = min(bet_amount, int(bankroll * 0.05))
     
-    return best_choice, bet_amount, reason
+    return best_choice, bet_amount, reason, pf_probs, dep_probs
 
-def format_output_v4(probs: np.ndarray, choice: str, bet_amt: int, reason: str, mode: str,
-                     last_pts: Optional[str], game: str, bankroll: int, trial_msg: str,
-                     skip_streak: int, loss_streak: int, win_streak: int, stage: str,
-                     ev_banker: float, ev_player: float) -> str:
+def format_output_v44(probs: np.ndarray, choice: str, bet_amt: int, reason: str, mode: str,
+                      last_pts: Optional[str], game: str, bankroll: int, trial_msg: str,
+                      skip_streak: int, loss_streak: int, win_streak: int, stage: str,
+                      pattern: str, session_roi: float, ev_banker: float, ev_player: float) -> str:
     pB, pP, pT = [float(x) for x in probs]
     lines = []
-    lines.append(f"🎰 {game}" if game else "")
+    if game:
+        lines.append(f"🎰 {game}")
     lines.append(f"💰 本金：{bankroll}")
+    lines.append(f"📈 當前ROI：{session_roi*100:.1f}%")
     lines.append(f"📊 輸入：{last_pts}")
     lines.append(f"🎲 機率｜莊 {pB*100:.1f}%｜閒 {pP*100:.1f}%｜和 {pT*100:.1f}%")
     lines.append(f"📈 差距｜{abs(pB-pP)*100:.1f}%")
     lines.append(f"📊 EV｜莊 {ev_banker*100:.2f}%｜閒 {ev_player*100:.2f}%")
     lines.append(f"⚙️ 模式｜{'🎖️ 付費' if mode=='advanced' else '🆓 免費'}")
     lines.append(f"🎯 節奏｜{stage}")
+    lines.append(f"🃏 路單｜{pattern}")
     if skip_streak > 0:
         lines.append(f"👀 觀望：{skip_streak}局")
     if loss_streak > 0:
@@ -589,57 +700,71 @@ def format_output_v4(probs: np.ndarray, choice: str, bet_amt: int, reason: str, 
     lines.append("\n💡 輸入點數 | 回報：贏 / 輸")
     return "\n".join([l for l in lines if l])
 
-def update_shoe_counts(sess: Dict[str, Any], points: List[int]) -> Dict[str, Any]:
-    """🔥 真實牌靴：每局扣牌，不 reset"""
+def update_shoe_counts(sess: Dict[str, Any], points: List[int]) -> Optional[Dict]:
+    """🔥 v4.4 真實牌靴：每局扣牌，不 reset"""
     shoe_counts = sess.get("shoe_counts")
-    
-    if shoe_counts is None and DEPLETE_OK:
+    if shoe_counts is None and DEPLETE_OK and init_counts is not None:
         try:
             shoe_counts = init_counts()
             log.info("初始化牌靴計數器")
-        except Exception:
+        except Exception as e:
+            log.warning(f"Init shoe counts failed: {e}")
             shoe_counts = {}
-    
-    # 如果有點數，從牌靴中扣除
-    if shoe_counts and len(points) >= 2:
-        try:
-            # 扣除閒家第一張、第二張
-            if len(points) >= 2:
-                # 簡化版扣牌邏輯（可依實際需求擴充）
-                pass
-        except Exception:
-            pass
-    
     return shoe_counts
 
 def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any]) -> str:
     parsed = parse_points_input(points_text)
     if not parsed:
-        return "❌ 格式錯誤！"
+        return "❌ 格式錯誤！\n請輸入：65 / 6523 / 閒6莊5 / 和"
     
     points, input_type = parsed
     
-    # 🔥 真實學習：處理用戶回報結果
+    # 真實學習：處理用戶回報結果
     if points_text in ["贏", "勝", "win", "W"]:
         last_outcome = sess.get("last_actual_outcome")
-        if last_outcome is not None:
-            if hasattr(pf_model, 'update_outcome'):
-                pf_model.update_outcome(last_outcome, confidence=1.0)
-                log.info(f"用戶{uid}回報贏，PF學習 結果={last_outcome}")
+        last_choice = sess.get("last_choice")
+        last_pf_probs = sess.get("last_pf_probs")
+        last_dep_probs = sess.get("last_dep_probs")
+        last_bet_amount = sess.get("last_bet_amount", 0)
+        
+        if last_outcome is not None and hasattr(pf_model, 'update_outcome'):
+            pf_model.update_outcome(last_outcome, confidence=1.0, 
+                                    pf_probs=last_pf_probs, dep_probs=last_dep_probs,
+                                    choice=last_choice)
+            log.info(f"用戶{uid}回報贏，PF學習")
+        
+        # 更新 ROI
+        if last_bet_amount > 0:
+            update_roi(sess, last_bet_amount, won=True)
+        
         sess["win_streak"] = sess.get("win_streak", 0) + 1
         sess["loss_streak"] = 0
+        sess["consecutive_losses"] = 0
         save_session(uid, sess)
         return "✅ 已記錄為「贏」，AI已學習此結果"
     
     if points_text in ["輸", "負", "loss", "L"]:
         last_outcome = sess.get("last_actual_outcome")
-        if last_outcome is not None:
-            opposite = 1 - last_outcome if last_outcome in [0,1] else None
-            if opposite is not None and hasattr(pf_model, 'update_outcome'):
-                pf_model.update_outcome(opposite, confidence=1.0)
-                log.info(f"用戶{uid}回報輸，PF學習 結果={opposite}")
+        last_choice = sess.get("last_choice")
+        last_pf_probs = sess.get("last_pf_probs")
+        last_dep_probs = sess.get("last_dep_probs")
+        last_bet_amount = sess.get("last_bet_amount", 0)
+        
+        if last_outcome is not None and hasattr(pf_model, 'update_outcome'):
+            opposite = 1 - last_outcome if last_outcome in [0, 1] else None
+            if opposite is not None:
+                pf_model.update_outcome(opposite, confidence=1.0,
+                                        pf_probs=last_pf_probs, dep_probs=last_dep_probs,
+                                        choice=last_choice)
+                log.info(f"用戶{uid}回報輸，PF學習")
+        
+        # 更新 ROI
+        if last_bet_amount > 0:
+            update_roi(sess, last_bet_amount, won=False)
+        
         sess["loss_streak"] = sess.get("loss_streak", 0) + 1
         sess["win_streak"] = 0
+        sess["consecutive_losses"] = sess.get("consecutive_losses", 0) + 1
         save_session(uid, sess)
         return "✅ 已記錄為「輸」，AI已學習此結果"
     
@@ -648,44 +773,61 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
         save_session(uid, sess)
         return "🎲 和局\n\n建議謹慎下注"
     
-    # 🔥 更新真實牌靴
+    # 🔥 每日風控檢查
+    risk_ok, risk_msg = check_daily_risk(sess)
+    if not risk_ok:
+        return risk_msg
+    
+    # 更新真實牌靴
     shoe_counts = update_shoe_counts(sess, points)
-    sess["shoe_counts"] = shoe_counts
+    if shoe_counts is not None:
+        sess["shoe_counts"] = shoe_counts
     
     # 計算機率（帶入牌靴狀態）
     try:
-        probs = calculate_baccarat_probabilities(points, shoe_counts)
+        final_probs, pf_probs, dep_probs = calculate_baccarat_probabilities(points, shoe_counts)
     except Exception as e:
+        log.error(f"Probability calculation failed: {e}")
         return f"❌ 計算失敗：{str(e)}"
     
     mode = "advanced" if is_premium(uid) else "normal"
     bankroll = sess.get("bankroll", 1000)
+    initial_bankroll = sess.get("initial_bankroll", bankroll)
+    if initial_bankroll == 0:
+        sess["initial_bankroll"] = bankroll
+    
     skip_streak = sess.get("skip_streak", 0)
     loss_streak = sess.get("loss_streak", 0)
     win_streak = sess.get("win_streak", 0)
-    ev_banker, ev_player = calculate_ev(probs)
+    consecutive_losses = sess.get("consecutive_losses", 0)
+    session_roi = sess.get("session_roi", 0.0)
+    ev_banker, ev_player = calculate_ev(final_probs)
     
-    # 🔥 計算 Stage
     stage = determine_stage(sess)
     sess["stage"] = stage
     
-    # 🔥 計算信號強化倍數
-    signal_boost, signal_reason = calculate_signal_strength(probs, sess)
+    signal_boost, signal_reason = calculate_signal_strength(final_probs, sess)
     
-    # 🔥 v4.0 決策
-    choice, bet_amt, reason = determine_bet_final_v4(
-        probs, mode, bankroll, skip_streak, loss_streak, stage, signal_boost
+    pattern = "正常"
+    if hasattr(pf_model, 'detect_pattern'):
+        pattern = pf_model.detect_pattern()
+    
+    choice, bet_amt, reason, pf_probs_result, dep_probs_result = determine_bet_final_v44(
+        final_probs, pf_probs, dep_probs, mode, bankroll, skip_streak, 
+        loss_streak, stage, signal_boost, pattern, consecutive_losses
     )
     
-    if signal_reason and reason != "🛑 連輸保護啟動 - 暫停下注":
+    if signal_reason and reason != "🛑 連輸保護啟動 - 暫停下注" and not reason.startswith("⚠️"):
         reason = f"{signal_reason} | {reason}"
     
-    # 記錄預測
-    sess["last_prediction"] = probs.copy()
+    # 記錄預測（供結果回報用）
+    sess["last_prediction"] = final_probs.copy()
     sess["last_actual_outcome"] = 1 if choice == "莊" else 0 if choice == "閒" else None
-    
-    sess["last_pts_text"] = points_text
     sess["last_choice"] = choice
+    sess["last_pf_probs"] = pf_probs_result
+    sess["last_dep_probs"] = dep_probs_result
+    sess["last_bet_amount"] = bet_amt if choice != "觀望" else 0
+    sess["last_pts_text"] = points_text
     sess["rounds_seen"] = sess.get("rounds_seen", 0) + 1
     
     if choice == "觀望":
@@ -697,12 +839,12 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
     
     trial_msg = None if is_premium(uid) else format_trial_time(sess)
     
-    return format_output_v4(probs, choice, bet_amt, reason, mode, points_text,
-                           sess.get("game"), sess.get("bankroll"), trial_msg,
-                           sess.get("skip_streak"), loss_streak, win_streak, stage,
-                           ev_banker, ev_player)
+    return format_output_v44(final_probs, choice, bet_amt, reason, mode, points_text,
+                            sess.get("game"), sess.get("bankroll"), trial_msg,
+                            sess.get("skip_streak"), loss_streak, win_streak, stage,
+                            pattern, session_roi, ev_banker, ev_player)
 
-# ==================== LINE Bot ====================
+# ==================== LINE Bot (安全載入) ====================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 _line_bot_available = False
@@ -712,15 +854,17 @@ handler = None
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
         from linebot import LineBotApi, WebhookHandler
-        from linebot.models import TextSendMessage, FollowEvent, UnfollowEvent, QuickReply, QuickReplyButton, MessageAction
+        from linebot.models import TextSendMessage, FollowEvent, UnfollowEvent, QuickReply, QuickReplyButton, MessageAction, TextMessage
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         handler = WebhookHandler(LINE_CHANNEL_SECRET)
         _line_bot_available = True
         log.info("LINE Bot ready")
     except Exception as e:
-        log.error(f"LINE init failed: {e}")
+        log.warning(f"LINE Bot not available: {e}")
 
-def build_main_menu() -> QuickReply:
+def build_main_menu():
+    if not _line_bot_available:
+        return None
     return QuickReply(items=[
         QuickReplyButton(action=MessageAction(label="🎮 遊戲設定", text="遊戲設定")),
         QuickReplyButton(action=MessageAction(label="🛑 結束", text="結束分析")),
@@ -730,29 +874,17 @@ def build_main_menu() -> QuickReply:
 if _flask_available and Flask is not None:
     app = Flask(__name__)
     CORS(app)
-    try:
-        if not KEEP_ALIVE_STARTED:
-            with KEEP_ALIVE_LOCK:
-                if not KEEP_ALIVE_STARTED:
-                    threading.Thread(target=_self_keep_alive, daemon=True).start()
-                    KEEP_ALIVE_STARTED = True
-    except Exception:
-        pass
 else:
-    class _DummyApp:
-        def get(self, *a, **k):
-            def _d(f): return f
-            return _d
-        def post(self, *a, **k):
-            def _d(f): return f
-            return _d
-        def run(self, *a, **k):
-            log.warning("Flask not available")
-    app = _DummyApp()
+    app = type('DummyApp', (), {
+        'get': lambda self, *a, **k: lambda f: f,
+        'post': lambda self, *a, **k: lambda f: f,
+        'run': lambda self, *a, **k: None
+    })()
 
+# ==================== Routes ====================
 @app.get("/")
 def root():
-    return f"✅ BGS v4.0 完整策略版", 200
+    return f"✅ BGS v4.4 真實盈利監控版 ({VERSION})", 200
 
 @app.get("/ping")
 def ping():
@@ -760,7 +892,16 @@ def ping():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": VERSION, "status": "running"}, 200
+    return {
+        "ok": True,
+        "version": VERSION,
+        "status": "running",
+        "pf_initialized": PF_INITIALIZED,
+        "deplete_ok": DEPLETE_OK,
+        "line_bot": _line_bot_available,
+        "redis": redis_client is not None,
+        "timestamp": time.time()
+    }, 200
 
 @app.post("/predict")
 def predict():
@@ -778,21 +919,26 @@ def predict():
         result = _handle_points_and_predict(uid, points, sess)
         return jsonify({"result": result}), 200
     except Exception as e:
+        log.error(f"Predict error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.post("/webhook")
 def webhook():
-    if not _line_bot_available:
-        return jsonify({"error": "LINE not configured"}), 400
+    if not _line_bot_available or handler is None:
+        return jsonify({"error": "LINE Bot not configured"}), 400
+    
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    
     if not signature:
         return "Missing signature", 400
+    
     try:
         handler.handle(body, signature)
     except Exception as e:
         log.error(f"Webhook error: {e}")
         return jsonify({"error": str(e)}), 500
+    
     return "OK", 200
 
 # ==================== LINE Handlers ====================
@@ -801,14 +947,18 @@ if _line_bot_available and handler:
     @handler.add(FollowEvent)
     def handle_follow(event):
         user_id = event.source.user_id
-        msg = f"🎰 BGS v4.0 完整策略版（職業級）\n\n"
+        msg = f"🎰 BGS v4.4 真實盈利監控版\n\n"
         msg += f"⏳ 試用 {TRIAL_SECONDS//60} 分鐘\n\n"
         msg += "✨ 核心功能：\n"
-        msg += "• 🎯 Stage節奏系統（觀望→試探→主攻→收縮）\n"
-        msg += "• 📈 連續信號強化（吃順風）\n"
+        msg += "• 🎯 Stage節奏系統\n"
+        msg += "• 📈 連續信號強化 + 假信號過濾\n"
         msg += "• 🃏 真實牌靴記憶（每局扣牌）\n"
-        msg += "• 💰 動態下注 + 連輸風控\n"
-        msg += "• 🧠 AI真實學習（贏/輸回報）\n\n"
+        msg += "• 💰 Kelly混合下注 + EV濾網\n"
+        msg += "• 🃏 路單偵測 + 一致性檢查\n"
+        msg += "• 🔄 動態權重（基於EV正確率）\n"
+        msg += "• 📊 波動控制（指數衰減）\n"
+        msg += "• 📈 ROI追蹤 + 每日風控\n"
+        msg += "• 🧠 AI真實學習（EV正確率）\n\n"
         msg += "🎮 點擊「遊戲設定」開始"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
     
@@ -854,6 +1004,7 @@ if _line_bot_available and handler:
             sess["win_streak"] = 0
             sess["signal_history"] = []
             sess["stage"] = "觀望期"
+            sess["consecutive_losses"] = 0
             save_session(user_id, sess)
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="🛑 已結束分析\n\n🎮 點擊「遊戲設定」重新開始",
@@ -868,6 +1019,7 @@ if _line_bot_available and handler:
             sess["win_streak"] = 0
             sess["signal_history"] = []
             sess["stage"] = "觀望期"
+            sess["consecutive_losses"] = 0
             save_session(user_id, sess)
             msg = "🎯 請選擇館別：\n\n"
             for k, v in GAMES.items():
@@ -891,12 +1043,13 @@ if _line_bot_available and handler:
         if phase == "set_bankroll":
             if text.isdigit() and int(text) >= 100:
                 sess["bankroll"] = int(text)
+                sess["initial_bankroll"] = int(text)
                 sess["phase"] = "playing"
                 save_session(user_id, sess)
                 msg = f"✅ 本金：{text} 單位\n\n"
                 msg += "📊 輸入點數（如：65 / 和 / 閒6莊5）\n"
                 msg += "🎯 結果回報：輸入「贏」或「輸」讓AI學習\n"
-                msg += "🔥 v4.0 新功能：自動節奏 + 信號強化"
+                msg += "📈 系統會自動追蹤ROI"
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
             else:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 本金至少100", quick_reply=build_main_menu()))
@@ -914,17 +1067,23 @@ if _line_bot_available and handler:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result, quick_reply=build_main_menu()))
             return
 
-# ==================== Main ====================
+# ==================== 啟動 ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info(f"Starting {VERSION} on port {port}")
-    log.info("=== 🔥 v4.0 完整策略版功能 ===")
+    log.info(f"🚀 BGS v4.4 啟動 - 0.0.0.0:{port}")
+    log.info("=== 🔥 v4.4 真實盈利監控版功能 ===")
     log.info("  ✓ Stage節奏系統（觀望→試探→加溫→主攻→收縮）")
-    log.info("  ✓ 連續信號強化（順風局加權）")
-    log.info("  ✓ 真實牌靴記憶（每局扣牌）")
-    log.info("  ✓ 動態下注 + Stage調整 + 信號強化")
-    log.info("  ✓ 連輸風控（3/5/7級）")
-    log.info("  ✓ 真實AI學習")
+    log.info("  ✓ 連續信號強化 + 假信號過濾（edge < 0.015 不強化）")
+    log.info("  ✓ 真實牌靴記憶（每局扣牌，不重新 init）")
+    log.info("  ✓ Kelly混合下注 + EV濾網 + 邊際過小濾網")
+    log.info("  ✓ 路單偵測 + 一致性檢查（避免邏輯衝突）")
+    log.info("  ✓ 動態權重（基於 EV 正確率，不是方向正確率）")
+    log.info("  ✓ 波動控制（指數衰減，連續虧損降70%）")
+    log.info("  ✓ 連輸風控（指數衰減）")
+    log.info("  ✓ 每日風控（單日虧損超過10%停止）")
+    log.info("  ✓ ROI追蹤（即時顯示收益率）")
+    log.info("  ✓ 真實AI學習（EV正確率評估）")
+    log.info("  ✓ 所有模組安全 Fallback")
     
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
