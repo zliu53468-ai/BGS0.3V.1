@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""server.py — BGS v4.4 真實盈利監控版（EV正確率評估 + 真實牌靴 + ROI追蹤 + 每日風控）"""
+"""server.py — BGS v4.4 真實盈利監控版（EV正確率評估 + 真實牌靴 + ROI追蹤 + 每日風控）
+🔥 2025-01-27 修復版：Webhook Log + Handler try-catch + dedupe_event 修復
+"""
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, date
 import numpy as np
 
 # ==================== VERSION 定義 ====================
-VERSION = "bgs-v4.4-profit-monitor-2025-11-03"
+VERSION = "bgs-v4.4-profit-monitor-2025-01-27-fixed"
 
 # ==================== 試用設定 ====================
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
@@ -258,9 +260,11 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
     KV_FALLBACK[k] = v
     return True
 
+# 🔥 修復：dedupe_event 處理 None 的情況
 def _dedupe_event(event_id: Optional[str]) -> bool:
+    """檢查是否重複事件，None 時直接放行"""
     if not event_id:
-        return True
+        return True  # None 時直接放行，不阻擋任何事件
     return _rsetnx(f"dedupe:{event_id}", "1", ex=DEDUPE_TTL)
 
 # ==================== Premium System ====================
@@ -922,21 +926,38 @@ def predict():
         log.error(f"Predict error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# 🔥 修復版 Webhook - 完整 Log 除錯
 @app.post("/webhook")
 def webhook():
+    """LINE Webhook - 完整除錯版本"""
+    log.info("=" * 50)
+    log.info("🔥 Webhook HIT")
+    
+    # 1. 檢查 LINE Bot 是否可用
     if not _line_bot_available or handler is None:
+        log.error("❌ LINE Bot not configured")
         return jsonify({"error": "LINE Bot not configured"}), 400
     
+    # 2. 獲取簽章和內容
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     
+    log.info(f"🔑 Signature (first 20): {signature[:20]}..." if signature else "🔑 Signature: MISSING")
+    log.info(f"📩 Body length: {len(body)}")
+    log.info(f"📩 Body preview: {body[:300]}")
+    
+    # 3. 檢查簽章
     if not signature:
+        log.error("❌ Missing X-Line-Signature header")
         return "Missing signature", 400
     
+    # 4. 處理 webhook
     try:
         handler.handle(body, signature)
+        log.info("✅ Handler processed successfully")
+        log.info("=" * 50)
     except Exception as e:
-        log.error(f"Webhook error: {e}")
+        log.error(f"❌ Webhook error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     
     return "OK", 200
@@ -946,132 +967,174 @@ if _line_bot_available and handler:
     
     @handler.add(FollowEvent)
     def handle_follow(event):
-        user_id = event.source.user_id
-        msg = f"🎰 BGS v4.4 真實盈利監控版\n\n"
-        msg += f"⏳ 試用 {TRIAL_SECONDS//60} 分鐘\n\n"
-        msg += "✨ 核心功能：\n"
-        msg += "• 🎯 Stage節奏系統\n"
-        msg += "• 📈 連續信號強化 + 假信號過濾\n"
-        msg += "• 🃏 真實牌靴記憶（每局扣牌）\n"
-        msg += "• 💰 Kelly混合下注 + EV濾網\n"
-        msg += "• 🃏 路單偵測 + 一致性檢查\n"
-        msg += "• 🔄 動態權重（基於EV正確率）\n"
-        msg += "• 📊 波動控制（指數衰減）\n"
-        msg += "• 📈 ROI追蹤 + 每日風控\n"
-        msg += "• 🧠 AI真實學習（EV正確率）\n\n"
-        msg += "🎮 點擊「遊戲設定」開始"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
+        try:
+            user_id = event.source.user_id
+            log.info(f"📱 New follower: {user_id}")
+            msg = f"🎰 BGS v4.4 真實盈利監控版\n\n"
+            msg += f"⏳ 試用 {TRIAL_SECONDS//60} 分鐘\n\n"
+            msg += "✨ 核心功能：\n"
+            msg += "• 🎯 Stage節奏系統\n"
+            msg += "• 📈 連續信號強化 + 假信號過濾\n"
+            msg += "• 🃏 真實牌靴記憶（每局扣牌）\n"
+            msg += "• 💰 Kelly混合下注 + EV濾網\n"
+            msg += "• 🃏 路單偵測 + 一致性檢查\n"
+            msg += "• 🔄 動態權重（基於EV正確率）\n"
+            msg += "• 📊 波動控制（指數衰減）\n"
+            msg += "• 📈 ROI追蹤 + 每日風控\n"
+            msg += "• 🧠 AI真實學習（EV正確率）\n\n"
+            msg += "🎮 點擊「遊戲設定」開始"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
+            log.info(f"✅ Follow reply sent to {user_id}")
+        except Exception as e:
+            log.error(f"❌ handle_follow error: {e}", exc_info=True)
     
+    # 🔥 修復版 Handler - 加入完整 try-catch
     @handler.add(TextMessage)
     def handle_text_message(event):
-        user_id = event.source.user_id
-        text = event.message.text.strip()
-        
-        if not _dedupe_event(getattr(event, "webhook_event_id", None)):
-            return
-        
-        sess = get_session(user_id)
-        
-        if not is_premium(user_id) and is_trial_expired(sess):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⏰ 試用已用完，請輸入開通碼：開通 [密碼]",
-                quick_reply=build_main_menu()
-            ))
-            return
-        
-        if text.startswith("開通"):
-            parts = text.split()
-            if len(parts) != 2:
-                reply = "❌ 格式：開通 [密碼]"
+        try:
+            user_id = event.source.user_id
+            text = event.message.text.strip()
+            log.info(f"💬 TextMessage from {user_id}: {text}")
+            
+            # 檢查重複事件（修復版）
+            event_id = getattr(event, "webhook_event_id", None)
+            if event_id:
+                if not _dedupe_event(event_id):
+                    log.info(f"⚠️ Duplicate event skipped: {event_id}")
+                    return
             else:
-                if use_activation_code(user_id, parts[1]):
-                    sess["premium"] = True
-                    save_session(user_id, sess)
-                    reply = "✅ 開通成功！已升級付費模式"
-                else:
-                    reply = "❌ 密碼錯誤"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply, quick_reply=build_main_menu()))
-            return
-        
-        phase = sess.get("phase", "init")
-        
-        if text in ["結束分析", "停止", "exit"]:
-            sess["phase"] = "init"
-            sess["game"] = None
-            sess["bankroll"] = 0
-            sess["skip_streak"] = 0
-            sess["loss_streak"] = 0
-            sess["win_streak"] = 0
-            sess["signal_history"] = []
-            sess["stage"] = "觀望期"
-            sess["consecutive_losses"] = 0
-            save_session(user_id, sess)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="🛑 已結束分析\n\n🎮 點擊「遊戲設定」重新開始",
-                quick_reply=build_main_menu()
-            ))
-            return
-        
-        if text in ["遊戲設定", "設定", "start"]:
-            sess["phase"] = "choose_game"
-            sess["skip_streak"] = 0
-            sess["loss_streak"] = 0
-            sess["win_streak"] = 0
-            sess["signal_history"] = []
-            sess["stage"] = "觀望期"
-            sess["consecutive_losses"] = 0
-            save_session(user_id, sess)
-            msg = "🎯 請選擇館別：\n\n"
-            for k, v in GAMES.items():
-                msg += f"{k}. {v}\n"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
-            return
-        
-        if phase == "choose_game":
-            if text in GAMES:
-                sess["game"] = GAMES[text]
-                sess["phase"] = "set_bankroll"
-                save_session(user_id, sess)
+                log.info(f"ℹ️ No webhook_event_id, processing anyway")
+            
+            sess = get_session(user_id)
+            
+            # 試用檢查
+            if not is_premium(user_id) and is_trial_expired(sess):
+                log.info(f"⏰ Trial expired for {user_id}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                    text=f"✅ 已選擇：{GAMES[text]}\n\n💰 請輸入本金（單位）",
+                    text="⏰ 試用已用完，請輸入開通碼：開通 [密碼]",
                     quick_reply=build_main_menu()
                 ))
-            else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 請輸入1-10", quick_reply=build_main_menu()))
-            return
-        
-        if phase == "set_bankroll":
-            if text.isdigit() and int(text) >= 100:
-                sess["bankroll"] = int(text)
-                sess["initial_bankroll"] = int(text)
-                sess["phase"] = "playing"
+                return
+            
+            # 開通碼處理
+            if text.startswith("開通"):
+                parts = text.split()
+                if len(parts) != 2:
+                    reply = "❌ 格式：開通 [密碼]"
+                else:
+                    if use_activation_code(user_id, parts[1]):
+                        sess["premium"] = True
+                        save_session(user_id, sess)
+                        reply = "✅ 開通成功！已升級付費模式"
+                        log.info(f"🎉 User {user_id} activated premium")
+                    else:
+                        reply = "❌ 密碼錯誤"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply, quick_reply=build_main_menu()))
+                return
+            
+            phase = sess.get("phase", "init")
+            
+            # 結束分析
+            if text in ["結束分析", "停止", "exit"]:
+                sess["phase"] = "init"
+                sess["game"] = None
+                sess["bankroll"] = 0
+                sess["skip_streak"] = 0
+                sess["loss_streak"] = 0
+                sess["win_streak"] = 0
+                sess["signal_history"] = []
+                sess["stage"] = "觀望期"
+                sess["consecutive_losses"] = 0
                 save_session(user_id, sess)
-                msg = f"✅ 本金：{text} 單位\n\n"
-                msg += "📊 輸入點數（如：65 / 和 / 閒6莊5）\n"
-                msg += "🎯 結果回報：輸入「贏」或「輸」讓AI學習\n"
-                msg += "📈 系統會自動追蹤ROI"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="🛑 已結束分析\n\n🎮 點擊「遊戲設定」重新開始",
+                    quick_reply=build_main_menu()
+                ))
+                return
+            
+            # 遊戲設定
+            if text in ["遊戲設定", "設定", "start"]:
+                sess["phase"] = "choose_game"
+                sess["skip_streak"] = 0
+                sess["loss_streak"] = 0
+                sess["win_streak"] = 0
+                sess["signal_history"] = []
+                sess["stage"] = "觀望期"
+                sess["consecutive_losses"] = 0
+                save_session(user_id, sess)
+                msg = "🎯 請選擇館別：\n\n"
+                for k, v in GAMES.items():
+                    msg += f"{k}. {v}\n"
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
-            else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 本金至少100", quick_reply=build_main_menu()))
-            return
-        
-        if phase == "init":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⚠️ 請先點擊「遊戲設定」",
-                quick_reply=build_main_menu()
-            ))
-            return
-        
-        if phase == "playing":
-            result = _handle_points_and_predict(user_id, text, sess)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result, quick_reply=build_main_menu()))
-            return
+                return
+            
+            # 選擇館別
+            if phase == "choose_game":
+                if text in GAMES:
+                    sess["game"] = GAMES[text]
+                    sess["phase"] = "set_bankroll"
+                    save_session(user_id, sess)
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text=f"✅ 已選擇：{GAMES[text]}\n\n💰 請輸入本金（單位）",
+                        quick_reply=build_main_menu()
+                    ))
+                else:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 請輸入1-10", quick_reply=build_main_menu()))
+                return
+            
+            # 設定本金
+            if phase == "set_bankroll":
+                if text.isdigit() and int(text) >= 100:
+                    sess["bankroll"] = int(text)
+                    sess["initial_bankroll"] = int(text)
+                    sess["phase"] = "playing"
+                    save_session(user_id, sess)
+                    msg = f"✅ 本金：{text} 單位\n\n"
+                    msg += "📊 輸入點數（如：65 / 和 / 閒6莊5）\n"
+                    msg += "🎯 結果回報：輸入「贏」或「輸」讓AI學習\n"
+                    msg += "📈 系統會自動追蹤ROI"
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
+                else:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 本金至少100", quick_reply=build_main_menu()))
+                return
+            
+            # 未設定遊戲
+            if phase == "init":
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="⚠️ 請先點擊「遊戲設定」",
+                    quick_reply=build_main_menu()
+                ))
+                return
+            
+            # 遊玩模式
+            if phase == "playing":
+                result = _handle_points_and_predict(user_id, text, sess)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result, quick_reply=build_main_menu()))
+                log.info(f"✅ Response sent to {user_id}")
+                return
+                
+        except Exception as e:
+            log.error(f"❌ handle_text_message crashed: {e}", exc_info=True)
+            try:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"⚠️ 系統錯誤，請稍後再試\n錯誤：{str(e)[:100]}"
+                ))
+            except Exception as reply_error:
+                log.error(f"❌ Failed to send error message: {reply_error}")
 
 # ==================== 啟動 ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
+    
+    # 顯示 Webhook URL 提示
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if render_url:
+        log.info(f"🌐 Webhook URL should be: {render_url}/webhook")
+    else:
+        log.info("🌐 Webhook URL: https://YOUR_DOMAIN/webhook")
+    
     log.info(f"🚀 BGS v4.4 啟動 - 0.0.0.0:{port}")
-    log.info("=== 🔥 v4.4 真實盈利監控版功能 ===")
+    log.info("=== 🔥 v4.4 真實盈利監控版功能 (修復版) ===")
     log.info("  ✓ Stage節奏系統（觀望→試探→加溫→主攻→收縮）")
     log.info("  ✓ 連續信號強化 + 假信號過濾（edge < 0.015 不強化）")
     log.info("  ✓ 真實牌靴記憶（每局扣牌，不重新 init）")
@@ -1084,6 +1147,11 @@ if __name__ == "__main__":
     log.info("  ✓ ROI追蹤（即時顯示收益率）")
     log.info("  ✓ 真實AI學習（EV正確率評估）")
     log.info("  ✓ 所有模組安全 Fallback")
+    log.info("=== 🔧 修復內容 ===")
+    log.info("  ✓ Webhook 完整 Log 除錯")
+    log.info("  ✓ dedupe_event 修復 (None 不阻擋)")
+    log.info("  ✓ Handler try-catch 保護")
+    log.info("  ✓ FollowEvent 錯誤處理")
     
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
