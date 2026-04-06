@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """server.py — BGS v4.4 真實盈利監控版（EV正確率評估 + 真實牌靴 + ROI追蹤 + 每日風控）
 🔥 2025-01-27 修復版：Webhook Log + Handler try-catch + dedupe_event 修復
+🔥 2025-01-27 v2：Flask強制檢查 + SELF PING防休眠 + Webhook強化
 """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
@@ -8,7 +9,7 @@ from datetime import datetime, date
 import numpy as np
 
 # ==================== VERSION 定義 ====================
-VERSION = "bgs-v4.4-profit-monitor-2025-01-27-fixed"
+VERSION = "bgs-v4.4-profit-monitor-2025-01-27-fixed-v2"
 
 # ==================== 試用設定 ====================
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
@@ -56,7 +57,6 @@ class SmartDummyPF:
         self.base_probs = np.array([0.4586, 0.4462, 0.0952])
         self.outcome_history = []
         self.direction_history = []
-        # 🔥 v4.4 改用 EV 正確率
         self.pf_ev_accuracy_history = []
         self.deplete_ev_accuracy_history = []
         self.learning_rate = 0.1
@@ -65,10 +65,8 @@ class SmartDummyPF:
         log.info("PF Model initialized (v4.4 Profit Monitor)")
     
     def predict_proba(self, points: List[int], shoe_counts: Optional[Dict] = None) -> np.ndarray:
-        """🔥 v4.4 使用真實牌靴計數器，不重新 init"""
         if DEPLETE_OK and init_counts is not None and probs_after_points is not None:
             try:
-                # 🔥 使用傳入的 shoe_counts，不要每次都 init
                 counts = shoe_counts if shoe_counts is not None else (init_counts() if init_counts else None)
                 if counts is not None and len(points) >= 2:
                     try:
@@ -89,22 +87,18 @@ class SmartDummyPF:
     def update_outcome(self, outcome: int, confidence: float = 1.0, 
                        pf_probs: np.ndarray = None, dep_probs: np.ndarray = None,
                        choice: str = None) -> None:
-        """🔥 v4.4 改用 EV 正確率評估"""
         if outcome is None or confidence < 0.8:
             return
         
-        # 記錄方向歷史
         self.direction_history.append("莊" if outcome == 1 else "閒")
         if len(self.direction_history) > 50:
             self.direction_history = self.direction_history[-50:]
         
-        # 🔥 計算 PF 的 EV 是否正確
         if pf_probs is not None:
             pB, pP, _ = pf_probs
             ev_banker = pB * 0.95 - (1 - pB)
             ev_player = pP * 1.0 - (1 - pP)
             
-            # EV 正確的定義：正EV時應該贏，負EV時應該輸
             if choice == "莊":
                 is_ev_correct = (ev_banker > 0 and outcome == 1) or (ev_banker <= 0 and outcome == 0)
             elif choice == "閒":
@@ -116,7 +110,6 @@ class SmartDummyPF:
             if len(self.pf_ev_accuracy_history) > 50:
                 self.pf_ev_accuracy_history = self.pf_ev_accuracy_history[-50:]
         
-        # 🔥 計算 Deplete 的 EV 是否正確
         if dep_probs is not None:
             pB, pP, _ = dep_probs
             ev_banker = pB * 0.95 - (1 - pB)
@@ -171,7 +164,6 @@ class SmartDummyPF:
         return "正常"
     
     def get_dynamic_weights(self) -> Tuple[float, float]:
-        """🔥 v4.4 基於 EV 正確率的動態權重"""
         if len(self.pf_ev_accuracy_history) >= 20 and len(self.deplete_ev_accuracy_history) >= 20:
             pf_acc = sum(self.pf_ev_accuracy_history[-20:]) / 20
             dep_acc = sum(self.deplete_ev_accuracy_history[-20:]) / 20
@@ -196,7 +188,7 @@ except Exception as e:
     pf_model = SmartDummyPF()
     PF_INITIALIZED = True
 
-# ==================== Flask (安全載入) ====================
+# ==================== Flask (安全載入 + 強制檢查) ====================
 try:
     from flask import Flask, request, jsonify
     from flask_cors import CORS
@@ -204,12 +196,10 @@ try:
 except Exception as e:
     log.error(f"Flask import failed: {e}")
     _flask_available = False
-    Flask = None
-    request = None
-    def jsonify(*args, **kwargs):
-        return {"error": "Flask not available"}
-    def CORS(app):
-        return None
+
+# 🔥 強制檢查 Flask 是否可用
+if not _flask_available:
+    raise RuntimeError("❌ Flask 未安裝！請執行：pip install flask flask-cors")
 
 # ==================== Redis (選用，不強制) ====================
 try:
@@ -260,11 +250,9 @@ def _rsetnx(k: str, v: str, ex: int) -> bool:
     KV_FALLBACK[k] = v
     return True
 
-# 🔥 修復：dedupe_event 處理 None 的情況
 def _dedupe_event(event_id: Optional[str]) -> bool:
-    """檢查是否重複事件，None 時直接放行"""
     if not event_id:
-        return True  # None 時直接放行，不阻擋任何事件
+        return True
     return _rsetnx(f"dedupe:{event_id}", "1", ex=DEDUPE_TTL)
 
 # ==================== Premium System ====================
@@ -316,7 +304,7 @@ def _init_session_defaults(sess: Dict, uid: str):
     sess.setdefault("phase", "init")
     sess.setdefault("game", None)
     sess.setdefault("bankroll", 0)
-    sess.setdefault("initial_bankroll", 0)  # 🔥 v4.4 ROI 追蹤
+    sess.setdefault("initial_bankroll", 0)
     sess.setdefault("rounds_seen", 0)
     sess.setdefault("premium", is_premium(uid))
     sess.setdefault("trial_start", int(time.time()))
@@ -330,7 +318,6 @@ def _init_session_defaults(sess: Dict, uid: str):
     sess.setdefault("signal_history", [])
     sess.setdefault("stage", "觀望期")
     sess.setdefault("consecutive_losses", 0)
-    # 🔥 v4.4 ROI 追蹤
     sess.setdefault("session_profit", 0)
     sess.setdefault("session_roi", 0.0)
     sess.setdefault("daily_profit", 0)
@@ -376,7 +363,6 @@ def format_trial_time(sess: Dict[str, Any]) -> str:
 # ==================== v4.4 核心策略函數 ====================
 
 def check_daily_risk(sess: Dict[str, Any]) -> Tuple[bool, str]:
-    """🔥 v4.4 每日風控：單日虧損超過限制則停止"""
     today = str(date.today())
     if sess.get("daily_date") != today:
         sess["daily_date"] = today
@@ -392,9 +378,8 @@ def check_daily_risk(sess: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 def update_roi(sess: Dict[str, Any], bet_amount: int, won: bool) -> None:
-    """🔥 v4.4 更新 ROI 追蹤"""
     if won:
-        profit = bet_amount * 0.95  # 莊贏扣水
+        profit = bet_amount * 0.95
         sess["session_profit"] = sess.get("session_profit", 0) + profit
         sess["daily_profit"] = sess.get("daily_profit", 0) + profit
     else:
@@ -474,12 +459,10 @@ def calculate_bet_ratio_advanced(pB: float, pP: float, ev: float, mode: str,
                                   signal_boost: float, pattern: str,
                                   consecutive_losses: int) -> Tuple[float, str]:
     
-    # 🔥 EV 濾網
     if ev < 0.01:
         return 0, "📉 EV過低，暫停下注"
     
     edge = abs(pB - pP)
-    # 🔥 邊際過小濾網（避免假優勢）
     if edge < 0.02:
         return 0, "📉 邊際過小（避免假優勢）"
     
@@ -586,14 +569,11 @@ def parse_points_input(text: str) -> Optional[Tuple[List[int], str]]:
     return None
 
 def calculate_baccarat_probabilities(points: List[int], shoe_counts: Optional[Dict] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """🔥 v4.4 使用真實牌靴計數器"""
-    # 傳入 shoe_counts，不重新 init
     pf_probs = pf_model.predict_proba(points, shoe_counts)
     dep_probs = pf_probs.copy()
     
     if DEPLETE_OK and probs_after_points is not None and len(points) >= 2:
         try:
-            # 🔥 使用真實牌靴計數器
             counts = shoe_counts if shoe_counts is not None else (init_counts() if init_counts else None)
             if counts is not None:
                 dep_probs = probs_after_points(counts, points[0], points[1])
@@ -626,7 +606,6 @@ def determine_bet_final_v44(probs: np.ndarray, pf_probs: np.ndarray, dep_probs: 
                             mode: str, bankroll: int, skip_streak: int, 
                             loss_streak: int, stage: str, signal_boost: float, 
                             pattern: str, consecutive_losses: int) -> Tuple[str, int, str, np.ndarray, np.ndarray]:
-    """🔥 v4.4 完整決策引擎"""
     pB, pP, _ = probs
     ev_banker, ev_player = calculate_ev(probs)
     edge = abs(pB - pP)
@@ -705,7 +684,6 @@ def format_output_v44(probs: np.ndarray, choice: str, bet_amt: int, reason: str,
     return "\n".join([l for l in lines if l])
 
 def update_shoe_counts(sess: Dict[str, Any], points: List[int]) -> Optional[Dict]:
-    """🔥 v4.4 真實牌靴：每局扣牌，不 reset"""
     shoe_counts = sess.get("shoe_counts")
     if shoe_counts is None and DEPLETE_OK and init_counts is not None:
         try:
@@ -723,7 +701,6 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
     
     points, input_type = parsed
     
-    # 真實學習：處理用戶回報結果
     if points_text in ["贏", "勝", "win", "W"]:
         last_outcome = sess.get("last_actual_outcome")
         last_choice = sess.get("last_choice")
@@ -737,7 +714,6 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
                                     choice=last_choice)
             log.info(f"用戶{uid}回報贏，PF學習")
         
-        # 更新 ROI
         if last_bet_amount > 0:
             update_roi(sess, last_bet_amount, won=True)
         
@@ -762,7 +738,6 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
                                         choice=last_choice)
                 log.info(f"用戶{uid}回報輸，PF學習")
         
-        # 更新 ROI
         if last_bet_amount > 0:
             update_roi(sess, last_bet_amount, won=False)
         
@@ -777,17 +752,14 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
         save_session(uid, sess)
         return "🎲 和局\n\n建議謹慎下注"
     
-    # 🔥 每日風控檢查
     risk_ok, risk_msg = check_daily_risk(sess)
     if not risk_ok:
         return risk_msg
     
-    # 更新真實牌靴
     shoe_counts = update_shoe_counts(sess, points)
     if shoe_counts is not None:
         sess["shoe_counts"] = shoe_counts
     
-    # 計算機率（帶入牌靴狀態）
     try:
         final_probs, pf_probs, dep_probs = calculate_baccarat_probabilities(points, shoe_counts)
     except Exception as e:
@@ -824,7 +796,6 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
     if signal_reason and reason != "🛑 連輸保護啟動 - 暫停下注" and not reason.startswith("⚠️"):
         reason = f"{signal_reason} | {reason}"
     
-    # 記錄預測（供結果回報用）
     sess["last_prediction"] = final_probs.copy()
     sess["last_actual_outcome"] = 1 if choice == "莊" else 0 if choice == "閒" else None
     sess["last_choice"] = choice
@@ -875,15 +846,8 @@ def build_main_menu():
     ])
 
 # ==================== Flask App ====================
-if _flask_available and Flask is not None:
-    app = Flask(__name__)
-    CORS(app)
-else:
-    app = type('DummyApp', (), {
-        'get': lambda self, *a, **k: lambda f: f,
-        'post': lambda self, *a, **k: lambda f: f,
-        'run': lambda self, *a, **k: None
-    })()
+app = Flask(__name__)
+CORS(app)
 
 # ==================== Routes ====================
 @app.get("/")
@@ -931,33 +895,30 @@ def predict():
 def webhook():
     """LINE Webhook - 完整除錯版本"""
     log.info("=" * 50)
-    log.info("🔥 Webhook HIT")
+    log.info("🔥🔥🔥 Webhook HIT 🔥🔥🔥")
     
-    # 1. 檢查 LINE Bot 是否可用
     if not _line_bot_available or handler is None:
         log.error("❌ LINE Bot not configured")
         return jsonify({"error": "LINE Bot not configured"}), 400
     
-    # 2. 獲取簽章和內容
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     
     log.info(f"🔑 Signature (first 20): {signature[:20]}..." if signature else "🔑 Signature: MISSING")
+    log.info(f"📩 Headers: {dict(request.headers)}")
     log.info(f"📩 Body length: {len(body)}")
-    log.info(f"📩 Body preview: {body[:300]}")
+    log.info(f"📩 Body preview: {body[:500]}")
     
-    # 3. 檢查簽章
     if not signature:
         log.error("❌ Missing X-Line-Signature header")
         return "Missing signature", 400
     
-    # 4. 處理 webhook
     try:
         handler.handle(body, signature)
-        log.info("✅ Handler processed successfully")
+        log.info("✅ Webhook handled OK")
         log.info("=" * 50)
     except Exception as e:
-        log.error(f"❌ Webhook error: {e}", exc_info=True)
+        log.error(f"❌ Webhook crash: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     
     return "OK", 200
@@ -988,7 +949,6 @@ if _line_bot_available and handler:
         except Exception as e:
             log.error(f"❌ handle_follow error: {e}", exc_info=True)
     
-    # 🔥 修復版 Handler - 加入完整 try-catch
     @handler.add(TextMessage)
     def handle_text_message(event):
         try:
@@ -996,7 +956,6 @@ if _line_bot_available and handler:
             text = event.message.text.strip()
             log.info(f"💬 TextMessage from {user_id}: {text}")
             
-            # 檢查重複事件（修復版）
             event_id = getattr(event, "webhook_event_id", None)
             if event_id:
                 if not _dedupe_event(event_id):
@@ -1007,7 +966,6 @@ if _line_bot_available and handler:
             
             sess = get_session(user_id)
             
-            # 試用檢查
             if not is_premium(user_id) and is_trial_expired(sess):
                 log.info(f"⏰ Trial expired for {user_id}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -1016,7 +974,6 @@ if _line_bot_available and handler:
                 ))
                 return
             
-            # 開通碼處理
             if text.startswith("開通"):
                 parts = text.split()
                 if len(parts) != 2:
@@ -1034,7 +991,6 @@ if _line_bot_available and handler:
             
             phase = sess.get("phase", "init")
             
-            # 結束分析
             if text in ["結束分析", "停止", "exit"]:
                 sess["phase"] = "init"
                 sess["game"] = None
@@ -1052,7 +1008,6 @@ if _line_bot_available and handler:
                 ))
                 return
             
-            # 遊戲設定
             if text in ["遊戲設定", "設定", "start"]:
                 sess["phase"] = "choose_game"
                 sess["skip_streak"] = 0
@@ -1068,7 +1023,6 @@ if _line_bot_available and handler:
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=build_main_menu()))
                 return
             
-            # 選擇館別
             if phase == "choose_game":
                 if text in GAMES:
                     sess["game"] = GAMES[text]
@@ -1082,7 +1036,6 @@ if _line_bot_available and handler:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 請輸入1-10", quick_reply=build_main_menu()))
                 return
             
-            # 設定本金
             if phase == "set_bankroll":
                 if text.isdigit() and int(text) >= 100:
                     sess["bankroll"] = int(text)
@@ -1098,7 +1051,6 @@ if _line_bot_available and handler:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ 本金至少100", quick_reply=build_main_menu()))
                 return
             
-            # 未設定遊戲
             if phase == "init":
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text="⚠️ 請先點擊「遊戲設定」",
@@ -1106,7 +1058,6 @@ if _line_bot_available and handler:
                 ))
                 return
             
-            # 遊玩模式
             if phase == "playing":
                 result = _handle_points_and_predict(user_id, text, sess)
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result, quick_reply=build_main_menu()))
@@ -1122,19 +1073,47 @@ if _line_bot_available and handler:
             except Exception as reply_error:
                 log.error(f"❌ Failed to send error message: {reply_error}")
 
+# ==================== SELF PING 防休眠 ====================
+def self_ping():
+    """每5分鐘 ping 自己，防止 Render 休眠"""
+    import requests
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        log.warning("⚠️ SELF_PING 無法啟動（沒有 RENDER_EXTERNAL_URL）")
+        return
+    while True:
+        try:
+            full_url = f"{url}/ping"
+            log.info(f"🔁 SELF PING: {full_url}")
+            requests.get(full_url, timeout=10)
+        except Exception as e:
+            log.warning(f"SELF_PING failed: {e}")
+        time.sleep(300)  # 5分鐘
+
 # ==================== 啟動 ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     
-    # 顯示 Webhook URL 提示
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
     if render_url:
         log.info(f"🌐 Webhook URL should be: {render_url}/webhook")
     else:
         log.info("🌐 Webhook URL: https://YOUR_DOMAIN/webhook")
     
+    # 🔥 環境變數檢查
+    log.info(f"ENV CHECK → LINE_SECRET: {'✅ OK' if LINE_CHANNEL_SECRET else '❌ MISSING'}")
+    log.info(f"ENV CHECK → LINE_TOKEN: {'✅ OK' if LINE_CHANNEL_ACCESS_TOKEN else '❌ MISSING'}")
+    log.info(f"ENV CHECK → RENDER_URL: {render_url if render_url else '❌ NOT SET (SELF PING 無法啟動)'}")
+    
+    # 🔥 啟動 SELF PING（防 Render 休眠）
+    if render_url:
+        threading.Thread(target=self_ping, daemon=True).start()
+        log.info("✅ SELF PING 已啟動（每5分鐘）")
+    else:
+        log.warning("⚠️ SELF PING 未啟動（需設定 RENDER_EXTERNAL_URL）")
+    
     log.info(f"🚀 BGS v4.4 啟動 - 0.0.0.0:{port}")
-    log.info("=== 🔥 v4.4 真實盈利監控版功能 (修復版) ===")
+    log.info("=== 🔥 v4.4 真實盈利監控版功能 (修復版v2) ===")
     log.info("  ✓ Stage節奏系統（觀望→試探→加溫→主攻→收縮）")
     log.info("  ✓ 連續信號強化 + 假信號過濾（edge < 0.015 不強化）")
     log.info("  ✓ 真實牌靴記憶（每局扣牌，不重新 init）")
@@ -1147,13 +1126,12 @@ if __name__ == "__main__":
     log.info("  ✓ ROI追蹤（即時顯示收益率）")
     log.info("  ✓ 真實AI學習（EV正確率評估）")
     log.info("  ✓ 所有模組安全 Fallback")
-    log.info("=== 🔧 修復內容 ===")
-    log.info("  ✓ Webhook 完整 Log 除錯")
+    log.info("=== 🔧 修復內容 v2 ===")
+    log.info("  ✓ Flask 強制檢查（不再假啟動）")
+    log.info("  ✓ SELF PING 防 Render 休眠")
+    log.info("  ✓ Webhook 完整 Log 除錯（headers + body）")
+    log.info("  ✓ 環境變數啟動檢查")
     log.info("  ✓ dedupe_event 修復 (None 不阻擋)")
     log.info("  ✓ Handler try-catch 保護")
-    log.info("  ✓ FollowEvent 錯誤處理")
     
-    if _flask_available and Flask is not None:
-        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-    else:
-        log.error("Flask not available")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
