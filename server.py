@@ -699,7 +699,16 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
     sess["adv_history"] = history
     probs2 = np.array([float(probs[0]), float(probs[1]), float(probs[2])], dtype=np.float32)
     probs2 = probs2 / probs2.sum()
-    return probs2, 0.006, "正常"
+    # The second element returned here acts as the minimum edge threshold
+    # required by ``decide_only_bp`` to move from "觀望" to a bet.  In the
+    # original implementation this was set to 0.006, which often resulted in
+    # many hands being classified as "觀望" even when the Banker/Player edge
+    # difference was modest.  To reduce the frequency of "觀望" outcomes and
+    # make the bot more willing to place a bet, lower the threshold here.
+    # Setting this to 0.003 (half of the original) strikes a balance between
+    # caution and action.  If you wish to tweak the aggressiveness further,
+    # adjust this value accordingly.
+    return probs2, 0.003, "正常"
 
 
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
@@ -1254,3 +1263,4 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
         log.warning("Flask not available; cannot run HTTP server.")
+
