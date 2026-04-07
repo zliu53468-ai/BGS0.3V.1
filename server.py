@@ -695,41 +695,38 @@ def update_shoe_counts(sess: Dict[str, Any], points: List[int]) -> Optional[Dict
     return shoe_counts
 
 def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any]) -> str:
-    parsed = parse_points_input(points_text)
-    if not parsed:
-        return "❌ 格式錯誤！\n請輸入：65 / 6523 / 閒6莊5 / 和"
-    
-    points, input_type = parsed
-    
-    if points_text in ["贏", "勝", "win", "W"]:
+    raw_text = (points_text or "").strip()
+
+    # 先處理結果回報，避免被點數解析擋掉
+    if raw_text in ["贏", "勝", "win", "W"]:
         last_outcome = sess.get("last_actual_outcome")
         last_choice = sess.get("last_choice")
         last_pf_probs = sess.get("last_pf_probs")
         last_dep_probs = sess.get("last_dep_probs")
         last_bet_amount = sess.get("last_bet_amount", 0)
-        
+
         if last_outcome is not None and hasattr(pf_model, 'update_outcome'):
             pf_model.update_outcome(last_outcome, confidence=1.0, 
                                     pf_probs=last_pf_probs, dep_probs=last_dep_probs,
                                     choice=last_choice)
             log.info(f"用戶{uid}回報贏，PF學習")
-        
+
         if last_bet_amount > 0:
             update_roi(sess, last_bet_amount, won=True)
-        
+
         sess["win_streak"] = sess.get("win_streak", 0) + 1
         sess["loss_streak"] = 0
         sess["consecutive_losses"] = 0
         save_session(uid, sess)
         return "✅ 已記錄為「贏」，AI已學習此結果"
-    
-    if points_text in ["輸", "負", "loss", "L"]:
+
+    if raw_text in ["輸", "負", "loss", "L"]:
         last_outcome = sess.get("last_actual_outcome")
         last_choice = sess.get("last_choice")
         last_pf_probs = sess.get("last_pf_probs")
         last_dep_probs = sess.get("last_dep_probs")
         last_bet_amount = sess.get("last_bet_amount", 0)
-        
+
         if last_outcome is not None and hasattr(pf_model, 'update_outcome'):
             opposite = 1 - last_outcome if last_outcome in [0, 1] else None
             if opposite is not None:
@@ -737,21 +734,27 @@ def _handle_points_and_predict(uid: str, points_text: str, sess: Dict[str, Any])
                                         pf_probs=last_pf_probs, dep_probs=last_dep_probs,
                                         choice=last_choice)
                 log.info(f"用戶{uid}回報輸，PF學習")
-        
+
         if last_bet_amount > 0:
             update_roi(sess, last_bet_amount, won=False)
-        
+
         sess["loss_streak"] = sess.get("loss_streak", 0) + 1
         sess["win_streak"] = 0
         sess["consecutive_losses"] = sess.get("consecutive_losses", 0) + 1
         save_session(uid, sess)
         return "✅ 已記錄為「輸」，AI已學習此結果"
-    
-    if input_type == "tie":
+
+    if raw_text in ["和", "tie", "Tie", "TIE"]:
         sess["last_choice"] = "和"
         save_session(uid, sess)
         return "🎲 和局\n\n建議謹慎下注"
-    
+
+    parsed = parse_points_input(raw_text)
+    if not parsed:
+        return "❌ 格式錯誤！\n請輸入：65 / 6523 / 閒6莊5 / 和"
+
+    points, input_type = parsed
+
     risk_ok, risk_msg = check_daily_risk(sess)
     if not risk_ok:
         return risk_msg
@@ -890,29 +893,28 @@ def predict():
         log.error(f"Predict error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# 🔥 修復版 Webhook - 完整 Log 除錯
-@app.post("/webhook")
-def webhook():
+# 🔥 Webhook 入口（多路徑相容）
+def _handle_line_webhook():
     """LINE Webhook - 完整除錯版本"""
     log.info("=" * 50)
     log.info("🔥🔥🔥 Webhook HIT 🔥🔥🔥")
-    
+
     if not _line_bot_available or handler is None:
         log.error("❌ LINE Bot not configured")
         return jsonify({"error": "LINE Bot not configured"}), 400
-    
+
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
-    
+
     log.info(f"🔑 Signature (first 20): {signature[:20]}..." if signature else "🔑 Signature: MISSING")
     log.info(f"📩 Headers: {dict(request.headers)}")
     log.info(f"📩 Body length: {len(body)}")
     log.info(f"📩 Body preview: {body[:500]}")
-    
+
     if not signature:
         log.error("❌ Missing X-Line-Signature header")
-        return "Missing signature", 400
-    
+        return jsonify({"error": "Missing signature"}), 400
+
     try:
         handler.handle(body, signature)
         log.info("✅ Webhook handled OK")
@@ -920,8 +922,20 @@ def webhook():
     except Exception as e:
         log.error(f"❌ Webhook crash: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
-    
+
     return "OK", 200
+
+@app.post("/webhook")
+def webhook():
+    return _handle_line_webhook()
+
+@app.post("/line-webhook")
+def line_webhook():
+    return _handle_line_webhook()
+
+@app.post("/callback")
+def line_webhook_callback():
+    return _handle_line_webhook()
 
 # ==================== LINE Handlers ====================
 if _line_bot_available and handler:
