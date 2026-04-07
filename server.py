@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+from pathlib import Path
+
+server_code = r'''# -*- coding: utf-8 -*-
 """
 server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility + Stability + Advanced Control (FINAL FIXED + GPT-PATCH3)
 """
@@ -315,6 +317,7 @@ PF_STATEFUL = env_flag("PF_STATEFUL", 1)
 
 OutcomePF = None
 pf_initialized = False
+
 try:
     from bgs.pfilter import OutcomePF as RealOutcomePF
     OutcomePF = RealOutcomePF
@@ -327,7 +330,7 @@ except Exception as e1:
         pf_initialized = True
         log.info("成功從本地 pfilter 導入 OutcomePF")
     except Exception as e2:
-        log.error("無法導入 OutcomePF: bgs=%s | local=%s", e1, e2)
+        log.error("無法導入 OutcomePF: bgs=%r | local=%r", e1, e2)
         OutcomePF = None
         pf_initialized = False
 
@@ -1557,3 +1560,8 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
         log.warning("Flask not available; cannot run HTTP server.")
+'''
+
+path = Path('/mnt/data/server.py')
+path.write_text(server_code, encoding='utf-8')
+print(f"Wrote {path}")
