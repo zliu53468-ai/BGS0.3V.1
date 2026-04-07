@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Stability
@@ -552,8 +553,11 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
             final_edge = max(abs(evB), abs(evP))
             if edge < 0.065 and point_diff <= 5:
                 # 在 hybrid 模式下，當莊/閒勝率差距小且點數接近時，原始邏輯會在 final_edge < 0.014（約 1.4%）時強制觀望。
-                # 為了讓 1.x% 的差距也能產生下注建議，將閾值從 0.014 降至 0.01（約 1%）。若 final_edge 介於 1%–1.4%，仍會採用 EV 方式判斷下注。
-                if final_edge < 0.010:
+                # 為了讓 1.x% 的差距也能產生下注建議，此專案已將閾值降至 0.010（約 1.0%）。為了進一步降低「觀望」的頻率，
+                # 我們再將這一閾值略微降低至 0.007（約 0.7%）。這表示當 EV 差距超過約 0.7% 時，系統會更加傾向於下注。
+                # 若 final_edge 低於 0.007，仍返回觀望；若介於 0.007 到 0.014 之間，將繼續採用 EV 判斷下注。按需調整此值可改變
+                # 下注的積極程度。
+                if final_edge < 0.007:
                     return ("觀望", final_edge, 0.0, f"點數接近(diff={point_diff}) + 差距小 → 強制觀望")
                 if evB > evP + MIN_EV_EDGE + 0.001:
                     side = s2
@@ -702,15 +706,16 @@ def _advanced_control(sess: Dict[str, Any], probs: np.ndarray):
     probs2 = np.array([float(probs[0]), float(probs[1]), float(probs[2])], dtype=np.float32)
     probs2 = probs2 / probs2.sum()
     # The second element returned here acts as the minimum edge threshold
-    # required by ``decide_only_bp`` to move from "觀望" to a bet.  In the
-    # original implementation this was set to 0.006, which often resulted in
-    # many hands being classified as "觀望" even when the Banker/Player edge
-    # difference was modest.  To reduce the frequency of "觀望" outcomes and
-    # make the bot more willing to place a bet, lower the threshold here.
-    # Setting this to 0.003 (half of the original) strikes a balance between
-    # caution and action.  If you wish to tweak the aggressiveness further,
-    # adjust this value accordingly.
-    return probs2, 0.003, "正常"
+    # required by ``decide_only_bp`` to move from "觀望" (wait/observe) to a
+    # bet.  In the original implementation this was set to 0.006, which often
+    # resulted in many hands being classified as "觀望" even when the
+    # Banker/Player edge difference was modest.  To make the system more
+    # proactive, we further reduce this threshold.  A value of 0.002 means
+    # that as long as the effective edge is at least ~0.2 %, the bot will
+    # consider placing a bet instead of remaining in a neutral state.  If you
+    # wish to tweak the aggressiveness further, modify this value (e.g. to
+    # ``0.001`` for even more bets or back to ``0.003`` for more caution).
+    return probs2, 0.002, "正常"
 
 
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
@@ -1265,4 +1270,3 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
         log.warning("Flask not available; cannot run HTTP server.")
-
