@@ -551,7 +551,9 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
             s2, _, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
             if edge < 0.065 and point_diff <= 5:
-                if final_edge < 0.014:
+                # 在 hybrid 模式下，當莊/閒勝率差距小且點數接近時，原始邏輯會在 final_edge < 0.014（約 1.4%）時強制觀望。
+                # 為了讓 1.x% 的差距也能產生下注建議，將閾值從 0.014 降至 0.01（約 1%）。若 final_edge 介於 1%–1.4%，仍會採用 EV 方式判斷下注。
+                if final_edge < 0.010:
                     return ("觀望", final_edge, 0.0, f"點數接近(diff={point_diff}) + 差距小 → 強制觀望")
                 if evB > evP + MIN_EV_EDGE + 0.001:
                     side = s2
