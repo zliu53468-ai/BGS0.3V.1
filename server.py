@@ -2,6 +2,7 @@
 """server.py — BGS v4.4 真實盈利監控版（EV正確率評估 + 真實牌靴 + ROI追蹤 + 每日風控）
 🔥 2025-01-27 修復版：Webhook Log + Handler try-catch + dedupe_event 修復
 🔥 2025-01-27 v2：Flask強制檢查 + SELF PING防休眠 + Webhook強化
+🔥 2025-01-28 v3：徹底修復 404 問題 + 路由診斷
 """
 import os, sys, logging, time, re, json, threading
 from typing import Optional, Dict, Any, Tuple, List
@@ -9,15 +10,15 @@ from datetime import datetime, date
 import numpy as np
 
 # ==================== VERSION 定義 ====================
-VERSION = "bgs-v4.4-profit-monitor-2025-01-27-fixed-v2"
+VERSION = "bgs-v4.4-profit-monitor-2025-01-28-fixed-v3"
 
 # ==================== 試用設定 ====================
 TRIAL_SECONDS = int(os.getenv("TRIAL_SECONDS", "1800"))
 PREMIUM_TRIAL_SECONDS = int(os.getenv("PREMIUM_TRIAL_SECONDS", "2592000"))
 
 # ==================== 風控設定 ====================
-DAILY_MAX_LOSS_RATIO = float(os.getenv("DAILY_MAX_LOSS_RATIO", "0.1"))  # 單日最大虧損10%
-SESSION_MIN_PROFIT_RATIO = float(os.getenv("SESSION_MIN_PROFIT_RATIO", "-0.05"))  # 單局最小允許虧損5%
+DAILY_MAX_LOSS_RATIO = float(os.getenv("DAILY_MAX_LOSS_RATIO", "0.1"))
+SESSION_MIN_PROFIT_RATIO = float(os.getenv("SESSION_MIN_PROFIT_RATIO", "-0.05"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bgs-server")
@@ -197,11 +198,10 @@ except Exception as e:
     log.error(f"Flask import failed: {e}")
     _flask_available = False
 
-# 🔥 強制檢查 Flask 是否可用
 if not _flask_available:
     raise RuntimeError("❌ Flask 未安裝！請執行：pip install flask flask-cors")
 
-# ==================== Redis (選用，不強制) ====================
+# ==================== Redis (選用) ====================
 try:
     import redis
     REDIS_URL = os.getenv("REDIS_URL")
@@ -852,6 +852,12 @@ def build_main_menu():
 app = Flask(__name__)
 CORS(app)
 
+# ==================== 全域 404 記錄 ====================
+@app.errorhandler(404)
+def not_found(e):
+    log.warning(f"404 Not Found: {request.method} {request.path} - headers: {dict(request.headers)}")
+    return jsonify({"error": "not found", "path": request.path}), 404
+
 # ==================== Routes ====================
 @app.get("/")
 def root():
@@ -874,6 +880,18 @@ def health():
         "timestamp": time.time()
     }, 200
 
+@app.get("/debug/routes")
+def debug_routes():
+    """列出所有已註冊的路由，方便除錯"""
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            "endpoint": rule.endpoint,
+            "methods": list(rule.methods),
+            "path": str(rule)
+        })
+    return jsonify(routes), 200
+
 @app.post("/predict")
 def predict():
     try:
@@ -893,38 +911,44 @@ def predict():
         log.error(f"Predict error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# 🔥 Webhook 入口（多路徑相容）
+# 🔥 核心 Webhook 處理器 (統一入口)
 def _handle_line_webhook():
-    """LINE Webhook - 完整除錯版本"""
+    """LINE Webhook - 完整除錯版本，無論如何都返回 200"""
     log.info("=" * 50)
     log.info("🔥🔥🔥 Webhook HIT 🔥🔥🔥")
-
+    log.info(f"Method: {request.method}")
+    log.info(f"Path: {request.path}")
+    log.info(f"Headers: {dict(request.headers)}")
+    
+    # 即使 LINE Bot 未設定，也記錄並返回 200，避免 LINE 重試
     if not _line_bot_available or handler is None:
-        log.error("❌ LINE Bot not configured")
-        return jsonify({"error": "LINE Bot not configured"}), 400
+        log.error("❌ LINE Bot not configured - returning 200 anyway")
+        return "OK", 200
 
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
 
     log.info(f"🔑 Signature (first 20): {signature[:20]}..." if signature else "🔑 Signature: MISSING")
-    log.info(f"📩 Headers: {dict(request.headers)}")
     log.info(f"📩 Body length: {len(body)}")
     log.info(f"📩 Body preview: {body[:500]}")
 
     if not signature:
         log.error("❌ Missing X-Line-Signature header")
-        return jsonify({"error": "Missing signature"}), 400
+        # 仍回 200 避免 LINE 持續重送
+        return "OK", 200
 
     try:
         handler.handle(body, signature)
         log.info("✅ Webhook handled OK")
-        log.info("=" * 50)
     except Exception as e:
         log.error(f"❌ Webhook crash: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        # 錯誤仍回 200
+        return "OK", 200
 
+    log.info("=" * 50)
     return "OK", 200
 
+# 三個路徑都指向同一個處理函數，確保相容性
 @app.post("/webhook")
 def webhook():
     return _handle_line_webhook()
@@ -955,6 +979,7 @@ if _line_bot_available and handler:
             msg += "• 🃏 路單偵測 + 一致性檢查\n"
             msg += "• 🔄 動態權重（基於EV正確率）\n"
             msg += "• 📊 波動控制（指數衰減）\n"
+            msg += "• 🛡️ 連輸風控（指數衰減）\n"
             msg += "• 📈 ROI追蹤 + 每日風控\n"
             msg += "• 🧠 AI真實學習（EV正確率）\n\n"
             msg += "🎮 點擊「遊戲設定」開始"
@@ -1089,12 +1114,12 @@ if _line_bot_available and handler:
 
 # ==================== SELF PING 防休眠 ====================
 def self_ping():
-    """每5分鐘 ping 自己，防止 Render 休眠"""
-    import requests
+    """每5分鐘 ping 自己，防止 Render 休眠（需設定 RENDER_EXTERNAL_URL）"""
     url = os.getenv("RENDER_EXTERNAL_URL")
     if not url:
         log.warning("⚠️ SELF_PING 無法啟動（沒有 RENDER_EXTERNAL_URL）")
         return
+    import requests
     while True:
         try:
             full_url = f"{url}/ping"
@@ -1104,22 +1129,28 @@ def self_ping():
             log.warning(f"SELF_PING failed: {e}")
         time.sleep(300)  # 5分鐘
 
+# ==================== 啟動前輸出路由 ====================
+def log_routes():
+    log.info("=== Registered Routes ===")
+    for rule in app.url_map.iter_rules():
+        log.info(f"{rule.methods} {rule}")
+
 # ==================== 啟動 ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
     if render_url:
-        log.info(f"🌐 Webhook URL should be: {render_url}/webhook")
+        log.info(f"🌐 Webhook URL 應設為: {render_url}/webhook")
     else:
-        log.info("🌐 Webhook URL: https://YOUR_DOMAIN/webhook")
+        log.info("🌐 Webhook URL: https://YOUR_DOMAIN/webhook (請設定 RENDER_EXTERNAL_URL 以啟用 SELF PING)")
     
-    # 🔥 環境變數檢查
+    # 環境變數檢查
     log.info(f"ENV CHECK → LINE_SECRET: {'✅ OK' if LINE_CHANNEL_SECRET else '❌ MISSING'}")
     log.info(f"ENV CHECK → LINE_TOKEN: {'✅ OK' if LINE_CHANNEL_ACCESS_TOKEN else '❌ MISSING'}")
     log.info(f"ENV CHECK → RENDER_URL: {render_url if render_url else '❌ NOT SET (SELF PING 無法啟動)'}")
     
-    # 🔥 啟動 SELF PING（防 Render 休眠）
+    # 啟動 SELF PING（防 Render 休眠）
     if render_url:
         threading.Thread(target=self_ping, daemon=True).start()
         log.info("✅ SELF PING 已啟動（每5分鐘）")
@@ -1127,7 +1158,7 @@ if __name__ == "__main__":
         log.warning("⚠️ SELF PING 未啟動（需設定 RENDER_EXTERNAL_URL）")
     
     log.info(f"🚀 BGS v4.4 啟動 - 0.0.0.0:{port}")
-    log.info("=== 🔥 v4.4 真實盈利監控版功能 (修復版v2) ===")
+    log.info("=== 🔥 v4.4 真實盈利監控版功能 (修復版v3) ===")
     log.info("  ✓ Stage節奏系統（觀望→試探→加溫→主攻→收縮）")
     log.info("  ✓ 連續信號強化 + 假信號過濾（edge < 0.015 不強化）")
     log.info("  ✓ 真實牌靴記憶（每局扣牌，不重新 init）")
@@ -1140,12 +1171,14 @@ if __name__ == "__main__":
     log.info("  ✓ ROI追蹤（即時顯示收益率）")
     log.info("  ✓ 真實AI學習（EV正確率評估）")
     log.info("  ✓ 所有模組安全 Fallback")
-    log.info("=== 🔧 修復內容 v2 ===")
-    log.info("  ✓ Flask 強制檢查（不再假啟動）")
-    log.info("  ✓ SELF PING 防 Render 休眠")
-    log.info("  ✓ Webhook 完整 Log 除錯（headers + body）")
-    log.info("  ✓ 環境變數啟動檢查")
-    log.info("  ✓ dedupe_event 修復 (None 不阻擋)")
-    log.info("  ✓ Handler try-catch 保護")
+    log.info("=== 🔧 修復內容 v3 ===")
+    log.info("  ✓ 全域 404 記錄 + 診斷")
+    log.info("  ✓ Webhook 無論如何都回傳 200 (避免 LINE 重試)")
+    log.info("  ✓ 新增 /debug/routes 端點")
+    log.info("  ✓ 啟動時輸出所有註冊路由")
+    log.info("  ✓ 強化 Webhook 路徑相容性")
+    
+    # 輸出路由表
+    log_routes()
     
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
