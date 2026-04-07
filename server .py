@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Compatibility + Stability + Advanced Control (FINAL FIXED + GPT-PATCH3)
 """
