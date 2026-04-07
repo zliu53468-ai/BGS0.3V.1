@@ -1559,8 +1559,3 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
         log.warning("Flask not available; cannot run HTTP server.")
-'''
-
-path = Path('/mnt/data/server.py')
-path.write_text(code, encoding='utf-8')
-print(f"Wrote {path}")
