@@ -1,6 +1,4 @@
-from pathlib import Path
-
-server_code = '''# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Stability
 """
@@ -247,8 +245,8 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
     if bet_amt and bet_amt > 0:
         lines.append(f"配注：{bet_amt}")
     if cont:
-        lines.append("\\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
-    return "\\n".join(lines)
+        lines.append("\n（輸入下一局點數：例如 65 / 和 / 閒6莊5）")
+    return "\n".join(lines)
 
 
 VERSION = "bgs-clean-server-pf360-line-fix-2026-04-08"
@@ -664,21 +662,21 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if not text:
         return None
     s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
-    s = re.sub(r"[\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u206f\\ufeff\\r\\n\\t]", "", s).replace("\\u3000", " ")
+    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s).replace("\u3000", " ")
     u = s.upper().strip()
 
-    m = re.search(r"(?:和|TIE|DRAW)\\s*:?:?\\s*(\\d)?", u)
+    m = re.search(r"(?:和|TIE|DRAW)\s*:?:?\s*(\d)?", u)
     if m:
         d = m.group(1)
         return (int(d), int(d)) if d else (0, 0)
-    m = re.search(r"(?:閒|闲|P)\\s*:?:?\\s*(\\d)\\D+(?:莊|庄|B)\\s*:?:?\\s*(\\d)", u)
+    m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
     if m:
         return (int(m.group(1)), int(m.group(2)))
-    m = re.search(r"(?:莊|庄|B)\\s*:?:?\\s*(\\d)\\D+(?:閒|闲|P)\\s*:?:?\\s*(\\d)", u)
+    m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
     if m:
         return (int(m.group(2)), int(m.group(1)))
 
-    t = u.replace(" ", "").replace("\\u3000", "")
+    t = u.replace(" ", "").replace("\u3000", "")
     if t in ("B", "莊", "庄"):
         return (0, 1)
     if t in ("P", "閒", "闲"):
@@ -687,7 +685,7 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
         return (0, 0)
     if re.search(r"[A-Z]", u):
         return None
-    d = re.findall(r"\\d", u)
+    d = re.findall(r"\d", u)
     if len(d) == 2:
         return (int(d[0]), int(d[1]))
     return None
@@ -886,7 +884,7 @@ def trial_persist_guard(uid: str) -> Optional[str]:
     if is_premium(uid):
         return None
     if is_trial_blocked(uid):
-        return f"⛔ 試用已到期（帳號曾被封鎖）\\n🔐 如需重新啟用，請輸入：開通 你的密碼\\n📞 或聯繫：{ADMIN_CONTACT}"
+        return f"⛔ 試用已到期（帳號曾被封鎖）\n🔐 如需重新啟用，請輸入：開通 你的密碼\n📞 或聯繫：{ADMIN_CONTACT}"
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
@@ -907,16 +905,16 @@ def trial_persist_guard(uid: str) -> Optional[str]:
         expired = None
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
-        return f"⏰ 免費試用 {TRIAL_MINUTES} 分鐘已用完\\n🔐 請輸入：開通 你的專屬密碼\\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+        return f"⏰ 免費試用 {TRIAL_MINUTES} 分鐘已用完\n🔐 請輸入：開通 你的專屬密碼\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
     if expired == "1":
-        return f"⛔ 試用已到期\\n🔐 請輸入：開通 你的專屬密碼\\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+        return f"⛔ 試用已到期\n🔐 請輸入：開通 你的專屬密碼\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
     return None
 
 
 def validate_activation_code(code: str) -> bool:
     if not code:
         return False
-    norm = str(code).replace("\\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
+    norm = str(code).replace("\u3000", " ").replace("：", ":").strip().lstrip(":").strip()
     return bool(ADMIN_ACTIVATION_SECRET) and norm == ADMIN_ACTIVATION_SECRET
 
 
@@ -929,7 +927,7 @@ def game_menu_text(left_min: int) -> str:
         lines.append(f"{k}. {GAMES[k]}")
     lines.append("「請直接輸入數字選擇」")
     lines.append(f"⏳ 試用剩餘 {left_min} 分鐘（共 {TRIAL_MINUTES} 分鐘）")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def _quick_buttons():
@@ -1023,9 +1021,9 @@ try:
             except Exception:
                 pass
             if sess.get("premium", False) or is_premium(uid):
-                msg = "👋 歡迎回來，已是永久開通用戶。\\n輸入『遊戲設定』開始。"
+                msg = "👋 歡迎回來，已是永久開通用戶。\n輸入『遊戲設定』開始。"
             else:
-                msg = guard_msg or f"👋 歡迎！你有 {TRIAL_MINUTES} 分鐘免費試用。\\n輸入『遊戲設定』開始。"
+                msg = guard_msg or f"👋 歡迎！你有 {TRIAL_MINUTES} 分鐘免費試用。\n輸入『遊戲設定』開始。"
             _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
 
@@ -1034,7 +1032,7 @@ try:
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
             uid = event.source.user_id
-            text = re.sub(r"\\s+", " ", (event.message.text or "").replace("\\u3000", " ").strip())
+            text = re.sub(r"\s+", " ", (event.message.text or "").replace("\u3000", " ").strip())
             up = text.upper()
             sess = get_session(uid)
 
@@ -1072,7 +1070,7 @@ try:
             if hist_match:
                 sess["rounds_seen"] = len(text)
                 save_session(uid, sess)
-                _reply(line_api, event.reply_token, "歷史載入完成\\n請輸入下一局點數\\n例如：65 / 和 / 閒6莊5")
+                _reply(line_api, event.reply_token, "歷史載入完成\n請輸入下一局點數\n例如：65 / 和 / 閒6莊5")
                 return
 
             pts = parse_last_hand_points(text)
@@ -1089,7 +1087,7 @@ try:
                 return
 
             if sess.get("phase") == "choose_game":
-                m = re.match(r"^\\s*(\\d+)", text)
+                m = re.match(r"^\s*(\d+)", text)
                 if m and m.group(1) in GAMES:
                     sess["game"] = GAMES[m.group(1)]
                     sess["phase"] = "input_bankroll"
@@ -1100,14 +1098,14 @@ try:
                 return
 
             if sess.get("phase") == "input_bankroll":
-                num = re.sub(r"[^\\d]", "", text)
+                num = re.sub(r"[^\d]", "", text)
                 amt = int(num) if num else 0
                 if amt <= 0:
                     _reply(line_api, event.reply_token, "⚠️ 請輸入正整數金額。")
                     return
                 sess["bankroll"] = amt
                 sess["phase"] = "await_pts"
-                _reply(line_api, event.reply_token, f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\\n📌 現在輸入第一局點數（例：閒6莊5 / 65 / 和）")
+                _reply(line_api, event.reply_token, f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 現在輸入第一局點數（例：閒6莊5 / 65 / 和）")
                 save_session(uid, sess)
                 return
 
@@ -1140,7 +1138,7 @@ try:
                     _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
                 return
 
-            _reply(line_api, event.reply_token, "指令無法辨識。\\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。")
+            _reply(line_api, event.reply_token, "指令無法辨識。\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。")
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
