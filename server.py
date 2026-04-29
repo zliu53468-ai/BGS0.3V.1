@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Stability
+server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Stability + Stat Calibrator
 
-This version is modified to provide per-user particle filter (PF) instances. Each user
-maintains an independent PF state, avoiding cross-user contamination. The code also
-removes global prediction locks and instead relies on a per-user lock to protect PF
-updates and predictions. Negative probability bias values continue to be supported,
-and the logic for gracefully handling multiple signatures of probs_after_points is
-preserved.
+This version provides:
+1. Per-user particle filter instances.
+2. Per-user locking to avoid cross-user contamination.
+3. Negative / positive PROB_BIAS_B2P support.
+4. Graceful handling for multiple probs_after_points signatures.
+5. Optional stat calibrator layer:
+   bgs/stat_calibrator.py + bgs/calibrator_stats.json
 
-1. ``_apply_prob_bias`` supports positive and negative ``PROB_BIAS_B2P`` values.
-2. ``_handle_points_and_predict`` uses per-user locking and wraps calls to
-   ``probs_after_points`` to handle different function signatures gracefully.
+Stat calibrator position:
+PF predict
+→ soft tau
+→ deplete
+→ theo blend
+→ tie cap
+→ PROB_BIAS_B2P
+→ STAT_CALIBRATOR.adjust(...)
+→ advanced control
+→ decision
 """
 
 import os
@@ -72,6 +80,32 @@ except Exception:
     except Exception as e:
         log.warning("deplete import failed: %r", e)
         DEPLETE_OK = False
+
+#
+# ---------- stat calibrator ----------
+#
+STAT_CALIBRATOR_OK = False
+StatCalibrator = None
+STAT_CALIBRATOR = None
+
+try:
+    from bgs.stat_calibrator import StatCalibrator as RealStatCalibrator  # type: ignore
+    StatCalibrator = RealStatCalibrator
+    STAT_CALIBRATOR = StatCalibrator()
+    STAT_CALIBRATOR_OK = True
+    log.info("成功從 bgs.stat_calibrator 導入 StatCalibrator")
+except Exception as e1:
+    try:
+        from stat_calibrator import StatCalibrator as LocalStatCalibrator  # type: ignore
+        StatCalibrator = LocalStatCalibrator
+        STAT_CALIBRATOR = StatCalibrator()
+        STAT_CALIBRATOR_OK = True
+        log.info("成功從本地 stat_calibrator 導入 StatCalibrator")
+    except Exception as e2:
+        log.warning("StatCalibrator import failed: bgs=%r | local=%r", e1, e2)
+        StatCalibrator = None
+        STAT_CALIBRATOR = None
+        STAT_CALIBRATOR_OK = False
 
 #
 # ---------- Flask ----------
@@ -202,6 +236,35 @@ def _sess_key(uid: str) -> str:
     return f"sess:{uid}"
 
 
+def _ensure_session_defaults(sess: Dict[str, Any], uid: str) -> Dict[str, Any]:
+    """Ensure old Redis sessions also have new fields."""
+    if is_premium(uid):
+        sess["premium"] = True
+
+    sess.setdefault("phase", "await_pts")
+    sess.setdefault("bankroll", 0)
+    sess.setdefault("rounds_seen", 0)
+    sess.setdefault("last_pts_text", None)
+    sess.setdefault("premium", is_premium(uid))
+    sess.setdefault("trial_start", int(time.time()))
+    sess.setdefault("last_card", None)
+    sess.setdefault("last_card_ts", None)
+    sess.setdefault("pending", False)
+    sess.setdefault("pending_seq", 0)
+    sess.setdefault("loss_streak", 0)
+    sess.setdefault("adv_history", [])
+    sess.setdefault("last_choice", None)
+
+    # 新增：給百萬局統計校準層使用
+    sess.setdefault("outcome_streak_side", None)
+    sess.setdefault("outcome_streak_len", 0)
+    sess.setdefault("last_result", None)
+    sess.setdefault("last_banker_point", None)
+    sess.setdefault("last_player_point", None)
+
+    return sess
+
+
 def get_session(uid: str) -> Dict[str, Any]:
     """
     Retrieve the session dictionary for a given user. If no session exists,
@@ -214,24 +277,12 @@ def get_session(uid: str) -> Dict[str, Any]:
             raw = redis_client.get(_sess_key(uid))  # type: ignore[call-arg]
             if raw:
                 sess = json.loads(raw)
-                if is_premium(uid):
-                    sess["premium"] = True
-                sess.setdefault("pending", False)
-                sess.setdefault("pending_seq", 0)
-                sess.setdefault("loss_streak", 0)
-                sess.setdefault("adv_history", [])
-                sess.setdefault("last_choice", None)
-                return sess
+                return _ensure_session_defaults(sess, uid)
+
         sess = SESS_FALLBACK.get(uid)
         if isinstance(sess, dict):
-            if is_premium(uid):
-                sess["premium"] = True
-            sess.setdefault("pending", False)
-            sess.setdefault("pending_seq", 0)
-            sess.setdefault("loss_streak", 0)
-            sess.setdefault("adv_history", [])
-            sess.setdefault("last_choice", None)
-            return sess
+            return _ensure_session_defaults(sess, uid)
+
     except Exception as e:
         log.warning("get_session error: %s", e)
 
@@ -249,6 +300,11 @@ def get_session(uid: str) -> Dict[str, Any]:
         "loss_streak": 0,
         "adv_history": [],
         "last_choice": None,
+        "outcome_streak_side": None,
+        "outcome_streak_len": 0,
+        "last_result": None,
+        "last_banker_point": None,
+        "last_player_point": None,
     }
     save_session(uid, sess)
     return sess
@@ -288,7 +344,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
     return "\n".join(lines)
 
 
-VERSION = "bgs-clean-server-pf360-line-fix-2026-04-08-per-user"
+VERSION = "bgs-clean-server-pf360-line-fix-2026-04-08-per-user+stat-calibrator"
 
 #
 # ---------- Flask App ----------
@@ -363,7 +419,6 @@ class SmartDummyPF:
         base = base ** (1.0 / max(1e-6, SOFT_TAU))
         base = base / base.sum()
         pT = float(base[2])
-        # Cap tie probability within [TIE_MIN, TIE_MAX]
         if pT < TIE_MIN:
             base[2] = TIE_MIN
             sc = (1.0 - TIE_MIN) / (1.0 - pT) if pT < 1.0 else 1.0
@@ -383,9 +438,6 @@ class SmartDummyPF:
 
 #
 # Per-user particle filter storage.
-# A dictionary mapping user IDs to their respective PF instances. Access to this
-# dictionary is protected by a global lock to ensure thread-safety when
-# creating or removing PF objects. This avoids cross-user state contamination.
 #
 _PF_BY_UID: Dict[str, Any] = {}
 _PF_BY_UID_LOCK = threading.Lock()
@@ -412,19 +464,21 @@ def _clear_prediction_cache(uid: str) -> None:
 
 def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> str:
     """
-    Construct a key used for caching predictions. The key incorporates various
-    session properties and input parameters to ensure that cached results are
-    only reused when appropriate.
+    Construct a key used for caching predictions.
     """
-    return (f"{uid}|r={int(sess.get('rounds_seen', 0))}|p={p_pts}|b={b_pts}|"
-            f"bank={int(sess.get('bankroll', 0))}|stateful={int(PF_STATEFUL)}|"
-            f"mode={str(sess.get('decision_mode') or os.getenv('DECISION_MODE', 'hybrid')).lower()}")
+    return (
+        f"{uid}|r={int(sess.get('rounds_seen', 0))}|p={p_pts}|b={b_pts}|"
+        f"bank={int(sess.get('bankroll', 0))}|stateful={int(PF_STATEFUL)}|"
+        f"mode={str(sess.get('decision_mode') or os.getenv('DECISION_MODE', 'hybrid')).lower()}|"
+        f"stat={int(STAT_CALIBRATOR_OK)}|"
+        f"stat_enable={os.getenv('STAT_CALIBRATOR_ENABLE', '1')}|"
+        f"stat_blend={os.getenv('STAT_CALIBRATOR_BLEND', '0.16')}"
+    )
 
 
 def _get_uid_lock(uid: str) -> threading.Lock:
     """
-    Retrieve a per-user threading lock. This lock is used to serialize
-    operations on a single user's PF instance and session data.
+    Retrieve a per-user threading lock.
     """
     uid = uid or "anon"
     with _UID_LOCKS_GUARD:
@@ -435,8 +489,7 @@ def _get_uid_lock(uid: str) -> threading.Lock:
 
 def _self_keep_alive() -> None:
     """
-    Periodically ping the service itself to prevent the hosting platform from
-    idling or sleeping the container. This requires the requests library.
+    Periodically ping the service itself to prevent idling.
     """
     try:
         import requests  # type: ignore
@@ -460,7 +513,6 @@ def _self_keep_alive() -> None:
 def _build_new_pf() -> Any:
     """
     Create a new particle filter instance using environment parameters.
-    This function is used whenever a new PF is required.
     """
     global KEEP_ALIVE_STARTED
     if not KEEP_ALIVE_STARTED:
@@ -472,8 +524,10 @@ def _build_new_pf() -> Any:
                     log.info("KEEP ALIVE thread started (ONLY ONCE)")
                 except Exception as e:
                     log.warning("KEEP ALIVE failed: %s", e)
+
     if OutcomePF is None:
         return SmartDummyPF()
+
     return OutcomePF(
         decks=int(os.getenv("DECKS", "8")),
         seed=int(os.getenv("SEED", "42")),
@@ -487,8 +541,7 @@ def _build_new_pf() -> Any:
 
 def get_pf_for_uid(uid: str) -> Any:
     """
-    Retrieve a particle filter instance specific to the given user. This ensures that each user
-    maintains an independent PF state, avoiding cross-user contamination.
+    Retrieve a particle filter instance specific to the given user.
     """
     uid = uid or "anon"
     with _PF_BY_UID_LOCK:
@@ -506,8 +559,7 @@ def get_pf_for_uid(uid: str) -> Any:
 
 def reset_pf_for_uid(uid: str) -> None:
     """
-    Clear the prediction cache and remove any existing PF state for the given user.
-    This forces a new PF instance to be created on the next access via get_pf_for_uid.
+    Clear prediction cache and PF state for the given user.
     """
     uid = uid or "anon"
     _clear_prediction_cache(uid)
@@ -541,7 +593,7 @@ THEO_BLEND_FORCE_DISABLE = env_flag("THEO_BLEND_FORCE_DISABLE", 1)
 
 
 def _current_decision_mode(over: Dict[str, float]) -> str:
-    """Determine the current decision mode, defaulting to the environment setting."""
+    """Determine the current decision mode."""
     try:
         return str(over.get("DECISION_MODE", os.getenv("DECISION_MODE", "hybrid"))).strip().lower()
     except Exception:
@@ -557,8 +609,7 @@ def bet_amount(bankroll: int, pct: float) -> int:
 
 def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
     """
-    Determine which side (Banker or Player) has the higher expected value.
-    Returns the chosen side index, the final edge magnitude, and the EVs for Banker and Player.
+    Determine which side has the higher expected value.
     """
     evB = BANKER_PAYOUT * pB - pP
     evP = pP - pB
@@ -569,22 +620,24 @@ def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
 
 def _effective_prob_flags(over: Dict[str, float], mode: str) -> Tuple[int, int, List[str]]:
     """
-    Compute effective flags controlling pure probability mode and EV-neutral mode,
-    honoring per-stage overrides and environment defaults.
+    Compute effective flags controlling pure probability mode and EV-neutral mode.
     """
     notes: List[str] = []
     eff_prob_pure = PROB_PURE_MODE
     eff_ev_neutral = EV_NEUTRAL
+
     try:
         if "PROB_PURE_MODE" in over:
             eff_prob_pure = int(float(over["PROB_PURE_MODE"]))
     except Exception:
         pass
+
     try:
         if "EV_NEUTRAL" in over:
             eff_ev_neutral = int(float(over["EV_NEUTRAL"]))
     except Exception:
         pass
+
     if mode == "prob" and PROB_FORCE_PURE_IN_PROB_MODE == 1:
         if eff_prob_pure != 1:
             notes.append("FORCE_PURE(prob 模式自動純機率)")
@@ -592,12 +645,13 @@ def _effective_prob_flags(over: Dict[str, float], mode: str) -> Tuple[int, int, 
         if eff_ev_neutral != 0:
             notes.append("FORCE_EV_NEUTRAL_OFF(prob 純機率關閉 payout-aware)")
             eff_ev_neutral = 0
+
     return eff_prob_pure, eff_ev_neutral, notes
 
 
 def _decide_side_by_prob(pB: float, pP: float, eff_prob_pure: int, eff_ev_neutral: int) -> int:
     """
-    Determine which side to choose based solely on probabilities and environment flags.
+    Determine side based on probabilities and flags.
     """
     if int(eff_prob_pure) == 1:
         return 0 if pB >= pP else 1
@@ -608,11 +662,10 @@ def _decide_side_by_prob(pB: float, pP: float, eff_prob_pure: int, eff_ev_neutra
 
 def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
     """
-    Apply a configurable bias between Banker and Player probabilities.
+    Apply configurable bias between Banker and Player probabilities.
 
-    Positive values shift probability mass from Banker to Player; negative values shift from Player to Banker.
-    Zero leaves the distribution unchanged. The bias is applied linearly and re-normalized to ensure
-    probabilities sum to 1.
+    Positive values shift probability mass from Banker to Player.
+    Negative values shift probability mass from Player to Banker.
     """
     b2p = PROB_BIAS_B2P
     try:
@@ -620,39 +673,41 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
             b2p = float(over["PROB_BIAS_B2P"])
     except Exception:
         pass
+
     try:
         b2p = float(b2p)
     except Exception:
         b2p = 0.0
+
     if b2p == 0.0:
         return prob
+
     p = prob.copy()
-    # Positive bias: shift from banker to player
+
     if b2p > 0.0:
         shift = min(float(p[0]), b2p)
         if shift > 0:
             p[0] -= shift
-            remBP = max(1e-8, 1.0 - float(p[2]))
-            p[1] = min(remBP, float(p[1]) + shift)
+            rem_bp = max(1e-8, 1.0 - float(p[2]))
+            p[1] = min(rem_bp, float(p[1]) + shift)
     else:
-        # Negative bias: shift from player to banker
         shift = min(float(p[1]), -b2p)
         if shift > 0:
             p[1] -= shift
-            remBP = max(1e-8, 1.0 - float(p[2]))
-            p[0] = min(remBP, float(p[0]) + shift)
+            rem_bp = max(1e-8, 1.0 - float(p[2]))
+            p[0] = min(rem_bp, float(p[0]) + shift)
+
     s = p.sum()
     if s > 0:
         p /= s
+
     return p
 
 
 def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_enter: float,
                    p_pts: int, b_pts: int) -> Tuple[str, float, float, str]:
     """
-    Decide whether to bet on Banker, Player, or observe based on the computed probabilities,
-    environment overrides, and stage-specific settings. Returns a recommended choice,
-    the final edge, a bet percentage, and a human-readable reason.
+    Decide whether to bet on Banker, Player, or observe.
     """
     mode = _current_decision_mode(over)
     pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
@@ -660,6 +715,7 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
     eff_prob_pure, eff_ev_neutral, notes = _effective_prob_flags(over, mode)
     if notes:
         reason.extend(notes)
+
     point_diff = abs(p_pts - b_pts)
 
     if mode == "prob":
@@ -667,6 +723,7 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
         _, _, evB, evP = _decide_side_by_ev(pB, pP)
         final_edge = max(abs(evB), abs(evP))
         reason.append(f"模式=prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
+
     elif mode == "hybrid":
         edge = abs(pB - pP)
         if edge >= PROB_MARGIN * 1.15:
@@ -677,9 +734,11 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
         else:
             s2, _, evB, evP = _decide_side_by_ev(pB, pP)
             final_edge = max(abs(evB), abs(evP))
+
             if edge < 0.065 and point_diff <= 5:
                 if final_edge < 0.007:
                     return ("觀望", final_edge, 0.0, f"點數接近(diff={point_diff}) + 差距小 → 強制觀望")
+
                 if evB > evP + MIN_EV_EDGE + 0.001:
                     side = s2
                     reason.append("模式=hybrid→ev (Banker 有優勢)")
@@ -693,9 +752,13 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
         reason.append("模式=ev")
 
     edge = abs(pB - pP)
+
     if LOG_DECISION or SHOW_CONF_DEBUG:
-        log.info("[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f final_edge=%.4f point_diff=%d mode=%s",
-                 pB, pP, pT, edge, final_edge, point_diff, mode)
+        log.info(
+            "[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f final_edge=%.4f point_diff=%d mode=%s",
+            pB, pP, pT, edge, final_edge, point_diff, mode,
+        )
+
     if final_edge < effective_edge_enter:
         reason.append(f"⚪ 優勢不足 final_edge={final_edge:.4f}<{effective_edge_enter:.4f}")
         return ("觀望", final_edge, 0.0, "; ".join(reason))
@@ -704,8 +767,10 @@ def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_ente
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
     bet_pct = min_b + (max_b - min_b) * (edge / MAX_EDGE_SCALE)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
+
     side_label = INV.get(side, "莊")
     reason.append(f"🔻 {side_label} 勝率={100.0 * (pB if side == 0 else pP):.1f}%")
+
     return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
 
 
@@ -726,15 +791,28 @@ def _stage_prefix(rounds_seen: int) -> str:
 
 def get_stage_over(rounds_seen: int) -> Dict[str, float]:
     """
-    Retrieve any stage-specific environment overrides based on the number of rounds seen.
-    Overrides are stored in environment variables with the appropriate prefix.
+    Retrieve stage-specific environment overrides.
     """
     if COMPAT_MODE == 1 or os.getenv("STAGE_MODE", "count").lower() == "disabled":
         return {}
+
     over: Dict[str, float] = {}
     prefix = _stage_prefix(rounds_seen)
-    keys = ["SOFT_TAU", "THEO_BLEND", "TIE_MAX", "EDGE_ENTER", "PROB_MARGIN", "PF_PRED_SIMS",
-            "DEPLETEMC_SIMS", "PF_UPD_SIMS", "PROB_PURE_MODE", "EV_NEUTRAL", "PROB_BIAS_B2P"]
+
+    keys = [
+        "SOFT_TAU",
+        "THEO_BLEND",
+        "TIE_MAX",
+        "EDGE_ENTER",
+        "PROB_MARGIN",
+        "PF_PRED_SIMS",
+        "DEPLETEMC_SIMS",
+        "PF_UPD_SIMS",
+        "PROB_PURE_MODE",
+        "EV_NEUTRAL",
+        "PROB_BIAS_B2P",
+    ]
+
     for k in keys:
         v = os.getenv(prefix + k)
         if v not in (None, ""):
@@ -742,19 +820,19 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
                 over[k] = float(v)
             except Exception:
                 pass
+
     return over
 
 
 def _depl_stage_scale(rounds_seen: int) -> float:
-    """Return the depletion scaling factor based on the current stage."""
+    """Return depletion scaling factor based on current stage."""
     prefix = _stage_prefix(rounds_seen)
     return EARLY_DEPL_SCALE if prefix == "EARLY_" else MID_DEPL_SCALE if prefix == "MID_" else LATE_DEPL_SCALE
 
 
 def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.ndarray:
     """
-    Gently blend between two probability distributions, limiting the maximum
-    shift per component to avoid unrealistic jumps.
+    Blend between two probability distributions while limiting max shift per component.
     """
     p_old = old_p.astype(float).copy()
     delta = np.clip(new_p.astype(float) - p_old, -max_shift, max_shift)
@@ -767,14 +845,15 @@ def _guard_shift(old_p: np.ndarray, new_p: np.ndarray, max_shift: float) -> np.n
 
 def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
     """
-    Adjust the number of prediction simulations based on environment caps and
-    the number of particles in the PF instance.
+    Adjust number of prediction simulations based on caps and PF particles.
     """
     try:
         cap = int(float(os.getenv("PRED_SIMS_CAP", "95")))
     except Exception:
         cap = 95
+
     n = max(1, min(int(base), int(cap)))
+
     try:
         n_particles = int(getattr(pf_obj, "n_particles", 0) or 0)
         if n_particles >= 360:
@@ -785,20 +864,23 @@ def _tuned_pred_sims(base: int, pf_obj: Any) -> int:
             n = min(n, int(os.getenv("PRED_GUARD_300_CAP", "35")))
     except Exception:
         pass
+
     return max(1, int(n))
 
 
 def _safe_predict_probs(pf_obj: Any, sims_used: int, uid: str) -> Tuple[np.ndarray, int]:
     """
-    Safely invoke the predict method of a particle filter, falling back to the
-    SmartDummyPF if an exception occurs.
+    Safely invoke PF.predict.
     """
     try:
         p = np.asarray(pf_obj.predict(sims_per_particle=int(sims_used)), dtype=np.float32)
+
         if p.shape != (3,) or (not np.isfinite(p).all()) or float(p.sum()) <= 0:
             raise ValueError(f"invalid probs shape={getattr(p, 'shape', None)} sum={float(np.sum(p))}")
+
         p = p / p.sum()
         return p.astype(np.float32), int(sims_used)
+
     except Exception as e:
         log.exception("PF.predict failed(uid=%s): %s", uid, e)
         fallback = SmartDummyPF().predict()
@@ -808,11 +890,12 @@ def _safe_predict_probs(pf_obj: Any, sims_used: int, uid: str) -> Tuple[np.ndarr
 
 def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     """
-    Parse user input representing the points for the last hand. Returns a tuple
-    of (Player points, Banker points) or None if parsing fails.
+    Parse user input representing last hand points.
+    Returns tuple: (Player points, Banker points)
     """
     if not text:
         return None
+
     s = str(text).translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
     s = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\r\n\t]", "", s).replace("\u3000", " ")
     u = s.upper().strip()
@@ -821,61 +904,201 @@ def parse_last_hand_points(text: str) -> Optional[Tuple[int, int]]:
     if m:
         d = m.group(1)
         return (int(d), int(d)) if d else (0, 0)
+
     m = re.search(r"(?:閒|闲|P)\s*:?:?\s*(\d)\D+(?:莊|庄|B)\s*:?:?\s*(\d)", u)
     if m:
         return (int(m.group(1)), int(m.group(2)))
+
     m = re.search(r"(?:莊|庄|B)\s*:?:?\s*(\d)\D+(?:閒|闲|P)\s*:?:?\s*(\d)", u)
     if m:
         return (int(m.group(2)), int(m.group(1)))
 
     t = u.replace(" ", "").replace("\u3000", "")
+
     if t in ("B", "莊", "庄"):
         return (0, 1)
+
     if t in ("P", "閒", "闲"):
         return (1, 0)
+
     if t in ("T", "和"):
         return (0, 0)
+
     if re.search(r"[A-Z]", u):
         return None
+
     d = re.findall(r"\d", u)
     if len(d) == 2:
         return (int(d[0]), int(d[1]))
+
     return None
+
+
+def _result_from_points(p_pts: int, b_pts: int) -> str:
+    """
+    Convert points to result:
+    B = banker win
+    P = player win
+    T = tie
+    """
+    if b_pts > p_pts:
+        return "B"
+    if p_pts > b_pts:
+        return "P"
+    return "T"
+
+
+def _update_outcome_context(sess: Dict[str, Any], p_pts: int, b_pts: int) -> Dict[str, Any]:
+    """
+    Update session outcome context for stat calibrator.
+    This context represents the latest finished hand and will be used to predict next hand.
+    """
+    result = _result_from_points(p_pts, b_pts)
+
+    prev_side = sess.get("outcome_streak_side")
+    prev_len = int(sess.get("outcome_streak_len", 0) or 0)
+
+    # 和局通常不打斷莊閒 streak
+    if result in ("B", "P"):
+        if prev_side == result:
+            streak_side = result
+            streak_len = prev_len + 1
+        else:
+            streak_side = result
+            streak_len = 1
+        sess["outcome_streak_side"] = streak_side
+        sess["outcome_streak_len"] = streak_len
+    else:
+        streak_side = prev_side
+        streak_len = prev_len
+
+    sess["last_result"] = result
+    sess["last_banker_point"] = b_pts
+    sess["last_player_point"] = p_pts
+
+    return {
+        "last_result": result,
+        "banker_point": b_pts,
+        "player_point": p_pts,
+        "streak_side": streak_side,
+        "streak_len": streak_len,
+    }
+
+
+def _apply_stat_calibrator(
+    p: np.ndarray,
+    sess: Dict[str, Any],
+    rounds_seen: int,
+    p_pts: int,
+    b_pts: int,
+) -> Tuple[np.ndarray, str]:
+    """
+    Apply stat calibrator after PF/deplete/bias and before final decision.
+    Returns adjusted probability and reason note.
+    """
+    if not STAT_CALIBRATOR_OK or STAT_CALIBRATOR is None:
+        return p, "StatCalibrator=OFF"
+
+    try:
+        outcome_ctx = _update_outcome_context(sess, p_pts, b_pts)
+
+        total_round_est = int(os.getenv("TOTAL_ROUND_EST", "70"))
+        shoe_pos = float(rounds_seen + 1) / max(float(total_round_est), 1.0)
+        shoe_pos = max(0.0, min(1.0, shoe_pos))
+
+        context = {
+            "shoe_pos": shoe_pos,
+            "round_index": rounds_seen + 1,
+            "total_round_est": total_round_est,
+            "last_result": outcome_ctx.get("last_result"),
+            "banker_point": outcome_ctx.get("banker_point"),
+            "player_point": outcome_ctx.get("player_point"),
+            "streak_side": outcome_ctx.get("streak_side"),
+            "streak_len": outcome_ctx.get("streak_len"),
+        }
+
+        base_dict = {
+            "banker": float(p[0]),
+            "player": float(p[1]),
+            "tie": float(p[2]),
+        }
+
+        adjusted = STAT_CALIBRATOR.adjust(base_dict, context)
+
+        p2 = np.array([
+            float(adjusted.get("banker", p[0])),
+            float(adjusted.get("player", p[1])),
+            float(adjusted.get("tie", p[2])),
+        ], dtype=np.float32)
+
+        if p2.shape != (3,) or (not np.isfinite(p2).all()) or float(p2.sum()) <= 0:
+            raise ValueError(f"invalid calibrated probs={p2}")
+
+        p2 = p2 / p2.sum()
+
+        # 再做一次 tie 安全線，避免校準後破壞原本 tie 限制
+        tie_max = float(os.getenv("TIE_MAX", str(TIE_MAX)))
+        if TIE_CAP_ENABLE == 1 and p2[2] > tie_max:
+            sc = (1.0 - tie_max) / (1.0 - float(p2[2])) if p2[2] < 1.0 else 1.0
+            p2[2] = tie_max
+            p2[0] *= sc
+            p2[1] *= sc
+            p2 = p2 / p2.sum()
+
+        if p2[2] < TIE_MIN:
+            sc = (1.0 - TIE_MIN) / (1.0 - float(p2[2])) if p2[2] < 1.0 else 1.0
+            p2[2] = TIE_MIN
+            p2[0] *= sc
+            p2[1] *= sc
+            p2 = p2 / p2.sum()
+
+        if LOG_DECISION or SHOW_CONF_DEBUG:
+            log.info(
+                "[STAT-CAL] before=(%.4f,%.4f,%.4f) after=(%.4f,%.4f,%.4f) ctx=%s",
+                float(p[0]), float(p[1]), float(p[2]),
+                float(p2[0]), float(p2[1]), float(p2[2]),
+                context,
+            )
+
+        return p2.astype(np.float32), "StatCalibrator=ON"
+
+    except Exception as e:
+        log.warning("StatCalibrator failed: %s", e)
+        return p, "StatCalibrator=ERR"
 
 
 def _advanced_control(sess: Dict[str, Any], probs: np.ndarray) -> Tuple[np.ndarray, float, str]:
     """
-    Apply advanced control logic for adjusting probabilities and deciding when to bet.
-    Returns the possibly adjusted probabilities, a dynamic edge threshold, and a string
-    describing the control mode.
+    Apply advanced control logic.
     """
     history = sess.get("adv_history", [])
     history.append(int(np.argmax(probs[:2])))
     if len(history) > 20:
         history.pop(0)
+
     sess["adv_history"] = history
+
     probs2 = np.array([float(probs[0]), float(probs[1]), float(probs[2])], dtype=np.float32)
     probs2 = probs2 / probs2.sum()
+
     return probs2, 0.002, "正常"
 
 
 def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: int) -> Tuple[np.ndarray, str, int, str]:
     """
-    Handle a single prediction request for a given user. This function updates the
-    user's particle filter state with the latest outcome, computes prediction probabilities,
-    and returns a recommended bet along with supporting details. The entire body
-    executes under a per-user lock to avoid concurrent updates to the same PF.
+    Handle a single prediction request for a given user.
     """
     uid = uid or "anon"
     lk = _get_uid_lock(uid)
+
     with lk:
         rounds_seen = int(sess.get("rounds_seen", 0))
         over = get_stage_over(rounds_seen)
         mode = _current_decision_mode(over)
         sess["decision_mode"] = mode
+
         cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
 
-        # Check the prediction cache first
         with _RESULT_CACHE_LOCK:
             if _RESULT_CACHE_KEY.get(uid) == cache_key:
                 cached = _RESULT_CACHE.get(uid)
@@ -887,7 +1110,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
 
         if PF_STATEFUL == 1:
             pf_obj = get_pf_for_uid(uid)
-            # Update the PF with the last hand outcome
+
             try:
                 if hasattr(pf_obj, "update_outcome"):
                     if p_pts == b_pts:
@@ -905,7 +1128,6 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             except Exception as e:
                 log.warning("PF.update_outcome failed(uid=%s): %s", uid, e)
 
-            # Apply per-stage overrides to PF update simulation count
             try:
                 upd_sims_val = over.get("PF_UPD_SIMS")
                 if upd_sims_val is None:
@@ -916,29 +1138,32 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 log.warning("stage PF_UPD_SIMS apply failed(uid=%s): %s", uid, e)
 
             sims_used = _tuned_pred_sims(sims_base, pf_obj)
+
             start_time = time.time()
             p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
+
             if time.time() - start_time > 1.2:
                 log.warning("⚠️ PF timeout fallback triggered(uid=%s)", uid)
                 p = SmartDummyPF().predict()
+
         else:
-            # Stateless mode: build a fresh PF for each prediction
             pf_obj = _build_new_pf()
             sims_used = _tuned_pred_sims(sims_base, pf_obj)
             p, sims_used = _safe_predict_probs(pf_obj, sims_used, uid)
 
-        # Soften probabilities based on SOFT_TAU (e.g., Dirichlet scaling)
+        # Soften probabilities
         soft_tau = float(over.get("SOFT_TAU", float(os.getenv("SOFT_TAU", "2.0"))))
         p = p ** (1.0 / max(1e-6, soft_tau))
         p = p / p.sum()
 
-        # Apply deplete adjustment if enabled and available
+        # Apply deplete adjustment
         if (COMPAT_MODE == 0) and (DEPL_ENABLE == 1) and DEPLETE_OK and probs_after_points:
             try:
                 stage_scale = _depl_stage_scale(rounds_seen)
                 diff = abs(p_pts - b_pts)
                 total = max(p_pts, b_pts)
                 base = DEPL_FACTOR * stage_scale
+
                 if diff <= 2:
                     adj = 1.65
                 elif diff in (3, 4):
@@ -947,15 +1172,18 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     adj = 0.85
                 else:
                     adj = 1.12
+
                 if total >= 7:
                     adj *= 0.87
                 elif total <= 5:
                     adj *= 1.22
+
                 alpha = min(0.40, base * adj)
+
                 if alpha > 0.0:
                     dep_sims = int(over.get("DEPLETEMC_SIMS", 25))
                     dep = None
-                    # Try various signatures of probs_after_points
+
                     try:
                         dep = probs_after_points(p_pts, b_pts, sims=dep_sims, rounds_seen=rounds_seen)
                     except TypeError:
@@ -966,18 +1194,23 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                                 dep = probs_after_points(p_pts, b_pts)  # type: ignore[arg-type]
                             except Exception:
                                 dep = None
+
                     if dep is not None:
                         dep = np.asarray(dep, dtype=np.float32)
                         if dep.sum() > 0:
                             dep = dep / dep.sum()
+
                     if dep is None or dep.sum() <= 0:
                         dep = p.copy()
+
                     mix = (1.0 - alpha) * p + alpha * dep
                     mix = mix / mix.sum()
                     p = _guard_shift(p, mix, MAX_DEPL_SHIFT)
+
             except Exception as e:
                 log.warning("Deplete 失敗(uid=%s): %s", uid, e)
 
+        # Optional theoretical blend
         if COMPAT_MODE == 0 and THEO_BLEND_FORCE_DISABLE != 1:
             theo_blend = float(over.get("THEO_BLEND", float(os.getenv("THEO_BLEND", "0.0"))))
             if theo_blend > 0.0:
@@ -985,6 +1218,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                 p = (1.0 - theo_blend) * p + theo_blend * theo
                 p = p / p.sum()
 
+        # Tie cap
         tie_max = float(over.get("TIE_MAX", float(os.getenv("TIE_MAX", str(TIE_MAX)))))
         if TIE_CAP_ENABLE == 1 and p[2] > tie_max:
             sc = (1.0 - tie_max) / (1.0 - float(p[2])) if p[2] < 1.0 else 1.0
@@ -1000,23 +1234,28 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
             p[1] *= sc
             p = p / p.sum()
 
-        # Apply probability bias and clamp extreme differences
+        # Bias
         p = _apply_prob_bias(p, over)
+
         if abs(p[0] - p[1]) > 0.20:
             mid = (p[0] + p[1]) / 2
             p[0] = mid + (p[0] - mid) * 0.95
             p[1] = mid + (p[1] - mid) * 0.95
             p = p / p.sum()
 
-        # Apply advanced control and compute decision
+        # New: Stat calibrator after PF/deplete/bias
+        p, stat_reason = _apply_stat_calibrator(p, sess, rounds_seen, p_pts, b_pts)
+
+        # Advanced control and decision
         p, dynamic_edge, ctrl_reason = _advanced_control(sess, p)
         choice, edge, bet_pct, reason = decide_only_bp(p, over, dynamic_edge, p_pts, b_pts)
-        reason = f"{reason} | {ctrl_reason}"
+        reason = f"{reason} | {ctrl_reason} | {stat_reason}"
+
         bet_amt = bet_amount(int(sess.get("bankroll", 0)), bet_pct)
+
         sess["rounds_seen"] = rounds_seen + 1
         sess["last_choice"] = choice
 
-        # Cache the result
         with _RESULT_CACHE_LOCK:
             _RESULT_CACHE[uid] = (p.copy(), choice, bet_amt, reason)
             _RESULT_CACHE_KEY[uid] = cache_key
@@ -1073,20 +1312,23 @@ def set_trial_blocked(uid: str, flag: bool = True) -> None:
 
 def trial_persist_guard(uid: str) -> Optional[str]:
     """
-    Check and update trial usage for a given user. Returns a string describing
-    any trial-related restriction, or None if the user may continue.
+    Check and update trial usage for a given user.
     """
     if is_premium(uid):
         return None
+
     if is_trial_blocked(uid):
         return f"⛔ 試用已到期（帳號曾被封鎖）\n🔐 如需重新啟用，請輸入：開通 你的密碼\n📞 或聯繫：{ADMIN_CONTACT}"
+
     now = int(time.time())
     first_ts = _rget(_trial_key(uid, "first_ts"))
     expired = _rget(_trial_key(uid, "expired"))
+
     if not first_ts:
         _rset(_trial_key(uid, "first_ts"), str(now))
         _rset(_trial_key(uid, "expired"), "0")
         return None
+
     try:
         first = int(first_ts)
     except Exception:
@@ -1094,15 +1336,20 @@ def trial_persist_guard(uid: str) -> Optional[str]:
         _rset(_trial_key(uid, "first_ts"), str(now))
         _rset(_trial_key(uid, "expired"), "0")
         return None
+
     used_min = (now - first) // 60
+
     if expired == "1" and used_min < TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "0")
         expired = None
+
     if used_min >= TRIAL_MINUTES:
         _rset(_trial_key(uid, "expired"), "1")
         return f"⏰ 免費試用 {TRIAL_MINUTES} 分鐘已用完\n🔐 請輸入：開通 你的專屬密碼\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+
     if expired == "1":
         return f"⛔ 試用已到期\n🔐 請輸入：開通 你的專屬密碼\n📞 沒有密碼？請聯繫：{ADMIN_CONTACT}"
+
     return None
 
 
@@ -1114,7 +1361,6 @@ def validate_activation_code(code: str) -> bool:
     return bool(ADMIN_ACTIVATION_SECRET) and norm == ADMIN_ACTIVATION_SECRET
 
 
-# Game mapping for display
 GAMES = {
     "1": "WM",
     "2": "PM",
@@ -1168,23 +1414,35 @@ def _reply(api, token: str, text: str) -> None:
 
 def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int) -> None:
     """
-    Asynchronous helper to push a prediction result to a LINE user. Only used if
-    asynchronous heavy processing is enabled.
+    Asynchronous helper to push a prediction result to a LINE user.
     """
     if line_api is None:
         return
+
     try:
         from linebot.models import TextSendMessage  # type: ignore
+
         sess = get_session(uid)
         sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-        msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                 cont=bool(CONTINUOUS_MODE), mode=sess.get("decision_mode", ""))
+
+        msg = format_output_card(
+            probs,
+            choice,
+            sess.get("last_pts_text"),
+            bet_amt,
+            cont=bool(CONTINUOUS_MODE),
+            mode=sess.get("decision_mode", ""),
+        )
+
         if int(sess.get("pending_seq", 0)) == int(seq):
             sess["last_card"] = msg
             sess["last_card_ts"] = int(time.time())
             sess["pending"] = False
+
         save_session(uid, sess)
+
         if _can_push():
             try:
                 line_api.push_message(uid, TextSendMessage(text=msg, quick_reply=_quick_buttons()))  # type: ignore
@@ -1195,12 +1453,14 @@ def _push_heavy_prediction(uid: str, p_pts: int, b_pts: int, seq: int) -> None:
                     line_api.push_message(uid, TextSendMessage(text=msg))  # type: ignore
                 except Exception as e2:
                     log.warning("[LINE] push fallback failed: %s", e2)
+
     except Exception as e:
         log.exception("[heavy] prediction failed(uid=%s): %s", uid, e)
 
 
 line_api = None
 line_handler = None
+
 try:
     from linebot import LineBotApi, WebhookHandler  # type: ignore
     from linebot.models import MessageEvent, TextMessage, FollowEvent, UnfollowEvent  # type: ignore
@@ -1215,7 +1475,7 @@ try:
 
         @line_handler.add(UnfollowEvent)
         def on_unfollow(event):  # type: ignore
-            """Handle unfollow events by blocking trial and marking expired."""
+            """Handle unfollow events."""
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
             try:
@@ -1227,42 +1487,48 @@ try:
 
         @line_handler.add(FollowEvent)
         def on_follow(event):  # type: ignore
-            """Handle follow events by greeting the user and initializing trial."""
+            """Handle follow events."""
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
+
             uid = event.source.user_id
             sess = get_session(uid)
             guard_msg = trial_persist_guard(uid)
+
             try:
                 first_ts = _rget(_trial_key(uid, "first_ts")) or str(int(time.time()))
                 sess["trial_start"] = int(first_ts)
             except Exception:
                 pass
+
             if sess.get("premium", False) or is_premium(uid):
                 msg = "👋 歡迎回來，已是永久開通用戶。\n輸入『遊戲設定』開始。"
             else:
                 msg = guard_msg or f"👋 歡迎！你有 {TRIAL_MINUTES} 分鐘免費試用。\n輸入『遊戲設定』開始。"
+
             _reply(line_api, event.reply_token, msg)
             save_session(uid, sess)
 
         @line_handler.add(MessageEvent, message=TextMessage)
         def on_text(event):  # type: ignore
-            """Handle incoming text messages and perform appropriate actions."""
+            """Handle incoming text messages."""
             if not _dedupe_event(_extract_line_event_id(event)):
                 return
+
             uid = event.source.user_id
             text = re.sub(r"\s+", " ", (event.message.text or "").replace("\u3000", " ").strip())
             up = text.upper()
             sess = get_session(uid)
 
-            # Activation command
             if up.startswith("開通") or up.startswith("ACTIVATE"):
                 after = text[2:] if up.startswith("開通") else text[len("ACTIVATE"):]
                 ok = validate_activation_code(after)
+
                 if ok:
                     sess["premium"] = True
                     set_premium(uid, True)
                     set_trial_blocked(uid, False)
+
                 _reply(line_api, event.reply_token, "✅ 已開通成功！" if ok else "❌ 密碼錯誤")
                 save_session(uid, sess)
                 return
@@ -1273,10 +1539,10 @@ try:
                 save_session(uid, sess)
                 return
 
-            # Reset or end analysis
             if up in ("結束分析", "清空", "RESET"):
                 premium = sess.get("premium", False) or is_premium(uid)
                 start_ts = sess.get("trial_start", int(time.time()))
+
                 sess = {
                     "phase": "await_pts",
                     "bankroll": 0,
@@ -1291,13 +1557,18 @@ try:
                     "loss_streak": 0,
                     "adv_history": [],
                     "last_choice": None,
+                    "outcome_streak_side": None,
+                    "outcome_streak_len": 0,
+                    "last_result": None,
+                    "last_banker_point": None,
+                    "last_player_point": None,
                 }
+
                 reset_pf_for_uid(uid)
                 _reply(line_api, event.reply_token, "🧹 已清空。輸入『遊戲設定』重新開始。")
                 save_session(uid, sess)
                 return
 
-            # Load history
             hist_match = re.fullmatch(r"[BPTHbpht]{6,30}", text)
             if hist_match:
                 sess["rounds_seen"] = len(text)
@@ -1307,100 +1578,133 @@ try:
 
             pts = parse_last_hand_points(text)
 
-            # Game settings flow
             if text == "遊戲設定" or up == "GAME SETTINGS":
                 sess["phase"] = "choose_game"
                 sess["game"] = None
                 sess["table"] = None
                 sess["bankroll"] = 0
+
                 first_ts = _rget(_trial_key(uid, "first_ts"))
                 left = max(0, TRIAL_MINUTES - ((int(time.time()) - int(first_ts)) // 60)) if first_ts else TRIAL_MINUTES
+
                 _reply(line_api, event.reply_token, game_menu_text(left))
                 save_session(uid, sess)
                 return
 
             if sess.get("phase") == "choose_game":
                 m = re.match(r"^\s*(\d+)", text)
+
                 if m and m.group(1) in GAMES:
                     sess["game"] = GAMES[m.group(1)]
                     sess["phase"] = "input_bankroll"
                     _reply(line_api, event.reply_token, f"🎰 已選擇：{sess['game']}，請輸入初始籌碼（金額）")
                     save_session(uid, sess)
                     return
+
                 _reply(line_api, event.reply_token, "⚠️ 無效的選項，請輸入上列數字。")
                 return
 
             if sess.get("phase") == "input_bankroll":
                 num = re.sub(r"[^\d]", "", text)
                 amt = int(num) if num else 0
+
                 if amt <= 0:
                     _reply(line_api, event.reply_token, "⚠️ 請輸入正整數金額。")
                     return
+
                 sess["bankroll"] = amt
                 sess["phase"] = "await_pts"
-                _reply(line_api, event.reply_token, f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 現在輸入第一局點數（例：閒6莊5 / 65 / 和）")
+
+                _reply(
+                    line_api,
+                    event.reply_token,
+                    f"✅ 設定完成！館別：{sess.get('game')}，初始籌碼：{amt}。\n📌 現在輸入第一局點數（例：閒6莊5 / 65 / 和）",
+                )
                 save_session(uid, sess)
                 return
 
-            # Prediction input flow
             if pts and sess.get("bankroll", 0) > 0:
                 p_pts, b_pts = pts
+
                 if LINE_ASYNC_HEAVY == 1 and _can_push():
                     if sess.get("pending"):
                         _reply(line_api, event.reply_token, "⚠️ 上一局還在計算中，請稍後再輸入下一局。")
                         return
+
                     _reply(line_api, event.reply_token, "✅ 已收到上一局結果，AI 正在計算。")
+
                     sess["pending"] = True
                     sess["pending_seq"] = int(sess.get("pending_seq", 0)) + 1
                     seq = int(sess["pending_seq"])
                     sess["last_card"] = None
                     sess["last_card_ts"] = None
+
                     save_session(uid, sess)
-                    threading.Thread(target=_push_heavy_prediction, args=(uid, p_pts, b_pts, seq), daemon=True).start()
+
+                    threading.Thread(
+                        target=_push_heavy_prediction,
+                        args=(uid, p_pts, b_pts, seq),
+                        daemon=True,
+                    ).start()
                     return
+
                 try:
                     sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+
                     probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
-                    msg = format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                             cont=bool(CONTINUOUS_MODE), mode=sess.get("decision_mode", ""))
+
+                    msg = format_output_card(
+                        probs,
+                        choice,
+                        sess.get("last_pts_text"),
+                        bet_amt,
+                        cont=bool(CONTINUOUS_MODE),
+                        mode=sess.get("decision_mode", ""),
+                    )
+
                     sess["last_card"] = msg
                     sess["last_card_ts"] = int(time.time())
                     sess["pending"] = False
+
                     save_session(uid, sess)
                     _reply(line_api, event.reply_token, msg)
+
                 except Exception as e:
                     log.exception("[LINE] sync predict failed(uid=%s): %s", uid, e)
                     _reply(line_api, event.reply_token, "⚠️ 計算失敗，請稍後再試或輸入下一局點數。")
+
                 return
 
-            # Default fallback
             _reply(line_api, event.reply_token, "指令無法辨識。\n📌 直接輸入點數（例：65 / 和 / 閒6莊5），或輸入『遊戲設定』。")
+
 except Exception as e:
     log.warning("LINE not fully configured: %s", e)
 
 
 def _handle_line_webhook():  # type: ignore
     """
-    Dispatch incoming webhook events to the LINE handler. In a misconfigured environment,
-    this route still returns 200 to silence the error.
+    Dispatch incoming webhook events to the LINE handler.
     """
     if "line_handler" not in globals() or line_handler is None:
         log.error("webhook called but LINE handler not ready (missing credentials?)")
         return "OK", 200
+
     signature = request.headers.get("X-Line-Signature", "")  # type: ignore[attr-defined]
     body = request.get_data(as_text=True)  # type: ignore[attr-defined]
+
     try:
         line_handler.handle(body, signature)  # type: ignore[call-arg]
     except Exception as e:
         log.error("webhook error: %s", e)
         return "OK", 200
+
     return "OK", 200
 
 
 @app.route("/line-webhook", methods=["POST", "GET", "OPTIONS"])
 def line_webhook():  # type: ignore
     """
-    HTTP endpoint for LINE webhooks, including CORS preflight handling.
+    HTTP endpoint for LINE webhooks.
     """
     if request.method == "OPTIONS":  # type: ignore[attr-defined]
         return ("", 204, {
@@ -1408,8 +1712,10 @@ def line_webhook():  # type: ignore
             "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, X-Line-Signature",
         })
+
     if request.method == "GET":  # type: ignore[attr-defined]
         return "OK", 200
+
     return _handle_line_webhook()
 
 
@@ -1424,27 +1730,33 @@ def line_webhook_callback():  # type: ignore
             "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, X-Line-Signature",
         })
+
     if request.method == "GET":  # type: ignore[attr-defined]
         return "OK", 200
+
     return _handle_line_webhook()
 
 
 @app.get("/")
 def root():  # type: ignore
     """
-    Health check root endpoint. Returns OK if the PF backend is initialized.
+    Health check root endpoint.
     """
     ua = request.headers.get("User-Agent", "") if request else ""  # type: ignore[attr-defined]
+
     if "UptimeRobot" in ua:
         return "OK", 200
+
     st = "OK" if pf_initialized else "BACKUP_MODE"
-    return f"✅ BGS Server {st} ({VERSION})", 200
+    cal = "CAL_ON" if STAT_CALIBRATOR_OK else "CAL_OFF"
+
+    return f"✅ BGS Server {st} {cal} ({VERSION})", 200
 
 
 @app.get("/health")
 def health():  # type: ignore
     """
-    Detailed health check endpoint returning JSON about server state.
+    Detailed health check endpoint.
     """
     return jsonify(
         ok=True,
@@ -1457,13 +1769,18 @@ def health():  # type: ignore
         line_can_push=bool(_can_push()),
         decision_mode=DECISION_MODE,
         webhook_ready=bool(line_handler is not None),
+        deplete_ok=bool(DEPLETE_OK),
+        stat_calibrator_ok=bool(STAT_CALIBRATOR_OK),
+        stat_calibrator_enable=os.getenv("STAT_CALIBRATOR_ENABLE", "1"),
+        stat_calibrator_blend=os.getenv("STAT_CALIBRATOR_BLEND", "0.16"),
+        stat_calibrator_max_shift=os.getenv("STAT_CALIBRATOR_MAX_SHIFT", "0.018"),
     ), 200
 
 
 @app.get("/ping")
 def ping():  # type: ignore
     """
-    Simple ping endpoint for health checks and uptime monitoring.
+    Simple ping endpoint.
     """
     return "OK", 200
 
@@ -1471,34 +1788,57 @@ def ping():  # type: ignore
 @app.post("/predict")
 def predict():  # type: ignore
     """
-    Public API endpoint to perform a prediction based on the user's last hand input.
-    Expects JSON with 'uid', 'last_text', and optional 'bankroll'.
-    Returns probabilities, recommended choice, bet amount, and reason.
+    Public API endpoint.
+    Expects JSON with:
+        uid
+        last_text
+        bankroll optional
     """
+    data: Dict[str, Any] = {}
+
     try:
         data = request.get_json(force=True) or {}  # type: ignore[attr-defined]
+
         uid = str(data.get("uid") or "anon")
         last_text = str(data.get("last_text") or "")
         bankroll = data.get("bankroll")
+
         sess = get_session(uid)
+
         if isinstance(bankroll, int) and bankroll >= 0:
             sess["bankroll"] = bankroll
+
         pts = parse_last_hand_points(last_text)
+
         if not pts:
-            return jsonify(ok=False, error="無法解析點數；請輸入 '閒6莊5' / '65' / '和'") , 200  # type: ignore[call-arg]
+            return jsonify(ok=False, error="無法解析點數；請輸入 '閒6莊5' / '65' / '和'"), 200  # type: ignore[call-arg]
+
         p_pts, b_pts = pts
+
         sess["last_pts_text"] = "上局結果: 和局" if (p_pts == b_pts and SKIP_TIE_UPD) else f"上局結果: 閒 {p_pts} 莊 {b_pts}"
+
         probs, choice, bet_amt, reason = _handle_points_and_predict(uid, sess, p_pts, b_pts)
+
         save_session(uid, sess)
+
         return jsonify(
             ok=True,
             probs=[float(probs[0]), float(probs[1]), float(probs[2])],
             choice=choice,
             bet=bet_amt,
             reason=reason,
-            card=format_output_card(probs, choice, sess.get("last_pts_text"), bet_amt,
-                                   cont=bool(CONTINUOUS_MODE), mode=sess.get("decision_mode", "")),
+            rounds_seen=int(sess.get("rounds_seen", 0)),
+            stat_calibrator_ok=bool(STAT_CALIBRATOR_OK),
+            card=format_output_card(
+                probs,
+                choice,
+                sess.get("last_pts_text"),
+                bet_amt,
+                cont=bool(CONTINUOUS_MODE),
+                mode=sess.get("decision_mode", ""),
+            ),
         ), 200
+
     except Exception as e:
         log.exception("predict error(uid=%s): %s", data.get("uid"), e)
         return jsonify(ok=False, error=str(e)), 500  # type: ignore[call-arg]
@@ -1506,12 +1846,22 @@ def predict():  # type: ignore
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
+
     if OutcomePF is None:
         log.warning("PF backend: smart-dummy (OutcomePF import failed).")
     else:
         log.info("PF backend: %s (OutcomePF available)", PF_BACKEND)
-    log.info("Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, webhook_ready=%s)",
-             VERSION, port, pf_initialized, DEPLETE_OK, bool(line_handler is not None))
+
+    log.info(
+        "Starting %s on port %s (PF_INIT=%s, DEPLETE_OK=%s, STAT_CALIBRATOR_OK=%s, webhook_ready=%s)",
+        VERSION,
+        port,
+        pf_initialized,
+        DEPLETE_OK,
+        STAT_CALIBRATOR_OK,
+        bool(line_handler is not None),
+    )
+
     if _flask_available and Flask is not None:
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
