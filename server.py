@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-server.py — BGS Pure PF + Deplete + Stage Overrides + FULL LINE Flow + Stability + Stat Calibrator
+server.py — BGS Pure PF + Deplete + Probability Only + FULL LINE Flow + Stability + Stat Calibrator
 
 This version provides:
 1. Per-user particle filter instances.
@@ -19,7 +19,7 @@ PF predict
 → PROB_BIAS_B2P
 → STAT_CALIBRATOR.adjust(...)
 → advanced control
-→ decision
+→ probability-only decision
 """
 
 import os
@@ -344,7 +344,7 @@ def format_output_card(probs: np.ndarray, choice: str, last_pts: Optional[str], 
     return "\n".join(lines)
 
 
-VERSION = "bgs-clean-server-pf360-line-fix-2026-04-08-per-user+stat-calibrator"
+VERSION = "bgs-prob-only-pf360-deplete-line-2026-05-08"
 
 #
 # ---------- Flask App ----------
@@ -469,7 +469,7 @@ def _make_result_cache_key(uid: str, sess: Dict[str, Any], p_pts: int, b_pts: in
     return (
         f"{uid}|r={int(sess.get('rounds_seen', 0))}|p={p_pts}|b={b_pts}|"
         f"bank={int(sess.get('bankroll', 0))}|stateful={int(PF_STATEFUL)}|"
-        f"mode={str(sess.get('decision_mode') or os.getenv('DECISION_MODE', 'hybrid')).lower()}|"
+        f"mode=probability_only|"
         f"stat={int(STAT_CALIBRATOR_OK)}|"
         f"stat_enable={os.getenv('STAT_CALIBRATOR_ENABLE', '1')}|"
         f"stat_blend={os.getenv('STAT_CALIBRATOR_BLEND', '0.16')}"
@@ -567,10 +567,14 @@ def reset_pf_for_uid(uid: str) -> None:
         _PF_BY_UID.pop(uid, None)
 
 
-DECISION_MODE = os.getenv("DECISION_MODE", "hybrid").lower()
-BANKER_PAYOUT = float(os.getenv("BANKER_PAYOUT", "0.95"))
-PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.02"))
-MIN_EV_EDGE = float(os.getenv("MIN_EV_EDGE", "0.0"))
+#
+# ---------- Probability-only decision settings ----------
+#
+# EV / hybrid decisions are intentionally removed.
+# Final choice is based only on Banker vs Player probability gap and confidence.
+DECISION_MODE = "probability_only"
+PROB_MARGIN = float(os.getenv("PROB_MARGIN", "0.018"))
+MIN_CONF_FOR_ENTRY = float(os.getenv("MIN_CONF_FOR_ENTRY", "0.500"))
 MIN_BET_PCT_ENV = float(os.getenv("MIN_BET_PCT", "0.05"))
 MAX_BET_PCT_ENV = float(os.getenv("MAX_BET_PCT", "0.40"))
 MAX_EDGE_SCALE = float(os.getenv("MAX_EDGE_FOR_FULLBET", "0.15"))
@@ -585,19 +589,26 @@ EARLY_DEPL_SCALE = float(os.getenv("EARLY_DEPL_SCALE", "0.2"))
 MID_DEPL_SCALE = float(os.getenv("MID_DEPL_SCALE", "0.6"))
 LATE_DEPL_SCALE = float(os.getenv("LATE_DEPL_SCALE", "0.9"))
 MAX_DEPL_SHIFT = float(os.getenv("MAX_DEPL_SHIFT", "0.03"))
-EV_NEUTRAL = int(os.getenv("EV_NEUTRAL", "0"))
 PROB_BIAS_B2P = float(os.getenv("PROB_BIAS_B2P", "0.0"))
-PROB_PURE_MODE = int(os.getenv("PROB_PURE_MODE", "0"))
-PROB_FORCE_PURE_IN_PROB_MODE = env_flag("PROB_FORCE_PURE_IN_PROB_MODE", 1)
 THEO_BLEND_FORCE_DISABLE = env_flag("THEO_BLEND_FORCE_DISABLE", 1)
 
 
 def _current_decision_mode(over: Dict[str, float]) -> str:
-    """Determine the current decision mode."""
+    """Return fixed decision mode. EV and hybrid are disabled by design."""
+    return "probability_only"
+
+
+def _env_float(name: str, default: float, over: Optional[Dict[str, float]] = None) -> float:
+    """Read float from stage override first, then env, then default."""
+    if over and name in over:
+        try:
+            return float(over[name])
+        except Exception:
+            pass
     try:
-        return str(over.get("DECISION_MODE", os.getenv("DECISION_MODE", "hybrid"))).strip().lower()
+        return float(os.getenv(name, str(default)))
     except Exception:
-        return "hybrid"
+        return float(default)
 
 
 def bet_amount(bankroll: int, pct: float) -> int:
@@ -605,59 +616,6 @@ def bet_amount(bankroll: int, pct: float) -> int:
     if bankroll <= 0 or pct <= 0:
         return 0
     return int(round(bankroll * pct))
-
-
-def _decide_side_by_ev(pB: float, pP: float) -> Tuple[int, float, float, float]:
-    """
-    Determine which side has the higher expected value.
-    """
-    evB = BANKER_PAYOUT * pB - pP
-    evP = pP - pB
-    side = 0 if evB > evP else 1
-    final_edge = max(abs(evB), abs(evP))
-    return side, final_edge, evB, evP
-
-
-def _effective_prob_flags(over: Dict[str, float], mode: str) -> Tuple[int, int, List[str]]:
-    """
-    Compute effective flags controlling pure probability mode and EV-neutral mode.
-    """
-    notes: List[str] = []
-    eff_prob_pure = PROB_PURE_MODE
-    eff_ev_neutral = EV_NEUTRAL
-
-    try:
-        if "PROB_PURE_MODE" in over:
-            eff_prob_pure = int(float(over["PROB_PURE_MODE"]))
-    except Exception:
-        pass
-
-    try:
-        if "EV_NEUTRAL" in over:
-            eff_ev_neutral = int(float(over["EV_NEUTRAL"]))
-    except Exception:
-        pass
-
-    if mode == "prob" and PROB_FORCE_PURE_IN_PROB_MODE == 1:
-        if eff_prob_pure != 1:
-            notes.append("FORCE_PURE(prob 模式自動純機率)")
-            eff_prob_pure = 1
-        if eff_ev_neutral != 0:
-            notes.append("FORCE_EV_NEUTRAL_OFF(prob 純機率關閉 payout-aware)")
-            eff_ev_neutral = 0
-
-    return eff_prob_pure, eff_ev_neutral, notes
-
-
-def _decide_side_by_prob(pB: float, pP: float, eff_prob_pure: int, eff_ev_neutral: int) -> int:
-    """
-    Determine side based on probabilities and flags.
-    """
-    if int(eff_prob_pure) == 1:
-        return 0 if pB >= pP else 1
-    if int(eff_ev_neutral) == 1:
-        return 0 if (BANKER_PAYOUT * pB) >= pP else 1
-    return 0 if pB >= pP else 1
 
 
 def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
@@ -707,71 +665,70 @@ def _apply_prob_bias(prob: np.ndarray, over: Dict[str, float]) -> np.ndarray:
 def decide_only_bp(prob: np.ndarray, over: Dict[str, float], effective_edge_enter: float,
                    p_pts: int, b_pts: int) -> Tuple[str, float, float, str]:
     """
-    Decide whether to bet on Banker, Player, or observe.
+    Probability-only decision.
+
+    Removed completely:
+    - EV decision
+    - hybrid decision
+    - payout-aware Banker 0.95 decision
+
+    Active rule:
+    1. Normalize [Banker, Player, Tie].
+    2. Compare Banker vs Player only.
+    3. Enter only when:
+       - max(Banker, Player) >= MIN_CONF_FOR_ENTRY
+       - abs(Banker - Player) >= PROB_MARGIN / stage PROB_MARGIN
+       - abs(Banker - Player) >= effective_edge_enter from advanced control
     """
-    mode = _current_decision_mode(over)
-    pB, pP, pT = float(prob[0]), float(prob[1]), float(prob[2])
-    reason: List[str] = []
-    eff_prob_pure, eff_ev_neutral, notes = _effective_prob_flags(over, mode)
-    if notes:
-        reason.extend(notes)
+    p = np.asarray(prob, dtype=np.float32).copy()
+    if p.shape != (3,) or (not np.isfinite(p).all()) or float(p.sum()) <= 0:
+        return ("觀望", 0.0, 0.0, "純機率：機率資料異常，建議觀望")
 
-    point_diff = abs(p_pts - b_pts)
+    p = np.maximum(p, 0.0)
+    p = p / max(float(p.sum()), 1e-8)
 
-    if mode == "prob":
-        side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
-        _, _, evB, evP = _decide_side_by_ev(pB, pP)
-        final_edge = max(abs(evB), abs(evP))
-        reason.append(f"模式=prob(pure={eff_prob_pure},ev_neutral={eff_ev_neutral})")
-
-    elif mode == "hybrid":
-        edge = abs(pB - pP)
-        if edge >= PROB_MARGIN * 1.15:
-            side = _decide_side_by_prob(pB, pP, eff_prob_pure, eff_ev_neutral)
-            _, _, evB, evP = _decide_side_by_ev(pB, pP)
-            final_edge = max(abs(evB), abs(evP))
-            reason.append(f"模式=hybrid→prob (大差距 {edge:.4f})")
-        else:
-            s2, _, evB, evP = _decide_side_by_ev(pB, pP)
-            final_edge = max(abs(evB), abs(evP))
-
-            if edge < 0.065 and point_diff <= 5:
-                if final_edge < 0.007:
-                    return ("觀望", final_edge, 0.0, f"點數接近(diff={point_diff}) + 差距小 → 強制觀望")
-
-                if evB > evP + MIN_EV_EDGE + 0.001:
-                    side = s2
-                    reason.append("模式=hybrid→ev (Banker 有優勢)")
-                else:
-                    return ("觀望", final_edge, 0.0, "hybrid → 觀望 (EV不足 + 小差距)")
-            else:
-                side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
-                reason.append("模式=ev")
-    else:
-        side, final_edge, evB, evP = _decide_side_by_ev(pB, pP)
-        reason.append("模式=ev")
-
+    pB, pP, pT = float(p[0]), float(p[1]), float(p[2])
     edge = abs(pB - pP)
+    confidence = max(pB, pP)
+
+    prob_margin = max(0.0, _env_float("PROB_MARGIN", PROB_MARGIN, over))
+    min_conf = max(0.0, min(1.0, _env_float("MIN_CONF_FOR_ENTRY", MIN_CONF_FOR_ENTRY, over)))
+    dyn_edge = max(0.0, float(effective_edge_enter or 0.0))
+    enter_edge = max(prob_margin, dyn_edge)
+
+    reason: List[str] = [
+        "模式=純機率",
+        f"信心={confidence:.4f}",
+        f"莊閒差距={edge:.4f}",
+        f"進場差距門檻={enter_edge:.4f}",
+        f"信心門檻={min_conf:.4f}",
+    ]
 
     if LOG_DECISION or SHOW_CONF_DEBUG:
         log.info(
-            "[DECIDE-DBG] pB=%.4f pP=%.4f pT=%.4f edge=%.4f final_edge=%.4f point_diff=%d mode=%s",
-            pB, pP, pT, edge, final_edge, point_diff, mode,
+            "[DECIDE-PROB-ONLY] pB=%.4f pP=%.4f pT=%.4f edge=%.4f conf=%.4f enter_edge=%.4f min_conf=%.4f",
+            pB, pP, pT, edge, confidence, enter_edge, min_conf,
         )
 
-    if final_edge < effective_edge_enter:
-        reason.append(f"⚪ 優勢不足 final_edge={final_edge:.4f}<{effective_edge_enter:.4f}")
-        return ("觀望", final_edge, 0.0, "; ".join(reason))
+    if confidence < min_conf:
+        reason.append(f"⚪ 信心不足 {confidence:.4f}<{min_conf:.4f}")
+        return ("觀望", edge, 0.0, "; ".join(reason))
 
+    if edge < enter_edge:
+        reason.append(f"⚪ 莊閒差距不足 {edge:.4f}<{enter_edge:.4f}")
+        return ("觀望", edge, 0.0, "; ".join(reason))
+
+    side = 0 if pB >= pP else 1
     min_b = max(0.0, min(1.0, MIN_BET_PCT_ENV))
     max_b = max(min_b, min(1.0, MAX_BET_PCT_ENV))
-    bet_pct = min_b + (max_b - min_b) * (edge / MAX_EDGE_SCALE)
+    scale = max(1e-6, float(MAX_EDGE_SCALE))
+    bet_pct = min_b + (max_b - min_b) * (edge / scale)
     bet_pct = float(min(max_b, max(min_b, bet_pct)))
 
     side_label = INV.get(side, "莊")
-    reason.append(f"🔻 {side_label} 勝率={100.0 * (pB if side == 0 else pP):.1f}%")
+    reason.append(f"🔻 {side_label} 機率={100.0 * (pB if side == 0 else pP):.1f}%")
 
-    return (("莊" if side == 0 else "閒"), final_edge, bet_pct, "; ".join(reason))
+    return (("莊" if side == 0 else "閒"), edge, bet_pct, "; ".join(reason))
 
 
 def _stage_bounds() -> Tuple[int, int]:
@@ -805,11 +762,10 @@ def get_stage_over(rounds_seen: int) -> Dict[str, float]:
         "TIE_MAX",
         "EDGE_ENTER",
         "PROB_MARGIN",
+        "MIN_CONF_FOR_ENTRY",
         "PF_PRED_SIMS",
         "DEPLETEMC_SIMS",
         "PF_UPD_SIMS",
-        "PROB_PURE_MODE",
-        "EV_NEUTRAL",
         "PROB_BIAS_B2P",
     ]
 
@@ -1094,7 +1050,7 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
     with lk:
         rounds_seen = int(sess.get("rounds_seen", 0))
         over = get_stage_over(rounds_seen)
-        mode = _current_decision_mode(over)
+        mode = "probability_only"
         sess["decision_mode"] = mode
 
         cache_key = _make_result_cache_key(uid, sess, p_pts, b_pts)
@@ -1185,15 +1141,21 @@ def _handle_points_and_predict(uid: str, sess: Dict[str, Any], p_pts: int, b_pts
                     dep = None
 
                     try:
-                        dep = probs_after_points(p_pts, b_pts, sims=dep_sims, rounds_seen=rounds_seen)
+                        # Preferred signature in current deplete.py:
+                        # probs_after_points(base_counts, p_pts, b_pts, sims=..., rounds_seen=...)
+                        dep = probs_after_points(None, p_pts, b_pts, sims=dep_sims, rounds_seen=rounds_seen)  # type: ignore[misc]
                     except TypeError:
                         try:
-                            dep = probs_after_points(p_pts, b_pts, sims=dep_sims)  # type: ignore[arg-type]
+                            dep = probs_after_points(None, p_pts, b_pts, sims=dep_sims)  # type: ignore[misc]
                         except TypeError:
                             try:
-                                dep = probs_after_points(p_pts, b_pts)  # type: ignore[arg-type]
-                            except Exception:
-                                dep = None
+                                dep = probs_after_points(None, p_pts, b_pts)  # type: ignore[misc]
+                            except TypeError:
+                                try:
+                                    # Backward-compatible old local signatures.
+                                    dep = probs_after_points(p_pts, b_pts, sims=dep_sims, rounds_seen=rounds_seen)  # type: ignore[arg-type]
+                                except Exception:
+                                    dep = None
 
                     if dep is not None:
                         dep = np.asarray(dep, dtype=np.float32)
@@ -1768,6 +1730,8 @@ def health():  # type: ignore
         line_async_heavy=bool(LINE_ASYNC_HEAVY),
         line_can_push=bool(_can_push()),
         decision_mode=DECISION_MODE,
+        prob_margin=PROB_MARGIN,
+        min_conf_for_entry=MIN_CONF_FOR_ENTRY,
         webhook_ready=bool(line_handler is not None),
         deplete_ok=bool(DEPLETE_OK),
         stat_calibrator_ok=bool(STAT_CALIBRATOR_OK),
