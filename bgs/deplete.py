@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-REAL DEPLETE.py — 真實扣牌 + 合理牌局反推扣牌 + 定期重置 + 統一隨機源
+REAL DEPLETE.py — 真實扣牌 + 合理牌局反推軟扣牌 + 定期重置 + 統一隨機源
 
 輸出機率順序：
     [Banker, Player, Tie]
@@ -10,9 +10,13 @@ REAL DEPLETE.py — 真實扣牌 + 合理牌局反推扣牌 + 定期重置 + 統
 1. 修正百家樂莊家補牌規則：
    - 閒未補牌時，莊 0~5 補，6~7 停
    - 閒有補牌時，依第三張牌規則補牌
-2. update_counts_from_points 不再單純亂扣牌
-   - 會用目前牌靴抽樣反推「符合輸入閒點 / 莊點」的一局牌
-   - 找到後扣除該局實際用牌
+
+2. update_counts_from_points 改成「多候選合理牌局 + 軟扣牌」
+   - 不再找到第一組就硬扣
+   - 會收集多組符合上一局點數的合理牌局
+   - 隨機挑一組後，再依 DEPLETEMC_SOFT_DEDUCT_RATE 軟扣
+   - 避免模型太黏上一局結果 / 上一局點數
+
 3. 保留原函式名稱，方便 server.py 不用改
 """
 
@@ -201,7 +205,6 @@ def deal_hand(counts: np.ndarray, return_cards: bool = False):
 
     # 莊家補牌規則
     if not player_draw:
-        # 關鍵修正：
         # 閒家未補牌時，莊家 0~5 補牌，6~7 停牌
         banker_draw = b <= 5
     else:
@@ -289,23 +292,48 @@ def simulate_probs(base_counts: np.ndarray, sims: int = 2000) -> np.ndarray:
 
 def _remove_used_cards(counts: np.ndarray, used_cards: List[int]) -> bool:
     """
-    從 counts 扣掉 used_cards。
-    如果某張牌不足，回傳 False。
+    軟扣牌版本：
+    找到符合上一局點數的合理牌局後，不是 100% 全扣，
+    而是依照 DEPLETEMC_SOFT_DEDUCT_RATE 做機率扣牌。
+
+    這樣可以避免模型太黏上一局點數 / 上一局結果。
+
+    建議參數：
+        DEPLETEMC_SOFT_DEDUCT_RATE=0.55
+
+    若還是太黏上一局：
+        改成 0.40
+
+    若想讓扣牌影響更強：
+        改成 0.70
     """
 
     if counts is None:
         return False
 
+    soft_rate = _env_float("DEPLETEMC_SOFT_DEDUCT_RATE", 0.55)
+    soft_rate = max(0.0, min(1.0, float(soft_rate)))
+
     tmp = np.asarray(counts, dtype=np.int32).copy()
+
+    deducted_any = False
 
     for card in used_cards:
         card = int(card) % 10
-        if tmp[card] <= 0:
-            return False
-        tmp[card] -= 1
 
-    counts[:] = tmp
-    return True
+        if tmp[card] <= 0:
+            continue
+
+        # 軟扣牌：不是每張都扣，避免過度相信上一局
+        if float(RNG.random()) <= soft_rate:
+            tmp[card] -= 1
+            deducted_any = True
+
+    if deducted_any:
+        counts[:] = tmp
+        return True
+
+    return False
 
 
 def _fallback_remove_cards(counts: np.ndarray, p_pts: int, b_pts: int) -> None:
@@ -319,8 +347,6 @@ def _fallback_remove_cards(counts: np.ndarray, p_pts: int, b_pts: int) -> None:
     if counts is None or counts.sum() <= 0:
         return
 
-    # 基礎至少 4 張
-    # 因為只有最終點數，不知道實際第三張，這裡保守估 4~6 張。
     remove_cards = 4
 
     try:
@@ -329,14 +355,16 @@ def _fallback_remove_cards(counts: np.ndarray, p_pts: int, b_pts: int) -> None:
     except Exception:
         p_pts, b_pts = 0, 0
 
-    # 最終低點通常比較可能有補牌，但不是絕對。
-    # 這裡只作 fallback，不作主判斷。
     if p_pts <= 5:
         remove_cards += 1
     if b_pts <= 5:
         remove_cards += 1
 
     remove_cards = max(4, min(6, remove_cards))
+
+    # fallback 也做得更保守，避免找不到候選時突然重扣
+    fallback_rate = _env_float("DEPLETEMC_FALLBACK_DEDUCT_RATE", 0.45)
+    fallback_rate = max(0.0, min(1.0, float(fallback_rate)))
 
     available = np.maximum(np.asarray(counts, dtype=np.int32), 0).astype(np.float64)
 
@@ -346,6 +374,9 @@ def _fallback_remove_cards(counts: np.ndarray, p_pts: int, b_pts: int) -> None:
     for _ in range(remove_cards):
         if available.sum() <= 0:
             break
+
+        if float(RNG.random()) > fallback_rate:
+            continue
 
         probs = available / available.sum()
         idx = int(RNG.choice(10, p=probs))
@@ -362,17 +393,13 @@ def update_counts_from_points(
     match_tries: int | None = None,
 ) -> None:
     """
-    根據上一局最終點數，反推一組合理牌局並扣牌。
+    根據上一局最終點數，反推合理牌局並做「軟扣牌」。
 
-    你前端通常只輸入：
-        閒點 p_pts
-        莊點 b_pts
-
-    但不知道實際牌面，所以這裡用目前牌靴抽樣多次，
-    找到一組最後結果剛好等於 p_pts / b_pts 的牌局，
-    再扣除那組實際使用牌。
-
-    這比原本單純亂扣 4~6 張準很多。
+    這版避免太黏上一局結果：
+    1. 不只找第一組符合牌局
+    2. 會收集多組候選牌局
+    3. 從候選裡隨機挑一組
+    4. 再用軟扣牌比例扣牌
     """
 
     if counts is None:
@@ -388,16 +415,21 @@ def update_counts_from_points(
         return
 
     if match_tries is None:
-        match_tries = _env_int("DEPLETEMC_MATCH_TRIES", 800)
+        match_tries = _env_int("DEPLETEMC_MATCH_TRIES", 600)
 
     match_tries = max(50, int(match_tries))
+
+    max_candidates = _env_int("DEPLETEMC_MATCH_CANDIDATES", 12)
+    max_candidates = max(1, min(50, int(max_candidates)))
 
     base = np.asarray(counts, dtype=np.int32)
 
     if base.sum() <= 0:
         return
 
-    # 反推合理牌局
+    candidates: List[List[int]] = []
+
+    # 收集多組合理牌局，不要第一組就直接扣
     for _ in range(match_tries):
         c = base.copy()
 
@@ -407,9 +439,18 @@ def update_counts_from_points(
             continue
 
         if sim_p == p_pts and sim_b == b_pts:
-            ok = _remove_used_cards(counts, used_cards)
-            if ok:
-                return
+            candidates.append(list(used_cards))
+
+            if len(candidates) >= max_candidates:
+                break
+
+    if candidates:
+        pick_idx = int(RNG.integers(0, len(candidates)))
+        used_cards = candidates[pick_idx]
+
+        ok = _remove_used_cards(counts, used_cards)
+        if ok:
+            return
 
     # 找不到合理牌局時，才走保守 fallback
     _fallback_remove_cards(counts, p_pts, b_pts)
