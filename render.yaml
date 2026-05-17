@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: bgs-dual-3m-db-line-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    envVars:
+      - key: TZ
+        value: Asia/Taipei
+      - key: APP_NAME
+        value: BGS_DUAL_3M_DB_LINE_BOT
+      - key: SESSION_EXPIRE_SECONDS
+        value: "1800"
+      - key: ENABLE_SIGNATURE_VERIFY
+        value: "1"
+      - key: DEFAULT_GAME
+        value: DG
+      - key: DEFAULT_TABLE
+        value: DG05
+      - key: PLAYER_INPUT_FIRST
+        value: "1"
+      - key: NO_OBSERVE
+        value: "1"
+      - key: REPLY_STYLE
+        value: COOL
+      - key: POINT_DB_PATH
+        value: data/point_db_3m.json
+      - key: RESULT_PATTERN_DB_PATH
+        value: data/result_pattern_db_3m.json
+      - key: USE_POINT_DB
+        value: "1"
+      - key: USE_PATTERN_DB
+        value: "1"
+      - key: POINT_WEIGHT
+        value: "0.58"
+      - key: PATTERN_WEIGHT
+        value: "0.30"
+      - key: SIM_WEIGHT
+        value: "0.12"
+      - key: MIN_OUTPUT_PROB
+        value: "0.05"
+      - key: MAX_OUTPUT_PROB
+        value: "0.95"
+      - key: PERCENT_DECIMALS
+        value: "2"
+      - key: GEMINI_ENABLE
+        value: "0"
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
+      - key: AI_TEXT_ENABLE
+        value: "1"
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

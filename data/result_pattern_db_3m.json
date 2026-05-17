@@ -1,0 +1,3996 @@
+{
+  "meta": {
+    "name": "BGS 3M aggregated result pattern database",
+    "version": "2026-05-10",
+    "total_simulated_samples": 3000000,
+    "windows": [
+      3,
+      5,
+      7
+    ],
+    "storage_note": "300萬組莊閒規律模擬樣本壓縮成pattern統計。W3/W5含B/P/T，W7含B/P規律。",
+    "warning": "此為模擬統計資料，不保證實際預測命中。"
+  },
+  "records": {
+    "W3:BBB": {
+      "window": 3,
+      "pattern": "BBB",
+      "sample": 7834,
+      "next_player_count": 4525,
+      "next_banker_count": 3309,
+      "next_player_rate": 0.57761,
+      "next_banker_rate": 0.42239,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BBP": {
+      "window": 3,
+      "pattern": "BBP",
+      "sample": 4529,
+      "next_player_count": 2710,
+      "next_banker_count": 1819,
+      "next_player_rate": 0.598366,
+      "next_banker_rate": 0.401634,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BBT": {
+      "window": 3,
+      "pattern": "BBT",
+      "sample": 4635,
+      "next_player_count": 2641,
+      "next_banker_count": 1994,
+      "next_player_rate": 0.569795,
+      "next_banker_rate": 0.430205,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BPB": {
+      "window": 3,
+      "pattern": "BPB",
+      "sample": 4439,
+      "next_player_count": 2684,
+      "next_banker_count": 1755,
+      "next_player_rate": 0.604641,
+      "next_banker_rate": 0.395359,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BPP": {
+      "window": 3,
+      "pattern": "BPP",
+      "sample": 4475,
+      "next_player_count": 1808,
+      "next_banker_count": 2667,
+      "next_player_rate": 0.404022,
+      "next_banker_rate": 0.595978,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BPT": {
+      "window": 3,
+      "pattern": "BPT",
+      "sample": 5653,
+      "next_player_count": 2748,
+      "next_banker_count": 2905,
+      "next_player_rate": 0.486114,
+      "next_banker_rate": 0.513886,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BTB": {
+      "window": 3,
+      "pattern": "BTB",
+      "sample": 5648,
+      "next_player_count": 3211,
+      "next_banker_count": 2437,
+      "next_player_rate": 0.56852,
+      "next_banker_rate": 0.43148,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BTP": {
+      "window": 3,
+      "pattern": "BTP",
+      "sample": 6133,
+      "next_player_count": 2982,
+      "next_banker_count": 3151,
+      "next_player_rate": 0.486222,
+      "next_banker_rate": 0.513778,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:BTT": {
+      "window": 3,
+      "pattern": "BTT",
+      "sample": 5568,
+      "next_player_count": 2709,
+      "next_banker_count": 2859,
+      "next_player_rate": 0.48653,
+      "next_banker_rate": 0.51347,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PBB": {
+      "window": 3,
+      "pattern": "PBB",
+      "sample": 3494,
+      "next_player_count": 1901,
+      "next_banker_count": 1593,
+      "next_player_rate": 0.544076,
+      "next_banker_rate": 0.455924,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PBP": {
+      "window": 3,
+      "pattern": "PBP",
+      "sample": 4996,
+      "next_player_count": 2153,
+      "next_banker_count": 2843,
+      "next_player_rate": 0.430945,
+      "next_banker_rate": 0.569055,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PBT": {
+      "window": 3,
+      "pattern": "PBT",
+      "sample": 5770,
+      "next_player_count": 3114,
+      "next_banker_count": 2656,
+      "next_player_rate": 0.539688,
+      "next_banker_rate": 0.460312,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PPB": {
+      "window": 3,
+      "pattern": "PPB",
+      "sample": 3572,
+      "next_player_count": 1454,
+      "next_banker_count": 2118,
+      "next_player_rate": 0.407055,
+      "next_banker_rate": 0.592945,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PPP": {
+      "window": 3,
+      "pattern": "PPP",
+      "sample": 5996,
+      "next_player_count": 2726,
+      "next_banker_count": 3270,
+      "next_player_rate": 0.454636,
+      "next_banker_rate": 0.545364,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PPT": {
+      "window": 3,
+      "pattern": "PPT",
+      "sample": 4375,
+      "next_player_count": 1947,
+      "next_banker_count": 2428,
+      "next_player_rate": 0.445029,
+      "next_banker_rate": 0.554971,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PTB": {
+      "window": 3,
+      "pattern": "PTB",
+      "sample": 5998,
+      "next_player_count": 3066,
+      "next_banker_count": 2932,
+      "next_player_rate": 0.51117,
+      "next_banker_rate": 0.48883,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PTP": {
+      "window": 3,
+      "pattern": "PTP",
+      "sample": 5834,
+      "next_player_count": 2403,
+      "next_banker_count": 3431,
+      "next_player_rate": 0.411896,
+      "next_banker_rate": 0.588104,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:PTT": {
+      "window": 3,
+      "pattern": "PTT",
+      "sample": 6150,
+      "next_player_count": 2868,
+      "next_banker_count": 3282,
+      "next_player_rate": 0.466341,
+      "next_banker_rate": 0.533659,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TBB": {
+      "window": 3,
+      "pattern": "TBB",
+      "sample": 4073,
+      "next_player_count": 2382,
+      "next_banker_count": 1691,
+      "next_player_rate": 0.584827,
+      "next_banker_rate": 0.415173,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TBP": {
+      "window": 3,
+      "pattern": "TBP",
+      "sample": 5188,
+      "next_player_count": 2240,
+      "next_banker_count": 2948,
+      "next_player_rate": 0.431766,
+      "next_banker_rate": 0.568234,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TBT": {
+      "window": 3,
+      "pattern": "TBT",
+      "sample": 5989,
+      "next_player_count": 2904,
+      "next_banker_count": 3085,
+      "next_player_rate": 0.484889,
+      "next_banker_rate": 0.515111,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TPB": {
+      "window": 3,
+      "pattern": "TPB",
+      "sample": 4439,
+      "next_player_count": 2282,
+      "next_banker_count": 2157,
+      "next_player_rate": 0.51408,
+      "next_banker_rate": 0.48592,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TPP": {
+      "window": 3,
+      "pattern": "TPP",
+      "sample": 4551,
+      "next_player_count": 1726,
+      "next_banker_count": 2825,
+      "next_player_rate": 0.379257,
+      "next_banker_rate": 0.620743,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TPT": {
+      "window": 3,
+      "pattern": "TPT",
+      "sample": 6163,
+      "next_player_count": 2956,
+      "next_banker_count": 3207,
+      "next_player_rate": 0.479637,
+      "next_banker_rate": 0.520363,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TTB": {
+      "window": 3,
+      "pattern": "TTB",
+      "sample": 5494,
+      "next_player_count": 2761,
+      "next_banker_count": 2733,
+      "next_player_rate": 0.502548,
+      "next_banker_rate": 0.497452,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TTP": {
+      "window": 3,
+      "pattern": "TTP",
+      "sample": 5160,
+      "next_player_count": 2535,
+      "next_banker_count": 2625,
+      "next_player_rate": 0.491279,
+      "next_banker_rate": 0.508721,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W3:TTT": {
+      "window": 3,
+      "pattern": "TTT",
+      "sample": 4924,
+      "next_player_count": 2255,
+      "next_banker_count": 2669,
+      "next_player_rate": 0.457961,
+      "next_banker_rate": 0.542039,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBBB": {
+      "window": 5,
+      "pattern": "BBBBB",
+      "sample": 8946,
+      "next_player_count": 5217,
+      "next_banker_count": 3729,
+      "next_player_rate": 0.583166,
+      "next_banker_rate": 0.416834,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBBP": {
+      "window": 5,
+      "pattern": "BBBBP",
+      "sample": 6860,
+      "next_player_count": 4030,
+      "next_banker_count": 2830,
+      "next_player_rate": 0.587464,
+      "next_banker_rate": 0.412536,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBBT": {
+      "window": 5,
+      "pattern": "BBBBT",
+      "sample": 6558,
+      "next_player_count": 3921,
+      "next_banker_count": 2637,
+      "next_player_rate": 0.597896,
+      "next_banker_rate": 0.402104,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBPB": {
+      "window": 5,
+      "pattern": "BBBPB",
+      "sample": 7095,
+      "next_player_count": 3991,
+      "next_banker_count": 3104,
+      "next_player_rate": 0.562509,
+      "next_banker_rate": 0.437491,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBPP": {
+      "window": 5,
+      "pattern": "BBBPP",
+      "sample": 6443,
+      "next_player_count": 3245,
+      "next_banker_count": 3198,
+      "next_player_rate": 0.503647,
+      "next_banker_rate": 0.496353,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBPT": {
+      "window": 5,
+      "pattern": "BBBPT",
+      "sample": 6927,
+      "next_player_count": 3602,
+      "next_banker_count": 3325,
+      "next_player_rate": 0.519994,
+      "next_banker_rate": 0.480006,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBTB": {
+      "window": 5,
+      "pattern": "BBBTB",
+      "sample": 6358,
+      "next_player_count": 3801,
+      "next_banker_count": 2557,
+      "next_player_rate": 0.59783,
+      "next_banker_rate": 0.40217,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBTP": {
+      "window": 5,
+      "pattern": "BBBTP",
+      "sample": 6708,
+      "next_player_count": 3454,
+      "next_banker_count": 3254,
+      "next_player_rate": 0.514908,
+      "next_banker_rate": 0.485092,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBBTT": {
+      "window": 5,
+      "pattern": "BBBTT",
+      "sample": 5826,
+      "next_player_count": 2631,
+      "next_banker_count": 3195,
+      "next_player_rate": 0.451596,
+      "next_banker_rate": 0.548404,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPBB": {
+      "window": 5,
+      "pattern": "BBPBB",
+      "sample": 5965,
+      "next_player_count": 3246,
+      "next_banker_count": 2719,
+      "next_player_rate": 0.544174,
+      "next_banker_rate": 0.455826,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPBP": {
+      "window": 5,
+      "pattern": "BBPBP",
+      "sample": 5813,
+      "next_player_count": 2805,
+      "next_banker_count": 3008,
+      "next_player_rate": 0.482539,
+      "next_banker_rate": 0.517461,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPBT": {
+      "window": 5,
+      "pattern": "BBPBT",
+      "sample": 5896,
+      "next_player_count": 3032,
+      "next_banker_count": 2864,
+      "next_player_rate": 0.514247,
+      "next_banker_rate": 0.485753,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPPB": {
+      "window": 5,
+      "pattern": "BBPPB",
+      "sample": 6234,
+      "next_player_count": 3109,
+      "next_banker_count": 3125,
+      "next_player_rate": 0.498717,
+      "next_banker_rate": 0.501283,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPPP": {
+      "window": 5,
+      "pattern": "BBPPP",
+      "sample": 6465,
+      "next_player_count": 3141,
+      "next_banker_count": 3324,
+      "next_player_rate": 0.485847,
+      "next_banker_rate": 0.514153,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPPT": {
+      "window": 5,
+      "pattern": "BBPPT",
+      "sample": 6931,
+      "next_player_count": 3805,
+      "next_banker_count": 3126,
+      "next_player_rate": 0.548983,
+      "next_banker_rate": 0.451017,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPTB": {
+      "window": 5,
+      "pattern": "BBPTB",
+      "sample": 5680,
+      "next_player_count": 2693,
+      "next_banker_count": 2987,
+      "next_player_rate": 0.47412,
+      "next_banker_rate": 0.52588,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPTP": {
+      "window": 5,
+      "pattern": "BBPTP",
+      "sample": 6172,
+      "next_player_count": 3214,
+      "next_banker_count": 2958,
+      "next_player_rate": 0.520739,
+      "next_banker_rate": 0.479261,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBPTT": {
+      "window": 5,
+      "pattern": "BBPTT",
+      "sample": 5785,
+      "next_player_count": 2543,
+      "next_banker_count": 3242,
+      "next_player_rate": 0.439585,
+      "next_banker_rate": 0.560415,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTBB": {
+      "window": 5,
+      "pattern": "BBTBB",
+      "sample": 5371,
+      "next_player_count": 2999,
+      "next_banker_count": 2372,
+      "next_player_rate": 0.558369,
+      "next_banker_rate": 0.441631,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTBP": {
+      "window": 5,
+      "pattern": "BBTBP",
+      "sample": 6183,
+      "next_player_count": 3116,
+      "next_banker_count": 3067,
+      "next_player_rate": 0.503962,
+      "next_banker_rate": 0.496038,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTBT": {
+      "window": 5,
+      "pattern": "BBTBT",
+      "sample": 7490,
+      "next_player_count": 3564,
+      "next_banker_count": 3926,
+      "next_player_rate": 0.475834,
+      "next_banker_rate": 0.524166,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTPB": {
+      "window": 5,
+      "pattern": "BBTPB",
+      "sample": 6066,
+      "next_player_count": 3092,
+      "next_banker_count": 2974,
+      "next_player_rate": 0.509726,
+      "next_banker_rate": 0.490274,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTPP": {
+      "window": 5,
+      "pattern": "BBTPP",
+      "sample": 5379,
+      "next_player_count": 2386,
+      "next_banker_count": 2993,
+      "next_player_rate": 0.443577,
+      "next_banker_rate": 0.556423,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTPT": {
+      "window": 5,
+      "pattern": "BBTPT",
+      "sample": 6621,
+      "next_player_count": 3303,
+      "next_banker_count": 3318,
+      "next_player_rate": 0.498867,
+      "next_banker_rate": 0.501133,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTTB": {
+      "window": 5,
+      "pattern": "BBTTB",
+      "sample": 5514,
+      "next_player_count": 2952,
+      "next_banker_count": 2562,
+      "next_player_rate": 0.535365,
+      "next_banker_rate": 0.464635,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTTP": {
+      "window": 5,
+      "pattern": "BBTTP",
+      "sample": 7517,
+      "next_player_count": 3372,
+      "next_banker_count": 4145,
+      "next_player_rate": 0.448583,
+      "next_banker_rate": 0.551417,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BBTTT": {
+      "window": 5,
+      "pattern": "BBTTT",
+      "sample": 6059,
+      "next_player_count": 2848,
+      "next_banker_count": 3211,
+      "next_player_rate": 0.470045,
+      "next_banker_rate": 0.529955,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBBB": {
+      "window": 5,
+      "pattern": "BPBBB",
+      "sample": 5802,
+      "next_player_count": 3454,
+      "next_banker_count": 2348,
+      "next_player_rate": 0.595312,
+      "next_banker_rate": 0.404688,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBBP": {
+      "window": 5,
+      "pattern": "BPBBP",
+      "sample": 6626,
+      "next_player_count": 3297,
+      "next_banker_count": 3329,
+      "next_player_rate": 0.497585,
+      "next_banker_rate": 0.502415,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBBT": {
+      "window": 5,
+      "pattern": "BPBBT",
+      "sample": 7480,
+      "next_player_count": 3687,
+      "next_banker_count": 3793,
+      "next_player_rate": 0.492914,
+      "next_banker_rate": 0.507086,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBPB": {
+      "window": 5,
+      "pattern": "BPBPB",
+      "sample": 6768,
+      "next_player_count": 3718,
+      "next_banker_count": 3050,
+      "next_player_rate": 0.54935,
+      "next_banker_rate": 0.45065,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBPP": {
+      "window": 5,
+      "pattern": "BPBPP",
+      "sample": 5659,
+      "next_player_count": 2565,
+      "next_banker_count": 3094,
+      "next_player_rate": 0.45326,
+      "next_banker_rate": 0.54674,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBPT": {
+      "window": 5,
+      "pattern": "BPBPT",
+      "sample": 8641,
+      "next_player_count": 4405,
+      "next_banker_count": 4236,
+      "next_player_rate": 0.509779,
+      "next_banker_rate": 0.490221,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBTB": {
+      "window": 5,
+      "pattern": "BPBTB",
+      "sample": 6947,
+      "next_player_count": 3311,
+      "next_banker_count": 3636,
+      "next_player_rate": 0.476609,
+      "next_banker_rate": 0.523391,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBTP": {
+      "window": 5,
+      "pattern": "BPBTP",
+      "sample": 7416,
+      "next_player_count": 3155,
+      "next_banker_count": 4261,
+      "next_player_rate": 0.425431,
+      "next_banker_rate": 0.574569,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPBTT": {
+      "window": 5,
+      "pattern": "BPBTT",
+      "sample": 8848,
+      "next_player_count": 4540,
+      "next_banker_count": 4308,
+      "next_player_rate": 0.51311,
+      "next_banker_rate": 0.48689,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPBB": {
+      "window": 5,
+      "pattern": "BPPBB",
+      "sample": 7339,
+      "next_player_count": 4019,
+      "next_banker_count": 3320,
+      "next_player_rate": 0.547622,
+      "next_banker_rate": 0.452378,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPBP": {
+      "window": 5,
+      "pattern": "BPPBP",
+      "sample": 6291,
+      "next_player_count": 2970,
+      "next_banker_count": 3321,
+      "next_player_rate": 0.472103,
+      "next_banker_rate": 0.527897,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPBT": {
+      "window": 5,
+      "pattern": "BPPBT",
+      "sample": 6219,
+      "next_player_count": 3067,
+      "next_banker_count": 3152,
+      "next_player_rate": 0.493166,
+      "next_banker_rate": 0.506834,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPPB": {
+      "window": 5,
+      "pattern": "BPPPB",
+      "sample": 5433,
+      "next_player_count": 2575,
+      "next_banker_count": 2858,
+      "next_player_rate": 0.473955,
+      "next_banker_rate": 0.526045,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPPP": {
+      "window": 5,
+      "pattern": "BPPPP",
+      "sample": 5863,
+      "next_player_count": 2420,
+      "next_banker_count": 3443,
+      "next_player_rate": 0.412758,
+      "next_banker_rate": 0.587242,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPPT": {
+      "window": 5,
+      "pattern": "BPPPT",
+      "sample": 5383,
+      "next_player_count": 2766,
+      "next_banker_count": 2617,
+      "next_player_rate": 0.51384,
+      "next_banker_rate": 0.48616,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPTB": {
+      "window": 5,
+      "pattern": "BPPTB",
+      "sample": 6828,
+      "next_player_count": 3429,
+      "next_banker_count": 3399,
+      "next_player_rate": 0.502197,
+      "next_banker_rate": 0.497803,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPTP": {
+      "window": 5,
+      "pattern": "BPPTP",
+      "sample": 7050,
+      "next_player_count": 3620,
+      "next_banker_count": 3430,
+      "next_player_rate": 0.513475,
+      "next_banker_rate": 0.486525,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPPTT": {
+      "window": 5,
+      "pattern": "BPPTT",
+      "sample": 6087,
+      "next_player_count": 3042,
+      "next_banker_count": 3045,
+      "next_player_rate": 0.499754,
+      "next_banker_rate": 0.500246,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTBB": {
+      "window": 5,
+      "pattern": "BPTBB",
+      "sample": 7476,
+      "next_player_count": 3950,
+      "next_banker_count": 3526,
+      "next_player_rate": 0.528357,
+      "next_banker_rate": 0.471643,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTBP": {
+      "window": 5,
+      "pattern": "BPTBP",
+      "sample": 8731,
+      "next_player_count": 3726,
+      "next_banker_count": 5005,
+      "next_player_rate": 0.426755,
+      "next_banker_rate": 0.573245,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTBT": {
+      "window": 5,
+      "pattern": "BPTBT",
+      "sample": 6727,
+      "next_player_count": 3056,
+      "next_banker_count": 3671,
+      "next_player_rate": 0.454289,
+      "next_banker_rate": 0.545711,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTPB": {
+      "window": 5,
+      "pattern": "BPTPB",
+      "sample": 8298,
+      "next_player_count": 4266,
+      "next_banker_count": 4032,
+      "next_player_rate": 0.5141,
+      "next_banker_rate": 0.4859,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTPP": {
+      "window": 5,
+      "pattern": "BPTPP",
+      "sample": 5763,
+      "next_player_count": 2632,
+      "next_banker_count": 3131,
+      "next_player_rate": 0.456707,
+      "next_banker_rate": 0.543293,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTPT": {
+      "window": 5,
+      "pattern": "BPTPT",
+      "sample": 9307,
+      "next_player_count": 4531,
+      "next_banker_count": 4776,
+      "next_player_rate": 0.486838,
+      "next_banker_rate": 0.513162,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTTB": {
+      "window": 5,
+      "pattern": "BPTTB",
+      "sample": 7562,
+      "next_player_count": 3544,
+      "next_banker_count": 4018,
+      "next_player_rate": 0.468659,
+      "next_banker_rate": 0.531341,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTTP": {
+      "window": 5,
+      "pattern": "BPTTP",
+      "sample": 8532,
+      "next_player_count": 4334,
+      "next_banker_count": 4198,
+      "next_player_rate": 0.50797,
+      "next_banker_rate": 0.49203,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BPTTT": {
+      "window": 5,
+      "pattern": "BPTTT",
+      "sample": 9096,
+      "next_player_count": 4981,
+      "next_banker_count": 4115,
+      "next_player_rate": 0.547603,
+      "next_banker_rate": 0.452397,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBBB": {
+      "window": 5,
+      "pattern": "BTBBB",
+      "sample": 6352,
+      "next_player_count": 3459,
+      "next_banker_count": 2893,
+      "next_player_rate": 0.544553,
+      "next_banker_rate": 0.455447,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBBP": {
+      "window": 5,
+      "pattern": "BTBBP",
+      "sample": 6321,
+      "next_player_count": 3412,
+      "next_banker_count": 2909,
+      "next_player_rate": 0.539788,
+      "next_banker_rate": 0.460212,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBBT": {
+      "window": 5,
+      "pattern": "BTBBT",
+      "sample": 5953,
+      "next_player_count": 3129,
+      "next_banker_count": 2824,
+      "next_player_rate": 0.525617,
+      "next_banker_rate": 0.474383,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBPB": {
+      "window": 5,
+      "pattern": "BTBPB",
+      "sample": 9093,
+      "next_player_count": 5275,
+      "next_banker_count": 3818,
+      "next_player_rate": 0.580117,
+      "next_banker_rate": 0.419883,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBPP": {
+      "window": 5,
+      "pattern": "BTBPP",
+      "sample": 6149,
+      "next_player_count": 3136,
+      "next_banker_count": 3013,
+      "next_player_rate": 0.510002,
+      "next_banker_rate": 0.489998,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBPT": {
+      "window": 5,
+      "pattern": "BTBPT",
+      "sample": 6877,
+      "next_player_count": 3371,
+      "next_banker_count": 3506,
+      "next_player_rate": 0.490185,
+      "next_banker_rate": 0.509815,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBTB": {
+      "window": 5,
+      "pattern": "BTBTB",
+      "sample": 8835,
+      "next_player_count": 4012,
+      "next_banker_count": 4823,
+      "next_player_rate": 0.454103,
+      "next_banker_rate": 0.545897,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBTP": {
+      "window": 5,
+      "pattern": "BTBTP",
+      "sample": 8998,
+      "next_player_count": 4623,
+      "next_banker_count": 4375,
+      "next_player_rate": 0.513781,
+      "next_banker_rate": 0.486219,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTBTT": {
+      "window": 5,
+      "pattern": "BTBTT",
+      "sample": 6982,
+      "next_player_count": 3504,
+      "next_banker_count": 3478,
+      "next_player_rate": 0.501862,
+      "next_banker_rate": 0.498138,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPBB": {
+      "window": 5,
+      "pattern": "BTPBB",
+      "sample": 6624,
+      "next_player_count": 3520,
+      "next_banker_count": 3104,
+      "next_player_rate": 0.531401,
+      "next_banker_rate": 0.468599,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPBP": {
+      "window": 5,
+      "pattern": "BTPBP",
+      "sample": 7317,
+      "next_player_count": 3385,
+      "next_banker_count": 3932,
+      "next_player_rate": 0.462621,
+      "next_banker_rate": 0.537379,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPBT": {
+      "window": 5,
+      "pattern": "BTPBT",
+      "sample": 7624,
+      "next_player_count": 3490,
+      "next_banker_count": 4134,
+      "next_player_rate": 0.457765,
+      "next_banker_rate": 0.542235,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPPB": {
+      "window": 5,
+      "pattern": "BTPPB",
+      "sample": 5493,
+      "next_player_count": 2690,
+      "next_banker_count": 2803,
+      "next_player_rate": 0.489714,
+      "next_banker_rate": 0.510286,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPPP": {
+      "window": 5,
+      "pattern": "BTPPP",
+      "sample": 7583,
+      "next_player_count": 3197,
+      "next_banker_count": 4386,
+      "next_player_rate": 0.421601,
+      "next_banker_rate": 0.578399,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPPT": {
+      "window": 5,
+      "pattern": "BTPPT",
+      "sample": 6690,
+      "next_player_count": 2950,
+      "next_banker_count": 3740,
+      "next_player_rate": 0.440957,
+      "next_banker_rate": 0.559043,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPTB": {
+      "window": 5,
+      "pattern": "BTPTB",
+      "sample": 7140,
+      "next_player_count": 3425,
+      "next_banker_count": 3715,
+      "next_player_rate": 0.479692,
+      "next_banker_rate": 0.520308,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPTP": {
+      "window": 5,
+      "pattern": "BTPTP",
+      "sample": 6866,
+      "next_player_count": 3517,
+      "next_banker_count": 3349,
+      "next_player_rate": 0.512234,
+      "next_banker_rate": 0.487766,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTPTT": {
+      "window": 5,
+      "pattern": "BTPTT",
+      "sample": 7987,
+      "next_player_count": 3927,
+      "next_banker_count": 4060,
+      "next_player_rate": 0.491674,
+      "next_banker_rate": 0.508326,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTBB": {
+      "window": 5,
+      "pattern": "BTTBB",
+      "sample": 5757,
+      "next_player_count": 3174,
+      "next_banker_count": 2583,
+      "next_player_rate": 0.551329,
+      "next_banker_rate": 0.448671,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTBP": {
+      "window": 5,
+      "pattern": "BTTBP",
+      "sample": 9491,
+      "next_player_count": 4957,
+      "next_banker_count": 4534,
+      "next_player_rate": 0.522284,
+      "next_banker_rate": 0.477716,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTBT": {
+      "window": 5,
+      "pattern": "BTTBT",
+      "sample": 8859,
+      "next_player_count": 4542,
+      "next_banker_count": 4317,
+      "next_player_rate": 0.512699,
+      "next_banker_rate": 0.487301,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTPB": {
+      "window": 5,
+      "pattern": "BTTPB",
+      "sample": 7392,
+      "next_player_count": 3669,
+      "next_banker_count": 3723,
+      "next_player_rate": 0.496347,
+      "next_banker_rate": 0.503653,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTPP": {
+      "window": 5,
+      "pattern": "BTTPP",
+      "sample": 7550,
+      "next_player_count": 3498,
+      "next_banker_count": 4052,
+      "next_player_rate": 0.463311,
+      "next_banker_rate": 0.536689,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTPT": {
+      "window": 5,
+      "pattern": "BTTPT",
+      "sample": 7429,
+      "next_player_count": 3670,
+      "next_banker_count": 3759,
+      "next_player_rate": 0.49401,
+      "next_banker_rate": 0.50599,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTTB": {
+      "window": 5,
+      "pattern": "BTTTB",
+      "sample": 8243,
+      "next_player_count": 4300,
+      "next_banker_count": 3943,
+      "next_player_rate": 0.521655,
+      "next_banker_rate": 0.478345,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTTP": {
+      "window": 5,
+      "pattern": "BTTTP",
+      "sample": 8798,
+      "next_player_count": 4458,
+      "next_banker_count": 4340,
+      "next_player_rate": 0.506706,
+      "next_banker_rate": 0.493294,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:BTTTT": {
+      "window": 5,
+      "pattern": "BTTTT",
+      "sample": 6634,
+      "next_player_count": 3387,
+      "next_banker_count": 3247,
+      "next_player_rate": 0.510552,
+      "next_banker_rate": 0.489448,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBBB": {
+      "window": 5,
+      "pattern": "PBBBB",
+      "sample": 7244,
+      "next_player_count": 4390,
+      "next_banker_count": 2854,
+      "next_player_rate": 0.606019,
+      "next_banker_rate": 0.393981,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBBP": {
+      "window": 5,
+      "pattern": "PBBBP",
+      "sample": 6016,
+      "next_player_count": 2817,
+      "next_banker_count": 3199,
+      "next_player_rate": 0.468251,
+      "next_banker_rate": 0.531749,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBBT": {
+      "window": 5,
+      "pattern": "PBBBT",
+      "sample": 5691,
+      "next_player_count": 2490,
+      "next_banker_count": 3201,
+      "next_player_rate": 0.437533,
+      "next_banker_rate": 0.562467,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBPB": {
+      "window": 5,
+      "pattern": "PBBPB",
+      "sample": 5291,
+      "next_player_count": 2772,
+      "next_banker_count": 2519,
+      "next_player_rate": 0.523909,
+      "next_banker_rate": 0.476091,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBPP": {
+      "window": 5,
+      "pattern": "PBBPP",
+      "sample": 6911,
+      "next_player_count": 3454,
+      "next_banker_count": 3457,
+      "next_player_rate": 0.499783,
+      "next_banker_rate": 0.500217,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBPT": {
+      "window": 5,
+      "pattern": "PBBPT",
+      "sample": 6700,
+      "next_player_count": 3197,
+      "next_banker_count": 3503,
+      "next_player_rate": 0.477164,
+      "next_banker_rate": 0.522836,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBTB": {
+      "window": 5,
+      "pattern": "PBBTB",
+      "sample": 6828,
+      "next_player_count": 3450,
+      "next_banker_count": 3378,
+      "next_player_rate": 0.505272,
+      "next_banker_rate": 0.494728,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBTP": {
+      "window": 5,
+      "pattern": "PBBTP",
+      "sample": 5762,
+      "next_player_count": 3066,
+      "next_banker_count": 2696,
+      "next_player_rate": 0.532107,
+      "next_banker_rate": 0.467893,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBBTT": {
+      "window": 5,
+      "pattern": "PBBTT",
+      "sample": 5691,
+      "next_player_count": 2612,
+      "next_banker_count": 3079,
+      "next_player_rate": 0.45897,
+      "next_banker_rate": 0.54103,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPBB": {
+      "window": 5,
+      "pattern": "PBPBB",
+      "sample": 6048,
+      "next_player_count": 3185,
+      "next_banker_count": 2863,
+      "next_player_rate": 0.52662,
+      "next_banker_rate": 0.47338,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPBP": {
+      "window": 5,
+      "pattern": "PBPBP",
+      "sample": 7491,
+      "next_player_count": 3281,
+      "next_banker_count": 4210,
+      "next_player_rate": 0.437992,
+      "next_banker_rate": 0.562008,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPBT": {
+      "window": 5,
+      "pattern": "PBPBT",
+      "sample": 8696,
+      "next_player_count": 4403,
+      "next_banker_count": 4293,
+      "next_player_rate": 0.506325,
+      "next_banker_rate": 0.493675,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPPB": {
+      "window": 5,
+      "pattern": "PBPPB",
+      "sample": 6063,
+      "next_player_count": 2963,
+      "next_banker_count": 3100,
+      "next_player_rate": 0.488702,
+      "next_banker_rate": 0.511298,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPPP": {
+      "window": 5,
+      "pattern": "PBPPP",
+      "sample": 7075,
+      "next_player_count": 2899,
+      "next_banker_count": 4176,
+      "next_player_rate": 0.409753,
+      "next_banker_rate": 0.590247,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPPT": {
+      "window": 5,
+      "pattern": "PBPPT",
+      "sample": 5880,
+      "next_player_count": 3031,
+      "next_banker_count": 2849,
+      "next_player_rate": 0.515476,
+      "next_banker_rate": 0.484524,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPTB": {
+      "window": 5,
+      "pattern": "PBPTB",
+      "sample": 7649,
+      "next_player_count": 3966,
+      "next_banker_count": 3683,
+      "next_player_rate": 0.518499,
+      "next_banker_rate": 0.481501,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPTP": {
+      "window": 5,
+      "pattern": "PBPTP",
+      "sample": 7192,
+      "next_player_count": 3631,
+      "next_banker_count": 3561,
+      "next_player_rate": 0.504867,
+      "next_banker_rate": 0.495133,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBPTT": {
+      "window": 5,
+      "pattern": "PBPTT",
+      "sample": 9410,
+      "next_player_count": 4807,
+      "next_banker_count": 4603,
+      "next_player_rate": 0.51084,
+      "next_banker_rate": 0.48916,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTBB": {
+      "window": 5,
+      "pattern": "PBTBB",
+      "sample": 6264,
+      "next_player_count": 3236,
+      "next_banker_count": 3028,
+      "next_player_rate": 0.516603,
+      "next_banker_rate": 0.483397,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTBP": {
+      "window": 5,
+      "pattern": "PBTBP",
+      "sample": 7556,
+      "next_player_count": 3442,
+      "next_banker_count": 4114,
+      "next_player_rate": 0.455532,
+      "next_banker_rate": 0.544468,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTBT": {
+      "window": 5,
+      "pattern": "PBTBT",
+      "sample": 9100,
+      "next_player_count": 4179,
+      "next_banker_count": 4921,
+      "next_player_rate": 0.459231,
+      "next_banker_rate": 0.540769,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTPB": {
+      "window": 5,
+      "pattern": "PBTPB",
+      "sample": 8343,
+      "next_player_count": 4241,
+      "next_banker_count": 4102,
+      "next_player_rate": 0.50833,
+      "next_banker_rate": 0.49167,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTPP": {
+      "window": 5,
+      "pattern": "PBTPP",
+      "sample": 5610,
+      "next_player_count": 2367,
+      "next_banker_count": 3243,
+      "next_player_rate": 0.421925,
+      "next_banker_rate": 0.578075,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTPT": {
+      "window": 5,
+      "pattern": "PBTPT",
+      "sample": 7106,
+      "next_player_count": 3749,
+      "next_banker_count": 3357,
+      "next_player_rate": 0.527582,
+      "next_banker_rate": 0.472418,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTTB": {
+      "window": 5,
+      "pattern": "PBTTB",
+      "sample": 8362,
+      "next_player_count": 4383,
+      "next_banker_count": 3979,
+      "next_player_rate": 0.524157,
+      "next_banker_rate": 0.475843,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTTP": {
+      "window": 5,
+      "pattern": "PBTTP",
+      "sample": 6623,
+      "next_player_count": 3258,
+      "next_banker_count": 3365,
+      "next_player_rate": 0.491922,
+      "next_banker_rate": 0.508078,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PBTTT": {
+      "window": 5,
+      "pattern": "PBTTT",
+      "sample": 8366,
+      "next_player_count": 3956,
+      "next_banker_count": 4410,
+      "next_player_rate": 0.472866,
+      "next_banker_rate": 0.527134,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBBB": {
+      "window": 5,
+      "pattern": "PPBBB",
+      "sample": 6814,
+      "next_player_count": 3805,
+      "next_banker_count": 3009,
+      "next_player_rate": 0.558409,
+      "next_banker_rate": 0.441591,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBBP": {
+      "window": 5,
+      "pattern": "PPBBP",
+      "sample": 7281,
+      "next_player_count": 3414,
+      "next_banker_count": 3867,
+      "next_player_rate": 0.468892,
+      "next_banker_rate": 0.531108,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBBT": {
+      "window": 5,
+      "pattern": "PPBBT",
+      "sample": 7200,
+      "next_player_count": 3584,
+      "next_banker_count": 3616,
+      "next_player_rate": 0.497778,
+      "next_banker_rate": 0.502222,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBPB": {
+      "window": 5,
+      "pattern": "PPBPB",
+      "sample": 5568,
+      "next_player_count": 2597,
+      "next_banker_count": 2971,
+      "next_player_rate": 0.466415,
+      "next_banker_rate": 0.533585,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBPP": {
+      "window": 5,
+      "pattern": "PPBPP",
+      "sample": 6246,
+      "next_player_count": 2733,
+      "next_banker_count": 3513,
+      "next_player_rate": 0.43756,
+      "next_banker_rate": 0.56244,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBPT": {
+      "window": 5,
+      "pattern": "PPBPT",
+      "sample": 7189,
+      "next_player_count": 3998,
+      "next_banker_count": 3191,
+      "next_player_rate": 0.556127,
+      "next_banker_rate": 0.443873,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBTB": {
+      "window": 5,
+      "pattern": "PPBTB",
+      "sample": 5792,
+      "next_player_count": 3149,
+      "next_banker_count": 2643,
+      "next_player_rate": 0.543681,
+      "next_banker_rate": 0.456319,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBTP": {
+      "window": 5,
+      "pattern": "PPBTP",
+      "sample": 5530,
+      "next_player_count": 2962,
+      "next_banker_count": 2568,
+      "next_player_rate": 0.535624,
+      "next_banker_rate": 0.464376,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPBTT": {
+      "window": 5,
+      "pattern": "PPBTT",
+      "sample": 6664,
+      "next_player_count": 3151,
+      "next_banker_count": 3513,
+      "next_player_rate": 0.472839,
+      "next_banker_rate": 0.527161,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPBB": {
+      "window": 5,
+      "pattern": "PPPBB",
+      "sample": 5369,
+      "next_player_count": 2551,
+      "next_banker_count": 2818,
+      "next_player_rate": 0.475135,
+      "next_banker_rate": 0.524865,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPBP": {
+      "window": 5,
+      "pattern": "PPPBP",
+      "sample": 6463,
+      "next_player_count": 2824,
+      "next_banker_count": 3639,
+      "next_player_rate": 0.436949,
+      "next_banker_rate": 0.563051,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPBT": {
+      "window": 5,
+      "pattern": "PPPBT",
+      "sample": 6718,
+      "next_player_count": 3298,
+      "next_banker_count": 3420,
+      "next_player_rate": 0.49092,
+      "next_banker_rate": 0.50908,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPPB": {
+      "window": 5,
+      "pattern": "PPPPB",
+      "sample": 6380,
+      "next_player_count": 2909,
+      "next_banker_count": 3471,
+      "next_player_rate": 0.455956,
+      "next_banker_rate": 0.544044,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPPP": {
+      "window": 5,
+      "pattern": "PPPPP",
+      "sample": 11685,
+      "next_player_count": 5306,
+      "next_banker_count": 6379,
+      "next_player_rate": 0.454086,
+      "next_banker_rate": 0.545914,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPPT": {
+      "window": 5,
+      "pattern": "PPPPT",
+      "sample": 5955,
+      "next_player_count": 2300,
+      "next_banker_count": 3655,
+      "next_player_rate": 0.38623,
+      "next_banker_rate": 0.61377,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPTB": {
+      "window": 5,
+      "pattern": "PPPTB",
+      "sample": 5691,
+      "next_player_count": 3142,
+      "next_banker_count": 2549,
+      "next_player_rate": 0.5521,
+      "next_banker_rate": 0.4479,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPTP": {
+      "window": 5,
+      "pattern": "PPPTP",
+      "sample": 5789,
+      "next_player_count": 2576,
+      "next_banker_count": 3213,
+      "next_player_rate": 0.444982,
+      "next_banker_rate": 0.555018,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPPTT": {
+      "window": 5,
+      "pattern": "PPPTT",
+      "sample": 5383,
+      "next_player_count": 2781,
+      "next_banker_count": 2602,
+      "next_player_rate": 0.516626,
+      "next_banker_rate": 0.483374,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTBB": {
+      "window": 5,
+      "pattern": "PPTBB",
+      "sample": 6582,
+      "next_player_count": 3356,
+      "next_banker_count": 3226,
+      "next_player_rate": 0.509875,
+      "next_banker_rate": 0.490125,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTBP": {
+      "window": 5,
+      "pattern": "PPTBP",
+      "sample": 6022,
+      "next_player_count": 2547,
+      "next_banker_count": 3475,
+      "next_player_rate": 0.422949,
+      "next_banker_rate": 0.577051,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTBT": {
+      "window": 5,
+      "pattern": "PPTBT",
+      "sample": 5590,
+      "next_player_count": 2529,
+      "next_banker_count": 3061,
+      "next_player_rate": 0.452415,
+      "next_banker_rate": 0.547585,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTPB": {
+      "window": 5,
+      "pattern": "PPTPB",
+      "sample": 7595,
+      "next_player_count": 3633,
+      "next_banker_count": 3962,
+      "next_player_rate": 0.478341,
+      "next_banker_rate": 0.521659,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTPP": {
+      "window": 5,
+      "pattern": "PPTPP",
+      "sample": 7072,
+      "next_player_count": 2873,
+      "next_banker_count": 4199,
+      "next_player_rate": 0.40625,
+      "next_banker_rate": 0.59375,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTPT": {
+      "window": 5,
+      "pattern": "PPTPT",
+      "sample": 7132,
+      "next_player_count": 3454,
+      "next_banker_count": 3678,
+      "next_player_rate": 0.484296,
+      "next_banker_rate": 0.515704,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTTB": {
+      "window": 5,
+      "pattern": "PPTTB",
+      "sample": 6465,
+      "next_player_count": 3279,
+      "next_banker_count": 3186,
+      "next_player_rate": 0.507193,
+      "next_banker_rate": 0.492807,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTTP": {
+      "window": 5,
+      "pattern": "PPTTP",
+      "sample": 6818,
+      "next_player_count": 3027,
+      "next_banker_count": 3791,
+      "next_player_rate": 0.443972,
+      "next_banker_rate": 0.556028,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PPTTT": {
+      "window": 5,
+      "pattern": "PPTTT",
+      "sample": 6765,
+      "next_player_count": 3273,
+      "next_banker_count": 3492,
+      "next_player_rate": 0.483814,
+      "next_banker_rate": 0.516186,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBBB": {
+      "window": 5,
+      "pattern": "PTBBB",
+      "sample": 6790,
+      "next_player_count": 3658,
+      "next_banker_count": 3132,
+      "next_player_rate": 0.538733,
+      "next_banker_rate": 0.461267,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBBP": {
+      "window": 5,
+      "pattern": "PTBBP",
+      "sample": 6145,
+      "next_player_count": 3115,
+      "next_banker_count": 3030,
+      "next_player_rate": 0.506916,
+      "next_banker_rate": 0.493084,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBBT": {
+      "window": 5,
+      "pattern": "PTBBT",
+      "sample": 6634,
+      "next_player_count": 2935,
+      "next_banker_count": 3699,
+      "next_player_rate": 0.442418,
+      "next_banker_rate": 0.557582,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBPB": {
+      "window": 5,
+      "pattern": "PTBPB",
+      "sample": 8427,
+      "next_player_count": 4682,
+      "next_banker_count": 3745,
+      "next_player_rate": 0.555595,
+      "next_banker_rate": 0.444405,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBPP": {
+      "window": 5,
+      "pattern": "PTBPP",
+      "sample": 5622,
+      "next_player_count": 2531,
+      "next_banker_count": 3091,
+      "next_player_rate": 0.450196,
+      "next_banker_rate": 0.549804,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBPT": {
+      "window": 5,
+      "pattern": "PTBPT",
+      "sample": 7586,
+      "next_player_count": 3671,
+      "next_banker_count": 3915,
+      "next_player_rate": 0.483918,
+      "next_banker_rate": 0.516082,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBTB": {
+      "window": 5,
+      "pattern": "PTBTB",
+      "sample": 7690,
+      "next_player_count": 4024,
+      "next_banker_count": 3666,
+      "next_player_rate": 0.523277,
+      "next_banker_rate": 0.476723,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBTP": {
+      "window": 5,
+      "pattern": "PTBTP",
+      "sample": 6946,
+      "next_player_count": 3075,
+      "next_banker_count": 3871,
+      "next_player_rate": 0.442701,
+      "next_banker_rate": 0.557299,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTBTT": {
+      "window": 5,
+      "pattern": "PTBTT",
+      "sample": 8743,
+      "next_player_count": 4165,
+      "next_banker_count": 4578,
+      "next_player_rate": 0.476381,
+      "next_banker_rate": 0.523619,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPBB": {
+      "window": 5,
+      "pattern": "PTPBB",
+      "sample": 7449,
+      "next_player_count": 3962,
+      "next_banker_count": 3487,
+      "next_player_rate": 0.531883,
+      "next_banker_rate": 0.468117,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPBP": {
+      "window": 5,
+      "pattern": "PTPBP",
+      "sample": 9359,
+      "next_player_count": 4216,
+      "next_banker_count": 5143,
+      "next_player_rate": 0.450475,
+      "next_banker_rate": 0.549525,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPBT": {
+      "window": 5,
+      "pattern": "PTPBT",
+      "sample": 7958,
+      "next_player_count": 4150,
+      "next_banker_count": 3808,
+      "next_player_rate": 0.521488,
+      "next_banker_rate": 0.478512,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPPB": {
+      "window": 5,
+      "pattern": "PTPPB",
+      "sample": 6083,
+      "next_player_count": 2921,
+      "next_banker_count": 3162,
+      "next_player_rate": 0.480191,
+      "next_banker_rate": 0.519809,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPPP": {
+      "window": 5,
+      "pattern": "PTPPP",
+      "sample": 6157,
+      "next_player_count": 2764,
+      "next_banker_count": 3393,
+      "next_player_rate": 0.44892,
+      "next_banker_rate": 0.55108,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPPT": {
+      "window": 5,
+      "pattern": "PTPPT",
+      "sample": 5356,
+      "next_player_count": 2459,
+      "next_banker_count": 2897,
+      "next_player_rate": 0.459111,
+      "next_banker_rate": 0.540889,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPTB": {
+      "window": 5,
+      "pattern": "PTPTB",
+      "sample": 8424,
+      "next_player_count": 4358,
+      "next_banker_count": 4066,
+      "next_player_rate": 0.517331,
+      "next_banker_rate": 0.482669,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPTP": {
+      "window": 5,
+      "pattern": "PTPTP",
+      "sample": 7913,
+      "next_player_count": 3971,
+      "next_banker_count": 3942,
+      "next_player_rate": 0.501832,
+      "next_banker_rate": 0.498168,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTPTT": {
+      "window": 5,
+      "pattern": "PTPTT",
+      "sample": 9007,
+      "next_player_count": 4323,
+      "next_banker_count": 4684,
+      "next_player_rate": 0.47996,
+      "next_banker_rate": 0.52004,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTBB": {
+      "window": 5,
+      "pattern": "PTTBB",
+      "sample": 6190,
+      "next_player_count": 3218,
+      "next_banker_count": 2972,
+      "next_player_rate": 0.519871,
+      "next_banker_rate": 0.480129,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTBP": {
+      "window": 5,
+      "pattern": "PTTBP",
+      "sample": 9353,
+      "next_player_count": 4094,
+      "next_banker_count": 5259,
+      "next_player_rate": 0.437721,
+      "next_banker_rate": 0.562279,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTBT": {
+      "window": 5,
+      "pattern": "PTTBT",
+      "sample": 8247,
+      "next_player_count": 4250,
+      "next_banker_count": 3997,
+      "next_player_rate": 0.515339,
+      "next_banker_rate": 0.484661,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTPB": {
+      "window": 5,
+      "pattern": "PTTPB",
+      "sample": 9190,
+      "next_player_count": 4194,
+      "next_banker_count": 4996,
+      "next_player_rate": 0.456366,
+      "next_banker_rate": 0.543634,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTPP": {
+      "window": 5,
+      "pattern": "PTTPP",
+      "sample": 5701,
+      "next_player_count": 2338,
+      "next_banker_count": 3363,
+      "next_player_rate": 0.410103,
+      "next_banker_rate": 0.589897,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTPT": {
+      "window": 5,
+      "pattern": "PTTPT",
+      "sample": 7732,
+      "next_player_count": 4040,
+      "next_banker_count": 3692,
+      "next_player_rate": 0.522504,
+      "next_banker_rate": 0.477496,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTTB": {
+      "window": 5,
+      "pattern": "PTTTB",
+      "sample": 9278,
+      "next_player_count": 4638,
+      "next_banker_count": 4640,
+      "next_player_rate": 0.499892,
+      "next_banker_rate": 0.500108,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTTP": {
+      "window": 5,
+      "pattern": "PTTTP",
+      "sample": 7228,
+      "next_player_count": 3705,
+      "next_banker_count": 3523,
+      "next_player_rate": 0.51259,
+      "next_banker_rate": 0.48741,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:PTTTT": {
+      "window": 5,
+      "pattern": "PTTTT",
+      "sample": 7751,
+      "next_player_count": 3588,
+      "next_banker_count": 4163,
+      "next_player_rate": 0.462908,
+      "next_banker_rate": 0.537092,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBBB": {
+      "window": 5,
+      "pattern": "TBBBB",
+      "sample": 5602,
+      "next_player_count": 3399,
+      "next_banker_count": 2203,
+      "next_player_rate": 0.606748,
+      "next_banker_rate": 0.393252,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBBP": {
+      "window": 5,
+      "pattern": "TBBBP",
+      "sample": 5875,
+      "next_player_count": 3117,
+      "next_banker_count": 2758,
+      "next_player_rate": 0.530553,
+      "next_banker_rate": 0.469447,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBBT": {
+      "window": 5,
+      "pattern": "TBBBT",
+      "sample": 7421,
+      "next_player_count": 3611,
+      "next_banker_count": 3810,
+      "next_player_rate": 0.486592,
+      "next_banker_rate": 0.513408,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBPB": {
+      "window": 5,
+      "pattern": "TBBPB",
+      "sample": 6499,
+      "next_player_count": 3330,
+      "next_banker_count": 3169,
+      "next_player_rate": 0.512387,
+      "next_banker_rate": 0.487613,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBPP": {
+      "window": 5,
+      "pattern": "TBBPP",
+      "sample": 6232,
+      "next_player_count": 2947,
+      "next_banker_count": 3285,
+      "next_player_rate": 0.472882,
+      "next_banker_rate": 0.527118,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBPT": {
+      "window": 5,
+      "pattern": "TBBPT",
+      "sample": 6258,
+      "next_player_count": 2819,
+      "next_banker_count": 3439,
+      "next_player_rate": 0.450463,
+      "next_banker_rate": 0.549537,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBTB": {
+      "window": 5,
+      "pattern": "TBBTB",
+      "sample": 7004,
+      "next_player_count": 3623,
+      "next_banker_count": 3381,
+      "next_player_rate": 0.517276,
+      "next_banker_rate": 0.482724,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBTP": {
+      "window": 5,
+      "pattern": "TBBTP",
+      "sample": 6236,
+      "next_player_count": 3107,
+      "next_banker_count": 3129,
+      "next_player_rate": 0.498236,
+      "next_banker_rate": 0.501764,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBBTT": {
+      "window": 5,
+      "pattern": "TBBTT",
+      "sample": 5826,
+      "next_player_count": 2927,
+      "next_banker_count": 2899,
+      "next_player_rate": 0.502403,
+      "next_banker_rate": 0.497597,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPBB": {
+      "window": 5,
+      "pattern": "TBPBB",
+      "sample": 5985,
+      "next_player_count": 3326,
+      "next_banker_count": 2659,
+      "next_player_rate": 0.555723,
+      "next_banker_rate": 0.444277,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPBP": {
+      "window": 5,
+      "pattern": "TBPBP",
+      "sample": 7711,
+      "next_player_count": 3304,
+      "next_banker_count": 4407,
+      "next_player_rate": 0.428479,
+      "next_banker_rate": 0.571521,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPBT": {
+      "window": 5,
+      "pattern": "TBPBT",
+      "sample": 7919,
+      "next_player_count": 4186,
+      "next_banker_count": 3733,
+      "next_player_rate": 0.528602,
+      "next_banker_rate": 0.471398,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPPB": {
+      "window": 5,
+      "pattern": "TBPPB",
+      "sample": 6431,
+      "next_player_count": 3218,
+      "next_banker_count": 3213,
+      "next_player_rate": 0.500389,
+      "next_banker_rate": 0.499611,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPPP": {
+      "window": 5,
+      "pattern": "TBPPP",
+      "sample": 5734,
+      "next_player_count": 2400,
+      "next_banker_count": 3334,
+      "next_player_rate": 0.418556,
+      "next_banker_rate": 0.581444,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPPT": {
+      "window": 5,
+      "pattern": "TBPPT",
+      "sample": 6431,
+      "next_player_count": 3196,
+      "next_banker_count": 3235,
+      "next_player_rate": 0.496968,
+      "next_banker_rate": 0.503032,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPTB": {
+      "window": 5,
+      "pattern": "TBPTB",
+      "sample": 7737,
+      "next_player_count": 3933,
+      "next_banker_count": 3804,
+      "next_player_rate": 0.508337,
+      "next_banker_rate": 0.491663,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPTP": {
+      "window": 5,
+      "pattern": "TBPTP",
+      "sample": 8927,
+      "next_player_count": 4187,
+      "next_banker_count": 4740,
+      "next_player_rate": 0.469027,
+      "next_banker_rate": 0.530973,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBPTT": {
+      "window": 5,
+      "pattern": "TBPTT",
+      "sample": 8192,
+      "next_player_count": 4039,
+      "next_banker_count": 4153,
+      "next_player_rate": 0.493042,
+      "next_banker_rate": 0.506958,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTBB": {
+      "window": 5,
+      "pattern": "TBTBB",
+      "sample": 7222,
+      "next_player_count": 4091,
+      "next_banker_count": 3131,
+      "next_player_rate": 0.566464,
+      "next_banker_rate": 0.433536,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTBP": {
+      "window": 5,
+      "pattern": "TBTBP",
+      "sample": 6610,
+      "next_player_count": 2906,
+      "next_banker_count": 3704,
+      "next_player_rate": 0.439637,
+      "next_banker_rate": 0.560363,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTBT": {
+      "window": 5,
+      "pattern": "TBTBT",
+      "sample": 9299,
+      "next_player_count": 4121,
+      "next_banker_count": 5178,
+      "next_player_rate": 0.443166,
+      "next_banker_rate": 0.556834,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTPB": {
+      "window": 5,
+      "pattern": "TBTPB",
+      "sample": 8423,
+      "next_player_count": 4842,
+      "next_banker_count": 3581,
+      "next_player_rate": 0.574855,
+      "next_banker_rate": 0.425145,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTPP": {
+      "window": 5,
+      "pattern": "TBTPP",
+      "sample": 7258,
+      "next_player_count": 3414,
+      "next_banker_count": 3844,
+      "next_player_rate": 0.470378,
+      "next_banker_rate": 0.529622,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTPT": {
+      "window": 5,
+      "pattern": "TBTPT",
+      "sample": 8774,
+      "next_player_count": 4600,
+      "next_banker_count": 4174,
+      "next_player_rate": 0.524276,
+      "next_banker_rate": 0.475724,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTTB": {
+      "window": 5,
+      "pattern": "TBTTB",
+      "sample": 8524,
+      "next_player_count": 3875,
+      "next_banker_count": 4649,
+      "next_player_rate": 0.454599,
+      "next_banker_rate": 0.545401,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTTP": {
+      "window": 5,
+      "pattern": "TBTTP",
+      "sample": 6776,
+      "next_player_count": 3570,
+      "next_banker_count": 3206,
+      "next_player_rate": 0.52686,
+      "next_banker_rate": 0.47314,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TBTTT": {
+      "window": 5,
+      "pattern": "TBTTT",
+      "sample": 8883,
+      "next_player_count": 4599,
+      "next_banker_count": 4284,
+      "next_player_rate": 0.51773,
+      "next_banker_rate": 0.48227,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBBB": {
+      "window": 5,
+      "pattern": "TPBBB",
+      "sample": 6055,
+      "next_player_count": 3134,
+      "next_banker_count": 2921,
+      "next_player_rate": 0.517589,
+      "next_banker_rate": 0.482411,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBBP": {
+      "window": 5,
+      "pattern": "TPBBP",
+      "sample": 7435,
+      "next_player_count": 3337,
+      "next_banker_count": 4098,
+      "next_player_rate": 0.448823,
+      "next_banker_rate": 0.551177,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBBT": {
+      "window": 5,
+      "pattern": "TPBBT",
+      "sample": 6661,
+      "next_player_count": 3311,
+      "next_banker_count": 3350,
+      "next_player_rate": 0.497073,
+      "next_banker_rate": 0.502927,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBPB": {
+      "window": 5,
+      "pattern": "TPBPB",
+      "sample": 8836,
+      "next_player_count": 4952,
+      "next_banker_count": 3884,
+      "next_player_rate": 0.560435,
+      "next_banker_rate": 0.439565,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBPP": {
+      "window": 5,
+      "pattern": "TPBPP",
+      "sample": 6221,
+      "next_player_count": 2659,
+      "next_banker_count": 3562,
+      "next_player_rate": 0.427423,
+      "next_banker_rate": 0.572577,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBPT": {
+      "window": 5,
+      "pattern": "TPBPT",
+      "sample": 7707,
+      "next_player_count": 3928,
+      "next_banker_count": 3779,
+      "next_player_rate": 0.509667,
+      "next_banker_rate": 0.490333,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBTB": {
+      "window": 5,
+      "pattern": "TPBTB",
+      "sample": 8919,
+      "next_player_count": 4103,
+      "next_banker_count": 4816,
+      "next_player_rate": 0.460029,
+      "next_banker_rate": 0.539971,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBTP": {
+      "window": 5,
+      "pattern": "TPBTP",
+      "sample": 7186,
+      "next_player_count": 3435,
+      "next_banker_count": 3751,
+      "next_player_rate": 0.478013,
+      "next_banker_rate": 0.521987,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPBTT": {
+      "window": 5,
+      "pattern": "TPBTT",
+      "sample": 7785,
+      "next_player_count": 3932,
+      "next_banker_count": 3853,
+      "next_player_rate": 0.505074,
+      "next_banker_rate": 0.494926,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPBB": {
+      "window": 5,
+      "pattern": "TPPBB",
+      "sample": 6405,
+      "next_player_count": 3243,
+      "next_banker_count": 3162,
+      "next_player_rate": 0.506323,
+      "next_banker_rate": 0.493677,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPBP": {
+      "window": 5,
+      "pattern": "TPPBP",
+      "sample": 5282,
+      "next_player_count": 2443,
+      "next_banker_count": 2839,
+      "next_player_rate": 0.462514,
+      "next_banker_rate": 0.537486,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPBT": {
+      "window": 5,
+      "pattern": "TPPBT",
+      "sample": 5492,
+      "next_player_count": 2598,
+      "next_banker_count": 2894,
+      "next_player_rate": 0.473052,
+      "next_banker_rate": 0.526948,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPPB": {
+      "window": 5,
+      "pattern": "TPPPB",
+      "sample": 6388,
+      "next_player_count": 3317,
+      "next_banker_count": 3071,
+      "next_player_rate": 0.519255,
+      "next_banker_rate": 0.480745,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPPP": {
+      "window": 5,
+      "pattern": "TPPPP",
+      "sample": 7586,
+      "next_player_count": 3276,
+      "next_banker_count": 4310,
+      "next_player_rate": 0.431848,
+      "next_banker_rate": 0.568152,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPPT": {
+      "window": 5,
+      "pattern": "TPPPT",
+      "sample": 5971,
+      "next_player_count": 3124,
+      "next_banker_count": 2847,
+      "next_player_rate": 0.523195,
+      "next_banker_rate": 0.476805,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPTB": {
+      "window": 5,
+      "pattern": "TPPTB",
+      "sample": 6917,
+      "next_player_count": 3198,
+      "next_banker_count": 3719,
+      "next_player_rate": 0.462339,
+      "next_banker_rate": 0.537661,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPTP": {
+      "window": 5,
+      "pattern": "TPPTP",
+      "sample": 6269,
+      "next_player_count": 3131,
+      "next_banker_count": 3138,
+      "next_player_rate": 0.499442,
+      "next_banker_rate": 0.500558,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPPTT": {
+      "window": 5,
+      "pattern": "TPPTT",
+      "sample": 6999,
+      "next_player_count": 3163,
+      "next_banker_count": 3836,
+      "next_player_rate": 0.451922,
+      "next_banker_rate": 0.548078,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTBB": {
+      "window": 5,
+      "pattern": "TPTBB",
+      "sample": 7509,
+      "next_player_count": 3985,
+      "next_banker_count": 3524,
+      "next_player_rate": 0.530696,
+      "next_banker_rate": 0.469304,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTBP": {
+      "window": 5,
+      "pattern": "TPTBP",
+      "sample": 7041,
+      "next_player_count": 3165,
+      "next_banker_count": 3876,
+      "next_player_rate": 0.44951,
+      "next_banker_rate": 0.55049,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTBT": {
+      "window": 5,
+      "pattern": "TPTBT",
+      "sample": 6933,
+      "next_player_count": 3019,
+      "next_banker_count": 3914,
+      "next_player_rate": 0.435454,
+      "next_banker_rate": 0.564546,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTPB": {
+      "window": 5,
+      "pattern": "TPTPB",
+      "sample": 8924,
+      "next_player_count": 4376,
+      "next_banker_count": 4548,
+      "next_player_rate": 0.490363,
+      "next_banker_rate": 0.509637,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTPP": {
+      "window": 5,
+      "pattern": "TPTPP",
+      "sample": 6814,
+      "next_player_count": 2807,
+      "next_banker_count": 4007,
+      "next_player_rate": 0.411946,
+      "next_banker_rate": 0.588054,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTPT": {
+      "window": 5,
+      "pattern": "TPTPT",
+      "sample": 9384,
+      "next_player_count": 4492,
+      "next_banker_count": 4892,
+      "next_player_rate": 0.478687,
+      "next_banker_rate": 0.521313,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTTB": {
+      "window": 5,
+      "pattern": "TPTTB",
+      "sample": 7932,
+      "next_player_count": 3633,
+      "next_banker_count": 4299,
+      "next_player_rate": 0.458018,
+      "next_banker_rate": 0.541982,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTTP": {
+      "window": 5,
+      "pattern": "TPTTP",
+      "sample": 6646,
+      "next_player_count": 3579,
+      "next_banker_count": 3067,
+      "next_player_rate": 0.538519,
+      "next_banker_rate": 0.461481,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TPTTT": {
+      "window": 5,
+      "pattern": "TPTTT",
+      "sample": 7543,
+      "next_player_count": 3865,
+      "next_banker_count": 3678,
+      "next_player_rate": 0.512396,
+      "next_banker_rate": 0.487604,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBBB": {
+      "window": 5,
+      "pattern": "TTBBB",
+      "sample": 6821,
+      "next_player_count": 3760,
+      "next_banker_count": 3061,
+      "next_player_rate": 0.551239,
+      "next_banker_rate": 0.448761,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBBP": {
+      "window": 5,
+      "pattern": "TTBBP",
+      "sample": 6726,
+      "next_player_count": 3125,
+      "next_banker_count": 3601,
+      "next_player_rate": 0.464615,
+      "next_banker_rate": 0.535385,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBBT": {
+      "window": 5,
+      "pattern": "TTBBT",
+      "sample": 5891,
+      "next_player_count": 2891,
+      "next_banker_count": 3000,
+      "next_player_rate": 0.490749,
+      "next_banker_rate": 0.509251,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBPB": {
+      "window": 5,
+      "pattern": "TTBPB",
+      "sample": 6732,
+      "next_player_count": 3623,
+      "next_banker_count": 3109,
+      "next_player_rate": 0.538176,
+      "next_banker_rate": 0.461824,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBPP": {
+      "window": 5,
+      "pattern": "TTBPP",
+      "sample": 6148,
+      "next_player_count": 2709,
+      "next_banker_count": 3439,
+      "next_player_rate": 0.440631,
+      "next_banker_rate": 0.559369,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBPT": {
+      "window": 5,
+      "pattern": "TTBPT",
+      "sample": 8585,
+      "next_player_count": 4355,
+      "next_banker_count": 4230,
+      "next_player_rate": 0.50728,
+      "next_banker_rate": 0.49272,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBTB": {
+      "window": 5,
+      "pattern": "TTBTB",
+      "sample": 7918,
+      "next_player_count": 4062,
+      "next_banker_count": 3856,
+      "next_player_rate": 0.513008,
+      "next_banker_rate": 0.486992,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBTP": {
+      "window": 5,
+      "pattern": "TTBTP",
+      "sample": 8650,
+      "next_player_count": 4454,
+      "next_banker_count": 4196,
+      "next_player_rate": 0.514913,
+      "next_banker_rate": 0.485087,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTBTT": {
+      "window": 5,
+      "pattern": "TTBTT",
+      "sample": 7429,
+      "next_player_count": 3697,
+      "next_banker_count": 3732,
+      "next_player_rate": 0.497644,
+      "next_banker_rate": 0.502356,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPBB": {
+      "window": 5,
+      "pattern": "TTPBB",
+      "sample": 6287,
+      "next_player_count": 3490,
+      "next_banker_count": 2797,
+      "next_player_rate": 0.555114,
+      "next_banker_rate": 0.444886,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPBP": {
+      "window": 5,
+      "pattern": "TTPBP",
+      "sample": 6711,
+      "next_player_count": 3306,
+      "next_banker_count": 3405,
+      "next_player_rate": 0.492624,
+      "next_banker_rate": 0.507376,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPBT": {
+      "window": 5,
+      "pattern": "TTPBT",
+      "sample": 8589,
+      "next_player_count": 4138,
+      "next_banker_count": 4451,
+      "next_player_rate": 0.481779,
+      "next_banker_rate": 0.518221,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPPB": {
+      "window": 5,
+      "pattern": "TTPPB",
+      "sample": 6164,
+      "next_player_count": 3239,
+      "next_banker_count": 2925,
+      "next_player_rate": 0.52547,
+      "next_banker_rate": 0.47453,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPPP": {
+      "window": 5,
+      "pattern": "TTPPP",
+      "sample": 7062,
+      "next_player_count": 3153,
+      "next_banker_count": 3909,
+      "next_player_rate": 0.446474,
+      "next_banker_rate": 0.553526,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPPT": {
+      "window": 5,
+      "pattern": "TTPPT",
+      "sample": 6347,
+      "next_player_count": 3276,
+      "next_banker_count": 3071,
+      "next_player_rate": 0.516149,
+      "next_banker_rate": 0.483851,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPTB": {
+      "window": 5,
+      "pattern": "TTPTB",
+      "sample": 8544,
+      "next_player_count": 4457,
+      "next_banker_count": 4087,
+      "next_player_rate": 0.521653,
+      "next_banker_rate": 0.478347,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPTP": {
+      "window": 5,
+      "pattern": "TTPTP",
+      "sample": 8550,
+      "next_player_count": 3762,
+      "next_banker_count": 4788,
+      "next_player_rate": 0.44,
+      "next_banker_rate": 0.56,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTPTT": {
+      "window": 5,
+      "pattern": "TTPTT",
+      "sample": 8215,
+      "next_player_count": 4107,
+      "next_banker_count": 4108,
+      "next_player_rate": 0.499939,
+      "next_banker_rate": 0.500061,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTBB": {
+      "window": 5,
+      "pattern": "TTTBB",
+      "sample": 6507,
+      "next_player_count": 3677,
+      "next_banker_count": 2830,
+      "next_player_rate": 0.565084,
+      "next_banker_rate": 0.434916,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTBP": {
+      "window": 5,
+      "pattern": "TTTBP",
+      "sample": 9186,
+      "next_player_count": 4183,
+      "next_banker_count": 5003,
+      "next_player_rate": 0.455367,
+      "next_banker_rate": 0.544633,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTBT": {
+      "window": 5,
+      "pattern": "TTTBT",
+      "sample": 8534,
+      "next_player_count": 4304,
+      "next_banker_count": 4230,
+      "next_player_rate": 0.504336,
+      "next_banker_rate": 0.495664,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTPB": {
+      "window": 5,
+      "pattern": "TTTPB",
+      "sample": 9308,
+      "next_player_count": 4655,
+      "next_banker_count": 4653,
+      "next_player_rate": 0.500107,
+      "next_banker_rate": 0.499893,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTPP": {
+      "window": 5,
+      "pattern": "TTTPP",
+      "sample": 6197,
+      "next_player_count": 2828,
+      "next_banker_count": 3369,
+      "next_player_rate": 0.45635,
+      "next_banker_rate": 0.54365,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTPT": {
+      "window": 5,
+      "pattern": "TTTPT",
+      "sample": 7468,
+      "next_player_count": 3612,
+      "next_banker_count": 3856,
+      "next_player_rate": 0.483664,
+      "next_banker_rate": 0.516336,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTTB": {
+      "window": 5,
+      "pattern": "TTTTB",
+      "sample": 9008,
+      "next_player_count": 4258,
+      "next_banker_count": 4750,
+      "next_player_rate": 0.472691,
+      "next_banker_rate": 0.527309,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTTP": {
+      "window": 5,
+      "pattern": "TTTTP",
+      "sample": 8309,
+      "next_player_count": 4023,
+      "next_banker_count": 4286,
+      "next_player_rate": 0.484174,
+      "next_banker_rate": 0.515826,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W5:TTTTT": {
+      "window": 5,
+      "pattern": "TTTTT",
+      "sample": 7347,
+      "next_player_count": 3626,
+      "next_banker_count": 3721,
+      "next_player_rate": 0.493535,
+      "next_banker_rate": 0.506465,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBBBB": {
+      "window": 7,
+      "pattern": "BBBBBBB",
+      "sample": 16659,
+      "next_player_count": 9626,
+      "next_banker_count": 7033,
+      "next_player_rate": 0.577826,
+      "next_banker_rate": 0.422174,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBBBP": {
+      "window": 7,
+      "pattern": "BBBBBBP",
+      "sample": 7814,
+      "next_player_count": 4129,
+      "next_banker_count": 3685,
+      "next_player_rate": 0.528411,
+      "next_banker_rate": 0.471589,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBBPB": {
+      "window": 7,
+      "pattern": "BBBBBPB",
+      "sample": 9362,
+      "next_player_count": 5534,
+      "next_banker_count": 3828,
+      "next_player_rate": 0.591113,
+      "next_banker_rate": 0.408887,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBBPP": {
+      "window": 7,
+      "pattern": "BBBBBPP",
+      "sample": 8711,
+      "next_player_count": 4196,
+      "next_banker_count": 4515,
+      "next_player_rate": 0.48169,
+      "next_banker_rate": 0.51831,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBPBB": {
+      "window": 7,
+      "pattern": "BBBBPBB",
+      "sample": 8522,
+      "next_player_count": 5085,
+      "next_banker_count": 3437,
+      "next_player_rate": 0.596691,
+      "next_banker_rate": 0.403309,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBPBP": {
+      "window": 7,
+      "pattern": "BBBBPBP",
+      "sample": 7472,
+      "next_player_count": 3590,
+      "next_banker_count": 3882,
+      "next_player_rate": 0.48046,
+      "next_banker_rate": 0.51954,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBPPB": {
+      "window": 7,
+      "pattern": "BBBBPPB",
+      "sample": 7332,
+      "next_player_count": 4173,
+      "next_banker_count": 3159,
+      "next_player_rate": 0.569149,
+      "next_banker_rate": 0.430851,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBBPPP": {
+      "window": 7,
+      "pattern": "BBBBPPP",
+      "sample": 9412,
+      "next_player_count": 4899,
+      "next_banker_count": 4513,
+      "next_player_rate": 0.520506,
+      "next_banker_rate": 0.479494,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPBBB": {
+      "window": 7,
+      "pattern": "BBBPBBB",
+      "sample": 7202,
+      "next_player_count": 4150,
+      "next_banker_count": 3052,
+      "next_player_rate": 0.576229,
+      "next_banker_rate": 0.423771,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPBBP": {
+      "window": 7,
+      "pattern": "BBBPBBP",
+      "sample": 9873,
+      "next_player_count": 5235,
+      "next_banker_count": 4638,
+      "next_player_rate": 0.530234,
+      "next_banker_rate": 0.469766,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPBPB": {
+      "window": 7,
+      "pattern": "BBBPBPB",
+      "sample": 8652,
+      "next_player_count": 4850,
+      "next_banker_count": 3802,
+      "next_player_rate": 0.560564,
+      "next_banker_rate": 0.439436,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPBPP": {
+      "window": 7,
+      "pattern": "BBBPBPP",
+      "sample": 9515,
+      "next_player_count": 4397,
+      "next_banker_count": 5118,
+      "next_player_rate": 0.462112,
+      "next_banker_rate": 0.537888,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPPBB": {
+      "window": 7,
+      "pattern": "BBBPPBB",
+      "sample": 7656,
+      "next_player_count": 4139,
+      "next_banker_count": 3517,
+      "next_player_rate": 0.540622,
+      "next_banker_rate": 0.459378,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPPBP": {
+      "window": 7,
+      "pattern": "BBBPPBP",
+      "sample": 8105,
+      "next_player_count": 3642,
+      "next_banker_count": 4463,
+      "next_player_rate": 0.449352,
+      "next_banker_rate": 0.550648,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPPPB": {
+      "window": 7,
+      "pattern": "BBBPPPB",
+      "sample": 9400,
+      "next_player_count": 5071,
+      "next_banker_count": 4329,
+      "next_player_rate": 0.539468,
+      "next_banker_rate": 0.460532,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBBPPPP": {
+      "window": 7,
+      "pattern": "BBBPPPP",
+      "sample": 9494,
+      "next_player_count": 4626,
+      "next_banker_count": 4868,
+      "next_player_rate": 0.487255,
+      "next_banker_rate": 0.512745,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBBBB": {
+      "window": 7,
+      "pattern": "BBPBBBB",
+      "sample": 8333,
+      "next_player_count": 5053,
+      "next_banker_count": 3280,
+      "next_player_rate": 0.606384,
+      "next_banker_rate": 0.393616,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBBBP": {
+      "window": 7,
+      "pattern": "BBPBBBP",
+      "sample": 9113,
+      "next_player_count": 4638,
+      "next_banker_count": 4475,
+      "next_player_rate": 0.508943,
+      "next_banker_rate": 0.491057,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBBPB": {
+      "window": 7,
+      "pattern": "BBPBBPB",
+      "sample": 9075,
+      "next_player_count": 5052,
+      "next_banker_count": 4023,
+      "next_player_rate": 0.556694,
+      "next_banker_rate": 0.443306,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBBPP": {
+      "window": 7,
+      "pattern": "BBPBBPP",
+      "sample": 10087,
+      "next_player_count": 4721,
+      "next_banker_count": 5366,
+      "next_player_rate": 0.468028,
+      "next_banker_rate": 0.531972,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBPBB": {
+      "window": 7,
+      "pattern": "BBPBPBB",
+      "sample": 10192,
+      "next_player_count": 5678,
+      "next_banker_count": 4514,
+      "next_player_rate": 0.557104,
+      "next_banker_rate": 0.442896,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBPBP": {
+      "window": 7,
+      "pattern": "BBPBPBP",
+      "sample": 7971,
+      "next_player_count": 3610,
+      "next_banker_count": 4361,
+      "next_player_rate": 0.452892,
+      "next_banker_rate": 0.547108,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBPPB": {
+      "window": 7,
+      "pattern": "BBPBPPB",
+      "sample": 9008,
+      "next_player_count": 4429,
+      "next_banker_count": 4579,
+      "next_player_rate": 0.491674,
+      "next_banker_rate": 0.508326,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPBPPP": {
+      "window": 7,
+      "pattern": "BBPBPPP",
+      "sample": 9207,
+      "next_player_count": 4645,
+      "next_banker_count": 4562,
+      "next_player_rate": 0.504507,
+      "next_banker_rate": 0.495493,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPBBB": {
+      "window": 7,
+      "pattern": "BBPPBBB",
+      "sample": 9002,
+      "next_player_count": 4505,
+      "next_banker_count": 4497,
+      "next_player_rate": 0.500444,
+      "next_banker_rate": 0.499556,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPBBP": {
+      "window": 7,
+      "pattern": "BBPPBBP",
+      "sample": 9854,
+      "next_player_count": 4554,
+      "next_banker_count": 5300,
+      "next_player_rate": 0.462147,
+      "next_banker_rate": 0.537853,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPBPB": {
+      "window": 7,
+      "pattern": "BBPPBPB",
+      "sample": 9300,
+      "next_player_count": 5074,
+      "next_banker_count": 4226,
+      "next_player_rate": 0.545591,
+      "next_banker_rate": 0.454409,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPBPP": {
+      "window": 7,
+      "pattern": "BBPPBPP",
+      "sample": 7750,
+      "next_player_count": 3590,
+      "next_banker_count": 4160,
+      "next_player_rate": 0.463226,
+      "next_banker_rate": 0.536774,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPPBB": {
+      "window": 7,
+      "pattern": "BBPPPBB",
+      "sample": 10108,
+      "next_player_count": 5546,
+      "next_banker_count": 4562,
+      "next_player_rate": 0.548674,
+      "next_banker_rate": 0.451326,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPPBP": {
+      "window": 7,
+      "pattern": "BBPPPBP",
+      "sample": 7500,
+      "next_player_count": 3707,
+      "next_banker_count": 3793,
+      "next_player_rate": 0.494267,
+      "next_banker_rate": 0.505733,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPPPB": {
+      "window": 7,
+      "pattern": "BBPPPPB",
+      "sample": 7579,
+      "next_player_count": 3992,
+      "next_banker_count": 3587,
+      "next_player_rate": 0.526719,
+      "next_banker_rate": 0.473281,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BBPPPPP": {
+      "window": 7,
+      "pattern": "BBPPPPP",
+      "sample": 7976,
+      "next_player_count": 3546,
+      "next_banker_count": 4430,
+      "next_player_rate": 0.444584,
+      "next_banker_rate": 0.555416,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBBBB": {
+      "window": 7,
+      "pattern": "BPBBBBB",
+      "sample": 8295,
+      "next_player_count": 4385,
+      "next_banker_count": 3910,
+      "next_player_rate": 0.528632,
+      "next_banker_rate": 0.471368,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBBBP": {
+      "window": 7,
+      "pattern": "BPBBBBP",
+      "sample": 10063,
+      "next_player_count": 5401,
+      "next_banker_count": 4662,
+      "next_player_rate": 0.536719,
+      "next_banker_rate": 0.463281,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBBPB": {
+      "window": 7,
+      "pattern": "BPBBBPB",
+      "sample": 7746,
+      "next_player_count": 3921,
+      "next_banker_count": 3825,
+      "next_player_rate": 0.506197,
+      "next_banker_rate": 0.493803,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBBPP": {
+      "window": 7,
+      "pattern": "BPBBBPP",
+      "sample": 9401,
+      "next_player_count": 4442,
+      "next_banker_count": 4959,
+      "next_player_rate": 0.472503,
+      "next_banker_rate": 0.527497,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBPBB": {
+      "window": 7,
+      "pattern": "BPBBPBB",
+      "sample": 10093,
+      "next_player_count": 5162,
+      "next_banker_count": 4931,
+      "next_player_rate": 0.511444,
+      "next_banker_rate": 0.488556,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBPBP": {
+      "window": 7,
+      "pattern": "BPBBPBP",
+      "sample": 8198,
+      "next_player_count": 3713,
+      "next_banker_count": 4485,
+      "next_player_rate": 0.452915,
+      "next_banker_rate": 0.547085,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBPPB": {
+      "window": 7,
+      "pattern": "BPBBPPB",
+      "sample": 9065,
+      "next_player_count": 4858,
+      "next_banker_count": 4207,
+      "next_player_rate": 0.535907,
+      "next_banker_rate": 0.464093,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBBPPP": {
+      "window": 7,
+      "pattern": "BPBBPPP",
+      "sample": 9718,
+      "next_player_count": 4777,
+      "next_banker_count": 4941,
+      "next_player_rate": 0.491562,
+      "next_banker_rate": 0.508438,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPBBB": {
+      "window": 7,
+      "pattern": "BPBPBBB",
+      "sample": 8517,
+      "next_player_count": 4282,
+      "next_banker_count": 4235,
+      "next_player_rate": 0.502759,
+      "next_banker_rate": 0.497241,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPBBP": {
+      "window": 7,
+      "pattern": "BPBPBBP",
+      "sample": 8446,
+      "next_player_count": 4401,
+      "next_banker_count": 4045,
+      "next_player_rate": 0.521075,
+      "next_banker_rate": 0.478925,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPBPB": {
+      "window": 7,
+      "pattern": "BPBPBPB",
+      "sample": 11696,
+      "next_player_count": 6253,
+      "next_banker_count": 5443,
+      "next_player_rate": 0.534627,
+      "next_banker_rate": 0.465373,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPBPP": {
+      "window": 7,
+      "pattern": "BPBPBPP",
+      "sample": 7684,
+      "next_player_count": 3696,
+      "next_banker_count": 3988,
+      "next_player_rate": 0.480999,
+      "next_banker_rate": 0.519001,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPPBB": {
+      "window": 7,
+      "pattern": "BPBPPBB",
+      "sample": 7924,
+      "next_player_count": 4409,
+      "next_banker_count": 3515,
+      "next_player_rate": 0.556411,
+      "next_banker_rate": 0.443589,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPPBP": {
+      "window": 7,
+      "pattern": "BPBPPBP",
+      "sample": 7509,
+      "next_player_count": 3686,
+      "next_banker_count": 3823,
+      "next_player_rate": 0.490878,
+      "next_banker_rate": 0.509122,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPPPB": {
+      "window": 7,
+      "pattern": "BPBPPPB",
+      "sample": 8508,
+      "next_player_count": 4365,
+      "next_banker_count": 4143,
+      "next_player_rate": 0.513047,
+      "next_banker_rate": 0.486953,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPBPPPP": {
+      "window": 7,
+      "pattern": "BPBPPPP",
+      "sample": 8240,
+      "next_player_count": 3427,
+      "next_banker_count": 4813,
+      "next_player_rate": 0.415898,
+      "next_banker_rate": 0.584102,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBBBB": {
+      "window": 7,
+      "pattern": "BPPBBBB",
+      "sample": 8299,
+      "next_player_count": 4186,
+      "next_banker_count": 4113,
+      "next_player_rate": 0.504398,
+      "next_banker_rate": 0.495602,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBBBP": {
+      "window": 7,
+      "pattern": "BPPBBBP",
+      "sample": 7503,
+      "next_player_count": 3712,
+      "next_banker_count": 3791,
+      "next_player_rate": 0.494735,
+      "next_banker_rate": 0.505265,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBBPB": {
+      "window": 7,
+      "pattern": "BPPBBPB",
+      "sample": 9547,
+      "next_player_count": 5016,
+      "next_banker_count": 4531,
+      "next_player_rate": 0.525401,
+      "next_banker_rate": 0.474599,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBBPP": {
+      "window": 7,
+      "pattern": "BPPBBPP",
+      "sample": 8146,
+      "next_player_count": 3687,
+      "next_banker_count": 4459,
+      "next_player_rate": 0.452615,
+      "next_banker_rate": 0.547385,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBPBB": {
+      "window": 7,
+      "pattern": "BPPBPBB",
+      "sample": 7398,
+      "next_player_count": 3890,
+      "next_banker_count": 3508,
+      "next_player_rate": 0.525818,
+      "next_banker_rate": 0.474182,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBPBP": {
+      "window": 7,
+      "pattern": "BPPBPBP",
+      "sample": 8555,
+      "next_player_count": 3666,
+      "next_banker_count": 4889,
+      "next_player_rate": 0.428521,
+      "next_banker_rate": 0.571479,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBPPB": {
+      "window": 7,
+      "pattern": "BPPBPPB",
+      "sample": 8892,
+      "next_player_count": 4321,
+      "next_banker_count": 4571,
+      "next_player_rate": 0.485942,
+      "next_banker_rate": 0.514058,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPBPPP": {
+      "window": 7,
+      "pattern": "BPPBPPP",
+      "sample": 7971,
+      "next_player_count": 3857,
+      "next_banker_count": 4114,
+      "next_player_rate": 0.483879,
+      "next_banker_rate": 0.516121,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPBBB": {
+      "window": 7,
+      "pattern": "BPPPBBB",
+      "sample": 8087,
+      "next_player_count": 4415,
+      "next_banker_count": 3672,
+      "next_player_rate": 0.545938,
+      "next_banker_rate": 0.454062,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPBBP": {
+      "window": 7,
+      "pattern": "BPPPBBP",
+      "sample": 9099,
+      "next_player_count": 3895,
+      "next_banker_count": 5204,
+      "next_player_rate": 0.428069,
+      "next_banker_rate": 0.571931,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPBPB": {
+      "window": 7,
+      "pattern": "BPPPBPB",
+      "sample": 9164,
+      "next_player_count": 4708,
+      "next_banker_count": 4456,
+      "next_player_rate": 0.513749,
+      "next_banker_rate": 0.486251,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPBPP": {
+      "window": 7,
+      "pattern": "BPPPBPP",
+      "sample": 9832,
+      "next_player_count": 4394,
+      "next_banker_count": 5438,
+      "next_player_rate": 0.446908,
+      "next_banker_rate": 0.553092,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPPBB": {
+      "window": 7,
+      "pattern": "BPPPPBB",
+      "sample": 7181,
+      "next_player_count": 3857,
+      "next_banker_count": 3324,
+      "next_player_rate": 0.537112,
+      "next_banker_rate": 0.462888,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPPBP": {
+      "window": 7,
+      "pattern": "BPPPPBP",
+      "sample": 8134,
+      "next_player_count": 3981,
+      "next_banker_count": 4153,
+      "next_player_rate": 0.489427,
+      "next_banker_rate": 0.510573,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPPPB": {
+      "window": 7,
+      "pattern": "BPPPPPB",
+      "sample": 10027,
+      "next_player_count": 4801,
+      "next_banker_count": 5226,
+      "next_player_rate": 0.478807,
+      "next_banker_rate": 0.521193,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:BPPPPPP": {
+      "window": 7,
+      "pattern": "BPPPPPP",
+      "sample": 9433,
+      "next_player_count": 4100,
+      "next_banker_count": 5333,
+      "next_player_rate": 0.434644,
+      "next_banker_rate": 0.565356,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBBBB": {
+      "window": 7,
+      "pattern": "PBBBBBB",
+      "sample": 10001,
+      "next_player_count": 5466,
+      "next_banker_count": 4535,
+      "next_player_rate": 0.546545,
+      "next_banker_rate": 0.453455,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBBBP": {
+      "window": 7,
+      "pattern": "PBBBBBP",
+      "sample": 9839,
+      "next_player_count": 4961,
+      "next_banker_count": 4878,
+      "next_player_rate": 0.504218,
+      "next_banker_rate": 0.495782,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBBPB": {
+      "window": 7,
+      "pattern": "PBBBBPB",
+      "sample": 9965,
+      "next_player_count": 5109,
+      "next_banker_count": 4856,
+      "next_player_rate": 0.512694,
+      "next_banker_rate": 0.487306,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBBPP": {
+      "window": 7,
+      "pattern": "PBBBBPP",
+      "sample": 7781,
+      "next_player_count": 3948,
+      "next_banker_count": 3833,
+      "next_player_rate": 0.50739,
+      "next_banker_rate": 0.49261,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBPBB": {
+      "window": 7,
+      "pattern": "PBBBPBB",
+      "sample": 8121,
+      "next_player_count": 4054,
+      "next_banker_count": 4067,
+      "next_player_rate": 0.4992,
+      "next_banker_rate": 0.5008,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBPBP": {
+      "window": 7,
+      "pattern": "PBBBPBP",
+      "sample": 7649,
+      "next_player_count": 3737,
+      "next_banker_count": 3912,
+      "next_player_rate": 0.488561,
+      "next_banker_rate": 0.511439,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBPPB": {
+      "window": 7,
+      "pattern": "PBBBPPB",
+      "sample": 9102,
+      "next_player_count": 4706,
+      "next_banker_count": 4396,
+      "next_player_rate": 0.517029,
+      "next_banker_rate": 0.482971,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBBPPP": {
+      "window": 7,
+      "pattern": "PBBBPPP",
+      "sample": 8718,
+      "next_player_count": 4413,
+      "next_banker_count": 4305,
+      "next_player_rate": 0.506194,
+      "next_banker_rate": 0.493806,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPBBB": {
+      "window": 7,
+      "pattern": "PBBPBBB",
+      "sample": 10097,
+      "next_player_count": 5680,
+      "next_banker_count": 4417,
+      "next_player_rate": 0.562543,
+      "next_banker_rate": 0.437457,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPBBP": {
+      "window": 7,
+      "pattern": "PBBPBBP",
+      "sample": 8025,
+      "next_player_count": 3651,
+      "next_banker_count": 4374,
+      "next_player_rate": 0.454953,
+      "next_banker_rate": 0.545047,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPBPB": {
+      "window": 7,
+      "pattern": "PBBPBPB",
+      "sample": 10137,
+      "next_player_count": 5254,
+      "next_banker_count": 4883,
+      "next_player_rate": 0.518299,
+      "next_banker_rate": 0.481701,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPBPP": {
+      "window": 7,
+      "pattern": "PBBPBPP",
+      "sample": 9183,
+      "next_player_count": 4220,
+      "next_banker_count": 4963,
+      "next_player_rate": 0.459545,
+      "next_banker_rate": 0.540455,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPPBB": {
+      "window": 7,
+      "pattern": "PBBPPBB",
+      "sample": 7193,
+      "next_player_count": 3627,
+      "next_banker_count": 3566,
+      "next_player_rate": 0.50424,
+      "next_banker_rate": 0.49576,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPPBP": {
+      "window": 7,
+      "pattern": "PBBPPBP",
+      "sample": 8326,
+      "next_player_count": 3656,
+      "next_banker_count": 4670,
+      "next_player_rate": 0.439106,
+      "next_banker_rate": 0.560894,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPPPB": {
+      "window": 7,
+      "pattern": "PBBPPPB",
+      "sample": 7726,
+      "next_player_count": 4197,
+      "next_banker_count": 3529,
+      "next_player_rate": 0.543231,
+      "next_banker_rate": 0.456769,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBBPPPP": {
+      "window": 7,
+      "pattern": "PBBPPPP",
+      "sample": 10237,
+      "next_player_count": 5031,
+      "next_banker_count": 5206,
+      "next_player_rate": 0.491453,
+      "next_banker_rate": 0.508547,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBBBB": {
+      "window": 7,
+      "pattern": "PBPBBBB",
+      "sample": 9207,
+      "next_player_count": 5290,
+      "next_banker_count": 3917,
+      "next_player_rate": 0.574563,
+      "next_banker_rate": 0.425437,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBBBP": {
+      "window": 7,
+      "pattern": "PBPBBBP",
+      "sample": 8332,
+      "next_player_count": 3952,
+      "next_banker_count": 4380,
+      "next_player_rate": 0.474316,
+      "next_banker_rate": 0.525684,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBBPB": {
+      "window": 7,
+      "pattern": "PBPBBPB",
+      "sample": 7857,
+      "next_player_count": 4335,
+      "next_banker_count": 3522,
+      "next_player_rate": 0.551737,
+      "next_banker_rate": 0.448263,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBBPP": {
+      "window": 7,
+      "pattern": "PBPBBPP",
+      "sample": 9242,
+      "next_player_count": 4281,
+      "next_banker_count": 4961,
+      "next_player_rate": 0.463211,
+      "next_banker_rate": 0.536789,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBPBB": {
+      "window": 7,
+      "pattern": "PBPBPBB",
+      "sample": 9703,
+      "next_player_count": 4837,
+      "next_banker_count": 4866,
+      "next_player_rate": 0.498506,
+      "next_banker_rate": 0.501494,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBPBP": {
+      "window": 7,
+      "pattern": "PBPBPBP",
+      "sample": 10088,
+      "next_player_count": 4834,
+      "next_banker_count": 5254,
+      "next_player_rate": 0.479183,
+      "next_banker_rate": 0.520817,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBPPB": {
+      "window": 7,
+      "pattern": "PBPBPPB",
+      "sample": 7119,
+      "next_player_count": 3671,
+      "next_banker_count": 3448,
+      "next_player_rate": 0.515662,
+      "next_banker_rate": 0.484338,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPBPPP": {
+      "window": 7,
+      "pattern": "PBPBPPP",
+      "sample": 10128,
+      "next_player_count": 4209,
+      "next_banker_count": 5919,
+      "next_player_rate": 0.415581,
+      "next_banker_rate": 0.584419,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPBBB": {
+      "window": 7,
+      "pattern": "PBPPBBB",
+      "sample": 8078,
+      "next_player_count": 4416,
+      "next_banker_count": 3662,
+      "next_player_rate": 0.54667,
+      "next_banker_rate": 0.45333,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPBBP": {
+      "window": 7,
+      "pattern": "PBPPBBP",
+      "sample": 7626,
+      "next_player_count": 3497,
+      "next_banker_count": 4129,
+      "next_player_rate": 0.458563,
+      "next_banker_rate": 0.541437,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPBPB": {
+      "window": 7,
+      "pattern": "PBPPBPB",
+      "sample": 9143,
+      "next_player_count": 4608,
+      "next_banker_count": 4535,
+      "next_player_rate": 0.503992,
+      "next_banker_rate": 0.496008,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPBPP": {
+      "window": 7,
+      "pattern": "PBPPBPP",
+      "sample": 8434,
+      "next_player_count": 4026,
+      "next_banker_count": 4408,
+      "next_player_rate": 0.477354,
+      "next_banker_rate": 0.522646,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPPBB": {
+      "window": 7,
+      "pattern": "PBPPPBB",
+      "sample": 7202,
+      "next_player_count": 3388,
+      "next_banker_count": 3814,
+      "next_player_rate": 0.470425,
+      "next_banker_rate": 0.529575,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPPBP": {
+      "window": 7,
+      "pattern": "PBPPPBP",
+      "sample": 9866,
+      "next_player_count": 4173,
+      "next_banker_count": 5693,
+      "next_player_rate": 0.422968,
+      "next_banker_rate": 0.577032,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPPPB": {
+      "window": 7,
+      "pattern": "PBPPPPB",
+      "sample": 9634,
+      "next_player_count": 4949,
+      "next_banker_count": 4685,
+      "next_player_rate": 0.513701,
+      "next_banker_rate": 0.486299,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PBPPPPP": {
+      "window": 7,
+      "pattern": "PBPPPPP",
+      "sample": 9703,
+      "next_player_count": 4085,
+      "next_banker_count": 5618,
+      "next_player_rate": 0.421004,
+      "next_banker_rate": 0.578996,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBBBB": {
+      "window": 7,
+      "pattern": "PPBBBBB",
+      "sample": 9804,
+      "next_player_count": 5159,
+      "next_banker_count": 4645,
+      "next_player_rate": 0.526214,
+      "next_banker_rate": 0.473786,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBBBP": {
+      "window": 7,
+      "pattern": "PPBBBBP",
+      "sample": 8456,
+      "next_player_count": 4054,
+      "next_banker_count": 4402,
+      "next_player_rate": 0.479423,
+      "next_banker_rate": 0.520577,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBBPB": {
+      "window": 7,
+      "pattern": "PPBBBPB",
+      "sample": 9585,
+      "next_player_count": 5307,
+      "next_banker_count": 4278,
+      "next_player_rate": 0.553678,
+      "next_banker_rate": 0.446322,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBBPP": {
+      "window": 7,
+      "pattern": "PPBBBPP",
+      "sample": 8303,
+      "next_player_count": 3792,
+      "next_banker_count": 4511,
+      "next_player_rate": 0.456702,
+      "next_banker_rate": 0.543298,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBPBB": {
+      "window": 7,
+      "pattern": "PPBBPBB",
+      "sample": 9655,
+      "next_player_count": 4714,
+      "next_banker_count": 4941,
+      "next_player_rate": 0.488244,
+      "next_banker_rate": 0.511756,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBPBP": {
+      "window": 7,
+      "pattern": "PPBBPBP",
+      "sample": 8753,
+      "next_player_count": 4194,
+      "next_banker_count": 4559,
+      "next_player_rate": 0.47915,
+      "next_banker_rate": 0.52085,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBPPB": {
+      "window": 7,
+      "pattern": "PPBBPPB",
+      "sample": 9684,
+      "next_player_count": 4549,
+      "next_banker_count": 5135,
+      "next_player_rate": 0.469744,
+      "next_banker_rate": 0.530256,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBBPPP": {
+      "window": 7,
+      "pattern": "PPBBPPP",
+      "sample": 10165,
+      "next_player_count": 4282,
+      "next_banker_count": 5883,
+      "next_player_rate": 0.421249,
+      "next_banker_rate": 0.578751,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPBBB": {
+      "window": 7,
+      "pattern": "PPBPBBB",
+      "sample": 8571,
+      "next_player_count": 4279,
+      "next_banker_count": 4292,
+      "next_player_rate": 0.499242,
+      "next_banker_rate": 0.500758,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPBBP": {
+      "window": 7,
+      "pattern": "PPBPBBP",
+      "sample": 9761,
+      "next_player_count": 4504,
+      "next_banker_count": 5257,
+      "next_player_rate": 0.461428,
+      "next_banker_rate": 0.538572,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPBPB": {
+      "window": 7,
+      "pattern": "PPBPBPB",
+      "sample": 9882,
+      "next_player_count": 5214,
+      "next_banker_count": 4668,
+      "next_player_rate": 0.527626,
+      "next_banker_rate": 0.472374,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPBPP": {
+      "window": 7,
+      "pattern": "PPBPBPP",
+      "sample": 7958,
+      "next_player_count": 3292,
+      "next_banker_count": 4666,
+      "next_player_rate": 0.413672,
+      "next_banker_rate": 0.586328,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPPBB": {
+      "window": 7,
+      "pattern": "PPBPPBB",
+      "sample": 8652,
+      "next_player_count": 4135,
+      "next_banker_count": 4517,
+      "next_player_rate": 0.477924,
+      "next_banker_rate": 0.522076,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPPBP": {
+      "window": 7,
+      "pattern": "PPBPPBP",
+      "sample": 7471,
+      "next_player_count": 3131,
+      "next_banker_count": 4340,
+      "next_player_rate": 0.419087,
+      "next_banker_rate": 0.580913,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPPPB": {
+      "window": 7,
+      "pattern": "PPBPPPB",
+      "sample": 9694,
+      "next_player_count": 4905,
+      "next_banker_count": 4789,
+      "next_player_rate": 0.505983,
+      "next_banker_rate": 0.494017,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPBPPPP": {
+      "window": 7,
+      "pattern": "PPBPPPP",
+      "sample": 10162,
+      "next_player_count": 4173,
+      "next_banker_count": 5989,
+      "next_player_rate": 0.410648,
+      "next_banker_rate": 0.589352,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBBBB": {
+      "window": 7,
+      "pattern": "PPPBBBB",
+      "sample": 7259,
+      "next_player_count": 4050,
+      "next_banker_count": 3209,
+      "next_player_rate": 0.557928,
+      "next_banker_rate": 0.442072,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBBBP": {
+      "window": 7,
+      "pattern": "PPPBBBP",
+      "sample": 7481,
+      "next_player_count": 3257,
+      "next_banker_count": 4224,
+      "next_player_rate": 0.43537,
+      "next_banker_rate": 0.56463,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBBPB": {
+      "window": 7,
+      "pattern": "PPPBBPB",
+      "sample": 7430,
+      "next_player_count": 3470,
+      "next_banker_count": 3960,
+      "next_player_rate": 0.467026,
+      "next_banker_rate": 0.532974,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBBPP": {
+      "window": 7,
+      "pattern": "PPPBBPP",
+      "sample": 9648,
+      "next_player_count": 4532,
+      "next_banker_count": 5116,
+      "next_player_rate": 0.469735,
+      "next_banker_rate": 0.530265,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBPBB": {
+      "window": 7,
+      "pattern": "PPPBPBB",
+      "sample": 8071,
+      "next_player_count": 4360,
+      "next_banker_count": 3711,
+      "next_player_rate": 0.540206,
+      "next_banker_rate": 0.459794,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBPBP": {
+      "window": 7,
+      "pattern": "PPPBPBP",
+      "sample": 7845,
+      "next_player_count": 3653,
+      "next_banker_count": 4192,
+      "next_player_rate": 0.465647,
+      "next_banker_rate": 0.534353,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBPPB": {
+      "window": 7,
+      "pattern": "PPPBPPB",
+      "sample": 10008,
+      "next_player_count": 5185,
+      "next_banker_count": 4823,
+      "next_player_rate": 0.518086,
+      "next_banker_rate": 0.481914,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPBPPP": {
+      "window": 7,
+      "pattern": "PPPBPPP",
+      "sample": 9496,
+      "next_player_count": 3700,
+      "next_banker_count": 5796,
+      "next_player_rate": 0.389638,
+      "next_banker_rate": 0.610362,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPBBB": {
+      "window": 7,
+      "pattern": "PPPPBBB",
+      "sample": 7408,
+      "next_player_count": 3952,
+      "next_banker_count": 3456,
+      "next_player_rate": 0.533477,
+      "next_banker_rate": 0.466523,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPBBP": {
+      "window": 7,
+      "pattern": "PPPPBBP",
+      "sample": 7382,
+      "next_player_count": 3480,
+      "next_banker_count": 3902,
+      "next_player_rate": 0.471417,
+      "next_banker_rate": 0.528583,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPBPB": {
+      "window": 7,
+      "pattern": "PPPPBPB",
+      "sample": 8094,
+      "next_player_count": 3893,
+      "next_banker_count": 4201,
+      "next_player_rate": 0.480974,
+      "next_banker_rate": 0.519026,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPBPP": {
+      "window": 7,
+      "pattern": "PPPPBPP",
+      "sample": 8141,
+      "next_player_count": 3262,
+      "next_banker_count": 4879,
+      "next_player_rate": 0.400688,
+      "next_banker_rate": 0.599312,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPPBB": {
+      "window": 7,
+      "pattern": "PPPPPBB",
+      "sample": 7875,
+      "next_player_count": 3742,
+      "next_banker_count": 4133,
+      "next_player_rate": 0.475175,
+      "next_banker_rate": 0.524825,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPPBP": {
+      "window": 7,
+      "pattern": "PPPPPBP",
+      "sample": 9405,
+      "next_player_count": 4185,
+      "next_banker_count": 5220,
+      "next_player_rate": 0.444976,
+      "next_banker_rate": 0.555024,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPPPB": {
+      "window": 7,
+      "pattern": "PPPPPPB",
+      "sample": 10102,
+      "next_player_count": 4138,
+      "next_banker_count": 5964,
+      "next_player_rate": 0.409622,
+      "next_banker_rate": 0.590378,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    },
+    "W7:PPPPPPP": {
+      "window": 7,
+      "pattern": "PPPPPPP",
+      "sample": 14032,
+      "next_player_count": 5756,
+      "next_banker_count": 8276,
+      "next_player_rate": 0.410205,
+      "next_banker_rate": 0.589795,
+      "source": "SIM_3M_AGGREGATED_RESULT_PATTERN_DB"
+    }
+  }
+}
