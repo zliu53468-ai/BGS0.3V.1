@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -38,6 +39,20 @@ CORS(app)
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 TRIAL_SECONDS = TRIAL_MINUTES * 60
 TRIAL_STARTED_AT = {}
+
+# ---------- 自動化成交 / 開通碼系統 ----------
+# 這幾個值都可以在 Render Environment Variables 修改。
+ADMIN_LINE_URL = os.getenv("ADMIN_LINE_URL", "https://lin.ee/xYcGKN0").strip()
+TEMP_TRIAL_CODE = os.getenv("TEMP_TRIAL_CODE", "aaa1688002").strip()
+TEMP_TRIAL_MINUTES = int(os.getenv("TEMP_TRIAL_MINUTES", "15"))
+TEMP_TRIAL_SECONDS = TEMP_TRIAL_MINUTES * 60
+MONTHLY_ACTIVATION_CODE = os.getenv("MONTHLY_ACTIVATION_CODE", "aaa1688001").strip()
+MONTHLY_DAYS = int(os.getenv("MONTHLY_DAYS", "30"))
+PERMANENT_ACTIVATION_CODE = os.getenv("PERMANENT_ACTIVATION_CODE", "aaa1688000").strip()
+
+# 權限資料依 LINE UID 暫存在目前服務記憶體。
+# code_version 會記錄當下使用的開通碼；若之後 Render 環境變數改碼，舊 UID 權限會自動失效。
+ACCESS_BY_UID = {}
 
 
 # 只針對 DG / MT真人 內建桌廳選項
@@ -147,7 +162,8 @@ def trial_expired_text() -> str:
     return (
         "⏰ 試用時間已結束\n"
         f"本 UID 的 {TRIAL_MINUTES} 分鐘試用已到期，暫時無法再進行預測分析。\n\n"
-        "如需繼續使用，請聯繫官方客服開通正式權限。"
+        "🔐 如需繼續使用，請聯繫管理員官方 LINE 領取開通碼。\n"
+        f"👉 管理員官方 LINE：{ADMIN_LINE_URL}"
     )
 
 
@@ -170,6 +186,175 @@ def get_trial_remaining_seconds(user_id: str):
 def is_trial_expired(user_id: str) -> bool:
     remaining = get_trial_remaining_seconds(user_id)
     return remaining is not None and remaining <= 0
+
+
+def taipei_time_text(ts: float = None) -> str:
+    tz = timezone(timedelta(hours=8))
+    if ts is None:
+        ts = time.time()
+    return datetime.fromtimestamp(ts, tz).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def normalize_activation_input(raw: str) -> str:
+    text = (raw or "").replace("\u3000", " ").strip()
+    if text.startswith("開通"):
+        text = text[2:].strip()
+    elif text.upper().startswith("ACTIVATE"):
+        text = text[len("ACTIVATE"):].strip()
+    return text.strip().strip("：:").strip()
+
+
+def admin_line_notice_text(title: str = "請聯繫管理員官方 LINE") -> str:
+    return (
+        f"{title}\n"
+        "🔐 請聯繫管理員官方 LINE 領取／續用開通碼。\n"
+        f"👉 管理員官方 LINE：{ADMIN_LINE_URL}"
+    )
+
+
+def set_temp_trial_access(user_id: str) -> str:
+    expires_at = time.time() + TEMP_TRIAL_SECONDS
+    ACCESS_BY_UID[user_id] = {
+        "type": "temp",
+        "expires_at": expires_at,
+        "code_version": TEMP_TRIAL_CODE,
+        "started_at": time.time(),
+    }
+    return (
+        "✅ 臨時開通成功！\n"
+        f"⏱️ 此 LINE UID 已獲得 {TEMP_TRIAL_MINUTES} 分鐘臨時試用。\n"
+        f"📍 開通時間：{taipei_time_text()}（台北時間）\n"
+        f"⏰ 到期時間：{taipei_time_text(expires_at)}（台北時間）\n\n"
+        "請直接輸入點數開始分析，例如：65"
+    )
+
+
+def set_monthly_access(user_id: str) -> str:
+    expires_at = time.time() + (MONTHLY_DAYS * 24 * 60 * 60)
+    ACCESS_BY_UID[user_id] = {
+        "type": "monthly",
+        "expires_at": expires_at,
+        "code_version": MONTHLY_ACTIVATION_CODE,
+        "started_at": time.time(),
+    }
+    return (
+        "✅ 月租開通成功！\n"
+        f"👑 此 LINE UID 已認定為月租客戶，有效期限 {MONTHLY_DAYS} 日。\n"
+        f"📍 開通時間：{taipei_time_text()}（台北時間）\n"
+        f"⏰ 到期時間：{taipei_time_text(expires_at)}（台北時間）\n\n"
+        "請直接輸入點數開始分析，例如：65"
+    )
+
+
+def set_permanent_access(user_id: str) -> str:
+    ACCESS_BY_UID[user_id] = {
+        "type": "permanent",
+        "expires_at": None,
+        "code_version": PERMANENT_ACTIVATION_CODE,
+        "started_at": time.time(),
+    }
+    return (
+        "✅ 永久開通成功！\n"
+        "💎 此 LINE UID 已認定為永久客戶，不受試用時間限制。\n"
+        f"📍 開通時間：{taipei_time_text()}（台北時間）\n\n"
+        "請直接輸入點數開始分析，例如：65"
+    )
+
+
+def handle_activation_code(user_id: str, raw: str):
+    code = normalize_activation_input(raw)
+
+    if TEMP_TRIAL_CODE and code == TEMP_TRIAL_CODE:
+        return set_temp_trial_access(user_id)
+
+    if MONTHLY_ACTIVATION_CODE and code == MONTHLY_ACTIVATION_CODE:
+        return set_monthly_access(user_id)
+
+    if PERMANENT_ACTIVATION_CODE and code == PERMANENT_ACTIVATION_CODE:
+        return set_permanent_access(user_id)
+
+    return None
+
+
+def get_access_status(user_id: str):
+    info = ACCESS_BY_UID.get(user_id)
+    if not info:
+        return None, None
+
+    access_type = info.get("type")
+    code_version = info.get("code_version", "")
+
+    # 若 Render 環境變數已換開通碼，舊 UID 權限自動失效。
+    if access_type == "temp" and code_version != TEMP_TRIAL_CODE:
+        ACCESS_BY_UID.pop(user_id, None)
+        return None, admin_line_notice_text("⛔ 臨時開通碼已更新，此 UID 需要重新領取開通碼。")
+
+    if access_type == "monthly" and code_version != MONTHLY_ACTIVATION_CODE:
+        ACCESS_BY_UID.pop(user_id, None)
+        return None, admin_line_notice_text("⛔ 月租開通碼已更新，此 UID 需要重新領取開通碼。")
+
+    if access_type == "permanent" and code_version != PERMANENT_ACTIVATION_CODE:
+        ACCESS_BY_UID.pop(user_id, None)
+        return None, admin_line_notice_text("⛔ 永久開通碼已更新，此 UID 需要重新領取開通碼。")
+
+    expires_at = info.get("expires_at")
+    if expires_at is not None and time.time() >= float(expires_at):
+        ACCESS_BY_UID.pop(user_id, None)
+        if access_type == "temp":
+            return None, admin_line_notice_text("⏰ 15 分鐘臨時試用已到期。")
+        if access_type == "monthly":
+            return None, admin_line_notice_text("⏰ 月租 30 日權限已到期，如需繼續租用請聯繫管理員官方 LINE。")
+        return None, admin_line_notice_text("⏰ 權限已到期。")
+
+    return info, None
+
+
+def has_active_access(user_id: str) -> bool:
+    info, _ = get_access_status(user_id)
+    return bool(info)
+
+
+def access_status_text(user_id: str) -> str:
+    info, expired_msg = get_access_status(user_id)
+    if expired_msg:
+        return expired_msg
+
+    if not info:
+        remaining = get_trial_remaining_seconds(user_id)
+        if remaining is None:
+            return trial_not_started_text()
+        if remaining <= 0:
+            return trial_expired_text()
+        return trial_started_text(remaining)
+
+    access_type = info.get("type")
+    expires_at = info.get("expires_at")
+
+    if access_type == "permanent":
+        return (
+            "💎 權限狀態：永久會員\n"
+            "✅ 此 LINE UID 不受試用時間限制。"
+        )
+
+    if access_type == "monthly":
+        left_seconds = max(0, int(float(expires_at) - time.time()))
+        left_days = max(1, left_seconds // 86400)
+        return (
+            "👑 權限狀態：月租會員\n"
+            f"⏳ 約剩 {left_days} 日\n"
+            f"⏰ 到期時間：{taipei_time_text(float(expires_at))}（台北時間）"
+        )
+
+    if access_type == "temp":
+        left_seconds = max(0, int(float(expires_at) - time.time()))
+        left_minutes = max(1, left_seconds // 60)
+        return (
+            "⏱️ 權限狀態：臨時試用\n"
+            f"⏳ 約剩 {left_minutes} 分鐘\n"
+            f"⏰ 到期時間：{taipei_time_text(float(expires_at))}（台北時間）"
+        )
+
+    return "✅ 權限正常"
 
 
 def verify_line_signature(body: bytes, signature: str) -> bool:
@@ -261,19 +446,17 @@ def handle_text(user_id: str, reply_token: str, text: str):
     sess = store.get(user_id)
     raw = text.strip()
 
+    activation_msg = handle_activation_code(user_id, raw)
+    if activation_msg:
+        reply_messages(reply_token, [text_message(activation_msg)])
+        return
+
     if raw in {"help", "幫助", "說明", "指令"}:
         reply_messages(reply_token, [text_message(help_text())])
         return
 
-    if raw in {"試用時間", "剩餘時間", "試用剩餘", "查詢試用"}:
-        remaining = get_trial_remaining_seconds(user_id)
-        if remaining is None:
-            reply_messages(reply_token, [text_message(trial_not_started_text())])
-            return
-        if remaining <= 0:
-            reply_messages(reply_token, [text_message(trial_expired_text())])
-            return
-        reply_messages(reply_token, [text_message(trial_started_text(remaining))])
+    if raw in {"試用時間", "剩餘時間", "試用剩餘", "查詢試用", "權限", "權限查詢", "會員狀態"}:
+        reply_messages(reply_token, [text_message(access_status_text(user_id))])
         return
 
     if raw in {"遊戲設定", "設定遊戲", "遊戲館別", "館別設定"}:
@@ -360,12 +543,21 @@ def handle_text(user_id: str, reply_token: str, text: str):
 
     points = parse_points(raw)
     if points:
-        if is_trial_expired(user_id):
-            reply_messages(reply_token, [text_message(trial_expired_text())])
+        access_info, access_expired_msg = get_access_status(user_id)
+        if access_expired_msg:
+            reply_messages(reply_token, [text_message(access_expired_msg)])
             return
 
-        trial_first_start = ensure_trial_started(user_id)
-        remaining = get_trial_remaining_seconds(user_id) or TRIAL_SECONDS
+        if not access_info:
+            if is_trial_expired(user_id):
+                reply_messages(reply_token, [text_message(trial_expired_text())])
+                return
+
+            trial_first_start = ensure_trial_started(user_id)
+            remaining = get_trial_remaining_seconds(user_id) or TRIAL_SECONDS
+        else:
+            trial_first_start = False
+            remaining = TRIAL_SECONDS
 
         player_point, banker_point = points
         sess.active = True
