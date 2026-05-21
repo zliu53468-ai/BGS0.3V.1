@@ -1,7 +1,7 @@
 import hashlib
 import math
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from config import (
     POINT_WEIGHT,
     PATTERN_WEIGHT,
@@ -12,6 +12,7 @@ from config import (
     USE_POINT_DB,
     USE_PATTERN_DB,
 )
+import point_db as point_db_module
 from point_db import get_point_record, point_db_meta
 from pattern_db import pattern_lookup, pattern_db_meta
 
@@ -39,35 +40,40 @@ def _get_bool_env(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# 莊閒累積開局差距權重切換器
+# ==================== 局型資料庫查詢模式 ====================
+# ROUTE_DB_MODE=1：
+# 會先嘗試用「點數 + route_type」查局型專用資料庫。
+# 如果 point_db.py 尚未支援 get_point_route_record，會自動 fallback 回原本 get_point_record。
+ROUTE_DB_MODE = _get_bool_env("ROUTE_DB_MODE", True)
+ROUTE_DB_MIN_SAMPLE = _get_int_env("ROUTE_DB_MIN_SAMPLE", 30)
+ROUTE_DB_FALLBACK_TO_BASE = _get_bool_env("ROUTE_DB_FALLBACK_TO_BASE", True)
+
+
+# ==================== 莊閒累積開局差距權重切換器 ====================
 COUNT_GAP_MODE = _get_bool_env("COUNT_GAP_MODE", False)
 
-# 正常模式
 NORMAL_POINT_WEIGHT = _get_float_env("NORMAL_POINT_WEIGHT", POINT_WEIGHT)
 NORMAL_PATTERN_WEIGHT = _get_float_env("NORMAL_PATTERN_WEIGHT", PATTERN_WEIGHT)
 NORMAL_SIM_WEIGHT = _get_float_env("NORMAL_SIM_WEIGHT", SIM_WEIGHT)
 
-# 偏差模式
 COUNT_GAP_TRIGGER = _get_int_env("COUNT_GAP_TRIGGER", 3)
 GAP_POINT_WEIGHT = _get_float_env("GAP_POINT_WEIGHT", 0.62)
 GAP_PATTERN_WEIGHT = _get_float_env("GAP_PATTERN_WEIGHT", 0.23)
 GAP_SIM_WEIGHT = _get_float_env("GAP_SIM_WEIGHT", 0.15)
 
-# 極端偏差模式
 EXTREME_COUNT_GAP_TRIGGER = _get_int_env("EXTREME_COUNT_GAP_TRIGGER", 6)
 EXTREME_GAP_POINT_WEIGHT = _get_float_env("EXTREME_GAP_POINT_WEIGHT", 0.68)
 EXTREME_GAP_PATTERN_WEIGHT = _get_float_env("EXTREME_GAP_PATTERN_WEIGHT", 0.17)
 EXTREME_GAP_SIM_WEIGHT = _get_float_env("EXTREME_GAP_SIM_WEIGHT", 0.15)
 
-# 局型偵測器
+
+# ==================== 局型偵測器 ====================
 ROUTE_MODE = _get_bool_env("ROUTE_MODE", True)
 
-# 長龍判斷門檻
 DRAGON_TRIGGER = _get_int_env("DRAGON_TRIGGER", 3)
 DRAGON_STRONG_TRIGGER = _get_int_env("DRAGON_STRONG_TRIGGER", 5)
 DRAGON_HOT_TRIGGER = _get_int_env("DRAGON_HOT_TRIGGER", 7)
 
-# 長龍權重
 DRAGON_POINT_WEIGHT = _get_float_env("DRAGON_POINT_WEIGHT", 0.46)
 DRAGON_PATTERN_WEIGHT = _get_float_env("DRAGON_PATTERN_WEIGHT", 0.40)
 DRAGON_SIM_WEIGHT = _get_float_env("DRAGON_SIM_WEIGHT", 0.14)
@@ -80,19 +86,16 @@ DRAGON_HOT_POINT_WEIGHT = _get_float_env("DRAGON_HOT_POINT_WEIGHT", 0.49)
 DRAGON_HOT_PATTERN_WEIGHT = _get_float_env("DRAGON_HOT_PATTERN_WEIGHT", 0.37)
 DRAGON_HOT_SIM_WEIGHT = _get_float_env("DRAGON_HOT_SIM_WEIGHT", 0.14)
 
-# 跳路
 CHOP_TRIGGER = _get_int_env("CHOP_TRIGGER", 4)
 CHOP_POINT_WEIGHT = _get_float_env("CHOP_POINT_WEIGHT", 0.46)
 CHOP_PATTERN_WEIGHT = _get_float_env("CHOP_PATTERN_WEIGHT", 0.40)
 CHOP_SIM_WEIGHT = _get_float_env("CHOP_SIM_WEIGHT", 0.14)
 
-# 兩房
 TWO_ROOM_TRIGGER = _get_int_env("TWO_ROOM_TRIGGER", 4)
 TWO_ROOM_POINT_WEIGHT = _get_float_env("TWO_ROOM_POINT_WEIGHT", 0.48)
 TWO_ROOM_PATTERN_WEIGHT = _get_float_env("TWO_ROOM_PATTERN_WEIGHT", 0.38)
 TWO_ROOM_SIM_WEIGHT = _get_float_env("TWO_ROOM_SIM_WEIGHT", 0.14)
 
-# 單跳 / 雙跳
 SINGLE_CHOP_TRIGGER = _get_int_env("SINGLE_CHOP_TRIGGER", 4)
 DOUBLE_CHOP_TRIGGER = _get_int_env("DOUBLE_CHOP_TRIGGER", 3)
 
@@ -104,7 +107,8 @@ DOUBLE_CHOP_POINT_WEIGHT = _get_float_env("DOUBLE_CHOP_POINT_WEIGHT", 0.46)
 DOUBLE_CHOP_PATTERN_WEIGHT = _get_float_env("DOUBLE_CHOP_PATTERN_WEIGHT", 0.41)
 DOUBLE_CHOP_SIM_WEIGHT = _get_float_env("DOUBLE_CHOP_SIM_WEIGHT", 0.13)
 
-# ==================== 新增：斷路偵測 ====================
+
+# ==================== 斷路偵測 ====================
 BREAK_ROUTE_MODE = _get_bool_env("BREAK_ROUTE_MODE", True)
 
 BREAK_DRAGON_POINT_WEIGHT = _get_float_env("BREAK_DRAGON_POINT_WEIGHT", 0.52)
@@ -200,21 +204,26 @@ def count_banker_player_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
     banker_count = 0
     player_count = 0
     tie_count = 0
+
     for item in rounds or []:
         symbol = normalize_result_symbol(item.get("last_result", ""))
+
         if symbol == "B":
             banker_count += 1
         elif symbol == "P":
             player_count += 1
         else:
             tie_count += 1
+
     gap = abs(banker_count - player_count)
+
     if banker_count > player_count:
         leader = "莊"
     elif player_count > banker_count:
         leader = "閒"
     else:
         leader = "平衡"
+
     return {
         "banker_count": banker_count,
         "player_count": player_count,
@@ -227,13 +236,16 @@ def count_banker_player_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
 def detect_dragon(symbols: List[str]) -> Dict[str, Any]:
     if not symbols:
         return {"active": False, "side": None, "length": 0}
+
     last = symbols[-1]
     length = 1
+
     for s in reversed(symbols[:-1]):
         if s == last:
             length += 1
         else:
             break
+
     return {
         "active": length >= DRAGON_TRIGGER,
         "side": "莊" if last == "B" else "閒",
@@ -244,12 +256,15 @@ def detect_dragon(symbols: List[str]) -> Dict[str, Any]:
 def detect_chop(symbols: List[str]) -> Dict[str, Any]:
     if len(symbols) < CHOP_TRIGGER:
         return {"active": False, "length": 0}
+
     length = 1
+
     for i in range(len(symbols) - 1, 0, -1):
         if symbols[i] != symbols[i - 1]:
             length += 1
         else:
             break
+
     return {
         "active": length >= CHOP_TRIGGER,
         "length": length,
@@ -259,28 +274,33 @@ def detect_chop(symbols: List[str]) -> Dict[str, Any]:
 def detect_two_room(symbols: List[str]) -> Dict[str, Any]:
     if len(symbols) < TWO_ROOM_TRIGGER:
         return {"active": False, "pattern": "", "length": 0}
+
     recent4 = "".join(symbols[-4:])
     recent6 = "".join(symbols[-6:]) if len(symbols) >= 6 else ""
+
     valid4 = {"BBPP", "PPBB", "BPPB", "PBBP"}
     valid6 = {"BBPPBB", "PPBBPP", "BPPBBP", "PBBPPB"}
+
     if recent6 in valid6:
         return {"active": True, "pattern": recent6, "length": 6}
     if recent4 in valid4:
         return {"active": True, "pattern": recent4, "length": 4}
+
     return {"active": False, "pattern": recent4, "length": 0}
 
 
 def detect_single_chop(symbols: List[str]) -> Dict[str, Any]:
-    """單跳偵測：BPBPBP... 嚴格交替"""
     if len(symbols) < SINGLE_CHOP_TRIGGER:
         return {"active": False, "length": 0, "type": "single_chop"}
 
     length = 1
+
     for i in range(len(symbols) - 1, 0, -1):
         if symbols[i] != symbols[i - 1]:
             length += 1
         else:
             break
+
     return {
         "active": length >= SINGLE_CHOP_TRIGGER,
         "length": length,
@@ -289,7 +309,6 @@ def detect_single_chop(symbols: List[str]) -> Dict[str, Any]:
 
 
 def detect_double_chop(symbols: List[str]) -> Dict[str, Any]:
-    """雙跳偵測：BBPPBBPP... 或 PPBBPPBB..."""
     if len(symbols) < DOUBLE_CHOP_TRIGGER * 2:
         return {"active": False, "length": 0, "type": "double_chop"}
 
@@ -308,38 +327,17 @@ def detect_double_chop(symbols: List[str]) -> Dict[str, Any]:
 
 
 def count_same_run_before_index(symbols: List[str], end_exclusive: int, side: str) -> int:
-    """
-    從 end_exclusive - 1 開始往前數連續 side 幾口。
-    """
     length = 0
     i = end_exclusive - 1
+
     while i >= 0 and symbols[i] == side:
         length += 1
         i -= 1
+
     return length
 
 
 def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
-    """
-    斷路偵測器。
-
-    break_dragon:
-        BBBBP / PPPPB
-        代表長龍剛被另一方打斷。
-
-    dragon_reconnect:
-        BBBP B / PPPB P
-        代表長龍斷一口後又接回。
-
-    break_chop:
-        BPBP P / PBPB B
-        代表單跳被破壞。
-
-    two_room_break:
-        BBPPBB B / PPBBPP P
-        代表兩房節奏被破壞，可能轉長龍。
-    """
-
     default = {
         "active": False,
         "type": "none",
@@ -356,8 +354,10 @@ def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
     if len(symbols) >= DRAGON_TRIGGER + 2:
         last = symbols[-1]
         breaker = symbols[-2]
+
         if last != breaker:
             previous_run_len = count_same_run_before_index(symbols, len(symbols) - 1, last)
+
             if previous_run_len >= DRAGON_TRIGGER:
                 return {
                     "active": True,
@@ -372,8 +372,10 @@ def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
     if len(symbols) >= DRAGON_TRIGGER + 1:
         last = symbols[-1]
         previous = symbols[-2]
+
         if last != previous:
             previous_run_len = count_same_run_before_index(symbols, len(symbols) - 1, previous)
+
             if previous_run_len >= DRAGON_TRIGGER:
                 return {
                     "active": True,
@@ -388,6 +390,7 @@ def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
     if len(symbols) >= CHOP_TRIGGER + 1:
         prev_symbols = symbols[:-1]
         prev_chop = detect_chop(prev_symbols)
+
         if prev_chop.get("active") and symbols[-1] == symbols[-2]:
             return {
                 "active": True,
@@ -403,6 +406,7 @@ def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
         prev_symbols = symbols[:-1]
         prev_two_room = detect_two_room(prev_symbols)
         now_two_room = detect_two_room(symbols)
+
         if prev_two_room.get("active") and not now_two_room.get("active"):
             return {
                 "active": True,
@@ -430,7 +434,6 @@ def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
     route_side = None
     route_length = 0
 
-    # 斷路優先級最高，避免已經破路還繼續硬套長龍 / 跳路 / 兩房權重。
     if break_route["active"]:
         route_type = break_route["type"]
         route_side = break_route.get("break_side")
@@ -439,6 +442,7 @@ def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
     elif dragon["active"]:
         route_side = dragon["side"]
         route_length = dragon["length"]
+
         if route_length >= DRAGON_HOT_TRIGGER:
             route_type = "dragon_hot"
         elif route_length >= DRAGON_STRONG_TRIGGER:
@@ -478,6 +482,7 @@ def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def select_weights_by_count_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
     stats = count_banker_player_gap(rounds)
+
     if not COUNT_GAP_MODE:
         return {
             "point_weight": POINT_WEIGHT,
@@ -487,7 +492,9 @@ def select_weights_by_count_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
             "count_gap_mode": False,
             **stats,
         }
+
     gap = stats["gap"]
+
     if gap >= EXTREME_COUNT_GAP_TRIGGER:
         return {
             "point_weight": EXTREME_GAP_POINT_WEIGHT,
@@ -497,6 +504,7 @@ def select_weights_by_count_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
             "count_gap_mode": True,
             **stats,
         }
+
     if gap >= COUNT_GAP_TRIGGER:
         return {
             "point_weight": GAP_POINT_WEIGHT,
@@ -506,6 +514,7 @@ def select_weights_by_count_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
             "count_gap_mode": True,
             **stats,
         }
+
     return {
         "point_weight": NORMAL_POINT_WEIGHT,
         "pattern_weight": NORMAL_PATTERN_WEIGHT,
@@ -518,6 +527,7 @@ def select_weights_by_count_gap(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def apply_route_weights(base_selected: Dict[str, Any], route: Dict[str, Any]) -> Dict[str, Any]:
     selected = dict(base_selected)
+
     if not ROUTE_MODE:
         selected["route_mode"] = False
         selected["route_applied"] = False
@@ -611,9 +621,204 @@ def apply_route_weights(base_selected: Dict[str, Any], route: Dict[str, Any]) ->
     return selected
 
 
-def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
-    rec = get_point_record(player_point, banker_point)
+def _record_float(rec: Dict[str, Any], keys: List[str], default: float) -> float:
+    for key in keys:
+        if key in rec:
+            try:
+                return float(rec[key])
+            except Exception:
+                pass
+    return default
+
+
+def _record_int(rec: Dict[str, Any], keys: List[str], default: int) -> int:
+    for key in keys:
+        if key in rec:
+            try:
+                return int(rec[key])
+            except Exception:
+                pass
+    return default
+
+
+def _format_route_key(player_point: int, banker_point: int, route_type: str, count_gap_mode: str = "") -> List[str]:
+    base = f"P{player_point}_B{banker_point}"
+    keys = [
+        f"{base}_ROUTE_{route_type}",
+        f"{base}_R_{route_type}",
+        f"{base}:{route_type}",
+        f"{route_type}:{base}",
+    ]
+
+    if count_gap_mode:
+        keys.extend([
+            f"{base}_ROUTE_{route_type}_GAP_{count_gap_mode}",
+            f"{base}_R_{route_type}_G_{count_gap_mode}",
+            f"{route_type}:{count_gap_mode}:{base}",
+        ])
+
+    return keys
+
+
+def _try_call_route_db_function(
+    fn,
+    player_point: int,
+    banker_point: int,
+    route_type: str,
+    count_gap_mode: str,
+) -> Optional[Dict[str, Any]]:
+    call_patterns = [
+        lambda: fn(player_point, banker_point, route_type),
+        lambda: fn(player_point, banker_point, route_type, count_gap_mode),
+        lambda: fn(player_point=player_point, banker_point=banker_point, route_type=route_type),
+        lambda: fn(player_point=player_point, banker_point=banker_point, route_type=route_type, count_gap_mode=count_gap_mode),
+        lambda: fn(player_point=player_point, banker_point=banker_point, route=route_type),
+    ]
+
+    for call in call_patterns:
+        try:
+            rec = call()
+            if isinstance(rec, dict):
+                return rec
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
+def _try_get_route_record_from_point_db(
+    player_point: int,
+    banker_point: int,
+    route_type: str,
+    count_gap_mode: str,
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """
+    嘗試從 point_db.py 取得「點數 + 局型」專用資料。
+
+    支援以下任一種寫法：
+    1. point_db.py 有 get_point_route_record()
+    2. point_db.py 有 get_route_point_record()
+    3. point_db.py 有 get_context_point_record()
+    4. point_db.py 有 POINT_ROUTE_DB / ROUTE_POINT_DB dict
+    """
+
+    if not ROUTE_DB_MODE or not route_type or route_type == "normal":
+        return None, "ROUTE_DB_DISABLED_OR_NORMAL", ""
+
+    function_names = [
+        "get_point_route_record",
+        "get_route_point_record",
+        "get_context_point_record",
+        "get_point_context_record",
+    ]
+
+    for fn_name in function_names:
+        fn = getattr(point_db_module, fn_name, None)
+        if callable(fn):
+            rec = _try_call_route_db_function(fn, player_point, banker_point, route_type, count_gap_mode)
+            if isinstance(rec, dict):
+                return rec, f"ROUTE_DB_FUNCTION:{fn_name}", ""
+
+    keys = _format_route_key(player_point, banker_point, route_type, count_gap_mode)
+
+    dict_names = [
+        "POINT_ROUTE_DB",
+        "ROUTE_POINT_DB",
+        "POINT_CONTEXT_DB",
+        "CONTEXT_POINT_DB",
+    ]
+
+    for dict_name in dict_names:
+        db = getattr(point_db_module, dict_name, None)
+        if isinstance(db, dict):
+            for key in keys:
+                rec = db.get(key)
+                if isinstance(rec, dict):
+                    return rec, f"ROUTE_DB_DICT:{dict_name}", key
+
+    return None, "ROUTE_DB_NOT_FOUND_FALLBACK_BASE", ""
+
+
+def _build_point_result_from_record(
+    rec: Dict[str, Any],
+    player_point: int,
+    banker_point: int,
+    source: str,
+    feature_key_value: str,
+    available: bool = True,
+) -> Dict[str, Any]:
+    banker = _record_float(
+        rec,
+        ["next_banker_rate", "banker_prob", "banker_rate", "b_rate", "banker"],
+        BASE_BANKER_NO_TIE,
+    )
+
+    player = _record_float(
+        rec,
+        ["next_player_rate", "player_prob", "player_rate", "p_rate", "player"],
+        1.0 - banker,
+    )
+
+    total = banker + player
+    if total > 0:
+        banker = banker / total
+        player = player / total
+    else:
+        banker = BASE_BANKER_NO_TIE
+        player = 1.0 - banker
+
+    sample_size = _record_int(rec, ["sample", "sample_size", "samples", "n"], 0)
+
     return {
+        "available": available,
+        "feature_key": feature_key_value,
+        "banker_prob": clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB),
+        "player_prob": 1.0 - clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB),
+        "source": rec.get("source", source),
+        "sample_size": sample_size,
+        "total_simulated_samples": int(point_db_meta().get("total_simulated_samples", 0)),
+        "route_db_used": source.startswith("ROUTE_DB"),
+        "route_db_key": feature_key_value,
+    }
+
+
+def point_db_lookup(
+    player_point: int,
+    banker_point: int,
+    route_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    route_context = route_context or {}
+    route_type = str(route_context.get("route_type", "normal"))
+    count_gap_mode = str(route_context.get("count_gap_mode", ""))
+
+    route_rec, route_source, route_key = _try_get_route_record_from_point_db(
+        player_point,
+        banker_point,
+        route_type,
+        count_gap_mode,
+    )
+
+    if isinstance(route_rec, dict):
+        sample_size = _record_int(route_rec, ["sample", "sample_size", "samples", "n"], 0)
+
+        if sample_size >= ROUTE_DB_MIN_SAMPLE or sample_size == 0:
+            feature = route_key or f"P{player_point}_B{banker_point}_ROUTE_{route_type}"
+            return _build_point_result_from_record(
+                route_rec,
+                player_point,
+                banker_point,
+                route_source,
+                feature,
+                available=True,
+            )
+
+    if not ROUTE_DB_FALLBACK_TO_BASE:
+        return fallback_point_lookup(player_point, banker_point)
+
+    rec = get_point_record(player_point, banker_point)
+    base_result = {
         "available": True,
         "feature_key": f"P{player_point}_B{banker_point}",
         "banker_prob": float(rec["next_banker_rate"]),
@@ -621,13 +826,19 @@ def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
         "source": rec.get("source", "POINT_DB"),
         "sample_size": int(rec.get("sample", 0)),
         "total_simulated_samples": int(point_db_meta().get("total_simulated_samples", 0)),
+        "route_db_used": False,
+        "route_db_key": "",
+        "route_db_status": route_source,
+        "route_type": route_type,
     }
+    return base_result
 
 
 def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
     banker = BASE_BANKER_NO_TIE
+
     if diff == 0:
         banker += stable_noise(key + ":tie", 0.018)
     elif 1 <= diff <= 2:
@@ -642,8 +853,10 @@ def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any
         banker -= 0.185
     elif diff <= -6:
         banker -= 0.115
+
     banker += stable_noise(key + ":fallback", 0.045)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+
     return {
         "available": False,
         "feature_key": key,
@@ -652,24 +865,33 @@ def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any
         "source": "FALLBACK_POINT_RULE",
         "sample_size": 0,
         "total_simulated_samples": 0,
+        "route_db_used": False,
+        "route_db_key": "",
+        "route_db_status": "FALLBACK_POINT_RULE",
+        "route_type": "",
     }
 
 
 def ai_simulation_layer(player_point: int, banker_point: int) -> Dict[str, Any]:
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
+
     x = 0.0
     x += -0.055 * diff
+
     if abs(diff) in {1, 2}:
         x += -0.16 if diff > 0 else 0.16
     elif abs(diff) in {3, 4, 5}:
         x += 0.16 if diff > 0 else -0.16
     elif abs(diff) >= 6:
         x += 0.09 if diff > 0 else -0.09
+
     x += stable_noise(key + ":ai", 0.11)
+
     banker = 1.0 / (1.0 + math.exp(-x))
     banker = 0.15 + banker * 0.70
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+
     return {
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
@@ -682,8 +904,19 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     banker_point = validate_point(banker_point)
     rounds = rounds or []
 
+    selected = select_weights_by_count_gap(rounds)
+    route = detect_route_type(rounds)
+    selected = apply_route_weights(selected, route)
+
+    route_context = {
+        "route_type": route.get("route_type", "normal"),
+        "count_gap_mode": selected.get("mode", ""),
+        "count_gap": selected.get("gap", 0),
+        "leader": selected.get("leader", "平衡"),
+    }
+
     try:
-        point = point_db_lookup(player_point, banker_point) if USE_POINT_DB else fallback_point_lookup(player_point, banker_point)
+        point = point_db_lookup(player_point, banker_point, route_context) if USE_POINT_DB else fallback_point_lookup(player_point, banker_point)
     except Exception:
         point = fallback_point_lookup(player_point, banker_point)
 
@@ -698,17 +931,15 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     ai = ai_simulation_layer(player_point, banker_point)
 
-    selected = select_weights_by_count_gap(rounds)
-    route = detect_route_type(rounds)
-    selected = apply_route_weights(selected, route)
-
     p_w = selected["point_weight"]
     pat_w = selected["pattern_weight"] if pattern.get("available") else 0.0
     sim_w = selected["sim_weight"]
+
     if not pattern.get("available"):
         p_w += selected["pattern_weight"]
 
     total_weight = max(p_w + pat_w + sim_w, 0.0001)
+
     banker = (
         point["banker_prob"] * p_w +
         pattern["banker_prob"] * pat_w +
@@ -739,6 +970,15 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "pattern_total_samples": int(pattern_db_meta().get("total_simulated_samples", 0)),
         "matched_patterns": pattern.get("matched", [])[:3],
         "weights": {"point": p_w, "pattern": pat_w, "simulation": sim_w},
+        "route_db_debug": {
+            "route_db_mode": ROUTE_DB_MODE,
+            "route_db_used": point.get("route_db_used", False),
+            "route_db_key": point.get("route_db_key", ""),
+            "route_db_status": point.get("route_db_status", ""),
+            "route_type_for_db": route_context["route_type"],
+            "count_gap_mode_for_db": route_context["count_gap_mode"],
+            "route_db_min_sample": ROUTE_DB_MIN_SAMPLE,
+        },
         "count_gap_debug": {
             "mode": selected["mode"],
             "count_gap_mode": selected["count_gap_mode"],
