@@ -17,11 +17,13 @@ from pattern_db import pattern_lookup, pattern_db_meta
 
 BASE_BANKER_NO_TIE = 0.5068
 
+
 def _get_float_env(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
     except Exception:
         return default
+
 
 def _get_int_env(name: str, default: int) -> int:
     try:
@@ -29,11 +31,13 @@ def _get_int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _get_bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 # 莊閒累積開局差距權重切換器
 COUNT_GAP_MODE = _get_bool_env("COUNT_GAP_MODE", False)
@@ -88,7 +92,7 @@ TWO_ROOM_POINT_WEIGHT = _get_float_env("TWO_ROOM_POINT_WEIGHT", 0.48)
 TWO_ROOM_PATTERN_WEIGHT = _get_float_env("TWO_ROOM_PATTERN_WEIGHT", 0.38)
 TWO_ROOM_SIM_WEIGHT = _get_float_env("TWO_ROOM_SIM_WEIGHT", 0.14)
 
-# ==================== 新增：單跳 / 雙跳 ====================
+# 單跳 / 雙跳
 SINGLE_CHOP_TRIGGER = _get_int_env("SINGLE_CHOP_TRIGGER", 4)
 DOUBLE_CHOP_TRIGGER = _get_int_env("DOUBLE_CHOP_TRIGGER", 3)
 
@@ -99,6 +103,25 @@ SINGLE_CHOP_SIM_WEIGHT = _get_float_env("SINGLE_CHOP_SIM_WEIGHT", 0.13)
 DOUBLE_CHOP_POINT_WEIGHT = _get_float_env("DOUBLE_CHOP_POINT_WEIGHT", 0.46)
 DOUBLE_CHOP_PATTERN_WEIGHT = _get_float_env("DOUBLE_CHOP_PATTERN_WEIGHT", 0.41)
 DOUBLE_CHOP_SIM_WEIGHT = _get_float_env("DOUBLE_CHOP_SIM_WEIGHT", 0.13)
+
+# ==================== 新增：斷路偵測 ====================
+BREAK_ROUTE_MODE = _get_bool_env("BREAK_ROUTE_MODE", True)
+
+BREAK_DRAGON_POINT_WEIGHT = _get_float_env("BREAK_DRAGON_POINT_WEIGHT", 0.52)
+BREAK_DRAGON_PATTERN_WEIGHT = _get_float_env("BREAK_DRAGON_PATTERN_WEIGHT", 0.35)
+BREAK_DRAGON_SIM_WEIGHT = _get_float_env("BREAK_DRAGON_SIM_WEIGHT", 0.13)
+
+DRAGON_RECONNECT_POINT_WEIGHT = _get_float_env("DRAGON_RECONNECT_POINT_WEIGHT", 0.44)
+DRAGON_RECONNECT_PATTERN_WEIGHT = _get_float_env("DRAGON_RECONNECT_PATTERN_WEIGHT", 0.43)
+DRAGON_RECONNECT_SIM_WEIGHT = _get_float_env("DRAGON_RECONNECT_SIM_WEIGHT", 0.13)
+
+BREAK_CHOP_POINT_WEIGHT = _get_float_env("BREAK_CHOP_POINT_WEIGHT", 0.51)
+BREAK_CHOP_PATTERN_WEIGHT = _get_float_env("BREAK_CHOP_PATTERN_WEIGHT", 0.36)
+BREAK_CHOP_SIM_WEIGHT = _get_float_env("BREAK_CHOP_SIM_WEIGHT", 0.13)
+
+TWO_ROOM_BREAK_POINT_WEIGHT = _get_float_env("TWO_ROOM_BREAK_POINT_WEIGHT", 0.50)
+TWO_ROOM_BREAK_PATTERN_WEIGHT = _get_float_env("TWO_ROOM_BREAK_PATTERN_WEIGHT", 0.37)
+TWO_ROOM_BREAK_SIM_WEIGHT = _get_float_env("TWO_ROOM_BREAK_SIM_WEIGHT", 0.13)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -247,22 +270,21 @@ def detect_two_room(symbols: List[str]) -> Dict[str, Any]:
     return {"active": False, "pattern": recent4, "length": 0}
 
 
-# ==================== 新增函數：單跳與雙跳 ====================
 def detect_single_chop(symbols: List[str]) -> Dict[str, Any]:
     """單跳偵測：BPBPBP... 嚴格交替"""
     if len(symbols) < SINGLE_CHOP_TRIGGER:
         return {"active": False, "length": 0, "type": "single_chop"}
-    
+
     length = 1
-    for i in range(len(symbols)-1, 0, -1):
-        if symbols[i] != symbols[i-1]:
+    for i in range(len(symbols) - 1, 0, -1):
+        if symbols[i] != symbols[i - 1]:
             length += 1
         else:
             break
     return {
         "active": length >= SINGLE_CHOP_TRIGGER,
         "length": length,
-        "type": "single_chop"
+        "type": "single_chop",
     }
 
 
@@ -270,35 +292,151 @@ def detect_double_chop(symbols: List[str]) -> Dict[str, Any]:
     """雙跳偵測：BBPPBBPP... 或 PPBBPPBB..."""
     if len(symbols) < DOUBLE_CHOP_TRIGGER * 2:
         return {"active": False, "length": 0, "type": "double_chop"}
-    
+
     recent = "".join(symbols[-10:])
     double_patterns = ["BBPPBBPP", "PPBBPPBB", "BPPBBPPB", "PBBPPBBP"]
-    
+
     for p in double_patterns:
         if p in recent:
             return {"active": True, "length": 8, "type": "double_chop"}
-    
+
     recent4 = "".join(symbols[-4:])
     if recent4 in ["BBPP", "PPBB"]:
         return {"active": True, "length": 4, "type": "double_chop"}
-    
+
     return {"active": False, "length": 0, "type": "double_chop"}
+
+
+def count_same_run_before_index(symbols: List[str], end_exclusive: int, side: str) -> int:
+    """
+    從 end_exclusive - 1 開始往前數連續 side 幾口。
+    """
+    length = 0
+    i = end_exclusive - 1
+    while i >= 0 and symbols[i] == side:
+        length += 1
+        i -= 1
+    return length
+
+
+def detect_break_route(symbols: List[str]) -> Dict[str, Any]:
+    """
+    斷路偵測器。
+
+    break_dragon:
+        BBBBP / PPPPB
+        代表長龍剛被另一方打斷。
+
+    dragon_reconnect:
+        BBBP B / PPPB P
+        代表長龍斷一口後又接回。
+
+    break_chop:
+        BPBP P / PBPB B
+        代表單跳被破壞。
+
+    two_room_break:
+        BBPPBB B / PPBBPP P
+        代表兩房節奏被破壞，可能轉長龍。
+    """
+
+    default = {
+        "active": False,
+        "type": "none",
+        "broken_side": None,
+        "break_side": None,
+        "length": 0,
+        "pattern": "".join(symbols[-10:]),
+    }
+
+    if not BREAK_ROUTE_MODE or len(symbols) < 4:
+        return default
+
+    # 斷一口後接回：BBBBP B / PPPPB P
+    if len(symbols) >= DRAGON_TRIGGER + 2:
+        last = symbols[-1]
+        breaker = symbols[-2]
+        if last != breaker:
+            previous_run_len = count_same_run_before_index(symbols, len(symbols) - 1, last)
+            if previous_run_len >= DRAGON_TRIGGER:
+                return {
+                    "active": True,
+                    "type": "dragon_reconnect",
+                    "broken_side": "莊" if last == "B" else "閒",
+                    "break_side": "莊" if breaker == "B" else "閒",
+                    "length": previous_run_len,
+                    "pattern": "".join(symbols[-10:]),
+                }
+
+    # 長龍剛被打斷：BBBBP / PPPPB
+    if len(symbols) >= DRAGON_TRIGGER + 1:
+        last = symbols[-1]
+        previous = symbols[-2]
+        if last != previous:
+            previous_run_len = count_same_run_before_index(symbols, len(symbols) - 1, previous)
+            if previous_run_len >= DRAGON_TRIGGER:
+                return {
+                    "active": True,
+                    "type": "break_dragon",
+                    "broken_side": "莊" if previous == "B" else "閒",
+                    "break_side": "莊" if last == "B" else "閒",
+                    "length": previous_run_len,
+                    "pattern": "".join(symbols[-10:]),
+                }
+
+    # 單跳破壞：前面是單跳，最後一口變成連續同方
+    if len(symbols) >= CHOP_TRIGGER + 1:
+        prev_symbols = symbols[:-1]
+        prev_chop = detect_chop(prev_symbols)
+        if prev_chop.get("active") and symbols[-1] == symbols[-2]:
+            return {
+                "active": True,
+                "type": "break_chop",
+                "broken_side": None,
+                "break_side": "莊" if symbols[-1] == "B" else "閒",
+                "length": prev_chop.get("length", 0),
+                "pattern": "".join(symbols[-10:]),
+            }
+
+    # 兩房破壞：前面是兩房，最後一口讓兩房不成立
+    if len(symbols) >= TWO_ROOM_TRIGGER + 1:
+        prev_symbols = symbols[:-1]
+        prev_two_room = detect_two_room(prev_symbols)
+        now_two_room = detect_two_room(symbols)
+        if prev_two_room.get("active") and not now_two_room.get("active"):
+            return {
+                "active": True,
+                "type": "two_room_break",
+                "broken_side": None,
+                "break_side": "莊" if symbols[-1] == "B" else "閒",
+                "length": prev_two_room.get("length", 0),
+                "pattern": "".join(symbols[-10:]),
+            }
+
+    return default
 
 
 def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
     symbols = rounds_to_symbols(rounds, ignore_tie=True)
-    
+
     dragon = detect_dragon(symbols)
     single_chop = detect_single_chop(symbols)
     double_chop = detect_double_chop(symbols)
     chop = detect_chop(symbols)
     two_room = detect_two_room(symbols)
+    break_route = detect_break_route(symbols)
 
     route_type = "normal"
     route_side = None
     route_length = 0
 
-    if dragon["active"]:
+    # 斷路優先級最高，避免已經破路還繼續硬套長龍 / 跳路 / 兩房權重。
+    if break_route["active"]:
+        route_type = break_route["type"]
+        route_side = break_route.get("break_side")
+        route_length = break_route.get("length", 0)
+
+    elif dragon["active"]:
         route_side = dragon["side"]
         route_length = dragon["length"]
         if route_length >= DRAGON_HOT_TRIGGER:
@@ -307,15 +445,19 @@ def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
             route_type = "dragon_strong"
         else:
             route_type = "dragon"
+
     elif single_chop["active"]:
         route_type = "single_chop"
         route_length = single_chop["length"]
+
     elif double_chop["active"]:
         route_type = "double_chop"
         route_length = double_chop["length"]
+
     elif chop["active"]:
         route_type = "chop"
         route_length = chop["length"]
+
     elif two_room["active"]:
         route_type = "two_room"
         route_length = two_room["length"]
@@ -330,6 +472,7 @@ def detect_route_type(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
         "double_chop": double_chop,
         "chop": chop,
         "two_room": two_room,
+        "break_route": break_route,
     }
 
 
@@ -383,48 +526,83 @@ def apply_route_weights(base_selected: Dict[str, Any], route: Dict[str, Any]) ->
 
     route_type = route.get("route_type", "normal")
 
-    if route_type == "dragon":
+    if route_type == "break_dragon":
+        selected["point_weight"] = BREAK_DRAGON_POINT_WEIGHT
+        selected["pattern_weight"] = BREAK_DRAGON_PATTERN_WEIGHT
+        selected["sim_weight"] = BREAK_DRAGON_SIM_WEIGHT
+        selected["mode"] = f"{selected['mode']}+break_dragon"
+        selected["route_applied"] = True
+
+    elif route_type == "dragon_reconnect":
+        selected["point_weight"] = DRAGON_RECONNECT_POINT_WEIGHT
+        selected["pattern_weight"] = DRAGON_RECONNECT_PATTERN_WEIGHT
+        selected["sim_weight"] = DRAGON_RECONNECT_SIM_WEIGHT
+        selected["mode"] = f"{selected['mode']}+dragon_reconnect"
+        selected["route_applied"] = True
+
+    elif route_type == "break_chop":
+        selected["point_weight"] = BREAK_CHOP_POINT_WEIGHT
+        selected["pattern_weight"] = BREAK_CHOP_PATTERN_WEIGHT
+        selected["sim_weight"] = BREAK_CHOP_SIM_WEIGHT
+        selected["mode"] = f"{selected['mode']}+break_chop"
+        selected["route_applied"] = True
+
+    elif route_type == "two_room_break":
+        selected["point_weight"] = TWO_ROOM_BREAK_POINT_WEIGHT
+        selected["pattern_weight"] = TWO_ROOM_BREAK_PATTERN_WEIGHT
+        selected["sim_weight"] = TWO_ROOM_BREAK_SIM_WEIGHT
+        selected["mode"] = f"{selected['mode']}+two_room_break"
+        selected["route_applied"] = True
+
+    elif route_type == "dragon":
         selected["point_weight"] = DRAGON_POINT_WEIGHT
         selected["pattern_weight"] = DRAGON_PATTERN_WEIGHT
         selected["sim_weight"] = DRAGON_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+dragon"
         selected["route_applied"] = True
+
     elif route_type == "dragon_strong":
         selected["point_weight"] = DRAGON_STRONG_POINT_WEIGHT
         selected["pattern_weight"] = DRAGON_STRONG_PATTERN_WEIGHT
         selected["sim_weight"] = DRAGON_STRONG_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+dragon_strong"
         selected["route_applied"] = True
+
     elif route_type == "dragon_hot":
         selected["point_weight"] = DRAGON_HOT_POINT_WEIGHT
         selected["pattern_weight"] = DRAGON_HOT_PATTERN_WEIGHT
         selected["sim_weight"] = DRAGON_HOT_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+dragon_hot"
         selected["route_applied"] = True
+
     elif route_type == "single_chop":
         selected["point_weight"] = SINGLE_CHOP_POINT_WEIGHT
         selected["pattern_weight"] = SINGLE_CHOP_PATTERN_WEIGHT
         selected["sim_weight"] = SINGLE_CHOP_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+single_chop"
         selected["route_applied"] = True
+
     elif route_type == "double_chop":
         selected["point_weight"] = DOUBLE_CHOP_POINT_WEIGHT
         selected["pattern_weight"] = DOUBLE_CHOP_PATTERN_WEIGHT
         selected["sim_weight"] = DOUBLE_CHOP_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+double_chop"
         selected["route_applied"] = True
+
     elif route_type == "chop":
         selected["point_weight"] = CHOP_POINT_WEIGHT
         selected["pattern_weight"] = CHOP_PATTERN_WEIGHT
         selected["sim_weight"] = CHOP_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+chop"
         selected["route_applied"] = True
+
     elif route_type == "two_room":
         selected["point_weight"] = TWO_ROOM_POINT_WEIGHT
         selected["pattern_weight"] = TWO_ROOM_PATTERN_WEIGHT
         selected["sim_weight"] = TWO_ROOM_SIM_WEIGHT
         selected["mode"] = f"{selected['mode']}+two_room"
         selected["route_applied"] = True
+
     else:
         selected["route_applied"] = False
 
@@ -587,6 +765,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "double_chop": route.get("double_chop"),
             "chop": route["chop"],
             "two_room": route["two_room"],
+            "break_route": route["break_route"],
         },
         "no_observe": True,
     }
