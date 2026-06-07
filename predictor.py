@@ -1,6 +1,7 @@
 import hashlib
 import math
 from typing import Dict, Any, List
+
 from config import (
     POINT_WEIGHT,
     PATTERN_WEIGHT,
@@ -10,9 +11,31 @@ from config import (
     PERCENT_DECIMALS,
     USE_POINT_DB,
 )
+
 from point_db import get_point_record, point_db_meta
 
+
 BASE_BANKER_NO_TIE = 0.5068
+
+# ============================================================
+# 和局點數保護參數
+# ============================================================
+# TIE_AI_MAX_WEIGHT:
+# 上一局為和局點數時，限制 AI simulation 最大權重，避免 noise 拉歪結果。
+TIE_AI_MAX_WEIGHT = 0.02
+
+# TIE_SHRINK:
+# 上一局為和局點數時，將預測機率往 BASE_BANKER_NO_TIE 拉回。
+# 數值越低越保守：
+# 0.20 = 很保守
+# 0.30 = 建議穩定版
+# 0.40 = 比較積極
+TIE_SHRINK = 0.30
+
+# TIE_MIN_GAP_FOR_ENTRY:
+# 上一局為和局點數時，莊閒差距低於此值就建議觀察。
+# 0.08 = 8%
+TIE_MIN_GAP_FOR_ENTRY = 0.08
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -174,6 +197,24 @@ def ai_simulation_layer(player_point: int, banker_point: int) -> Dict[str, Any]:
     }
 
 
+def apply_tie_point_protection(banker: float, is_tie_point: bool) -> float:
+    """
+    和局點數保護：
+    如果上一局為和局點數，例如 P6_B6、P7_B7、P8_B8，
+    則不完全相信 point_db 或 AI 拉出的偏移值，
+    而是將機率往百家樂基準莊率 BASE_BANKER_NO_TIE 拉回。
+
+    目的：
+    - 降低和局後預測過度自信
+    - 避免和局樣本偏差導致方向亂喊
+    - 讓和局後的訊號更保守
+    """
+    if not is_tie_point:
+        return banker
+
+    return BASE_BANKER_NO_TIE + (banker - BASE_BANKER_NO_TIE) * TIE_SHRINK
+
+
 def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     純資料庫對應版。
@@ -186,10 +227,19 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     - 不使用 Count Gap。
     - 不使用 Route Detector。
     - 不使用 Break Route。
+
+    本版新增：
+    - 和局點數保護 tie_point_mode。
+    - 上一局如果是和局點數，降低 AI simulation 干擾。
+    - 上一局如果是和局點數，機率拉回 BASE_BANKER_NO_TIE。
+    - 上一局如果是和局點數且莊閒差距不足，回傳 entry_allowed=False。
     """
 
     player_point = validate_point(player_point)
     banker_point = validate_point(banker_point)
+
+    last_result = get_last_result(player_point, banker_point)
+    is_tie_point = player_point == banker_point
 
     try:
         point = point_db_lookup(player_point, banker_point) if USE_POINT_DB else fallback_point_lookup(player_point, banker_point)
@@ -203,6 +253,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     pat_w = 0.0
     sim_w = SIM_WEIGHT
 
+    # 和局點數時，降低 AI 模擬層干擾。
+    if is_tie_point:
+        sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
+
     total_weight = max(p_w + sim_w, 0.0001)
 
     banker = (
@@ -210,36 +264,72 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         ai["banker_prob"] * sim_w
     ) / total_weight
 
+    # 和局點數保護：把機率拉回基準莊率附近。
+    banker = apply_tie_point_protection(banker, is_tie_point)
+
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     player = 1.0 - banker
+
+    gap = abs(banker - player)
+
     recommend = "莊" if banker >= player else "閒"
+
+    entry_allowed = True
+    weak_reason = ""
+
+    # 和局後如果莊閒差距不足，建議觀察。
+    if is_tie_point and gap < TIE_MIN_GAP_FOR_ENTRY:
+        entry_allowed = False
+        weak_reason = "上一局為和局點數，莊閒優勢不足，建議觀察一局"
 
     return {
         "ok": True,
+
         "player_point": player_point,
         "banker_point": banker_point,
-        "last_result": get_last_result(player_point, banker_point),
+        "last_result": last_result,
+
         "recommend": recommend,
         "player_prob": round(player * 100, PERCENT_DECIMALS),
         "banker_prob": round(banker * 100, PERCENT_DECIMALS),
+
         "player_prob_raw": player,
         "banker_prob_raw": banker,
+
+        "confidence_gap": round(gap * 100, PERCENT_DECIMALS),
+        "confidence_gap_raw": gap,
+
+        "entry_allowed": entry_allowed,
+        "weak_reason": weak_reason,
+
+        "tie_point_mode": is_tie_point,
+        "tie_ai_max_weight": TIE_AI_MAX_WEIGHT if is_tie_point else None,
+        "tie_shrink": TIE_SHRINK if is_tie_point else None,
+        "tie_min_gap_for_entry": TIE_MIN_GAP_FOR_ENTRY if is_tie_point else None,
+
         "feature_key": point["feature_key"],
+
         "point_source": point["source"],
         "pattern_source": "DISABLED_HISTORY_NOT_USED",
         "ai_source": ai["source"],
+
         "point_sample_size": point["sample_size"],
         "pattern_sample_size": 0,
+
         "point_total_samples": point["total_simulated_samples"],
         "pattern_total_samples": 0,
+
         "matched_patterns": [],
+
         "weights": {
             "point": p_w,
             "pattern": pat_w,
             "simulation": sim_w,
         },
+
         "history_used": False,
         "rounds_ignored": True,
-        "mode": "POINT_DB_ONLY_NO_USER_HISTORY",
-        "no_observe": True,
+
+        "mode": "POINT_DB_ONLY_NO_USER_HISTORY_TIE_PROTECTION",
+        "no_observe": not entry_allowed,
     }
