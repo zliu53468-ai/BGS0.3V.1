@@ -158,8 +158,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
 
     total_weight = max(p_w + pat_w + sim_w, 0.0001)
+    
+    # 真正加入 PATTERN_WEIGHT（目前借用 point_db 結果作為規律貢獻）
     banker = (
-        point["banker_prob"] * p_w +
+        point["banker_prob"] * (p_w + pat_w) +   # POINT + PATTERN 都用 point_db
         ai["banker_prob"] * sim_w
     ) / total_weight
 
@@ -195,12 +197,12 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "tie_min_gap_for_entry": TIE_MIN_GAP_FOR_ENTRY if is_tie_point else None,
         "feature_key": point["feature_key"],
         "point_source": point["source"],
-        "pattern_source": "DB_PATTERN_DISABLED",
+        "pattern_source": "POINT_DB_PATTERN" if pat_w > 0 else "DISABLED",
         "ai_source": ai["source"],
         "point_sample_size": point["sample_size"],
-        "pattern_sample_size": 0,
+        "pattern_sample_size": point["sample_size"] if pat_w > 0 else 0,
         "point_total_samples": point["total_simulated_samples"],
-        "pattern_total_samples": 0,
+        "pattern_total_samples": point["total_simulated_samples"] if pat_w > 0 else 0,
         "matched_patterns": [],
         "weights": {"point": p_w, "pattern": pat_w, "simulation": sim_w},
         "history_used": False,
