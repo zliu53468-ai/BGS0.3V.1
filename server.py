@@ -1,14 +1,21 @@
 import base64
 import hashlib
 import hmac
+import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
+
+try:
+    import redis
+except Exception:
+    redis = None
 
 from config import LINE_CHANNEL_SECRET, ENABLE_SIGNATURE_VERIFY, GAME_MAP, DEFAULT_GAME, DEFAULT_TABLE
 from session_store import store
@@ -30,33 +37,169 @@ from parser_utils import parse_points, looks_like_table_id
 from point_db import point_db_meta
 from pattern_db import pattern_db_meta
 
+
 app = Flask(__name__)
 CORS(app)
 
 
-# 每個 UID 第一次正式輸入莊閒點數後，才開始計算試用時間。
-# 預設 30 分鐘，可在 Render 環境變數設定 TRIAL_MINUTES 調整。
+# ============================================================
+# 基本設定
+# ============================================================
+
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 TRIAL_SECONDS = TRIAL_MINUTES * 60
-TRIAL_STARTED_AT = {}
 
-# ---------- 自動化成交 / 開通碼 / 封鎖紀錄 ----------
-# 可在 Render Environment Variables 修改。
 ADMIN_LINE_URL = os.getenv("ADMIN_LINE_URL", "https://lin.ee/xYcGKN0").strip()
+
 TEMP_TRIAL_CODE = os.getenv("TEMP_TRIAL_CODE", "aaa1688002").strip()
 TEMP_TRIAL_MINUTES = int(os.getenv("TEMP_TRIAL_MINUTES", "15"))
 TEMP_TRIAL_SECONDS = TEMP_TRIAL_MINUTES * 60
+
 MONTHLY_ACTIVATION_CODE = os.getenv("MONTHLY_ACTIVATION_CODE", "aaa1688001").strip()
 MONTHLY_DAYS = int(os.getenv("MONTHLY_DAYS", "30"))
+
 PERMANENT_ACTIVATION_CODE = os.getenv("PERMANENT_ACTIVATION_CODE", "aaa1788001").strip()
 
-# 注意：沿用目前專案架構，以下資料暫存在服務記憶體。
-# Render 重啟 / 重新部署後會清空；正式長期營運建議再改 Redis / DB。
-ACCESS_BY_UID = {}
-BLOCKED_HISTORY_UIDS = set()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_PREFIX = os.getenv("REDIS_PREFIX", "bgs_line_bot").strip()
 
 
-# ---------- 逆馬丁本金配注 ----------
+# ============================================================
+# Redis / 記憶體持久化封裝
+# ============================================================
+
+class PersistentAccessStore:
+    """
+    正式營運建議一定要設定 REDIS_URL。
+    沒有 REDIS_URL 時，會退回記憶體模式，但 Render 重啟後資料會清空。
+    """
+
+    def __init__(self):
+        self.redis_client = None
+        self.memory = {
+            "trial_started_at": {},
+            "trial_expired": set(),
+            "access": {},
+            "blocked_history": set(),
+        }
+
+        if REDIS_URL and redis is not None:
+            try:
+                self.redis_client = redis.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_timeout=5,
+                    socket_connect_timeout=5,
+                )
+                self.redis_client.ping()
+                print("[PersistentAccessStore] Redis connected.")
+            except Exception as e:
+                print(f"[PersistentAccessStore] Redis connect failed, fallback to memory: {e}")
+                self.redis_client = None
+        else:
+            print("[PersistentAccessStore] REDIS_URL not set or redis package missing, using memory mode.")
+
+    @property
+    def mode(self) -> str:
+        return "redis" if self.redis_client else "memory"
+
+    def key(self, name: str, user_id: str) -> str:
+        return f"{REDIS_PREFIX}:{name}:{user_id}"
+
+    # ---------- trial_started_at ----------
+
+    def get_trial_started_at(self, user_id: str):
+        if self.redis_client:
+            value = self.redis_client.get(self.key("trial_started_at", user_id))
+            return float(value) if value else None
+
+        return self.memory["trial_started_at"].get(user_id)
+
+    def set_trial_started_at(self, user_id: str, ts: float):
+        if self.redis_client:
+            self.redis_client.set(self.key("trial_started_at", user_id), str(float(ts)))
+            return
+
+        self.memory["trial_started_at"][user_id] = float(ts)
+
+    # ---------- trial_expired ----------
+
+    def is_trial_expired_uid(self, user_id: str) -> bool:
+        if self.redis_client:
+            return bool(self.redis_client.get(self.key("trial_expired", user_id)))
+
+        return user_id in self.memory["trial_expired"]
+
+    def set_trial_expired_uid(self, user_id: str):
+        if self.redis_client:
+            self.redis_client.set(self.key("trial_expired", user_id), "1")
+            return
+
+        self.memory["trial_expired"].add(user_id)
+
+    # ---------- access ----------
+
+    def get_access(self, user_id: str):
+        if self.redis_client:
+            raw = self.redis_client.get(self.key("access", user_id))
+            if not raw:
+                return None
+
+            try:
+                return json.loads(raw)
+            except Exception:
+                self.delete_access(user_id)
+                return None
+
+        return self.memory["access"].get(user_id)
+
+    def set_access(self, user_id: str, data: dict):
+        if self.redis_client:
+            self.redis_client.set(
+                self.key("access", user_id),
+                json.dumps(data, ensure_ascii=False),
+            )
+            return
+
+        self.memory["access"][user_id] = data
+
+    def delete_access(self, user_id: str):
+        if self.redis_client:
+            self.redis_client.delete(self.key("access", user_id))
+            return
+
+        self.memory["access"].pop(user_id, None)
+
+    # ---------- blocked_history ----------
+
+    def is_blocked_history(self, user_id: str) -> bool:
+        if self.redis_client:
+            return bool(self.redis_client.get(self.key("blocked_history", user_id)))
+
+        return user_id in self.memory["blocked_history"]
+
+    def set_blocked_history(self, user_id: str):
+        if self.redis_client:
+            self.redis_client.set(self.key("blocked_history", user_id), "1")
+            return
+
+        self.memory["blocked_history"].add(user_id)
+
+    def clear_blocked_history(self, user_id: str):
+        if self.redis_client:
+            self.redis_client.delete(self.key("blocked_history", user_id))
+            return
+
+        self.memory["blocked_history"].discard(user_id)
+
+
+pstore = PersistentAccessStore()
+
+
+# ============================================================
+# 逆馬丁本金配注
+# ============================================================
+
 BET_LEVEL_PCTS = [0.03, 0.07, 0.15]
 
 
@@ -73,34 +216,42 @@ def _set_attr(obj, name, value):
 
 def _normalize_side(value):
     text = str(value or "").strip()
+
     if "莊" in text or text.upper() in {"B", "BANKER"}:
         return "莊"
+
     if "閒" in text or "闲" in text or text.upper() in {"P", "PLAYER"}:
         return "閒"
+
     return None
 
 
 def _round_bet_amount(amount: float) -> int:
     amount = float(amount or 0)
+
     if amount <= 0:
         return 0
-    # 四捨五入到百位：1520 -> 1500，1560 -> 1600
+
     return int((amount + 50) // 100 * 100)
 
 
 def _ensure_betting_fields(sess):
     if _get_attr(sess, "bankroll", None) is None:
         _set_attr(sess, "bankroll", 0)
+
     if _get_attr(sess, "bet_level", None) is None:
         _set_attr(sess, "bet_level", 0)
+
     if _get_attr(sess, "last_recommend", None) is None:
         _set_attr(sess, "last_recommend", None)
+
     if _get_attr(sess, "last_bet_level", None) is None:
         _set_attr(sess, "last_bet_level", 0)
 
 
 def _settle_betting_level(sess, actual_side: str) -> str:
     _ensure_betting_fields(sess)
+
     last_recommend = _normalize_side(_get_attr(sess, "last_recommend", None))
     last_bet_level = int(_get_attr(sess, "last_bet_level", 0) or 0)
 
@@ -112,6 +263,7 @@ def _settle_betting_level(sess, actual_side: str) -> str:
         if last_bet_level >= 2:
             _set_attr(sess, "bet_level", 0)
             return "✅ 上局建議命中，第 3 關 15% 已過，下一局自動回到第 1 關 3%。"
+
         _set_attr(sess, "bet_level", last_bet_level + 1)
         next_pct = BET_LEVEL_PCTS[last_bet_level + 1] * 100
         return f"✅ 上局建議命中，下一局進入第 {last_bet_level + 2} 關，本金 {next_pct:.0f}%。"
@@ -122,14 +274,17 @@ def _settle_betting_level(sess, actual_side: str) -> str:
 
 def _betting_advice_text(sess, recommend: str, settle_note: str = "") -> str:
     _ensure_betting_fields(sess)
+
     bankroll = int(_get_attr(sess, "bankroll", 0) or 0)
     level = int(_get_attr(sess, "bet_level", 0) or 0)
     level = max(0, min(level, len(BET_LEVEL_PCTS) - 1))
+
     pct = BET_LEVEL_PCTS[level]
     amount = _round_bet_amount(bankroll * pct)
     side = _normalize_side(recommend)
 
     lines = []
+
     if settle_note:
         lines.append(settle_note)
         lines.append("")
@@ -172,35 +327,33 @@ def ask_bankroll_text() -> str:
 def parse_bankroll(raw: str):
     text = str(raw or "").replace(",", "").replace("，", "").strip()
     digits = "".join(ch for ch in text if ch.isdigit())
+
     if not digits:
         return None
+
     value = int(digits)
+
     if value <= 0:
         return None
+
     return value
 
 
+# ============================================================
 # 只針對 DG / MT真人 內建桌廳選項
-# 其餘館別不要求使用者輸入桌號，會直接進入資料庫連接流程
+# ============================================================
+
 BUILTIN_TABLES = {
     "DG": [
-        # 經典百家樂
         "RB01", "RB02", "RB03", "RB04", "RB05", "RB06", "RB07",
-
-        # 特色百家樂
         "S01", "S02", "S03", "S05", "S06", "S07",
-
-        # 區塊百家樂
         "QC01", "QC02", "QC03", "QC05", "QC06", "QC07",
         "QD01", "QD02", "QD03", "QD05", "QD06", "QD07",
     ],
     "MT真人": [
-        # MT 百家樂
         "百家樂1", "百家樂2", "百家樂3", "百家樂3A", "百家樂5",
         "百家樂6", "百家樂7", "百家樂8", "百家樂9", "百家樂10",
         "百家樂11", "百家樂12", "百家樂13", "百家樂13A",
-
-        # MT 其他廳
         "龍虎1", "龍虎2", "牛牛1", "殷寶1",
     ],
 }
@@ -215,7 +368,7 @@ def build_builtin_table_menu(game: str) -> str:
     lines = [
         f"🎯【請選擇{game}桌廳】",
         "請直接輸入數字或桌號選擇",
-        ""
+        "",
     ]
 
     for idx, table in enumerate(tables, start=1):
@@ -231,27 +384,30 @@ def normalize_builtin_table_input(game: str, raw: str):
     if not tables:
         return None
 
-    # 支援輸入數字選擇
     if text.isdigit():
         idx = int(text)
+
         if 1 <= idx <= len(tables):
             return tables[idx - 1]
 
-    # 支援直接輸入 DG 桌號，例如 RB01 / QC01 / QD05 / S01
     for table in tables:
         normalized = table.upper().replace(" ", "")
+
         if text == normalized:
             return table
 
-    # 支援 MT 直接輸入 1 / 百家樂1 / 龍虎1 等
-    # 例如輸入「百家樂 1」會被轉成「百家樂1」
     raw_no_space = raw.strip().replace(" ", "").upper()
+
     for table in tables:
         if raw_no_space == table.upper().replace(" ", ""):
             return table
 
     return None
 
+
+# ============================================================
+# 文字訊息
+# ============================================================
 
 def welcome_join_text() -> str:
     return (
@@ -277,6 +433,7 @@ def trial_not_started_text() -> str:
 
 def trial_started_text(remaining_seconds: int) -> str:
     minutes = max(1, remaining_seconds // 60)
+
     return (
         "⏱️ 試用已正式開始\n"
         f"本 UID 試用時間為 {TRIAL_MINUTES} 分鐘，目前約剩 {minutes} 分鐘。"
@@ -304,52 +461,93 @@ def blocked_history_notice_text() -> str:
     return admin_line_notice_text("⛔ 此 LINE UID 有封鎖／取消加入紀錄，需重新領取開通碼後才能使用。")
 
 
+# ============================================================
+# 試用與權限邏輯：已改為 Redis 持久化
+# ============================================================
+
 def ensure_trial_started(user_id: str):
-    if user_id not in TRIAL_STARTED_AT:
-        TRIAL_STARTED_AT[user_id] = time.time()
+    """
+    第一次正式輸入點數才開始計時。
+    如果已經試用到期過，不會重新開始。
+    """
+
+    if pstore.is_trial_expired_uid(user_id):
+        return False
+
+    started_at = pstore.get_trial_started_at(user_id)
+
+    if started_at is None:
+        pstore.set_trial_started_at(user_id, time.time())
         return True
+
     return False
 
 
 def get_trial_remaining_seconds(user_id: str):
-    started_at = TRIAL_STARTED_AT.get(user_id)
-    if not started_at:
+    """
+    回傳剩餘秒數。
+    None = 尚未開始。
+    0 = 已過期。
+    """
+
+    if pstore.is_trial_expired_uid(user_id):
+        return 0
+
+    started_at = pstore.get_trial_started_at(user_id)
+
+    if started_at is None:
         return None
 
-    elapsed = time.time() - started_at
-    return max(0, int(TRIAL_SECONDS - elapsed))
+    elapsed = time.time() - float(started_at)
+    remaining = max(0, int(TRIAL_SECONDS - elapsed))
+
+    if remaining <= 0:
+        pstore.set_trial_expired_uid(user_id)
+
+    return remaining
 
 
 def is_trial_expired(user_id: str) -> bool:
+    if pstore.is_trial_expired_uid(user_id):
+        return True
+
     remaining = get_trial_remaining_seconds(user_id)
+
     return remaining is not None and remaining <= 0
 
 
 def taipei_time_text(ts: float = None) -> str:
     tz = timezone(timedelta(hours=8))
+
     if ts is None:
         ts = time.time()
+
     return datetime.fromtimestamp(ts, tz).strftime("%Y/%m/%d %H:%M:%S")
 
 
 def normalize_activation_input(raw: str) -> str:
     text = (raw or "").replace("\u3000", " ").strip()
+
     if text.startswith("開通"):
         text = text[2:].strip()
     elif text.upper().startswith("ACTIVATE"):
         text = text[len("ACTIVATE"):].strip()
+
     return text.strip().strip("：:").strip()
 
 
 def set_temp_trial_access(user_id: str) -> str:
     expires_at = time.time() + TEMP_TRIAL_SECONDS
-    BLOCKED_HISTORY_UIDS.discard(user_id)
-    ACCESS_BY_UID[user_id] = {
+
+    pstore.clear_blocked_history(user_id)
+
+    pstore.set_access(user_id, {
         "type": "temp",
         "expires_at": expires_at,
         "code_version": TEMP_TRIAL_CODE,
         "started_at": time.time(),
-    }
+    })
+
     return (
         "✅ 臨時開通成功！\n"
         f"⏱️ 此 LINE UID 已獲得 {TEMP_TRIAL_MINUTES} 分鐘臨時試用。\n"
@@ -361,13 +559,16 @@ def set_temp_trial_access(user_id: str) -> str:
 
 def set_monthly_access(user_id: str) -> str:
     expires_at = time.time() + (MONTHLY_DAYS * 24 * 60 * 60)
-    BLOCKED_HISTORY_UIDS.discard(user_id)
-    ACCESS_BY_UID[user_id] = {
+
+    pstore.clear_blocked_history(user_id)
+
+    pstore.set_access(user_id, {
         "type": "monthly",
         "expires_at": expires_at,
         "code_version": MONTHLY_ACTIVATION_CODE,
         "started_at": time.time(),
-    }
+    })
+
     return (
         "✅ 月租開通成功！\n"
         f"👑 此 LINE UID 已認定為月租客戶，有效期限 {MONTHLY_DAYS} 日。\n"
@@ -378,13 +579,15 @@ def set_monthly_access(user_id: str) -> str:
 
 
 def set_permanent_access(user_id: str) -> str:
-    BLOCKED_HISTORY_UIDS.discard(user_id)
-    ACCESS_BY_UID[user_id] = {
+    pstore.clear_blocked_history(user_id)
+
+    pstore.set_access(user_id, {
         "type": "permanent",
         "expires_at": None,
         "code_version": PERMANENT_ACTIVATION_CODE,
         "started_at": time.time(),
-    }
+    })
+
     return (
         "✅ 永久開通成功！\n"
         "💎 此 LINE UID 已認定為永久客戶，不受試用時間限制。\n"
@@ -409,33 +612,41 @@ def handle_activation_code(user_id: str, raw: str):
 
 
 def get_access_status(user_id: str):
-    info = ACCESS_BY_UID.get(user_id)
+    info = pstore.get_access(user_id)
+
     if not info:
         return None, None
 
     access_type = info.get("type")
     code_version = info.get("code_version", "")
 
-    # 若 Render 環境變數已換開通碼，舊 UID 權限自動失效。
     if access_type == "temp" and code_version != TEMP_TRIAL_CODE:
-        ACCESS_BY_UID.pop(user_id, None)
+        pstore.delete_access(user_id)
         return None, admin_line_notice_text("⛔ 臨時開通碼已更新，此 UID 需要重新領取開通碼。")
 
     if access_type == "monthly" and code_version != MONTHLY_ACTIVATION_CODE:
-        ACCESS_BY_UID.pop(user_id, None)
+        pstore.delete_access(user_id)
         return None, admin_line_notice_text("⛔ 月租開通碼已更新，此 UID 需要重新領取開通碼。")
 
     if access_type == "permanent" and code_version != PERMANENT_ACTIVATION_CODE:
-        ACCESS_BY_UID.pop(user_id, None)
+        pstore.delete_access(user_id)
         return None, admin_line_notice_text("⛔ 永久開通碼已更新，此 UID 需要重新領取開通碼。")
 
     expires_at = info.get("expires_at")
+
     if expires_at is not None and time.time() >= float(expires_at):
-        ACCESS_BY_UID.pop(user_id, None)
+        pstore.delete_access(user_id)
+
+        # 重要修補：
+        # 權限到期後，直接標記此 UID 已經不能回到免費試用。
+        pstore.set_trial_expired_uid(user_id)
+
         if access_type == "temp":
-            return None, admin_line_notice_text("⏰ 15 分鐘臨時試用已到期。")
+            return None, admin_line_notice_text(f"⏰ {TEMP_TRIAL_MINUTES} 分鐘臨時試用已到期。")
+
         if access_type == "monthly":
-            return None, admin_line_notice_text("⏰ 月租 30 日權限已到期，如需繼續租用請聯繫管理員官方 LINE。")
+            return None, admin_line_notice_text(f"⏰ 月租 {MONTHLY_DAYS} 日權限已到期，如需繼續租用請聯繫管理員官方 LINE。")
+
         return None, admin_line_notice_text("⏰ 權限已到期。")
 
     return info, None
@@ -448,18 +659,22 @@ def has_active_access(user_id: str) -> bool:
 
 def access_status_text(user_id: str) -> str:
     info, expired_msg = get_access_status(user_id)
+
     if expired_msg:
         return expired_msg
 
-    if user_id in BLOCKED_HISTORY_UIDS and not info:
+    if pstore.is_blocked_history(user_id) and not info:
         return blocked_history_notice_text()
 
     if not info:
         remaining = get_trial_remaining_seconds(user_id)
+
         if remaining is None:
             return trial_not_started_text()
+
         if remaining <= 0:
             return trial_expired_text()
+
         return trial_started_text(remaining)
 
     access_type = info.get("type")
@@ -474,6 +689,7 @@ def access_status_text(user_id: str) -> str:
     if access_type == "monthly":
         left_seconds = max(0, int(float(expires_at) - time.time()))
         left_days = max(1, left_seconds // 86400)
+
         return (
             "👑 權限狀態：月租會員\n"
             f"⏳ 約剩 {left_days} 日\n"
@@ -483,6 +699,7 @@ def access_status_text(user_id: str) -> str:
     if access_type == "temp":
         left_seconds = max(0, int(float(expires_at) - time.time()))
         left_minutes = max(1, left_seconds // 60)
+
         return (
             "⏱️ 權限狀態：臨時試用\n"
             f"⏳ 約剩 {left_minutes} 分鐘\n"
@@ -494,23 +711,41 @@ def access_status_text(user_id: str) -> str:
 
 def should_block_for_expired_trial(user_id: str) -> bool:
     info, expired_msg = get_access_status(user_id)
+
     if info:
         return False
+
     if expired_msg:
         return True
+
     return is_trial_expired(user_id)
 
+
+# ============================================================
+# LINE 簽章驗證
+# ============================================================
 
 def verify_line_signature(body: bytes, signature: str) -> bool:
     if not ENABLE_SIGNATURE_VERIFY:
         return True
+
     if not LINE_CHANNEL_SECRET:
         return False
 
-    digest = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).digest()
+
     expected = base64.b64encode(digest).decode("utf-8")
+
     return hmac.compare_digest(expected, signature)
 
+
+# ============================================================
+# Routes
+# ============================================================
 
 @app.get("/")
 def home():
@@ -521,11 +756,14 @@ def home():
 def health():
     pm = point_db_meta()
     rm = pattern_db_meta()
+
     return jsonify({
         "ok": True,
         "service": "BGS_DUAL_3M_DB_LINE_BOT",
-        "version": "server-access-betting-patch-v6-final",
+        "version": "server-access-betting-patch-v7-redis-persistent-trial",
         "sessions": store.all_count(),
+        "access_store_mode": pstore.mode,
+        "redis_enabled": pstore.mode == "redis",
         "mode": "dual_3m_point_and_result_pattern_no_observe",
         "point_db_samples": pm.get("total_simulated_samples"),
         "pattern_db_samples": rm.get("total_simulated_samples"),
@@ -535,11 +773,14 @@ def health():
 @app.post("/api/predict")
 def api_predict():
     data = request.get_json(force=True)
+
     player_point = int(data.get("player_point"))
     banker_point = int(data.get("banker_point"))
     rounds = data.get("rounds", [])
+
     result = predict(player_point, banker_point, rounds)
     ai_text = explain(result)
+
     return jsonify({**result, "ai_text": ai_text})
 
 
@@ -552,29 +793,36 @@ def webhook():
         abort(400)
 
     payload = request.get_json(force=True)
+
     for event in payload.get("events", []):
         handle_event(event)
 
     return "OK"
 
 
+# ============================================================
+# LINE Event Handler
+# ============================================================
+
 def handle_event(event: dict):
     source = event.get("source", {})
     user_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "anonymous"
 
     if event.get("type") in {"unfollow", "leave", "memberLeft"}:
-        BLOCKED_HISTORY_UIDS.add(user_id)
-        ACCESS_BY_UID.pop(user_id, None)
+        pstore.set_blocked_history(user_id)
+        pstore.delete_access(user_id)
         return
 
     reply_token = event.get("replyToken")
+
     if not reply_token:
         return
 
     if event.get("type") in {"follow", "join", "memberJoined"}:
-        if user_id in BLOCKED_HISTORY_UIDS and not has_active_access(user_id):
+        if pstore.is_blocked_history(user_id) and not has_active_access(user_id):
             reply_messages(reply_token, [text_message(blocked_history_notice_text())])
             return
+
         reply_messages(reply_token, [text_message(welcome_join_text())])
         return
 
@@ -586,6 +834,7 @@ def handle_event(event: dict):
         return
 
     msg = event.get("message", {})
+
     if msg.get("type") != "text":
         reply_messages(reply_token, [text_message("目前只支援文字輸入點數，例如：65")])
         return
@@ -593,25 +842,30 @@ def handle_event(event: dict):
     return handle_text(user_id, reply_token, msg.get("text", "").strip())
 
 
+# ============================================================
+# 主要文字流程
+# ============================================================
+
 def handle_text(user_id: str, reply_token: str, text: str):
-    # 這裡仍然是依照每個 user_id 取得自己的 session
-    # 不同使用者不會共用 rounds / game / table
     sess = store.get(user_id)
     _ensure_betting_fields(sess)
+
     raw = text.strip()
 
-    # 開通碼一定優先判斷，避免 aaa1688002 / aaa1688001 / aaa1788001 被當成點數或本金。
+    # 開通碼優先判斷，避免 aaa1688002 / aaa1688001 / aaa1788001 被當成點數或本金。
     activation_msg = handle_activation_code(user_id, raw)
+
     if activation_msg:
         reply_messages(reply_token, [text_message(activation_msg)])
         return
 
     access_info, access_expired_msg = get_access_status(user_id)
+
     if access_expired_msg:
         reply_messages(reply_token, [text_message(access_expired_msg)])
         return
 
-    if user_id in BLOCKED_HISTORY_UIDS and not access_info:
+    if pstore.is_blocked_history(user_id) and not access_info:
         reply_messages(reply_token, [text_message(blocked_history_notice_text())])
         return
 
@@ -628,10 +882,11 @@ def handle_text(user_id: str, reply_token: str, text: str):
         reply_messages(reply_token, [text_message(trial_expired_text())])
         return
 
-    # 結束 / 重置要放在本金判斷前，避免卡在 need_bankroll 時被當成本金格式錯誤。
+    # 結束 / 重置放在本金判斷前，避免卡在 need_bankroll 時被當成本金格式錯誤。
     if raw in {"結束分析", "結束", "停止分析", "停止"}:
         sess.active = False
         sess.phase = "idle"
+
         reply_messages(reply_token, [text_message(end_text())])
         return
 
@@ -639,37 +894,42 @@ def handle_text(user_id: str, reply_token: str, text: str):
         store.reset(user_id, keep_setting=True)
         new_sess = store.get(user_id)
         _ensure_betting_fields(new_sess)
-        reply_messages(reply_token, [text_message("♻️ 已重置本輪資料\n請輸入「開始分析」重新設定館別與本金。")])
+
+        reply_messages(reply_token, [
+            text_message("♻️ 已重置本輪資料\n請輸入「開始分析」重新設定館別與本金。")
+        ])
         return
 
     if raw in {"遊戲設定", "設定遊戲", "遊戲館別", "館別設定"}:
         sess.phase = "choose_game"
         sess.active = False
+
         reply_messages(reply_token, [text_message(game_menu_text())])
         return
 
     if raw in {"開始分析", "開始", "啟動分析"}:
         sess.phase = "choose_game"
         sess.active = False
+
         reply_messages(reply_token, [text_message(game_menu_text())])
         return
 
     if sess.phase == "choose_game" and raw in GAME_MAP:
         sess.game = GAME_MAP[raw]
 
-        # 只有 DG / MT真人 需要進入內建桌廳選擇
         if sess.game in BUILTIN_TABLES:
             sess.phase = "need_builtin_table"
+
             reply_messages(reply_token, [
                 text_message(f"✅ 已設定遊戲類別【{sess.game}】"),
                 text_message(build_builtin_table_menu(sess.game)),
             ])
             return
 
-        # 其餘館別不用引導輸入桌廳，直接自動設定並連接
         sess.table = f"{sess.game}_AUTO"
         sess.phase = "need_bankroll"
         sess.active = False
+
         reply_messages(reply_token, [
             text_message(f"✅ 已設定遊戲類別【{sess.game}】"),
             text_message(table_connecting_text()),
@@ -685,6 +945,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
             sess.table = selected_table
             sess.phase = "need_bankroll"
             sess.active = False
+
             reply_messages(reply_token, [
                 text_message(table_connecting_text()),
                 text_message(table_connected_text()),
@@ -701,11 +962,11 @@ def handle_text(user_id: str, reply_token: str, text: str):
         ])
         return
 
-    # 保留原本人工桌號輸入邏輯，避免舊流程或特殊情境不能用
     if sess.phase == "need_table" and looks_like_table_id(raw):
         sess.table = raw.upper()
         sess.phase = "need_bankroll"
         sess.active = False
+
         reply_messages(reply_token, [
             text_message(table_connecting_text()),
             text_message(table_connected_text()),
@@ -715,6 +976,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
 
     if sess.phase == "need_bankroll":
         bankroll = parse_bankroll(raw)
+
         if bankroll is None:
             reply_messages(reply_token, [
                 text_message(
@@ -730,6 +992,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
         sess.last_bet_level = 0
         sess.phase = "idle"
         sess.active = True
+
         reply_messages(reply_token, [
             text_message(
                 f"✅ 本金設定完成：{bankroll}\n"
@@ -746,6 +1009,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
         return
 
     points = parse_points(raw)
+
     if points:
         if not access_info:
             if is_trial_expired(user_id):
@@ -753,7 +1017,14 @@ def handle_text(user_id: str, reply_token: str, text: str):
                 return
 
             trial_first_start = ensure_trial_started(user_id)
-            remaining = get_trial_remaining_seconds(user_id) or TRIAL_SECONDS
+            remaining = get_trial_remaining_seconds(user_id)
+
+            if remaining is None:
+                remaining = TRIAL_SECONDS
+
+            if remaining <= 0:
+                reply_messages(reply_token, [text_message(trial_expired_text())])
+                return
         else:
             trial_first_start = False
             remaining = TRIAL_SECONDS
@@ -764,18 +1035,16 @@ def handle_text(user_id: str, reply_token: str, text: str):
             return
 
         player_point, banker_point = points
+
         sess.active = True
 
-        # 先依照用戶輸入的實際結果，結算上一局建議是否命中，再決定下一局配注關卡。
         actual_side = "閒" if player_point > banker_point else ("莊" if banker_point > player_point else "和")
         settle_note = _settle_betting_level(sess, actual_side)
 
-        # 先把本局結果放入臨時rounds，讓pattern能包含最新一局。
-        last_result = actual_side
         temp_rounds = sess.rounds + [{
             "player_point": player_point,
             "banker_point": banker_point,
-            "last_result": last_result,
+            "last_result": actual_side,
         }]
 
         pred = predict(player_point, banker_point, temp_rounds)
@@ -790,8 +1059,6 @@ def handle_text(user_id: str, reply_token: str, text: str):
             "banker_prob": pred["banker_prob"],
         }
 
-        # 只保留最近30局供莊閒pattern查詢；不是用來累計點數權重。
-        # 此資料存在目前 user_id 的 session 裡，每位使用者獨立。
         sess.last_round = round_data
         sess.rounds.append(round_data)
         sess.rounds = sess.rounds[-30:]
@@ -801,6 +1068,7 @@ def handle_text(user_id: str, reply_token: str, text: str):
         sess.last_bet_level = current_level
 
         messages = []
+
         if trial_first_start:
             messages.append(text_message(trial_started_text(remaining)))
 
@@ -822,6 +1090,10 @@ def handle_text(user_id: str, reply_token: str, text: str):
         )
     ])
 
+
+# ============================================================
+# Local Run
+# ============================================================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
