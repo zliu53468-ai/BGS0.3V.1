@@ -50,15 +50,9 @@ PATTERN_DB_PATH = os.getenv("PATTERN_DB_PATH", getattr(config, "PATTERN_DB_PATH"
 # 模型基準參數
 # ============================================================
 
-# 不含和局時，莊家的長期期望略高於閒
 BASE_BANKER_NO_TIE = env_float("BASE_BANKER_NO_TIE", "0.5068")
 
-# 一般局進場門檻
-# gap = abs(banker - player)
-# 0.035 = 莊閒差距小於 3.5% 不建議進場
 MIN_GAP_FOR_ENTRY = env_float("MIN_GAP_FOR_ENTRY", "0.035")
-
-# 強勢局門檻，給前端或文字判斷用
 STRONG_GAP_FOR_ENTRY = env_float("STRONG_GAP_FOR_ENTRY", "0.065")
 
 
@@ -72,6 +66,13 @@ TIE_MIN_GAP_FOR_ENTRY = env_float("TIE_MIN_GAP_FOR_ENTRY", "0.08")
 
 
 # ============================================================
+# AI 微調參數
+# ============================================================
+
+AI_NOISE_SCALE = env_float("AI_NOISE_SCALE", "0.018")
+
+
+# ============================================================
 # 工具函式
 # ============================================================
 
@@ -80,11 +81,6 @@ def clamp(value: float, low: float, high: float) -> float:
 
 
 def stable_noise(key: str, scale: float = 0.035) -> float:
-    """
-    穩定雜訊：
-    同一組 key 永遠得到同一個偏移值。
-    不是隨機亂數，不會每次跳不同結果。
-    """
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     raw = int(digest[:8], 16) / 0xFFFFFFFF
     return (raw - 0.5) * 2 * scale
@@ -93,61 +89,41 @@ def stable_noise(key: str, scale: float = 0.035) -> float:
 def get_last_result(player_point: int, banker_point: int) -> str:
     if player_point > banker_point:
         return "閒"
-
     if banker_point > player_point:
         return "莊"
-
     return "和"
 
 
 def validate_point(v: int) -> int:
     iv = int(v)
-
     if iv < 0 or iv > 9:
         raise ValueError("point must be 0-9")
-
     return iv
 
 
 def point_zone(point: int) -> str:
     if point <= 2:
         return "LOW"
-
     if point <= 5:
         return "MID"
-
     if point <= 7:
         return "HIGH"
-
     return "TOP"
 
 
 def diff_zone(diff: int) -> str:
     ad = abs(diff)
-
     if ad == 0:
         return "Z"
-
     if ad <= 2:
         return "S"
-
     if ad <= 5:
         return "M"
-
     return "L"
 
 
 def feature_key(player_point: int, banker_point: int) -> str:
-    """
-    規律特徵 key。
-    這個 key 是用來查 pattern_db 的核心。
-
-    例：
-    閒 6、莊 5
-    P6_B5_R閒_D1_ZS_PZHIGH_BZMID
-    """
     diff = player_point - banker_point
-
     return (
         f"P{player_point}_B{banker_point}"
         f"_R{get_last_result(player_point, banker_point)}"
@@ -163,11 +139,6 @@ def simple_point_key(player_point: int, banker_point: int) -> str:
 
 
 def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
-    """
-    將 banker / player 機率轉成 0~1，並正規化。
-    支援資料庫裡存 0.53 或 53 兩種格式。
-    """
-
     banker = float(banker)
     player = float(player)
 
@@ -211,11 +182,6 @@ def neutral_record(source: str = "NEUTRAL_FALLBACK") -> Dict[str, Any]:
 # ============================================================
 
 def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
-    """
-    point_db 不可用時的保底規則。
-    這層只負責避免系統掛掉，不建議當正式主模型。
-    """
-
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
 
@@ -251,25 +217,25 @@ def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any
 
 
 def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
-    """
-    主要點數資料庫查詢：
-    根據輸入點數 P/B 直接查 point_db。
-    """
-
     if not USE_POINT_DB:
         return fallback_point_lookup(player_point, banker_point)
 
     try:
         rec = get_point_record(player_point, banker_point)
 
-        banker = rec.get("next_banker_rate", rec.get("banker_prob", rec.get("banker_rate", None)))
-        player = rec.get("next_player_rate", rec.get("player_prob", rec.get("player_rate", None)))
+        banker = rec.get(
+            "next_banker_rate",
+            rec.get("banker_prob", rec.get("banker_rate", None))
+        )
+        player = rec.get(
+            "next_player_rate",
+            rec.get("player_prob", rec.get("player_rate", None))
+        )
 
         if banker is None or player is None:
             return fallback_point_lookup(player_point, banker_point)
 
         banker, player = normalize_prob_pair(float(banker), float(player))
-
         meta = point_db_meta()
 
         return {
@@ -292,41 +258,6 @@ def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def load_pattern_db_file() -> Dict[str, Any]:
-    """
-    支援 pattern_db.json 多種格式：
-
-    格式 A：
-    {
-      "records": {
-        "P6_B5_R閒_D1_ZS_PZHIGH_BZMID": {
-          "next_banker_rate": 0.53,
-          "next_player_rate": 0.47,
-          "sample": 1200
-        }
-      }
-    }
-
-    格式 B：
-    {
-      "records": [
-        {
-          "feature_key": "P6_B5_R閒_D1_ZS_PZHIGH_BZMID",
-          "next_banker_rate": 0.53,
-          "next_player_rate": 0.47,
-          "sample": 1200
-        }
-      ]
-    }
-
-    格式 C：
-    {
-      "P6_B5_R閒_D1_ZS_PZHIGH_BZMID": {
-        "banker_prob": 53,
-        "player_prob": 47
-      }
-    }
-    """
-
     path = PATTERN_DB_PATH
 
     if not os.path.exists(path):
@@ -339,7 +270,7 @@ def load_pattern_db_file() -> Dict[str, Any]:
                 "source": "PATTERN_DB_FILE_NOT_FOUND",
                 "path": PATTERN_DB_PATH,
                 "total_simulated_samples": 0,
-            }
+            },
         }
 
     try:
@@ -353,7 +284,7 @@ def load_pattern_db_file() -> Dict[str, Any]:
                     "source": "PATTERN_DB_FORMAT_ERROR",
                     "path": PATTERN_DB_PATH,
                     "total_simulated_samples": 0,
-                }
+                },
             }
 
         return data
@@ -365,20 +296,11 @@ def load_pattern_db_file() -> Dict[str, Any]:
                 "source": f"PATTERN_DB_LOAD_ERROR:{e}",
                 "path": PATTERN_DB_PATH,
                 "total_simulated_samples": 0,
-            }
+            },
         }
 
 
 def try_import_pattern_db_record(player_point: int, banker_point: int, fkey: str) -> Optional[Dict[str, Any]]:
-    """
-    優先嘗試使用 pattern_db.py 裡面的 get_pattern_record。
-    為了兼容你現有專案，這裡支援多種函式寫法：
-
-    get_pattern_record(player_point, banker_point)
-    get_pattern_record(feature_key)
-    get_pattern_record(player_point=..., banker_point=..., feature_key=...)
-    """
-
     try:
         import pattern_db
     except Exception:
@@ -399,10 +321,8 @@ def try_import_pattern_db_record(player_point: int, banker_point: int, fkey: str
     for call in call_styles:
         try:
             rec = call()
-
             if isinstance(rec, dict):
                 return rec
-
         except Exception:
             continue
 
@@ -411,7 +331,6 @@ def try_import_pattern_db_record(player_point: int, banker_point: int, fkey: str
 
 def find_record_in_pattern_json(player_point: int, banker_point: int, fkey: str) -> Optional[Dict[str, Any]]:
     data = load_pattern_db_file()
-
     records = data.get("records", data)
 
     keys_to_try = [
@@ -422,17 +341,14 @@ def find_record_in_pattern_json(player_point: int, banker_point: int, fkey: str)
         f"{player_point}{banker_point}",
     ]
 
-    # records 是 dict 格式
     if isinstance(records, dict):
         for key in keys_to_try:
             rec = records.get(key)
-
             if isinstance(rec, dict):
                 rec = dict(rec)
                 rec.setdefault("feature_key", key)
                 return rec
 
-    # records 是 list 格式
     if isinstance(records, list):
         for rec in records:
             if not isinstance(rec, dict):
@@ -462,11 +378,6 @@ def find_record_in_pattern_json(player_point: int, banker_point: int, fkey: str)
 
 
 def extract_prob_from_pattern_record(rec: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    """
-    從 pattern_db record 取出 banker/player 機率。
-    支援多種欄位名稱。
-    """
-
     banker = (
         rec.get("next_banker_rate")
         if rec.get("next_banker_rate") is not None
@@ -507,7 +418,6 @@ def pattern_db_meta_safe() -> Dict[str, Any]:
 
         if callable(fn):
             meta = fn()
-
             if isinstance(meta, dict):
                 return meta
     except Exception:
@@ -536,14 +446,6 @@ def pattern_db_meta_safe() -> Dict[str, Any]:
 
 
 def pattern_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
-    """
-    真正的 pattern_db 查詢。
-
-    重點：
-    這裡不再借用 point_db。
-    找不到 pattern_db 時，回中性值 BASE_BANKER_NO_TIE。
-    """
-
     fkey = feature_key(player_point, banker_point)
 
     if not USE_PATTERN_DB:
@@ -588,34 +490,34 @@ def pattern_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
 
 def ai_simulation_layer(player_point: int, banker_point: int) -> Dict[str, Any]:
     """
-    本地 AI 修正層。
-    注意：這層不是主模型，只做小幅修正。
+    本地 AI 修正層 v2。
+    只做小幅修正，不搶 point_db / pattern_db 主導權。
     """
 
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
 
-    x = 0.0
+    banker = BASE_BANKER_NO_TIE
 
-    x += -0.055 * diff
+    if diff == 0:
+        banker += stable_noise(key + ":ai_tie", 0.006)
 
-    if abs(diff) in {1, 2}:
-        x += -0.16 if diff > 0 else 0.16
-    elif abs(diff) in {3, 4, 5}:
-        x += 0.16 if diff > 0 else -0.16
-    elif abs(diff) >= 6:
-        x += 0.09 if diff > 0 else -0.09
+    elif abs(diff) <= 2:
+        banker += -0.018 if diff > 0 else 0.018
 
-    x += stable_noise(key + ":ai", 0.11)
+    elif abs(diff) <= 5:
+        banker += 0.022 if diff > 0 else -0.022
 
-    banker = 1.0 / (1.0 + math.exp(-x))
-    banker = 0.15 + banker * 0.70
+    else:
+        banker += 0.012 if diff > 0 else -0.012
+
+    banker += stable_noise(key + ":ai_v2", AI_NOISE_SCALE)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
 
     return {
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
-        "source": "LOCAL_AI_SIMULATION_POINT_FEATURE",
+        "source": "LOCAL_AI_SIMULATION_POINT_FEATURE_V2",
     }
 
 
@@ -624,11 +526,6 @@ def ai_simulation_layer(player_point: int, banker_point: int) -> Dict[str, Any]:
 # ============================================================
 
 def apply_tie_point_protection(banker: float, is_tie_point: bool) -> float:
-    """
-    上一局點數為和局時，把結果往基準值收斂。
-    避免 66 / 77 / 88 這種點數被 AI 或 DB 偏移拉太誇張。
-    """
-
     if not is_tie_point:
         return banker
 
@@ -640,38 +537,31 @@ def apply_tie_point_protection(banker: float, is_tie_point: bool) -> float:
 # ============================================================
 
 def build_entry_decision(is_tie_point: bool, gap: float, recommend: str) -> Tuple[bool, str, str]:
-    """
-    回傳：
-    entry_allowed: 是否建議進場
-    entry_level: no_entry / normal / strong
-    weak_reason: 原因文字
-    """
-
     if is_tie_point and gap < TIE_MIN_GAP_FOR_ENTRY:
         return (
             False,
             "no_entry",
-            "上一局為和局點數，莊閒優勢不足，建議觀察一局"
+            "上一局為和局點數，莊閒優勢不足，建議觀察一局",
         )
 
     if gap < MIN_GAP_FOR_ENTRY:
         return (
             False,
             "no_entry",
-            "莊閒機率差距不足，建議觀察一局"
+            "莊閒機率差距不足，建議觀察一局",
         )
 
     if gap >= STRONG_GAP_FOR_ENTRY:
         return (
             True,
             "strong",
-            ""
+            "",
         )
 
     return (
         True,
         "normal",
-        ""
+        "",
     )
 
 
@@ -680,18 +570,6 @@ def build_entry_decision(is_tie_point: bool, gap: float, recommend: str) -> Tupl
 # ============================================================
 
 def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    主模型：
-
-    不吃使用者前端歷史路紙。
-    只使用當前輸入點數：
-    1. 查 point_db
-    2. 查 pattern_db
-    3. AI 模擬微調
-    4. 和局保護
-    5. 進場判斷
-    """
-
     player_point = validate_point(player_point)
     banker_point = validate_point(banker_point)
 
@@ -712,14 +590,15 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     if not USE_PATTERN_DB:
         pat_w = 0.0
 
-    # pattern_db 找不到時，不要把 pattern 權重偷塞給 point_db。
-    # 這裡保留 pattern 權重，但 pattern 給中性值。
-    # 這樣輸出會比較保守，不會假裝 pattern 有命中。
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
 
     total_weight = max(p_w + pat_w + sim_w, 0.0001)
 
+    # 核心修正：
+    # POINT_WEIGHT 只給 point_db
+    # PATTERN_WEIGHT 只給 pattern_db
+    # SIM_WEIGHT 只給 AI
     banker = (
         point["banker_prob"] * p_w +
         pattern["banker_prob"] * pat_w +
@@ -748,8 +627,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "last_result": last_result,
 
         "recommend": recommend,
+
         "player_prob": round(player * 100, PERCENT_DECIMALS),
         "banker_prob": round(banker * 100, PERCENT_DECIMALS),
+
         "player_prob_raw": player,
         "banker_prob_raw": banker,
 
@@ -805,9 +686,8 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "ai_player_prob": ai["player_prob"],
         },
 
-        # 保留這兩個欄位，明確表示不使用前端歷史路紙
         "history_used": False,
         "rounds_ignored": True,
 
-        "mode": "POINT_DB_PLUS_PATTERN_DB_PLUS_AI_NO_HISTORY",
+        "mode": "POINT_DB_PLUS_PATTERN_DB_PLUS_AI_NO_HISTORY_V2",
     }
