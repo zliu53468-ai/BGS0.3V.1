@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import random
 from functools import lru_cache
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -70,6 +71,21 @@ TIE_MIN_GAP_FOR_ENTRY = env_float("TIE_MIN_GAP_FOR_ENTRY", "0.08")
 # ============================================================
 
 AI_NOISE_SCALE = env_float("AI_NOISE_SCALE", "0.018")
+
+
+# ============================================================
+# Monte Carlo 風控驗證參數
+# ============================================================
+
+USE_MONTE_CARLO = env_bool("USE_MONTE_CARLO", "1")
+MC_SIMULATIONS = env_int("MC_SIMULATIONS", "300")
+MC_MIN_SIMULATIONS = env_int("MC_MIN_SIMULATIONS", "80")
+MC_MAX_SIMULATIONS = env_int("MC_MAX_SIMULATIONS", "800")
+MC_SEED = env_int("MC_SEED", "42")
+MC_MAX_NOISE = env_float("MC_MAX_NOISE", "0.018")
+MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1")
+MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", "0.035")
+MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "0")
 
 
 # ============================================================
@@ -190,17 +206,23 @@ def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any
     if diff == 0:
         banker += stable_noise(key + ":tie", 0.018)
     elif 1 <= diff <= 2:
+        # diff = player_point - banker_point；diff > 0 代表閒點較高，banker 應下修。
         banker -= 0.185
     elif 3 <= diff <= 5:
-        banker += 0.185
+        # 閒中高點優勢，fallback 不可反向偏莊。
+        banker -= 0.185
     elif diff >= 6:
-        banker += 0.115
+        # 閒大點差優勢，仍只做溫和下修，避免 fallback 過度極端。
+        banker -= 0.115
     elif -2 <= diff <= -1:
+        # diff < 0 代表莊點較高，banker 應上修。
         banker += 0.185
     elif -5 <= diff <= -3:
-        banker -= 0.185
+        # 莊中高點優勢，banker 上修。
+        banker += 0.185
     elif diff <= -6:
-        banker -= 0.115
+        # 莊大點差優勢，溫和上修。
+        banker += 0.115
 
     banker += stable_noise(key + ":fallback", 0.045)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
@@ -952,6 +974,99 @@ def ai_simulation_layer(
 
 
 # ============================================================
+# Monte Carlo 風控驗證層
+# ============================================================
+
+def monte_carlo_verify_from_probs(
+    banker_prob: float,
+    player_prob: float,
+    n_sim: Optional[int] = None,
+    seed_key: str = "",
+) -> Dict[str, Any]:
+    """
+    安全版 Monte Carlo：只拿 predict 已經算好的最終機率做穩定度抽樣。
+
+    重要：這裡不能再呼叫 predict()，否則會造成 predict -> MC -> predict 的無限遞迴。
+    定位：風控驗證層，不是主預測層。
+    """
+    if n_sim is None:
+        n_sim = MC_SIMULATIONS
+
+    try:
+        n_sim = int(n_sim)
+    except Exception:
+        n_sim = 300
+
+    min_sim = max(20, int(MC_MIN_SIMULATIONS))
+    max_sim = max(min_sim, int(MC_MAX_SIMULATIONS))
+    n_sim = max(min_sim, min(n_sim, max_sim))
+
+    banker_prob, player_prob = normalize_prob_pair(float(banker_prob), float(player_prob))
+
+    rng = random.Random(f"{MC_SEED}:{seed_key}")
+
+    wins = {
+        "banker": 0,
+        "player": 0,
+        "tie": 0,
+    }
+
+    for _ in range(n_sim):
+        # 微幅擾動用來測試目前推薦方向是否穩定。
+        noise = rng.uniform(-MC_MAX_NOISE, MC_MAX_NOISE)
+        b = clamp(banker_prob + noise, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+        p = 1.0 - b
+
+        # 只抽一次亂數，避免 banker / player 判斷機率失真。
+        r = rng.random()
+
+        if r < b:
+            wins["banker"] += 1
+        elif r < b + p:
+            wins["player"] += 1
+        else:
+            wins["tie"] += 1
+
+    total = wins["banker"] + wins["player"] + wins["tie"]
+
+    if total <= 0:
+        banker_rate = BASE_BANKER_NO_TIE
+        player_rate = 1.0 - BASE_BANKER_NO_TIE
+        tie_rate = 0.0
+    else:
+        banker_rate = wins["banker"] / total
+        player_rate = wins["player"] / total
+        tie_rate = wins["tie"] / total
+
+    mc_gap = abs(banker_rate - player_rate)
+    mc_recommend = "莊" if banker_rate >= player_rate else "閒"
+
+    return {
+        "mc_enabled": True,
+        "mc_simulations": n_sim,
+        "mc_banker_rate": round(banker_rate * 100, PERCENT_DECIMALS),
+        "mc_player_rate": round(player_rate * 100, PERCENT_DECIMALS),
+        "mc_tie_rate": round(tie_rate * 100, PERCENT_DECIMALS),
+        "mc_banker_rate_raw": banker_rate,
+        "mc_player_rate_raw": player_rate,
+        "mc_tie_rate_raw": tie_rate,
+        "mc_recommend": mc_recommend,
+        "mc_gap": round(mc_gap * 100, PERCENT_DECIMALS),
+        "mc_gap_raw": mc_gap,
+        "mc_source": "MONTE_CARLO_PROB_STABILITY_CHECK_SAFE_V1",
+        "mc_note": "MC only verifies final probability stability; it does not call predict().",
+    }
+
+
+def disabled_monte_carlo_result() -> Dict[str, Any]:
+    return {
+        "mc_enabled": False,
+        "mc_simulations": 0,
+        "mc_source": "MONTE_CARLO_DISABLED",
+    }
+
+
+# ============================================================
 # 和局保護
 # ============================================================
 
@@ -1049,7 +1164,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         recommend=recommend,
     )
 
-    return {
+    result = {
         "ok": True,
 
         "player_point": player_point,
@@ -1127,5 +1242,44 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "pattern_window": pattern.get("window", 0),
         "pattern_rounds_enriched": True,
 
-        "mode": "POINT_DB_PLUS_TRUE_PATTERN_DB_PLUS_POINT_SEQUENCE_AI_V5",
+        "mode": "POINT_DB_PLUS_TRUE_PATTERN_DB_PLUS_POINT_SEQUENCE_AI_MC_V6_1",
     }
+
+    if USE_MONTE_CARLO:
+        mc_result = monte_carlo_verify_from_probs(
+            banker_prob=banker,
+            player_prob=player,
+            seed_key=f"{player_point}:{banker_point}:{pattern.get('feature_key', '')}:{ai.get('history_adjust', 0.0)}",
+        )
+        result["monte_carlo"] = mc_result
+
+        mc_gap_raw = float(mc_result.get("mc_gap_raw", 0.0) or 0.0)
+        mc_recommend = mc_result.get("mc_recommend", recommend)
+
+        # MC 不改推薦方向，只做風控；若 MC 顯示差距不足，就降級觀察。
+        if MC_BLOCK_LOW_GAP and result["entry_allowed"] and mc_gap_raw < MC_MIN_GAP_FOR_ENTRY:
+            result["entry_allowed"] = False
+            result["entry_level"] = "no_entry"
+            result["weak_reason"] = "Monte Carlo 穩定度不足，莊閒差距偏小，建議觀察一局"
+            result["no_observe"] = True
+            result["mc_entry_blocked"] = True
+        else:
+            result["mc_entry_blocked"] = False
+
+        # 預設不因 MC 方向不一致直接擋單；若你想更保守，可設 MC_DIRECTION_MISMATCH_BLOCK=1。
+        if (
+            MC_DIRECTION_MISMATCH_BLOCK
+            and result["entry_allowed"]
+            and mc_recommend in {"莊", "閒"}
+            and mc_recommend != recommend
+        ):
+            result["entry_allowed"] = False
+            result["entry_level"] = "no_entry"
+            result["weak_reason"] = "Monte Carlo 模擬方向與主模型不一致，建議觀察一局"
+            result["no_observe"] = True
+            result["mc_entry_blocked"] = True
+    else:
+        result["monte_carlo"] = disabled_monte_carlo_result()
+        result["mc_entry_blocked"] = False
+
+    return result
