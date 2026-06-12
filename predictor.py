@@ -258,6 +258,11 @@ def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def load_pattern_db_file() -> Dict[str, Any]:
+    """
+    備援用：如果 pattern_db.py 沒有成功 import / 呼叫，
+    才直接讀 PATTERN_DB_PATH 的 json。
+    主要邏輯仍以 pattern_db.py 的 pattern_lookup(rounds) / get_pattern_record(pattern, window) 為優先。
+    """
     path = PATTERN_DB_PATH
 
     if not os.path.exists(path):
@@ -300,81 +305,146 @@ def load_pattern_db_file() -> Dict[str, Any]:
         }
 
 
-def try_import_pattern_db_record(player_point: int, banker_point: int, fkey: str) -> Optional[Dict[str, Any]]:
-    try:
-        import pattern_db
-    except Exception:
+def normalize_round_result(value: Any) -> Optional[str]:
+    """
+    將各種可能的歷史資料格式統一成 B / P / T。
+    支援：
+    - "B" / "P" / "T"
+    - "莊" / "閒" / "和"
+    - "banker" / "player" / "tie"
+    - {"result": "..."}
+    - {"winner": "..."}
+    - {"last_result": "..."}
+    - {"player_point": 6, "banker_point": 5}
+    - {"player": 6, "banker": 5}
+    """
+
+    if value is None:
         return None
 
-    fn = getattr(pattern_db, "get_pattern_record", None)
+    if isinstance(value, dict):
+        raw = (
+            value.get("result")
+            or value.get("winner")
+            or value.get("last_result")
+            or value.get("outcome")
+            or value.get("side")
+        )
 
-    if not callable(fn):
-        return None
+        if raw is not None:
+            return normalize_round_result(raw)
 
-    call_styles = [
-        lambda: fn(player_point, banker_point),
-        lambda: fn(fkey),
-        lambda: fn(player_point=player_point, banker_point=banker_point, feature_key=fkey),
-        lambda: fn(feature_key=fkey),
-    ]
+        pp = (
+            value.get("player_point")
+            if value.get("player_point") is not None
+            else value.get("player")
+            if value.get("player") is not None
+            else value.get("p")
+        )
+        bp = (
+            value.get("banker_point")
+            if value.get("banker_point") is not None
+            else value.get("banker")
+            if value.get("banker") is not None
+            else value.get("b")
+        )
 
-    for call in call_styles:
         try:
-            rec = call()
-            if isinstance(rec, dict):
-                return rec
+            if pp is None or bp is None:
+                return None
+
+            pp = int(pp)
+            bp = int(bp)
+
+            if pp > bp:
+                return "P"
+            if bp > pp:
+                return "B"
+            return "T"
         except Exception:
-            continue
+            return None
+
+    s = str(value).strip().upper()
+
+    if s in {"B", "BANKER", "庄", "莊"}:
+        return "B"
+
+    if s in {"P", "PLAYER", "闲", "閒", "閑"}:
+        return "P"
+
+    if s in {"T", "TIE", "和", "和局"}:
+        return "T"
 
     return None
 
 
-def find_record_in_pattern_json(player_point: int, banker_point: int, fkey: str) -> Optional[Dict[str, Any]]:
-    data = load_pattern_db_file()
-    records = data.get("records", data)
+def rounds_to_pattern_string(rounds: Optional[List[Any]]) -> str:
+    """
+    將 rounds 轉成 pattern_db 真正吃的牌路字串，例如：BPBPP。
+    無法辨識的資料會自動略過。
+    """
+    if not rounds:
+        return ""
 
-    keys_to_try = [
-        fkey,
-        simple_point_key(player_point, banker_point),
-        f"P{player_point}_B{banker_point}",
-        f"{player_point}_{banker_point}",
-        f"{player_point}{banker_point}",
-    ]
+    chars: List[str] = []
 
-    if isinstance(records, dict):
-        for key in keys_to_try:
-            rec = records.get(key)
-            if isinstance(rec, dict):
-                rec = dict(rec)
-                rec.setdefault("feature_key", key)
-                return rec
+    for r in rounds:
+        ch = normalize_round_result(r)
+        if ch in {"B", "P", "T"}:
+            chars.append(ch)
 
-    if isinstance(records, list):
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
+    return "".join(chars)
 
-            rec_key = str(
-                rec.get("feature_key")
-                or rec.get("key")
-                or rec.get("pattern_key")
-                or rec.get("point_key")
-                or ""
-            )
 
-            if rec_key in keys_to_try:
-                return rec
-
-            rp = rec.get("player_point", rec.get("p", None))
-            rb = rec.get("banker_point", rec.get("b", None))
-
-            try:
-                if int(rp) == int(player_point) and int(rb) == int(banker_point):
-                    return rec
-            except Exception:
-                pass
-
+def symbol_to_last_result(symbol: Optional[str]) -> Optional[str]:
+    """
+    將 B / P / T 轉成 pattern_db.py 常見的中文 last_result。
+    pattern_db.py 若只讀 r.get("last_result")，就需要這個欄位。
+    """
+    if symbol == "B":
+        return "莊"
+    if symbol == "P":
+        return "閒"
+    if symbol == "T":
+        return "和"
     return None
+
+
+def enrich_rounds_for_pattern_db(rounds: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """
+    補齊 pattern_db.pattern_lookup(rounds) 需要的 last_result。
+
+    你的實際 rounds 多半是：
+        {"player_point": 6, "banker_point": 5}
+
+    但 pattern_db.py 可能只讀：
+        r.get("last_result")
+
+    所以這裡會在不破壞原資料的前提下，自動補：
+        player_point > banker_point => last_result = "閒"
+        banker_point > player_point => last_result = "莊"
+        相等 => last_result = "和"
+    """
+    if not rounds:
+        return []
+
+    enriched: List[Dict[str, Any]] = []
+
+    for r in rounds:
+        symbol = normalize_round_result(r)
+        last_result = symbol_to_last_result(symbol)
+
+        if isinstance(r, dict):
+            item = dict(r)
+            if not item.get("last_result") and last_result:
+                item["last_result"] = last_result
+            enriched.append(item)
+        else:
+            # 非 dict 的歷史資料也轉成 pattern_lookup 可讀的格式。
+            if last_result:
+                enriched.append({"last_result": last_result, "raw": r})
+
+    return enriched
 
 
 def extract_prob_from_pattern_record(rec: Dict[str, Any]) -> Optional[Tuple[float, float]]:
@@ -388,6 +458,10 @@ def extract_prob_from_pattern_record(rec: Dict[str, Any]) -> Optional[Tuple[floa
         else rec.get("next_banker_prob")
         if rec.get("next_banker_prob") is not None
         else rec.get("banker")
+        if rec.get("banker") is not None
+        else rec.get("B")
+        if rec.get("B") is not None
+        else rec.get("b")
     )
 
     player = (
@@ -400,6 +474,10 @@ def extract_prob_from_pattern_record(rec: Dict[str, Any]) -> Optional[Tuple[floa
         else rec.get("next_player_prob")
         if rec.get("next_player_prob") is not None
         else rec.get("player")
+        if rec.get("player") is not None
+        else rec.get("P")
+        if rec.get("P") is not None
+        else rec.get("p")
     )
 
     if banker is None or player is None:
@@ -445,42 +523,214 @@ def pattern_db_meta_safe() -> Dict[str, Any]:
     return meta
 
 
-def pattern_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
-    fkey = feature_key(player_point, banker_point)
+def try_pattern_lookup_from_module(rounds: Optional[List[Any]], pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    優先呼叫 pattern_db.py 裡真正的 pattern_lookup。
+    Claude 指出的核心問題就是這裡：不能再拿 P6_B5 這種點數 key 去查規律。
+    """
+    try:
+        import pattern_db
+    except Exception:
+        return None
+
+    fn = getattr(pattern_db, "pattern_lookup", None)
+
+    if not callable(fn):
+        return None
+
+    call_styles = [
+        lambda: fn(rounds),
+        lambda: fn(pattern),
+        lambda: fn(rounds=rounds),
+        lambda: fn(pattern=pattern),
+        lambda: fn(history=rounds),
+        lambda: fn(pattern_string=pattern),
+    ]
+
+    for call in call_styles:
+        try:
+            rec = call()
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec.setdefault("feature_key", pattern)
+                rec.setdefault("pattern", pattern)
+                return rec
+        except Exception:
+            continue
+
+    return None
+
+
+def try_get_pattern_record_from_module(pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    若 pattern_db.py 沒有 pattern_lookup，就退而求其次呼叫：
+    get_pattern_record(pattern: str, window: int)
+
+    會從較長 window 往短 window 找，讓 300 萬組規律資料有機會命中。
+    """
+    try:
+        import pattern_db
+    except Exception:
+        return None
+
+    fn = getattr(pattern_db, "get_pattern_record", None)
+
+    if not callable(fn):
+        return None
+
+    max_window = min(len(pattern), env_int("PATTERN_MAX_WINDOW", "12"))
+    min_window = min(env_int("PATTERN_MIN_WINDOW", "3"), max_window)
+
+    for window in range(max_window, min_window - 1, -1):
+        sub_pattern = pattern[-window:]
+
+        call_styles = [
+            lambda sub_pattern=sub_pattern, window=window: fn(sub_pattern, window),
+            lambda sub_pattern=sub_pattern, window=window: fn(pattern=sub_pattern, window=window),
+            lambda sub_pattern=sub_pattern, window=window: fn(pattern=sub_pattern, win=window),
+            lambda sub_pattern=sub_pattern, window=window: fn(sub_pattern),
+        ]
+
+        for call in call_styles:
+            try:
+                rec = call()
+                if isinstance(rec, dict):
+                    rec = dict(rec)
+                    rec.setdefault("feature_key", sub_pattern)
+                    rec.setdefault("pattern", sub_pattern)
+                    rec.setdefault("window", window)
+                    return rec
+            except Exception:
+                continue
+
+    return None
+
+
+def find_record_in_pattern_json(pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    最後備援：直接讀 pattern_db.json。
+    支援 records 為 dict 或 list 的格式。
+    """
+    data = load_pattern_db_file()
+    records = data.get("records", data)
+
+    max_window = min(len(pattern), env_int("PATTERN_MAX_WINDOW", "12"))
+    min_window = min(env_int("PATTERN_MIN_WINDOW", "3"), max_window)
+
+    keys_to_try: List[str] = []
+
+    for window in range(max_window, min_window - 1, -1):
+        sub_pattern = pattern[-window:]
+        keys_to_try.extend([
+            sub_pattern,
+            f"{sub_pattern}:{window}",
+            f"{window}:{sub_pattern}",
+            f"W{window}_{sub_pattern}",
+        ])
+
+    if isinstance(records, dict):
+        for key in keys_to_try:
+            rec = records.get(key)
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec.setdefault("feature_key", key)
+                rec.setdefault("pattern", key)
+                return rec
+
+    if isinstance(records, list):
+        for key in keys_to_try:
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+
+                rec_key = str(
+                    rec.get("feature_key")
+                    or rec.get("key")
+                    or rec.get("pattern_key")
+                    or rec.get("pattern")
+                    or ""
+                )
+
+                if rec_key == key:
+                    rec = dict(rec)
+                    rec.setdefault("feature_key", rec_key)
+                    return rec
+
+    return None
+
+
+def pattern_db_lookup(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    正確版 pattern 查詢：
+    1. rounds 先轉成 B/P/T 歷史牌路字串
+    2. 優先呼叫 pattern_db.pattern_lookup(rounds / pattern)
+    3. 再退回 pattern_db.get_pattern_record(pattern, window)
+    4. 最後才直接查 json
+    """
+
+    current_fkey = feature_key(player_point, banker_point)
+    enriched_rounds = enrich_rounds_for_pattern_db(rounds)
+    pattern = rounds_to_pattern_string(enriched_rounds)
 
     if not USE_PATTERN_DB:
         rec = neutral_record("PATTERN_DB_DISABLED")
-        rec["feature_key"] = fkey
+        rec["feature_key"] = current_fkey
+        rec["pattern"] = pattern
         return rec
 
-    rec = try_import_pattern_db_record(player_point, banker_point, fkey)
+    if not pattern or len(pattern) < env_int("PATTERN_MIN_HISTORY", "3"):
+        rec = neutral_record("PATTERN_COLD_START")
+        rec["feature_key"] = current_fkey
+        rec["pattern"] = pattern
+        return rec
+
+    # 關鍵修正：pattern_lookup 要吃已補 last_result 的 rounds，
+    # 不能直接把只有點數的 rounds 丟進去，否則 pattern_db.py 會讀不到牌路。
+    rec = try_pattern_lookup_from_module(enriched_rounds, pattern)
 
     if rec is None:
-        rec = find_record_in_pattern_json(player_point, banker_point, fkey)
+        rec = try_get_pattern_record_from_module(pattern)
+
+    if rec is None:
+        rec = find_record_in_pattern_json(pattern)
 
     if not isinstance(rec, dict):
         neutral = neutral_record("PATTERN_DB_NEUTRAL_FALLBACK")
-        neutral["feature_key"] = fkey
+        neutral["feature_key"] = pattern
+        neutral["pattern"] = pattern
         return neutral
 
     probs = extract_prob_from_pattern_record(rec)
 
     if probs is None:
         neutral = neutral_record("PATTERN_DB_RECORD_NO_PROB_FALLBACK")
-        neutral["feature_key"] = fkey
+        neutral["feature_key"] = rec.get("feature_key", pattern)
+        neutral["pattern"] = pattern
         return neutral
 
     banker, player = probs
     meta = pattern_db_meta_safe()
+    matched_pattern = str(
+        rec.get("pattern")
+        or rec.get("feature_key")
+        or rec.get("key")
+        or pattern
+    )
 
     return {
         "available": True,
-        "feature_key": rec.get("feature_key", rec.get("key", fkey)),
+        "feature_key": matched_pattern,
+        "pattern": pattern,
         "banker_prob": banker,
         "player_prob": player,
-        "source": rec.get("source", "PATTERN_DB"),
-        "sample_size": int(rec.get("sample", rec.get("sample_size", 0)) or 0),
+        "source": rec.get("source", "PATTERN_DB_HISTORY_LOOKUP"),
+        "sample_size": int(rec.get("sample", rec.get("sample_size", rec.get("count", 0))) or 0),
         "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+        "window": int(rec.get("window", len(matched_pattern)) or 0),
     }
 
 
@@ -488,36 +738,216 @@ def pattern_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
 # AI 模擬層
 # ============================================================
 
-def ai_simulation_layer(player_point: int, banker_point: int) -> Dict[str, Any]:
+AI_HISTORY_WINDOW = env_int("AI_HISTORY_WINDOW", "8")
+AI_TREND_STRENGTH = env_float("AI_TREND_STRENGTH", "0.014")
+AI_DIFF_MOMENTUM_STRENGTH = env_float("AI_DIFF_MOMENTUM_STRENGTH", "0.012")
+AI_REVERSAL_STRENGTH = env_float("AI_REVERSAL_STRENGTH", "0.010")
+AI_HISTORY_MAX_ADJUST = env_float("AI_HISTORY_MAX_ADJUST", "0.035")
+
+
+def extract_round_points(rounds: Optional[List[Any]]) -> List[Tuple[int, int]]:
     """
-    本地 AI 修正層 v2。
-    只做小幅修正，不搶 point_db / pattern_db 主導權。
+    從 rounds 抽出歷史點數序列。
+    支援格式：
+    - {"player_point": 6, "banker_point": 5}
+    - {"player": 6, "banker": 5}
+    - {"p": 6, "b": 5}
+    - (6, 5) / [6, 5]
+
+    回傳格式固定為：[(player_point, banker_point), ...]
+    """
+    if not rounds:
+        return []
+
+    out: List[Tuple[int, int]] = []
+
+    for r in rounds:
+        pp = None
+        bp = None
+
+        if isinstance(r, dict):
+            pp = (
+                r.get("player_point")
+                if r.get("player_point") is not None
+                else r.get("player")
+                if r.get("player") is not None
+                else r.get("p")
+            )
+            bp = (
+                r.get("banker_point")
+                if r.get("banker_point") is not None
+                else r.get("banker")
+                if r.get("banker") is not None
+                else r.get("b")
+            )
+        elif isinstance(r, (list, tuple)) and len(r) >= 2:
+            pp, bp = r[0], r[1]
+
+        try:
+            if pp is None or bp is None:
+                continue
+
+            pp = int(pp)
+            bp = int(bp)
+
+            if 0 <= pp <= 9 and 0 <= bp <= 9:
+                out.append((pp, bp))
+        except Exception:
+            continue
+
+    return out
+
+
+def trend_delta(values: List[int]) -> float:
+    """
+    用簡單線性趨勢看最近點數是往上還往下。
+    正值代表後段偏高，負值代表後段偏低。
+    """
+    n = len(values)
+    if n < 3:
+        return 0.0
+
+    mid = n // 2
+    early = values[:mid]
+    late = values[mid:]
+
+    if not early or not late:
+        return 0.0
+
+    return (sum(late) / len(late)) - (sum(early) / len(early))
+
+
+def streak_count(results: List[str], side: str) -> int:
+    """
+    計算最近連續同邊次數，和局不列入連續方向。
+    """
+    count = 0
+    for r in reversed(results):
+        if r == "T":
+            continue
+        if r == side:
+            count += 1
+        else:
+            break
+    return count
+
+
+def ai_simulation_layer(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    本地 AI 修正層 v3：點數序列趨勢版。
+
+    分工原則：
+    - point_db：看「當前這一局點數組合」的統計。
+    - pattern_db：看「B/P/T 牌路字串」的規律。
+    - AI 層：看「歷史點數序列」的趨勢、動能、過熱反轉。
+
+    注意：AI 層只做小幅微調，避免蓋過 point_db / pattern_db。
     """
 
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
 
     banker = BASE_BANKER_NO_TIE
+    reasons: List[str] = []
+    history_adjust = 0.0
 
+    # 1) 當前點數差：保留原本 v2 的基礎判斷
     if diff == 0:
         banker += stable_noise(key + ":ai_tie", 0.006)
+        reasons.append("current_tie_point_noise")
 
     elif abs(diff) <= 2:
-        banker += -0.018 if diff > 0 else 0.018
+        adj = -0.018 if diff > 0 else 0.018
+        banker += adj
+        reasons.append("current_small_diff_adjust")
 
     elif abs(diff) <= 5:
-        banker += 0.022 if diff > 0 else -0.022
+        # diff = 閒點 - 莊點；diff > 0 代表閒點較高，banker 應下修。
+        adj = -0.022 if diff > 0 else 0.022
+        banker += adj
+        reasons.append("current_mid_diff_adjust")
 
     else:
-        banker += 0.012 if diff > 0 else -0.012
+        # 大點差也維持同一方向：閒高偏閒、莊高偏莊。
+        adj = -0.012 if diff > 0 else 0.012
+        banker += adj
+        reasons.append("current_large_diff_adjust")
 
-    banker += stable_noise(key + ":ai_v2", AI_NOISE_SCALE)
+    # 2) 歷史點數序列：真正讓 AI 層吃 rounds
+    point_history = extract_round_points(rounds)
+    recent = point_history[-AI_HISTORY_WINDOW:] if point_history else []
+
+    if len(recent) >= 3:
+        player_points = [p for p, _ in recent]
+        banker_points = [b for _, b in recent]
+        diffs = [p - b for p, b in recent]
+        results = ["P" if p > b else "B" if b > p else "T" for p, b in recent]
+
+        p_trend = trend_delta(player_points)
+        b_trend = trend_delta(banker_points)
+        diff_trend = trend_delta(diffs)
+
+        # 閒點數近期升得比莊明顯：偏閒，banker 下修
+        if p_trend - b_trend >= 1.5:
+            adj = -AI_TREND_STRENGTH
+            history_adjust += adj
+            reasons.append("player_point_trend_up")
+
+        # 莊點數近期升得比閒明顯：偏莊，banker 上修
+        elif b_trend - p_trend >= 1.5:
+            adj = AI_TREND_STRENGTH
+            history_adjust += adj
+            reasons.append("banker_point_trend_up")
+
+        # 點差動能：diff = 閒點 - 莊點；diff 越往正，代表閒動能增強
+        if diff_trend >= 1.25:
+            adj = -AI_DIFF_MOMENTUM_STRENGTH
+            history_adjust += adj
+            reasons.append("player_diff_momentum")
+        elif diff_trend <= -1.25:
+            adj = AI_DIFF_MOMENTUM_STRENGTH
+            history_adjust += adj
+            reasons.append("banker_diff_momentum")
+
+        # 過熱反轉：某一邊連續高點數，下一手不追太滿，只做小幅反向保護
+        recent_player_hot = sum(1 for x in player_points[-3:] if x >= 7)
+        recent_banker_hot = sum(1 for x in banker_points[-3:] if x >= 7)
+
+        if recent_player_hot >= 3:
+            history_adjust += AI_REVERSAL_STRENGTH
+            reasons.append("player_hot_reversal_guard")
+        elif recent_banker_hot >= 3:
+            history_adjust -= AI_REVERSAL_STRENGTH
+            reasons.append("banker_hot_reversal_guard")
+
+        # 連莊 / 連閒保護：不是直接反打，只是避免 AI 層過度追單邊
+        b_streak = streak_count(results, "B")
+        p_streak = streak_count(results, "P")
+
+        if b_streak >= 4:
+            history_adjust -= AI_REVERSAL_STRENGTH * 0.7
+            reasons.append("banker_streak_guard")
+        elif p_streak >= 4:
+            history_adjust += AI_REVERSAL_STRENGTH * 0.7
+            reasons.append("player_streak_guard")
+
+    history_adjust = clamp(history_adjust, -AI_HISTORY_MAX_ADJUST, AI_HISTORY_MAX_ADJUST)
+    banker += history_adjust
+
+    banker += stable_noise(key + ":ai_v3_history", AI_NOISE_SCALE)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
 
     return {
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
-        "source": "LOCAL_AI_SIMULATION_POINT_FEATURE_V2",
+        "source": "LOCAL_AI_SIMULATION_POINT_SEQUENCE_V3",
+        "history_points_used": len(recent),
+        "history_adjust": history_adjust,
+        "history_reasons": reasons,
     }
 
 
@@ -577,8 +1007,8 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     is_tie_point = player_point == banker_point
 
     point = point_db_lookup(player_point, banker_point)
-    pattern = pattern_db_lookup(player_point, banker_point)
-    ai = ai_simulation_layer(player_point, banker_point)
+    pattern = pattern_db_lookup(player_point, banker_point, rounds=rounds)
+    ai = ai_simulation_layer(player_point, banker_point, rounds=rounds)
 
     p_w = float(POINT_WEIGHT)
     pat_w = float(PATTERN_WEIGHT)
@@ -658,6 +1088,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "point_source": point["source"],
         "pattern_source": pattern["source"],
         "ai_source": ai["source"],
+        "ai_history_points_used": ai.get("history_points_used", 0),
+        "ai_history_adjust": ai.get("history_adjust", 0.0),
+        "ai_history_reasons": ai.get("history_reasons", []),
 
         "point_available": point["available"],
         "pattern_available": pattern["available"],
@@ -686,8 +1119,13 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "ai_player_prob": ai["player_prob"],
         },
 
-        "history_used": False,
-        "rounds_ignored": True,
+        "history_used": bool(rounds) and (
+            pattern.get("source") != "PATTERN_COLD_START" or ai.get("history_points_used", 0) >= 3
+        ),
+        "rounds_ignored": False,
+        "pattern_string": pattern.get("pattern", ""),
+        "pattern_window": pattern.get("window", 0),
+        "pattern_rounds_enriched": True,
 
-        "mode": "POINT_DB_PLUS_PATTERN_DB_PLUS_AI_NO_HISTORY_V2",
+        "mode": "POINT_DB_PLUS_TRUE_PATTERN_DB_PLUS_POINT_SEQUENCE_AI_V5",
     }
