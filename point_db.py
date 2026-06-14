@@ -13,11 +13,6 @@ BASE_BANKER_NO_TIE = 0.5068
 
 
 def _resolve_path(path: str) -> str:
-    """
-    支援 Render / 本機兩種路徑：
-    1. 直接存在的路徑
-    2. 以目前工作目錄為基準的相對路徑
-    """
     if os.path.exists(path):
         return path
 
@@ -43,11 +38,6 @@ def load_point_db() -> Dict[str, Any]:
         raise ValueError("Point DB format error: root must be dict")
 
     if "records" not in db:
-        # 兼容格式：
-        # {
-        #   "P6_B5": {...},
-        #   "P8_B9": {...}
-        # }
         db = {
             "meta": db.get("meta", {}) if isinstance(db.get("meta", {}), dict) else {},
             "records": db,
@@ -67,7 +57,6 @@ def normalize_prob_pair(banker: float, player: float):
     banker = float(banker)
     player = float(player)
 
-    # 支援 53 / 47 或 0.53 / 0.47
     if banker > 1:
         banker = banker / 100.0
 
@@ -125,6 +114,8 @@ def extract_point_record(rec: Dict[str, Any], key: str) -> Dict[str, Any]:
         if rec.get("sample_count") is not None
         else rec.get("sample_size")
         if rec.get("sample_size") is not None
+        else rec.get("no_tie_sample")
+        if rec.get("no_tie_sample") is not None
         else 0
     )
 
@@ -156,21 +147,12 @@ def find_point_record(player_point: int, banker_point: int) -> Optional[Dict[str
         f"{int(player_point)}{int(banker_point)}",
     ]
 
-    # 格式 A：
-    # records = {
-    #   "P6_B5": {...}
-    # }
     if isinstance(records, dict):
         for k in keys_to_try:
             rec = records.get(k)
-
             if isinstance(rec, dict):
                 return extract_point_record(rec, k)
 
-    # 格式 B：
-    # records = [
-    #   {"player_point": 6, "banker_point": 5, ...}
-    # ]
     if isinstance(records, list):
         for rec in records:
             if not isinstance(rec, dict):
