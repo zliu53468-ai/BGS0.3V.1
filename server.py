@@ -1064,21 +1064,51 @@ def handle_text(user_id: str, reply_token: str, text: str):
         sess.rounds = sess.rounds[-30:]
 
         current_level = int(_get_attr(sess, "bet_level", 0) or 0)
-        sess.last_recommend = pred.get("recommend")
-        sess.last_bet_level = current_level
 
-        messages = []
+        # ============================================================
+        # 回覆整合修正：
+        # 1. 保留原先預測與配注邏輯
+        # 2. 不再把「預測結果」與「本金配注建議」分開傳送
+        # 3. 若 predictor 回傳 entry_allowed=False，則顯示觀望且不建議下注
+        # ============================================================
+
+        entry_allowed = bool(pred.get("entry_allowed", True))
+
+        if entry_allowed:
+            sess.last_recommend = pred.get("recommend")
+            sess.last_bet_level = current_level
+            bet_text = _betting_advice_text(sess, pred.get("recommend"), settle_note)
+        else:
+            # 觀望局不紀錄下注方向，避免下一局把觀望局當成上一局下注結果結算。
+            sess.last_recommend = None
+            sess.last_bet_level = current_level
+
+            weak_reason = pred.get("weak_reason", "訊號不足，建議觀察一局")
+            bet_text = (
+                "💰【本金配注建議】\n"
+                "本局建議觀望，不建議下注。"
+            )
+
+            if settle_note:
+                bet_text = f"{settle_note}\n\n" + bet_text
+
+            if weak_reason:
+                bet_text += f"\n原因：{weak_reason}"
+
+        reply_parts = []
 
         if trial_first_start:
-            messages.append(text_message(trial_started_text(remaining)))
+            reply_parts.append(trial_started_text(remaining))
 
-        messages.extend([
-            text_message(read_done_text(player_point, banker_point)),
-            text_message(prediction_text(pred, ai_text)),
-            text_message(_betting_advice_text(sess, pred.get("recommend"), settle_note)),
+        reply_parts.extend([
+            read_done_text(player_point, banker_point),
+            prediction_text(pred, ai_text),
+            bet_text,
         ])
 
-        reply_messages(reply_token, messages)
+        final_reply_text = "\n\n".join(part for part in reply_parts if part)
+
+        reply_messages(reply_token, [text_message(final_reply_text)])
         return
 
     reply_messages(reply_token, [
