@@ -1,174 +1,63 @@
-# BGS Dual 3M DB LINE Bot
+BGS 真實牌靴模擬 + 複合資料庫補丁
 
-這是一套可直接 push 到 GitHub、部署到 Render 的 LINE 官方帳號機器人。
+覆蓋檔案：
+1. generate_databases.py
+2. point_db.py
+3. pattern_db.py
+4. combo_db.py
+5. predictor.py
+6. config.py
+7. message_builder.py
 
-## 這版包含
+沒有修改 server.py。
+你的 server.py 已經會把 temp_rounds 傳進 predict()，所以不用動。
 
-- `data/point_db_3m.json`
-  - 300萬組點數模擬樣本
-  - 壓縮成 100 組閒莊點數統計
+部署步驟：
+1. 把以上檔案覆蓋到專案根目錄。
+2. 先在本機或 Render Shell 執行：python generate_databases.py
+3. 確認產生：
+   - data/point_db_3m.json
+   - data/result_pattern_db_3m.json
+   - data/combo_db_3m.json
+4. 上傳/提交到 GitHub 後重新部署 Render。
+5. 打開 /health 確認 point_db_samples / pattern_db_samples 是否正常。
 
-- `data/result_pattern_db_3m.json`
-  - 300萬組莊閒規律模擬樣本
-  - 壓縮成 W3 / W5 / W7 路單 pattern 統計
+建議環境變數：
+USE_POINT_DB=true
+USE_PATTERN_DB=true
+USE_COMBO_DB=true
+USE_MONTE_CARLO=true
 
-- 不使用「觀望」
-- 玩家直接輸入 `65`
-- 點數規則：先閒點，再莊點
-- 快捷按鈕：開始分析、結束分析
-- Gemini 可選開啟；Gemini 只負責文字，不改機率
-
-## 預測融合
-
-預設權重：
-
-```env
-POINT_WEIGHT=0.58
-PATTERN_WEIGHT=0.30
+POINT_WEIGHT=0.55
+COMBO_WEIGHT=0.30
+PATTERN_WEIGHT=0.03
 SIM_WEIGHT=0.12
-```
+COMBO_MIN_SAMPLE=80
 
-代表：
+MIN_GAP_FOR_ENTRY=0.060
+STRONG_GAP_FOR_ENTRY=0.090
 
-```text
-點數資料庫 58%
-莊閒規律資料庫 30%
-本地AI模擬層 12%
-```
+MC_SIMULATIONS=600
+MC_MIN_SIMULATIONS=100
+MC_MAX_SIMULATIONS=900
+MC_SEED=42
+MC_MAX_NOISE=0.018
+MC_BLOCK_LOW_GAP=true
+MC_MIN_GAP_FOR_ENTRY=0.055
+MC_DIRECTION_MISMATCH_BLOCK=true
 
-前幾局沒有足夠 pattern 時，系統會自動把 pattern 權重轉給點數資料庫。
+TIE_AI_MAX_WEIGHT=0.01
+TIE_SHRINK=0.18
+TIE_MIN_GAP_FOR_ENTRY=0.12
 
-## LINE 操作
+AI_NOISE_SCALE=0.008
+AI_HISTORY_WINDOW=8
+AI_TREND_STRENGTH=0.010
+AI_DIFF_MOMENTUM_STRENGTH=0.009
+AI_REVERSAL_STRENGTH=0.016
+AI_HISTORY_MAX_ADJUST=0.018
 
-```text
-遊戲設定
-```
-
-選擇：
-
-```text
-3
-```
-
-輸入桌號：
-
-```text
-DG05
-```
-
-開始：
-
-```text
-開始分析
-```
-
-每局輸入：
-
-```text
-65
-```
-
-代表：
-
-```text
-閒 6
-莊 5
-```
-
-## Render 設定
-
-Build Command：
-
-```bash
-pip install -r requirements.txt
-```
-
-Start Command：
-
-```bash
-gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
-```
-
-Webhook URL：
-
-```text
-https://你的-render網址.onrender.com/webhook
-```
-
-## Render 環境變數
-
-必填：
-
-```env
-LINE_CHANNEL_ACCESS_TOKEN=你的_LINE_Channel_Access_Token
-LINE_CHANNEL_SECRET=你的_LINE_Channel_Secret
-```
-
-建議：
-
-```env
-APP_NAME=BGS_DUAL_3M_DB_LINE_BOT
-TZ=Asia/Taipei
-SESSION_EXPIRE_SECONDS=1800
-ENABLE_SIGNATURE_VERIFY=1
-DEFAULT_GAME=DG
-DEFAULT_TABLE=DG05
-PLAYER_INPUT_FIRST=1
-NO_OBSERVE=1
-REPLY_STYLE=COOL
-POINT_DB_PATH=data/point_db_3m.json
-RESULT_PATTERN_DB_PATH=data/result_pattern_db_3m.json
-USE_POINT_DB=1
-USE_PATTERN_DB=1
-POINT_WEIGHT=0.58
-PATTERN_WEIGHT=0.30
-SIM_WEIGHT=0.12
-MIN_OUTPUT_PROB=0.05
-MAX_OUTPUT_PROB=0.95
-PERCENT_DECIMALS=2
-GEMINI_ENABLE=0
-GEMINI_MODEL=gemini-flash-latest
-AI_TEXT_ENABLE=1
-```
-
-Gemini 要開啟時：
-
-```env
-GEMINI_ENABLE=1
-GEMINI_API_KEY=你的_Gemini_API_Key
-```
-
-## 測試
-
-首頁：
-
-```text
-https://你的-render網址.onrender.com/
-```
-
-成功會看到：
-
-```text
-OK - BGS Dual 3M DB LINE BOT is running
-```
-
-健康檢查：
-
-```text
-https://你的-render網址.onrender.com/health
-```
-
-應看到：
-
-```json
-{
-  "ok": true,
-  "point_db_samples": 3000000,
-  "pattern_db_samples": 3000000
-}
-```
-
-## 重要說明
-
-這套是機率模擬與技術測試，不保證任何結果。
-百家樂具有隨機性，輸出不可視為穩贏或保證命中。
+注意：
+- generate_databases.py 跑 300 萬局會花時間，Render 免費機可能較慢。
+- 如果要先快速測試，可以先設 SIM_ROUNDS=300000 跑小資料庫確認程式可運作。
+- 正式使用再改回 SIM_ROUNDS=3000000。
