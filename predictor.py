@@ -32,19 +32,22 @@ def env_int(name: str, default: str) -> int:
         return int(default)
 
 
-POINT_WEIGHT = env_float("POINT_WEIGHT", str(getattr(config, "POINT_WEIGHT", 0.72)))
-PATTERN_WEIGHT = env_float("PATTERN_WEIGHT", str(getattr(config, "PATTERN_WEIGHT", 0.18)))
-SIM_WEIGHT = env_float("SIM_WEIGHT", str(getattr(config, "SIM_WEIGHT", 0.10)))
+POINT_WEIGHT = env_float("POINT_WEIGHT", str(getattr(config, "POINT_WEIGHT", 0.80)))
+PATTERN_WEIGHT = env_float("PATTERN_WEIGHT", str(getattr(config, "PATTERN_WEIGHT", 0.05)))
+SIM_WEIGHT = env_float("SIM_WEIGHT", str(getattr(config, "SIM_WEIGHT", 0.15)))
 
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", str(getattr(config, "MIN_OUTPUT_PROB", 0.38)))
 MAX_OUTPUT_PROB = env_float("MAX_OUTPUT_PROB", str(getattr(config, "MAX_OUTPUT_PROB", 0.62)))
 PERCENT_DECIMALS = env_int("PERCENT_DECIMALS", str(getattr(config, "PERCENT_DECIMALS", 2)))
 
 USE_POINT_DB = env_bool("USE_POINT_DB", "1" if getattr(config, "USE_POINT_DB", True) else "0")
-USE_PATTERN_DB = env_bool("USE_PATTERN_DB", "1")
+USE_PATTERN_DB = env_bool("USE_PATTERN_DB", "1" if getattr(config, "USE_PATTERN_DB", True) else "0")
 
-POINT_DB_PATH = os.getenv("POINT_DB_PATH", getattr(config, "POINT_DB_PATH", "point_db.json")).strip()
-PATTERN_DB_PATH = os.getenv("PATTERN_DB_PATH", getattr(config, "PATTERN_DB_PATH", "pattern_db.json")).strip()
+POINT_DB_PATH = os.getenv("POINT_DB_PATH", getattr(config, "POINT_DB_PATH", "data/point_db_3m.json")).strip()
+PATTERN_DB_PATH = os.getenv(
+    "PATTERN_DB_PATH",
+    os.getenv("RESULT_PATTERN_DB_PATH", getattr(config, "RESULT_PATTERN_DB_PATH", "data/result_pattern_db_3m.json")),
+).strip()
 
 
 # ============================================================
@@ -753,6 +756,7 @@ def pattern_db_lookup(
         "sample_size": int(rec.get("sample", rec.get("sample_size", rec.get("count", 0))) or 0),
         "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
         "window": int(rec.get("window", len(matched_pattern)) or 0),
+        "matched": rec.get("matched", []),
     }
 
 
@@ -1135,6 +1139,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     if not USE_PATTERN_DB:
         pat_w = 0.0
 
+    # pattern 沒命中時，不用中性 50/50 吃掉 PATTERN_WEIGHT，避免冷啟動或資料不足時稀釋 point_db。
+    if not pattern.get("available", False):
+        pat_w = 0.0
+
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
 
@@ -1216,7 +1224,11 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "point_total_samples": point["total_simulated_samples"],
         "pattern_total_samples": pattern["total_simulated_samples"],
 
-        "matched_patterns": [pattern["feature_key"]] if pattern["available"] else [],
+        "matched_patterns": (
+            pattern.get("matched")
+            if isinstance(pattern.get("matched"), list) and pattern.get("matched")
+            else ([pattern["feature_key"]] if pattern["available"] else [])
+        ),
 
         "weights": {
             "point": p_w,
