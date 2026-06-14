@@ -6,13 +6,18 @@ from typing import Dict, Any, Optional
 try:
     from config import POINT_DB_PATH
 except Exception:
-    POINT_DB_PATH = os.getenv("POINT_DB_PATH", "point_db.json")
+    POINT_DB_PATH = os.getenv("POINT_DB_PATH", "data/point_db_3m.json")
 
 
 BASE_BANKER_NO_TIE = 0.5068
 
 
 def _resolve_path(path: str) -> str:
+    """
+    支援 Render / 本機兩種路徑：
+    1. 直接存在的路徑
+    2. 以目前工作目錄為基準的相對路徑
+    """
     if os.path.exists(path):
         return path
 
