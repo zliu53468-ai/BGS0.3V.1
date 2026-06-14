@@ -38,19 +38,35 @@ def end_text() -> str:
 return "🛑 結束分析\n本輪資料已停止讀取。"
 
 def read_done_text(player_point: int, banker_point: int) -> str:
-return f"✅ 讀取完成\n📊 上局結果: 閒 {player_point} 莊 {banker_point}\n⚡ 開始分析下局...."
+return (
+f"✅ 讀取完成\n"
+f"📊 上局結果：閒 {player_point} 莊 {banker_point}\n"
+f"⚡ 開始分析下局...."
+)
 
 def prediction_text(pred: Dict[str, Any], ai_text: str = "") -> str:
+"""
+簡潔版預測顯示：
+- 不顯示資料層狀態
+- 不顯示複合特徵
+- 不顯示規律特徵
+- 不顯示蒙卡穩定度
+- 支援觀望顯示
+"""
 entry_allowed = bool(pred.get("entry_allowed", True))
 weak_reason = pred.get("weak_reason", "")
 
 ```
+player_prob = float(pred.get("player_prob", 0))
+banker_prob = float(pred.get("banker_prob", 0))
+gap = float(pred.get("confidence_gap", 0))
+
 if not entry_allowed:
     text = (
         "⚠️【建議觀察】\n"
-        f"閒：{pred.get('player_prob', 0):.2f}%\n"
-        f"莊：{pred.get('banker_prob', 0):.2f}%\n"
-        f"差距：{pred.get('confidence_gap', 0):.2f}%\n"
+        f"閒：{player_prob:.2f}%\n"
+        f"莊：{banker_prob:.2f}%\n"
+        f"差距：{gap:.2f}%\n"
         "🎯 本次建議：觀察一局"
     )
 
@@ -64,14 +80,48 @@ if not entry_allowed:
 
 text = (
     "🔮【預測結果】\n"
-    f"閒：{pred.get('player_prob', 0):.2f}%\n"
-    f"莊：{pred.get('banker_prob', 0):.2f}%\n"
-    f"差距：{pred.get('confidence_gap', 0):.2f}%\n"
+    f"閒：{player_prob:.2f}%\n"
+    f"莊：{banker_prob:.2f}%\n"
+    f"差距：{gap:.2f}%\n"
     f"🎯 本次預測結果：{pred.get('recommend', '-')}"
 )
 
 if ai_text:
     text += f"\n\n{ai_text}"
+
+return text
+```
+
+def combined_prediction_text(
+pred: Dict[str, Any],
+ai_text: str = "",
+bet_text: str = "",
+) -> str:
+"""
+將「預測結果」與「配注建議」合併成同一則 LINE 訊息。
+server.py 要改成呼叫這個函式，才不會分開傳。
+"""
+text = prediction_text(pred, ai_text)
+
+```
+if bet_text:
+    text += f"\n\n{bet_text}"
+
+return text
+```
+
+def observe_bet_text(reason: str = "") -> str:
+"""
+觀望時使用的配注文字，避免預測觀望但下面還叫用戶下注。
+"""
+text = (
+"💰【本金配注建議】\n"
+"本局建議觀望，不建議下注。"
+)
+
+```
+if reason:
+    text += f"\n原因：{reason}"
 
 return text
 ```
