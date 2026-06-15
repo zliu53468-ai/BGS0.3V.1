@@ -760,7 +760,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "BGS_DUAL_3M_DB_LINE_BOT",
-        "version": "server-access-betting-patch-v7-redis-persistent-trial",
+        "version": "server-access-betting-patch-v7-redis-persistent-trial-reset-on-end-v1",
         "sessions": store.all_count(),
         "access_store_mode": pstore.mode,
         "redis_enabled": pstore.mode == "redis",
@@ -883,9 +883,11 @@ def handle_text(user_id: str, reply_token: str, text: str):
         return
 
     # 結束 / 重置放在本金判斷前，避免卡在 need_bankroll 時被當成本金格式錯誤。
+    # 重要：結束分析只清空「本 UID 的本輪分析資料」，不刪除試用 / 月租 / 永久開通權限。
     if raw in {"結束分析", "結束", "停止分析", "停止"}:
-        sess.active = False
-        sess.phase = "idle"
+        store.reset(user_id, keep_setting=True)
+        new_sess = store.get(user_id)
+        _ensure_betting_fields(new_sess)
 
         reply_messages(reply_token, [text_message(end_text())])
         return
