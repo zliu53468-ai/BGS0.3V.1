@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import random
 from functools import lru_cache
@@ -7,12 +8,6 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import config
 from point_db import get_point_record, point_db_meta
-
-try:
-    from combo_db import combo_lookup, combo_db_meta
-except Exception:
-    combo_lookup = None
-    combo_db_meta = None
 
 
 # ============================================================
@@ -37,23 +32,35 @@ def env_int(name: str, default: str) -> int:
         return int(default)
 
 
-POINT_WEIGHT = env_float("POINT_WEIGHT", str(getattr(config, "POINT_WEIGHT", 0.55)))
-COMBO_WEIGHT = env_float("COMBO_WEIGHT", str(getattr(config, "COMBO_WEIGHT", 0.30)))
-PATTERN_WEIGHT = env_float("PATTERN_WEIGHT", str(getattr(config, "PATTERN_WEIGHT", 0.03)))
-SIM_WEIGHT = env_float("SIM_WEIGHT", str(getattr(config, "SIM_WEIGHT", 0.12)))
+POINT_WEIGHT = env_float("POINT_WEIGHT", str(getattr(config, "POINT_WEIGHT", 0.72)))
+PATTERN_WEIGHT = env_float("PATTERN_WEIGHT", str(getattr(config, "PATTERN_WEIGHT", 0.18)))
+SIM_WEIGHT = env_float("SIM_WEIGHT", str(getattr(config, "SIM_WEIGHT", 0.10)))
+
+# ============================================================
+# Feature DB 模式參數
+# ============================================================
+# hybrid  = 優先查 feature_db，查不到退回原本 history rounds 模式
+# feature = 只用 feature_db，查不到走中性 fallback
+# history = 完全使用原本 rounds 模式
+PREDICT_MODE = os.getenv("PREDICT_MODE", "hybrid").strip().lower()
+
+USE_PATTERN_FEATURE_DB = env_bool("USE_PATTERN_FEATURE_DB", "1")
+USE_AI_POINT_FEATURE_DB = env_bool("USE_AI_POINT_FEATURE_DB", "1")
+FEATURE_DB_FALLBACK_TO_HISTORY = env_bool("FEATURE_DB_FALLBACK_TO_HISTORY", "1")
+FEATURE_DB_MIN_SAMPLE = env_int("FEATURE_DB_MIN_SAMPLE", "80")
+
+PATTERN_FEATURE_DB_PATH = os.getenv("PATTERN_FEATURE_DB_PATH", "pattern_feature_db.json").strip()
+AI_POINT_FEATURE_DB_PATH = os.getenv("AI_POINT_FEATURE_DB_PATH", "ai_point_feature_db.json").strip()
 
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", str(getattr(config, "MIN_OUTPUT_PROB", 0.38)))
 MAX_OUTPUT_PROB = env_float("MAX_OUTPUT_PROB", str(getattr(config, "MAX_OUTPUT_PROB", 0.62)))
 PERCENT_DECIMALS = env_int("PERCENT_DECIMALS", str(getattr(config, "PERCENT_DECIMALS", 2)))
 
 USE_POINT_DB = env_bool("USE_POINT_DB", "1" if getattr(config, "USE_POINT_DB", True) else "0")
-USE_PATTERN_DB = env_bool("USE_PATTERN_DB", "1" if getattr(config, "USE_PATTERN_DB", True) else "0")
-USE_COMBO_DB = env_bool("USE_COMBO_DB", "1" if getattr(config, "USE_COMBO_DB", True) else "0")
-COMBO_MIN_SAMPLE = env_int("COMBO_MIN_SAMPLE", str(getattr(config, "COMBO_MIN_SAMPLE", 80)))
+USE_PATTERN_DB = env_bool("USE_PATTERN_DB", "1")
 
-POINT_DB_PATH = os.getenv("POINT_DB_PATH", getattr(config, "POINT_DB_PATH", "data/point_db_3m.json")).strip()
-PATTERN_DB_PATH = os.getenv("RESULT_PATTERN_DB_PATH", getattr(config, "RESULT_PATTERN_DB_PATH", "data/result_pattern_db_3m.json")).strip()
-COMBO_DB_PATH = os.getenv("COMBO_DB_PATH", getattr(config, "COMBO_DB_PATH", "data/combo_db_3m.json")).strip()
+POINT_DB_PATH = os.getenv("POINT_DB_PATH", getattr(config, "POINT_DB_PATH", "point_db.json")).strip()
+PATTERN_DB_PATH = os.getenv("PATTERN_DB_PATH", getattr(config, "PATTERN_DB_PATH", "pattern_db.json")).strip()
 
 
 # ============================================================
@@ -62,30 +69,39 @@ COMBO_DB_PATH = os.getenv("COMBO_DB_PATH", getattr(config, "COMBO_DB_PATH", "dat
 
 BASE_BANKER_NO_TIE = env_float("BASE_BANKER_NO_TIE", "0.5068")
 
-MIN_GAP_FOR_ENTRY = env_float("MIN_GAP_FOR_ENTRY", str(getattr(config, "MIN_GAP_FOR_ENTRY", 0.060)))
-STRONG_GAP_FOR_ENTRY = env_float("STRONG_GAP_FOR_ENTRY", str(getattr(config, "STRONG_GAP_FOR_ENTRY", 0.090)))
+MIN_GAP_FOR_ENTRY = env_float("MIN_GAP_FOR_ENTRY", "0.035")
+STRONG_GAP_FOR_ENTRY = env_float("STRONG_GAP_FOR_ENTRY", "0.065")
 
-TIE_AI_MAX_WEIGHT = env_float("TIE_AI_MAX_WEIGHT", str(getattr(config, "TIE_AI_MAX_WEIGHT", 0.01)))
-TIE_SHRINK = env_float("TIE_SHRINK", str(getattr(config, "TIE_SHRINK", 0.18)))
-TIE_MIN_GAP_FOR_ENTRY = env_float("TIE_MIN_GAP_FOR_ENTRY", str(getattr(config, "TIE_MIN_GAP_FOR_ENTRY", 0.12)))
 
-AI_NOISE_SCALE = env_float("AI_NOISE_SCALE", str(getattr(config, "AI_NOISE_SCALE", 0.008)))
+# ============================================================
+# 和局點數保護參數
+# ============================================================
 
-USE_MONTE_CARLO = env_bool("USE_MONTE_CARLO", "1" if getattr(config, "USE_MONTE_CARLO", True) else "0")
-MC_SIMULATIONS = env_int("MC_SIMULATIONS", str(getattr(config, "MC_SIMULATIONS", 600)))
-MC_MIN_SIMULATIONS = env_int("MC_MIN_SIMULATIONS", str(getattr(config, "MC_MIN_SIMULATIONS", 100)))
-MC_MAX_SIMULATIONS = env_int("MC_MAX_SIMULATIONS", str(getattr(config, "MC_MAX_SIMULATIONS", 900)))
-MC_SEED = env_int("MC_SEED", str(getattr(config, "MC_SEED", 42)))
-MC_MAX_NOISE = env_float("MC_MAX_NOISE", str(getattr(config, "MC_MAX_NOISE", 0.018)))
-MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1" if getattr(config, "MC_BLOCK_LOW_GAP", True) else "0")
-MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", str(getattr(config, "MC_MIN_GAP_FOR_ENTRY", 0.055)))
-MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "1" if getattr(config, "MC_DIRECTION_MISMATCH_BLOCK", True) else "0")
+TIE_AI_MAX_WEIGHT = env_float("TIE_AI_MAX_WEIGHT", "0.02")
+TIE_SHRINK = env_float("TIE_SHRINK", "0.30")
+TIE_MIN_GAP_FOR_ENTRY = env_float("TIE_MIN_GAP_FOR_ENTRY", "0.08")
 
-AI_HISTORY_WINDOW = env_int("AI_HISTORY_WINDOW", str(getattr(config, "AI_HISTORY_WINDOW", 8)))
-AI_TREND_STRENGTH = env_float("AI_TREND_STRENGTH", str(getattr(config, "AI_TREND_STRENGTH", 0.010)))
-AI_DIFF_MOMENTUM_STRENGTH = env_float("AI_DIFF_MOMENTUM_STRENGTH", str(getattr(config, "AI_DIFF_MOMENTUM_STRENGTH", 0.009)))
-AI_REVERSAL_STRENGTH = env_float("AI_REVERSAL_STRENGTH", str(getattr(config, "AI_REVERSAL_STRENGTH", 0.016)))
-AI_HISTORY_MAX_ADJUST = env_float("AI_HISTORY_MAX_ADJUST", str(getattr(config, "AI_HISTORY_MAX_ADJUST", 0.018)))
+
+# ============================================================
+# AI 微調參數
+# ============================================================
+
+AI_NOISE_SCALE = env_float("AI_NOISE_SCALE", "0.018")
+
+
+# ============================================================
+# Monte Carlo 風控驗證參數
+# ============================================================
+
+USE_MONTE_CARLO = env_bool("USE_MONTE_CARLO", "1")
+MC_SIMULATIONS = env_int("MC_SIMULATIONS", "300")
+MC_MIN_SIMULATIONS = env_int("MC_MIN_SIMULATIONS", "80")
+MC_MAX_SIMULATIONS = env_int("MC_MAX_SIMULATIONS", "800")
+MC_SEED = env_int("MC_SEED", "42")
+MC_MAX_NOISE = env_float("MC_MAX_NOISE", "0.018")
+MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1")
+MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", "0.035")
+MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "0")
 
 
 # ============================================================
@@ -160,10 +176,12 @@ def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
 
     if banker > 1.0:
         banker = banker / 100.0
+
     if player > 1.0:
         player = player / 100.0
 
     total = banker + player
+
     if total <= 0:
         banker = BASE_BANKER_NO_TIE
         player = 1.0 - banker
@@ -173,11 +191,13 @@ def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
 
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     player = 1.0 - banker
+
     return banker, player
 
 
 def neutral_record(source: str = "NEUTRAL_FALLBACK") -> Dict[str, Any]:
     banker = clamp(BASE_BANKER_NO_TIE, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+
     return {
         "available": False,
         "feature_key": "NEUTRAL",
@@ -196,24 +216,31 @@ def neutral_record(source: str = "NEUTRAL_FALLBACK") -> Dict[str, Any]:
 def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
+
     banker = BASE_BANKER_NO_TIE
 
     if diff == 0:
         banker += stable_noise(key + ":tie", 0.018)
     elif 1 <= diff <= 2:
-        banker -= 0.08
+        # diff = player_point - banker_point；diff > 0 代表閒點較高，banker 應下修。
+        banker -= 0.185
     elif 3 <= diff <= 5:
-        banker -= 0.10
+        # 閒中高點優勢，fallback 不可反向偏莊。
+        banker -= 0.185
     elif diff >= 6:
-        banker -= 0.06
+        # 閒大點差優勢，仍只做溫和下修，避免 fallback 過度極端。
+        banker -= 0.115
     elif -2 <= diff <= -1:
-        banker += 0.08
+        # diff < 0 代表莊點較高，banker 應上修。
+        banker += 0.185
     elif -5 <= diff <= -3:
-        banker += 0.10
+        # 莊中高點優勢，banker 上修。
+        banker += 0.185
     elif diff <= -6:
-        banker += 0.06
+        # 莊大點差優勢，溫和上修。
+        banker += 0.115
 
-    banker += stable_noise(key + ":fallback", 0.025)
+    banker += stable_noise(key + ":fallback", 0.045)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
 
     return {
@@ -233,8 +260,16 @@ def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
 
     try:
         rec = get_point_record(player_point, banker_point)
-        banker = rec.get("next_banker_rate", rec.get("banker_prob", rec.get("banker_rate", None)))
-        player = rec.get("next_player_rate", rec.get("player_prob", rec.get("player_rate", None)))
+
+        banker = rec.get(
+            "next_banker_rate",
+            rec.get("banker_prob", rec.get("banker_rate", None))
+        )
+        player = rec.get(
+            "next_player_rate",
+            rec.get("player_prob", rec.get("player_rate", None))
+        )
+
         if banker is None or player is None:
             return fallback_point_lookup(player_point, banker_point)
 
@@ -247,139 +282,829 @@ def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
             "banker_prob": banker,
             "player_prob": player,
             "source": rec.get("source", "POINT_DB"),
-            "sample_size": int(rec.get("sample", rec.get("sample_size", rec.get("no_tie_sample", 0))) or 0),
+            "sample_size": int(rec.get("sample", rec.get("sample_size", 0)) or 0),
             "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
         }
-    except Exception as e:
-        out = fallback_point_lookup(player_point, banker_point)
-        out["point_error"] = str(e)
-        return out
+
+    except Exception:
+        return fallback_point_lookup(player_point, banker_point)
 
 
 # ============================================================
 # PATTERN DB 查詢
 # ============================================================
 
-def pattern_db_lookup(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
-    if not USE_PATTERN_DB:
-        rec = neutral_record("PATTERN_DB_DISABLED")
-        rec["feature_key"] = feature_key(player_point, banker_point)
-        rec["pattern"] = ""
-        rec["window"] = 0
-        return rec
+@lru_cache(maxsize=1)
+def load_pattern_db_file() -> Dict[str, Any]:
+    """
+    備援用：如果 pattern_db.py 沒有成功 import / 呼叫，
+    才直接讀 PATTERN_DB_PATH 的 json。
+    主要邏輯仍以 pattern_db.py 的 pattern_lookup(rounds) / get_pattern_record(pattern, window) 為優先。
+    """
+    path = PATTERN_DB_PATH
 
+    if not os.path.exists(path):
+        path = os.path.join(os.getcwd(), path)
+
+    if not os.path.exists(path):
+        return {
+            "records": {},
+            "meta": {
+                "source": "PATTERN_DB_FILE_NOT_FOUND",
+                "path": PATTERN_DB_PATH,
+                "total_simulated_samples": 0,
+            },
+        }
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {
+                "records": {},
+                "meta": {
+                    "source": "PATTERN_DB_FORMAT_ERROR",
+                    "path": PATTERN_DB_PATH,
+                    "total_simulated_samples": 0,
+                },
+            }
+
+        return data
+
+    except Exception as e:
+        return {
+            "records": {},
+            "meta": {
+                "source": f"PATTERN_DB_LOAD_ERROR:{e}",
+                "path": PATTERN_DB_PATH,
+                "total_simulated_samples": 0,
+            },
+        }
+
+
+def normalize_round_result(value: Any) -> Optional[str]:
+    """
+    將各種可能的歷史資料格式統一成 B / P / T。
+    支援：
+    - "B" / "P" / "T"
+    - "莊" / "閒" / "和"
+    - "banker" / "player" / "tie"
+    - {"result": "..."}
+    - {"winner": "..."}
+    - {"last_result": "..."}
+    - {"player_point": 6, "banker_point": 5}
+    - {"player": 6, "banker": 5}
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        raw = (
+            value.get("result")
+            or value.get("winner")
+            or value.get("last_result")
+            or value.get("outcome")
+            or value.get("side")
+        )
+
+        if raw is not None:
+            return normalize_round_result(raw)
+
+        pp = (
+            value.get("player_point")
+            if value.get("player_point") is not None
+            else value.get("player")
+            if value.get("player") is not None
+            else value.get("p")
+        )
+        bp = (
+            value.get("banker_point")
+            if value.get("banker_point") is not None
+            else value.get("banker")
+            if value.get("banker") is not None
+            else value.get("b")
+        )
+
+        try:
+            if pp is None or bp is None:
+                return None
+
+            pp = int(pp)
+            bp = int(bp)
+
+            if pp > bp:
+                return "P"
+            if bp > pp:
+                return "B"
+            return "T"
+        except Exception:
+            return None
+
+    s = str(value).strip().upper()
+
+    if s in {"B", "BANKER", "庄", "莊"}:
+        return "B"
+
+    if s in {"P", "PLAYER", "闲", "閒", "閑"}:
+        return "P"
+
+    if s in {"T", "TIE", "和", "和局"}:
+        return "T"
+
+    return None
+
+
+def rounds_to_pattern_string(rounds: Optional[List[Any]]) -> str:
+    """
+    將 rounds 轉成 pattern_db 真正吃的牌路字串，例如：BPBPP。
+    無法辨識的資料會自動略過。
+    """
+    if not rounds:
+        return ""
+
+    chars: List[str] = []
+
+    for r in rounds:
+        ch = normalize_round_result(r)
+        if ch in {"B", "P", "T"}:
+            chars.append(ch)
+
+    return "".join(chars)
+
+
+def symbol_to_last_result(symbol: Optional[str]) -> Optional[str]:
+    """
+    將 B / P / T 轉成 pattern_db.py 常見的中文 last_result。
+    pattern_db.py 若只讀 r.get("last_result")，就需要這個欄位。
+    """
+    if symbol == "B":
+        return "莊"
+    if symbol == "P":
+        return "閒"
+    if symbol == "T":
+        return "和"
+    return None
+
+
+def enrich_rounds_for_pattern_db(rounds: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """
+    補齊 pattern_db.pattern_lookup(rounds) 需要的 last_result。
+
+    你的實際 rounds 多半是：
+        {"player_point": 6, "banker_point": 5}
+
+    但 pattern_db.py 可能只讀：
+        r.get("last_result")
+
+    所以這裡會在不破壞原資料的前提下，自動補：
+        player_point > banker_point => last_result = "閒"
+        banker_point > player_point => last_result = "莊"
+        相等 => last_result = "和"
+    """
+    if not rounds:
+        return []
+
+    enriched: List[Dict[str, Any]] = []
+
+    for r in rounds:
+        symbol = normalize_round_result(r)
+        last_result = symbol_to_last_result(symbol)
+
+        if isinstance(r, dict):
+            item = dict(r)
+            if not item.get("last_result") and last_result:
+                item["last_result"] = last_result
+            enriched.append(item)
+        else:
+            # 非 dict 的歷史資料也轉成 pattern_lookup 可讀的格式。
+            if last_result:
+                enriched.append({"last_result": last_result, "raw": r})
+
+    return enriched
+
+
+def extract_prob_from_pattern_record(rec: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    banker = (
+        rec.get("next_banker_rate")
+        if rec.get("next_banker_rate") is not None
+        else rec.get("banker_prob")
+        if rec.get("banker_prob") is not None
+        else rec.get("banker_rate")
+        if rec.get("banker_rate") is not None
+        else rec.get("next_banker_prob")
+        if rec.get("next_banker_prob") is not None
+        else rec.get("banker")
+        if rec.get("banker") is not None
+        else rec.get("B")
+        if rec.get("B") is not None
+        else rec.get("b")
+    )
+
+    player = (
+        rec.get("next_player_rate")
+        if rec.get("next_player_rate") is not None
+        else rec.get("player_prob")
+        if rec.get("player_prob") is not None
+        else rec.get("player_rate")
+        if rec.get("player_rate") is not None
+        else rec.get("next_player_prob")
+        if rec.get("next_player_prob") is not None
+        else rec.get("player")
+        if rec.get("player") is not None
+        else rec.get("P")
+        if rec.get("P") is not None
+        else rec.get("p")
+    )
+
+    if banker is None or player is None:
+        return None
+
+    try:
+        return normalize_prob_pair(float(banker), float(player))
+    except Exception:
+        return None
+
+
+def pattern_db_meta_safe() -> Dict[str, Any]:
     try:
         import pattern_db
-        fn = getattr(pattern_db, "pattern_lookup", None)
-        if not callable(fn):
-            raise RuntimeError("pattern_lookup not found")
-        rec = fn(rounds or [])
-        if not isinstance(rec, dict):
-            raise RuntimeError("pattern_lookup returned non-dict")
+        fn = getattr(pattern_db, "pattern_db_meta", None)
 
-        banker = rec.get("banker_prob", rec.get("next_banker_rate", BASE_BANKER_NO_TIE))
-        player = rec.get("player_prob", rec.get("next_player_rate", 1.0 - BASE_BANKER_NO_TIE))
-        banker, player = normalize_prob_pair(float(banker), float(player))
+        if callable(fn):
+            meta = fn()
+            if isinstance(meta, dict):
+                return meta
+    except Exception:
+        pass
 
-        meta = pattern_db.pattern_db_meta_safe() if hasattr(pattern_db, "pattern_db_meta_safe") else pattern_db.pattern_db_meta()
+    data = load_pattern_db_file()
+    meta = data.get("meta", {})
 
-        return {
-            "available": bool(rec.get("available", False)),
-            "feature_key": rec.get("feature_key", "PATTERN"),
-            "pattern": rec.get("pattern", ""),
-            "banker_prob": banker,
-            "player_prob": player,
-            "source": rec.get("source", "PATTERN_DB"),
-            "sample_size": int(rec.get("sample_size", rec.get("sample", 0)) or 0),
-            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
-            "window": int(rec.get("window", 0) or 0),
-            "matched": rec.get("matched", []),
-        }
-    except Exception as e:
-        rec = neutral_record(f"PATTERN_DB_ERROR:{e}")
-        rec["feature_key"] = feature_key(player_point, banker_point)
-        rec["pattern"] = ""
-        rec["window"] = 0
-        rec["matched"] = []
+    if not isinstance(meta, dict):
+        meta = {}
+
+    records = data.get("records", {})
+
+    if isinstance(records, dict):
+        count = len(records)
+    elif isinstance(records, list):
+        count = len(records)
+    else:
+        count = 0
+
+    meta.setdefault("total_simulated_samples", 0)
+    meta.setdefault("record_count", count)
+    meta.setdefault("source", "PATTERN_DB_JSON")
+
+    return meta
+
+
+def try_pattern_lookup_from_module(rounds: Optional[List[Any]], pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    優先呼叫 pattern_db.py 裡真正的 pattern_lookup。
+    Claude 指出的核心問題就是這裡：不能再拿 P6_B5 這種點數 key 去查規律。
+    """
+    try:
+        import pattern_db
+    except Exception:
+        return None
+
+    fn = getattr(pattern_db, "pattern_lookup", None)
+
+    if not callable(fn):
+        return None
+
+    call_styles = [
+        lambda: fn(rounds),
+        lambda: fn(pattern),
+        lambda: fn(rounds=rounds),
+        lambda: fn(pattern=pattern),
+        lambda: fn(history=rounds),
+        lambda: fn(pattern_string=pattern),
+    ]
+
+    for call in call_styles:
+        try:
+            rec = call()
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec.setdefault("feature_key", pattern)
+                rec.setdefault("pattern", pattern)
+                return rec
+        except Exception:
+            continue
+
+    return None
+
+
+def try_get_pattern_record_from_module(pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    若 pattern_db.py 沒有 pattern_lookup，就退而求其次呼叫：
+    get_pattern_record(pattern: str, window: int)
+
+    會從較長 window 往短 window 找，讓 300 萬組規律資料有機會命中。
+    """
+    try:
+        import pattern_db
+    except Exception:
+        return None
+
+    fn = getattr(pattern_db, "get_pattern_record", None)
+
+    if not callable(fn):
+        return None
+
+    max_window = min(len(pattern), env_int("PATTERN_MAX_WINDOW", "12"))
+    min_window = min(env_int("PATTERN_MIN_WINDOW", "3"), max_window)
+
+    for window in range(max_window, min_window - 1, -1):
+        sub_pattern = pattern[-window:]
+
+        call_styles = [
+            lambda sub_pattern=sub_pattern, window=window: fn(sub_pattern, window),
+            lambda sub_pattern=sub_pattern, window=window: fn(pattern=sub_pattern, window=window),
+            lambda sub_pattern=sub_pattern, window=window: fn(pattern=sub_pattern, win=window),
+            lambda sub_pattern=sub_pattern, window=window: fn(sub_pattern),
+        ]
+
+        for call in call_styles:
+            try:
+                rec = call()
+                if isinstance(rec, dict):
+                    rec = dict(rec)
+                    rec.setdefault("feature_key", sub_pattern)
+                    rec.setdefault("pattern", sub_pattern)
+                    rec.setdefault("window", window)
+                    return rec
+            except Exception:
+                continue
+
+    return None
+
+
+def find_record_in_pattern_json(pattern: str) -> Optional[Dict[str, Any]]:
+    """
+    最後備援：直接讀 pattern_db.json。
+    支援 records 為 dict 或 list 的格式。
+    """
+    data = load_pattern_db_file()
+    records = data.get("records", data)
+
+    max_window = min(len(pattern), env_int("PATTERN_MAX_WINDOW", "12"))
+    min_window = min(env_int("PATTERN_MIN_WINDOW", "3"), max_window)
+
+    keys_to_try: List[str] = []
+
+    for window in range(max_window, min_window - 1, -1):
+        sub_pattern = pattern[-window:]
+        keys_to_try.extend([
+            sub_pattern,
+            f"{sub_pattern}:{window}",
+            f"{window}:{sub_pattern}",
+            f"W{window}_{sub_pattern}",
+        ])
+
+    if isinstance(records, dict):
+        for key in keys_to_try:
+            rec = records.get(key)
+            if isinstance(rec, dict):
+                rec = dict(rec)
+                rec.setdefault("feature_key", key)
+                rec.setdefault("pattern", key)
+                return rec
+
+    if isinstance(records, list):
+        for key in keys_to_try:
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+
+                rec_key = str(
+                    rec.get("feature_key")
+                    or rec.get("key")
+                    or rec.get("pattern_key")
+                    or rec.get("pattern")
+                    or ""
+                )
+
+                if rec_key == key:
+                    rec = dict(rec)
+                    rec.setdefault("feature_key", rec_key)
+                    return rec
+
+    return None
+
+
+def pattern_db_lookup(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    正確版 pattern 查詢：
+    1. rounds 先轉成 B/P/T 歷史牌路字串
+    2. 優先呼叫 pattern_db.pattern_lookup(rounds / pattern)
+    3. 再退回 pattern_db.get_pattern_record(pattern, window)
+    4. 最後才直接查 json
+    """
+
+    current_fkey = feature_key(player_point, banker_point)
+    enriched_rounds = enrich_rounds_for_pattern_db(rounds)
+    pattern = rounds_to_pattern_string(enriched_rounds)
+
+    if not USE_PATTERN_DB:
+        rec = neutral_record("PATTERN_DB_DISABLED")
+        rec["feature_key"] = current_fkey
+        rec["pattern"] = pattern
         return rec
 
+    if not pattern or len(pattern) < env_int("PATTERN_MIN_HISTORY", "3"):
+        rec = neutral_record("PATTERN_COLD_START")
+        rec["feature_key"] = current_fkey
+        rec["pattern"] = pattern
+        return rec
+
+    # 關鍵修正：pattern_lookup 要吃已補 last_result 的 rounds，
+    # 不能直接把只有點數的 rounds 丟進去，否則 pattern_db.py 會讀不到牌路。
+    rec = try_pattern_lookup_from_module(enriched_rounds, pattern)
+
+    if rec is None:
+        rec = try_get_pattern_record_from_module(pattern)
+
+    if rec is None:
+        rec = find_record_in_pattern_json(pattern)
+
+    if not isinstance(rec, dict):
+        neutral = neutral_record("PATTERN_DB_NEUTRAL_FALLBACK")
+        neutral["feature_key"] = pattern
+        neutral["pattern"] = pattern
+        return neutral
+
+    probs = extract_prob_from_pattern_record(rec)
+
+    if probs is None:
+        neutral = neutral_record("PATTERN_DB_RECORD_NO_PROB_FALLBACK")
+        neutral["feature_key"] = rec.get("feature_key", pattern)
+        neutral["pattern"] = pattern
+        return neutral
+
+    banker, player = probs
+    meta = pattern_db_meta_safe()
+    matched_pattern = str(
+        rec.get("pattern")
+        or rec.get("feature_key")
+        or rec.get("key")
+        or pattern
+    )
+
+    return {
+        "available": True,
+        "feature_key": matched_pattern,
+        "pattern": pattern,
+        "banker_prob": banker,
+        "player_prob": player,
+        "source": rec.get("source", "PATTERN_DB_HISTORY_LOOKUP"),
+        "sample_size": int(rec.get("sample", rec.get("sample_size", rec.get("count", 0))) or 0),
+        "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+        "window": int(rec.get("window", len(matched_pattern)) or 0),
+    }
+
 
 # ============================================================
-# COMBO DB 查詢
+# FEATURE DB 查詢層：讓 pattern / AI 也可以像 point_db 一樣用當前點數獨立查表
 # ============================================================
 
-def combo_db_lookup(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
-    if not USE_COMBO_DB or combo_lookup is None:
-        rec = neutral_record("COMBO_DB_DISABLED")
-        rec["feature_key"] = feature_key(player_point, banker_point)
-        rec["candidate_keys"] = []
+def _extract_prob_from_feature_record(rec: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """
+    feature_db / ai_feature_db 共用的機率欄位解析。
+    支援 banker_prob/player_prob、next_banker_rate/next_player_rate、B/P 等常見命名。
+    """
+    if not isinstance(rec, dict):
+        return None
+
+    banker = (
+        rec.get("next_banker_rate")
+        if rec.get("next_banker_rate") is not None
+        else rec.get("banker_prob")
+        if rec.get("banker_prob") is not None
+        else rec.get("banker_rate")
+        if rec.get("banker_rate") is not None
+        else rec.get("next_banker_prob")
+        if rec.get("next_banker_prob") is not None
+        else rec.get("banker")
+        if rec.get("banker") is not None
+        else rec.get("B")
+        if rec.get("B") is not None
+        else rec.get("b")
+    )
+
+    player = (
+        rec.get("next_player_rate")
+        if rec.get("next_player_rate") is not None
+        else rec.get("player_prob")
+        if rec.get("player_prob") is not None
+        else rec.get("player_rate")
+        if rec.get("player_rate") is not None
+        else rec.get("next_player_prob")
+        if rec.get("next_player_prob") is not None
+        else rec.get("player")
+        if rec.get("player") is not None
+        else rec.get("P")
+        if rec.get("P") is not None
+        else rec.get("p")
+    )
+
+    if banker is None or player is None:
+        return None
+
+    try:
+        return normalize_prob_pair(float(banker), float(player))
+    except Exception:
+        return None
+
+
+def pattern_feature_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
+    """
+    方案一：pattern_feature_db。
+    用當前點數特徵直接查 pattern_feature_db.json，讓 pattern 層可像 point_db 一樣獨立查表。
+    查不到時回 neutral，是否退回原本 rounds pattern 由 predict() 控制。
+    """
+    fkey = feature_key(player_point, banker_point)
+
+    if not USE_PATTERN_FEATURE_DB:
+        rec = neutral_record("PATTERN_FEATURE_DB_DISABLED")
+        rec["feature_key"] = fkey
         return rec
 
     try:
-        rec = combo_lookup(player_point, banker_point, rounds or [], min_sample=COMBO_MIN_SAMPLE)
-        if not isinstance(rec, dict):
-            raise RuntimeError("combo_lookup returned non-dict")
-        banker = rec.get("banker_prob", rec.get("next_banker_rate", BASE_BANKER_NO_TIE))
-        player = rec.get("player_prob", rec.get("next_player_rate", 1.0 - BASE_BANKER_NO_TIE))
-        banker, player = normalize_prob_pair(float(banker), float(player))
+        import pattern_feature_db
+        fn = getattr(pattern_feature_db, "get_pattern_feature_record", None)
+        meta_fn = getattr(pattern_feature_db, "pattern_feature_db_meta", None)
+
+        if not callable(fn):
+            raise RuntimeError("get_pattern_feature_record not callable")
+
+        raw = fn(player_point, banker_point)
+
+        if not isinstance(raw, dict):
+            raise RuntimeError("feature record not dict")
+
+        sample_size = int(raw.get("sample", raw.get("sample_size", raw.get("count", 0))) or 0)
+
+        if sample_size and sample_size < FEATURE_DB_MIN_SAMPLE:
+            rec = neutral_record("PATTERN_FEATURE_DB_LOW_SAMPLE_FALLBACK")
+            rec["feature_key"] = raw.get("feature_key", fkey)
+            rec["sample_size"] = sample_size
+            return rec
+
+        probs = _extract_prob_from_feature_record(raw)
+
+        if probs is None:
+            rec = neutral_record("PATTERN_FEATURE_DB_NO_PROB_FALLBACK")
+            rec["feature_key"] = raw.get("feature_key", fkey)
+            rec["sample_size"] = sample_size
+            return rec
+
+        meta = meta_fn() if callable(meta_fn) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        banker, player = probs
+
         return {
-            "available": bool(rec.get("available", False)),
-            "feature_key": rec.get("feature_key", feature_key(player_point, banker_point)),
+            "available": True,
+            "feature_key": raw.get("feature_key", raw.get("key", fkey)),
+            "pattern": raw.get("pattern", raw.get("feature_key", fkey)),
             "banker_prob": banker,
             "player_prob": player,
-            "source": rec.get("source", "COMBO_DB"),
-            "sample_size": int(rec.get("sample_size", rec.get("sample", 0)) or 0),
-            "total_simulated_samples": int(rec.get("total_simulated_samples", 0) or 0),
-            "candidate_keys": rec.get("candidate_keys", []),
+            "source": raw.get("source", "PATTERN_FEATURE_DB"),
+            "sample_size": sample_size,
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+            "window": 0,
         }
+
     except Exception as e:
-        rec = neutral_record(f"COMBO_DB_ERROR:{e}")
-        rec["feature_key"] = feature_key(player_point, banker_point)
-        rec["candidate_keys"] = []
+        rec = neutral_record(f"PATTERN_FEATURE_DB_ERROR:{e}")
+        rec["feature_key"] = fkey
         return rec
+
+
+def ai_point_feature_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
+    """
+    方案二：ai_point_feature_db。
+    用當前點數特徵直接查 ai_point_feature_db.json，讓 AI 層可像 point_db 一樣獨立查表。
+    查不到時回 neutral，是否退回原本 rounds AI 由 predict() 控制。
+    """
+    fkey = feature_key(player_point, banker_point)
+
+    if not USE_AI_POINT_FEATURE_DB:
+        rec = neutral_record("AI_POINT_FEATURE_DB_DISABLED")
+        rec["feature_key"] = fkey
+        return {
+            **rec,
+            "history_points_used": 0,
+            "history_adjust": 0.0,
+            "history_reasons": ["ai_feature_db_disabled"],
+        }
+
+    try:
+        import ai_point_feature_db
+        fn = getattr(ai_point_feature_db, "get_ai_point_feature_record", None)
+        meta_fn = getattr(ai_point_feature_db, "ai_point_feature_db_meta", None)
+
+        if not callable(fn):
+            raise RuntimeError("get_ai_point_feature_record not callable")
+
+        raw = fn(player_point, banker_point)
+
+        if not isinstance(raw, dict):
+            raise RuntimeError("ai feature record not dict")
+
+        sample_size = int(raw.get("sample", raw.get("sample_size", raw.get("count", 0))) or 0)
+
+        if sample_size and sample_size < FEATURE_DB_MIN_SAMPLE:
+            rec = neutral_record("AI_POINT_FEATURE_DB_LOW_SAMPLE_FALLBACK")
+            rec["feature_key"] = raw.get("feature_key", fkey)
+            rec["sample_size"] = sample_size
+            return {
+                **rec,
+                "history_points_used": 0,
+                "history_adjust": 0.0,
+                "history_reasons": ["ai_feature_low_sample"],
+            }
+
+        probs = _extract_prob_from_feature_record(raw)
+
+        if probs is None:
+            rec = neutral_record("AI_POINT_FEATURE_DB_NO_PROB_FALLBACK")
+            rec["feature_key"] = raw.get("feature_key", fkey)
+            rec["sample_size"] = sample_size
+            return {
+                **rec,
+                "history_points_used": 0,
+                "history_adjust": 0.0,
+                "history_reasons": ["ai_feature_no_prob"],
+            }
+
+        meta = meta_fn() if callable(meta_fn) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        banker, player = probs
+
+        return {
+            "available": True,
+            "feature_key": raw.get("feature_key", raw.get("key", fkey)),
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": raw.get("source", "AI_POINT_FEATURE_DB"),
+            "sample_size": sample_size,
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+            "history_points_used": 0,
+            "history_adjust": float(raw.get("history_adjust", 0.0) or 0.0),
+            "history_reasons": ["ai_point_feature_db_lookup"],
+        }
+
+    except Exception as e:
+        rec = neutral_record(f"AI_POINT_FEATURE_DB_ERROR:{e}")
+        rec["feature_key"] = fkey
+        return {
+            **rec,
+            "history_points_used": 0,
+            "history_adjust": 0.0,
+            "history_reasons": ["ai_feature_db_error"],
+        }
+
+
+def choose_pattern_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]]) -> Dict[str, Any]:
+    mode = PREDICT_MODE if PREDICT_MODE in {"hybrid", "feature", "history"} else "hybrid"
+
+    if mode == "history":
+        rec = pattern_db_lookup(player_point, banker_point, rounds=rounds)
+        rec["layer_mode"] = "history"
+        return rec
+
+    feature_rec = pattern_feature_db_lookup(player_point, banker_point)
+
+    if feature_rec.get("available") or mode == "feature" or not FEATURE_DB_FALLBACK_TO_HISTORY:
+        feature_rec["layer_mode"] = "feature"
+        return feature_rec
+
+    history_rec = pattern_db_lookup(player_point, banker_point, rounds=rounds)
+    history_rec["layer_mode"] = "history_fallback"
+    history_rec["feature_fallback_source"] = feature_rec.get("source")
+    return history_rec
+
+
+def choose_ai_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]]) -> Dict[str, Any]:
+    mode = PREDICT_MODE if PREDICT_MODE in {"hybrid", "feature", "history"} else "hybrid"
+
+    if mode == "history":
+        rec = ai_simulation_layer(player_point, banker_point, rounds=rounds)
+        rec["layer_mode"] = "history"
+        return rec
+
+    feature_rec = ai_point_feature_db_lookup(player_point, banker_point)
+
+    if feature_rec.get("available") or mode == "feature" or not FEATURE_DB_FALLBACK_TO_HISTORY:
+        feature_rec["layer_mode"] = "feature"
+        return feature_rec
+
+    history_rec = ai_simulation_layer(player_point, banker_point, rounds=rounds)
+    history_rec["layer_mode"] = "history_fallback"
+    history_rec["feature_fallback_source"] = feature_rec.get("source")
+    return history_rec
 
 
 # ============================================================
 # AI 模擬層
 # ============================================================
 
+AI_HISTORY_WINDOW = env_int("AI_HISTORY_WINDOW", "8")
+AI_TREND_STRENGTH = env_float("AI_TREND_STRENGTH", "0.014")
+AI_DIFF_MOMENTUM_STRENGTH = env_float("AI_DIFF_MOMENTUM_STRENGTH", "0.012")
+AI_REVERSAL_STRENGTH = env_float("AI_REVERSAL_STRENGTH", "0.010")
+AI_HISTORY_MAX_ADJUST = env_float("AI_HISTORY_MAX_ADJUST", "0.035")
+
+
 def extract_round_points(rounds: Optional[List[Any]]) -> List[Tuple[int, int]]:
+    """
+    從 rounds 抽出歷史點數序列。
+    支援格式：
+    - {"player_point": 6, "banker_point": 5}
+    - {"player": 6, "banker": 5}
+    - {"p": 6, "b": 5}
+    - (6, 5) / [6, 5]
+
+    回傳格式固定為：[(player_point, banker_point), ...]
+    """
     if not rounds:
         return []
+
     out: List[Tuple[int, int]] = []
+
     for r in rounds:
         pp = None
         bp = None
+
         if isinstance(r, dict):
-            pp = r.get("player_point", r.get("player", r.get("p")))
-            bp = r.get("banker_point", r.get("banker", r.get("b")))
+            pp = (
+                r.get("player_point")
+                if r.get("player_point") is not None
+                else r.get("player")
+                if r.get("player") is not None
+                else r.get("p")
+            )
+            bp = (
+                r.get("banker_point")
+                if r.get("banker_point") is not None
+                else r.get("banker")
+                if r.get("banker") is not None
+                else r.get("b")
+            )
         elif isinstance(r, (list, tuple)) and len(r) >= 2:
             pp, bp = r[0], r[1]
+
         try:
             if pp is None or bp is None:
                 continue
+
             pp = int(pp)
             bp = int(bp)
+
             if 0 <= pp <= 9 and 0 <= bp <= 9:
                 out.append((pp, bp))
         except Exception:
             continue
+
     return out
 
 
 def trend_delta(values: List[int]) -> float:
+    """
+    用簡單線性趨勢看最近點數是往上還往下。
+    正值代表後段偏高，負值代表後段偏低。
+    """
     n = len(values)
     if n < 3:
         return 0.0
+
     mid = n // 2
     early = values[:mid]
     late = values[mid:]
+
     if not early or not late:
         return 0.0
+
     return (sum(late) / len(late)) - (sum(early) / len(early))
 
 
 def streak_count(results: List[str], side: str) -> int:
+    """
+    計算最近連續同邊次數，和局不列入連續方向。
+    """
     count = 0
     for r in reversed(results):
         if r == "T":
@@ -391,26 +1116,52 @@ def streak_count(results: List[str], side: str) -> int:
     return count
 
 
-def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
+def ai_simulation_layer(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    本地 AI 修正層 v3：點數序列趨勢版。
+
+    分工原則：
+    - point_db：看「當前這一局點數組合」的統計。
+    - pattern_db：看「B/P/T 牌路字串」的規律。
+    - AI 層：看「歷史點數序列」的趨勢、動能、過熱反轉。
+
+    注意：AI 層只做小幅微調，避免蓋過 point_db / pattern_db。
+    """
+
     diff = player_point - banker_point
     key = feature_key(player_point, banker_point)
+
     banker = BASE_BANKER_NO_TIE
     reasons: List[str] = []
     history_adjust = 0.0
 
+    # 1) 當前點數差：保留原本 v2 的基礎判斷
     if diff == 0:
-        banker += stable_noise(key + ":ai_tie", 0.004)
+        banker += stable_noise(key + ":ai_tie", 0.006)
         reasons.append("current_tie_point_noise")
+
     elif abs(diff) <= 2:
-        banker += -0.012 if diff > 0 else 0.012
+        adj = -0.018 if diff > 0 else 0.018
+        banker += adj
         reasons.append("current_small_diff_adjust")
+
     elif abs(diff) <= 5:
-        banker += -0.016 if diff > 0 else 0.016
+        # diff = 閒點 - 莊點；diff > 0 代表閒點較高，banker 應下修。
+        adj = -0.022 if diff > 0 else 0.022
+        banker += adj
         reasons.append("current_mid_diff_adjust")
+
     else:
-        banker += -0.010 if diff > 0 else 0.010
+        # 大點差也維持同一方向：閒高偏閒、莊高偏莊。
+        adj = -0.012 if diff > 0 else 0.012
+        banker += adj
         reasons.append("current_large_diff_adjust")
 
+    # 2) 歷史點數序列：真正讓 AI 層吃 rounds
     point_history = extract_round_points(rounds)
     recent = point_history[-AI_HISTORY_WINDOW:] if point_history else []
 
@@ -424,20 +1175,29 @@ def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[L
         b_trend = trend_delta(banker_points)
         diff_trend = trend_delta(diffs)
 
+        # 閒點數近期升得比莊明顯：偏閒，banker 下修
         if p_trend - b_trend >= 1.5:
-            history_adjust -= AI_TREND_STRENGTH
+            adj = -AI_TREND_STRENGTH
+            history_adjust += adj
             reasons.append("player_point_trend_up")
+
+        # 莊點數近期升得比閒明顯：偏莊，banker 上修
         elif b_trend - p_trend >= 1.5:
-            history_adjust += AI_TREND_STRENGTH
+            adj = AI_TREND_STRENGTH
+            history_adjust += adj
             reasons.append("banker_point_trend_up")
 
+        # 點差動能：diff = 閒點 - 莊點；diff 越往正，代表閒動能增強
         if diff_trend >= 1.25:
-            history_adjust -= AI_DIFF_MOMENTUM_STRENGTH
+            adj = -AI_DIFF_MOMENTUM_STRENGTH
+            history_adjust += adj
             reasons.append("player_diff_momentum")
         elif diff_trend <= -1.25:
-            history_adjust += AI_DIFF_MOMENTUM_STRENGTH
+            adj = AI_DIFF_MOMENTUM_STRENGTH
+            history_adjust += adj
             reasons.append("banker_diff_momentum")
 
+        # 過熱反轉：某一邊連續高點數，下一手不追太滿，只做小幅反向保護
         recent_player_hot = sum(1 for x in player_points[-3:] if x >= 7)
         recent_banker_hot = sum(1 for x in banker_points[-3:] if x >= 7)
 
@@ -448,6 +1208,7 @@ def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[L
             history_adjust -= AI_REVERSAL_STRENGTH
             reasons.append("banker_hot_reversal_guard")
 
+        # 連莊 / 連閒保護：不是直接反打，只是避免 AI 層過度追單邊
         b_streak = streak_count(results, "B")
         p_streak = streak_count(results, "P")
 
@@ -460,13 +1221,14 @@ def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[L
 
     history_adjust = clamp(history_adjust, -AI_HISTORY_MAX_ADJUST, AI_HISTORY_MAX_ADJUST)
     banker += history_adjust
-    banker += stable_noise(key + ":ai_v4_combo", AI_NOISE_SCALE)
+
+    banker += stable_noise(key + ":ai_v3_history", AI_NOISE_SCALE)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
 
     return {
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
-        "source": "LOCAL_AI_SIMULATION_POINT_SEQUENCE_V4_COMBO_SAFE",
+        "source": "LOCAL_AI_SIMULATION_POINT_SEQUENCE_V3",
         "history_points_used": len(recent),
         "history_adjust": history_adjust,
         "history_reasons": reasons,
@@ -477,27 +1239,49 @@ def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[L
 # Monte Carlo 風控驗證層
 # ============================================================
 
-def monte_carlo_verify_from_probs(banker_prob: float, player_prob: float, n_sim: Optional[int] = None, seed_key: str = "") -> Dict[str, Any]:
+def monte_carlo_verify_from_probs(
+    banker_prob: float,
+    player_prob: float,
+    n_sim: Optional[int] = None,
+    seed_key: str = "",
+) -> Dict[str, Any]:
+    """
+    安全版 Monte Carlo：只拿 predict 已經算好的最終機率做穩定度抽樣。
+
+    重要：這裡不能再呼叫 predict()，否則會造成 predict -> MC -> predict 的無限遞迴。
+    定位：風控驗證層，不是主預測層。
+    """
     if n_sim is None:
         n_sim = MC_SIMULATIONS
+
     try:
         n_sim = int(n_sim)
     except Exception:
-        n_sim = 600
+        n_sim = 300
 
     min_sim = max(20, int(MC_MIN_SIMULATIONS))
     max_sim = max(min_sim, int(MC_MAX_SIMULATIONS))
     n_sim = max(min_sim, min(n_sim, max_sim))
 
     banker_prob, player_prob = normalize_prob_pair(float(banker_prob), float(player_prob))
+
     rng = random.Random(f"{MC_SEED}:{seed_key}")
-    wins = {"banker": 0, "player": 0, "tie": 0}
+
+    wins = {
+        "banker": 0,
+        "player": 0,
+        "tie": 0,
+    }
 
     for _ in range(n_sim):
+        # 微幅擾動用來測試目前推薦方向是否穩定。
         noise = rng.uniform(-MC_MAX_NOISE, MC_MAX_NOISE)
         b = clamp(banker_prob + noise, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
         p = 1.0 - b
+
+        # 只抽一次亂數，避免 banker / player 判斷機率失真。
         r = rng.random()
+
         if r < b:
             wins["banker"] += 1
         elif r < b + p:
@@ -506,6 +1290,7 @@ def monte_carlo_verify_from_probs(banker_prob: float, player_prob: float, n_sim:
             wins["tie"] += 1
 
     total = wins["banker"] + wins["player"] + wins["tie"]
+
     if total <= 0:
         banker_rate = BASE_BANKER_NO_TIE
         player_rate = 1.0 - BASE_BANKER_NO_TIE
@@ -530,33 +1315,61 @@ def monte_carlo_verify_from_probs(banker_prob: float, player_prob: float, n_sim:
         "mc_recommend": mc_recommend,
         "mc_gap": round(mc_gap * 100, PERCENT_DECIMALS),
         "mc_gap_raw": mc_gap,
-        "mc_source": "MONTE_CARLO_PROB_STABILITY_CHECK_SAFE_V2",
+        "mc_source": "MONTE_CARLO_PROB_STABILITY_CHECK_SAFE_V1",
         "mc_note": "MC only verifies final probability stability; it does not call predict().",
     }
 
 
 def disabled_monte_carlo_result() -> Dict[str, Any]:
-    return {"mc_enabled": False, "mc_simulations": 0, "mc_source": "MONTE_CARLO_DISABLED"}
+    return {
+        "mc_enabled": False,
+        "mc_simulations": 0,
+        "mc_source": "MONTE_CARLO_DISABLED",
+    }
 
 
 # ============================================================
-# 保護與進場判斷
+# 和局保護
 # ============================================================
 
 def apply_tie_point_protection(banker: float, is_tie_point: bool) -> float:
     if not is_tie_point:
         return banker
+
     return BASE_BANKER_NO_TIE + (banker - BASE_BANKER_NO_TIE) * TIE_SHRINK
 
 
+# ============================================================
+# 進場判斷
+# ============================================================
+
 def build_entry_decision(is_tie_point: bool, gap: float, recommend: str) -> Tuple[bool, str, str]:
     if is_tie_point and gap < TIE_MIN_GAP_FOR_ENTRY:
-        return False, "no_entry", "上一局為和局點數，莊閒優勢不足，建議觀察一局"
+        return (
+            False,
+            "no_entry",
+            "上一局為和局點數，莊閒優勢不足，建議觀察一局",
+        )
+
     if gap < MIN_GAP_FOR_ENTRY:
-        return False, "no_entry", "莊閒機率差距不足，建議觀察一局"
+        return (
+            False,
+            "no_entry",
+            "莊閒機率差距不足，建議觀察一局",
+        )
+
     if gap >= STRONG_GAP_FOR_ENTRY:
-        return True, "strong", ""
-    return True, "normal", ""
+        return (
+            True,
+            "strong",
+            "",
+        )
+
+    return (
+        True,
+        "normal",
+        "",
+    )
 
 
 # ============================================================
@@ -571,29 +1384,30 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     is_tie_point = player_point == banker_point
 
     point = point_db_lookup(player_point, banker_point)
-    pattern = pattern_db_lookup(player_point, banker_point, rounds=rounds)
-    combo = combo_db_lookup(player_point, banker_point, rounds=rounds)
-    ai = ai_simulation_layer(player_point, banker_point, rounds=rounds)
+    pattern = choose_pattern_layer(player_point, banker_point, rounds=rounds)
+    ai = choose_ai_layer(player_point, banker_point, rounds=rounds)
 
     p_w = float(POINT_WEIGHT)
-    c_w = float(COMBO_WEIGHT)
     pat_w = float(PATTERN_WEIGHT)
     sim_w = float(SIM_WEIGHT)
 
-    if not USE_POINT_DB or not point.get("available"):
+    if not USE_POINT_DB:
         p_w = 0.0
-    if not USE_COMBO_DB or not combo.get("available"):
-        c_w = 0.0
-    if not USE_PATTERN_DB or not pattern.get("available"):
+
+    if not USE_PATTERN_DB:
         pat_w = 0.0
+
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
 
-    total_weight = max(p_w + c_w + pat_w + sim_w, 0.0001)
+    total_weight = max(p_w + pat_w + sim_w, 0.0001)
 
+    # 核心修正：
+    # POINT_WEIGHT 只給 point_db
+    # PATTERN_WEIGHT 只給 pattern_db
+    # SIM_WEIGHT 只給 AI
     banker = (
         point["banker_prob"] * p_w +
-        combo["banker_prob"] * c_w +
         pattern["banker_prob"] * pat_w +
         ai["banker_prob"] * sim_w
     ) / total_weight
@@ -603,6 +1417,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     player = 1.0 - banker
     gap = abs(banker - player)
+
     recommend = "莊" if banker >= player else "閒"
 
     entry_allowed, entry_level, weak_reason = build_entry_decision(
@@ -611,96 +1426,125 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         recommend=recommend,
     )
 
-    result: Dict[str, Any] = {
+    result = {
         "ok": True,
+
         "player_point": player_point,
         "banker_point": banker_point,
         "last_result": last_result,
+
         "recommend": recommend,
+
         "player_prob": round(player * 100, PERCENT_DECIMALS),
         "banker_prob": round(banker * 100, PERCENT_DECIMALS),
+
         "player_prob_raw": player,
         "banker_prob_raw": banker,
+
         "confidence_gap": round(gap * 100, PERCENT_DECIMALS),
         "confidence_gap_raw": gap,
+
         "entry_allowed": entry_allowed,
         "entry_level": entry_level,
         "weak_reason": weak_reason,
         "no_observe": not entry_allowed,
+
         "tie_point_mode": is_tie_point,
         "tie_ai_max_weight": TIE_AI_MAX_WEIGHT if is_tie_point else None,
         "tie_shrink": TIE_SHRINK if is_tie_point else None,
         "tie_min_gap_for_entry": TIE_MIN_GAP_FOR_ENTRY if is_tie_point else None,
+
         "min_gap_for_entry": MIN_GAP_FOR_ENTRY,
         "strong_gap_for_entry": STRONG_GAP_FOR_ENTRY,
+
         "feature_key": feature_key(player_point, banker_point),
+
         "point_feature_key": point["feature_key"],
-        "combo_feature_key": combo["feature_key"],
         "pattern_feature_key": pattern["feature_key"],
+
         "point_source": point["source"],
-        "combo_source": combo["source"],
         "pattern_source": pattern["source"],
         "ai_source": ai["source"],
         "ai_history_points_used": ai.get("history_points_used", 0),
         "ai_history_adjust": ai.get("history_adjust", 0.0),
         "ai_history_reasons": ai.get("history_reasons", []),
+        "predict_mode": PREDICT_MODE,
+        "pattern_layer_mode": pattern.get("layer_mode", "unknown"),
+        "ai_layer_mode": ai.get("layer_mode", "unknown"),
+
         "point_available": point["available"],
-        "combo_available": combo["available"],
         "pattern_available": pattern["available"],
+
         "point_sample_size": point["sample_size"],
-        "combo_sample_size": combo["sample_size"],
         "pattern_sample_size": pattern["sample_size"],
+
         "point_total_samples": point["total_simulated_samples"],
-        "combo_total_samples": combo["total_simulated_samples"],
         "pattern_total_samples": pattern["total_simulated_samples"],
-        "matched_patterns": [pattern["feature_key"]] if pattern.get("available") else [],
-        "combo_candidate_keys": combo.get("candidate_keys", []),
+
+        "matched_patterns": [pattern["feature_key"]] if pattern["available"] else [],
+
         "weights": {
             "point": p_w,
-            "combo": c_w,
             "pattern": pat_w,
             "simulation": sim_w,
             "total": total_weight,
         },
+
         "raw_layers": {
             "point_banker_prob": point["banker_prob"],
-            "combo_banker_prob": combo["banker_prob"],
             "pattern_banker_prob": pattern["banker_prob"],
             "ai_banker_prob": ai["banker_prob"],
             "point_player_prob": point["player_prob"],
-            "combo_player_prob": combo["player_prob"],
             "pattern_player_prob": pattern["player_prob"],
             "ai_player_prob": ai["player_prob"],
         },
+
         "history_used": bool(rounds) and (
-            combo.get("available") or pattern.get("available") or ai.get("history_points_used", 0) >= 3
+            pattern.get("source") != "PATTERN_COLD_START" or ai.get("history_points_used", 0) >= 3
         ),
         "rounds_ignored": False,
         "pattern_string": pattern.get("pattern", ""),
         "pattern_window": pattern.get("window", 0),
-        "combo_min_sample": COMBO_MIN_SAMPLE,
+        "pattern_rounds_enriched": True,
+
+        "mode": "POINT_DB_PLUS_FEATURE_DB_HYBRID_AI_MC_V7",
     }
 
     if USE_MONTE_CARLO:
-        mc = monte_carlo_verify_from_probs(
+        mc_result = monte_carlo_verify_from_probs(
             banker_prob=banker,
             player_prob=player,
-            seed_key=f"{player_point}-{banker_point}-{result.get('pattern_string', '')}-{result.get('combo_feature_key', '')}",
+            seed_key=f"{player_point}:{banker_point}:{pattern.get('feature_key', '')}:{ai.get('history_adjust', 0.0)}",
         )
-        result.update(mc)
+        result["monte_carlo"] = mc_result
 
-        if MC_BLOCK_LOW_GAP and mc.get("mc_gap_raw", 0.0) < MC_MIN_GAP_FOR_ENTRY:
-            result["entry_allowed"] = False
-            result["entry_level"] = "mc_no_entry"
-            result["weak_reason"] = "蒙地卡羅穩定度不足，建議觀察一局"
-            result["no_observe"] = True
+        mc_gap_raw = float(mc_result.get("mc_gap_raw", 0.0) or 0.0)
+        mc_recommend = mc_result.get("mc_recommend", recommend)
 
-        if MC_DIRECTION_MISMATCH_BLOCK and mc.get("mc_recommend") in {"莊", "閒"} and mc.get("mc_recommend") != recommend:
+        # MC 不改推薦方向，只做風控；若 MC 顯示差距不足，就降級觀察。
+        if MC_BLOCK_LOW_GAP and result["entry_allowed"] and mc_gap_raw < MC_MIN_GAP_FOR_ENTRY:
             result["entry_allowed"] = False
-            result["entry_level"] = "mc_direction_mismatch"
-            result["weak_reason"] = "蒙地卡羅方向與主模型不一致，建議觀察一局"
+            result["entry_level"] = "no_entry"
+            result["weak_reason"] = "Monte Carlo 穩定度不足，莊閒差距偏小，建議觀察一局"
             result["no_observe"] = True
+            result["mc_entry_blocked"] = True
+        else:
+            result["mc_entry_blocked"] = False
+
+        # 預設不因 MC 方向不一致直接擋單；若你想更保守，可設 MC_DIRECTION_MISMATCH_BLOCK=1。
+        if (
+            MC_DIRECTION_MISMATCH_BLOCK
+            and result["entry_allowed"]
+            and mc_recommend in {"莊", "閒"}
+            and mc_recommend != recommend
+        ):
+            result["entry_allowed"] = False
+            result["entry_level"] = "no_entry"
+            result["weak_reason"] = "Monte Carlo 模擬方向與主模型不一致，建議觀察一局"
+            result["no_observe"] = True
+            result["mc_entry_blocked"] = True
     else:
-        result.update(disabled_monte_carlo_result())
+        result["monte_carlo"] = disabled_monte_carlo_result()
+        result["mc_entry_blocked"] = False
 
     return result
