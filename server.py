@@ -49,6 +49,10 @@ CORS(app)
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 TRIAL_SECONDS = TRIAL_MINUTES * 60
 
+# 本輪暖機局數保護：剛開始歷史不足時只讀牌，不建議進場。
+# 例如 MIN_HISTORY_FOR_ENTRY=3，代表前 2 局只建立牌路，第 3 局起才允許進場判斷。
+MIN_HISTORY_FOR_ENTRY = int(os.getenv("MIN_HISTORY_FOR_ENTRY", "3"))
+
 ADMIN_LINE_URL = os.getenv("ADMIN_LINE_URL", "https://lin.ee/xYcGKN0").strip()
 
 TEMP_TRIAL_CODE = os.getenv("TEMP_TRIAL_CODE", "aaa1688002").strip()
@@ -760,7 +764,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "BGS_DUAL_3M_DB_LINE_BOT",
-        "version": "server-access-betting-patch-v7-redis-persistent-trial-reset-on-end-v1",
+        "version": "server-access-betting-patch-v7-redis-persistent-trial-reset-on-end-warmup-v2",
         "sessions": store.all_count(),
         "access_store_mode": pstore.mode,
         "redis_enabled": pstore.mode == "redis",
@@ -1050,6 +1054,30 @@ def handle_text(user_id: str, reply_token: str, text: str):
         }]
 
         pred = predict(player_point, banker_point, temp_rounds)
+
+        # ============================================================
+        # 新增：本輪歷史不足時，只讀牌，不進場
+        # 目的：避免重置後第 1～2 手因 pattern_db / AI 歷史樣本不足而硬進場。
+        # 注意：這裡只改 entry_allowed，不改 predict 原始推薦與機率，方便後續追蹤。
+        # ============================================================
+        current_history_count = len(temp_rounds)
+
+        if MIN_HISTORY_FOR_ENTRY > 1 and current_history_count < MIN_HISTORY_FOR_ENTRY:
+            pred["entry_allowed"] = False
+            pred["entry_level"] = "no_entry"
+            pred["weak_reason"] = (
+                f"目前本輪僅累積 {current_history_count} 局資料，"
+                f"未達 {MIN_HISTORY_FOR_ENTRY} 局最低分析門檻，建議先觀察建立牌路。"
+            )
+            pred["no_observe"] = True
+            pred["history_warmup_blocked"] = True
+            pred["history_warmup_count"] = current_history_count
+            pred["min_history_for_entry"] = MIN_HISTORY_FOR_ENTRY
+        else:
+            pred["history_warmup_blocked"] = False
+            pred["history_warmup_count"] = current_history_count
+            pred["min_history_for_entry"] = MIN_HISTORY_FOR_ENTRY
+
         ai_text = explain(pred)
 
         round_data = {
