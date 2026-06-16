@@ -10,6 +10,13 @@ except Exception:
 
 BASE_BANKER_NO_TIE = 0.5068
 
+SCENARIO_ALIASES = {
+    "NONE_DRAW": ["NONE_DRAW", "NO_DRAW", "none_draw", "no_draw"],
+    "PLAYER_DRAW": ["PLAYER_DRAW", "P_DRAW", "player_draw"],
+    "BANKER_DRAW": ["BANKER_DRAW", "B_DRAW", "banker_draw"],
+    "BOTH_DRAW": ["BOTH_DRAW", "BOTH", "both_draw"],
+}
+
 
 def _resolve_path(path: str) -> str:
     if os.path.exists(path):
@@ -34,8 +41,19 @@ def load_combo_db() -> Dict[str, Any]:
             "records": {},
         }
 
-    with open(path, "r", encoding="utf-8") as f:
-        db = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception as e:
+        return {
+            "meta": {
+                "source": f"COMBO_DB_LOAD_ERROR:{e}",
+                "path": COMBO_DB_PATH,
+                "total_simulated_samples": 0,
+                "record_count": 0,
+            },
+            "records": {},
+        }
 
     if not isinstance(db, dict):
         return {
@@ -69,6 +87,7 @@ def combo_db_meta() -> Dict[str, Any]:
     meta.setdefault("record_count", len(records) if isinstance(records, dict) else 0)
     meta.setdefault("total_simulated_samples", 0)
     meta.setdefault("source", "COMBO_DB")
+    meta.setdefault("path", COMBO_DB_PATH)
     return meta
 
 
@@ -89,170 +108,87 @@ def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
     return banker, player
 
 
-def normalize_round_result(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        raw = (
-            value.get("result")
-            or value.get("winner")
-            or value.get("last_result")
-            or value.get("outcome")
-            or value.get("side")
-        )
-        if raw is not None:
-            return normalize_round_result(raw)
-
-        pp = value.get("player_point", value.get("player", value.get("p")))
-        bp = value.get("banker_point", value.get("banker", value.get("b")))
-        try:
-            if pp is None or bp is None:
-                return None
-            pp = int(pp)
-            bp = int(bp)
-            if pp > bp:
-                return "P"
-            if bp > pp:
-                return "B"
-            return "T"
-        except Exception:
-            return None
-
-    s = str(value).strip().upper()
-    if s in {"B", "BANKER", "莊", "庄"}:
-        return "B"
-    if s in {"P", "PLAYER", "閒", "閑", "闲"}:
-        return "P"
-    if s in {"T", "TIE", "和", "和局"}:
-        return "T"
-    return None
-
-
-def rounds_to_results(rounds: Optional[List[Any]]) -> List[str]:
-    if not rounds:
-        return []
-    out: List[str] = []
-    for r in rounds:
-        ch = normalize_round_result(r)
-        if ch in {"B", "P", "T"}:
-            out.append(ch)
-    return out
-
-
-def normalize_w7_pattern(seq: List[str]) -> Optional[str]:
-    fixed: List[str] = []
-    last: Optional[str] = None
-    for s in seq:
-        if s in {"B", "P"}:
-            fixed.append(s)
-            last = s
-        else:
-            if last is None:
-                return None
-            fixed.append(last)
-    return "".join(fixed)
-
-
-def streak_info(results: List[str]) -> Tuple[str, int]:
-    count = 0
-    side: Optional[str] = None
-    for r in reversed(results):
-        if r == "T":
-            continue
-        if side is None:
-            side = r
-            count = 1
-        elif r == side:
-            count += 1
-        else:
-            break
-    if side is None:
-        return "N", 0
-    return side, count
-
-
-def alt_bucket(results: List[str], window: int = 6) -> str:
-    seq = [x for x in results[-window:] if x in {"B", "P"}]
-    if len(seq) < 3:
-        return "NA"
-    alt = sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1])
-    if alt >= 5:
-        return "ALT5"
-    if alt >= 3:
-        return "ALT3_4"
-    return "ALT0_2"
-
-
-def balance10(results: List[str]) -> str:
-    seq = [x for x in results[-10:] if x in {"B", "P"}]
-    if not seq:
-        return "NA"
-    b = seq.count("B")
-    p = seq.count("P")
-    if b - p >= 4:
-        return "B_HEAVY"
-    if p - b >= 4:
-        return "P_HEAVY"
-    if abs(b - p) <= 1:
-        return "BALANCED"
-    return "MID"
-
-
-def tie_age(results: List[str]) -> str:
-    age = 0
-    for r in reversed(results):
-        if r == "T":
-            break
-        age += 1
-    if age == 0:
-        return "T0"
-    if age == 1:
-        return "T1"
-    if age == 2:
-        return "T2"
-    if age <= 4:
-        return "T3_4"
-    return "T5P"
-
-
 def point_key(player_point: int, banker_point: int) -> str:
     return f"P{int(player_point)}_B{int(banker_point)}"
 
 
-def build_combo_candidate_keys(player_point: int, banker_point: int, rounds: Optional[List[Any]]) -> List[str]:
+def _scenario_norm(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    if s in {"NO_DRAW", "NONE", "NONE_DRAW"}:
+        return "NONE_DRAW"
+    if s in {"PLAYER_DRAW", "P_DRAW", "PLAYER", "P"}:
+        return "PLAYER_DRAW"
+    if s in {"BANKER_DRAW", "B_DRAW", "BANKER", "B"}:
+        return "BANKER_DRAW"
+    if s in {"BOTH_DRAW", "BOTH", "BOTH_DRAWN"}:
+        return "BOTH_DRAW"
+    return s or "UNKNOWN"
+
+
+def extract_scenarios(composition: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(composition, dict):
+        return []
+    items = composition.get("scenario_debug") or []
+    out: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        return out
+
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        scenario = _scenario_norm(raw.get("scenario"))
+        if scenario == "UNKNOWN":
+            continue
+        try:
+            prob = float(raw.get("scenario_probability", raw.get("scenario_weight", 0.0)) or 0.0)
+        except Exception:
+            prob = 0.0
+        if prob <= 0:
+            prob = 0.01
+        out.append({
+            "scenario": scenario,
+            "weight": prob,
+            "player_count": int(raw.get("player_count", 0) or 0),
+            "banker_count": int(raw.get("banker_count", 0) or 0),
+            "raw": raw,
+        })
+
+    total = sum(x["weight"] for x in out)
+    if total > 0:
+        for x in out:
+            x["weight"] = x["weight"] / total
+
+    out.sort(key=lambda x: x.get("weight", 0.0), reverse=True)
+    return out
+
+
+def candidate_keys_for_scenario(player_point: int, banker_point: int, scenario: str, player_count: int = 0, banker_count: int = 0) -> List[str]:
     pkey = point_key(player_point, banker_point)
-    results = rounds_to_results(rounds)
+    scenario = _scenario_norm(scenario)
     keys: List[str] = []
 
-    # 查詢順序：先最具體，再較粗略。
-    if len(results) >= 5:
-        pat5 = "".join(results[-5:])
-        side, streak = streak_info(results)
-        streak_bucket = min(streak, 6)
-        keys.append(f"{pkey}|W5:{pat5}|ALT:{alt_bucket(results)}")
-        keys.append(f"{pkey}|W5:{pat5}|STREAK:{side}{streak_bucket}")
+    aliases = SCENARIO_ALIASES.get(scenario, [scenario])
 
-    for w in [7, 5, 3]:
-        if len(results) >= w:
-            raw_seq = results[-w:]
-            if w == 7:
-                pat = normalize_w7_pattern(raw_seq)
-                if not pat:
-                    continue
-            else:
-                pat = "".join(raw_seq)
-            keys.append(f"{pkey}|W{w}:{pat}")
+    for sc in aliases:
+        keys.extend([
+            f"{pkey}|SC:{sc}",
+            f"{pkey}|SC_{sc}",
+            f"{pkey}_SC_{sc}",
+            f"{pkey}:{sc}",
+            f"{pkey}|{sc}",
+        ])
+        if player_count and banker_count:
+            keys.extend([
+                f"{pkey}|SC:{sc}|PC:{player_count}|BC:{banker_count}",
+                f"{pkey}|PC:{player_count}|BC:{banker_count}|SC:{sc}",
+                f"{pkey}_PC{player_count}_BC{banker_count}_SC_{sc}",
+            ])
 
-    side, streak = streak_info(results)
-    streak_bucket = min(streak, 6)
-    keys.append(f"{pkey}|STREAK:{side}{streak_bucket}")
-    keys.append(f"{pkey}|ALT:{alt_bucket(results)}")
-    keys.append(f"{pkey}|BAL10:{balance10(results)}")
-    keys.append(f"{pkey}|TIEAGE:{tie_age(results)}")
+    # 最粗 fallback：只用點數。
+    keys.extend([pkey, f"{pkey}|BASE", f"{pkey}_BASE"])
 
     seen = set()
-    out: List[str] = []
+    out = []
     for k in keys:
         if k not in seen:
             seen.add(k)
@@ -262,13 +198,16 @@ def build_combo_candidate_keys(player_point: int, banker_point: int, rounds: Opt
 
 def extract_combo_record(rec: Dict[str, Any], key: str) -> Dict[str, Any]:
     rec = dict(rec)
-
     banker = (
         rec.get("next_banker_rate")
         if rec.get("next_banker_rate") is not None
         else rec.get("banker_prob")
         if rec.get("banker_prob") is not None
         else rec.get("banker_rate")
+        if rec.get("banker_rate") is not None
+        else rec.get("B")
+        if rec.get("B") is not None
+        else rec.get("b")
     )
     player = (
         rec.get("next_player_rate")
@@ -276,13 +215,17 @@ def extract_combo_record(rec: Dict[str, Any], key: str) -> Dict[str, Any]:
         else rec.get("player_prob")
         if rec.get("player_prob") is not None
         else rec.get("player_rate")
+        if rec.get("player_rate") is not None
+        else rec.get("P")
+        if rec.get("P") is not None
+        else rec.get("p")
     )
 
     if banker is None or player is None:
         raise ValueError(f"Combo DB record missing banker/player probability: {key}")
 
     banker_prob, player_prob = normalize_prob_pair(float(banker), float(player))
-    sample = rec.get("sample", rec.get("sample_size", rec.get("no_tie_sample", 0)))
+    sample = rec.get("sample", rec.get("sample_size", rec.get("no_tie_sample", rec.get("count", 0))))
     try:
         sample = int(sample)
     except Exception:
@@ -294,55 +237,132 @@ def extract_combo_record(rec: Dict[str, Any], key: str) -> Dict[str, Any]:
     rec["banker_prob"] = banker_prob
     rec["player_prob"] = player_prob
     rec["sample"] = sample
-    rec.setdefault("source", "COMBO_DB")
+    rec.setdefault("source", "POINT_CONDITION_COMBO_DB")
     return rec
 
 
-def find_combo_record(player_point: int, banker_point: int, rounds: Optional[List[Any]], min_sample: int = 80) -> Optional[Dict[str, Any]]:
-    db = load_combo_db()
-    records = db.get("records", {})
-    if not isinstance(records, dict) or not records:
-        return None
-
-    for key in build_combo_candidate_keys(player_point, banker_point, rounds):
+def _find_record_by_keys(records: Dict[str, Any], keys: List[str], min_sample: int) -> Optional[Dict[str, Any]]:
+    for key in keys:
         rec = records.get(key)
         if not isinstance(rec, dict):
             continue
         try:
-            sample = int(rec.get("sample", rec.get("no_tie_sample", 0)) or 0)
+            sample = int(rec.get("sample", rec.get("sample_size", rec.get("no_tie_sample", rec.get("count", 0)))) or 0)
         except Exception:
             sample = 0
         if sample < int(min_sample):
             continue
-        return extract_combo_record(rec, key)
-
+        try:
+            return extract_combo_record(rec, key)
+        except Exception:
+            continue
     return None
 
 
-def combo_lookup(player_point: int, banker_point: int, rounds: Optional[List[Any]], min_sample: int = 80) -> Dict[str, Any]:
+def combo_lookup(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+    composition: Optional[Dict[str, Any]] = None,
+    min_sample: int = 80,
+) -> Dict[str, Any]:
+    """
+    V9 主查詢：使用「點數 + 補牌情境」去查 300 萬組條件資料庫。
+    rounds 只保留參數相容，主邏輯不依賴前面路單。
+    """
     meta = combo_db_meta()
-    rec = find_combo_record(player_point, banker_point, rounds, min_sample=min_sample)
-    if not rec:
+    db = load_combo_db()
+    records = db.get("records", {})
+    if not isinstance(records, dict) or not records:
         return {
             "available": False,
             "feature_key": point_key(player_point, banker_point),
             "banker_prob": BASE_BANKER_NO_TIE,
             "player_prob": 1.0 - BASE_BANKER_NO_TIE,
-            "source": "COMBO_DB_NOT_MATCHED",
+            "source": "COMBO_DB_NOT_MATCHED_OR_EMPTY",
             "sample_size": 0,
             "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
-            "candidate_keys": build_combo_candidate_keys(player_point, banker_point, rounds)[:8],
+            "candidate_keys": [point_key(player_point, banker_point)],
+            "matched_records": [],
+            "top_scenario": "UNKNOWN",
         }
 
+    scenarios = extract_scenarios(composition)
+    if not scenarios:
+        scenarios = [{"scenario": "NONE_DRAW", "weight": 1.0, "player_count": 0, "banker_count": 0, "raw": {}}]
+
+    weighted_b = 0.0
+    total_weight = 0.0
+    sample_total = 0
+    matched_records: List[Dict[str, Any]] = []
+    candidate_keys: List[str] = []
+
+    for sc in scenarios:
+        keys = candidate_keys_for_scenario(
+            player_point,
+            banker_point,
+            sc.get("scenario", "UNKNOWN"),
+            player_count=int(sc.get("player_count", 0) or 0),
+            banker_count=int(sc.get("banker_count", 0) or 0),
+        )
+        candidate_keys.extend(keys[:6])
+        rec = _find_record_by_keys(records, keys, min_sample=min_sample)
+        if not rec:
+            continue
+
+        sample = int(rec.get("sample", 0) or 0)
+        # 情境權重 * 樣本信任權重。樣本越大權重越高，但避免過度極端。
+        scenario_weight = float(sc.get("weight", 0.0) or 0.0)
+        sample_weight = min(max(sample / 10000.0, 0.45), 2.2)
+        w = max(0.0001, scenario_weight * sample_weight)
+
+        weighted_b += float(rec["banker_prob"]) * w
+        total_weight += w
+        sample_total += sample
+        matched_records.append({
+            "scenario": sc.get("scenario"),
+            "weight": w,
+            "scenario_weight": scenario_weight,
+            "feature_key": rec.get("feature_key"),
+            "banker_prob": rec.get("banker_prob"),
+            "player_prob": rec.get("player_prob"),
+            "sample": sample,
+            "source": rec.get("source", "POINT_CONDITION_COMBO_DB"),
+        })
+
+    seen = set()
+    candidate_keys = [x for x in candidate_keys if not (x in seen or seen.add(x))]
+
+    if total_weight <= 0:
+        return {
+            "available": False,
+            "feature_key": point_key(player_point, banker_point),
+            "banker_prob": BASE_BANKER_NO_TIE,
+            "player_prob": 1.0 - BASE_BANKER_NO_TIE,
+            "source": "POINT_CONDITION_COMBO_DB_NOT_MATCHED",
+            "sample_size": 0,
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+            "candidate_keys": candidate_keys[:12],
+            "matched_records": [],
+            "top_scenario": scenarios[0].get("scenario", "UNKNOWN") if scenarios else "UNKNOWN",
+        }
+
+    banker_prob = weighted_b / total_weight
+    player_prob = 1.0 - banker_prob
+    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
+
+    best = matched_records[0] if matched_records else {}
     return {
         "available": True,
-        "feature_key": rec.get("feature_key", point_key(player_point, banker_point)),
-        "banker_prob": float(rec["banker_prob"]),
-        "player_prob": float(rec["player_prob"]),
-        "source": rec.get("source", "COMBO_DB"),
-        "sample_size": int(rec.get("sample", 0) or 0),
+        "feature_key": best.get("feature_key", point_key(player_point, banker_point)),
+        "banker_prob": banker_prob,
+        "player_prob": player_prob,
+        "source": "POINT_CONDITION_COMBO_DB_V9",
+        "sample_size": sample_total,
         "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
-        "candidate_keys": build_combo_candidate_keys(player_point, banker_point, rounds)[:8],
+        "candidate_keys": candidate_keys[:12],
+        "matched_records": matched_records,
+        "top_scenario": scenarios[0].get("scenario", "UNKNOWN") if scenarios else "UNKNOWN",
     }
 
 
