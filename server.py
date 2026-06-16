@@ -49,9 +49,10 @@ CORS(app)
 TRIAL_MINUTES = int(os.getenv("TRIAL_MINUTES", "30"))
 TRIAL_SECONDS = TRIAL_MINUTES * 60
 
-# 本輪暖機局數保護：剛開始歷史不足時只讀牌，不建議進場。
-# 例如 MIN_HISTORY_FOR_ENTRY=3，代表前 2 局只建立牌路，第 3 局起才允許進場判斷。
-MIN_HISTORY_FOR_ENTRY = int(os.getenv("MIN_HISTORY_FOR_ENTRY", "3"))
+# 本輪暖機局數保護：
+# V9 改為以「當前點數 + 補牌情境 + combo_db + Monte Carlo」為主，
+# 預設不強制觀察前三局。若你未來想恢復暖機，可在 Render 設 MIN_HISTORY_FOR_ENTRY=3。
+MIN_HISTORY_FOR_ENTRY = int(os.getenv("MIN_HISTORY_FOR_ENTRY", "0"))
 
 ADMIN_LINE_URL = os.getenv("ADMIN_LINE_URL", "https://lin.ee/xYcGKN0").strip()
 
@@ -764,11 +765,11 @@ def health():
     return jsonify({
         "ok": True,
         "service": "BGS_DUAL_3M_DB_LINE_BOT",
-        "version": "server-access-betting-patch-v7-redis-persistent-trial-reset-on-end-warmup-v2",
+        "version": "server-v9-point-condition-combo-no-warmup",
         "sessions": store.all_count(),
         "access_store_mode": pstore.mode,
         "redis_enabled": pstore.mode == "redis",
-        "mode": "dual_3m_point_and_result_pattern_no_observe",
+        "mode": "v9_point_condition_combo_mc_no_warmup",
         "point_db_samples": pm.get("total_simulated_samples"),
         "pattern_db_samples": rm.get("total_simulated_samples"),
     })
