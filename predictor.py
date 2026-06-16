@@ -9,6 +9,11 @@ from typing import Dict, Any, List, Optional, Tuple
 import config
 from point_db import get_point_record, point_db_meta
 
+try:
+    from point_composition_mc import composition_mc_lookup
+except Exception:
+    composition_mc_lookup = None
+
 
 # ============================================================
 # 環境變數 / config 參數讀取
@@ -102,6 +107,17 @@ MC_MAX_NOISE = env_float("MC_MAX_NOISE", "0.018")
 MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1")
 MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", "0.035")
 MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "0")
+
+
+# ============================================================
+# 點數組成 / 補牌可能性 MC 輔助層參數
+# ============================================================
+# 這層不需要使用者輸入實際牌面，仍然只吃 player_point / banker_point。
+# 它會反推「不補牌 / 閒補 / 莊補 / 雙方補」可能組合，當成輔助修正。
+USE_COMPOSITION_MC = env_bool("USE_COMPOSITION_MC", "1")
+COMPOSITION_MC_WEIGHT = env_float("COMPOSITION_MC_WEIGHT", "0.10")
+COMPOSITION_MC_SIMULATIONS = env_int("COMPOSITION_MC_SIMULATIONS", "500")
+COMPOSITION_MC_MAX_COMBOS = env_int("COMPOSITION_MC_MAX_COMBOS", "160")
 
 
 # ============================================================
@@ -1328,6 +1344,65 @@ def disabled_monte_carlo_result() -> Dict[str, Any]:
     }
 
 
+
+# ============================================================
+# 點數組成 / 補牌可能性 MC 輔助層
+# ============================================================
+
+def composition_mc_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
+    if not USE_COMPOSITION_MC or not callable(composition_mc_lookup):
+        return {
+            "available": False,
+            "feature_key": "COMPOSITION_MC_DISABLED",
+            "banker_prob": BASE_BANKER_NO_TIE,
+            "player_prob": 1.0 - BASE_BANKER_NO_TIE,
+            "source": "COMPOSITION_MC_DISABLED",
+            "sample_size": 0,
+            "total_simulated_samples": 0,
+            "scenario_debug": [],
+        }
+
+    try:
+        rec = composition_mc_lookup(
+            player_point=player_point,
+            banker_point=banker_point,
+            n_sim=COMPOSITION_MC_SIMULATIONS,
+            max_combos=COMPOSITION_MC_MAX_COMBOS,
+            seed_key=f"{player_point}:{banker_point}:{len(rounds or [])}",
+        )
+
+        if not isinstance(rec, dict):
+            raise ValueError("composition_mc_lookup returned non-dict")
+
+        banker, player = normalize_prob_pair(
+            float(rec.get("banker_prob", BASE_BANKER_NO_TIE)),
+            float(rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE)),
+        )
+
+        return {
+            "available": bool(rec.get("available", False)),
+            "feature_key": rec.get("feature_key", f"P{player_point}_B{banker_point}_COMPOSITION_MC"),
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": rec.get("source", "POINT_COMPOSITION_MC"),
+            "sample_size": int(rec.get("sample_size", 0) or 0),
+            "total_simulated_samples": int(rec.get("total_simulated_samples", rec.get("sample_size", 0)) or 0),
+            "scenario_debug": rec.get("scenario_debug", []),
+        }
+
+    except Exception as e:
+        return {
+            "available": False,
+            "feature_key": f"P{player_point}_B{banker_point}_COMPOSITION_MC_ERROR",
+            "banker_prob": BASE_BANKER_NO_TIE,
+            "player_prob": 1.0 - BASE_BANKER_NO_TIE,
+            "source": f"COMPOSITION_MC_ERROR:{e}",
+            "sample_size": 0,
+            "total_simulated_samples": 0,
+            "scenario_debug": [],
+        }
+
+
 # ============================================================
 # 和局保護
 # ============================================================
@@ -1386,10 +1461,12 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     point = point_db_lookup(player_point, banker_point)
     pattern = choose_pattern_layer(player_point, banker_point, rounds=rounds)
     ai = choose_ai_layer(player_point, banker_point, rounds=rounds)
+    comp = composition_mc_layer(player_point, banker_point, rounds=rounds)
 
     p_w = float(POINT_WEIGHT)
     pat_w = float(PATTERN_WEIGHT)
     sim_w = float(SIM_WEIGHT)
+    comp_w = float(COMPOSITION_MC_WEIGHT) if comp.get("available") else 0.0
 
     if not USE_POINT_DB:
         p_w = 0.0
@@ -1399,17 +1476,20 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
+        comp_w = min(comp_w, COMPOSITION_MC_WEIGHT * 0.50)
 
-    total_weight = max(p_w + pat_w + sim_w, 0.0001)
+    total_weight = max(p_w + pat_w + sim_w + comp_w, 0.0001)
 
     # 核心修正：
     # POINT_WEIGHT 只給 point_db
     # PATTERN_WEIGHT 只給 pattern_db
     # SIM_WEIGHT 只給 AI
+    # COMPOSITION_MC_WEIGHT 只給「點數組成 / 補牌可能性 MC」
     banker = (
         point["banker_prob"] * p_w +
         pattern["banker_prob"] * pat_w +
-        ai["banker_prob"] * sim_w
+        ai["banker_prob"] * sim_w +
+        comp["banker_prob"] * comp_w
     ) / total_weight
 
     banker = apply_tie_point_protection(banker, is_tie_point)
@@ -1471,6 +1551,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "predict_mode": PREDICT_MODE,
         "pattern_layer_mode": pattern.get("layer_mode", "unknown"),
         "ai_layer_mode": ai.get("layer_mode", "unknown"),
+        "composition_mc_source": comp.get("source", "COMPOSITION_MC_UNKNOWN"),
+        "composition_mc_available": comp.get("available", False),
+        "composition_mc_sample_size": comp.get("sample_size", 0),
 
         "point_available": point["available"],
         "pattern_available": pattern["available"],
@@ -1487,6 +1570,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "point": p_w,
             "pattern": pat_w,
             "simulation": sim_w,
+            "composition_mc": comp_w,
             "total": total_weight,
         },
 
@@ -1494,9 +1578,11 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "point_banker_prob": point["banker_prob"],
             "pattern_banker_prob": pattern["banker_prob"],
             "ai_banker_prob": ai["banker_prob"],
+            "composition_mc_banker_prob": comp["banker_prob"],
             "point_player_prob": point["player_prob"],
             "pattern_player_prob": pattern["player_prob"],
             "ai_player_prob": ai["player_prob"],
+            "composition_mc_player_prob": comp["player_prob"],
         },
 
         "history_used": bool(rounds) and (
@@ -1507,14 +1593,14 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "pattern_window": pattern.get("window", 0),
         "pattern_rounds_enriched": True,
 
-        "mode": "POINT_DB_PLUS_FEATURE_DB_HYBRID_AI_MC_V7",
+        "mode": "POINT_DB_PLUS_FEATURE_DB_COMPOSITION_MC_HYBRID_V8",
     }
 
     if USE_MONTE_CARLO:
         mc_result = monte_carlo_verify_from_probs(
             banker_prob=banker,
             player_prob=player,
-            seed_key=f"{player_point}:{banker_point}:{pattern.get('feature_key', '')}:{ai.get('history_adjust', 0.0)}",
+            seed_key=f"{player_point}:{banker_point}:{pattern.get('feature_key', '')}:{ai.get('history_adjust', 0.0)}:{comp.get('banker_prob', 0.0)}",
         )
         result["monte_carlo"] = mc_result
 
