@@ -8,7 +8,7 @@ try:
 except Exception:
     COMBO_DB_PATH = os.getenv("COMBO_DB_PATH", "data/combo_db_3m.json")
 
-BASE_BANKER_NO_TIE = 0.5068
+BASE_BANKER_NO_TIE = 0.5000  # V9 no banker base bias: neutral fallback only
 
 SCENARIO_ALIASES = {
     "NONE_DRAW": ["NONE_DRAW", "NO_DRAW", "none_draw", "no_draw"],
