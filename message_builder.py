@@ -52,6 +52,49 @@ def read_done_text(player_point: int, banker_point: int) -> str:
     )
 
 
+def _fmt_pct(value: Any, decimals: int = 2) -> str:
+    try:
+        return f"{float(value):.{decimals}f}%"
+    except Exception:
+        return "0.00%"
+
+
+def _scenario_tw(s: str) -> str:
+    s = str(s or "UNKNOWN").upper()
+    mapping = {
+        "NONE_DRAW": "雙方未補",
+        "NO_DRAW": "雙方未補",
+        "PLAYER_DRAW": "閒補一張",
+        "BANKER_DRAW": "莊補一張",
+        "BOTH_DRAW": "莊閒皆補",
+        "UNKNOWN": "未判定",
+    }
+    return mapping.get(s, s)
+
+
+def _debug_block(pred: Dict[str, Any]) -> str:
+    point_sample = int(pred.get("point_sample_size", 0) or 0)
+    combo_sample = int(pred.get("combo_sample_size", pred.get("pattern_sample_size", 0)) or 0)
+    comp_sample = int(pred.get("composition_mc_sample_size", 0) or 0)
+    top_scenario = _scenario_tw(pred.get("composition_top_scenario", pred.get("combo_top_scenario", "UNKNOWN")))
+
+    text = (
+        "\n\n🤖 條件資料庫比對完成："
+        f"\n點數樣本 {point_sample} + 條件樣本 {combo_sample}"
+        f"\n補牌情境：{top_scenario}"
+        f"\n補牌MC樣本：{comp_sample}"
+    )
+
+    mc = pred.get("monte_carlo", {})
+    if isinstance(mc, dict) and mc.get("mc_enabled"):
+        text += (
+            f"\nMC模擬：莊 {_fmt_pct(mc.get('mc_banker_rate', 0))} / "
+            f"閒 {_fmt_pct(mc.get('mc_player_rate', 0))}"
+        )
+
+    return text
+
+
 def prediction_text(pred: Dict[str, Any], ai_text: str = "") -> str:
     entry_allowed = bool(pred.get("entry_allowed", True))
     weak_reason = pred.get("weak_reason", "")
@@ -68,13 +111,11 @@ def prediction_text(pred: Dict[str, Any], ai_text: str = "") -> str:
             f"差距：{gap:.2f}%\n"
             "🎯 本次建議：觀察一局"
         )
-
         if weak_reason:
             text += f"\n原因：{weak_reason}"
-
+        text += _debug_block(pred)
         if ai_text:
             text += f"\n\n{ai_text}"
-
         return text
 
     text = (
@@ -84,23 +125,16 @@ def prediction_text(pred: Dict[str, Any], ai_text: str = "") -> str:
         f"差距：{gap:.2f}%\n"
         f"🎯 本次預測結果：{pred.get('recommend', '-')}"
     )
-
+    text += _debug_block(pred)
     if ai_text:
         text += f"\n\n{ai_text}"
-
     return text
 
 
-def combined_prediction_text(
-    pred: Dict[str, Any],
-    ai_text: str = "",
-    bet_text: str = "",
-) -> str:
+def combined_prediction_text(pred: Dict[str, Any], ai_text: str = "", bet_text: str = "") -> str:
     text = prediction_text(pred, ai_text)
-
     if bet_text:
         text += f"\n\n{bet_text}"
-
     return text
 
 
@@ -109,10 +143,8 @@ def observe_bet_text(reason: str = "") -> str:
         "💰【本金配注建議】\n"
         "本局建議觀望，不建議下注。"
     )
-
     if reason:
         text += f"\n原因：{reason}"
-
     return text
 
 
