@@ -3,47 +3,30 @@ import random
 from typing import Dict, Any, List, Tuple, Optional
 
 # ============================================================
-# 點數組成 / 補牌可能性 Monte Carlo
+# 點數組成 / 補牌可能性 Monte Carlo V9
 # ============================================================
-# 用途：
 # 使用者仍然只輸入「閒點 + 莊點」，例如 65。
-# 本模組會反推：
-# - 閒點數可能由 2 張或 3 張牌組成
-# - 莊點數可能由 2 張或 3 張牌組成
-# - 模擬四種情境：雙方不補、閒補、莊補、雙方補
+# 本模組反推四種點數形成情境：
+# - NONE_DRAW：雙方都沒補牌
+# - PLAYER_DRAW：閒補一張、莊未補
+# - BANKER_DRAW：閒未補、莊補一張
+# - BOTH_DRAW：雙方都有補牌
 #
-# 注意：
-# 這不是完整牌靴追蹤，因為使用者沒有輸入實際牌面。
-# 它是「點數組成可能性修正層」，適合當輔助權重，不建議權重過高。
+# 回傳 scenario_debug 會給 combo_db.py 使用，拿「點數 + 補牌情境」
+# 去對應 300 萬組條件資料庫。
 # ============================================================
 
 BASE_BANKER_NO_TIE = 0.5068
 
 CARD_VALUES = {
-    "A": 1,
-    "2": 2,
-    "3": 3,
-    "4": 4,
-    "5": 5,
-    "6": 6,
-    "7": 7,
-    "8": 8,
-    "9": 9,
-    "T": 0,
+    "A": 1, "2": 2, "3": 3, "4": 4, "5": 5,
+    "6": 6, "7": 7, "8": 8, "9": 9, "T": 0,
 }
 
-# 百家樂點數中 10/J/Q/K 都算 0，合併成 T，權重等同 16 張。
+# 10/J/Q/K 都算 0，合併為 T，等同 16 張。
 CARD_WEIGHTS = {
-    "A": 4,
-    "2": 4,
-    "3": 4,
-    "4": 4,
-    "5": 4,
-    "6": 4,
-    "7": 4,
-    "8": 4,
-    "9": 4,
-    "T": 16,
+    "A": 4, "2": 4, "3": 4, "4": 4, "5": 4,
+    "6": 4, "7": 4, "8": 4, "9": 4, "T": 16,
 }
 
 
@@ -63,14 +46,10 @@ def combo_weight(combo: Tuple[str, ...]) -> int:
     return w
 
 
-def possible_hands_for_total(
-    total: int,
-    card_count: int,
-    max_combos: int = 160,
-) -> List[Tuple[str, ...]]:
+def possible_hands_for_total(total: int, card_count: int, max_combos: int = 160) -> List[Tuple[str, ...]]:
     """
     反推某個點數可能由哪些牌組成。
-    card_count = 2 代表沒補牌；card_count = 3 代表有補牌。
+    card_count = 2 代表未補牌；card_count = 3 代表有補牌。
     """
     total = int(total) % 10
     card_count = int(card_count)
@@ -94,6 +73,16 @@ def weighted_combo_score(combos: List[Tuple[str, ...]]) -> float:
     return float(sum(combo_weight(c) for c in combos))
 
 
+def scenario_name(player_draw: bool, banker_draw: bool) -> str:
+    if player_draw and banker_draw:
+        return "BOTH_DRAW"
+    if player_draw and not banker_draw:
+        return "PLAYER_DRAW"
+    if banker_draw and not player_draw:
+        return "BANKER_DRAW"
+    return "NONE_DRAW"
+
+
 def scenario_combo_info(
     player_point: int,
     banker_point: int,
@@ -111,6 +100,7 @@ def scenario_combo_info(
     banker_score = weighted_combo_score(banker_hands)
 
     return {
+        "scenario": scenario_name(player_draw, banker_draw),
         "player_draw": bool(player_draw),
         "banker_draw": bool(banker_draw),
         "player_count": player_count,
@@ -148,12 +138,9 @@ def composition_mc_lookup(
     """
     根據輸入點數，模擬四種補牌情境的可能組合。
 
-    回傳格式會刻意設計成跟其他 layer 類似：
-    - available
-    - banker_prob
-    - player_prob
-    - source
-    - sample_size
+    回傳重點：
+    - scenario_debug：每種補牌情境與權重，供 combo_db.py 查 300 萬條件資料庫。
+    - banker_prob/player_prob：補牌組成層自身的輔助概率。
     """
     try:
         player_point = int(player_point)
@@ -166,6 +153,7 @@ def composition_mc_lookup(
             "source": "POINT_COMPOSITION_MC_INVALID_POINT",
             "sample_size": 0,
             "scenario_debug": [],
+            "top_scenario": "UNKNOWN",
         }
 
     if not (0 <= player_point <= 9 and 0 <= banker_point <= 9):
@@ -176,26 +164,25 @@ def composition_mc_lookup(
             "source": "POINT_COMPOSITION_MC_POINT_OUT_OF_RANGE",
             "sample_size": 0,
             "scenario_debug": [],
+            "top_scenario": "UNKNOWN",
         }
 
     n_sim = max(80, min(int(n_sim or 500), 2000))
     max_combos = max(40, min(int(max_combos or 160), 500))
 
-    # 四種情境：不補/補牌。權重不是絕對機率，只是簡化假設。
-    # 後續可用環境變數或實測資料再校正。
     if not scenario_weights:
         scenario_weights = {
-            "none_draw": 0.20,
-            "player_draw": 0.25,
-            "banker_draw": 0.25,
-            "both_draw": 0.30,
+            "NONE_DRAW": 0.20,
+            "PLAYER_DRAW": 0.25,
+            "BANKER_DRAW": 0.25,
+            "BOTH_DRAW": 0.30,
         }
 
     scenarios = [
-        (False, False, float(scenario_weights.get("none_draw", 0.20)), "none_draw"),
-        (True, False, float(scenario_weights.get("player_draw", 0.25)), "player_draw"),
-        (False, True, float(scenario_weights.get("banker_draw", 0.25)), "banker_draw"),
-        (True, True, float(scenario_weights.get("both_draw", 0.30)), "both_draw"),
+        (False, False, float(scenario_weights.get("NONE_DRAW", scenario_weights.get("none_draw", 0.20)))),
+        (True, False, float(scenario_weights.get("PLAYER_DRAW", scenario_weights.get("player_draw", 0.25)))),
+        (False, True, float(scenario_weights.get("BANKER_DRAW", scenario_weights.get("banker_draw", 0.25)))),
+        (True, True, float(scenario_weights.get("BOTH_DRAW", scenario_weights.get("both_draw", 0.30)))),
     ]
 
     banker_score_total = 0.0
@@ -203,8 +190,10 @@ def composition_mc_lookup(
     used_weight = 0.0
     scenario_debug: List[Dict[str, Any]] = []
 
-    for player_draw, banker_draw, weight, name in scenarios:
-        if weight <= 0:
+    raw_scenario_strength_total = 0.0
+
+    for player_draw, banker_draw, base_weight in scenarios:
+        if base_weight <= 0:
             continue
 
         info = scenario_combo_info(
@@ -221,12 +210,11 @@ def composition_mc_lookup(
         if p_score <= 0 or b_score <= 0:
             continue
 
-        # 組合形成度：哪邊在該情境下越容易形成該點數，就給哪邊一點修正。
         combo_total = p_score + b_score
         banker_form_rate = b_score / combo_total
         player_form_rate = p_score / combo_total
 
-        # 當局點數方向修正：這層仍然尊重輸入點數強弱，但不拉太滿。
+        # 尊重當局點數方向，但不拉太滿。
         if banker_point > player_point:
             banker_form_rate += 0.035
             player_form_rate -= 0.035
@@ -237,35 +225,49 @@ def composition_mc_lookup(
         banker_form_rate = clamp(banker_form_rate, 0.40, 0.60)
         player_form_rate = 1.0 - banker_form_rate
 
-        banker_score_total += banker_form_rate * weight
-        player_score_total += player_form_rate * weight
-        used_weight += weight
+        # 情境可信度：基礎權重 * 雙方組合形成度。
+        scenario_strength = base_weight * combo_total
+        raw_scenario_strength_total += scenario_strength
+
+        banker_score_total += banker_form_rate * base_weight
+        player_score_total += player_form_rate * base_weight
+        used_weight += base_weight
 
         info.update({
-            "scenario": name,
-            "scenario_weight": weight,
+            "scenario_weight": base_weight,
+            "scenario_strength": scenario_strength,
+            "scenario_probability": 0.0,  # 下方正規化後補上
             "banker_form_rate": banker_form_rate,
             "player_form_rate": player_form_rate,
         })
         scenario_debug.append(info)
 
-    if used_weight <= 0:
+    if used_weight <= 0 or not scenario_debug:
         banker_prob = BASE_BANKER_NO_TIE
         player_prob = 1.0 - banker_prob
         available = False
+        top_scenario = "UNKNOWN"
     else:
+        for info in scenario_debug:
+            if raw_scenario_strength_total > 0:
+                info["scenario_probability"] = float(info.get("scenario_strength", 0.0)) / raw_scenario_strength_total
+            else:
+                info["scenario_probability"] = float(info.get("scenario_weight", 0.0)) / used_weight
+
+        scenario_debug.sort(key=lambda x: x.get("scenario_probability", 0.0), reverse=True)
+        top_scenario = str(scenario_debug[0].get("scenario", "UNKNOWN"))
+
         banker_prob = banker_score_total / used_weight
         player_prob = player_score_total / used_weight
         banker_prob, player_prob = normalize_pair(banker_prob, player_prob)
         available = True
 
-    # 抽樣只是讓輸出更像 MC 穩定度結果；不重新模擬完整牌靴。
+    # 抽樣驗證此補牌組成層的穩定度。
     rng = random.Random(f"point_composition_mc:{player_point}:{banker_point}:{seed_key}")
     banker_wins = 0
     player_wins = 0
 
     for _ in range(n_sim):
-        # 微幅擾動避免完全死板，但限制很小。
         b = clamp(banker_prob + rng.uniform(-0.008, 0.008), 0.38, 0.62)
         if rng.random() < b:
             banker_wins += 1
@@ -283,8 +285,10 @@ def composition_mc_lookup(
         "feature_key": f"P{player_point}_B{banker_point}_COMPOSITION_MC",
         "banker_prob": banker_prob,
         "player_prob": player_prob,
-        "source": "POINT_COMPOSITION_MC_DRAW_SCENARIO_V1" if available else "POINT_COMPOSITION_MC_FALLBACK",
+        "source": "POINT_COMPOSITION_MC_DRAW_SCENARIO_V9" if available else "POINT_COMPOSITION_MC_FALLBACK",
         "sample_size": int(n_sim),
         "total_simulated_samples": int(n_sim),
         "scenario_debug": scenario_debug,
+        "top_scenario": top_scenario,
+        "scenario_count": len(scenario_debug),
     }
