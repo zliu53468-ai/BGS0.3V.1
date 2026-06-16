@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Tuple, Optional
 # 去對應 300 萬組條件資料庫。
 # ============================================================
 
-BASE_BANKER_NO_TIE = 0.5068
+BASE_BANKER_NO_TIE = 0.5000  # V9 no banker base bias: neutral fallback only
 
 CARD_VALUES = {
     "A": 1, "2": 2, "3": 3, "4": 4, "5": 5,
