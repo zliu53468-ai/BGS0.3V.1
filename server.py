@@ -54,6 +54,12 @@ TRIAL_SECONDS = TRIAL_MINUTES * 60
 # 預設不強制觀察前三局。若你未來想恢復暖機，可在 Render 設 MIN_HISTORY_FOR_ENTRY=3。
 MIN_HISTORY_FOR_ENTRY = int(os.getenv("MIN_HISTORY_FOR_ENTRY", "0"))
 
+# V9 當前局獨立分析模式：
+# 1 = predict() 只吃本次輸入的閒/莊點數，不吃本輪前面累積 rounds。
+# 目的：符合「每一局獨立用當前點數 + 補牌情境 + combo + MC 判斷」的理念，
+# 避免 AI / SIM 層因歷史資料產生見莊打莊、見閒打閒、方向黏住。
+PREDICT_CURRENT_ROUND_ONLY = os.getenv("PREDICT_CURRENT_ROUND_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+
 ADMIN_LINE_URL = os.getenv("ADMIN_LINE_URL", "https://lin.ee/xYcGKN0").strip()
 
 TEMP_TRIAL_CODE = os.getenv("TEMP_TRIAL_CODE", "aaa1688002").strip()
@@ -765,13 +771,14 @@ def health():
     return jsonify({
         "ok": True,
         "service": "BGS_DUAL_3M_DB_LINE_BOT",
-        "version": "server-v9-point-condition-combo-no-warmup",
+        "version": "server-v9-current-round-only-no-warmup",
         "sessions": store.all_count(),
         "access_store_mode": pstore.mode,
         "redis_enabled": pstore.mode == "redis",
-        "mode": "v9_point_condition_combo_mc_no_warmup",
+        "mode": "v9_point_condition_combo_mc_current_round_only",
         "point_db_samples": pm.get("total_simulated_samples"),
         "pattern_db_samples": rm.get("total_simulated_samples"),
+        "predict_current_round_only": PREDICT_CURRENT_ROUND_ONLY,
     })
 
 
@@ -783,7 +790,18 @@ def api_predict():
     banker_point = int(data.get("banker_point"))
     rounds = data.get("rounds", [])
 
-    result = predict(player_point, banker_point, rounds)
+    if PREDICT_CURRENT_ROUND_ONLY:
+        actual_side = "閒" if player_point > banker_point else ("莊" if banker_point > player_point else "和")
+        predict_rounds = [{
+            "player_point": player_point,
+            "banker_point": banker_point,
+            "last_result": actual_side,
+        }]
+    else:
+        predict_rounds = rounds
+
+    result = predict(player_point, banker_point, predict_rounds)
+    result["predict_current_round_only"] = PREDICT_CURRENT_ROUND_ONLY
     ai_text = explain(result)
 
     return jsonify({**result, "ai_text": ai_text})
@@ -1048,20 +1066,29 @@ def handle_text(user_id: str, reply_token: str, text: str):
         actual_side = "閒" if player_point > banker_point else ("莊" if banker_point > player_point else "和")
         settle_note = _settle_betting_level(sess, actual_side)
 
-        temp_rounds = sess.rounds + [{
+        current_round = {
             "player_point": player_point,
             "banker_point": banker_point,
             "last_result": actual_side,
-        }]
+        }
 
-        pred = predict(player_point, banker_point, temp_rounds)
+        # V9 當前局獨立分析：
+        # 預測模型只吃本次輸入的點數，不再吃 sess.rounds 歷史資料。
+        # sess.rounds 仍保留給配注結算、本輪紀錄與上一局建議使用。
+        if PREDICT_CURRENT_ROUND_ONLY:
+            predict_rounds = [current_round]
+        else:
+            predict_rounds = sess.rounds + [current_round]
+
+        pred = predict(player_point, banker_point, predict_rounds)
+        pred["predict_current_round_only"] = PREDICT_CURRENT_ROUND_ONLY
 
         # ============================================================
         # 新增：本輪歷史不足時，只讀牌，不進場
         # 目的：避免重置後第 1～2 手因 pattern_db / AI 歷史樣本不足而硬進場。
         # 注意：這裡只改 entry_allowed，不改 predict 原始推薦與機率，方便後續追蹤。
         # ============================================================
-        current_history_count = len(temp_rounds)
+        current_history_count = len(predict_rounds)
 
         if MIN_HISTORY_FOR_ENTRY > 1 and current_history_count < MIN_HISTORY_FOR_ENTRY:
             pred["entry_allowed"] = False
