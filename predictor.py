@@ -94,6 +94,22 @@ MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1")
 MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", "0.055")
 MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "0")
 
+# ============================================================
+# AI 綜合決策層：
+# AI 不再只是「歷史修正」，而是綜合 point_db / combo_db /
+# 補牌MC / Monte Carlo / 主模型結果，判斷要出莊、閒或觀望。
+# ============================================================
+USE_AI_DECISION_LAYER = env_bool("USE_AI_DECISION_LAYER", "1")
+AI_DECISION_WEIGHT = env_float("AI_DECISION_WEIGHT", os.getenv("SIM_WEIGHT", "0.12"))
+AI_REQUIRE_SIGNAL_AGREEMENT = env_bool("AI_REQUIRE_SIGNAL_AGREEMENT", "1")
+AI_BLOCK_CONFLICT_SIGNAL = env_bool("AI_BLOCK_CONFLICT_SIGNAL", "1")
+AI_MIN_AGREEMENT_COUNT = env_int("AI_MIN_AGREEMENT_COUNT", "3")
+AI_MIN_CONFIDENCE_GAP = env_float("AI_MIN_CONFIDENCE_GAP", "0.070")
+AI_COMBO_SAMPLE_STRONG = env_int("AI_COMBO_SAMPLE_STRONG", "300")
+AI_COMBO_SAMPLE_WEAK = env_int("AI_COMBO_SAMPLE_WEAK", "80")
+AI_FORCE_OBSERVE_ON_SPLIT = env_bool("AI_FORCE_OBSERVE_ON_SPLIT", "1")
+AI_OVERRIDE_DIRECTION = env_bool("AI_OVERRIDE_DIRECTION", "1")
+
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -459,6 +475,257 @@ def build_entry_decision(is_tie_point: bool, gap: float) -> Tuple[bool, str, str
     return True, "normal", ""
 
 
+
+# ============================================================
+# AI 綜合決策層
+# ============================================================
+
+def prob_direction(banker_prob: float, player_prob: float) -> Tuple[str, float]:
+    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
+    if banker_prob >= player_prob:
+        return "莊", abs(banker_prob - player_prob)
+    return "閒", abs(player_prob - banker_prob)
+
+
+def _signal_item(
+    name: str,
+    banker_prob: float,
+    player_prob: float,
+    available: bool = True,
+    sample_size: int = 0,
+    base_weight: float = 1.0,
+    min_gap: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    if not available:
+        return None
+
+    direction, gap = prob_direction(banker_prob, player_prob)
+
+    if gap < min_gap:
+        strength = 0.0
+    else:
+        strength = gap * base_weight
+
+    return {
+        "name": name,
+        "direction": direction,
+        "gap_raw": gap,
+        "gap": round(gap * 100, PERCENT_DECIMALS),
+        "sample_size": int(sample_size or 0),
+        "weight": float(base_weight),
+        "strength": float(strength),
+    }
+
+
+def ai_ensemble_decision_layer(
+    point: Dict[str, Any],
+    combo: Dict[str, Any],
+    comp: Dict[str, Any],
+    mc: Dict[str, Any],
+    current_recommend: str,
+    banker_prob: float,
+    player_prob: float,
+    gap: float,
+) -> Dict[str, Any]:
+    """
+    AI 綜合決策層：
+    不追歷史、不看路單延續，而是檢查各模型訊號是否一致。
+
+    會看：
+    - point_db 方向
+    - combo_db 方向與樣本數
+    - 補牌 MC 方向
+    - Monte Carlo 方向
+    - 主模型方向與差距
+
+    回傳：
+    - ai_decision_recommend: 莊 / 閒 / 觀望
+    - ai_decision_observe: 是否建議觀望
+    - ai_decision_reason: 決策原因
+    """
+    if not USE_AI_DECISION_LAYER:
+        return {
+            "ai_decision_enabled": False,
+            "ai_decision_recommend": current_recommend,
+            "ai_decision_observe": False,
+            "ai_decision_reason": "AI_DECISION_LAYER_DISABLED",
+            "ai_signals": [],
+        }
+
+    signals: List[Dict[str, Any]] = []
+
+    # point_db：當前點數統計，視為主訊號之一。
+    sig = _signal_item(
+        "point_db",
+        point.get("banker_prob", BASE_BANKER_NO_TIE),
+        point.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
+        available=bool(point.get("available", False)),
+        sample_size=int(point.get("sample_size", 0) or 0),
+        base_weight=1.15,
+        min_gap=0.0,
+    )
+    if sig:
+        signals.append(sig)
+
+    # combo_db：樣本足夠才列入強訊號；樣本偏低則降權。
+    combo_sample = int(combo.get("sample_size", 0) or 0)
+    combo_available = bool(combo.get("available", False)) and combo_sample >= AI_COMBO_SAMPLE_WEAK
+    if combo_available:
+        if combo_sample >= AI_COMBO_SAMPLE_STRONG:
+            combo_weight = 1.25
+        else:
+            combo_weight = 0.75
+
+        sig = _signal_item(
+            "combo_db",
+            combo.get("banker_prob", BASE_BANKER_NO_TIE),
+            combo.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
+            available=True,
+            sample_size=combo_sample,
+            base_weight=combo_weight,
+            min_gap=0.0,
+        )
+        if sig:
+            signals.append(sig)
+
+    # 補牌 MC：用來判斷當前點數形成情境，不看歷史。
+    sig = _signal_item(
+        "composition_mc",
+        comp.get("banker_prob", BASE_BANKER_NO_TIE),
+        comp.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
+        available=bool(comp.get("available", False)),
+        sample_size=int(comp.get("sample_size", 0) or 0),
+        base_weight=1.10,
+        min_gap=0.0,
+    )
+    if sig:
+        signals.append(sig)
+
+    # 主模型融合結果。
+    sig = _signal_item(
+        "main_model",
+        banker_prob,
+        player_prob,
+        available=True,
+        sample_size=0,
+        base_weight=0.95,
+        min_gap=0.0,
+    )
+    if sig:
+        signals.append(sig)
+
+    # Monte Carlo 方向。
+    if mc and mc.get("mc_enabled"):
+        sig = _signal_item(
+            "monte_carlo",
+            mc.get("mc_banker_rate_raw", BASE_BANKER_NO_TIE),
+            mc.get("mc_player_rate_raw", 1.0 - BASE_BANKER_NO_TIE),
+            available=True,
+            sample_size=int(mc.get("mc_simulations", 0) or 0),
+            base_weight=1.20,
+            min_gap=0.0,
+        )
+        if sig:
+            signals.append(sig)
+
+    banker_votes = [s for s in signals if s.get("direction") == "莊"]
+    player_votes = [s for s in signals if s.get("direction") == "閒"]
+
+    banker_score = sum(float(s.get("strength", 0.0)) for s in banker_votes)
+    player_score = sum(float(s.get("strength", 0.0)) for s in player_votes)
+
+    banker_count = len(banker_votes)
+    player_count = len(player_votes)
+
+    if banker_score > player_score:
+        ai_direction = "莊"
+        agreement_count = banker_count
+        conflict_count = player_count
+    elif player_score > banker_score:
+        ai_direction = "閒"
+        agreement_count = player_count
+        conflict_count = banker_count
+    else:
+        # 分數一樣時，用票數；票數也一樣就視為分歧。
+        if banker_count > player_count:
+            ai_direction = "莊"
+            agreement_count = banker_count
+            conflict_count = player_count
+        elif player_count > banker_count:
+            ai_direction = "閒"
+            agreement_count = player_count
+            conflict_count = banker_count
+        else:
+            ai_direction = "觀望"
+            agreement_count = max(banker_count, player_count)
+            conflict_count = agreement_count
+
+    reasons: List[str] = []
+
+    if not signals:
+        return {
+            "ai_decision_enabled": True,
+            "ai_decision_recommend": "觀望",
+            "ai_decision_observe": True,
+            "ai_decision_reason": "AI 無可用訊號，建議觀望",
+            "ai_signal_summary": "NO_SIGNAL",
+            "ai_agreement_count": 0,
+            "ai_conflict_count": 0,
+            "ai_banker_score": 0.0,
+            "ai_player_score": 0.0,
+            "ai_signals": [],
+        }
+
+    if ai_direction == "觀望" and AI_FORCE_OBSERVE_ON_SPLIT:
+        reasons.append("AI 訊號分歧，莊閒沒有明確共識")
+
+    if AI_REQUIRE_SIGNAL_AGREEMENT and ai_direction in {"莊", "閒"} and agreement_count < AI_MIN_AGREEMENT_COUNT:
+        reasons.append(f"AI 同方向訊號不足，僅 {agreement_count} 個，未達 {AI_MIN_AGREEMENT_COUNT} 個")
+
+    if AI_BLOCK_CONFLICT_SIGNAL and ai_direction in {"莊", "閒"}:
+        # 反向訊號太多，代表各層判斷衝突。
+        if conflict_count >= 2 and agreement_count <= conflict_count + 1:
+            reasons.append("AI 偵測 point/combo/補牌MC/MC 訊號衝突，建議觀望")
+
+    if gap < AI_MIN_CONFIDENCE_GAP:
+        reasons.append(f"AI 判斷主模型差距 {gap * 100:.2f}% 未達 {AI_MIN_CONFIDENCE_GAP * 100:.1f}%")
+
+    observe = bool(reasons)
+    decision_recommend = "觀望" if observe else ai_direction
+
+    # 如果 AI 方向與主模型不同，但 AI 訊號足夠一致，允許 AI 改方向。
+    direction_override = False
+    if (
+        not observe
+        and AI_OVERRIDE_DIRECTION
+        and ai_direction in {"莊", "閒"}
+        and current_recommend in {"莊", "閒"}
+        and ai_direction != current_recommend
+    ):
+        direction_override = True
+        reasons.append(f"AI 綜合訊號改判：{current_recommend} → {ai_direction}")
+
+    signal_summary = " / ".join(
+        f"{s.get('name')}:{s.get('direction')}({s.get('gap')}%)"
+        for s in signals
+    )
+
+    return {
+        "ai_decision_enabled": True,
+        "ai_decision_recommend": decision_recommend,
+        "ai_decision_direction": ai_direction,
+        "ai_decision_observe": observe,
+        "ai_decision_reason": "；".join(reasons) if reasons else f"AI 綜合訊號一致，偏向{ai_direction}",
+        "ai_signal_summary": signal_summary,
+        "ai_agreement_count": agreement_count,
+        "ai_conflict_count": conflict_count,
+        "ai_banker_score": banker_score,
+        "ai_player_score": player_score,
+        "ai_direction_override": direction_override,
+        "ai_signals": signals,
+    }
+
+
 # ============================================================
 # 主預測函式
 # ============================================================
@@ -478,7 +745,11 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     p_w = float(POINT_WEIGHT) if USE_POINT_DB else 0.0
     combo_w = float(COMBO_WEIGHT)
-    sim_w = float(SIM_WEIGHT)
+
+    # V9.1：SIM_WEIGHT 改為 AI 綜合決策層權重。
+    # 若 USE_AI_DECISION_LAYER=1，就不再把舊 AI 歷史層混進機率，避免追莊追閒。
+    sim_w = 0.0 if USE_AI_DECISION_LAYER else float(SIM_WEIGHT)
+
     comp_w = float(COMPOSITION_MC_WEIGHT) if comp.get("available") else 0.0
 
     if COMBO_WEIGHT_REQUIRE_AVAILABLE and (not combo.get("available") or int(combo.get("sample_size", 0) or 0) <= 0):
@@ -586,7 +857,8 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(rounds),
         "rounds_ignored": False,
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9",
+        "ai_decision_layer_enabled": USE_AI_DECISION_LAYER,
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_AI_DECISION_V9_1",
     }
 
     if USE_MONTE_CARLO:
