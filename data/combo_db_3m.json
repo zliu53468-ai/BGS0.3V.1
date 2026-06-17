@@ -1,319 +1,404 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generate_combo_db_3m.py
+V9 combo_db_3m.json 生成器：每一個條件 key 各自抽滿 N 筆樣本。
 
-V9 專用：產生 data/combo_db_3m.json
-邏輯：用 8 副牌百家樂補牌規則，連續模擬牌靴，統計：
-    當局點數 + 當局補牌情境  ->  下一局莊 / 閒 機率
+用途：
+- 產生 data/combo_db_3m.json
+- key 格式：P6_B5|SC:BOTH_DRAW / PLAYER_DRAW / BANKER_DRAW / NONE_DRAW
+- 可選產生 P6_B5|BASE
 
-輸出 key 範例：
-    P6_B5|SC:BOTH_DRAW
-    P6_B5|SC:PLAYER_DRAW
-    P6_B5|SC:BANKER_DRAW
-    P6_B5|SC:NONE_DRAW
-    P6_B5|BASE
+重要說明：
+- PER_CONDITION_SAMPLES=3000000 代表「每個 key 各 300 萬次 next-hand 模擬」。
+- 不是把所有原始樣本存進 JSON，而是只存統計結果，所以 JSON 不會爆大。
+- 但運算量非常大：
+  4 種補牌情境 x 100 組點數 x 300萬 = 12 億次 next-hand 模擬。
+  若 INCLUDE_BASE=1，會再多 100 x 300萬 = 3 億次，共 15 億次。
 
-使用方式：
-    python generate_combo_db_3m.py
+建議先測：
+  PER_CONDITION_SAMPLES=10000 python generate_combo_db_per_condition_3m.py
+正式跑：
+  PER_CONDITION_SAMPLES=3000000 python generate_combo_db_per_condition_3m.py
 
-可調環境變數：
-    COMBO_SIM_TRANSITIONS=3000000
-    COMBO_DB_OUTPUT=data/combo_db_3m.json
-    COMBO_DECKS=8
-    COMBO_CUT_REMAINING=70
-    COMBO_SEED=42
+可中斷續跑：
+- 會每完成一個 key 就寫入輸出檔與 checkpoint。
 """
 
-from __future__ import annotations
-
+import itertools
 import json
+import math
 import os
 import random
 import time
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
-
-TARGET_TRANSITIONS = int(os.getenv("COMBO_SIM_TRANSITIONS", "3000000"))
-OUTPUT_PATH = os.getenv("COMBO_DB_OUTPUT", "data/combo_db_3m.json")
-DECKS = int(os.getenv("COMBO_DECKS", "8"))
-CUT_REMAINING = int(os.getenv("COMBO_CUT_REMAINING", "70"))
+# =========================
+# 環境設定
+# =========================
+OUTPUT_PATH = Path(os.getenv("COMBO_OUTPUT_PATH", "data/combo_db_3m.json"))
+PER_CONDITION_SAMPLES = int(os.getenv("PER_CONDITION_SAMPLES", "3000000"))
+DECKS = int(os.getenv("DECKS", "8"))
 SEED = int(os.getenv("COMBO_SEED", "42"))
+INCLUDE_BASE = int(os.getenv("INCLUDE_BASE", "1")) == 1
+SAVE_EVERY_KEY = int(os.getenv("SAVE_EVERY_KEY", "1")) == 1
 
-SCENARIOS = ("NONE_DRAW", "PLAYER_DRAW", "BANKER_DRAW", "BOTH_DRAW")
+# 若你正式跑 300萬，建議保持 1；若要快速粗測可設 0
+USE_REALISTIC_DRAW_RULE_FILTER = int(os.getenv("USE_REALISTIC_DRAW_RULE_FILTER", "1")) == 1
 
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "T"]
+VALUES = {"A": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "T": 0}
+# T 代表 10/J/Q/K，共 16 張/副；其他點數 4 張/副
+RANK_COUNTS_PER_DECK = {r: (16 if r == "T" else 4) for r in RANKS}
+SCENARIOS = ["NONE_DRAW", "PLAYER_DRAW", "BANKER_DRAW", "BOTH_DRAW"]
 
-@dataclass(frozen=True)
-class RoundResult:
-    player_point: int
-    banker_point: int
-    result: str  # "P" / "B" / "T"
-    scenario: str
-    player_draw: bool
-    banker_draw: bool
+SCENARIO_FLAGS = {
+    "NONE_DRAW": (False, False),
+    "PLAYER_DRAW": (True, False),
+    "BANKER_DRAW": (False, True),
+    "BOTH_DRAW": (True, True),
+}
 
-
-def make_shoe(decks: int = 8) -> List[int]:
-    """8 副牌：A=1, 2~9，10/J/Q/K=0。"""
-    shoe: List[int] = []
-    for _ in range(decks):
-        # 每副牌：A~9 各 4 張；10/J/Q/K 共 16 張，點數都是 0。
-        for v in range(1, 10):
-            shoe.extend([v] * 4)
-        shoe.extend([0] * 16)
-    random.shuffle(shoe)
-    return shoe
-
-
-def total(cards: List[int]) -> int:
-    return sum(cards) % 10
+SCENARIO_ZH = {
+    "NONE_DRAW": "雙方不補",
+    "PLAYER_DRAW": "閒補莊不補",
+    "BANKER_DRAW": "莊補閒不補",
+    "BOTH_DRAW": "莊閒皆補",
+}
 
 
-def draw_card(shoe: List[int]) -> int:
-    return shoe.pop()
+def total(cards: Tuple[str, ...]) -> int:
+    return sum(VALUES[c] for c in cards) % 10
 
 
-def banker_should_draw(banker_total: int, player_third: int | None) -> bool:
-    """標準百家樂補牌規則。"""
-    if player_third is None:
-        return banker_total <= 5
+def fresh_shoe_counts() -> Dict[str, int]:
+    return {r: RANK_COUNTS_PER_DECK[r] * DECKS for r in RANKS}
 
-    if banker_total <= 2:
+
+def draw_one(rng: random.Random, shoe: Dict[str, int]) -> str:
+    n = sum(shoe.values())
+    if n <= 0:
+        raise RuntimeError("shoe empty")
+    x = rng.randrange(n)
+    acc = 0
+    for r in RANKS:
+        c = shoe.get(r, 0)
+        if c <= 0:
+            continue
+        acc += c
+        if x < acc:
+            shoe[r] -= 1
+            return r
+    # 理論上不會到這裡
+    r = RANKS[-1]
+    shoe[r] -= 1
+    return r
+
+
+def remove_cards(shoe: Dict[str, int], cards: Tuple[str, ...]) -> bool:
+    for c in cards:
+        if shoe.get(c, 0) <= 0:
+            return False
+        shoe[c] -= 1
+    return True
+
+
+def banker_should_draw(banker_two_total: int, player_third_value: int = None, player_drew: bool = False) -> bool:
+    """標準百家樂莊家補牌規則。"""
+    b = banker_two_total
+    if not player_drew:
+        return b <= 5
+    pt = int(player_third_value)
+    if b <= 2:
         return True
-    if banker_total == 3:
-        return player_third != 8
-    if banker_total == 4:
-        return 2 <= player_third <= 7
-    if banker_total == 5:
-        return 4 <= player_third <= 7
-    if banker_total == 6:
-        return 6 <= player_third <= 7
+    if b == 3:
+        return pt != 8
+    if b == 4:
+        return 2 <= pt <= 7
+    if b == 5:
+        return 4 <= pt <= 7
+    if b == 6:
+        return pt in (6, 7)
     return False
 
 
-def scenario_name(player_draw: bool, banker_draw: bool) -> str:
-    if player_draw and banker_draw:
-        return "BOTH_DRAW"
-    if player_draw and not banker_draw:
-        return "PLAYER_DRAW"
-    if banker_draw and not player_draw:
-        return "BANKER_DRAW"
-    return "NONE_DRAW"
+def deal_baccarat_round(rng: random.Random, shoe: Dict[str, int]) -> Tuple[int, int, str, Tuple[str, ...], Tuple[str, ...]]:
+    """從指定 shoe 發一局，回傳 final player/banker total、勝方、兩邊實際牌。"""
+    p = [draw_one(rng, shoe), draw_one(rng, shoe)]
+    b = [draw_one(rng, shoe), draw_one(rng, shoe)]
+    p2 = total(tuple(p))
+    b2 = total(tuple(b))
 
-
-def play_round(shoe: List[int]) -> RoundResult:
-    """從同一牌靴發一局百家樂，回傳最終點數與實際補牌情境。"""
-    player = [draw_card(shoe), draw_card(shoe)]
-    banker = [draw_card(shoe), draw_card(shoe)]
-
-    p_total = total(player)
-    b_total = total(banker)
-
-    player_draw = False
-    banker_draw = False
-    player_third = None
-
-    # Natural 8/9：雙方不補。
-    if p_total not in (8, 9) and b_total not in (8, 9):
-        if p_total <= 5:
-            player_third = draw_card(shoe)
-            player.append(player_third)
-            player_draw = True
-            p_total = total(player)
-
-        if banker_should_draw(b_total, player_third):
-            banker.append(draw_card(shoe))
-            banker_draw = True
-            b_total = total(banker)
-
-    if p_total > b_total:
-        result = "P"
-    elif b_total > p_total:
-        result = "B"
+    # Natural：任一方 8/9，雙方不補
+    if p2 in (8, 9) or b2 in (8, 9):
+        pt, bt = p2, b2
     else:
-        result = "T"
+        p_drew = p2 <= 5
+        p_third_value = None
+        if p_drew:
+            c = draw_one(rng, shoe)
+            p.append(c)
+            p_third_value = VALUES[c]
+        if banker_should_draw(b2, p_third_value, p_drew):
+            b.append(draw_one(rng, shoe))
+        pt, bt = total(tuple(p)), total(tuple(b))
 
-    return RoundResult(
-        player_point=p_total,
-        banker_point=b_total,
-        result=result,
-        scenario=scenario_name(player_draw, banker_draw),
-        player_draw=player_draw,
-        banker_draw=banker_draw,
-    )
-
-
-def new_counter() -> Dict[str, int]:
-    return {
-        "count": 0,
-        "next_player": 0,
-        "next_banker": 0,
-        "next_tie": 0,
-        "no_tie_sample": 0,
-    }
-
-
-def update_counter(counter: Dict[str, int], next_result: str) -> None:
-    counter["count"] += 1
-    if next_result == "P":
-        counter["next_player"] += 1
-        counter["no_tie_sample"] += 1
-    elif next_result == "B":
-        counter["next_banker"] += 1
-        counter["no_tie_sample"] += 1
+    if bt > pt:
+        winner = "BANKER"
+    elif pt > bt:
+        winner = "PLAYER"
     else:
-        counter["next_tie"] += 1
+        winner = "TIE"
+    return pt, bt, winner, tuple(p), tuple(b)
 
 
-def to_record(key: str, c: Dict[str, int]) -> Dict[str, object]:
-    no_tie = int(c.get("no_tie_sample", 0))
-    count = int(c.get("count", 0))
-    next_banker = int(c.get("next_banker", 0))
-    next_player = int(c.get("next_player", 0))
-    next_tie = int(c.get("next_tie", 0))
+def valid_current_state(player_cards: Tuple[str, ...], banker_cards: Tuple[str, ...]) -> bool:
+    """檢查一組當局牌面是否符合標準補牌規則。"""
+    p2 = total(player_cards[:2])
+    b2 = total(banker_cards[:2])
+    p_drew = len(player_cards) == 3
+    b_drew = len(banker_cards) == 3
 
+    # Natural 時雙方都不能補牌
+    if p2 in (8, 9) or b2 in (8, 9):
+        return (not p_drew) and (not b_drew)
+
+    expected_p_draw = p2 <= 5
+    if p_drew != expected_p_draw:
+        return False
+
+    p_third_value = VALUES[player_cards[2]] if p_drew else None
+    expected_b_draw = banker_should_draw(b2, p_third_value, p_drew)
+    if b_drew != expected_b_draw:
+        return False
+    return True
+
+
+def state_weight(cards: Tuple[str, ...]) -> int:
+    """簡化權重：T 比其他 rank 常見。"""
+    w = 1
+    for c in cards:
+        w *= RANK_COUNTS_PER_DECK[c]
+    return int(w)
+
+
+def weighted_choice(rng: random.Random, items: List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]):
+    total_w = sum(x[2] for x in items)
+    if total_w <= 0:
+        return items[rng.randrange(len(items))]
+    x = rng.randrange(total_w)
+    acc = 0
+    for p_cards, b_cards, w in items:
+        acc += w
+        if x < acc:
+            return p_cards, b_cards, w
+    return items[-1]
+
+
+def build_current_state_pools() -> Dict[Tuple[int, int, str], List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]]:
+    """
+    建立「指定 final 點數 + 補牌情境」可能的當局牌面池。
+    這個池會給每個條件 key 抽樣，之後移除當局牌，再發下一局。
+    """
+    print("[1/3] Building current-state pools ...")
+    pools: Dict[Tuple[int, int, str], List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]] = defaultdict(list)
+
+    hand_cache: Dict[int, List[Tuple[str, ...]]] = {}
+    for card_count in (2, 3):
+        hand_cache[card_count] = list(itertools.product(RANKS, repeat=card_count))
+
+    checked = 0
+    kept = 0
+    for scenario, (p_draw, b_draw) in SCENARIO_FLAGS.items():
+        p_count = 3 if p_draw else 2
+        b_count = 3 if b_draw else 2
+        for p_cards in hand_cache[p_count]:
+            for b_cards in hand_cache[b_count]:
+                checked += 1
+                if USE_REALISTIC_DRAW_RULE_FILTER and not valid_current_state(p_cards, b_cards):
+                    continue
+                pt = total(p_cards)
+                bt = total(b_cards)
+                # 確保 8 副牌數量足以移除這些牌
+                tmp = fresh_shoe_counts()
+                if not remove_cards(tmp, p_cards + b_cards):
+                    continue
+                w = state_weight(p_cards + b_cards)
+                pools[(pt, bt, scenario)].append((p_cards, b_cards, w))
+                kept += 1
+    print(f"[1/3] Pools ready. checked={checked:,}, kept={kept:,}, keys={len(pools):,}")
+    return pools
+
+
+def simulate_next_after_condition(
+    rng: random.Random,
+    state_pool: List[Tuple[Tuple[str, ...], Tuple[str, ...], int]],
+    n: int,
+) -> Dict[str, int]:
+    banker = player = tie = 0
+    for _ in range(n):
+        p_cards, b_cards, _w = weighted_choice(rng, state_pool)
+        shoe = fresh_shoe_counts()
+        ok = remove_cards(shoe, p_cards + b_cards)
+        if not ok:
+            continue
+        _pt, _bt, winner, _np, _nb = deal_baccarat_round(rng, shoe)
+        if winner == "BANKER":
+            banker += 1
+        elif winner == "PLAYER":
+            player += 1
+        else:
+            tie += 1
+    return {"banker": banker, "player": player, "tie": tie}
+
+
+def make_record(key: str, player_point: int, banker_point: int, scenario: str, counts: Dict[str, int], state_pool_size: int) -> Dict[str, Any]:
+    b = int(counts.get("banker", 0))
+    p = int(counts.get("player", 0))
+    t = int(counts.get("tie", 0))
+    sample_size = b + p + t
+    no_tie = b + p
     if no_tie > 0:
-        b_rate = next_banker / no_tie
-        p_rate = next_player / no_tie
+        banker_prob = b / no_tie
+        player_prob = p / no_tie
     else:
-        b_rate = 0.5
-        p_rate = 0.5
-
-    tie_rate = next_tie / count if count > 0 else 0.0
-
+        banker_prob = 0.5
+        player_prob = 0.5
     return {
-        "feature_key": key,
-        "next_banker_rate": round(b_rate, 8),
-        "next_player_rate": round(p_rate, 8),
-        "next_tie_rate": round(tie_rate, 8),
-        "banker_prob": round(b_rate, 8),
-        "player_prob": round(p_rate, 8),
-        "sample": no_tie,
-        "sample_size": no_tie,
-        "no_tie_sample": no_tie,
-        "count": count,
-        "next_banker": next_banker,
-        "next_player": next_player,
-        "next_tie": next_tie,
-        "source": "BACCARAT_8_DECK_SHOE_TRANSITION_COMBO_DB_V9",
+        "available": True,
+        "key": key,
+        "player_point": int(player_point),
+        "banker_point": int(banker_point),
+        "scenario": scenario,
+        "scenario_zh": SCENARIO_ZH.get(scenario, scenario),
+        "banker_prob": round(banker_prob, 8),
+        "player_prob": round(player_prob, 8),
+        "tie_rate": round(t / sample_size, 8) if sample_size else 0.0,
+        "banker_wins": b,
+        "player_wins": p,
+        "tie_count": t,
+        "sample_size": int(sample_size),
+        "no_tie_sample_size": int(no_tie),
+        "state_pool_size": int(state_pool_size),
+        "source": "STRATIFIED_PER_CONDITION_8_DECK_BACCARAT_MC_V9",
+        "note": "每個條件 key 獨立抽樣；當局牌面符合標準補牌規則，移除當局牌後模擬下一局。",
     }
 
 
-def main() -> None:
-    random.seed(SEED)
-    start = time.time()
-
-    counters: Dict[str, Dict[str, int]] = defaultdict(new_counter)
-    transitions = 0
-    shoes_used = 0
-
-    shoe = make_shoe(DECKS)
-    shoes_used += 1
-    prev: RoundResult | None = None
-
-    while transitions < TARGET_TRANSITIONS:
-        # 至少保留足夠牌數，避免一局不夠發。
-        if len(shoe) < CUT_REMAINING:
-            shoe = make_shoe(DECKS)
-            shoes_used += 1
-            prev = None
-            continue
-
-        try:
-            cur = play_round(shoe)
-        except IndexError:
-            shoe = make_shoe(DECKS)
-            shoes_used += 1
-            prev = None
-            continue
-
-        if prev is not None:
-            pkey = f"P{prev.player_point}_B{prev.banker_point}"
-            sc_key = f"{pkey}|SC:{prev.scenario}"
-            base_key = f"{pkey}|BASE"
-            plain_key = pkey
-
-            update_counter(counters[sc_key], cur.result)
-            update_counter(counters[base_key], cur.result)
-            update_counter(counters[plain_key], cur.result)
-
-            transitions += 1
-
-            if transitions % 250000 == 0:
-                elapsed = time.time() - start
-                print(f"[combo_db] {transitions:,}/{TARGET_TRANSITIONS:,} transitions, records={len(counters)}, shoes={shoes_used}, elapsed={elapsed:.1f}s")
-
-        prev = cur
-
-    records = {key: to_record(key, c) for key, c in sorted(counters.items())}
-
-    # 補空殼：確保 100 點數 * 4 情境 key 都存在；樣本不足時用 BASE 或中性補上。
-    for p in range(10):
-        for b in range(10):
-            pkey = f"P{p}_B{b}"
-            base_key = f"{pkey}|BASE"
-            base_rec = records.get(base_key)
-            for sc in SCENARIOS:
-                key = f"{pkey}|SC:{sc}"
-                if key not in records:
-                    if base_rec:
-                        rec = dict(base_rec)
-                        rec["feature_key"] = key
-                        rec["source"] = "BACCARAT_8_DECK_SHOE_TRANSITION_COMBO_DB_V9_BASE_BACKFILL"
-                        # sample 保留 base 樣本，讓系統能查到，但 source 會標示是 base 回填。
-                        records[key] = rec
-                    else:
-                        records[key] = {
-                            "feature_key": key,
-                            "next_banker_rate": 0.5,
-                            "next_player_rate": 0.5,
-                            "next_tie_rate": 0.0,
-                            "banker_prob": 0.5,
-                            "player_prob": 0.5,
-                            "sample": 0,
-                            "sample_size": 0,
-                            "no_tie_sample": 0,
-                            "count": 0,
-                            "next_banker": 0,
-                            "next_player": 0,
-                            "next_tie": 0,
-                            "source": "BACCARAT_8_DECK_SHOE_TRANSITION_COMBO_DB_V9_EMPTY_BACKFILL",
-                        }
-
-    db = {
-        "meta": {
-            "source": "BACCARAT_8_DECK_SHOE_TRANSITION_COMBO_DB_V9",
-            "description": "Current round final points + actual draw scenario -> next round no-tie banker/player rates. Generated by standard baccarat drawing rules.",
-            "total_simulated_samples": TARGET_TRANSITIONS,
-            "transition_samples": TARGET_TRANSITIONS,
-            "record_count": len(records),
-            "decks": DECKS,
-            "cut_remaining": CUT_REMAINING,
-            "seed": SEED,
-            "generated_at_unix": int(time.time()),
-            "key_examples": [
-                "P6_B5|SC:BOTH_DRAW",
-                "P6_B5|SC:PLAYER_DRAW",
-                "P6_B5|SC:BANKER_DRAW",
-                "P6_B5|SC:NONE_DRAW",
-                "P6_B5|BASE",
-            ],
-        },
-        "records": records,
-    }
-
-    out = Path(OUTPUT_PATH)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(out.suffix + ".tmp")
+def save_db(db: Dict[str, Any], path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, separators=(",", ":"))
-    tmp.replace(out)
+    tmp.replace(path)
 
-    elapsed = time.time() - start
-    print(f"[combo_db] done: {out} records={len(records)} transitions={TARGET_TRANSITIONS:,} shoes={shoes_used} elapsed={elapsed:.1f}s")
+
+def load_existing(path: Path) -> Dict[str, Any]:
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(f"[WARN] Cannot load existing db: {e}")
+    return {}
+
+
+def build_base_pool_for_point(pools, player_point: int, banker_point: int):
+    merged = []
+    for sc in SCENARIOS:
+        merged.extend(pools.get((player_point, banker_point, sc), []))
+    return merged
+
+
+def main():
+    start = time.time()
+    rng = random.Random(SEED)
+    print("=" * 72)
+    print("V9 combo_db per-condition generator")
+    print(f"OUTPUT_PATH={OUTPUT_PATH}")
+    print(f"PER_CONDITION_SAMPLES={PER_CONDITION_SAMPLES:,}")
+    print(f"DECKS={DECKS}")
+    print(f"INCLUDE_BASE={INCLUDE_BASE}")
+    print(f"USE_REALISTIC_DRAW_RULE_FILTER={USE_REALISTIC_DRAW_RULE_FILTER}")
+    print("=" * 72)
+
+    pools = build_current_state_pools()
+    db = load_existing(OUTPUT_PATH)
+
+    # metadata
+    db.setdefault("__meta__", {})
+    db["__meta__"].update({
+        "version": "combo_db_per_condition_v9",
+        "decks": DECKS,
+        "per_condition_samples_target": PER_CONDITION_SAMPLES,
+        "include_base": INCLUDE_BASE,
+        "seed": SEED,
+        "scenario_keys": SCENARIOS,
+        "description": "每個點數+補牌情境 key 獨立抽樣到指定樣本數。",
+        "updated_at_unix": int(time.time()),
+    })
+
+    tasks = []
+    for pp in range(10):
+        for bp in range(10):
+            for sc in SCENARIOS:
+                tasks.append((pp, bp, sc, f"P{pp}_B{bp}|SC:{sc}"))
+            if INCLUDE_BASE:
+                tasks.append((pp, bp, "BASE", f"P{pp}_B{bp}|BASE"))
+
+    total_tasks = len(tasks)
+    print(f"[2/3] Total keys to build: {total_tasks}")
+
+    done = 0
+    skipped = 0
+    for idx, (pp, bp, sc, key) in enumerate(tasks, start=1):
+        existing = db.get(key)
+        if isinstance(existing, dict) and int(existing.get("sample_size", 0)) >= PER_CONDITION_SAMPLES:
+            skipped += 1
+            continue
+
+        if sc == "BASE":
+            pool = build_base_pool_for_point(pools, pp, bp)
+        else:
+            pool = pools.get((pp, bp, sc), [])
+
+        if not pool:
+            db[key] = {
+                "available": False,
+                "key": key,
+                "player_point": pp,
+                "banker_point": bp,
+                "scenario": sc,
+                "banker_prob": 0.5,
+                "player_prob": 0.5,
+                "sample_size": 0,
+                "source": "NO_REALISTIC_STATE_POOL_FOR_CONDITION",
+            }
+            print(f"[{idx}/{total_tasks}] {key} -> no pool, skipped")
+            if SAVE_EVERY_KEY:
+                save_db(db, OUTPUT_PATH)
+            continue
+
+        print(f"[{idx}/{total_tasks}] Building {key} | pool={len(pool):,} | n={PER_CONDITION_SAMPLES:,}")
+        counts = simulate_next_after_condition(rng, pool, PER_CONDITION_SAMPLES)
+        db[key] = make_record(key, pp, bp, sc, counts, len(pool))
+        done += 1
+
+        if SAVE_EVERY_KEY:
+            save_db(db, OUTPUT_PATH)
+
+    db["__meta__"]["completed_at_unix"] = int(time.time())
+    db["__meta__"]["elapsed_seconds"] = round(time.time() - start, 2)
+    db["__meta__"]["records"] = len([k for k in db.keys() if not k.startswith("__")])
+    save_db(db, OUTPUT_PATH)
+
+    print("[3/3] Done")
+    print(f"records={db['__meta__']['records']:,}, done={done:,}, skipped={skipped:,}")
+    print(f"output={OUTPUT_PATH}")
+    print(f"elapsed={db['__meta__']['elapsed_seconds']} sec")
 
 
 if __name__ == "__main__":
