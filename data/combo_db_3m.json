@@ -1,405 +1,566 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V9 combo_db_3m.json 生成器：每一個條件 key 各自抽滿 N 筆樣本。
+combo_db.py - V9.4 compatible connector for data/combo_db_3m.json
 
-用途：
-- 產生 data/combo_db_3m.json
-- key 格式：P6_B5|SC:BOTH_DRAW / PLAYER_DRAW / BANKER_DRAW / NONE_DRAW
-- 可選產生 P6_B5|BASE
-
-重要說明：
-- PER_CONDITION_SAMPLES=3000000 代表「每個 key 各 300 萬次 next-hand 模擬」。
-- 不是把所有原始樣本存進 JSON，而是只存統計結果，所以 JSON 不會爆大。
-- 但運算量非常大：
-  4 種補牌情境 x 100 組點數 x 300萬 = 12 億次 next-hand 模擬。
-  若 INCLUDE_BASE=1，會再多 100 x 300萬 = 3 億次，共 15 億次。
-
-建議先測：
-  PER_CONDITION_SAMPLES=10000 python generate_combo_db_per_condition_3m.py
-正式跑：
-  PER_CONDITION_SAMPLES=3000000 python generate_combo_db_per_condition_3m.py
-
-可中斷續跑：
-- 會每完成一個 key 就寫入輸出檔與 checkpoint。
+Purpose:
+- Keep the original database/prediction logic intact.
+- Only fix the connector layer so combo_db_3m.json can be read reliably.
+- Support both JSON formats:
+    1) {"meta": {...}, "records": {"P2_B7|SC:BOTH_DRAW": {...}}}
+    2) {"__meta__": {...}, "P2_B7|SC:BOTH_DRAW": {...}}
+- Support Chinese scenario names such as 「莊閒皆補」 -> BOTH_DRAW.
+- Support multiple key styles and fallback to BASE / point-only records.
 """
 
-import itertools
 import json
-import math
 import os
-import random
-import time
-from collections import defaultdict
-from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from functools import lru_cache
+from typing import Dict, Any, List, Optional, Tuple
 
-# =========================
-# 環境設定
-# =========================
-OUTPUT_PATH = Path(os.getenv("COMBO_OUTPUT_PATH", "data/combo_db_3m.json"))
-PER_CONDITION_SAMPLES = int(os.getenv("PER_CONDITION_SAMPLES", "3000000"))
-DECKS = int(os.getenv("DECKS", "8"))
-SEED = int(os.getenv("COMBO_SEED", "42"))
-INCLUDE_BASE = int(os.getenv("INCLUDE_BASE", "1")) == 1
-SAVE_EVERY_KEY = int(os.getenv("SAVE_EVERY_KEY", "1")) == 1
+try:
+    import config
+except Exception:
+    config = None
 
-# 若你正式跑 300萬，建議保持 1；若要快速粗測可設 0
-USE_REALISTIC_DRAW_RULE_FILTER = int(os.getenv("USE_REALISTIC_DRAW_RULE_FILTER", "1")) == 1
+COMBO_DB_PATH = os.getenv(
+    "COMBO_DB_PATH",
+    getattr(config, "COMBO_DB_PATH", "data/combo_db_3m.json") if config is not None else "data/combo_db_3m.json",
+).strip()
 
-RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "T"]
-VALUES = {"A": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "T": 0}
-# T 代表 10/J/Q/K，共 16 張/副；其他點數 4 張/副
-RANK_COUNTS_PER_DECK = {r: (16 if r == "T" else 4) for r in RANKS}
-SCENARIOS = ["NONE_DRAW", "PLAYER_DRAW", "BANKER_DRAW", "BOTH_DRAW"]
+BASE_BANKER_NO_TIE = 0.5000
 
-SCENARIO_FLAGS = {
-    "NONE_DRAW": (False, False),
-    "PLAYER_DRAW": (True, False),
-    "BANKER_DRAW": (False, True),
-    "BOTH_DRAW": (True, True),
+SCENARIO_ALIASES = {
+    "NONE_DRAW": [
+        "NONE_DRAW", "NO_DRAW", "NONE", "NO", "N", "none_draw", "no_draw",
+        "雙方不補", "雙方未補", "皆不補", "不補牌", "無補牌", "都不補", "沒補牌",
+    ],
+    "PLAYER_DRAW": [
+        "PLAYER_DRAW", "P_DRAW", "PLAYER", "P", "player_draw",
+        "閒補", "閒家補", "閒補牌", "閒補莊不補", "閒補莊未補", "閒家補牌", "閒補莊沒補",
+    ],
+    "BANKER_DRAW": [
+        "BANKER_DRAW", "B_DRAW", "BANKER", "B", "banker_draw",
+        "莊補", "莊家補", "莊補牌", "莊補閒不補", "莊補閒未補", "莊家補牌", "莊補閒沒補",
+    ],
+    "BOTH_DRAW": [
+        "BOTH_DRAW", "BOTH", "BOTH_DRAWN", "both_draw",
+        "莊閒皆補", "雙方補", "雙方皆補", "兩邊補", "閒莊皆補", "莊閒都補", "雙方補牌", "皆補牌",
+    ],
 }
 
-SCENARIO_ZH = {
-    "NONE_DRAW": "雙方不補",
-    "PLAYER_DRAW": "閒補莊不補",
-    "BANKER_DRAW": "莊補閒不補",
-    "BOTH_DRAW": "莊閒皆補",
-}
+_ALIAS_TO_CANONICAL: Dict[str, str] = {}
+for canonical, aliases in SCENARIO_ALIASES.items():
+    for alias in aliases:
+        _ALIAS_TO_CANONICAL[str(alias).strip().upper().replace(" ", "")] = canonical
+
+META_KEYS = {"meta", "__meta__", "metadata", "_meta"}
 
 
-def total(cards: Tuple[str, ...]) -> int:
-    return sum(VALUES[c] for c in cards) % 10
+def _resolve_path(path: str) -> str:
+    candidates = [
+        path,
+        os.path.join(os.getcwd(), path),
+        os.path.join("/opt/render/project/src", path),
+        os.path.join(os.path.dirname(__file__), path),
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return path
 
 
-def fresh_shoe_counts() -> Dict[str, int]:
-    return {r: RANK_COUNTS_PER_DECK[r] * DECKS for r in RANKS}
+@lru_cache(maxsize=1)
+def load_combo_db() -> Dict[str, Any]:
+    path = _resolve_path(COMBO_DB_PATH)
+    if not os.path.exists(path):
+        return {
+            "meta": {
+                "source": "COMBO_DB_FILE_NOT_FOUND",
+                "path": COMBO_DB_PATH,
+                "resolved_path": path,
+                "record_count": 0,
+                "total_simulated_samples": 0,
+            },
+            "records": {},
+        }
 
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw_db = json.load(f)
+    except Exception as e:
+        return {
+            "meta": {
+                "source": f"COMBO_DB_LOAD_ERROR:{e}",
+                "path": COMBO_DB_PATH,
+                "resolved_path": path,
+                "record_count": 0,
+                "total_simulated_samples": 0,
+            },
+            "records": {},
+        }
 
-def draw_one(rng: random.Random, shoe: Dict[str, int]) -> str:
-    n = sum(shoe.values())
-    if n <= 0:
-        raise RuntimeError("shoe empty")
-    x = rng.randrange(n)
-    acc = 0
-    for r in RANKS:
-        c = shoe.get(r, 0)
-        if c <= 0:
-            continue
-        acc += c
-        if x < acc:
-            shoe[r] -= 1
-            return r
-    # 理論上不會到這裡
-    r = RANKS[-1]
-    shoe[r] -= 1
-    return r
+    if not isinstance(raw_db, dict):
+        return {
+            "meta": {
+                "source": "COMBO_DB_FORMAT_ERROR_NOT_DICT",
+                "path": COMBO_DB_PATH,
+                "resolved_path": path,
+                "record_count": 0,
+                "total_simulated_samples": 0,
+            },
+            "records": {},
+        }
 
-
-def remove_cards(shoe: Dict[str, int], cards: Tuple[str, ...]) -> bool:
-    for c in cards:
-        if shoe.get(c, 0) <= 0:
-            return False
-        shoe[c] -= 1
-    return True
-
-
-def banker_should_draw(banker_two_total: int, player_third_value: int = None, player_drew: bool = False) -> bool:
-    """標準百家樂莊家補牌規則。"""
-    b = banker_two_total
-    if not player_drew:
-        return b <= 5
-    pt = int(player_third_value)
-    if b <= 2:
-        return True
-    if b == 3:
-        return pt != 8
-    if b == 4:
-        return 2 <= pt <= 7
-    if b == 5:
-        return 4 <= pt <= 7
-    if b == 6:
-        return pt in (6, 7)
-    return False
-
-
-def deal_baccarat_round(rng: random.Random, shoe: Dict[str, int]) -> Tuple[int, int, str, Tuple[str, ...], Tuple[str, ...]]:
-    """從指定 shoe 發一局，回傳 final player/banker total、勝方、兩邊實際牌。"""
-    p = [draw_one(rng, shoe), draw_one(rng, shoe)]
-    b = [draw_one(rng, shoe), draw_one(rng, shoe)]
-    p2 = total(tuple(p))
-    b2 = total(tuple(b))
-
-    # Natural：任一方 8/9，雙方不補
-    if p2 in (8, 9) or b2 in (8, 9):
-        pt, bt = p2, b2
+    # 支援 {"records": {...}} 與直接 key-value 兩種資料庫格式。
+    if isinstance(raw_db.get("records"), dict):
+        records = raw_db.get("records", {})
+        meta = raw_db.get("meta") if isinstance(raw_db.get("meta"), dict) else {}
     else:
-        p_drew = p2 <= 5
-        p_third_value = None
-        if p_drew:
-            c = draw_one(rng, shoe)
-            p.append(c)
-            p_third_value = VALUES[c]
-        if banker_should_draw(b2, p_third_value, p_drew):
-            b.append(draw_one(rng, shoe))
-        pt, bt = total(tuple(p)), total(tuple(b))
+        meta = {}
+        for mk in META_KEYS:
+            if isinstance(raw_db.get(mk), dict):
+                meta.update(raw_db.get(mk, {}))
+        records = {k: v for k, v in raw_db.items() if str(k) not in META_KEYS}
 
-    if bt > pt:
-        winner = "BANKER"
-    elif pt > bt:
-        winner = "PLAYER"
-    else:
-        winner = "TIE"
-    return pt, bt, winner, tuple(p), tuple(b)
+    if not isinstance(records, dict):
+        records = {}
+    if not isinstance(meta, dict):
+        meta = {}
 
+    # 建立大小寫/空白不敏感索引，避免 key 格式小差異導致找不到。
+    normalized_index = {}
+    for k in records.keys():
+        nk = _key_norm(k)
+        if nk not in normalized_index:
+            normalized_index[nk] = k
 
-def valid_current_state(player_cards: Tuple[str, ...], banker_cards: Tuple[str, ...]) -> bool:
-    """檢查一組當局牌面是否符合標準補牌規則。"""
-    p2 = total(player_cards[:2])
-    b2 = total(banker_cards[:2])
-    p_drew = len(player_cards) == 3
-    b_drew = len(banker_cards) == 3
+    meta.setdefault("source", "COMBO_DB")
+    meta.setdefault("path", COMBO_DB_PATH)
+    meta.setdefault("resolved_path", path)
+    meta.setdefault("record_count", len(records))
+    meta.setdefault("total_simulated_samples", 0)
 
-    # Natural 時雙方都不能補牌
-    if p2 in (8, 9) or b2 in (8, 9):
-        return (not p_drew) and (not b_drew)
-
-    expected_p_draw = p2 <= 5
-    if p_drew != expected_p_draw:
-        return False
-
-    p_third_value = VALUES[player_cards[2]] if p_drew else None
-    expected_b_draw = banker_should_draw(b2, p_third_value, p_drew)
-    if b_drew != expected_b_draw:
-        return False
-    return True
-
-
-def state_weight(cards: Tuple[str, ...]) -> int:
-    """簡化權重：T 比其他 rank 常見。"""
-    w = 1
-    for c in cards:
-        w *= RANK_COUNTS_PER_DECK[c]
-    return int(w)
-
-
-def weighted_choice(rng: random.Random, items: List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]):
-    total_w = sum(x[2] for x in items)
-    if total_w <= 0:
-        return items[rng.randrange(len(items))]
-    x = rng.randrange(total_w)
-    acc = 0
-    for p_cards, b_cards, w in items:
-        acc += w
-        if x < acc:
-            return p_cards, b_cards, w
-    return items[-1]
-
-
-def build_current_state_pools() -> Dict[Tuple[int, int, str], List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]]:
-    """
-    建立「指定 final 點數 + 補牌情境」可能的當局牌面池。
-    這個池會給每個條件 key 抽樣，之後移除當局牌，再發下一局。
-    """
-    print("[1/3] Building current-state pools ...")
-    pools: Dict[Tuple[int, int, str], List[Tuple[Tuple[str, ...], Tuple[str, ...], int]]] = defaultdict(list)
-
-    hand_cache: Dict[int, List[Tuple[str, ...]]] = {}
-    for card_count in (2, 3):
-        hand_cache[card_count] = list(itertools.product(RANKS, repeat=card_count))
-
-    checked = 0
-    kept = 0
-    for scenario, (p_draw, b_draw) in SCENARIO_FLAGS.items():
-        p_count = 3 if p_draw else 2
-        b_count = 3 if b_draw else 2
-        for p_cards in hand_cache[p_count]:
-            for b_cards in hand_cache[b_count]:
-                checked += 1
-                if USE_REALISTIC_DRAW_RULE_FILTER and not valid_current_state(p_cards, b_cards):
-                    continue
-                pt = total(p_cards)
-                bt = total(b_cards)
-                # 確保 8 副牌數量足以移除這些牌
-                tmp = fresh_shoe_counts()
-                if not remove_cards(tmp, p_cards + b_cards):
-                    continue
-                w = state_weight(p_cards + b_cards)
-                pools[(pt, bt, scenario)].append((p_cards, b_cards, w))
-                kept += 1
-    print(f"[1/3] Pools ready. checked={checked:,}, kept={kept:,}, keys={len(pools):,}")
-    return pools
-
-
-def simulate_next_after_condition(
-    rng: random.Random,
-    state_pool: List[Tuple[Tuple[str, ...], Tuple[str, ...], int]],
-    n: int,
-) -> Dict[str, int]:
-    banker = player = tie = 0
-    for _ in range(n):
-        p_cards, b_cards, _w = weighted_choice(rng, state_pool)
-        shoe = fresh_shoe_counts()
-        ok = remove_cards(shoe, p_cards + b_cards)
-        if not ok:
-            continue
-        _pt, _bt, winner, _np, _nb = deal_baccarat_round(rng, shoe)
-        if winner == "BANKER":
-            banker += 1
-        elif winner == "PLAYER":
-            player += 1
-        else:
-            tie += 1
-    return {"banker": banker, "player": player, "tie": tie}
-
-
-def make_record(key: str, player_point: int, banker_point: int, scenario: str, counts: Dict[str, int], state_pool_size: int) -> Dict[str, Any]:
-    b = int(counts.get("banker", 0))
-    p = int(counts.get("player", 0))
-    t = int(counts.get("tie", 0))
-    sample_size = b + p + t
-    no_tie = b + p
-    if no_tie > 0:
-        banker_prob = b / no_tie
-        player_prob = p / no_tie
-    else:
-        banker_prob = 0.5
-        player_prob = 0.5
     return {
-        "available": True,
-        "key": key,
-        "player_point": int(player_point),
-        "banker_point": int(banker_point),
-        "scenario": scenario,
-        "scenario_zh": SCENARIO_ZH.get(scenario, scenario),
-        "banker_prob": round(banker_prob, 8),
-        "player_prob": round(player_prob, 8),
-        "tie_rate": round(t / sample_size, 8) if sample_size else 0.0,
-        "banker_wins": b,
-        "player_wins": p,
-        "tie_count": t,
-        "sample_size": int(sample_size),
-        "no_tie_sample_size": int(no_tie),
-        "state_pool_size": int(state_pool_size),
-        "source": "STRATIFIED_PER_CONDITION_8_DECK_BACCARAT_MC_V9",
-        "note": "每個條件 key 獨立抽樣；當局牌面符合標準補牌規則，移除當局牌後模擬下一局。",
+        "meta": meta,
+        "records": records,
+        "normalized_index": normalized_index,
     }
 
 
-def save_db(db: Dict[str, Any], path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, separators=(",", ":"))
-    tmp.replace(path)
+def combo_db_meta() -> Dict[str, Any]:
+    db = load_combo_db()
+    meta = db.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    records = db.get("records", {})
+    meta.setdefault("record_count", len(records) if isinstance(records, dict) else 0)
+    meta.setdefault("total_simulated_samples", 0)
+    meta.setdefault("source", "COMBO_DB")
+    meta.setdefault("path", COMBO_DB_PATH)
+    return meta
 
 
-def load_existing(path: Path) -> Dict[str, Any]:
-    if path.exists():
+def _key_norm(value: Any) -> str:
+    return str(value or "").strip().upper().replace(" ", "")
+
+
+def _scenario_norm(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "UNKNOWN"
+    key = _key_norm(raw)
+    return _ALIAS_TO_CANONICAL.get(key, key)
+
+
+def _first_present(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if d.get(k) is not None:
+            return d.get(k)
+    return default
+
+
+def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
+    banker = float(banker)
+    player = float(player)
+    if banker > 1:
+        banker /= 100.0
+    if player > 1:
+        player /= 100.0
+    total = banker + player
+    if total <= 0:
+        banker = BASE_BANKER_NO_TIE
+        player = 1.0 - banker
+    else:
+        banker /= total
+        player /= total
+    return banker, player
+
+
+def point_key(player_point: int, banker_point: int) -> str:
+    return f"P{int(player_point)}_B{int(banker_point)}"
+
+
+def _get_record(records: Dict[str, Any], normalized_index: Dict[str, str], key: str) -> Optional[Dict[str, Any]]:
+    rec = records.get(key)
+    if isinstance(rec, dict):
+        return rec
+    real_key = normalized_index.get(_key_norm(key))
+    if real_key:
+        rec = records.get(real_key)
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
+def _sample_of(rec: Dict[str, Any]) -> int:
+    try:
+        return int(_first_present(rec, ["sample", "sample_size", "no_tie_sample", "no_tie_sample_size", "count", "n", "total", "samples"], 0) or 0)
+    except Exception:
+        return 0
+
+
+def extract_scenarios(composition: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(composition, dict):
+        return []
+
+    items = composition.get("scenario_debug") or []
+    out: List[Dict[str, Any]] = []
+
+    if isinstance(items, list):
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            scenario_raw = _first_present(
+                raw,
+                [
+                    "scenario", "scenario_key", "scenario_name", "scenario_label",
+                    "top_scenario", "draw_scenario", "name", "label", "type",
+                ],
+            )
+            scenario = _scenario_norm(scenario_raw)
+            if scenario == "UNKNOWN":
+                continue
+            try:
+                prob = float(
+                    _first_present(
+                        raw,
+                        ["scenario_probability", "scenario_weight", "probability", "prob", "weight", "rate", "pct"],
+                        0.0,
+                    ) or 0.0
+                )
+            except Exception:
+                prob = 0.0
+            if prob > 1:
+                prob /= 100.0
+            if prob <= 0:
+                prob = 0.01
+            out.append({
+                "scenario": scenario,
+                "weight": prob,
+                "player_count": int(raw.get("player_count", raw.get("p_count", raw.get("player_cards", 0))) or 0),
+                "banker_count": int(raw.get("banker_count", raw.get("b_count", raw.get("banker_cards", 0))) or 0),
+                "raw": raw,
+            })
+
+    if not out:
+        top_raw = _first_present(composition, ["top_scenario", "scenario", "scenario_key", "scenario_name", "draw_scenario"])
+        top_scenario = _scenario_norm(top_raw)
+        if top_scenario != "UNKNOWN":
+            out.append({
+                "scenario": top_scenario,
+                "weight": 1.0,
+                "player_count": int(composition.get("player_count", 0) or 0),
+                "banker_count": int(composition.get("banker_count", 0) or 0),
+                "raw": {"fallback_top_scenario": top_raw},
+            })
+
+    total = sum(x["weight"] for x in out)
+    if total > 0:
+        for x in out:
+            x["weight"] = x["weight"] / total
+
+    out.sort(key=lambda x: x.get("weight", 0.0), reverse=True)
+    return out
+
+
+def candidate_keys_for_scenario(player_point: int, banker_point: int, scenario: str, player_count: int = 0, banker_count: int = 0) -> List[str]:
+    pkey = point_key(player_point, banker_point)
+    scenario = _scenario_norm(scenario)
+    keys: List[str] = []
+    aliases = SCENARIO_ALIASES.get(scenario, [scenario])
+
+    # 優先 canonical，再補 aliases。資料庫 generator 使用 P2_B7|SC:BOTH_DRAW。
+    candidates = [scenario] + [str(a).strip().upper().replace(" ", "") for a in aliases]
+    seen_sc = set()
+    scenario_names = []
+    for sc in candidates:
+        if sc and sc not in seen_sc:
+            seen_sc.add(sc)
+            scenario_names.append(sc)
+
+    for sc in scenario_names:
+        keys.extend([
+            f"{pkey}|SC:{sc}",
+            f"{pkey}|SC_{sc}",
+            f"{pkey}_SC_{sc}",
+            f"{pkey}:SC:{sc}",
+            f"{pkey}:{sc}",
+            f"{pkey}|{sc}",
+            f"{pkey}_{sc}",
+            f"{pkey}|DRAW:{sc}",
+            f"{pkey}|SCENARIO:{sc}",
+        ])
+        if player_count and banker_count:
+            keys.extend([
+                f"{pkey}|SC:{sc}|PC:{player_count}|BC:{banker_count}",
+                f"{pkey}|PC:{player_count}|BC:{banker_count}|SC:{sc}",
+                f"{pkey}_PC{player_count}_BC{banker_count}_SC_{sc}",
+            ])
+
+    # Fallback：BASE 與點數本身。若你的 DB 只有 point-only，也能接上。
+    keys.extend([f"{pkey}|BASE", f"{pkey}_BASE", f"{pkey}:BASE", pkey])
+
+    seen = set()
+    out = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def extract_combo_record(rec: Dict[str, Any], key: str) -> Dict[str, Any]:
+    rec = dict(rec)
+    banker = _first_present(
+        rec,
+        ["next_banker_rate", "banker_prob", "banker_rate", "b_rate", "B", "b", "banker", "莊", "庄"],
+    )
+    player = _first_present(
+        rec,
+        ["next_player_rate", "player_prob", "player_rate", "p_rate", "P", "p", "player", "閒", "闲"],
+    )
+    if banker is None or player is None:
+        raise ValueError(f"Combo DB record missing banker/player probability: {key}")
+
+    banker_prob, player_prob = normalize_prob_pair(float(banker), float(player))
+    sample = _sample_of(rec)
+
+    rec["feature_key"] = key
+    rec["next_banker_rate"] = banker_prob
+    rec["next_player_rate"] = player_prob
+    rec["banker_prob"] = banker_prob
+    rec["player_prob"] = player_prob
+    rec["sample"] = sample
+    rec.setdefault("source", "POINT_CONDITION_COMBO_DB")
+    return rec
+
+
+def _find_record_by_keys(records: Dict[str, Any], normalized_index: Dict[str, str], keys: List[str], min_sample: int) -> Optional[Dict[str, Any]]:
+    for key in keys:
+        raw = _get_record(records, normalized_index, key)
+        if not isinstance(raw, dict):
+            continue
+        sample = _sample_of(raw)
+        if sample < int(min_sample):
+            continue
         try:
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception as e:
-            print(f"[WARN] Cannot load existing db: {e}")
-    return {}
+            return extract_combo_record(raw, key)
+        except Exception:
+            continue
+    return None
 
 
-def build_base_pool_for_point(pools, player_point: int, banker_point: int):
-    merged = []
-    for sc in SCENARIOS:
-        merged.extend(pools.get((player_point, banker_point, sc), []))
-    return merged
+def _aggregate_point_records(records: Dict[str, Any], normalized_index: Dict[str, str], player_point: int, banker_point: int, min_sample: int) -> Optional[Dict[str, Any]]:
+    """最後保險：若精準情境 key 找不到，聚合該點數所有 scenario/base records。"""
+    pkey = point_key(player_point, banker_point)
+    prefixes = [f"{pkey}|SC:", f"{pkey}|SC_", f"{pkey}_SC_", f"{pkey}|", f"{pkey}_"]
+    weighted_b = 0.0
+    total_w = 0.0
+    sample_total = 0
+    used = []
+
+    for key, raw in records.items():
+        if not isinstance(raw, dict):
+            continue
+        skey = str(key)
+        if skey == pkey or any(skey.startswith(px) for px in prefixes):
+            # 排除非本點數的近似 key，例如 P2_B70
+            if not (skey == pkey or skey.startswith(f"{pkey}|") or skey.startswith(f"{pkey}_")):
+                continue
+            sample = _sample_of(raw)
+            if sample < int(min_sample):
+                continue
+            try:
+                rec = extract_combo_record(raw, skey)
+            except Exception:
+                continue
+            w = max(1.0, min(sample / 10000.0, 3.0))
+            weighted_b += float(rec["banker_prob"]) * w
+            total_w += w
+            sample_total += sample
+            used.append({
+                "feature_key": skey,
+                "sample": sample,
+                "banker_prob": rec.get("banker_prob"),
+                "player_prob": rec.get("player_prob"),
+                "source": rec.get("source", "POINT_CONDITION_COMBO_DB"),
+            })
+
+    if total_w <= 0:
+        return None
+
+    banker_prob = weighted_b / total_w
+    player_prob = 1.0 - banker_prob
+    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
+    return {
+        "available": True,
+        "feature_key": pkey,
+        "banker_prob": banker_prob,
+        "player_prob": player_prob,
+        "source": "POINT_CONDITION_COMBO_DB_POINT_AGGREGATE_FALLBACK",
+        "sample": sample_total,
+        "sample_size": sample_total,
+        "matched_records": used[:20],
+    }
 
 
-def main():
-    start = time.time()
-    rng = random.Random(SEED)
-    print("=" * 72)
-    print("V9 combo_db per-condition generator")
-    print(f"OUTPUT_PATH={OUTPUT_PATH}")
-    print(f"PER_CONDITION_SAMPLES={PER_CONDITION_SAMPLES:,}")
-    print(f"DECKS={DECKS}")
-    print(f"INCLUDE_BASE={INCLUDE_BASE}")
-    print(f"USE_REALISTIC_DRAW_RULE_FILTER={USE_REALISTIC_DRAW_RULE_FILTER}")
-    print("=" * 72)
+def combo_lookup(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+    composition: Optional[Dict[str, Any]] = None,
+    min_sample: int = 80,
+) -> Dict[str, Any]:
+    """
+    V9.4 主查詢：使用「點數 + 補牌情境」查 combo_db_3m.json。
+    rounds 只保留參數相容，主邏輯不依賴前面路單。
+    """
+    meta = combo_db_meta()
+    db = load_combo_db()
+    records = db.get("records", {})
+    normalized_index = db.get("normalized_index", {})
+    pkey = point_key(player_point, banker_point)
 
-    pools = build_current_state_pools()
-    db = load_existing(OUTPUT_PATH)
+    if not isinstance(records, dict) or not records:
+        return {
+            "available": False,
+            "feature_key": pkey,
+            "banker_prob": BASE_BANKER_NO_TIE,
+            "player_prob": 1.0 - BASE_BANKER_NO_TIE,
+            "source": "COMBO_DB_NOT_MATCHED_OR_EMPTY",
+            "sample_size": 0,
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+            "candidate_keys": [pkey],
+            "matched_records": [],
+            "top_scenario": "UNKNOWN",
+            "meta": meta,
+        }
 
-    # metadata
-    db.setdefault("__meta__", {})
-    db["__meta__"].update({
-        "version": "combo_db_per_condition_v9",
-        "decks": DECKS,
-        "per_condition_samples_target": PER_CONDITION_SAMPLES,
-        "include_base": INCLUDE_BASE,
-        "seed": SEED,
-        "scenario_keys": SCENARIOS,
-        "description": "每個點數+補牌情境 key 獨立抽樣到指定樣本數。",
-        "updated_at_unix": int(time.time()),
-    })
+    scenarios = extract_scenarios(composition)
+    if not scenarios:
+        scenarios = [{"scenario": "NONE_DRAW", "weight": 1.0, "player_count": 0, "banker_count": 0, "raw": {}}]
 
-    tasks = []
-    for pp in range(10):
-        for bp in range(10):
-            for sc in SCENARIOS:
-                tasks.append((pp, bp, sc, f"P{pp}_B{bp}|SC:{sc}"))
-            if INCLUDE_BASE:
-                tasks.append((pp, bp, "BASE", f"P{pp}_B{bp}|BASE"))
+    weighted_b = 0.0
+    total_weight = 0.0
+    sample_total = 0
+    matched_records: List[Dict[str, Any]] = []
+    candidate_keys: List[str] = []
 
-    total_tasks = len(tasks)
-    print(f"[2/3] Total keys to build: {total_tasks}")
-
-    done = 0
-    skipped = 0
-    for idx, (pp, bp, sc, key) in enumerate(tasks, start=1):
-        existing = db.get(key)
-        if isinstance(existing, dict) and int(existing.get("sample_size", 0)) >= PER_CONDITION_SAMPLES:
-            skipped += 1
+    for sc in scenarios:
+        keys = candidate_keys_for_scenario(
+            player_point,
+            banker_point,
+            sc.get("scenario", "UNKNOWN"),
+            player_count=int(sc.get("player_count", 0) or 0),
+            banker_count=int(sc.get("banker_count", 0) or 0),
+        )
+        candidate_keys.extend(keys[:12])
+        rec = _find_record_by_keys(records, normalized_index, keys, min_sample=min_sample)
+        if not rec:
             continue
 
-        if sc == "BASE":
-            pool = build_base_pool_for_point(pools, pp, bp)
-        else:
-            pool = pools.get((pp, bp, sc), [])
+        sample = int(rec.get("sample", 0) or 0)
+        scenario_weight = float(sc.get("weight", 0.0) or 0.0)
+        sample_weight = min(max(sample / 10000.0, 0.45), 2.2)
+        w = max(0.0001, scenario_weight * sample_weight)
 
-        if not pool:
-            db[key] = {
-                "available": False,
-                "key": key,
-                "player_point": pp,
-                "banker_point": bp,
-                "scenario": sc,
-                "banker_prob": 0.5,
-                "player_prob": 0.5,
-                "sample_size": 0,
-                "source": "NO_REALISTIC_STATE_POOL_FOR_CONDITION",
+        weighted_b += float(rec["banker_prob"]) * w
+        total_weight += w
+        sample_total += sample
+        matched_records.append({
+            "scenario": sc.get("scenario"),
+            "weight": w,
+            "scenario_weight": scenario_weight,
+            "feature_key": rec.get("feature_key"),
+            "banker_prob": rec.get("banker_prob"),
+            "player_prob": rec.get("player_prob"),
+            "sample": sample,
+            "source": rec.get("source", "POINT_CONDITION_COMBO_DB"),
+        })
+
+    seen = set()
+    candidate_keys = [x for x in candidate_keys if not (x in seen or seen.add(x))]
+
+    # 若情境 key 都找不到，最後用該點數全部可用條件聚合，不改原資料，只做讀取 fallback。
+    if total_weight <= 0:
+        agg = _aggregate_point_records(records, normalized_index, player_point, banker_point, min_sample=min_sample)
+        if agg:
+            return {
+                "available": True,
+                "feature_key": agg.get("feature_key", pkey),
+                "banker_prob": agg.get("banker_prob", BASE_BANKER_NO_TIE),
+                "player_prob": agg.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
+                "source": agg.get("source", "POINT_CONDITION_COMBO_DB_POINT_AGGREGATE_FALLBACK"),
+                "sample_size": int(agg.get("sample_size", 0) or 0),
+                "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+                "candidate_keys": candidate_keys[:24],
+                "matched_records": agg.get("matched_records", []),
+                "top_scenario": scenarios[0].get("scenario", "UNKNOWN") if scenarios else "UNKNOWN",
+                "meta": meta,
             }
-            print(f"[{idx}/{total_tasks}] {key} -> no pool, skipped")
-            if SAVE_EVERY_KEY:
-                save_db(db, OUTPUT_PATH)
-            continue
 
-        print(f"[{idx}/{total_tasks}] Building {key} | pool={len(pool):,} | n={PER_CONDITION_SAMPLES:,}")
-        counts = simulate_next_after_condition(rng, pool, PER_CONDITION_SAMPLES)
-        db[key] = make_record(key, pp, bp, sc, counts, len(pool))
-        done += 1
+        return {
+            "available": False,
+            "feature_key": pkey,
+            "banker_prob": BASE_BANKER_NO_TIE,
+            "player_prob": 1.0 - BASE_BANKER_NO_TIE,
+            "source": "POINT_CONDITION_COMBO_DB_NOT_MATCHED",
+            "sample_size": 0,
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+            "candidate_keys": candidate_keys[:24],
+            "matched_records": [],
+            "top_scenario": scenarios[0].get("scenario", "UNKNOWN") if scenarios else "UNKNOWN",
+            "meta": meta,
+        }
 
-        if SAVE_EVERY_KEY:
-            save_db(db, OUTPUT_PATH)
+    banker_prob = weighted_b / total_weight
+    player_prob = 1.0 - banker_prob
+    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
+    best = matched_records[0] if matched_records else {}
 
-    db["__meta__"]["completed_at_unix"] = int(time.time())
-    db["__meta__"]["elapsed_seconds"] = round(time.time() - start, 2)
-    db["__meta__"]["records"] = len([k for k in db.keys() if not k.startswith("__")])
-    save_db(db, OUTPUT_PATH)
+    return {
+        "available": True,
+        "feature_key": best.get("feature_key", pkey),
+        "banker_prob": banker_prob,
+        "player_prob": player_prob,
+        "source": "POINT_CONDITION_COMBO_DB_V9_4_CONNECTED",
+        "sample_size": sample_total,
+        "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+        "candidate_keys": candidate_keys[:24],
+        "matched_records": matched_records,
+        "top_scenario": scenarios[0].get("scenario", "UNKNOWN") if scenarios else "UNKNOWN",
+        "meta": meta,
+    }
 
-    print("[3/3] Done")
-    print(f"records={db['__meta__']['records']:,}, done={done:,}, skipped={skipped:,}")
-    print(f"output={OUTPUT_PATH}")
-    print(f"elapsed={db['__meta__']['elapsed_seconds']} sec")
+
+def clear_combo_db_cache():
+    load_combo_db.cache_clear()
 
 
 if __name__ == "__main__":
-    main()
+    print("META =", combo_db_meta())
+    for pp, bp, sc in [(2, 7, "莊閒皆補"), (2, 7, "BOTH_DRAW"), (6, 5, "PLAYER_DRAW")]:
+        print("LOOKUP", pp, bp, sc, "=>")
+        print(combo_lookup(pp, bp, composition={"top_scenario": sc}, min_sample=1))
