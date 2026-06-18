@@ -92,277 +92,371 @@ MC_SEED = env_int("MC_SEED", "42")
 MC_MAX_NOISE = env_float("MC_MAX_NOISE", "0.010")
 MC_BLOCK_LOW_GAP = env_bool("MC_BLOCK_LOW_GAP", "1")
 MC_MIN_GAP_FOR_ENTRY = env_float("MC_MIN_GAP_FOR_ENTRY", "0.055")
-MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "1")
-
-# ============================================================
-# AI 綜合決策層：
-# AI 不再只是「歷史修正」，而是綜合 point_db / combo_db /
-# 補牌MC / Monte Carlo / 主模型結果，判斷要出莊、閒或觀望。
-# ============================================================
-USE_AI_DECISION_LAYER = env_bool("USE_AI_DECISION_LAYER", "1")
-AI_DECISION_WEIGHT = env_float("AI_DECISION_WEIGHT", os.getenv("SIM_WEIGHT", "0.12"))
-AI_REQUIRE_SIGNAL_AGREEMENT = env_bool("AI_REQUIRE_SIGNAL_AGREEMENT", "1")
-AI_BLOCK_CONFLICT_SIGNAL = env_bool("AI_BLOCK_CONFLICT_SIGNAL", "1")
-AI_MIN_AGREEMENT_COUNT = env_int("AI_MIN_AGREEMENT_COUNT", "3")
-AI_MIN_CONFIDENCE_GAP = env_float("AI_MIN_CONFIDENCE_GAP", "0.085")
-AI_COMBO_SAMPLE_STRONG = env_int("AI_COMBO_SAMPLE_STRONG", "300")
-AI_COMBO_SAMPLE_WEAK = env_int("AI_COMBO_SAMPLE_WEAK", "80")
-AI_FORCE_OBSERVE_ON_SPLIT = env_bool("AI_FORCE_OBSERVE_ON_SPLIT", "1")
-# 預設不讓 AI 硬改方向，避免主模型機率顯示與建議方向互相打架。
-# 若未來你想讓 AI 在 4/5 訊號強一致時可改方向，再設 AI_OVERRIDE_DIRECTION=1。
-AI_OVERRIDE_DIRECTION = env_bool("AI_OVERRIDE_DIRECTION", "0")
-
-# 中性死區：避免 50.1% / 49.9% 這種微小差距被自動判成莊。
-MODEL_NEUTRAL_GAP = env_float("MODEL_NEUTRAL_GAP", "0.003")
-MC_NEUTRAL_GAP = env_float("MC_NEUTRAL_GAP", "0.006")
-AI_SIGNAL_MIN_GAP = env_float("AI_SIGNAL_MIN_GAP", "0.012")
-AI_MAIN_SIGNAL_MIN_GAP = env_float("AI_MAIN_SIGNAL_MIN_GAP", "0.020")
-AI_MIN_SCORE_EDGE = env_float("AI_MIN_SCORE_EDGE", "0.010")
-
-# ============================================================
-# AI 綜合決策層
-# ============================================================
-
-def prob_direction(banker_prob: float, player_prob: float, neutral_gap: float = 0.0) -> Tuple[str, float]:
-    """回傳方向與差距。若落在中性死區，回傳「觀望」。"""
-    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
-    gap = abs(banker_prob - player_prob)
-    if gap < float(neutral_gap or 0.0):
-        return "觀望", gap
-    if banker_prob > player_prob:
-        return "莊", gap
-    return "閒", gap
+MC_DIRECTION_MISMATCH_BLOCK = env_bool("MC_DIRECTION_MISMATCH_BLOCK", "0")
 
 
-def _signal_item(
-    name: str,
-    banker_prob: float,
-    player_prob: float,
-    available: bool = True,
-    sample_size: int = 0,
-    base_weight: float = 1.0,
-    min_gap: float = 0.0,
-) -> Optional[Dict[str, Any]]:
-    """
-    建立 AI 訊號。
-    重點：低於 min_gap 的小差距不列入投票，避免 50.1% 微偏莊也被當有效莊票。
-    """
-    if not available:
-        return None
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-    direction, gap = prob_direction(banker_prob, player_prob, neutral_gap=min_gap)
 
-    if direction == "觀望":
-        return None
+def stable_noise(key: str, scale: float = 0.035) -> float:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    raw = int(digest[:8], 16) / 0xFFFFFFFF
+    return (raw - 0.5) * 2 * scale
 
-    strength = gap * float(base_weight)
 
+def validate_point(v: int) -> int:
+    iv = int(v)
+    if iv < 0 or iv > 9:
+        raise ValueError("point must be 0-9")
+    return iv
+
+
+def get_last_result(player_point: int, banker_point: int) -> str:
+    if player_point > banker_point:
+        return "閒"
+    if banker_point > player_point:
+        return "莊"
+    return "和"
+
+
+def point_key(player_point: int, banker_point: int) -> str:
+    return f"P{player_point}_B{banker_point}"
+
+
+def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
+    banker = float(banker)
+    player = float(player)
+    if banker > 1:
+        banker /= 100.0
+    if player > 1:
+        player /= 100.0
+    total = banker + player
+    if total <= 0:
+        banker = BASE_BANKER_NO_TIE
+        player = 1.0 - banker
+    else:
+        banker /= total
+        player /= total
+    banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+    player = 1.0 - banker
+    return banker, player
+
+
+def neutral_record(source: str = "NEUTRAL") -> Dict[str, Any]:
+    banker = clamp(BASE_BANKER_NO_TIE, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     return {
-        "name": name,
-        "direction": direction,
-        "gap_raw": gap,
-        "gap": round(gap * 100, PERCENT_DECIMALS),
-        "sample_size": int(sample_size or 0),
-        "weight": float(base_weight),
-        "strength": float(strength),
+        "available": False,
+        "feature_key": "NEUTRAL",
+        "banker_prob": banker,
+        "player_prob": 1.0 - banker,
+        "source": source,
+        "sample_size": 0,
+        "total_simulated_samples": 0,
     }
 
 
-def ai_ensemble_decision_layer(
-    point: Dict[str, Any],
-    combo: Dict[str, Any],
-    comp: Dict[str, Any],
-    mc: Dict[str, Any],
-    current_recommend: str,
-    banker_prob: float,
-    player_prob: float,
-    gap: float,
-) -> Dict[str, Any]:
-    """
-    AI 綜合決策層：
-    不追歷史、不看路單延續，而是檢查各模型訊號是否一致。
+# ============================================================
+# point_db：單純點數統計層
+# ============================================================
 
-    會看：
-    - point_db 方向
-    - combo_db 方向與樣本數
-    - 補牌 MC 方向
-    - Monte Carlo 方向
-    - 主模型方向與差距
+def fallback_point_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
+    diff = player_point - banker_point
+    key = point_key(player_point, banker_point)
+    banker = BASE_BANKER_NO_TIE
 
-    最終回傳：莊 / 閒 / 觀望。
-    """
-    if not USE_AI_DECISION_LAYER:
+    if diff == 0:
+        banker += stable_noise(key + ":tie", 0.014)
+    elif 1 <= diff <= 5:
+        banker -= 0.155
+    elif diff >= 6:
+        banker -= 0.095
+    elif -5 <= diff <= -1:
+        banker += 0.155
+    elif diff <= -6:
+        banker += 0.095
+
+    banker += stable_noise(key + ":fallback", 0.035)
+    banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+    return {
+        "available": False,
+        "feature_key": key,
+        "banker_prob": banker,
+        "player_prob": 1.0 - banker,
+        "source": "FALLBACK_POINT_RULE_ONLY",
+        "sample_size": 0,
+        "total_simulated_samples": 0,
+    }
+
+
+def point_db_lookup(player_point: int, banker_point: int) -> Dict[str, Any]:
+    if not USE_POINT_DB:
+        return fallback_point_lookup(player_point, banker_point)
+    try:
+        rec = get_point_record(player_point, banker_point)
+        banker = rec.get("next_banker_rate", rec.get("banker_prob", rec.get("banker_rate")))
+        player = rec.get("next_player_rate", rec.get("player_prob", rec.get("player_rate")))
+        if banker is None or player is None:
+            return fallback_point_lookup(player_point, banker_point)
+        banker, player = normalize_prob_pair(float(banker), float(player))
+        meta = point_db_meta()
         return {
-            "ai_decision_enabled": False,
-            "ai_decision_recommend": current_recommend,
-            "ai_decision_direction": current_recommend,
-            "ai_decision_observe": False,
-            "ai_decision_reason": "AI_DECISION_LAYER_DISABLED",
-            "ai_signal_summary": "DISABLED",
-            "ai_signals": [],
+            "available": True,
+            "feature_key": point_key(player_point, banker_point),
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": rec.get("source", "POINT_DB"),
+            "sample_size": int(rec.get("sample", rec.get("sample_size", 0)) or 0),
+            "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
+        }
+    except Exception:
+        return fallback_point_lookup(player_point, banker_point)
+
+
+# ============================================================
+# composition + combo condition db
+# ============================================================
+
+def composition_mc_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
+    if not USE_COMPOSITION_MC or not callable(composition_mc_lookup):
+        return {
+            **neutral_record("COMPOSITION_MC_DISABLED"),
+            "scenario_debug": [],
+            "top_scenario": "UNKNOWN",
+            "scenario_count": 0,
+        }
+    try:
+        rec = composition_mc_lookup(
+            player_point=player_point,
+            banker_point=banker_point,
+            n_sim=COMPOSITION_MC_SIMULATIONS,
+            max_combos=COMPOSITION_MC_MAX_COMBOS,
+            seed_key=f"{player_point}:{banker_point}:{len(rounds or [])}",
+        )
+        if not isinstance(rec, dict):
+            raise ValueError("composition_mc_lookup returned non-dict")
+        banker, player = normalize_prob_pair(rec.get("banker_prob", BASE_BANKER_NO_TIE), rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE))
+        return {
+            "available": bool(rec.get("available", False)),
+            "feature_key": rec.get("feature_key", f"P{player_point}_B{banker_point}_COMPOSITION_MC"),
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": rec.get("source", "POINT_COMPOSITION_MC"),
+            "sample_size": int(rec.get("sample_size", 0) or 0),
+            "total_simulated_samples": int(rec.get("total_simulated_samples", rec.get("sample_size", 0)) or 0),
+            "scenario_debug": rec.get("scenario_debug", []),
+            "top_scenario": rec.get("top_scenario", "UNKNOWN"),
+            "scenario_count": int(rec.get("scenario_count", len(rec.get("scenario_debug", [])) if isinstance(rec.get("scenario_debug", []), list) else 0) or 0),
+        }
+    except Exception as e:
+        return {
+            **neutral_record(f"COMPOSITION_MC_ERROR:{e}"),
+            "scenario_debug": [],
+            "top_scenario": "UNKNOWN",
+            "scenario_count": 0,
         }
 
-    signals: List[Dict[str, Any]] = []
 
-    # point_db：當前點數統計，視為主訊號之一。
-    sig = _signal_item(
-        "point_db",
-        point.get("banker_prob", BASE_BANKER_NO_TIE),
-        point.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
-        available=bool(point.get("available", False)),
-        sample_size=int(point.get("sample_size", 0) or 0),
-        base_weight=1.15,
-        min_gap=AI_SIGNAL_MIN_GAP,
-    )
-    if sig:
-        signals.append(sig)
-
-    # combo_db：樣本足夠才列入訊號；樣本偏低則降權。
-    combo_sample = int(combo.get("sample_size", 0) or 0)
-    combo_available = bool(combo.get("available", False)) and combo_sample >= AI_COMBO_SAMPLE_WEAK
-    if combo_available:
-        combo_weight = 1.25 if combo_sample >= AI_COMBO_SAMPLE_STRONG else 0.75
-        sig = _signal_item(
-            "combo_db",
-            combo.get("banker_prob", BASE_BANKER_NO_TIE),
-            combo.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
-            available=True,
-            sample_size=combo_sample,
-            base_weight=combo_weight,
-            min_gap=AI_SIGNAL_MIN_GAP,
+def combo_condition_lookup(player_point: int, banker_point: int, rounds: Optional[List[Any]], comp: Dict[str, Any]) -> Dict[str, Any]:
+    if not USE_COMBO_DB or not callable(combo_lookup):
+        return neutral_record("COMBO_DB_DISABLED")
+    try:
+        rec = combo_lookup(
+            player_point=player_point,
+            banker_point=banker_point,
+            rounds=rounds,
+            composition=comp,
+            min_sample=COMBO_DB_MIN_SAMPLE,
         )
-        if sig:
-            signals.append(sig)
+        if not isinstance(rec, dict):
+            raise ValueError("combo_lookup returned non-dict")
+        banker, player = normalize_prob_pair(rec.get("banker_prob", BASE_BANKER_NO_TIE), rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE))
+        return {
+            "available": bool(rec.get("available", False)),
+            "feature_key": rec.get("feature_key", point_key(player_point, banker_point)),
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": rec.get("source", "POINT_CONDITION_COMBO_DB"),
+            "sample_size": int(rec.get("sample_size", 0) or 0),
+            "total_simulated_samples": int(rec.get("total_simulated_samples", 0) or 0),
+            "candidate_keys": rec.get("candidate_keys", []),
+            "matched_records": rec.get("matched_records", []),
+            "top_scenario": rec.get("top_scenario", comp.get("top_scenario", "UNKNOWN")),
+        }
+    except Exception as e:
+        return neutral_record(f"COMBO_DB_ERROR:{e}")
 
-    # 補牌 MC：用來判斷當前點數形成情境，不看歷史。
-    sig = _signal_item(
-        "composition_mc",
-        comp.get("banker_prob", BASE_BANKER_NO_TIE),
-        comp.get("player_prob", 1.0 - BASE_BANKER_NO_TIE),
-        available=bool(comp.get("available", False)),
-        sample_size=int(comp.get("sample_size", 0) or 0),
-        base_weight=1.10,
-        min_gap=AI_SIGNAL_MIN_GAP,
-    )
-    if sig:
-        signals.append(sig)
 
-    # 主模型融合結果：需要較高差距才列入，避免主模型微偏莊就變莊票。
-    sig = _signal_item(
-        "main_model",
-        banker_prob,
-        player_prob,
-        available=current_recommend in {"莊", "閒"},
-        sample_size=0,
-        base_weight=0.95,
-        min_gap=AI_MAIN_SIGNAL_MIN_GAP,
-    )
-    if sig:
-        signals.append(sig)
+# ============================================================
+# AI 微調層：只吃歷史點數序列，小權重修正
+# ============================================================
 
-    # Monte Carlo 方向：若 MC 自己為觀望，不列入投票。
-    if mc and mc.get("mc_enabled") and mc.get("mc_recommend") in {"莊", "閒"}:
-        sig = _signal_item(
-            "monte_carlo",
-            mc.get("mc_banker_rate_raw", BASE_BANKER_NO_TIE),
-            mc.get("mc_player_rate_raw", 1.0 - BASE_BANKER_NO_TIE),
-            available=True,
-            sample_size=int(mc.get("mc_simulations", 0) or 0),
-            base_weight=1.20,
-            min_gap=max(AI_SIGNAL_MIN_GAP, MC_NEUTRAL_GAP),
-        )
-        if sig:
-            signals.append(sig)
+def extract_round_points(rounds: Optional[List[Any]]) -> List[Tuple[int, int]]:
+    if not rounds:
+        return []
+    out: List[Tuple[int, int]] = []
+    for r in rounds:
+        pp = bp = None
+        if isinstance(r, dict):
+            pp = r.get("player_point", r.get("player", r.get("p")))
+            bp = r.get("banker_point", r.get("banker", r.get("b")))
+        elif isinstance(r, (list, tuple)) and len(r) >= 2:
+            pp, bp = r[0], r[1]
+        try:
+            pp = int(pp)
+            bp = int(bp)
+            if 0 <= pp <= 9 and 0 <= bp <= 9:
+                out.append((pp, bp))
+        except Exception:
+            continue
+    return out
 
-    banker_votes = [s for s in signals if s.get("direction") == "莊"]
-    player_votes = [s for s in signals if s.get("direction") == "閒"]
 
-    banker_score = sum(float(s.get("strength", 0.0)) for s in banker_votes)
-    player_score = sum(float(s.get("strength", 0.0)) for s in player_votes)
-    score_edge = abs(banker_score - player_score)
+def trend_delta(values: List[int]) -> float:
+    n = len(values)
+    if n < 3:
+        return 0.0
+    mid = n // 2
+    early = values[:mid]
+    late = values[mid:]
+    if not early or not late:
+        return 0.0
+    return (sum(late) / len(late)) - (sum(early) / len(early))
 
-    banker_count = len(banker_votes)
-    player_count = len(player_votes)
 
-    if banker_score > player_score:
-        ai_direction = "莊"
-        agreement_count = banker_count
-        conflict_count = player_count
-    elif player_score > banker_score:
-        ai_direction = "閒"
-        agreement_count = player_count
-        conflict_count = banker_count
-    else:
-        if banker_count > player_count:
-            ai_direction = "莊"
-            agreement_count = banker_count
-            conflict_count = player_count
-        elif player_count > banker_count:
-            ai_direction = "閒"
-            agreement_count = player_count
-            conflict_count = banker_count
-        else:
-            ai_direction = "觀望"
-            agreement_count = max(banker_count, player_count)
-            conflict_count = agreement_count
-
+def ai_simulation_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None) -> Dict[str, Any]:
+    diff = player_point - banker_point
+    key = point_key(player_point, banker_point)
+    banker = BASE_BANKER_NO_TIE
     reasons: List[str] = []
+    history_adjust = 0.0
 
-    if not signals:
-        reasons.append("AI 無足夠有效訊號")
-        ai_direction = "觀望"
-        agreement_count = 0
-        conflict_count = 0
+    if diff == 0:
+        banker += stable_noise(key + ":ai_tie", 0.004)
+        reasons.append("current_tie_point_noise")
+    elif abs(diff) <= 2:
+        banker += -0.014 if diff > 0 else 0.014
+        reasons.append("current_small_diff_adjust")
+    elif abs(diff) <= 5:
+        banker += -0.018 if diff > 0 else 0.018
+        reasons.append("current_mid_diff_adjust")
+    else:
+        banker += -0.010 if diff > 0 else 0.010
+        reasons.append("current_large_diff_adjust")
 
-    if ai_direction == "觀望" and AI_FORCE_OBSERVE_ON_SPLIT:
-        reasons.append("AI 訊號分歧或落在中性區")
+    recent = extract_round_points(rounds)[-AI_HISTORY_WINDOW:]
+    if len(recent) >= 3:
+        player_points = [p for p, _ in recent]
+        banker_points = [b for _, b in recent]
+        diffs = [p - b for p, b in recent]
+        p_trend = trend_delta(player_points)
+        b_trend = trend_delta(banker_points)
+        diff_trend = trend_delta(diffs)
 
-    if AI_REQUIRE_SIGNAL_AGREEMENT and ai_direction in {"莊", "閒"} and agreement_count < AI_MIN_AGREEMENT_COUNT:
-        reasons.append(f"AI 同方向訊號不足，僅 {agreement_count} 個，未達 {AI_MIN_AGREEMENT_COUNT} 個")
+        if p_trend - b_trend >= 1.5:
+            history_adjust -= AI_TREND_STRENGTH
+            reasons.append("player_point_trend_up")
+        elif b_trend - p_trend >= 1.5:
+            history_adjust += AI_TREND_STRENGTH
+            reasons.append("banker_point_trend_up")
 
-    if AI_BLOCK_CONFLICT_SIGNAL and ai_direction in {"莊", "閒"}:
-        # 反向訊號太多，代表各層判斷衝突。
-        if conflict_count >= 2 and agreement_count <= conflict_count + 1:
-            reasons.append("AI 偵測 point/combo/補牌MC/MC 訊號衝突")
+        if diff_trend >= 1.25:
+            history_adjust -= AI_DIFF_MOMENTUM_STRENGTH
+            reasons.append("player_diff_momentum")
+        elif diff_trend <= -1.25:
+            history_adjust += AI_DIFF_MOMENTUM_STRENGTH
+            reasons.append("banker_diff_momentum")
 
-    if gap < AI_MIN_CONFIDENCE_GAP:
-        reasons.append(f"AI 判斷主模型差距 {gap * 100:.2f}% 未達 {AI_MIN_CONFIDENCE_GAP * 100:.1f}%")
+        if sum(1 for x in player_points[-3:] if x >= 7) >= 3:
+            history_adjust += AI_REVERSAL_STRENGTH
+            reasons.append("player_hot_reversal_guard")
+        elif sum(1 for x in banker_points[-3:] if x >= 7) >= 3:
+            history_adjust -= AI_REVERSAL_STRENGTH
+            reasons.append("banker_hot_reversal_guard")
 
-    if score_edge < AI_MIN_SCORE_EDGE:
-        reasons.append(f"AI 莊閒分數差距不足，score_edge={score_edge:.4f}")
-
-    # 若 AI 與主模型相反，預設觀望；除非 AI_OVERRIDE_DIRECTION=1。
-    direction_override = False
-    if ai_direction in {"莊", "閒"} and current_recommend in {"莊", "閒"} and ai_direction != current_recommend:
-        if AI_OVERRIDE_DIRECTION:
-            direction_override = True
-            reasons.append(f"AI 綜合訊號改判：{current_recommend} → {ai_direction}")
-        else:
-            reasons.append(f"AI 方向與主模型不同：主模型{current_recommend} / AI{ai_direction}")
-
-    observe = bool(reasons)
-    decision_recommend = "觀望" if observe else ai_direction
-
-    signal_summary = " / ".join(
-        f"{s.get('name')}:{s.get('direction')}({s.get('gap')}%)"
-        for s in signals
-    ) or "NO_EFFECTIVE_SIGNAL"
-
+    history_adjust = clamp(history_adjust, -AI_HISTORY_MAX_ADJUST, AI_HISTORY_MAX_ADJUST)
+    banker += history_adjust
+    banker += stable_noise(key + ":ai_v9", AI_NOISE_SCALE)
+    banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     return {
-        "ai_decision_enabled": True,
-        "ai_decision_recommend": decision_recommend,
-        "ai_decision_direction": ai_direction,
-        "ai_decision_observe": observe,
-        "ai_decision_reason": "；".join(reasons) if reasons else f"AI 綜合訊號一致，偏向{ai_direction}",
-        "ai_signal_summary": signal_summary,
-        "ai_agreement_count": agreement_count,
-        "ai_conflict_count": conflict_count,
-        "ai_banker_score": banker_score,
-        "ai_player_score": player_score,
-        "ai_score_edge": score_edge,
-        "ai_direction_override": direction_override,
-        "ai_signals": signals,
+        "banker_prob": banker,
+        "player_prob": 1.0 - banker,
+        "source": "LOCAL_AI_POINT_SEQUENCE_V9",
+        "history_points_used": len(recent),
+        "history_adjust": history_adjust,
+        "history_reasons": reasons,
     }
+
+
+# ============================================================
+# Monte Carlo 風控驗證層
+# ============================================================
+
+def monte_carlo_verify_from_probs(banker_prob: float, player_prob: float, n_sim: Optional[int] = None, seed_key: str = "") -> Dict[str, Any]:
+    if n_sim is None:
+        n_sim = MC_SIMULATIONS
+    try:
+        n_sim = int(n_sim)
+    except Exception:
+        n_sim = 300
+    min_sim = max(20, int(MC_MIN_SIMULATIONS))
+    max_sim = max(min_sim, int(MC_MAX_SIMULATIONS))
+    n_sim = max(min_sim, min(n_sim, max_sim))
+
+    banker_prob, player_prob = normalize_prob_pair(banker_prob, player_prob)
+    rng = random.Random(f"{MC_SEED}:{seed_key}")
+    banker_wins = 0
+    player_wins = 0
+
+    for _ in range(n_sim):
+        b = clamp(banker_prob + rng.uniform(-MC_MAX_NOISE, MC_MAX_NOISE), MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+        if rng.random() < b:
+            banker_wins += 1
+        else:
+            player_wins += 1
+
+    total = banker_wins + player_wins
+    if total <= 0:
+        banker_rate = BASE_BANKER_NO_TIE
+        player_rate = 1.0 - banker_rate
+    else:
+        banker_rate = banker_wins / total
+        player_rate = player_wins / total
+
+    mc_gap = abs(banker_rate - player_rate)
+    mc_recommend = "莊" if banker_rate >= player_rate else "閒"
+    return {
+        "mc_enabled": True,
+        "mc_simulations": n_sim,
+        "mc_banker_rate": round(banker_rate * 100, PERCENT_DECIMALS),
+        "mc_player_rate": round(player_rate * 100, PERCENT_DECIMALS),
+        "mc_banker_rate_raw": banker_rate,
+        "mc_player_rate_raw": player_rate,
+        "mc_recommend": mc_recommend,
+        "mc_gap": round(mc_gap * 100, PERCENT_DECIMALS),
+        "mc_gap_raw": mc_gap,
+        "mc_source": "MONTE_CARLO_PROB_STABILITY_CHECK_V9",
+    }
+
+
+def disabled_monte_carlo_result() -> Dict[str, Any]:
+    return {"mc_enabled": False, "mc_simulations": 0, "mc_source": "MONTE_CARLO_DISABLED"}
+
+
+def apply_tie_point_protection(banker: float, is_tie_point: bool) -> float:
+    if not is_tie_point:
+        return banker
+    return BASE_BANKER_NO_TIE + (banker - BASE_BANKER_NO_TIE) * TIE_SHRINK
+
+
+def build_entry_decision(is_tie_point: bool, gap: float) -> Tuple[bool, str, str]:
+    if is_tie_point and gap < TIE_MIN_GAP_FOR_ENTRY:
+        return False, "no_entry", "上一局為和局點數，莊閒優勢不足，建議觀察一局"
+    if gap < MIN_GAP_FOR_ENTRY:
+        return False, "no_entry", "莊閒機率差距不足，建議觀察一局"
+    if gap >= STRONG_GAP_FOR_ENTRY:
+        return True, "strong", ""
+    return True, "normal", ""
 
 
 # ============================================================
@@ -384,11 +478,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     p_w = float(POINT_WEIGHT) if USE_POINT_DB else 0.0
     combo_w = float(COMBO_WEIGHT)
-
-    # V9.2：SIM_WEIGHT 改為 AI 綜合決策層權重。
-    # 若 USE_AI_DECISION_LAYER=1，就不再把舊 AI 歷史層混進機率，避免追莊追閒。
-    sim_w = 0.0 if USE_AI_DECISION_LAYER else float(SIM_WEIGHT)
-
+    sim_w = float(SIM_WEIGHT)
     comp_w = float(COMPOSITION_MC_WEIGHT) if comp.get("available") else 0.0
 
     if COMBO_WEIGHT_REQUIRE_AVAILABLE and (not combo.get("available") or int(combo.get("sample_size", 0) or 0) <= 0):
@@ -410,16 +500,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     player = 1.0 - banker
     gap = abs(banker - player)
-
-    # 關鍵修正：不再用 banker >= player，避免 50/50 或極小差距自動判莊。
-    recommend, _ = prob_direction(banker, player, neutral_gap=MODEL_NEUTRAL_GAP)
+    recommend = "莊" if banker >= player else "閒"
 
     entry_allowed, entry_level, weak_reason = build_entry_decision(is_tie_point=is_tie_point, gap=gap)
-
-    if recommend == "觀望":
-        entry_allowed = False
-        entry_level = "no_entry"
-        weak_reason = f"主模型落在中性區，差距未達 {MODEL_NEUTRAL_GAP * 100:.2f}%，建議觀察一局"
 
     if (
         REQUIRE_COMBO_SAMPLE_FOR_ENTRY
@@ -450,9 +533,6 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "tie_point_mode": is_tie_point,
         "min_gap_for_entry": MIN_GAP_FOR_ENTRY,
         "strong_gap_for_entry": STRONG_GAP_FOR_ENTRY,
-        "model_neutral_gap": MODEL_NEUTRAL_GAP,
-        "mc_neutral_gap": MC_NEUTRAL_GAP,
-        "ai_signal_min_gap": AI_SIGNAL_MIN_GAP,
         "feature_key": point_key(player_point, banker_point),
         "point_feature_key": point.get("feature_key"),
         "combo_feature_key": combo.get("feature_key"),
@@ -489,7 +569,6 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "combo": combo_w,
             "pattern": combo_w,  # 舊欄位相容
             "simulation": sim_w,
-            "ai_decision": AI_DECISION_WEIGHT if USE_AI_DECISION_LAYER else 0.0,
             "composition_mc": comp_w,
             "total": total_weight,
         },
@@ -507,11 +586,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(rounds),
         "rounds_ignored": False,
-        "ai_decision_layer_enabled": USE_AI_DECISION_LAYER,
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_AI_DECISION_NEUTRAL_GAP_V9_2",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9",
     }
 
-    # 先跑 Monte Carlo，再交給 AI 綜合決策層做最後裁判。
     if USE_MONTE_CARLO:
         mc_result = monte_carlo_verify_from_probs(
             banker_prob=banker,
@@ -531,7 +608,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         else:
             result["mc_entry_blocked"] = False
 
-        if MC_DIRECTION_MISMATCH_BLOCK and result["entry_allowed"] and mc_recommend in {"莊", "閒"} and recommend in {"莊", "閒"} and mc_recommend != recommend:
+        if MC_DIRECTION_MISMATCH_BLOCK and result["entry_allowed"] and mc_recommend in {"莊", "閒"} and mc_recommend != recommend:
             result["entry_allowed"] = False
             result["entry_level"] = "no_entry"
             result["weak_reason"] = "Monte Carlo 模擬方向與主模型不一致，建議觀察一局"
@@ -540,38 +617,5 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     else:
         result["monte_carlo"] = disabled_monte_carlo_result()
         result["mc_entry_blocked"] = False
-
-    # AI 綜合決策層最後裁判：可判莊 / 閒 / 觀望。
-    ai_decision = ai_ensemble_decision_layer(
-        point=point,
-        combo=combo,
-        comp=comp,
-        mc=result.get("monte_carlo", {}),
-        current_recommend=recommend,
-        banker_prob=banker,
-        player_prob=player,
-        gap=gap,
-    )
-    result["ai_decision"] = ai_decision
-    result["ai_decision_recommend"] = ai_decision.get("ai_decision_recommend")
-    result["ai_decision_reason"] = ai_decision.get("ai_decision_reason")
-    result["ai_signal_summary"] = ai_decision.get("ai_signal_summary")
-    result["ai_agreement_count"] = ai_decision.get("ai_agreement_count")
-    result["ai_conflict_count"] = ai_decision.get("ai_conflict_count")
-
-    if USE_AI_DECISION_LAYER:
-        ai_rec = ai_decision.get("ai_decision_recommend")
-        ai_dir = ai_decision.get("ai_decision_direction")
-
-        if ai_rec == "觀望" or ai_decision.get("ai_decision_observe"):
-            result["entry_allowed"] = False
-            result["entry_level"] = "no_entry"
-            result["weak_reason"] = ai_decision.get("ai_decision_reason", "AI 綜合判斷建議觀望")
-            result["no_observe"] = True
-            result["recommend"] = "觀望"
-        elif ai_rec in {"莊", "閒"}:
-            # AI 與主模型一致時，照 AI 決策結果；若有開 AI_OVERRIDE_DIRECTION，也可改方向。
-            if recommend == "觀望" or ai_rec == recommend or ai_decision.get("ai_direction_override"):
-                result["recommend"] = ai_rec
 
     return result
