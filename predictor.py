@@ -23,6 +23,11 @@ except Exception:
     road_profile_lookup = None
     road_profile_db_meta = None
 
+try:
+    from point_calibrator import calibrate_point_layer
+except Exception:
+    calibrate_point_layer = None
+
 # ============================================================
 # V9：點數 + 補牌情境 + 300 萬條件資料庫 + Monte Carlo
 # ============================================================
@@ -69,6 +74,9 @@ USE_MONTE_CARLO = env_bool("USE_MONTE_CARLO", "1")
 PREDICT_CURRENT_ROUND_ONLY = env_bool("PREDICT_CURRENT_ROUND_ONLY", "1")
 USE_ROAD_PROFILE_DB = env_bool("USE_ROAD_PROFILE_DB", "1")
 ROAD_PROFILE_WEIGHT = env_float("ROAD_PROFILE_WEIGHT", "0.06")
+
+# 點數校準層：不改 point_db 原始資料，只在當局依照 combo/補牌MC/牌路/AI 一致性調整 point 權重。
+USE_POINT_CALIBRATOR = env_bool("USE_POINT_CALIBRATOR", "1")
 ROAD_PROFILE_MIN_SAMPLE = env_int("ROAD_PROFILE_MIN_SAMPLE", "50")
 ROAD_PROFILE_WEIGHT_REQUIRE_AVAILABLE = env_bool("ROAD_PROFILE_WEIGHT_REQUIRE_AVAILABLE", "1")
 ROAD_PROFILE_REQUIRE_AVAILABLE = env_bool("ROAD_PROFILE_REQUIRE_AVAILABLE", "0")
@@ -549,7 +557,36 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     road = road_profile_layer(player_point, banker_point, comp=comp)
     ai = ai_simulation_layer(player_point, banker_point, rounds=model_rounds)
 
+    point_calibration = {
+        "point": point,
+        "weight_multiplier": 1.0,
+        "status": "NOT_AVAILABLE",
+        "signals": [],
+        "support_count": 0,
+        "conflict_count": 0,
+    }
+    if USE_POINT_CALIBRATOR and callable(calibrate_point_layer):
+        try:
+            point_calibration = calibrate_point_layer(
+                point=point,
+                combo=combo,
+                composition_mc=comp,
+                road_profile=road,
+                ai=ai,
+            )
+            point = point_calibration.get("point", point)
+        except Exception as e:
+            point_calibration = {
+                "point": point,
+                "weight_multiplier": 1.0,
+                "status": f"ERROR:{e}",
+                "signals": [],
+                "support_count": 0,
+                "conflict_count": 0,
+            }
+
     p_w = float(POINT_WEIGHT) if USE_POINT_DB else 0.0
+    p_w = p_w * float(point_calibration.get("weight_multiplier", 1.0) or 1.0)
     combo_w = float(COMBO_WEIGHT)
     sim_w = float(SIM_WEIGHT)
     comp_w = float(COMPOSITION_MC_WEIGHT) if comp.get("available") else 0.0
@@ -625,6 +662,15 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "point_feature_key": point.get("feature_key"),
         "combo_feature_key": combo.get("feature_key"),
         "point_source": point.get("source"),
+        "point_calibrator_status": point_calibration.get("status"),
+        "point_calibrator_weight_multiplier": point_calibration.get("weight_multiplier", 1.0),
+        "point_calibrator_support_count": point_calibration.get("support_count", 0),
+        "point_calibrator_conflict_count": point_calibration.get("conflict_count", 0),
+        "point_calibrator_support_score": point_calibration.get("support_score", 0.0),
+        "point_calibrator_conflict_score": point_calibration.get("conflict_score", 0.0),
+        "point_calibrator_signals": point_calibration.get("signals", []),
+        "point_banker_prob_original": point_calibration.get("original_banker_prob", point.get("banker_prob")),
+        "point_banker_prob_calibrated": point_calibration.get("calibrated_banker_prob", point.get("banker_prob")),
         "combo_source": combo.get("source"),
         "ai_source": ai.get("source"),
         "composition_mc_source": comp.get("source"),
@@ -689,7 +735,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_ROAD_PROFILE_V9_4",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_ROAD_PROFILE_POINT_CALIBRATOR_V9_6",
     }
 
     if USE_MONTE_CARLO:
