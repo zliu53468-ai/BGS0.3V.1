@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-combo_db.py - V9.4 compatible connector for data/combo_db_3m.json
+combo_db.py - V9.5 compatible connector for data/combo_db_3m.json
 
 Purpose:
 - Keep the original database/prediction logic intact.
@@ -57,14 +57,33 @@ META_KEYS = {"meta", "__meta__", "metadata", "_meta"}
 
 
 def _resolve_path(path: str) -> str:
+    """
+    Render 常見工作目錄是 /opt/render/project/src。
+    這裡多加幾個候選路徑，避免 combo_db_3m.json 明明在 data/ 裡卻讀不到。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+    base = os.path.basename(path)
+
     candidates = [
         path,
-        os.path.join(os.getcwd(), path),
+        os.path.join(cwd, path),
+        os.path.join(here, path),
         os.path.join("/opt/render/project/src", path),
-        os.path.join(os.path.dirname(__file__), path),
+        os.path.join(cwd, "data", base),
+        os.path.join(here, "data", base),
+        os.path.join("/opt/render/project/src/data", base),
     ]
+
+    seen = set()
     for p in candidates:
-        if p and os.path.exists(p):
+        if not p:
+            continue
+        p = os.path.normpath(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.exists(p):
             return p
     return path
 
@@ -111,16 +130,22 @@ def load_combo_db() -> Dict[str, Any]:
             "records": {},
         }
 
-    # 支援 {"records": {...}} 與直接 key-value 兩種資料庫格式。
+    # 支援 {"records": {...}}、{"data": {...}}、{"items": {...}} 與直接 key-value 格式。
+    meta = {}
+    for mk in META_KEYS:
+        if isinstance(raw_db.get(mk), dict):
+            meta.update(raw_db.get(mk, {}))
+
     if isinstance(raw_db.get("records"), dict):
         records = raw_db.get("records", {})
-        meta = raw_db.get("meta") if isinstance(raw_db.get("meta"), dict) else {}
+        if isinstance(raw_db.get("meta"), dict):
+            meta.update(raw_db.get("meta", {}))
+    elif isinstance(raw_db.get("data"), dict):
+        records = raw_db.get("data", {})
+    elif isinstance(raw_db.get("items"), dict):
+        records = raw_db.get("items", {})
     else:
-        meta = {}
-        for mk in META_KEYS:
-            if isinstance(raw_db.get(mk), dict):
-                meta.update(raw_db.get(mk, {}))
-        records = {k: v for k, v in raw_db.items() if str(k) not in META_KEYS}
+        records = {k: v for k, v in raw_db.items() if str(k) not in META_KEYS and k not in {"records", "data", "items"}}
 
     if not isinstance(records, dict):
         records = {}
@@ -134,7 +159,7 @@ def load_combo_db() -> Dict[str, Any]:
         if nk not in normalized_index:
             normalized_index[nk] = k
 
-    meta.setdefault("source", "COMBO_DB")
+    meta.setdefault("source", "COMBO_DB_V9_5_CONNECTED")
     meta.setdefault("path", COMBO_DB_PATH)
     meta.setdefault("resolved_path", path)
     meta.setdefault("record_count", len(records))
@@ -155,7 +180,7 @@ def combo_db_meta() -> Dict[str, Any]:
     records = db.get("records", {})
     meta.setdefault("record_count", len(records) if isinstance(records, dict) else 0)
     meta.setdefault("total_simulated_samples", 0)
-    meta.setdefault("source", "COMBO_DB")
+    meta.setdefault("source", "COMBO_DB_V9_5_CONNECTED")
     meta.setdefault("path", COMBO_DB_PATH)
     return meta
 
@@ -434,7 +459,7 @@ def combo_lookup(
     min_sample: int = 80,
 ) -> Dict[str, Any]:
     """
-    V9.4 主查詢：使用「點數 + 補牌情境」查 combo_db_3m.json。
+    V9.5 主查詢：使用「點數 + 補牌情境」查 combo_db_3m.json。
     rounds 只保留參數相容，主邏輯不依賴前面路單。
     """
     meta = combo_db_meta()
@@ -545,7 +570,7 @@ def combo_lookup(
         "feature_key": best.get("feature_key", pkey),
         "banker_prob": banker_prob,
         "player_prob": player_prob,
-        "source": "POINT_CONDITION_COMBO_DB_V9_4_CONNECTED",
+        "source": "POINT_CONDITION_COMBO_DB_V9_5_CONNECTED",
         "sample_size": sample_total,
         "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
         "candidate_keys": candidate_keys[:24],
