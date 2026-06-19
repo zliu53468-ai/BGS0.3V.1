@@ -85,6 +85,24 @@ def _debug_block(pred: Dict[str, Any]) -> str:
         f"\n補牌MC樣本：{comp_sample}"
     )
 
+    road_sample = int(pred.get("road_profile_sample_size", 0) or 0)
+    if road_sample > 0 or pred.get("road_profile_available"):
+        road_name = pred.get("road_profile_top_zh", "中性路段")
+        road_raw = pred.get("raw_layers", {}) if isinstance(pred.get("raw_layers", {}), dict) else {}
+        rb = road_raw.get("road_profile_banker_prob")
+        rp = road_raw.get("road_profile_player_prob")
+        try:
+            rb_txt = _fmt_pct(float(rb) * 100)
+            rp_txt = _fmt_pct(float(rp) * 100)
+            road_prob_txt = f"｜莊 {rb_txt} / 閒 {rp_txt}"
+        except Exception:
+            road_prob_txt = ""
+        text += (
+            f"\n牌路資料庫：{road_name}"
+            f"\n牌路樣本：{road_sample}{road_prob_txt}"
+            f"\n牌路模式：無記憶比對，不延續用戶紀錄"
+        )
+
     mc = pred.get("monte_carlo", {})
     if isinstance(mc, dict) and mc.get("mc_enabled"):
         text += (
