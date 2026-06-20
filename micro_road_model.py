@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-micro_road_model.py - V10 短牌路命中率校準層
+micro_road_model.py - V10.1 短牌路命中率校準層
 
-設計理念：
-- 不取代 point_db / combo_db / road_profile / composition_mc。
-- 不吃長歷史、不做追路、不需要暖機。
-- 只看最近 4~8 口 B/P 結果，抓「轉折口、雙跳尾、房廳尾、高點陷阱」。
-- 不是觀望層，而是輸出 banker_prob / player_prob 直接參與 predictor 融合。
+重點：
+- 只看最近 4~8 口，不吃長歷史、不做追路、不需要暖機。
+- 輸出方向與信心，讓 predictor.py 的 decision_controller 做最後命中率修正。
+- 專抓：轉折口、雙跳尾、房廳尾、天然高點陷阱、5~7差距陷阱。
 """
 
 from typing import Dict, Any, List, Tuple, Optional
@@ -36,15 +35,16 @@ def env_int(name: str, default: str) -> int:
 
 MICRO_ROAD_WINDOW = env_int("MICRO_ROAD_WINDOW", "8")
 MICRO_ROAD_MIN_ROUNDS = env_int("MICRO_ROAD_MIN_ROUNDS", "4")
-MICRO_ROAD_MAX_EDGE = env_float("MICRO_ROAD_MAX_EDGE", "0.055")
-MICRO_ROAD_BASE_EDGE = env_float("MICRO_ROAD_BASE_EDGE", "0.018")
-MICRO_ROAD_CONFIDENCE_SCALE = env_float("MICRO_ROAD_CONFIDENCE_SCALE", "1.00")
+MICRO_ROAD_MAX_EDGE = env_float("MICRO_ROAD_MAX_EDGE", "0.085")
+MICRO_ROAD_BASE_EDGE = env_float("MICRO_ROAD_BASE_EDGE", "0.030")
+MICRO_ROAD_CONFIDENCE_SCALE = env_float("MICRO_ROAD_CONFIDENCE_SCALE", "1.35")
 
-MICRO_ROAD_ZIGZAG_EDGE = env_float("MICRO_ROAD_ZIGZAG_EDGE", "0.030")
-MICRO_ROAD_DOUBLE_JUMP_EDGE = env_float("MICRO_ROAD_DOUBLE_JUMP_EDGE", "0.034")
-MICRO_ROAD_ROOM_EDGE = env_float("MICRO_ROAD_ROOM_EDGE", "0.028")
-MICRO_ROAD_STREAK_EDGE = env_float("MICRO_ROAD_STREAK_EDGE", "0.026")
-MICRO_ROAD_TRAP_EDGE = env_float("MICRO_ROAD_TRAP_EDGE", "0.038")
+MICRO_ROAD_ZIGZAG_EDGE = env_float("MICRO_ROAD_ZIGZAG_EDGE", "0.050")
+MICRO_ROAD_DOUBLE_JUMP_EDGE = env_float("MICRO_ROAD_DOUBLE_JUMP_EDGE", "0.054")
+MICRO_ROAD_ROOM_EDGE = env_float("MICRO_ROAD_ROOM_EDGE", "0.044")
+MICRO_ROAD_STREAK_EDGE = env_float("MICRO_ROAD_STREAK_EDGE", "0.022")
+MICRO_ROAD_TRAP_EDGE = env_float("MICRO_ROAD_TRAP_EDGE", "0.070")
+MICRO_ROAD_RECENT_REVERSAL_EDGE = env_float("MICRO_ROAD_RECENT_REVERSAL_EDGE", "0.038")
 
 MICRO_ROAD_NATURAL_HIGH_TRAP = env_bool("MICRO_ROAD_NATURAL_HIGH_TRAP", "1")
 MICRO_ROAD_MID_HIGH_GAP_TRAP = env_bool("MICRO_ROAD_MID_HIGH_GAP_TRAP", "1")
@@ -87,14 +87,16 @@ def extract_round_results(rounds: Optional[List[Any]]) -> List[str]:
     out: List[str] = []
     for r in rounds:
         if isinstance(r, dict):
-            norm = normalize_result(r.get("result") or r.get("winner") or r.get("last_result") or r.get("side"))
+            val = r.get("result") or r.get("winner") or r.get("last_result") or r.get("side")
+            norm = normalize_result(val)
             if norm:
                 out.append(norm)
                 continue
             pp = r.get("player_point", r.get("player", r.get("p")))
             bp = r.get("banker_point", r.get("banker", r.get("b")))
             try:
-                pp, bp = int(pp), int(bp)
+                pp = int(pp)
+                bp = int(bp)
                 if 0 <= pp <= 9 and 0 <= bp <= 9:
                     out.append(result_from_points(pp, bp))
                     continue
@@ -103,7 +105,8 @@ def extract_round_results(rounds: Optional[List[Any]]) -> List[str]:
         elif isinstance(r, (list, tuple)):
             if len(r) >= 2:
                 try:
-                    pp, bp = int(r[0]), int(r[1])
+                    pp = int(r[0])
+                    bp = int(r[1])
                     if 0 <= pp <= 9 and 0 <= bp <= 9:
                         out.append(result_from_points(pp, bp))
                         continue
@@ -121,50 +124,49 @@ def extract_round_results(rounds: Optional[List[Any]]) -> List[str]:
 
 
 def opposite(side: str) -> str:
-    return "P" if side == "B" else "B"
+    return "P" if side == "B" else "B" if side == "P" else "N"
 
 
 def side_to_prob(side: str, edge: float) -> Tuple[float, float]:
-    edge = clamp(abs(float(edge)), 0.0, MICRO_ROAD_MAX_EDGE)
+    edge = clamp(float(edge), -MICRO_ROAD_MAX_EDGE, MICRO_ROAD_MAX_EDGE)
     banker = BASE_BANKER_NO_TIE
     if side == "B":
-        banker += edge
+        banker += abs(edge)
     elif side == "P":
-        banker -= edge
+        banker -= abs(edge)
     banker = clamp(banker, 0.38, 0.62)
     return banker, 1.0 - banker
 
 
-def bp_only(seq: List[str]) -> List[str]:
+def filtered_bp(seq: List[str]) -> List[str]:
     return [x for x in seq if x in {"B", "P"}]
 
 
 def runs(seq: List[str]) -> List[Tuple[str, int]]:
-    filtered = bp_only(seq)
-    if not filtered:
+    f = filtered_bp(seq)
+    if not f:
         return []
     out: List[Tuple[str, int]] = []
-    cur = filtered[0]
+    cur = f[0]
     n = 1
-    for x in filtered[1:]:
+    for x in f[1:]:
         if x == cur:
             n += 1
         else:
             out.append((cur, n))
-            cur, n = x, 1
+            cur = x
+            n = 1
     out.append((cur, n))
     return out
 
 
 def last_streak(seq: List[str]) -> Tuple[str, int]:
     rr = runs(seq)
-    if not rr:
-        return "N", 0
-    return rr[-1]
+    return rr[-1] if rr else ("N", 0)
 
 
 def is_zigzag(seq: List[str]) -> bool:
-    f = bp_only(seq)
+    f = filtered_bp(seq)
     if len(f) < 5:
         return False
     tail = f[-5:]
@@ -172,30 +174,46 @@ def is_zigzag(seq: List[str]) -> bool:
 
 
 def is_double_jump_tail(seq: List[str]) -> bool:
-    f = bp_only(seq)
+    f = filtered_bp(seq)
     if len(f) < 6:
         return False
-    t = f[-6:]
-    return t[0] == t[1] and t[2] == t[3] and t[4] == t[5] and t[0] != t[2] and t[2] != t[4]
+    tail = f[-6:]
+    return (
+        tail[0] == tail[1]
+        and tail[2] == tail[3]
+        and tail[4] == tail[5]
+        and tail[0] != tail[2]
+        and tail[2] != tail[4]
+    )
 
 
 def room_pattern_tail(seq: List[str]) -> Optional[str]:
-    f = bp_only(seq)
+    f = filtered_bp(seq)
     if len(f) < 6:
         return None
-    t = f[-6:]
-    if t[0] == t[3] and t[1] == t[2] == t[4] == t[5] and t[0] != t[1]:
-        return t[0]
-    if t[0] == t[1] == t[3] == t[4] and t[2] == t[5] and t[0] != t[2]:
-        return t[0]
+    tail = f[-6:]
+    if tail[0] == tail[3] and tail[1] == tail[2] == tail[4] == tail[5] and tail[0] != tail[1]:
+        return tail[0]
+    if tail[0] == tail[1] == tail[3] == tail[4] and tail[2] == tail[5] and tail[0] != tail[2]:
+        return tail[0]
     return None
 
 
+def last_two_turn(seq: List[str]) -> bool:
+    f = filtered_bp(seq)
+    if len(f) < 4:
+        return False
+    tail = f[-4:]
+    return (tail[-4] == tail[-3] and tail[-2] != tail[-1]) or (tail[-4] != tail[-3] and tail[-2] == tail[-1])
+
+
 def infer_current_context(player_point: int, banker_point: int, composition: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    p, b = int(player_point), int(banker_point)
+    p = int(player_point)
+    b = int(banker_point)
     gap = abs(p - b)
     winner = "P" if p > b else "B" if b > p else "T"
     winner_point = max(p, b) if winner != "T" else p
+
     if gap == 0:
         gap_family = "TIE_GAP"
     elif gap <= 2:
@@ -206,9 +224,11 @@ def infer_current_context(player_point: int, banker_point: int, composition: Opt
         gap_family = "MID_HIGH_GAP_5_7"
     else:
         gap_family = "EXTREME_GAP_8_9"
+
     comp = composition or {}
     top_scenario = str(comp.get("top_scenario", "UNKNOWN"))
     natural_high = bool(comp.get("natural_high_winner") or (top_scenario == "NONE_DRAW" and winner_point in (8, 9)))
+
     return {
         "winner": winner,
         "winner_point": winner_point,
@@ -219,9 +239,15 @@ def infer_current_context(player_point: int, banker_point: int, composition: Opt
     }
 
 
-def micro_road_lookup(player_point: int, banker_point: int, rounds: Optional[List[Any]] = None, composition: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def micro_road_lookup(
+    player_point: int,
+    banker_point: int,
+    rounds: Optional[List[Any]] = None,
+    composition: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     seq_all = extract_round_results(rounds)
-    seq = bp_only(seq_all)[-max(3, int(MICRO_ROAD_WINDOW)):]
+    window = max(3, int(MICRO_ROAD_WINDOW))
+    seq = filtered_bp(seq_all)[-window:]
 
     if len(seq) < max(1, int(MICRO_ROAD_MIN_ROUNDS)):
         return {
@@ -238,65 +264,82 @@ def micro_road_lookup(player_point: int, banker_point: int, rounds: Optional[Lis
 
     ctx = infer_current_context(player_point, banker_point, composition)
     patterns: List[str] = []
-    scores = {"B": 0.0, "P": 0.0}
+    direction_scores = {"B": 0.0, "P": 0.0}
     last_side, streak_len = last_streak(seq)
 
     if is_zigzag(seq):
         d = opposite(seq[-1])
-        scores[d] += MICRO_ROAD_ZIGZAG_EDGE
+        direction_scores[d] += MICRO_ROAD_ZIGZAG_EDGE
         patterns.append("ZIGZAG_TURN")
 
     if is_double_jump_tail(seq):
         d = opposite(seq[-1])
-        scores[d] += MICRO_ROAD_DOUBLE_JUMP_EDGE
+        direction_scores[d] += MICRO_ROAD_DOUBLE_JUMP_EDGE
         patterns.append("DOUBLE_JUMP_TAIL")
 
     room_d = room_pattern_tail(seq)
     if room_d in {"B", "P"}:
-        scores[room_d] += MICRO_ROAD_ROOM_EDGE
+        direction_scores[room_d] += MICRO_ROAD_ROOM_EDGE
         patterns.append("ROOM_PATTERN_TAIL")
 
+    if last_two_turn(seq):
+        d = opposite(seq[-1])
+        direction_scores[d] += MICRO_ROAD_RECENT_REVERSAL_EDGE
+        patterns.append("LAST_TWO_TURN")
+
     if streak_len >= 3 and last_side in {"B", "P"}:
-        scores[last_side] += MICRO_ROAD_STREAK_EDGE * min(streak_len / 5.0, 1.0)
+        direction_scores[last_side] += MICRO_ROAD_STREAK_EDGE * min(streak_len / 5.0, 1.0)
         patterns.append(f"STREAK_{last_side}_{streak_len}")
 
-    if MICRO_ROAD_NATURAL_HIGH_TRAP and ctx["natural_high_winner"] and ctx["gap_family"] == "MID_HIGH_GAP_5_7":
-        if "ZIGZAG_TURN" in patterns or "DOUBLE_JUMP_TAIL" in patterns or "ROOM_PATTERN_TAIL" in patterns:
-            if ctx["winner"] in {"B", "P"}:
-                d = opposite(ctx["winner"])
-                scores[d] += MICRO_ROAD_TRAP_EDGE
-                patterns.append("NATURAL_HIGH_TRAP_REVERSAL")
+    if (
+        MICRO_ROAD_NATURAL_HIGH_TRAP
+        and ctx["natural_high_winner"]
+        and ctx["gap_family"] == "MID_HIGH_GAP_5_7"
+        and any(x in patterns for x in ["ZIGZAG_TURN", "DOUBLE_JUMP_TAIL", "ROOM_PATTERN_TAIL", "LAST_TWO_TURN"])
+    ):
+        cur = ctx.get("winner", "T")
+        if cur in {"B", "P"}:
+            d = opposite(cur)
+            direction_scores[d] += MICRO_ROAD_TRAP_EDGE
+            patterns.append("NATURAL_HIGH_TRAP_REVERSAL")
 
-    if MICRO_ROAD_MID_HIGH_GAP_TRAP and ctx["gap_family"] == "MID_HIGH_GAP_5_7":
-        if "ZIGZAG_TURN" in patterns or "DOUBLE_JUMP_TAIL" in patterns:
-            if ctx["winner"] in {"B", "P"}:
-                d = opposite(ctx["winner"])
-                scores[d] += MICRO_ROAD_TRAP_EDGE * 0.55
-                patterns.append("MID_HIGH_GAP_TURN_GUARD")
+    if (
+        MICRO_ROAD_MID_HIGH_GAP_TRAP
+        and ctx["gap_family"] == "MID_HIGH_GAP_5_7"
+        and any(x in patterns for x in ["ZIGZAG_TURN", "DOUBLE_JUMP_TAIL", "LAST_TWO_TURN"])
+    ):
+        cur = ctx.get("winner", "T")
+        if cur in {"B", "P"}:
+            d = opposite(cur)
+            direction_scores[d] += MICRO_ROAD_TRAP_EDGE * 0.55
+            patterns.append("MID_HIGH_GAP_TURN_GUARD")
 
-    b_score = scores["B"]
-    p_score = scores["P"]
-    if abs(b_score - p_score) < 0.003:
-        banker = clamp(BASE_BANKER_NO_TIE + stable_noise("".join(seq) + f":{player_point}:{banker_point}", 0.004), 0.38, 0.62)
-        direction = "NEUTRAL"
+    b_score = direction_scores["B"]
+    p_score = direction_scores["P"]
+
+    if abs(b_score - p_score) < 0.004:
+        n = stable_noise("".join(seq) + f":{player_point}:{banker_point}", 0.004)
+        banker = clamp(BASE_BANKER_NO_TIE + n, 0.38, 0.62)
+        micro_direction = "NEUTRAL"
         confidence = 0.0
     else:
-        direction = "B" if b_score > p_score else "P"
-        edge = clamp(max(abs(b_score - p_score), MICRO_ROAD_BASE_EDGE) * MICRO_ROAD_CONFIDENCE_SCALE, 0.0, MICRO_ROAD_MAX_EDGE)
-        banker, _ = side_to_prob(direction, edge)
+        micro_direction = "B" if b_score > p_score else "P"
+        edge = abs(b_score - p_score) * MICRO_ROAD_CONFIDENCE_SCALE
+        edge = clamp(max(edge, MICRO_ROAD_BASE_EDGE), 0.0, MICRO_ROAD_MAX_EDGE)
+        banker, _ = side_to_prob(micro_direction, edge)
         confidence = clamp(edge / max(MICRO_ROAD_MAX_EDGE, 0.0001), 0.0, 1.0)
 
     return {
         "available": bool(patterns),
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
-        "source": "MICRO_ROAD_MODEL_V10",
+        "source": "MICRO_ROAD_MODEL_V10_1",
         "sample_size": len(seq),
         "total_simulated_samples": len(seq),
-        "micro_direction": direction,
+        "micro_direction": micro_direction,
         "micro_confidence": confidence,
         "micro_patterns": patterns,
         "recent_road": "".join(seq),
-        "direction_scores": scores,
+        "direction_scores": direction_scores,
         "context": ctx,
     }
