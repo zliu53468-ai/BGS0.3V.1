@@ -28,6 +28,11 @@ try:
 except Exception:
     calibrate_point_layer = None
 
+try:
+    from micro_road_model import micro_road_lookup
+except Exception:
+    micro_road_lookup = None
+
 # ============================================================
 # V9：點數 + 補牌情境 + 300 萬條件資料庫 + Monte Carlo
 # ============================================================
@@ -74,6 +79,12 @@ USE_MONTE_CARLO = env_bool("USE_MONTE_CARLO", "1")
 PREDICT_CURRENT_ROUND_ONLY = env_bool("PREDICT_CURRENT_ROUND_ONLY", "1")
 USE_ROAD_PROFILE_DB = env_bool("USE_ROAD_PROFILE_DB", "1")
 ROAD_PROFILE_WEIGHT = env_float("ROAD_PROFILE_WEIGHT", "0.06")
+
+# V10 短牌路命中率校準層：只看最近 4~8 口，不吃長歷史、不改主架構。
+USE_MICRO_ROAD_MODEL = env_bool("USE_MICRO_ROAD_MODEL", "1")
+MICRO_ROAD_WEIGHT = env_float("MICRO_ROAD_WEIGHT", "0.085")
+MICRO_ROAD_WEIGHT_REQUIRE_AVAILABLE = env_bool("MICRO_ROAD_WEIGHT_REQUIRE_AVAILABLE", "1")
+MICRO_ROAD_MIN_CONFIDENCE = env_float("MICRO_ROAD_MIN_CONFIDENCE", "0.12")
 
 # 點數校準層：不改 point_db 原始資料，只在當局依照 combo/補牌MC/牌路/AI 一致性調整 point 權重。
 USE_POINT_CALIBRATOR = env_bool("USE_POINT_CALIBRATOR", "1")
@@ -746,6 +757,54 @@ def road_profile_layer(player_point: int, banker_point: int, comp: Dict[str, Any
         }
 
 
+
+# ============================================================
+# micro_road_model：短牌路方向校準層
+# ============================================================
+
+def micro_road_layer(player_point: int, banker_point: int, rounds: Optional[List[Any]], comp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    V10：短牌路命中率校準。
+    即使 PREDICT_CURRENT_ROUND_ONLY=1，這層仍可使用原始 rounds 的最近幾口；
+    它不是長歷史追路，而是短路口方向校準。
+    """
+    if not USE_MICRO_ROAD_MODEL or not callable(micro_road_lookup):
+        return {
+            **neutral_record("MICRO_ROAD_DISABLED"),
+            "micro_direction": "NEUTRAL",
+            "micro_confidence": 0.0,
+            "micro_patterns": [],
+            "recent_road": "",
+        }
+    try:
+        rec = micro_road_lookup(player_point=player_point, banker_point=banker_point, rounds=rounds, composition=comp)
+        if not isinstance(rec, dict):
+            raise ValueError("micro_road_lookup returned non-dict")
+        banker, player = normalize_prob_pair(rec.get("banker_prob", BASE_BANKER_NO_TIE), rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE))
+        return {
+            "available": bool(rec.get("available", False)),
+            "feature_key": f"{point_key(player_point, banker_point)}_MICRO_ROAD",
+            "banker_prob": banker,
+            "player_prob": player,
+            "source": rec.get("source", "MICRO_ROAD_MODEL"),
+            "sample_size": int(rec.get("sample_size", 0) or 0),
+            "total_simulated_samples": int(rec.get("total_simulated_samples", rec.get("sample_size", 0)) or 0),
+            "micro_direction": rec.get("micro_direction", "NEUTRAL"),
+            "micro_confidence": float(rec.get("micro_confidence", 0.0) or 0.0),
+            "micro_patterns": rec.get("micro_patterns", []),
+            "recent_road": rec.get("recent_road", ""),
+            "direction_scores": rec.get("direction_scores", {}),
+            "context": rec.get("context", {}),
+        }
+    except Exception as e:
+        return {
+            **neutral_record(f"MICRO_ROAD_ERROR:{e}"),
+            "micro_direction": "NEUTRAL",
+            "micro_confidence": 0.0,
+            "micro_patterns": [],
+            "recent_road": "",
+        }
+
 # ============================================================
 # AI 微調層：只吃歷史點數序列，小權重修正
 # ============================================================
@@ -936,6 +995,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     comp = composition_mc_layer(player_point, banker_point, rounds=model_rounds)
     combo = combo_condition_lookup(player_point, banker_point, rounds=model_rounds, comp=comp)
     road = road_profile_layer(player_point, banker_point, comp=comp)
+    micro = micro_road_layer(player_point, banker_point, rounds=rounds, comp=comp)
     ai = ai_simulation_layer(player_point, banker_point, rounds=model_rounds)
 
     point_calibration = {
@@ -988,6 +1048,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         )
 
     road_w = float(ROAD_PROFILE_WEIGHT) if USE_ROAD_PROFILE_DB else 0.0
+    micro_w = float(MICRO_ROAD_WEIGHT) if USE_MICRO_ROAD_MODEL else 0.0
+
+    if MICRO_ROAD_WEIGHT_REQUIRE_AVAILABLE and (not micro.get("available") or float(micro.get("micro_confidence", 0.0) or 0.0) < MICRO_ROAD_MIN_CONFIDENCE):
+        micro_w = 0.0
 
     if COMBO_WEIGHT_REQUIRE_AVAILABLE and (not combo.get("available") or int(combo.get("sample_size", 0) or 0) <= 0):
         combo_w = 0.0
@@ -1019,12 +1083,14 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
         comp_w = min(comp_w, COMPOSITION_MC_WEIGHT * 0.50)
         road_w = min(road_w, ROAD_PROFILE_WEIGHT * 0.50)
+        micro_w = min(micro_w, MICRO_ROAD_WEIGHT * 0.65)
 
-    total_weight = max(p_w + combo_w + road_w + sim_w + comp_w, 0.0001)
+    total_weight = max(p_w + combo_w + road_w + micro_w + sim_w + comp_w, 0.0001)
     banker = (
         point["banker_prob"] * p_w
         + combo["banker_prob"] * combo_w
         + road["banker_prob"] * road_w
+        + micro["banker_prob"] * micro_w
         + ai["banker_prob"] * sim_w
         + comp["banker_prob"] * comp_w
     ) / total_weight
@@ -1129,6 +1195,14 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "composition_weight_info": composition_weight_info,
         "composition_scenario_debug": comp.get("scenario_debug", []),
         "composition_scenario_count": comp.get("scenario_count", 0),
+        "micro_road_available": micro.get("available", False),
+        "micro_road_source": micro.get("source"),
+        "micro_road_sample_size": micro.get("sample_size", 0),
+        "micro_road_direction": micro.get("micro_direction", "NEUTRAL"),
+        "micro_road_confidence": micro.get("micro_confidence", 0.0),
+        "micro_road_patterns": micro.get("micro_patterns", []),
+        "micro_road_recent": micro.get("recent_road", ""),
+        "micro_road_context": micro.get("context", {}),
         "combo_available": combo.get("available", False),
         "combo_sample_size": combo.get("sample_size", 0),
         "combo_total_samples": combo.get("total_simulated_samples", 0),
@@ -1166,6 +1240,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "combo": combo_w,
             "pattern": combo_w,  # 舊欄位相容
             "road_profile": road_w,
+            "micro_road": micro_w,
             "simulation": sim_w,
             "composition_mc": comp_w,
             "total": total_weight,
@@ -1175,25 +1250,27 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
             "combo_banker_prob": combo.get("banker_prob"),
             "pattern_banker_prob": combo.get("banker_prob"),
             "road_profile_banker_prob": road.get("banker_prob"),
+            "micro_road_banker_prob": micro.get("banker_prob"),
             "ai_banker_prob": ai.get("banker_prob"),
             "composition_mc_banker_prob": comp.get("banker_prob"),
             "point_player_prob": point.get("player_prob"),
             "combo_player_prob": combo.get("player_prob"),
             "pattern_player_prob": combo.get("player_prob"),
             "road_profile_player_prob": road.get("player_prob"),
+            "micro_road_player_prob": micro.get("player_prob"),
             "ai_player_prob": ai.get("player_prob"),
             "composition_mc_player_prob": comp.get("player_prob"),
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_9_FINE_GAP_NATURAL_GUARD",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_MICRO_ROAD_HIT_MODEL",
     }
 
     if USE_MONTE_CARLO:
         mc_result = monte_carlo_verify_from_probs(
             banker_prob=banker,
             player_prob=player,
-            seed_key=f"{player_point}:{banker_point}:{combo.get('feature_key','')}:{road.get('feature_key','')}:{comp.get('top_scenario','')}:{ai.get('history_adjust',0.0)}",
+            seed_key=f"{player_point}:{banker_point}:{combo.get('feature_key','')}:{road.get('feature_key','')}:{micro.get('micro_direction','')}:{micro.get('recent_road','')}:{comp.get('top_scenario','')}:{ai.get('history_adjust',0.0)}",
         )
         result["monte_carlo"] = mc_result
         mc_gap_raw = float(mc_result.get("mc_gap_raw", 0.0) or 0.0)
