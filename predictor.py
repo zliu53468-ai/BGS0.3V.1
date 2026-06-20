@@ -86,6 +86,20 @@ MICRO_ROAD_WEIGHT = env_float("MICRO_ROAD_WEIGHT", "0.085")
 MICRO_ROAD_WEIGHT_REQUIRE_AVAILABLE = env_bool("MICRO_ROAD_WEIGHT_REQUIRE_AVAILABLE", "1")
 MICRO_ROAD_MIN_CONFIDENCE = env_float("MICRO_ROAD_MIN_CONFIDENCE", "0.12")
 
+# V10.1 命中率決策控制器：不是觀望，而是讓強短路口 / 多層共識直接修正最終方向。
+USE_DECISION_CONTROLLER = env_bool("USE_DECISION_CONTROLLER", "1")
+DECISION_CONTROLLER_MAX_ADJUST = env_float("DECISION_CONTROLLER_MAX_ADJUST", "0.055")
+CONSENSUS_MIN_SUPPORT = env_int("CONSENSUS_MIN_SUPPORT", "3")
+CONSENSUS_EDGE = env_float("CONSENSUS_EDGE", "0.020")
+CONSENSUS_BLEND = env_float("CONSENSUS_BLEND", "0.42")
+MICRO_ROAD_OVERRIDE = env_bool("MICRO_ROAD_OVERRIDE", "1")
+MICRO_ROAD_OVERRIDE_CONFIDENCE = env_float("MICRO_ROAD_OVERRIDE_CONFIDENCE", "0.38")
+MICRO_ROAD_OVERRIDE_EDGE = env_float("MICRO_ROAD_OVERRIDE_EDGE", "0.070")
+MICRO_ROAD_OVERRIDE_BLEND = env_float("MICRO_ROAD_OVERRIDE_BLEND", "0.72")
+MICRO_ROAD_OVERRIDE_ALWAYS_APPLY = env_bool("MICRO_ROAD_OVERRIDE_ALWAYS_APPLY", "0")
+NATURAL_TRAP_EXTRA_EDGE = env_float("NATURAL_TRAP_EXTRA_EDGE", "0.018")
+MID_HIGH_GAP_EXTRA_EDGE = env_float("MID_HIGH_GAP_EXTRA_EDGE", "0.012")
+
 # 點數校準層：不改 point_db 原始資料，只在當局依照 combo/補牌MC/牌路/AI 一致性調整 point 權重。
 USE_POINT_CALIBRATOR = env_bool("USE_POINT_CALIBRATOR", "1")
 ROAD_PROFILE_MIN_SAMPLE = env_int("ROAD_PROFILE_MIN_SAMPLE", "50")
@@ -977,6 +991,196 @@ def build_entry_decision(is_tie_point: bool, gap: float) -> Tuple[bool, str, str
     return True, "normal", ""
 
 
+
+# ============================================================
+# V10.1 決策控制器：多層共識 + micro road 強訊號覆蓋
+# ============================================================
+
+def _side_from_text(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    if s in {"B", "BANKER", "莊", "庄"}:
+        return "BANKER"
+    if s in {"P", "PLAYER", "閒", "闲"}:
+        return "PLAYER"
+    return "NEUTRAL"
+
+
+def _target_banker_for_side(side: str, edge: float) -> float:
+    edge = clamp(float(edge), 0.0, DECISION_CONTROLLER_MAX_ADJUST)
+    if side == "BANKER":
+        return clamp(BASE_BANKER_NO_TIE + edge, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+    if side == "PLAYER":
+        return clamp(BASE_BANKER_NO_TIE - edge, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+    return BASE_BANKER_NO_TIE
+
+
+def _blend_to_side(current_banker: float, side: str, edge: float, blend: float) -> float:
+    if side not in {"BANKER", "PLAYER"}:
+        return current_banker
+    target = _target_banker_for_side(side, edge)
+    blend = clamp(float(blend), 0.0, 1.0)
+    return clamp(current_banker * (1.0 - blend) + target * blend, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+
+
+def _layer_side_and_gap(rec: Dict[str, Any], neutral_gap: float = 0.006) -> Tuple[str, float]:
+    side, gap = _layer_direction(rec, neutral_gap=neutral_gap)
+    if side == "BANKER":
+        return "BANKER", gap
+    if side == "PLAYER":
+        return "PLAYER", gap
+    return "NEUTRAL", gap
+
+
+def _is_trap_pattern(patterns: List[Any]) -> bool:
+    pset = {str(x) for x in (patterns or [])}
+    trap_keys = {
+        "NATURAL_HIGH_TRAP_REVERSAL",
+        "MID_HIGH_GAP_TURN_GUARD",
+        "DOUBLE_JUMP_TAIL",
+        "ZIGZAG_TURN",
+        "ROOM_PATTERN_TAIL",
+        "ROAD_EDGE_REVERSAL",
+        "LAST_TWO_TURN",
+    }
+    return bool(pset.intersection(trap_keys))
+
+
+def apply_decision_controller(
+    banker: float,
+    point: Dict[str, Any],
+    combo: Dict[str, Any],
+    road: Dict[str, Any],
+    micro: Dict[str, Any],
+    comp: Dict[str, Any],
+    ai: Dict[str, Any],
+    weights: Dict[str, float],
+    point_gap_info: Dict[str, Any],
+    natural_high_guard_info: Dict[str, Any],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    V10.1：提高命中率用，不是觀望。
+    1. 多層方向共識強時，微幅推向共識方向。
+    2. micro road 抓到轉折口 / 天然高點陷阱 / 雙跳尾時，可直接修正最終方向。
+    3. 保留原本 point/combo/comp/road 架構，只在最後做方向校準。
+    """
+    original_banker = float(banker)
+    if not USE_DECISION_CONTROLLER:
+        return banker, {
+            "enabled": False,
+            "status": "DISABLED",
+            "banker_before": original_banker,
+            "banker_after": banker,
+            "adjustments": [],
+        }
+
+    adjustments: List[Dict[str, Any]] = []
+    banker2 = float(banker)
+    layers = {
+        "point": (point, float(weights.get("point", 0.0) or 0.0)),
+        "combo": (combo, float(weights.get("combo", 0.0) or 0.0)),
+        "composition_mc": (comp, float(weights.get("composition_mc", 0.0) or 0.0)),
+        "road_profile": (road, float(weights.get("road_profile", 0.0) or 0.0)),
+        "micro_road": (micro, float(weights.get("micro_road", 0.0) or 0.0)),
+        "ai": (ai, float(weights.get("simulation", 0.0) or 0.0)),
+    }
+
+    score = {"BANKER": 0.0, "PLAYER": 0.0}
+    support_count = {"BANKER": 0, "PLAYER": 0}
+    layer_debug: Dict[str, Any] = {}
+
+    for name, (rec, w) in layers.items():
+        if name == "micro_road":
+            side = _side_from_text(rec.get("micro_direction", "NEUTRAL"))
+            if side == "NEUTRAL":
+                side, gap = _layer_side_and_gap(rec, neutral_gap=0.006)
+            else:
+                gap = abs(float(rec.get("banker_prob", BASE_BANKER_NO_TIE)) - float(rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE)))
+        else:
+            side, gap = _layer_side_and_gap(rec, neutral_gap=0.006)
+        strength = max(0.0, w) * min(float(gap) / 0.08, 1.0)
+        if side in {"BANKER", "PLAYER"} and strength > 0:
+            score[side] += strength
+            support_count[side] += 1
+        layer_debug[name] = {"side": side, "gap": gap, "weight": w, "strength": strength}
+
+    consensus_side = "NEUTRAL"
+    if score["BANKER"] > score["PLAYER"]:
+        consensus_side = "BANKER"
+    elif score["PLAYER"] > score["BANKER"]:
+        consensus_side = "PLAYER"
+
+    if (
+        consensus_side in {"BANKER", "PLAYER"}
+        and support_count[consensus_side] >= int(CONSENSUS_MIN_SUPPORT)
+        and abs(score["BANKER"] - score["PLAYER"]) >= 0.025
+    ):
+        edge = min(CONSENSUS_EDGE + abs(score["BANKER"] - score["PLAYER"]) * 0.08, DECISION_CONTROLLER_MAX_ADJUST)
+        before = banker2
+        banker2 = _blend_to_side(banker2, consensus_side, edge=edge, blend=CONSENSUS_BLEND)
+        adjustments.append({
+            "type": "CONSENSUS_BOOST",
+            "side": consensus_side,
+            "edge": edge,
+            "blend": CONSENSUS_BLEND,
+            "before": before,
+            "after": banker2,
+            "support_count": support_count[consensus_side],
+            "score": dict(score),
+        })
+
+    micro_side = _side_from_text(micro.get("micro_direction", "NEUTRAL"))
+    micro_conf = float(micro.get("micro_confidence", 0.0) or 0.0)
+    micro_patterns = micro.get("micro_patterns", []) or []
+    current_side = "BANKER" if banker2 >= BASE_BANKER_NO_TIE else "PLAYER"
+    trap_hit = _is_trap_pattern(micro_patterns)
+
+    if (
+        MICRO_ROAD_OVERRIDE
+        and micro_side in {"BANKER", "PLAYER"}
+        and micro_conf >= MICRO_ROAD_OVERRIDE_CONFIDENCE
+        and (trap_hit or MICRO_ROAD_OVERRIDE_ALWAYS_APPLY)
+    ):
+        extra = 0.0
+        if bool(natural_high_guard_info.get("natural_high_winner", False)):
+            extra += NATURAL_TRAP_EXTRA_EDGE
+        if str(point_gap_info.get("gap_family", point_gap_info.get("gap_zone", ""))) == "MID_HIGH_GAP_5_7":
+            extra += MID_HIGH_GAP_EXTRA_EDGE
+        edge = min(MICRO_ROAD_OVERRIDE_EDGE * clamp(micro_conf, 0.40, 1.0) + extra, DECISION_CONTROLLER_MAX_ADJUST)
+        blend = MICRO_ROAD_OVERRIDE_BLEND if micro_side != current_side else min(MICRO_ROAD_OVERRIDE_BLEND * 0.55, 0.45)
+        before = banker2
+        banker2 = _blend_to_side(banker2, micro_side, edge=edge, blend=blend)
+        adjustments.append({
+            "type": "MICRO_ROAD_OVERRIDE",
+            "side": micro_side,
+            "edge": edge,
+            "blend": blend,
+            "before": before,
+            "after": banker2,
+            "micro_confidence": micro_conf,
+            "micro_patterns": micro_patterns,
+            "trap_hit": trap_hit,
+            "current_side_before": current_side,
+        })
+
+    banker2 = clamp(banker2, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
+    return banker2, {
+        "enabled": True,
+        "status": "APPLIED" if adjustments else "NO_STRONG_SIGNAL",
+        "banker_before": original_banker,
+        "banker_after": banker2,
+        "player_before": 1.0 - original_banker,
+        "player_after": 1.0 - banker2,
+        "consensus_side": consensus_side,
+        "score": score,
+        "support_count": support_count,
+        "layer_debug": layer_debug,
+        "micro_side": micro_side,
+        "micro_confidence": micro_conf,
+        "micro_patterns": micro_patterns,
+        "adjustments": adjustments,
+    }
+
+
 # ============================================================
 # 主預測函式
 # ============================================================
@@ -1095,6 +1299,27 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         + comp["banker_prob"] * comp_w
     ) / total_weight
 
+    banker_before_decision_controller = banker
+    banker, decision_controller_info = apply_decision_controller(
+        banker=banker,
+        point=point,
+        combo=combo,
+        road=road,
+        micro=micro,
+        comp=comp,
+        ai=ai,
+        weights={
+            "point": p_w,
+            "combo": combo_w,
+            "composition_mc": comp_w,
+            "road_profile": road_w,
+            "micro_road": micro_w,
+            "simulation": sim_w,
+        },
+        point_gap_info=point_gap_info,
+        natural_high_guard_info=natural_high_guard_info,
+    )
+
     banker = apply_tie_point_protection(banker, is_tie_point)
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     player = 1.0 - banker
@@ -1152,6 +1377,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "point_gap_calibrator": point_gap_info,
         "natural_high_guard": natural_high_guard_info,
         "natural_high_winner": natural_high_guard_info.get("natural_high_winner", False),
+        "decision_controller": decision_controller_info,
+        "banker_prob_before_decision_controller": banker_before_decision_controller,
+        "player_prob_before_decision_controller": 1.0 - banker_before_decision_controller,
         "min_gap_for_entry": MIN_GAP_FOR_ENTRY,
         "strong_gap_for_entry": STRONG_GAP_FOR_ENTRY,
         "feature_key": point_key(player_point, banker_point),
@@ -1263,7 +1491,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_MICRO_ROAD_HIT_MODEL",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_1_DECISION_CONTROLLER",
     }
 
     if USE_MONTE_CARLO:
