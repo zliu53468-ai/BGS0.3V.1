@@ -89,7 +89,17 @@ REQUIRE_COMBO_SAMPLE_FOR_ENTRY = env_bool("REQUIRE_COMBO_SAMPLE_FOR_ENTRY", "0")
 MIN_GAP_WITHOUT_COMBO = env_float("MIN_GAP_WITHOUT_COMBO", "0.150")
 
 COMPOSITION_MC_SIMULATIONS = env_int("COMPOSITION_MC_SIMULATIONS", "500")
-COMPOSITION_MC_MAX_COMBOS = env_int("COMPOSITION_MC_MAX_COMBOS", "160")
+COMPOSITION_MC_MAX_COMBOS = env_int("COMPOSITION_MC_MAX_COMBOS", "220")
+
+# 補牌MC V9.7 動態權重：保留原先融合邏輯，只讓補牌MC在「信心高/同向」時更有影響力。
+COMPOSITION_MC_DYNAMIC_WEIGHT = env_bool("COMPOSITION_MC_DYNAMIC_WEIGHT", "1")
+COMPOSITION_MC_MIN_WEIGHT_MULT = env_float("COMPOSITION_MC_MIN_WEIGHT_MULT", "0.70")
+COMPOSITION_MC_MAX_WEIGHT_MULT = env_float("COMPOSITION_MC_MAX_WEIGHT_MULT", "1.42")
+COMPOSITION_MC_CONFIDENCE_BOOST = env_float("COMPOSITION_MC_CONFIDENCE_BOOST", "0.32")
+COMPOSITION_MC_GAP_BOOST = env_float("COMPOSITION_MC_GAP_BOOST", "0.18")
+COMPOSITION_MC_SUPPORT_BOOST = env_float("COMPOSITION_MC_SUPPORT_BOOST", "1.10")
+COMPOSITION_MC_CONFLICT_SHRINK = env_float("COMPOSITION_MC_CONFLICT_SHRINK", "0.82")
+COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST = env_float("COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST", "0.38")
 
 BASE_BANKER_NO_TIE = 0.5000  # V9 no banker base bias: neutral fallback only
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", str(getattr(config, "MIN_OUTPUT_PROB", 0.38)))
@@ -166,6 +176,111 @@ def normalize_prob_pair(banker: float, player: float) -> Tuple[float, float]:
     banker = clamp(banker, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     player = 1.0 - banker
     return banker, player
+
+
+def _layer_direction(rec: Dict[str, Any], neutral_gap: float = 0.004) -> Tuple[str, float]:
+    if not isinstance(rec, dict):
+        return "NEUTRAL", 0.0
+    try:
+        b = float(rec.get("banker_prob", BASE_BANKER_NO_TIE) or BASE_BANKER_NO_TIE)
+        p = float(rec.get("player_prob", 1.0 - BASE_BANKER_NO_TIE) or (1.0 - BASE_BANKER_NO_TIE))
+        b, p = normalize_prob_pair(b, p)
+        gap = abs(b - p)
+        if gap < neutral_gap:
+            return "NEUTRAL", gap
+        return ("BANKER" if b >= p else "PLAYER"), gap
+    except Exception:
+        return "NEUTRAL", 0.0
+
+
+def _calibrate_composition_weight(
+    comp: Dict[str, Any],
+    point: Dict[str, Any],
+    combo: Dict[str, Any],
+    road: Dict[str, Any],
+    base_weight: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    補牌MC動態權重。
+    不改原本條件邏輯，只在 comp 本身信心高、或與 point/combo/road 同方向時微幅提高；
+    若 comp 與多數層衝突，則縮小 comp 權重，避免補牌MC硬拉錯方向。
+    """
+    if not COMPOSITION_MC_DYNAMIC_WEIGHT or not comp.get("available"):
+        return base_weight, {
+            "enabled": bool(COMPOSITION_MC_DYNAMIC_WEIGHT),
+            "weight_multiplier": 1.0,
+            "status": "DISABLED_OR_NOT_AVAILABLE",
+            "support_count": 0,
+            "conflict_count": 0,
+        }
+
+    comp_dir, comp_gap = _layer_direction(comp, neutral_gap=0.003)
+    point_dir, _ = _layer_direction(point, neutral_gap=0.004)
+    combo_dir, _ = _layer_direction(combo, neutral_gap=0.004)
+    road_dir, _ = _layer_direction(road, neutral_gap=0.004)
+
+    if comp_dir == "NEUTRAL":
+        return base_weight * COMPOSITION_MC_MIN_WEIGHT_MULT, {
+            "enabled": True,
+            "weight_multiplier": COMPOSITION_MC_MIN_WEIGHT_MULT,
+            "status": "COMP_NEUTRAL_SHRINK",
+            "composition_direction": comp_dir,
+            "composition_gap": comp_gap,
+            "support_count": 0,
+            "conflict_count": 0,
+        }
+
+    support_count = 0
+    conflict_count = 0
+    for d in [point_dir, combo_dir, road_dir]:
+        if d == "NEUTRAL":
+            continue
+        if d == comp_dir:
+            support_count += 1
+        else:
+            conflict_count += 1
+
+    confidence = float(comp.get("composition_confidence", 0.0) or 0.0)
+    top_prob = float(comp.get("top_scenario_probability", 0.0) or 0.0)
+
+    mult = 1.0
+
+    if confidence >= COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST:
+        mult += COMPOSITION_MC_CONFIDENCE_BOOST * confidence
+
+    mult += min(comp_gap / 0.08, 1.0) * COMPOSITION_MC_GAP_BOOST
+
+    if support_count >= 2:
+        mult *= COMPOSITION_MC_SUPPORT_BOOST
+    elif conflict_count >= 2 and support_count == 0:
+        mult *= COMPOSITION_MC_CONFLICT_SHRINK
+    elif conflict_count > support_count:
+        mult *= max(COMPOSITION_MC_CONFLICT_SHRINK, 0.88)
+
+    mult = clamp(mult, COMPOSITION_MC_MIN_WEIGHT_MULT, COMPOSITION_MC_MAX_WEIGHT_MULT)
+
+    status = "COMP_DYNAMIC_KEEP"
+    if support_count >= 2 and confidence >= COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST:
+        status = "COMP_CONFIDENT_SUPPORT_BOOST"
+    elif conflict_count >= 2 and support_count == 0:
+        status = "COMP_CONFLICT_SHRINK"
+    elif confidence >= COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST:
+        status = "COMP_CONFIDENCE_BOOST"
+
+    return base_weight * mult, {
+        "enabled": True,
+        "weight_multiplier": mult,
+        "status": status,
+        "composition_direction": comp_dir,
+        "composition_gap": comp_gap,
+        "composition_confidence": confidence,
+        "top_scenario_probability": top_prob,
+        "support_count": support_count,
+        "conflict_count": conflict_count,
+        "point_direction": point_dir,
+        "combo_direction": combo_dir,
+        "road_direction": road_dir,
+    }
 
 
 def neutral_record(source: str = "NEUTRAL") -> Dict[str, Any]:
@@ -271,6 +386,15 @@ def composition_mc_layer(player_point: int, banker_point: int, rounds: Optional[
             "total_simulated_samples": int(rec.get("total_simulated_samples", rec.get("sample_size", 0)) or 0),
             "scenario_debug": rec.get("scenario_debug", []),
             "top_scenario": rec.get("top_scenario", "UNKNOWN"),
+            "top_scenario_probability": float(rec.get("top_scenario_probability", 0.0) or 0.0),
+            "second_scenario_probability": float(rec.get("second_scenario_probability", 0.0) or 0.0),
+            "scenario_entropy": float(rec.get("scenario_entropy", 1.0) or 1.0),
+            "composition_confidence": float(rec.get("composition_confidence", 0.0) or 0.0),
+            "composition_gap": float(rec.get("composition_gap", abs(banker - player)) or 0.0),
+            "winner_side": rec.get("winner_side", "UNKNOWN"),
+            "winner_point": rec.get("winner_point"),
+            "winner_point_zone": rec.get("winner_point_zone", "UNKNOWN"),
+            "realistic_rule_filter": rec.get("realistic_rule_filter", False),
             "scenario_count": int(rec.get("scenario_count", len(rec.get("scenario_debug", [])) if isinstance(rec.get("scenario_debug", []), list) else 0) or 0),
         }
     except Exception as e:
@@ -590,6 +714,22 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     combo_w = float(COMBO_WEIGHT)
     sim_w = float(SIM_WEIGHT)
     comp_w = float(COMPOSITION_MC_WEIGHT) if comp.get("available") else 0.0
+    composition_weight_info = {
+        "enabled": False,
+        "weight_multiplier": 1.0,
+        "status": "NOT_APPLIED",
+        "support_count": 0,
+        "conflict_count": 0,
+    }
+    if comp_w > 0:
+        comp_w, composition_weight_info = _calibrate_composition_weight(
+            comp=comp,
+            point=point,
+            combo=combo,
+            road=road,
+            base_weight=comp_w,
+        )
+
     road_w = float(ROAD_PROFILE_WEIGHT) if USE_ROAD_PROFILE_DB else 0.0
 
     if COMBO_WEIGHT_REQUIRE_AVAILABLE and (not combo.get("available") or int(combo.get("sample_size", 0) or 0) <= 0):
@@ -677,6 +817,17 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "composition_mc_available": comp.get("available", False),
         "composition_mc_sample_size": comp.get("sample_size", 0),
         "composition_top_scenario": comp.get("top_scenario", "UNKNOWN"),
+        "composition_top_scenario_probability": comp.get("top_scenario_probability", 0.0),
+        "composition_second_scenario_probability": comp.get("second_scenario_probability", 0.0),
+        "composition_scenario_entropy": comp.get("scenario_entropy", 1.0),
+        "composition_confidence": comp.get("composition_confidence", 0.0),
+        "composition_gap": comp.get("composition_gap", 0.0),
+        "composition_winner_side": comp.get("winner_side", "UNKNOWN"),
+        "composition_winner_point": comp.get("winner_point"),
+        "composition_winner_point_zone": comp.get("winner_point_zone", "UNKNOWN"),
+        "composition_realistic_rule_filter": comp.get("realistic_rule_filter", False),
+        "composition_weight_info": composition_weight_info,
+        "composition_scenario_debug": comp.get("scenario_debug", []),
         "composition_scenario_count": comp.get("scenario_count", 0),
         "combo_available": combo.get("available", False),
         "combo_sample_size": combo.get("sample_size", 0),
@@ -735,7 +886,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_ROAD_PROFILE_POINT_CALIBRATOR_V9_6",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_7_ROAD_PROFILE_POINT_CALIBRATOR",
     }
 
     if USE_MONTE_CARLO:
