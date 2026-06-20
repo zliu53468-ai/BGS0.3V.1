@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-point_composition_mc.py - V9.8 補牌情境 + 點數差距校準 Monte Carlo 強化版
+point_composition_mc.py - V9.9 補牌情境 + 差距細分 + 天然高點保護 Monte Carlo 強化版
 
 設計目標：
 - 使用者仍然只輸入「閒點 + 莊點」，例如 65。
@@ -10,7 +10,7 @@ point_composition_mc.py - V9.8 補牌情境 + 點數差距校準 Monte Carlo 強
 - 升級重點：
   1. 加入百家樂真實補牌規則過濾，避免不可能的補牌情境亂進來。
   2. scenario_debug 變得更可靠，讓 combo_db.py 更容易對到正確條件資料庫。
-  3. 新增補牌情境信心、情境熵、贏方點數區間、點數差距區間等欄位，讓 predictor.py 可以更細緻融合。
+  3. 新增補牌情境信心、情境熵、贏方點數區間、細分點數差距、天然高點保護等欄位，讓 predictor.py 可以更細緻融合。
   4. 保留原本輸出欄位，不破壞原先邏輯。
 """
 
@@ -65,12 +65,25 @@ COMPOSITION_USE_REALISTIC_DRAW_RULE_FILTER = env_bool("COMPOSITION_USE_REALISTIC
 # 方向強度：仍尊重當前點數，但不讓補牌MC硬拉太滿。
 COMPOSITION_POINT_DIRECTION_STRENGTH = env_float("COMPOSITION_POINT_DIRECTION_STRENGTH", "0.030")
 
-# V9.8 點數差距校準：只做微調，不取代 point_db / combo_db / road_profile。
+# V9.9 點數差距細分：只做微調，不取代 point_db / combo_db / road_profile。
 COMPOSITION_USE_POINT_GAP_PROFILE = env_bool("COMPOSITION_USE_POINT_GAP_PROFILE", "1")
-COMPOSITION_SMALL_GAP_SCENARIO_BOOST = env_float("COMPOSITION_SMALL_GAP_SCENARIO_BOOST", "1.08")
-COMPOSITION_BIG_GAP_SCENARIO_SHRINK = env_float("COMPOSITION_BIG_GAP_SCENARIO_SHRINK", "0.94")
-COMPOSITION_TIE_GAP_SHRINK = env_float("COMPOSITION_TIE_GAP_SHRINK", "0.88")
-COMPOSITION_GAP_DIRECTION_MAX_ADJUST = env_float("COMPOSITION_GAP_DIRECTION_MAX_ADJUST", "0.010")
+
+# 兼容舊 V9.8 env，同時新增更細分的 V9.9 env。
+COMPOSITION_TINY_GAP_SCENARIO_BOOST = env_float(
+    "COMPOSITION_TINY_GAP_SCENARIO_BOOST",
+    os.getenv("COMPOSITION_SMALL_GAP_SCENARIO_BOOST", "1.06"),
+)
+COMPOSITION_LOW_MID_GAP_SCENARIO_BOOST = env_float("COMPOSITION_LOW_MID_GAP_SCENARIO_BOOST", "1.03")
+COMPOSITION_MID_HIGH_GAP_SCENARIO_SHRINK = env_float(
+    "COMPOSITION_MID_HIGH_GAP_SCENARIO_SHRINK",
+    os.getenv("COMPOSITION_BIG_GAP_SCENARIO_SHRINK", "0.96"),
+)
+COMPOSITION_EXTREME_GAP_SCENARIO_SHRINK = env_float("COMPOSITION_EXTREME_GAP_SCENARIO_SHRINK", "0.90")
+COMPOSITION_TIE_GAP_SHRINK = env_float("COMPOSITION_TIE_GAP_SHRINK", "0.86")
+COMPOSITION_GAP_DIRECTION_MAX_ADJUST = env_float("COMPOSITION_GAP_DIRECTION_MAX_ADJUST", "0.008")
+
+# 天然高點保護：贏方天然 8/9 且 top_scenario=NONE_DRAW 時，避免被補牌情境過度反拉。
+COMPOSITION_NATURAL_HIGH_SCENARIO_SHRINK = env_float("COMPOSITION_NATURAL_HIGH_SCENARIO_SHRINK", "0.90")
 
 # 補牌情境信心越高，predictor 可提高 composition_mc 權重。
 COMPOSITION_CONFIDENCE_GAP_SCALE = env_float("COMPOSITION_CONFIDENCE_GAP_SCALE", "0.22")
@@ -193,8 +206,8 @@ def scenario_name(player_draw: bool, banker_draw: bool) -> str:
 
 def winner_point_zone(player_point: int, banker_point: int) -> Dict[str, Any]:
     """
-    V9.8：同時回傳贏方點數區間 + 點數差距區間。
-    保留原本 winner_side / winner_point / winner_point_zone 欄位，避免破壞 predictor 舊邏輯。
+    V9.9：同時回傳贏方點數區間 + 最細 point_gap_code + 實用 gap_family。
+    保留原本 winner_side / winner_point / winner_point_zone / gap_zone 欄位，避免破壞 predictor 舊邏輯。
     """
     player_point = int(player_point)
     banker_point = int(banker_point)
@@ -223,18 +236,25 @@ def winner_point_zone(player_point: int, banker_point: int) -> Dict[str, Any]:
     else:
         zone = "ZERO"
 
+    # point_gap_code 是最細分：GAP_0 ~ GAP_9。
+    point_gap_code = f"GAP_{point_gap}"
+
+    # gap_family 是實戰更穩定的分組：避免每格樣本太散。
     if point_gap == 0:
-        gap_zone = "TIE_GAP"
-        gap_zone_zh = "和點差距"
+        gap_family = "TIE_GAP"
+        gap_family_zh = "和點"
     elif point_gap <= 2:
-        gap_zone = "SMALL_GAP_1_2"
-        gap_zone_zh = "小差距1-2"
-    elif point_gap <= 5:
-        gap_zone = "MID_GAP_3_5"
-        gap_zone_zh = "中差距3-5"
+        gap_family = "TINY_GAP_1_2"
+        gap_family_zh = "極小差距1-2"
+    elif point_gap <= 4:
+        gap_family = "LOW_MID_GAP_3_4"
+        gap_family_zh = "中小差距3-4"
+    elif point_gap <= 7:
+        gap_family = "MID_HIGH_GAP_5_7"
+        gap_family_zh = "中大差距5-7"
     else:
-        gap_zone = "BIG_GAP_6_9"
-        gap_zone_zh = "大差距6-9"
+        gap_family = "EXTREME_GAP_8_9"
+        gap_family_zh = "極大差距8-9"
 
     return {
         "winner_side": side,
@@ -242,34 +262,40 @@ def winner_point_zone(player_point: int, banker_point: int) -> Dict[str, Any]:
         "winner_point_zone": zone,
         "point_gap": point_gap,
         "point_diff": diff,
+        "point_gap_code": point_gap_code,
         "gap_direction": gap_direction,
-        "gap_zone": gap_zone,
-        "gap_zone_zh": gap_zone_zh,
+        "gap_zone": gap_family,
+        "gap_zone_zh": gap_family_zh,
+        "gap_family": gap_family,
+        "gap_family_zh": gap_family_zh,
     }
 
 
 def gap_zone_scenario_multiplier(gap_zone: str) -> float:
     """
-    點數差距只微調補牌情境可信度：
-    - 小差距：補牌情境更重要，略提高 scenario_strength。
-    - 大差距：point_db 通常更重要，補牌MC不要太硬拉，略收斂。
-    - 和點：交給和點保護，補牌情境略收斂。
+    V9.9 點數差距細分只微調補牌情境可信度。
     """
     if not COMPOSITION_USE_POINT_GAP_PROFILE:
         return 1.0
-    if gap_zone == "SMALL_GAP_1_2":
-        return COMPOSITION_SMALL_GAP_SCENARIO_BOOST
-    if gap_zone == "BIG_GAP_6_9":
-        return COMPOSITION_BIG_GAP_SCENARIO_SHRINK
-    if gap_zone == "TIE_GAP":
+
+    gz = str(gap_zone or "")
+    if gz in {"GAP_1", "GAP_2", "TINY_GAP_1_2", "SMALL_GAP_1_2"}:
+        return COMPOSITION_TINY_GAP_SCENARIO_BOOST
+    if gz in {"GAP_3", "GAP_4", "LOW_MID_GAP_3_4", "MID_GAP_3_5"}:
+        return COMPOSITION_LOW_MID_GAP_SCENARIO_BOOST
+    if gz in {"GAP_5", "GAP_6", "GAP_7", "MID_HIGH_GAP_5_7"}:
+        return COMPOSITION_MID_HIGH_GAP_SCENARIO_SHRINK
+    if gz in {"GAP_8", "GAP_9", "EXTREME_GAP_8_9", "BIG_GAP_6_9"}:
+        return COMPOSITION_EXTREME_GAP_SCENARIO_SHRINK
+    if gz == "TIE_GAP":
         return COMPOSITION_TIE_GAP_SHRINK
     return 1.0
 
 
 def apply_gap_direction_adjustment(banker_form_rate: float, player_point: int, banker_point: int) -> float:
     """
-    V9.8：讓補牌MC知道點數差距，但只做很小的方向校準。
-    大差距時稍微尊重贏方方向，小差距時幾乎不動，避免硬套規則。
+    V9.9：讓補牌MC知道點數差距，但只做很小的方向校準。
+    5~7 與 8~9 分開，避免差距5被誤判成普通中差距。
     """
     if not COMPOSITION_USE_POINT_GAP_PROFILE:
         return banker_form_rate
@@ -279,7 +305,6 @@ def apply_gap_direction_adjustment(banker_form_rate: float, player_point: int, b
     if point_gap <= 0:
         return banker_form_rate
 
-    # 1~2 小差距調整很小；6~9 大差距才稍明顯，但仍封頂 0.010。
     scale = min(point_gap / 9.0, 1.0)
     adjust = COMPOSITION_GAP_DIRECTION_MAX_ADJUST * scale
 
@@ -289,6 +314,10 @@ def apply_gap_direction_adjustment(banker_form_rate: float, player_point: int, b
         banker_form_rate -= adjust
 
     return banker_form_rate
+
+
+def is_natural_high_context(top_scenario: str, winner_point: int) -> bool:
+    return str(top_scenario) == "NONE_DRAW" and int(winner_point) in (8, 9)
 
 
 def normalize_pair(banker_prob: float, player_prob: float) -> Tuple[float, float]:
@@ -488,8 +517,14 @@ def composition_mc_lookup(
 
         # 情境可信度：基礎權重 * 真實可行 state 權重。
         # V9.8 再依點數差距區間做微調，小差距讓補牌情境更有參考，大差距避免補牌MC過度反拉。
-        gap_multiplier = gap_zone_scenario_multiplier(str(info.get("gap_zone", "MID_GAP_3_5")))
-        scenario_strength = float(base_weight) * valid_weight * float(gap_multiplier)
+        gap_multiplier = gap_zone_scenario_multiplier(str(info.get("gap_zone", "LOW_MID_GAP_3_4")))
+        natural_high_candidate = bool(
+            info.get("scenario") == "NONE_DRAW"
+            and int(info.get("winner_point", 0) or 0) in (8, 9)
+        )
+        natural_multiplier = COMPOSITION_NATURAL_HIGH_SCENARIO_SHRINK if natural_high_candidate else 1.0
+
+        scenario_strength = float(base_weight) * valid_weight * float(gap_multiplier) * float(natural_multiplier)
         raw_scenario_strength_total += scenario_strength
 
         info.update({
@@ -497,6 +532,8 @@ def composition_mc_lookup(
             "scenario_strength": float(scenario_strength),
             "scenario_probability": 0.0,
             "gap_scenario_multiplier": float(gap_multiplier),
+            "natural_high_candidate": bool(natural_high_candidate),
+            "natural_high_multiplier": float(natural_multiplier),
         })
         scenario_debug.append(info)
 
@@ -542,7 +579,7 @@ def composition_mc_lookup(
         available = True
 
     # 抽樣驗證此補牌組成層的穩定度。
-    rng = random.Random(f"point_composition_mc_v9_8:{player_point}:{banker_point}:{seed_key}:{top_scenario}")
+    rng = random.Random(f"point_composition_mc_v9_9:{player_point}:{banker_point}:{seed_key}:{top_scenario}")
     banker_wins = 0
     player_wins = 0
 
@@ -565,13 +602,16 @@ def composition_mc_lookup(
 
     gap = abs(banker_prob - player_prob)
     wz = winner_point_zone(player_point, banker_point)
+    natural_high_winner = is_natural_high_context(top_scenario, int(wz.get("winner_point", 0) or 0))
+    natural_winner = bool(str(top_scenario) == "NONE_DRAW" and int(wz.get("winner_point", 0) or 0) in (8, 9))
+    natural_side = wz.get("winner_side", "UNKNOWN") if natural_winner else "NONE"
 
     return {
         "available": bool(available),
         "feature_key": f"P{player_point}_B{banker_point}_COMPOSITION_MC",
         "banker_prob": banker_prob,
         "player_prob": player_prob,
-        "source": "POINT_COMPOSITION_MC_REALISTIC_DRAW_GAP_PROFILE_V9_8" if available else "POINT_COMPOSITION_MC_FALLBACK_V9_8",
+        "source": "POINT_COMPOSITION_MC_FINE_GAP_NATURAL_V9_9" if available else "POINT_COMPOSITION_MC_FALLBACK_V9_9",
         "sample_size": int(n_sim),
         "total_simulated_samples": int(n_sim),
         "scenario_debug": scenario_debug,
@@ -583,6 +623,9 @@ def composition_mc_lookup(
         "composition_gap": float(gap),
         "scenario_count": len(scenario_debug),
         "realistic_rule_filter": bool(COMPOSITION_USE_REALISTIC_DRAW_RULE_FILTER),
+        "natural_winner": bool(natural_winner),
+        "natural_high_winner": bool(natural_high_winner),
+        "natural_side": natural_side,
         "banker_mc_wins": int(banker_wins),
         "player_mc_wins": int(player_wins),
         **wz,
