@@ -91,7 +91,7 @@ MIN_GAP_WITHOUT_COMBO = env_float("MIN_GAP_WITHOUT_COMBO", "0.150")
 COMPOSITION_MC_SIMULATIONS = env_int("COMPOSITION_MC_SIMULATIONS", "500")
 COMPOSITION_MC_MAX_COMBOS = env_int("COMPOSITION_MC_MAX_COMBOS", "220")
 
-# 補牌MC V9.7 動態權重：保留原先融合邏輯，只讓補牌MC在「信心高/同向」時更有影響力。
+# 補牌MC V9.8 動態權重：保留原先融合邏輯，只讓補牌MC在「信心高/同向/點數差距合理」時更有影響力。
 COMPOSITION_MC_DYNAMIC_WEIGHT = env_bool("COMPOSITION_MC_DYNAMIC_WEIGHT", "1")
 COMPOSITION_MC_MIN_WEIGHT_MULT = env_float("COMPOSITION_MC_MIN_WEIGHT_MULT", "0.70")
 COMPOSITION_MC_MAX_WEIGHT_MULT = env_float("COMPOSITION_MC_MAX_WEIGHT_MULT", "1.42")
@@ -100,6 +100,18 @@ COMPOSITION_MC_GAP_BOOST = env_float("COMPOSITION_MC_GAP_BOOST", "0.18")
 COMPOSITION_MC_SUPPORT_BOOST = env_float("COMPOSITION_MC_SUPPORT_BOOST", "1.10")
 COMPOSITION_MC_CONFLICT_SHRINK = env_float("COMPOSITION_MC_CONFLICT_SHRINK", "0.82")
 COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST = env_float("COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST", "0.38")
+
+# V9.8 點數差距校準器：不改原本邏輯，只依照 point_gap/gap_zone 微調各層權重。
+USE_POINT_GAP_CALIBRATOR = env_bool("USE_POINT_GAP_CALIBRATOR", "1")
+POINT_GAP_SMALL_COMP_BOOST = env_float("POINT_GAP_SMALL_COMP_BOOST", "1.12")
+POINT_GAP_SMALL_COMBO_BOOST = env_float("POINT_GAP_SMALL_COMBO_BOOST", "1.08")
+POINT_GAP_SMALL_POINT_SHRINK = env_float("POINT_GAP_SMALL_POINT_SHRINK", "0.96")
+POINT_GAP_BIG_POINT_BOOST = env_float("POINT_GAP_BIG_POINT_BOOST", "1.10")
+POINT_GAP_BIG_COMP_SHRINK = env_float("POINT_GAP_BIG_COMP_SHRINK", "0.88")
+POINT_GAP_BIG_ROAD_SHRINK = env_float("POINT_GAP_BIG_ROAD_SHRINK", "0.92")
+POINT_GAP_TIE_COMP_SHRINK = env_float("POINT_GAP_TIE_COMP_SHRINK", "0.75")
+POINT_GAP_TIE_ROAD_SHRINK = env_float("POINT_GAP_TIE_ROAD_SHRINK", "0.75")
+POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT = env_float("POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT", "1.18")
 
 BASE_BANKER_NO_TIE = 0.5000  # V9 no banker base bias: neutral fallback only
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", str(getattr(config, "MIN_OUTPUT_PROB", 0.38)))
@@ -283,6 +295,142 @@ def _calibrate_composition_weight(
     }
 
 
+def point_gap_profile(player_point: int, banker_point: int) -> Dict[str, Any]:
+    """
+    V9.8：點數差距 profile。
+    不吃用戶歷史，只根據當前這一局的閒點 / 莊點。
+    """
+    player_point = int(player_point)
+    banker_point = int(banker_point)
+    diff = player_point - banker_point
+    point_gap = abs(diff)
+
+    if player_point > banker_point:
+        winner_side = "PLAYER"
+        winner_point = player_point
+    elif banker_point > player_point:
+        winner_side = "BANKER"
+        winner_point = banker_point
+    else:
+        winner_side = "TIE"
+        winner_point = player_point
+
+    if winner_point in (7, 8, 9):
+        winner_point_zone = "HIGH_7_9"
+    elif winner_point in (1, 2, 3, 4):
+        winner_point_zone = "LOW_1_4"
+    elif winner_point in (5, 6):
+        winner_point_zone = "MID_5_6"
+    else:
+        winner_point_zone = "ZERO"
+
+    if point_gap == 0:
+        gap_zone = "TIE_GAP"
+        gap_zone_zh = "和點差距"
+    elif point_gap <= 2:
+        gap_zone = "SMALL_GAP_1_2"
+        gap_zone_zh = "小差距1-2"
+    elif point_gap <= 5:
+        gap_zone = "MID_GAP_3_5"
+        gap_zone_zh = "中差距3-5"
+    else:
+        gap_zone = "BIG_GAP_6_9"
+        gap_zone_zh = "大差距6-9"
+
+    return {
+        "point_gap": point_gap,
+        "point_diff": diff,
+        "gap_zone": gap_zone,
+        "gap_zone_zh": gap_zone_zh,
+        "winner_side": winner_side,
+        "winner_point": winner_point,
+        "winner_point_zone": winner_point_zone,
+    }
+
+
+def apply_point_gap_calibrator(
+    player_point: int,
+    banker_point: int,
+    point_w: float,
+    combo_w: float,
+    comp_w: float,
+    road_w: float,
+    sim_w: float,
+) -> Tuple[float, float, float, float, float, Dict[str, Any]]:
+    """
+    V9.8 點數差距校準器。
+    設計理念：
+    - 小差距 1~2：補牌MC與combo更重要，point_db略收斂。
+    - 中差距 3~5：維持原始融合。
+    - 大差距 6~9：point_db更重要，補牌MC/road略收斂，避免被反拉。
+    - 和點：維持和點保護，補牌MC/road略收斂。
+    """
+    profile = point_gap_profile(player_point, banker_point)
+    if not USE_POINT_GAP_CALIBRATOR:
+        return point_w, combo_w, comp_w, road_w, sim_w, {
+            **profile,
+            "enabled": False,
+            "status": "DISABLED",
+            "multipliers": {},
+        }
+
+    gap_zone = profile.get("gap_zone", "MID_GAP_3_5")
+    multipliers = {
+        "point": 1.0,
+        "combo": 1.0,
+        "composition_mc": 1.0,
+        "road_profile": 1.0,
+        "simulation": 1.0,
+    }
+    status = "GAP_MID_KEEP"
+
+    if gap_zone == "SMALL_GAP_1_2":
+        multipliers["point"] = POINT_GAP_SMALL_POINT_SHRINK
+        multipliers["combo"] = POINT_GAP_SMALL_COMBO_BOOST
+        multipliers["composition_mc"] = POINT_GAP_SMALL_COMP_BOOST
+        status = "GAP_SMALL_COMP_COMBO_BOOST"
+    elif gap_zone == "BIG_GAP_6_9":
+        multipliers["point"] = POINT_GAP_BIG_POINT_BOOST
+        multipliers["composition_mc"] = POINT_GAP_BIG_COMP_SHRINK
+        multipliers["road_profile"] = POINT_GAP_BIG_ROAD_SHRINK
+        status = "GAP_BIG_POINT_PROTECT"
+    elif gap_zone == "TIE_GAP":
+        multipliers["composition_mc"] = POINT_GAP_TIE_COMP_SHRINK
+        multipliers["road_profile"] = POINT_GAP_TIE_ROAD_SHRINK
+        status = "GAP_TIE_PROTECTION"
+
+    # 限制總體放大，避免點數差距校準器破壞原本權重設計。
+    def _safe_mult(x: float) -> float:
+        return clamp(float(x), 0.55, POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT)
+
+    point_w2 = point_w * _safe_mult(multipliers["point"])
+    combo_w2 = combo_w * _safe_mult(multipliers["combo"])
+    comp_w2 = comp_w * _safe_mult(multipliers["composition_mc"])
+    road_w2 = road_w * _safe_mult(multipliers["road_profile"])
+    sim_w2 = sim_w * _safe_mult(multipliers["simulation"])
+
+    return point_w2, combo_w2, comp_w2, road_w2, sim_w2, {
+        **profile,
+        "enabled": True,
+        "status": status,
+        "multipliers": multipliers,
+        "before_weights": {
+            "point": point_w,
+            "combo": combo_w,
+            "composition_mc": comp_w,
+            "road_profile": road_w,
+            "simulation": sim_w,
+        },
+        "after_weights": {
+            "point": point_w2,
+            "combo": combo_w2,
+            "composition_mc": comp_w2,
+            "road_profile": road_w2,
+            "simulation": sim_w2,
+        },
+    }
+
+
 def neutral_record(source: str = "NEUTRAL") -> Dict[str, Any]:
     banker = clamp(BASE_BANKER_NO_TIE, MIN_OUTPUT_PROB, MAX_OUTPUT_PROB)
     return {
@@ -394,6 +542,11 @@ def composition_mc_layer(player_point: int, banker_point: int, rounds: Optional[
             "winner_side": rec.get("winner_side", "UNKNOWN"),
             "winner_point": rec.get("winner_point"),
             "winner_point_zone": rec.get("winner_point_zone", "UNKNOWN"),
+            "point_gap": rec.get("point_gap", abs(player_point - banker_point)),
+            "point_diff": rec.get("point_diff", player_point - banker_point),
+            "gap_direction": rec.get("gap_direction", "UNKNOWN"),
+            "gap_zone": rec.get("gap_zone", "UNKNOWN"),
+            "gap_zone_zh": rec.get("gap_zone_zh", ""),
             "realistic_rule_filter": rec.get("realistic_rule_filter", False),
             "scenario_count": int(rec.get("scenario_count", len(rec.get("scenario_debug", [])) if isinstance(rec.get("scenario_debug", []), list) else 0) or 0),
         }
@@ -738,6 +891,16 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
     if ROAD_PROFILE_WEIGHT_REQUIRE_AVAILABLE and (not road.get("available") or int(road.get("sample_size", 0) or 0) <= 0):
         road_w = 0.0
 
+    p_w, combo_w, comp_w, road_w, sim_w, point_gap_info = apply_point_gap_calibrator(
+        player_point=player_point,
+        banker_point=banker_point,
+        point_w=p_w,
+        combo_w=combo_w,
+        comp_w=comp_w,
+        road_w=road_w,
+        sim_w=sim_w,
+    )
+
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
         comp_w = min(comp_w, COMPOSITION_MC_WEIGHT * 0.50)
@@ -796,6 +959,14 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "weak_reason": weak_reason,
         "no_observe": not entry_allowed,
         "tie_point_mode": is_tie_point,
+        "point_gap": point_gap_info.get("point_gap", abs(player_point - banker_point)),
+        "point_diff": point_gap_info.get("point_diff", player_point - banker_point),
+        "gap_zone": point_gap_info.get("gap_zone", "UNKNOWN"),
+        "gap_zone_zh": point_gap_info.get("gap_zone_zh", ""),
+        "winner_side": point_gap_info.get("winner_side", comp.get("winner_side", "UNKNOWN")),
+        "winner_point": point_gap_info.get("winner_point", comp.get("winner_point")),
+        "winner_point_zone": point_gap_info.get("winner_point_zone", comp.get("winner_point_zone", "UNKNOWN")),
+        "point_gap_calibrator": point_gap_info,
         "min_gap_for_entry": MIN_GAP_FOR_ENTRY,
         "strong_gap_for_entry": STRONG_GAP_FOR_ENTRY,
         "feature_key": point_key(player_point, banker_point),
@@ -825,6 +996,10 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "composition_winner_side": comp.get("winner_side", "UNKNOWN"),
         "composition_winner_point": comp.get("winner_point"),
         "composition_winner_point_zone": comp.get("winner_point_zone", "UNKNOWN"),
+        "composition_point_gap": comp.get("point_gap", abs(player_point - banker_point)),
+        "composition_point_diff": comp.get("point_diff", player_point - banker_point),
+        "composition_gap_zone": comp.get("gap_zone", point_gap_info.get("gap_zone", "UNKNOWN")),
+        "composition_gap_zone_zh": comp.get("gap_zone_zh", point_gap_info.get("gap_zone_zh", "")),
         "composition_realistic_rule_filter": comp.get("realistic_rule_filter", False),
         "composition_weight_info": composition_weight_info,
         "composition_scenario_debug": comp.get("scenario_debug", []),
@@ -886,7 +1061,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_7_ROAD_PROFILE_POINT_CALIBRATOR",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_8_POINT_GAP_CALIBRATOR",
     }
 
     if USE_MONTE_CARLO:
