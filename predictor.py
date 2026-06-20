@@ -91,7 +91,7 @@ MIN_GAP_WITHOUT_COMBO = env_float("MIN_GAP_WITHOUT_COMBO", "0.150")
 COMPOSITION_MC_SIMULATIONS = env_int("COMPOSITION_MC_SIMULATIONS", "500")
 COMPOSITION_MC_MAX_COMBOS = env_int("COMPOSITION_MC_MAX_COMBOS", "220")
 
-# 補牌MC V9.8 動態權重：保留原先融合邏輯，只讓補牌MC在「信心高/同向/點數差距合理」時更有影響力。
+# 補牌MC V9.9 動態權重：保留原先融合邏輯，只讓補牌MC在「信心高/同向/細分點數差距合理」時更有影響力。
 COMPOSITION_MC_DYNAMIC_WEIGHT = env_bool("COMPOSITION_MC_DYNAMIC_WEIGHT", "1")
 COMPOSITION_MC_MIN_WEIGHT_MULT = env_float("COMPOSITION_MC_MIN_WEIGHT_MULT", "0.70")
 COMPOSITION_MC_MAX_WEIGHT_MULT = env_float("COMPOSITION_MC_MAX_WEIGHT_MULT", "1.42")
@@ -101,17 +101,36 @@ COMPOSITION_MC_SUPPORT_BOOST = env_float("COMPOSITION_MC_SUPPORT_BOOST", "1.10")
 COMPOSITION_MC_CONFLICT_SHRINK = env_float("COMPOSITION_MC_CONFLICT_SHRINK", "0.82")
 COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST = env_float("COMPOSITION_MC_MIN_CONFIDENCE_FOR_BOOST", "0.38")
 
-# V9.8 點數差距校準器：不改原本邏輯，只依照 point_gap/gap_zone 微調各層權重。
+# V9.9 點數差距細分校準器：不改原本邏輯，只依照 point_gap/gap_family 微調各層權重。
 USE_POINT_GAP_CALIBRATOR = env_bool("USE_POINT_GAP_CALIBRATOR", "1")
-POINT_GAP_SMALL_COMP_BOOST = env_float("POINT_GAP_SMALL_COMP_BOOST", "1.12")
-POINT_GAP_SMALL_COMBO_BOOST = env_float("POINT_GAP_SMALL_COMBO_BOOST", "1.08")
-POINT_GAP_SMALL_POINT_SHRINK = env_float("POINT_GAP_SMALL_POINT_SHRINK", "0.96")
-POINT_GAP_BIG_POINT_BOOST = env_float("POINT_GAP_BIG_POINT_BOOST", "1.10")
-POINT_GAP_BIG_COMP_SHRINK = env_float("POINT_GAP_BIG_COMP_SHRINK", "0.88")
-POINT_GAP_BIG_ROAD_SHRINK = env_float("POINT_GAP_BIG_ROAD_SHRINK", "0.92")
-POINT_GAP_TIE_COMP_SHRINK = env_float("POINT_GAP_TIE_COMP_SHRINK", "0.75")
-POINT_GAP_TIE_ROAD_SHRINK = env_float("POINT_GAP_TIE_ROAD_SHRINK", "0.75")
+
+# 兼容舊 V9.8 env；沒有設定新 V9.9 env 時，會吃舊值或安全預設。
+POINT_GAP_TINY_COMP_BOOST = env_float("POINT_GAP_TINY_COMP_BOOST", os.getenv("POINT_GAP_SMALL_COMP_BOOST", "1.08"))
+POINT_GAP_TINY_COMBO_BOOST = env_float("POINT_GAP_TINY_COMBO_BOOST", os.getenv("POINT_GAP_SMALL_COMBO_BOOST", "1.05"))
+POINT_GAP_TINY_POINT_SHRINK = env_float("POINT_GAP_TINY_POINT_SHRINK", os.getenv("POINT_GAP_SMALL_POINT_SHRINK", "0.98"))
+
+POINT_GAP_LOW_MID_COMP_BOOST = env_float("POINT_GAP_LOW_MID_COMP_BOOST", "1.03")
+POINT_GAP_LOW_MID_COMBO_BOOST = env_float("POINT_GAP_LOW_MID_COMBO_BOOST", "1.03")
+POINT_GAP_LOW_MID_POINT_MULT = env_float("POINT_GAP_LOW_MID_POINT_MULT", "1.00")
+
+POINT_GAP_MID_HIGH_POINT_BOOST = env_float("POINT_GAP_MID_HIGH_POINT_BOOST", "1.08")
+POINT_GAP_MID_HIGH_COMP_SHRINK = env_float("POINT_GAP_MID_HIGH_COMP_SHRINK", "0.90")
+POINT_GAP_MID_HIGH_ROAD_SHRINK = env_float("POINT_GAP_MID_HIGH_ROAD_SHRINK", "0.95")
+
+POINT_GAP_EXTREME_POINT_BOOST = env_float("POINT_GAP_EXTREME_POINT_BOOST", os.getenv("POINT_GAP_BIG_POINT_BOOST", "1.14"))
+POINT_GAP_EXTREME_COMP_SHRINK = env_float("POINT_GAP_EXTREME_COMP_SHRINK", os.getenv("POINT_GAP_BIG_COMP_SHRINK", "0.82"))
+POINT_GAP_EXTREME_ROAD_SHRINK = env_float("POINT_GAP_EXTREME_ROAD_SHRINK", os.getenv("POINT_GAP_BIG_ROAD_SHRINK", "0.88"))
+
+POINT_GAP_TIE_COMP_SHRINK = env_float("POINT_GAP_TIE_COMP_SHRINK", "0.72")
+POINT_GAP_TIE_ROAD_SHRINK = env_float("POINT_GAP_TIE_ROAD_SHRINK", "0.72")
 POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT = env_float("POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT", "1.18")
+
+# 天然高點保護：贏方天然 8/9 且補牌MC top_scenario=NONE_DRAW。
+USE_NATURAL_HIGH_GUARD = env_bool("USE_NATURAL_HIGH_GUARD", "1")
+NATURAL_HIGH_POINT_BOOST = env_float("NATURAL_HIGH_POINT_BOOST", "1.12")
+NATURAL_HIGH_COMP_SHRINK = env_float("NATURAL_HIGH_COMP_SHRINK", "0.84")
+NATURAL_HIGH_ROAD_SHRINK = env_float("NATURAL_HIGH_ROAD_SHRINK", "0.90")
+NATURAL_HIGH_COMBO_SHRINK = env_float("NATURAL_HIGH_COMBO_SHRINK", "0.94")
 
 BASE_BANKER_NO_TIE = 0.5000  # V9 no banker base bias: neutral fallback only
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", str(getattr(config, "MIN_OUTPUT_PROB", 0.38)))
@@ -297,7 +316,7 @@ def _calibrate_composition_weight(
 
 def point_gap_profile(player_point: int, banker_point: int) -> Dict[str, Any]:
     """
-    V9.8：點數差距 profile。
+    V9.9：點數差距細分 profile。
     不吃用戶歷史，只根據當前這一局的閒點 / 莊點。
     """
     player_point = int(player_point)
@@ -324,24 +343,32 @@ def point_gap_profile(player_point: int, banker_point: int) -> Dict[str, Any]:
     else:
         winner_point_zone = "ZERO"
 
+    point_gap_code = f"GAP_{point_gap}"
+
     if point_gap == 0:
-        gap_zone = "TIE_GAP"
-        gap_zone_zh = "和點差距"
+        gap_family = "TIE_GAP"
+        gap_family_zh = "和點"
     elif point_gap <= 2:
-        gap_zone = "SMALL_GAP_1_2"
-        gap_zone_zh = "小差距1-2"
-    elif point_gap <= 5:
-        gap_zone = "MID_GAP_3_5"
-        gap_zone_zh = "中差距3-5"
+        gap_family = "TINY_GAP_1_2"
+        gap_family_zh = "極小差距1-2"
+    elif point_gap <= 4:
+        gap_family = "LOW_MID_GAP_3_4"
+        gap_family_zh = "中小差距3-4"
+    elif point_gap <= 7:
+        gap_family = "MID_HIGH_GAP_5_7"
+        gap_family_zh = "中大差距5-7"
     else:
-        gap_zone = "BIG_GAP_6_9"
-        gap_zone_zh = "大差距6-9"
+        gap_family = "EXTREME_GAP_8_9"
+        gap_family_zh = "極大差距8-9"
 
     return {
         "point_gap": point_gap,
         "point_diff": diff,
-        "gap_zone": gap_zone,
-        "gap_zone_zh": gap_zone_zh,
+        "point_gap_code": point_gap_code,
+        "gap_zone": gap_family,
+        "gap_zone_zh": gap_family_zh,
+        "gap_family": gap_family,
+        "gap_family_zh": gap_family_zh,
         "winner_side": winner_side,
         "winner_point": winner_point,
         "winner_point_zone": winner_point_zone,
@@ -358,12 +385,7 @@ def apply_point_gap_calibrator(
     sim_w: float,
 ) -> Tuple[float, float, float, float, float, Dict[str, Any]]:
     """
-    V9.8 點數差距校準器。
-    設計理念：
-    - 小差距 1~2：補牌MC與combo更重要，point_db略收斂。
-    - 中差距 3~5：維持原始融合。
-    - 大差距 6~9：point_db更重要，補牌MC/road略收斂，避免被反拉。
-    - 和點：維持和點保護，補牌MC/road略收斂。
+    V9.9 點數差距細分校準器。
     """
     profile = point_gap_profile(player_point, banker_point)
     if not USE_POINT_GAP_CALIBRATOR:
@@ -374,7 +396,7 @@ def apply_point_gap_calibrator(
             "multipliers": {},
         }
 
-    gap_zone = profile.get("gap_zone", "MID_GAP_3_5")
+    gap_family = profile.get("gap_family", profile.get("gap_zone", "LOW_MID_GAP_3_4"))
     multipliers = {
         "point": 1.0,
         "combo": 1.0,
@@ -382,26 +404,35 @@ def apply_point_gap_calibrator(
         "road_profile": 1.0,
         "simulation": 1.0,
     }
-    status = "GAP_MID_KEEP"
+    status = "GAP_LOW_MID_KEEP"
 
-    if gap_zone == "SMALL_GAP_1_2":
-        multipliers["point"] = POINT_GAP_SMALL_POINT_SHRINK
-        multipliers["combo"] = POINT_GAP_SMALL_COMBO_BOOST
-        multipliers["composition_mc"] = POINT_GAP_SMALL_COMP_BOOST
-        status = "GAP_SMALL_COMP_COMBO_BOOST"
-    elif gap_zone == "BIG_GAP_6_9":
-        multipliers["point"] = POINT_GAP_BIG_POINT_BOOST
-        multipliers["composition_mc"] = POINT_GAP_BIG_COMP_SHRINK
-        multipliers["road_profile"] = POINT_GAP_BIG_ROAD_SHRINK
-        status = "GAP_BIG_POINT_PROTECT"
-    elif gap_zone == "TIE_GAP":
+    if gap_family in {"TINY_GAP_1_2", "SMALL_GAP_1_2"}:
+        multipliers["point"] = POINT_GAP_TINY_POINT_SHRINK
+        multipliers["combo"] = POINT_GAP_TINY_COMBO_BOOST
+        multipliers["composition_mc"] = POINT_GAP_TINY_COMP_BOOST
+        status = "GAP_TINY_COMP_COMBO_BOOST"
+    elif gap_family in {"LOW_MID_GAP_3_4", "MID_GAP_3_5"}:
+        multipliers["point"] = POINT_GAP_LOW_MID_POINT_MULT
+        multipliers["combo"] = POINT_GAP_LOW_MID_COMBO_BOOST
+        multipliers["composition_mc"] = POINT_GAP_LOW_MID_COMP_BOOST
+        status = "GAP_LOW_MID_BALANCE"
+    elif gap_family == "MID_HIGH_GAP_5_7":
+        multipliers["point"] = POINT_GAP_MID_HIGH_POINT_BOOST
+        multipliers["composition_mc"] = POINT_GAP_MID_HIGH_COMP_SHRINK
+        multipliers["road_profile"] = POINT_GAP_MID_HIGH_ROAD_SHRINK
+        status = "GAP_MID_HIGH_POINT_PROTECT"
+    elif gap_family in {"EXTREME_GAP_8_9", "BIG_GAP_6_9"}:
+        multipliers["point"] = POINT_GAP_EXTREME_POINT_BOOST
+        multipliers["composition_mc"] = POINT_GAP_EXTREME_COMP_SHRINK
+        multipliers["road_profile"] = POINT_GAP_EXTREME_ROAD_SHRINK
+        status = "GAP_EXTREME_POINT_PROTECT"
+    elif gap_family == "TIE_GAP":
         multipliers["composition_mc"] = POINT_GAP_TIE_COMP_SHRINK
         multipliers["road_profile"] = POINT_GAP_TIE_ROAD_SHRINK
         status = "GAP_TIE_PROTECTION"
 
-    # 限制總體放大，避免點數差距校準器破壞原本權重設計。
     def _safe_mult(x: float) -> float:
-        return clamp(float(x), 0.55, POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT)
+        return clamp(float(x), 0.50, POINT_GAP_CALIBRATOR_MAX_TOTAL_MULT)
 
     point_w2 = point_w * _safe_mult(multipliers["point"])
     combo_w2 = combo_w * _safe_mult(multipliers["combo"])
@@ -429,6 +460,73 @@ def apply_point_gap_calibrator(
             "simulation": sim_w2,
         },
     }
+
+
+def apply_natural_high_guard(
+    comp: Dict[str, Any],
+    point_gap_info: Dict[str, Any],
+    point_w: float,
+    combo_w: float,
+    comp_w: float,
+    road_w: float,
+    sim_w: float,
+) -> Tuple[float, float, float, float, float, Dict[str, Any]]:
+    """
+    天然高點保護：像 閒9莊4、莊8閒3 這種 top_scenario=NONE_DRAW 且贏方8/9，
+    不讓補牌MC/road/profile過度反拉。仍然只是權重微調，不改預測架構。
+    """
+    natural_high = bool(
+        USE_NATURAL_HIGH_GUARD
+        and (
+            comp.get("natural_high_winner")
+            or (
+                str(comp.get("top_scenario", "")) == "NONE_DRAW"
+                and int(point_gap_info.get("winner_point", 0) or 0) in (8, 9)
+            )
+        )
+    )
+
+    info = {
+        "enabled": bool(USE_NATURAL_HIGH_GUARD),
+        "natural_high_winner": natural_high,
+        "status": "NATURAL_HIGH_NOT_APPLIED",
+        "before_weights": {
+            "point": point_w,
+            "combo": combo_w,
+            "composition_mc": comp_w,
+            "road_profile": road_w,
+            "simulation": sim_w,
+        },
+    }
+
+    if not natural_high:
+        info["after_weights"] = dict(info["before_weights"])
+        return point_w, combo_w, comp_w, road_w, sim_w, info
+
+    point_w2 = point_w * clamp(NATURAL_HIGH_POINT_BOOST, 0.80, 1.25)
+    combo_w2 = combo_w * clamp(NATURAL_HIGH_COMBO_SHRINK, 0.70, 1.05)
+    comp_w2 = comp_w * clamp(NATURAL_HIGH_COMP_SHRINK, 0.60, 1.00)
+    road_w2 = road_w * clamp(NATURAL_HIGH_ROAD_SHRINK, 0.60, 1.00)
+    sim_w2 = sim_w
+
+    info.update({
+        "status": "NATURAL_HIGH_POINT_PROTECT",
+        "multipliers": {
+            "point": NATURAL_HIGH_POINT_BOOST,
+            "combo": NATURAL_HIGH_COMBO_SHRINK,
+            "composition_mc": NATURAL_HIGH_COMP_SHRINK,
+            "road_profile": NATURAL_HIGH_ROAD_SHRINK,
+            "simulation": 1.0,
+        },
+        "after_weights": {
+            "point": point_w2,
+            "combo": combo_w2,
+            "composition_mc": comp_w2,
+            "road_profile": road_w2,
+            "simulation": sim_w2,
+        },
+    })
+    return point_w2, combo_w2, comp_w2, road_w2, sim_w2, info
 
 
 def neutral_record(source: str = "NEUTRAL") -> Dict[str, Any]:
@@ -545,8 +643,14 @@ def composition_mc_layer(player_point: int, banker_point: int, rounds: Optional[
             "point_gap": rec.get("point_gap", abs(player_point - banker_point)),
             "point_diff": rec.get("point_diff", player_point - banker_point),
             "gap_direction": rec.get("gap_direction", "UNKNOWN"),
+            "point_gap_code": rec.get("point_gap_code", f"GAP_{abs(player_point - banker_point)}"),
             "gap_zone": rec.get("gap_zone", "UNKNOWN"),
             "gap_zone_zh": rec.get("gap_zone_zh", ""),
+            "gap_family": rec.get("gap_family", rec.get("gap_zone", "UNKNOWN")),
+            "gap_family_zh": rec.get("gap_family_zh", rec.get("gap_zone_zh", "")),
+            "natural_winner": rec.get("natural_winner", False),
+            "natural_high_winner": rec.get("natural_high_winner", False),
+            "natural_side": rec.get("natural_side", "NONE"),
             "realistic_rule_filter": rec.get("realistic_rule_filter", False),
             "scenario_count": int(rec.get("scenario_count", len(rec.get("scenario_debug", [])) if isinstance(rec.get("scenario_debug", []), list) else 0) or 0),
         }
@@ -901,6 +1005,16 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         sim_w=sim_w,
     )
 
+    p_w, combo_w, comp_w, road_w, sim_w, natural_high_guard_info = apply_natural_high_guard(
+        comp=comp,
+        point_gap_info=point_gap_info,
+        point_w=p_w,
+        combo_w=combo_w,
+        comp_w=comp_w,
+        road_w=road_w,
+        sim_w=sim_w,
+    )
+
     if is_tie_point:
         sim_w = min(sim_w, TIE_AI_MAX_WEIGHT)
         comp_w = min(comp_w, COMPOSITION_MC_WEIGHT * 0.50)
@@ -961,12 +1075,17 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "tie_point_mode": is_tie_point,
         "point_gap": point_gap_info.get("point_gap", abs(player_point - banker_point)),
         "point_diff": point_gap_info.get("point_diff", player_point - banker_point),
+        "point_gap_code": point_gap_info.get("point_gap_code", f"GAP_{abs(player_point - banker_point)}"),
         "gap_zone": point_gap_info.get("gap_zone", "UNKNOWN"),
         "gap_zone_zh": point_gap_info.get("gap_zone_zh", ""),
+        "gap_family": point_gap_info.get("gap_family", point_gap_info.get("gap_zone", "UNKNOWN")),
+        "gap_family_zh": point_gap_info.get("gap_family_zh", point_gap_info.get("gap_zone_zh", "")),
         "winner_side": point_gap_info.get("winner_side", comp.get("winner_side", "UNKNOWN")),
         "winner_point": point_gap_info.get("winner_point", comp.get("winner_point")),
         "winner_point_zone": point_gap_info.get("winner_point_zone", comp.get("winner_point_zone", "UNKNOWN")),
         "point_gap_calibrator": point_gap_info,
+        "natural_high_guard": natural_high_guard_info,
+        "natural_high_winner": natural_high_guard_info.get("natural_high_winner", False),
         "min_gap_for_entry": MIN_GAP_FOR_ENTRY,
         "strong_gap_for_entry": STRONG_GAP_FOR_ENTRY,
         "feature_key": point_key(player_point, banker_point),
@@ -998,8 +1117,14 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         "composition_winner_point_zone": comp.get("winner_point_zone", "UNKNOWN"),
         "composition_point_gap": comp.get("point_gap", abs(player_point - banker_point)),
         "composition_point_diff": comp.get("point_diff", player_point - banker_point),
+        "composition_point_gap_code": comp.get("point_gap_code", point_gap_info.get("point_gap_code", f"GAP_{abs(player_point - banker_point)}")),
         "composition_gap_zone": comp.get("gap_zone", point_gap_info.get("gap_zone", "UNKNOWN")),
         "composition_gap_zone_zh": comp.get("gap_zone_zh", point_gap_info.get("gap_zone_zh", "")),
+        "composition_gap_family": comp.get("gap_family", point_gap_info.get("gap_family", "UNKNOWN")),
+        "composition_gap_family_zh": comp.get("gap_family_zh", point_gap_info.get("gap_family_zh", "")),
+        "composition_natural_winner": comp.get("natural_winner", False),
+        "composition_natural_high_winner": comp.get("natural_high_winner", False),
+        "composition_natural_side": comp.get("natural_side", "NONE"),
         "composition_realistic_rule_filter": comp.get("realistic_rule_filter", False),
         "composition_weight_info": composition_weight_info,
         "composition_scenario_debug": comp.get("scenario_debug", []),
@@ -1061,7 +1186,7 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_8_POINT_GAP_CALIBRATOR",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V9_9_FINE_GAP_NATURAL_GUARD",
     }
 
     if USE_MONTE_CARLO:
