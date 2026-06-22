@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-combo_db.py - V9.5 compatible connector for data/combo_db_3m.json
+combo_db.py - V9.6 connector for data/combo_db_3m.json
 
-Purpose:
-- Keep the original database/prediction logic intact.
-- Only fix the connector layer so combo_db_3m.json can be read reliably.
-- Support both JSON formats:
-    1) {"meta": {...}, "records": {"P2_B7|SC:BOTH_DRAW": {...}}}
-    2) {"__meta__": {...}, "P2_B7|SC:BOTH_DRAW": {...}}
-- Support Chinese scenario names such as 「莊閒皆補」 -> BOTH_DRAW.
-- Support multiple key styles and fallback to BASE / point-only records.
+新增差距區間 (gap_family) 查詢維度，讓小差距點數也能取得有意義的條件機率。
 """
 
 import json
@@ -57,10 +50,6 @@ META_KEYS = {"meta", "__meta__", "metadata", "_meta"}
 
 
 def _resolve_path(path: str) -> str:
-    """
-    Render 常見工作目錄是 /opt/render/project/src。
-    這裡多加幾個候選路徑，避免 combo_db_3m.json 明明在 data/ 裡卻讀不到。
-    """
     here = os.path.dirname(os.path.abspath(__file__))
     cwd = os.getcwd()
     base = os.path.basename(path)
@@ -130,7 +119,6 @@ def load_combo_db() -> Dict[str, Any]:
             "records": {},
         }
 
-    # 支援 {"records": {...}}、{"data": {...}}、{"items": {...}} 與直接 key-value 格式。
     meta = {}
     for mk in META_KEYS:
         if isinstance(raw_db.get(mk), dict):
@@ -152,14 +140,13 @@ def load_combo_db() -> Dict[str, Any]:
     if not isinstance(meta, dict):
         meta = {}
 
-    # 建立大小寫/空白不敏感索引，避免 key 格式小差異導致找不到。
     normalized_index = {}
     for k in records.keys():
         nk = _key_norm(k)
         if nk not in normalized_index:
             normalized_index[nk] = k
 
-    meta.setdefault("source", "COMBO_DB_V9_5_CONNECTED")
+    meta.setdefault("source", "COMBO_DB_V9_6_CONNECTED")
     meta.setdefault("path", COMBO_DB_PATH)
     meta.setdefault("resolved_path", path)
     meta.setdefault("record_count", len(records))
@@ -180,7 +167,7 @@ def combo_db_meta() -> Dict[str, Any]:
     records = db.get("records", {})
     meta.setdefault("record_count", len(records) if isinstance(records, dict) else 0)
     meta.setdefault("total_simulated_samples", 0)
-    meta.setdefault("source", "COMBO_DB_V9_5_CONNECTED")
+    meta.setdefault("source", "COMBO_DB_V9_6_CONNECTED")
     meta.setdefault("path", COMBO_DB_PATH)
     return meta
 
@@ -310,13 +297,19 @@ def extract_scenarios(composition: Optional[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
-def candidate_keys_for_scenario(player_point: int, banker_point: int, scenario: str, player_count: int = 0, banker_count: int = 0) -> List[str]:
+def candidate_keys_for_scenario(
+    player_point: int,
+    banker_point: int,
+    scenario: str,
+    player_count: int = 0,
+    banker_count: int = 0,
+    gap_family: Optional[str] = None,  # V9.6: 差距區間
+) -> List[str]:
     pkey = point_key(player_point, banker_point)
     scenario = _scenario_norm(scenario)
     keys: List[str] = []
     aliases = SCENARIO_ALIASES.get(scenario, [scenario])
 
-    # 優先 canonical，再補 aliases。資料庫 generator 使用 P2_B7|SC:BOTH_DRAW。
     candidates = [scenario] + [str(a).strip().upper().replace(" ", "") for a in aliases]
     seen_sc = set()
     scenario_names = []
@@ -325,6 +318,7 @@ def candidate_keys_for_scenario(player_point: int, banker_point: int, scenario: 
             seen_sc.add(sc)
             scenario_names.append(sc)
 
+    # 基本情境 keys
     for sc in scenario_names:
         keys.extend([
             f"{pkey}|SC:{sc}",
@@ -344,7 +338,21 @@ def candidate_keys_for_scenario(player_point: int, banker_point: int, scenario: 
                 f"{pkey}_PC{player_count}_BC{banker_count}_SC_{sc}",
             ])
 
-    # Fallback：BASE 與點數本身。若你的 DB 只有 point-only，也能接上。
+    # V9.6: 差距區間 keys
+    if gap_family:
+        for sc in scenario_names:
+            keys.extend([
+                f"{pkey}|SC:{sc}|GAP:{gap_family}",
+                f"{pkey}|GAP:{gap_family}|SC:{sc}",
+                f"{pkey}_SC_{sc}_GAP_{gap_family}",
+            ])
+        # 也加入純點數+差距的 key（不帶情境）
+        keys.extend([
+            f"{pkey}|GAP:{gap_family}",
+            f"{pkey}_GAP_{gap_family}",
+        ])
+
+    # Fallback：BASE 與點數本身
     keys.extend([f"{pkey}|BASE", f"{pkey}_BASE", f"{pkey}:BASE", pkey])
 
     seen = set()
@@ -398,7 +406,6 @@ def _find_record_by_keys(records: Dict[str, Any], normalized_index: Dict[str, st
 
 
 def _aggregate_point_records(records: Dict[str, Any], normalized_index: Dict[str, str], player_point: int, banker_point: int, min_sample: int) -> Optional[Dict[str, Any]]:
-    """最後保險：若精準情境 key 找不到，聚合該點數所有 scenario/base records。"""
     pkey = point_key(player_point, banker_point)
     prefixes = [f"{pkey}|SC:", f"{pkey}|SC_", f"{pkey}_SC_", f"{pkey}|", f"{pkey}_"]
     weighted_b = 0.0
@@ -411,7 +418,6 @@ def _aggregate_point_records(records: Dict[str, Any], normalized_index: Dict[str
             continue
         skey = str(key)
         if skey == pkey or any(skey.startswith(px) for px in prefixes):
-            # 排除非本點數的近似 key，例如 P2_B70
             if not (skey == pkey or skey.startswith(f"{pkey}|") or skey.startswith(f"{pkey}_")):
                 continue
             sample = _sample_of(raw)
@@ -459,8 +465,7 @@ def combo_lookup(
     min_sample: int = 80,
 ) -> Dict[str, Any]:
     """
-    V9.5 主查詢：使用「點數 + 補牌情境」查 combo_db_3m.json。
-    rounds 只保留參數相容，主邏輯不依賴前面路單。
+    V9.6 主查詢：使用「點數 + 補牌情境 + 差距區間」查 combo_db_3m.json。
     """
     meta = combo_db_meta()
     db = load_combo_db()
@@ -487,6 +492,11 @@ def combo_lookup(
     if not scenarios:
         scenarios = [{"scenario": "NONE_DRAW", "weight": 1.0, "player_count": 0, "banker_count": 0, "raw": {}}]
 
+    # V9.6: 從 composition 提取 gap_family
+    gap_family = None
+    if isinstance(composition, dict):
+        gap_family = composition.get("gap_family") or composition.get("gap_zone")
+
     weighted_b = 0.0
     total_weight = 0.0
     sample_total = 0
@@ -500,6 +510,7 @@ def combo_lookup(
             sc.get("scenario", "UNKNOWN"),
             player_count=int(sc.get("player_count", 0) or 0),
             banker_count=int(sc.get("banker_count", 0) or 0),
+            gap_family=gap_family,  # 傳入差距區間
         )
         candidate_keys.extend(keys[:12])
         rec = _find_record_by_keys(records, normalized_index, keys, min_sample=min_sample)
@@ -528,7 +539,6 @@ def combo_lookup(
     seen = set()
     candidate_keys = [x for x in candidate_keys if not (x in seen or seen.add(x))]
 
-    # 若情境 key 都找不到，最後用該點數全部可用條件聚合，不改原資料，只做讀取 fallback。
     if total_weight <= 0:
         agg = _aggregate_point_records(records, normalized_index, player_point, banker_point, min_sample=min_sample)
         if agg:
@@ -570,7 +580,7 @@ def combo_lookup(
         "feature_key": best.get("feature_key", pkey),
         "banker_prob": banker_prob,
         "player_prob": player_prob,
-        "source": "POINT_CONDITION_COMBO_DB_V9_5_CONNECTED",
+        "source": "POINT_CONDITION_COMBO_DB_V9_6_CONNECTED",
         "sample_size": sample_total,
         "total_simulated_samples": int(meta.get("total_simulated_samples", 0) or 0),
         "candidate_keys": candidate_keys[:24],
