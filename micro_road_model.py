@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-micro_road_model.py - V10.1 短牌路命中率校準層
+micro_road_model.py - V10.2 短牌路命中率校準層（內建龍尾衰減）
 
 重點：
-- 只看最近 4~8 口，不吃長歷史、不做追路、不需要暖機。
+- 只看最近 4~8 口，不吃長歷史、不做追路。
 - 輸出方向與信心，讓 predictor.py 的 decision_controller 做最後命中率修正。
-- 專抓：轉折口、雙跳尾、房廳尾、天然高點陷阱、5~7差距陷阱。
+- V10.2 新增：長龍風險指標 dragon_tail_risk，自動衰減過熱趨勢的信心。
 """
 
 from typing import Dict, Any, List, Tuple, Optional
@@ -48,6 +48,10 @@ MICRO_ROAD_RECENT_REVERSAL_EDGE = env_float("MICRO_ROAD_RECENT_REVERSAL_EDGE", "
 
 MICRO_ROAD_NATURAL_HIGH_TRAP = env_bool("MICRO_ROAD_NATURAL_HIGH_TRAP", "1")
 MICRO_ROAD_MID_HIGH_GAP_TRAP = env_bool("MICRO_ROAD_MID_HIGH_GAP_TRAP", "1")
+
+# V10.2 長龍衰減參數
+MICRO_ROAD_STREAK_DECAY_START = env_int("MICRO_ROAD_STREAK_DECAY_START", "5")
+MICRO_ROAD_STREAK_DECAY_RATE = env_float("MICRO_ROAD_STREAK_DECAY_RATE", "0.15")
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -260,6 +264,7 @@ def micro_road_lookup(
             "micro_confidence": 0.0,
             "micro_patterns": [],
             "recent_road": "".join(seq),
+            "dragon_tail_risk": 0.0,
         }
 
     ctx = infer_current_context(player_point, banker_point, composition)
@@ -287,10 +292,20 @@ def micro_road_lookup(
         direction_scores[d] += MICRO_ROAD_RECENT_REVERSAL_EDGE
         patterns.append("LAST_TWO_TURN")
 
+    # 長龍跟隨，但超過衰減起點時邊際遞減
     if streak_len >= 3 and last_side in {"B", "P"}:
-        direction_scores[last_side] += MICRO_ROAD_STREAK_EDGE * min(streak_len / 5.0, 1.0)
+        base_streak_edge = MICRO_ROAD_STREAK_EDGE
+        decay = 0.0
+        if streak_len >= int(MICRO_ROAD_STREAK_DECAY_START):
+            # 長龍越長，跟隨力道越弱（避免追尾）
+            decay = min(0.8, (streak_len - MICRO_ROAD_STREAK_DECAY_START) * MICRO_ROAD_STREAK_DECAY_RATE)
+        effective_streak_edge = base_streak_edge * (1.0 - decay)
+        direction_scores[last_side] += effective_streak_edge * min(streak_len / 5.0, 1.0)
         patterns.append(f"STREAK_{last_side}_{streak_len}")
+        if decay > 0:
+            patterns.append("LONG_STREAK_WEAKEN")
 
+    # 陷阱偵測（原邏輯）
     if (
         MICRO_ROAD_NATURAL_HIGH_TRAP
         and ctx["natural_high_winner"]
@@ -314,6 +329,11 @@ def micro_road_lookup(
             direction_scores[d] += MICRO_ROAD_TRAP_EDGE * 0.55
             patterns.append("MID_HIGH_GAP_TURN_GUARD")
 
+    # 計算龍尾風險（0~1）
+    dragon_tail_risk = 0.0
+    if streak_len >= int(MICRO_ROAD_STREAK_DECAY_START):
+        dragon_tail_risk = min(1.0, (streak_len - MICRO_ROAD_STREAK_DECAY_START) * 0.2)
+
     b_score = direction_scores["B"]
     p_score = direction_scores["P"]
 
@@ -324,16 +344,20 @@ def micro_road_lookup(
         confidence = 0.0
     else:
         micro_direction = "B" if b_score > p_score else "P"
-        edge = abs(b_score - p_score) * MICRO_ROAD_CONFIDENCE_SCALE
-        edge = clamp(max(edge, MICRO_ROAD_BASE_EDGE), 0.0, MICRO_ROAD_MAX_EDGE)
-        banker, _ = side_to_prob(micro_direction, edge)
-        confidence = clamp(edge / max(MICRO_ROAD_MAX_EDGE, 0.0001), 0.0, 1.0)
+        raw_edge = abs(b_score - p_score) * MICRO_ROAD_CONFIDENCE_SCALE
+        raw_edge = clamp(max(raw_edge, MICRO_ROAD_BASE_EDGE), 0.0, MICRO_ROAD_MAX_EDGE)
+
+        # 長龍風險衰減信心
+        confidence_decay = 1.0 - dragon_tail_risk * 0.7
+        final_edge = raw_edge * confidence_decay
+        banker, _ = side_to_prob(micro_direction, final_edge)
+        confidence = clamp(final_edge / max(MICRO_ROAD_MAX_EDGE, 0.0001), 0.0, 1.0)
 
     return {
         "available": bool(patterns),
         "banker_prob": banker,
         "player_prob": 1.0 - banker,
-        "source": "MICRO_ROAD_MODEL_V10_1",
+        "source": "MICRO_ROAD_MODEL_V10_2",
         "sample_size": len(seq),
         "total_simulated_samples": len(seq),
         "micro_direction": micro_direction,
@@ -342,4 +366,5 @@ def micro_road_lookup(
         "recent_road": "".join(seq),
         "direction_scores": direction_scores,
         "context": ctx,
+        "dragon_tail_risk": dragon_tail_risk,
     }
