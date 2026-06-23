@@ -34,7 +34,7 @@ except Exception:
     micro_road_lookup = None
 
 # ============================================================
-# V10.5：點數主導 + AI 輔助 + DeepSeek 獨立預測融合
+# V10.6：點數主導 + AI 輔助 + DeepSeek + 下一局情境預測
 # ============================================================
 
 def env_bool(name: str, default: str = "0") -> bool:
@@ -149,6 +149,10 @@ AI_DB_WEIGHT_PATTERN = env_float("AI_DB_WEIGHT_PATTERN", "0.40")
 AI_DB_WEIGHT_DB = env_float("AI_DB_WEIGHT_DB", "0.30")
 AI_DB_MIN_CONFIDENCE = env_float("AI_DB_MIN_CONFIDENCE", "0.45")
 AI_DB_BLEND_FACTOR = env_float("AI_DB_BLEND_FACTOR", "0.30")
+
+# V10.6 新增：下一局補牌情境預測
+USE_NEXT_SCENARIO_PREDICT = env_bool("USE_NEXT_SCENARIO_PREDICT", "0")
+NEXT_SCENARIO_WEIGHT = env_float("NEXT_SCENARIO_WEIGHT", "0.4")
 
 BASE_BANKER_NO_TIE = 0.5000
 MIN_OUTPUT_PROB = env_float("MIN_OUTPUT_PROB", "0.39")
@@ -1370,7 +1374,7 @@ def apply_decision_controller(
     }
 
 # ============================================================
-# 主預測函式 V10.5 (DeepSeek 獨立預測融合)
+# 主預測函式 V10.6 (新增下一局情境預測融合)
 # ============================================================
 def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     player_point = validate_point(player_point)
@@ -1383,6 +1387,32 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
 
     point = point_db_lookup(player_point, banker_point)
     comp = composition_mc_layer(player_point, banker_point, rounds=model_rounds)
+
+    # ---------- V10.6 新增：融合下一局補牌情境預測 ----------
+    if USE_NEXT_SCENARIO_PREDICT:
+        try:
+            from next_scenario_db import get_next_scenario_probs
+            next_probs = get_next_scenario_probs(player_point, banker_point)
+            if next_probs:
+                # 取得原本的 scenario_debug 列表，若無則建空列表
+                comp_scenarios = comp.get("scenario_debug", [])
+                combined = {}
+                # 合併現有情境機率 (當局反推)
+                for s in comp_scenarios:
+                    sc = s.get("scenario", "UNKNOWN")
+                    prob = s.get("scenario_probability", s.get("weight", 0))
+                    combined[sc] = combined.get(sc, 0) + prob * (1.0 - NEXT_SCENARIO_WEIGHT)
+                # 合併下一局預測機率
+                for sc, prob in next_probs.items():
+                    combined[sc] = combined.get(sc, 0) + prob * NEXT_SCENARIO_WEIGHT
+                # 標準化
+                total = sum(combined.values())
+                if total > 0:
+                    new_debug = [{"scenario": sc, "scenario_probability": p/total} for sc, p in combined.items()]
+                    comp = {**comp, "scenario_debug": new_debug}
+        except Exception:
+            pass  # 若模組或資料庫不存在，則維持原 comp 不變
+
     combo = combo_condition_lookup(player_point, banker_point, rounds=model_rounds, comp=comp)
     road = road_profile_layer(player_point, banker_point, comp=comp)
     micro = micro_road_layer(player_point, banker_point, rounds=rounds, comp=comp)
@@ -1515,7 +1545,6 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         + comp["banker_prob"] * comp_w
     ) / total_weight
 
-    # 保存原始 banker 以便記錄
     banker_before_deepseek = banker
 
     # ---------- DeepSeek 獨立預測融合 ----------
@@ -1526,7 +1555,6 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
                 DEEPSEEK_INDEPENDENT_WEIGHT,
             )
 
-            # 準備近期點數摘要
             rounds_summary = ""
             if rounds:
                 recent_rounds = rounds[-8:]
@@ -1771,10 +1799,9 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_5_DEEPSEEK_FUSION",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_6_NEXT_SCENARIO",
     }
 
-    # 記錄 DeepSeek 獨立預測結果
     if result_deepseek is not None:
         result["deepseek_independent"] = result_deepseek
 
