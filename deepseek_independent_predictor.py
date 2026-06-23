@@ -1,4 +1,3 @@
-# deepseek_independent_predictor.py
 import os
 import json
 from typing import Dict, Any, Optional
@@ -26,7 +25,6 @@ def build_intelligence_report(
     ai: Dict[str, Any],
     rounds_summary: str,
 ) -> str:
-    """建立給 DeepSeek 的完整情報報告"""
     gap = abs(player_point - banker_point)
     if gap == 0:
         gap_family = "和點"
@@ -40,6 +38,20 @@ def build_intelligence_report(
         gap_family = "極大差距(8-9)"
 
     last_result = "閒" if player_point > banker_point else "莊" if banker_point > player_point else "和"
+
+    # ── V10.6 新增：讀取下一局補牌情境預測 ──
+    next_scenario_text = "無預測資料"
+    if os.getenv("USE_NEXT_SCENARIO_PREDICT", "0") == "1":
+        try:
+            from next_scenario_db import get_next_scenario_probs
+            next_probs = get_next_scenario_probs(player_point, banker_point)
+            if next_probs:
+                items = [f"{k}: {v*100:.1f}%" for k, v in sorted(next_probs.items(), key=lambda x: x[1], reverse=True)]
+                next_scenario_text = ", ".join(items)
+            else:
+                next_scenario_text = "資料庫尚無此點數的預測"
+        except Exception:
+            next_scenario_text = "模組載入失敗"
 
     report = f"""
 === 當前局情報 ===
@@ -62,6 +74,9 @@ def build_intelligence_report(
 次可能情境機率: {comp.get('second_scenario_probability', 0):.3f}
 情境熵: {comp.get('scenario_entropy', 1):.3f} (越高代表越不確定)
 模擬後莊家勝率: {comp.get('banker_prob', 0.5):.4f}
+
+=== 下一局補牌情境預測 (基於上一局點數) ===
+{next_scenario_text}
 
 === 牌路資料庫 (road_profile，相似路段分佈) ===
 可用: {road.get('available')}，樣本數: {road.get('sample_size', 0)}
@@ -98,7 +113,6 @@ def deepseek_independent_predict(
     ai: Dict[str, Any],
     rounds_summary: str,
 ) -> Optional[float]:
-    """獨立預測：讓 DeepSeek 閱讀完整情報後給出機率"""
     if not USE_DEEPSEEK_INDEPENDENT or not DEEPSEEK_API_KEY or OpenAI is None:
         return None
 
