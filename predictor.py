@@ -34,7 +34,7 @@ except Exception:
     micro_road_lookup = None
 
 # ============================================================
-# V10.4：點數主導 + AI 輔助 + 強弩之末保護 + 差距區間 combo
+# V10.5：點數主導 + AI 輔助 + DeepSeek 獨立預測融合
 # ============================================================
 
 def env_bool(name: str, default: str = "0") -> bool:
@@ -1370,7 +1370,7 @@ def apply_decision_controller(
     }
 
 # ============================================================
-# 主預測函式 V10.4
+# 主預測函式 V10.5 (DeepSeek 獨立預測融合)
 # ============================================================
 def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     player_point = validate_point(player_point)
@@ -1514,6 +1514,51 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         + ai["banker_prob"] * sim_w
         + comp["banker_prob"] * comp_w
     ) / total_weight
+
+    # 保存原始 banker 以便記錄
+    banker_before_deepseek = banker
+
+    # ---------- DeepSeek 獨立預測融合 ----------
+    if os.getenv("USE_DEEPSEEK_INDEPENDENT", "0") == "1":
+        try:
+            from deepseek_independent_predictor import (
+                deepseek_independent_predict,
+                DEEPSEEK_INDEPENDENT_WEIGHT,
+            )
+
+            # 準備近期點數摘要
+            rounds_summary = ""
+            if rounds:
+                recent_rounds = rounds[-8:]
+                rounds_summary = " → ".join(
+                    [f"閒{r['player_point']}莊{r['banker_point']}" for r in recent_rounds if isinstance(r, dict)]
+                )
+
+            ai_banker = deepseek_independent_predict(
+                player_point,
+                banker_point,
+                point,
+                combo,
+                road,
+                comp,
+                micro,
+                ai,
+                rounds_summary,
+            )
+            if ai_banker is not None:
+                blend_w = clamp(float(DEEPSEEK_INDEPENDENT_WEIGHT), 0.0, 1.0)
+                banker = ai_banker if blend_w >= 1.0 else banker * (1.0 - blend_w) + ai_banker * blend_w
+                result_deepseek = {
+                    "ai_banker": ai_banker,
+                    "weight": blend_w,
+                    "original_banker": banker_before_deepseek,
+                }
+            else:
+                result_deepseek = None
+        except Exception:
+            result_deepseek = None
+    else:
+        result_deepseek = None
 
     banker_before_decision_controller = banker
     banker, decision_controller_info = apply_decision_controller(
@@ -1726,8 +1771,12 @@ def predict(player_point: int, banker_point: int, rounds: List[Dict[str, Any]] =
         },
         "history_used": bool(model_rounds),
         "rounds_ignored": bool(rounds and PREDICT_CURRENT_ROUND_ONLY),
-        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_4_STRONG_NU_MO",
+        "mode": "POINT_CONDITION_COMBO_COMPOSITION_MC_V10_5_DEEPSEEK_FUSION",
     }
+
+    # 記錄 DeepSeek 獨立預測結果
+    if result_deepseek is not None:
+        result["deepseek_independent"] = result_deepseek
 
     if USE_MONTE_CARLO:
         mc_result = monte_carlo_verify_from_probs(
