@@ -1,23 +1,100 @@
 # point_composition_mc.py
-# V10.6：保留原有的補牌情境 Monte Carlo 模擬，並新增輸出下一局點數分佈。
+# V10.6：使用真實點數差距資料庫模擬下一局點數，並輸出補牌情境與點數分佈
 
 import random
 import os
-from typing import Dict, Any, List, Optional
+import json
+from typing import Dict, Any, List, Optional, Tuple
 
-# 百家樂補牌規則（標準，8副牌近似機率，不考慮牌堆消耗）
-# 我們使用簡化規則：以點數為基礎，模擬閒家、莊家補牌機率，並得到下一局的點數組合。
+# 嘗試載入 config 以讀取環境變數（若有）
+try:
+    import config
+except Exception:
+    config = None
 
-# 基礎點數生成（均勻 0-9，近似；真實情況會受到牌堆影響，但此處僅作情境模擬）
-def _random_point() -> int:
-    return random.randint(0, 9)
+# 環境變數
+USE_NEXT_POINT_GAP_DB = os.getenv("USE_NEXT_POINT_GAP_DB", "1") == "1"
+NEXT_POINT_GAP_DB_PATH = os.getenv("NEXT_POINT_GAP_DB_PATH", "data/next_point_gap_db.json")
+COMPOSITION_MC_SIMULATIONS = int(os.getenv("COMPOSITION_MC_SIMULATIONS", "800"))
+COMPOSITION_MC_MAX_COMBOS = int(os.getenv("COMPOSITION_MC_MAX_COMBOS", "300"))
 
-# 補牌規則：閒家是否補牌
-def player_draws(player_point: int) -> bool:
+def _load_gap_db() -> Dict[str, Dict[str, float]]:
+    """載入點數差距資料庫"""
+    if not USE_NEXT_POINT_GAP_DB:
+        return {}
+    path = NEXT_POINT_GAP_DB_PATH
+    if not os.path.exists(path):
+        # 嘗試從專案根目錄找
+        path = os.path.join(os.getcwd(), path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+# 快取資料庫（避免每次模擬都讀檔）
+_gap_db_cache = None
+
+def _get_gap_probabilities(player_point: int, banker_point: int) -> Optional[Dict[str, float]]:
+    """取得給定點數的下一局差距機率分佈"""
+    global _gap_db_cache
+    if _gap_db_cache is None:
+        _gap_db_cache = _load_gap_db()
+    key = f"P{player_point}_B{banker_point}"
+    return _gap_db_cache.get(key)
+
+def _random_point_by_gap(gap: int, rng: random.Random) -> Tuple[int, int]:
+    """根據差距隨機生成一組閒莊點數（0-9）"""
+    # 隨機選擇閒點，再計算莊點 = 閒點 ± gap，確保在 0-9 範圍內
+    player = rng.randint(0, 9)
+    if gap == 0:
+        banker = player
+    else:
+        # 隨機決定莊點比閒點大或小
+        if rng.random() < 0.5:
+            banker = player + gap
+        else:
+            banker = player - gap
+    # 調整到 0-9 範圍（若超出則鏡像或重新隨機，簡單處理：重新選取）
+    attempts = 0
+    while not (0 <= banker <= 9):
+        player = rng.randint(0, 9)
+        if gap == 0:
+            banker = player
+        else:
+            if rng.random() < 0.5:
+                banker = player + gap
+            else:
+                banker = player - gap
+        attempts += 1
+        if attempts > 100:  # 安全機制
+            banker = rng.randint(0, 9)
+            break
+    return player, banker
+
+def _sample_gap_from_distribution(probs: Dict[str, float], rng: random.Random) -> int:
+    """從機率分佈中抽樣一個 gap 值（0-9）"""
+    items = []
+    weights = []
+    for k, v in probs.items():
+        if k.startswith("gap_"):
+            g = int(k.split("_")[1])
+            items.append(g)
+            weights.append(v)
+    if not items:
+        return rng.randint(0, 9)
+    # 標準化（可能總和不為1）
+    total = sum(weights)
+    weights = [w/total for w in weights]
+    return rng.choices(items, weights=weights, k=1)[0]
+
+# 補牌相關函數（與先前一致）
+def _player_draws(player_point: int) -> bool:
     return player_point <= 5
 
-# 莊家是否補牌（需知道閒家是否補牌及閒家第三張牌點數）
-def banker_draws(banker_point: int, player_drew: bool, player_third: Optional[int] = None) -> bool:
+def _banker_draws(banker_point: int, player_drew: bool, player_third: Optional[int] = None) -> bool:
     if banker_point >= 7:
         return False
     if banker_point <= 2:
@@ -37,63 +114,64 @@ def banker_draws(banker_point: int, player_drew: bool, player_third: Optional[in
         return player_third in (6, 7)
     return False
 
-def simulate_one_game(player_point: int, banker_point: int) -> Dict[str, Any]:
-    """模擬一局，返回 (scenario, next_player_point, next_banker_point)"""
-    # 當前局點數已知，我們需要模擬這一局的補牌情境，並計算下一局的起始點數
-    # 注意：這一局的點數已經是結果，我們需要知道補牌情境才能反推，但這裡是「給定上一局點數，模擬下一局可能的補牌情境和點數」。
-    # 實際上 composition_mc 的用途是：給定已知點數（如 P7_B5），模擬這一局可能的補牌情境機率。
-    # 但是，要得到下一局的點數分佈，我們需要先模擬這一局的補牌，得到這一局的真實點數（補牌後），然後下一局的起始點數就是這一局的最終點數（但百家樂每一局獨立發牌，點數並不連續）。
-    # 這裡簡化：假設每一局點數獨立，我們直接隨機生成下一局點數，並根據點數計算補牌情境。
-    # 這樣做雖然不夠精確，但可提供一個參考分佈。
-    # 更正確的做法是從 combo_db 中獲取「給定當前點數，下一局點數組合的統計分佈」，但我們沒有。
-    # 我們採用折衷：利用當前點數的 gap 等資訊，生成偏向性的點數分佈，但這裡先簡單均勻分佈，權當示範。
-    # 後續可以用真實統計替換。
-    
-    next_player = _random_point()
-    next_banker = _random_point()
-    
-    # 計算下一局的補牌情境（用於回傳 scenario）
-    pd = player_draws(next_player)
+def _determine_scenario(player_point: int, banker_point: int, rng: random.Random) -> str:
+    """給定點數，判斷補牌情境（模擬第三張牌）"""
+    pd = _player_draws(player_point)
+    player_third = None
     if pd:
-        player_third = _random_point()
-    else:
-        player_third = None
-    bd = banker_draws(next_banker, pd, player_third)
+        player_third = rng.randint(0, 9)  # 簡化第三張牌點數隨機
+    bd = _banker_draws(banker_point, pd, player_third)
     
     if not pd and not bd:
-        scenario = "NONE_DRAW"
+        return "NONE_DRAW"
     elif pd and not bd:
-        scenario = "PLAYER_DRAW"
+        return "PLAYER_DRAW"
     elif not pd and bd:
-        scenario = "BANKER_DRAW"
+        return "BANKER_DRAW"
     else:
-        scenario = "BOTH_DRAW"
-    
-    return {
-        "scenario": scenario,
-        "next_player_point": next_player,
-        "next_banker_point": next_banker,
-    }
+        return "BOTH_DRAW"
 
 def composition_mc_lookup(
     player_point: int,
     banker_point: int,
-    n_sim: int = 500,
-    max_combos: int = 200,
+    n_sim: int = None,
+    max_combos: int = None,
     seed_key: str = "",
 ) -> Dict[str, Any]:
     """
     執行 Monte Carlo 模擬，返回補牌情境分佈 + 下一局點數分佈。
+    使用真實點數差距資料庫（若有）來生成下一局點數。
     """
+    if n_sim is None:
+        n_sim = COMPOSITION_MC_SIMULATIONS
+    if max_combos is None:
+        max_combos = COMPOSITION_MC_MAX_COMBOS
+    
     rng = random.Random(seed_key)
+    
+    # 取得該點數的下一局差距機率
+    gap_probs = _get_gap_probabilities(player_point, banker_point)
+    
     scenario_counts = {"NONE_DRAW": 0, "PLAYER_DRAW": 0, "BANKER_DRAW": 0, "BOTH_DRAW": 0}
     point_dist = {}  # (p,b) -> count
     
     for _ in range(n_sim):
-        sim = simulate_one_game(player_point, banker_point)
-        scenario_counts[sim["scenario"]] += 1
-        key = (sim["next_player_point"], sim["next_banker_point"])
+        # 決定下一局點數
+        if gap_probs:
+            gap = _sample_gap_from_distribution(gap_probs, rng)
+            next_player, next_banker = _random_point_by_gap(gap, rng)
+        else:
+            # 沒有資料庫時，均勻隨機
+            next_player = rng.randint(0, 9)
+            next_banker = rng.randint(0, 9)
+        
+        # 記錄點數組合
+        key = (next_player, next_banker)
         point_dist[key] = point_dist.get(key, 0) + 1
+        
+        # 判斷該點數組合的補牌情境
+        scenario = _determine_scenario(next_player, next_banker, rng)
+        scenario_counts[scenario] += 1
     
     # 標準化情境機率
     total = sum(scenario_counts.values())
@@ -108,14 +186,14 @@ def composition_mc_lookup(
     top_scenario = scenario_debug[0]["scenario"] if scenario_debug else "UNKNOWN"
     top_scenario_prob = scenario_debug[0]["scenario_probability"] if scenario_debug else 0.0
     
-    # 計算情境熵
+    # 情境熵（簡化）
     entropy = 0.0
     for s in scenario_debug:
         p = s["scenario_probability"]
         if p > 0:
-            entropy -= p * (p ** 0.5)  # 簡化熵，非嚴格定義
+            entropy -= p * (p ** 0.5)  # 非嚴格熵，僅供參考
     
-    # 下一局點數分佈（取前 max_combos 個）
+    # 下一局點數分佈
     sorted_points = sorted(point_dist.items(), key=lambda x: x[1], reverse=True)[:max_combos]
     total_points = sum(cnt for _, cnt in sorted_points)
     next_point_distribution = []
@@ -127,12 +205,7 @@ def composition_mc_lookup(
             "probability": prob,
         })
     
-    # 計算基於點數分佈的莊閒機率（下一局）
-    # 這裡的 banker_prob 可以簡單用下一局點數分佈中莊勝的機率來估計，但保持原有輸出結構
-    # 原有的 banker_prob 是基於情境查詢 combo_db 後的結果，這裡我們只提供模擬的點數分佈，不干擾原有邏輯。
-    # 回傳的 banker_prob 沿用以前的計算方式（例如從 combo_db 查詢），此處我們只輸出原始資料。
-    # 為了相容 predictor，仍需提供 banker_prob 等，但實際會由 predictor 後續融合。
-    # 我們提供一個基於點數分佈的粗略機率：
+    # 粗略莊閒機率（基於點數分佈中點數大小判斷）
     b_prob = 0.5
     p_prob = 0.5
     if next_point_distribution:
@@ -143,6 +216,7 @@ def composition_mc_lookup(
             b_prob = bw / total_w
             p_prob = pw / total_w
     
+    # 相容原有輸出欄位
     return {
         "available": True,
         "feature_key": f"P{player_point}_B{banker_point}_COMPOSITION_MC",
@@ -172,5 +246,5 @@ def composition_mc_lookup(
         "natural_side": "NONE",
         "realistic_rule_filter": False,
         "scenario_count": len(scenario_debug),
-        "next_point_distribution": next_point_distribution,  # 新增欄位
+        "next_point_distribution": next_point_distribution,  # 新增輸出
     }
