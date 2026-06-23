@@ -39,7 +39,7 @@ def build_intelligence_report(
 
     last_result = "閒" if player_point > banker_point else "莊" if banker_point > player_point else "和"
 
-    # ── V10.6 新增：讀取下一局補牌情境預測 ──
+    # --- 下一局補牌情境預測 ---
     next_scenario_text = "無預測資料"
     if os.getenv("USE_NEXT_SCENARIO_PREDICT", "0") == "1":
         try:
@@ -49,9 +49,33 @@ def build_intelligence_report(
                 items = [f"{k}: {v*100:.1f}%" for k, v in sorted(next_probs.items(), key=lambda x: x[1], reverse=True)]
                 next_scenario_text = ", ".join(items)
             else:
-                next_scenario_text = "資料庫尚無此點數的預測"
+                next_scenario_text = "尚無此點數的統計"
         except Exception:
             next_scenario_text = "模組載入失敗"
+
+    # --- 下一局點數分佈預測 ---
+    point_dist_text = "無預測資料"
+    next_point_details = ""
+    if "next_point_distribution" in comp and comp["next_point_distribution"]:
+        dist = comp["next_point_distribution"]
+        items = []
+        # 取前 8 個機率最高的點數
+        for d in dist[:8]:
+            pp, bp, prob = d["player_point"], d["banker_point"], d["probability"]
+            items.append(f"閒{pp}莊{bp}：{prob*100:.1f}%")
+            # 查詢該點數組合的再下一局補牌情境預測
+            if os.getenv("USE_NEXT_SCENARIO_PREDICT", "0") == "1":
+                try:
+                    from next_scenario_db import get_next_scenario_probs
+                    sub_probs = get_next_scenario_probs(pp, bp)
+                    if sub_probs:
+                        sub_items = [f"{k}:{v*100:.1f}%" for k, v in sorted(sub_probs.items(), key=lambda x: x[1], reverse=True)]
+                        next_point_details += f"   ↳ 若開閒{pp}莊{bp}，再下一局補牌：{', '.join(sub_items)}\n"
+                except Exception:
+                    pass
+        point_dist_text = ", ".join(items)
+    else:
+        point_dist_text = "尚未計算"
 
     report = f"""
 === 當前局情報 ===
@@ -62,39 +86,36 @@ def build_intelligence_report(
 可用: {point.get('available')}，樣本數: {point.get('sample_size', 0)}
 莊家勝率: {point.get('banker_prob', 0.5):.4f}，閒家勝率: {point.get('player_prob', 0.5):.4f}
 
-=== 條件資料庫 (combo_db，點數+補牌情境) ===
+=== 條件資料庫 (combo_db) ===
 可用: {combo.get('available')}，總樣本: {combo.get('sample_size', 0)}
 莊家勝率: {combo.get('banker_prob', 0.5):.4f}，閒家勝率: {combo.get('player_prob', 0.5):.4f}
 主要情境: {combo.get('top_scenario', '未知')}
-匹配記錄數: {len(combo.get('matched_records', []))}
 
 === 補牌情境 Monte Carlo ===
-可用: {comp.get('available')}，模擬樣本: {comp.get('sample_size', 0)}
 最可能情境: {comp.get('top_scenario')} (機率 {comp.get('top_scenario_probability', 0):.3f})
-次可能情境機率: {comp.get('second_scenario_probability', 0):.3f}
-情境熵: {comp.get('scenario_entropy', 1):.3f} (越高代表越不確定)
-模擬後莊家勝率: {comp.get('banker_prob', 0.5):.4f}
+情境熵: {comp.get('scenario_entropy', 1):.3f}
 
 === 下一局補牌情境預測 (基於上一局點數) ===
 {next_scenario_text}
 
-=== 牌路資料庫 (road_profile，相似路段分佈) ===
-可用: {road.get('available')}，樣本數: {road.get('sample_size', 0)}
+=== 下一局點數分佈預測 (模擬可能開出的點數) ===
+{point_dist_text}
+{next_point_details}
+
+=== 牌路資料庫 (road_profile) ===
 最相似路段: {road.get('top_road_profile_zh', '無')}
-莊家勝率: {road.get('banker_prob', 0.5):.4f}
 
 === 短牌路模型 (最近4-8口) ===
 方向: {micro.get('micro_direction')}，信心: {micro.get('micro_confidence', 0):.2f}
 模式: {micro.get('micro_patterns', [])}
 龍尾風險: {micro.get('dragon_tail_risk', 0):.2f}
 
-=== AI 模式識別 (近8局結果規律) ===
+=== AI 模式識別 ===
 模式類型: {ai.get('pattern_type')}，強度: {ai.get('pattern_strength', 0):.2f}
-模式建議方向: {ai.get('pattern_suggest')}
-長龍資訊: {ai.get('streak_side')} {ai.get('streak_count', 0)}口
-近期結果序列: {ai.get('history_results', [])}
+建議方向: {ai.get('pattern_suggest')}
+近期結果: {ai.get('history_results', [])}
 
-=== 近期點數趨勢 (最近8局原始點數) ===
+=== 近期點數趨勢 ===
 {rounds_summary}
 
 請根據以上所有情報，推理下一手莊家勝率。只輸出一個0到1之間的數字，例如0.5234。
