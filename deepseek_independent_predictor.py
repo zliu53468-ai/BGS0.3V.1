@@ -12,7 +12,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 USE_DEEPSEEK_INDEPENDENT = os.getenv("USE_DEEPSEEK_INDEPENDENT", "0") == "1"
-DEEPSEEK_INDEPENDENT_WEIGHT = float(os.getenv("DEEPSEEK_INDEPENDENT_WEIGHT", "0.75"))
+DEEPSEEK_INDEPENDENT_WEIGHT = float(os.getenv("DEEPSEEK_INDEPENDENT_WEIGHT", "0.78"))
 
 
 def build_intelligence_report(
@@ -27,31 +27,31 @@ def build_intelligence_report(
     rounds_summary: str,
 ) -> str:
     gap = abs(player_point - banker_point)
-    # 點差區間與對應的歷史調參經驗
+    # 強化點差建議
     if gap == 0:
         gap_family = "和點"
-        gap_advice = "點差為0，模型極不穩定，應完全依靠近期規律（單跳/長龍）和短牌路方向，忽略點數統計層。"
+        gap_advice = "點差為0，模型極不穩定。請完全忽略點數統計層，以近期規律（單跳/長龍）和短牌路方向為唯一依據。"
     elif gap <= 2:
         gap_family = f"極小差距({gap})"
-        gap_advice = "點差很小，點數統計區分力不足。請優先參考近期結果規律、短牌路模型，以及 AI 模式識別，點數層僅作微幅參考。"
+        gap_advice = "點差很小，點數層無效。請以近期結果規律和 AI 模式識別為主要依據，點數層最多 20% 權重。"
     elif gap <= 4:
         gap_family = f"中小差距({gap})"
-        gap_advice = "有一定方向性，但補牌情境影響顯著。請以條件資料庫和補牌情境 MC 為主要依據，並參考近期規律是否支持。"
+        gap_advice = "有一定方向性，但補牌情境影響顯著。若補牌預測與強勢方矛盾，應降低強勢方信心。"
     elif gap <= 7:
         gap_family = f"中高差距({gap})"
-        gap_advice = "強勢方明顯，通常跟隨強勢方，但需警惕翻盤。若短牌路出現轉折信號，應降低強勢方信心。"
+        gap_advice = "強勢方明顯，通常跟隨強勢方。但若短牌路出現轉折信號或補牌預測相反，請勿過度追強。"
     else:
         gap_family = f"極大差距({gap})"
-        gap_advice = "極度懸殊，強勢方高度可信，但歷史上仍有約 5% 的翻盤機率。若近期規律與強勢方相反，請小心。"
+        gap_advice = "⚠️ 極度懸殊，歷史上翻盤率約 8~12%。若近期規律不支持強勢方，或短牌路出現轉折，請優先考慮反向。不要盲目追強。"
 
-    # 補牌情境影響指南（經驗法則）
+    # 補牌影響指南
     draw_guide = """
-【補牌情境對勝率的影響（經驗法則）】
-- NONE_DRAW：雙方不補牌，原始點數直接決定勝負，點差越大越可信。
-- PLAYER_DRAW：閒家補牌，莊家優勢微幅上升（約 +0.02~0.04），因為閒家補牌後點數可能變小。
-- BANKER_DRAW：莊家補牌，閒家優勢微幅上升（約 +0.02~0.04）。
-- BOTH_DRAW：雙方補牌，不確定性最高，勝率趨近 50%，需依靠點差和其他規律。
-請根據預測的補牌情境機率，動態調整你給出的莊家勝率。例如，若 PLAYER_DRAW 機率很高，應在基礎勝率上略微調高莊家勝率。
+【補牌情境對勝率的強制調整規則】
+- 若下一局 NONE_DRAW 機率最高：勝率直接由點差決定，點差越大越可信。
+- 若下一局 PLAYER_DRAW 機率最高：莊家勝率微幅上升（+0.02~0.05），因為閒補牌後點數可能變小。
+- 若下一局 BANKER_DRAW 機率最高：閒家勝率微幅上升（+0.02~0.05）。
+- 若下一局 BOTH_DRAW 機率最高：不確定性極高，勝率趨近 0.5，請大幅降低信心，以近期規律為主。
+請嚴格根據預測的補牌情境機率，動態調整你給出的莊家勝率。
 """
 
     last_result = "閒" if player_point > banker_point else "莊" if banker_point > player_point else "和"
@@ -64,7 +64,7 @@ def build_intelligence_report(
     streak_count = ai.get("streak_count", 0)
     pattern_detail = ai.get("pattern_detail", "")
     if streak_count >= 5:
-        pattern_detail += " (長龍尾端，反轉風險升高)"
+        pattern_detail += " (⚠️長龍尾端，反轉風險極高，請勿追龍)"
 
     # 各層方向共識
     def side(p):
@@ -79,11 +79,11 @@ def build_intelligence_report(
     }
     unique_sides = len(set(layers_sides.values()))
     if unique_sides <= 2:
-        consensus = "✅ 高度一致，可信度較高"
+        consensus = "✅ 高度一致"
     elif unique_sides == 3:
-        consensus = "⚠️ 有明顯分歧，請仔細權衡"
+        consensus = "⚠️ 有明顯分歧，請以近期規律和點差特性為準"
     else:
-        consensus = "🚨 各層方向混亂，應以近期規律和點差特性為最終依據"
+        consensus = "🚨 各層方向混亂，必須以近期規律為唯一依據"
 
     # 下一局補牌情境預測
     next_scenario_text = "無預測資料"
@@ -97,12 +97,12 @@ def build_intelligence_report(
         except Exception:
             pass
 
-    # 下一局點數分佈（取前10）
+    # 下一局點數分佈（取前8）
     point_dist_text = "無預測資料"
     if "next_point_distribution" in comp and comp["next_point_distribution"]:
         dist = comp["next_point_distribution"]
         items = []
-        for d in dist[:10]:
+        for d in dist[:8]:
             pp, bp, prob = d["player_point"], d["banker_point"], d["probability"]
             result = "閒勝" if pp > bp else ("莊勝" if bp > pp else "和")
             items.append(f"閒{pp}莊{bp} ({result}) {prob*100:.1f}%")
