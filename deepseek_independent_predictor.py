@@ -43,7 +43,17 @@ def build_intelligence_report(
     else:
         gap_family = f"極大差距({gap})"
         gap_advice = "極度懸殊，強勢方高度可信，但歷史上仍有約 5% 的翻盤機率。若近期規律與強勢方相反，請小心。"
-    
+
+    # 補牌情境影響指南（經驗法則）
+    draw_guide = """
+【補牌情境對勝率的影響（經驗法則）】
+- NONE_DRAW：雙方不補牌，原始點數直接決定勝負，點差越大越可信。
+- PLAYER_DRAW：閒家補牌，莊家優勢微幅上升（約 +0.02~0.04），因為閒家補牌後點數可能變小。
+- BANKER_DRAW：莊家補牌，閒家優勢微幅上升（約 +0.02~0.04）。
+- BOTH_DRAW：雙方補牌，不確定性最高，勝率趨近 50%，需依靠點差和其他規律。
+請根據預測的補牌情境機率，動態調整你給出的莊家勝率。例如，若 PLAYER_DRAW 機率很高，應在基礎勝率上略微調高莊家勝率。
+"""
+
     last_result = "閒" if player_point > banker_point else "莊" if banker_point > player_point else "和"
 
     # 近期規律
@@ -101,13 +111,17 @@ def build_intelligence_report(
     report = f"""
 你是一位專精百家樂數據的 AI 分析師。請根據以下完整的結構化情報，推理下一手莊家勝率。
 
-【核心決策框架】你必須按此順序思考：
+【補牌影響指南】你必須嚴格遵守以下規則來調整機率：
+{draw_guide}
+
+【核心決策框架】按此順序思考：
 1. 點差特性：{gap_family}。{gap_advice}
 2. 各層共識：{consensus}
    各層方向：{json.dumps(layers_sides, ensure_ascii=False)}
 3. 近期規律：模式 {pattern_type} (強度 {pattern_strength:.2f})，建議方向 {pattern_suggest}，{pattern_detail}
    近期長龍：{streak_side} {streak_count}口
 4. 下一局補牌預測：{next_scenario_text}
+   請根據上述補牌影響指南，計算加權後的莊家勝率。
 5. 下一局最可能開出的點數與勝方：{point_dist_text}
 6. 參考統計數據：
    - 點數歷史勝率：莊 {point.get('banker_prob',0.5):.4f}（樣本 {point.get('sample_size',0)}）
@@ -116,7 +130,7 @@ def build_intelligence_report(
    - 短牌路方向：{micro.get('micro_direction')}（信心 {micro.get('micro_confidence',0):.2f}，龍尾風險 {micro.get('dragon_tail_risk',0):.2f}）
 7. 近期點數序列：{rounds_summary}
 
-請綜合以上所有資訊，特別嚴格遵循點差特性的建議，輸出一個 JSON 物件，格式如下：
+請綜合以上所有資訊，特別是補牌情境對勝率的調整規則，輸出一個 JSON 物件，格式如下：
 {{"banker_prob": 0.5234, "reasoning": "簡短說明你為何給出這個機率（20字內）"}}
 只輸出 JSON，不要有其他文字。
 """
@@ -148,15 +162,13 @@ def deepseek_independent_predict(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=100,
-            response_format={"type": "json_object"},  # 強制 JSON 輸出
+            response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content.strip()
-        # 嘗試解析 JSON
         data = json.loads(content)
         val = float(data.get("banker_prob", 0.5))
         return max(0.35, min(0.65, val))
     except json.JSONDecodeError:
-        # 若 JSON 解析失敗，嘗試用正則提取數字
         content = response.choices[0].message.content.strip()
         match = re.search(r"(\d+\.\d+)", content)
         if match:
