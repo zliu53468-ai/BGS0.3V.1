@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>AI 規律分析面板</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root { --yellow:#ffd000; --black:#111; --gray:#f4f4f4; --red:#e60012; --blue:#0033cc; --green:#00a000; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", Arial, sans-serif; background:#f1f1f1; color:#111; }
+    .wrap { max-width:480px; margin:0 auto; min-height:100vh; background:#fff; padding:14px; }
+    .top { background:linear-gradient(135deg,#111,#2d2d2d); border-radius:18px; padding:16px; color:#fff; box-shadow:0 6px 18px rgba(0,0,0,.18); }
+    .brand { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .brand h1 { font-size:21px; margin:0; color:var(--yellow); letter-spacing:.5px; }
+    .pill { background:rgba(255,208,0,.16); color:var(--yellow); border:1px solid rgba(255,208,0,.5); border-radius:999px; padding:5px 10px; font-size:12px; }
+    .card { background:#fff; border:1px solid #e7e7e7; border-radius:16px; padding:14px; margin-top:12px; box-shadow:0 3px 12px rgba(0,0,0,.06); }
+    .title { font-weight:800; font-size:16px; border-bottom:2px solid var(--yellow); padding-bottom:8px; margin-bottom:10px; }
+    label { display:block; font-size:13px; color:#444; margin:10px 0 5px; }
+    select,input { width:100%; height:42px; border:1px solid #ddd; border-radius:12px; padding:0 12px; font-size:15px; outline:none; background:#fff; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .btn { border:0; border-radius:12px; min-height:44px; padding:11px 12px; font-size:15px; font-weight:800; cursor:pointer; }
+    .btn-yellow { background:var(--yellow); color:#111; }
+    .btn-dark { background:#242424; color:#fff; }
+    .btn-red { background:#ffe8e8; color:var(--red); border:1px solid #ffb6b6; }
+    .btn-blue { background:#e8edff; color:var(--blue); border:1px solid #bdc9ff; }
+    .btn-green { background:#e9ffe9; color:var(--green); border:1px solid #b9efb9; }
+    .btn:active { transform:scale(.98); }
+    .road { display:flex; flex-wrap:wrap; gap:6px; min-height:40px; padding:10px; background:#fafafa; border-radius:12px; border:1px solid #eee; }
+    .chip { width:28px; height:28px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:13px; }
+    .B { color:var(--red); background:#fff0f0; border:1px solid #ffb7b7; }
+    .P { color:var(--blue); background:#eef2ff; border:1px solid #bac6ff; }
+    .T { color:var(--green); background:#efffee; border:1px solid #b8ebb6; }
+    .stats { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-top:8px; }
+    .stat { background:#fafafa; border:1px solid #eee; border-radius:12px; padding:10px; text-align:center; }
+    .stat small { display:block; color:#666; font-size:12px; }
+    .stat b { font-size:19px; }
+    .recommend { display:flex; justify-content:space-between; align-items:center; background:var(--yellow); border-radius:12px; padding:12px; font-size:18px; font-weight:900; margin-top:12px; }
+    .muted { color:#777; font-size:12px; line-height:1.5; }
+    .row { display:flex; justify-content:space-between; gap:12px; padding:6px 0; font-size:14px; }
+    .loading { opacity:.55; pointer-events:none; }
+
+    /* access control additions */
+    .access-box { background:#fffaf0; border:1px solid #ffe08a; border-radius:14px; padding:12px; margin-top:10px; }
+    .access-ok { background:#efffee; border-color:#b8ebb6; }
+    .access-bad { background:#fff0f0; border-color:#ffb7b7; }
+    .access-row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; font-size:13px; border-bottom:1px dashed rgba(0,0,0,.08); }
+    .access-row:last-child { border-bottom:0; }
+    .access-row span:first-child { color:#555; flex:0 0 86px; }
+    .access-row b { text-align:right; word-break:break-all; }
+    .notice { background:#fff6cc; border:1px solid #ffe08a; border-radius:12px; padding:10px; margin-top:10px; font-size:13px; line-height:1.55; }
+    .notice-danger { background:#fff0f0; border-color:#ffb7b7; color:#9d0000; }
+    .code-line { display:grid; grid-template-columns:1fr auto; gap:8px; margin-top:10px; }
+    .btn-small { min-height:42px; padding:8px 12px; white-space:nowrap; }
+    .blocked { display:none; position:fixed; inset:0; background:rgba(0,0,0,.78); z-index:9999; padding:18px; align-items:center; justify-content:center; }
+    .blocked.show { display:flex; }
+    .blocked-card { width:100%; max-width:420px; background:#fff; border-radius:18px; padding:18px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,.35); }
+    .blocked-card h2 { margin:0 0 8px; font-size:22px; }
+    .blocked-card p { color:#333; line-height:1.6; }
+
+  </style>
+</head>
+<body>
+  <div class="wrap" id="app">
+    <div class="top">
+      <div class="brand">
+        <h1>AI 規律分析</h1>
+        <span class="pill" id="statusPill">初始化</span>
+      </div>
+      <p class="muted" style="color:#ddd;margin:10px 0 0;">莊 / 閒 / 和點擊只更新面板，不會在聊天室洗版。按「開始AI判斷」才呼叫模型。</p>
+    </div>
+
+    <div class="card" id="accessCard">
+      <div class="title">使用權限 / 試用狀態</div>
+      <div class="access-box" id="accessBox">
+        <div class="access-row"><span>LINE UID</span><b id="uidText">讀取中</b></div>
+        <div class="access-row"><span>台北時間</span><b id="taipeiNow">--</b></div>
+        <div class="access-row"><span>目前方案</span><b id="planText">初始化</b></div>
+        <div class="access-row"><span>到期時間</span><b id="expireText">--</b></div>
+        <div class="access-row"><span>剩餘時間</span><b id="remainText">--</b></div>
+      </div>
+      <div class="notice" id="accessNotice">
+        尚未檢查使用權限。第一次點擊「開始AI判斷」後，系統會依 LINE UID 開始計算 30 分鐘試用。
+      </div>
+      <label>開通碼</label>
+      <div class="code-line">
+        <input id="activationCode" placeholder="請輸入買斷 / 月租開通碼" autocomplete="off" />
+        <button class="btn btn-yellow btn-small" onclick="activateCode()">開通</button>
+      </div>
+      <p class="muted">買斷碼可永久使用；月租碼為 30 天。臨時碼也可在 LINE 聊天室輸入後開通 30 分鐘。</p>
+    </div>
+
+    <div class="card">
+      <div class="title">1. 遊戲設定</div>
+      <div class="grid">
+        <div>
+          <label>遊戲館</label>
+          <select id="venue"></select>
+        </div>
+        <div>
+          <label>遊戲廳</label>
+          <select id="room"></select>
+        </div>
+      </div>
+      <label>靴號 / 桌號備註</label>
+      <input id="shoe" placeholder="例如 13539_40 / 5號桌" />
+      <button class="btn btn-yellow" style="width:100%;margin-top:12px;" onclick="startSession()">建立 / 更新本靴</button>
+    </div>
+
+    <div class="card">
+      <div class="title">2. 輸入莊閒和</div>
+      <div class="grid" style="grid-template-columns:1fr 1fr 1fr;">
+        <button class="btn btn-red" onclick="addRound('B')">莊 B</button>
+        <button class="btn btn-blue" onclick="addRound('P')">閒 P</button>
+        <button class="btn btn-green" onclick="addRound('T')">和 T</button>
+      </div>
+      <div class="grid" style="margin-top:10px;">
+        <button class="btn btn-dark" onclick="undoRound()">上一步</button>
+        <button class="btn btn-dark" onclick="resetRounds()">清除本靴</button>
+      </div>
+      <div class="row"><span>目前局數</span><b id="roundNo">第 1 局</b></div>
+      <div class="road" id="road"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">3. 規律模型 + DeepSeek 校準</div>
+      <button class="btn btn-yellow" style="width:100%;" onclick="runPredict()">開始AI判斷</button>
+      <div class="stats">
+        <div class="stat"><small>莊</small><b style="color:var(--red);" id="bRate">--</b></div>
+        <div class="stat"><small>閒</small><b style="color:var(--blue);" id="pRate">--</b></div>
+        <div class="stat"><small>和</small><b style="color:var(--green);" id="tRate">--</b></div>
+      </div>
+      <div class="recommend"><span>推薦</span><span id="rec">--</span></div>
+      <p class="muted" id="reason">尚未分析</p>
+      <button class="btn btn-dark" style="width:100%;margin-top:8px;" onclick="endSession()">結束分析</button>
+    </div>
+  </div>
+
+
+  <div class="blocked" id="blockedOverlay">
+    <div class="blocked-card">
+      <h2>使用權限提醒</h2>
+      <p id="blockedMessage">請聯繫管理員官方 LINE：@jins888</p>
+      <p><b id="redirectCountdown">30</b> 秒後將自動跳轉回官方 LINE。</p>
+      <button class="btn btn-yellow" style="width:100%;" onclick="goAdminLine()">聯繫管理員 @jins888</button>
+    </div>
+  </div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+let CONFIG = null;
+let USER_ID = localStorage.getItem('baccarat_user_id') || '';
+let SESSION = null;
+let ACCESS = null;
+let redirectTimer = null;
+let renderTimer = null;
+
+function api(path, options={}) {
+  return fetch(path, {
+    headers: {'Content-Type':'application/json'},
+    ...options
+  }).then(async r => {
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(data.detail || 'API error');
+    return data;
+  });
+}
+
+function setLoading(on) {
+  document.getElementById('app').classList.toggle('loading', !!on);
+}
+
+async function init() {
+  CONFIG = await api('/api/config');
+  fillSelects();
+  const ready = await initLiff();
+  if (!ready) return;
+  await refreshAccessStatus();
+  await loadCurrent();
+  startRenderTimer();
+}
+
+function fillSelects() {
+  const venueEl = document.getElementById('venue');
+  const roomEl = document.getElementById('room');
+  venueEl.innerHTML = '';
+  CONFIG.venues.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v.code;
+    opt.textContent = v.name;
+    venueEl.appendChild(opt);
+  });
+  const urlVenue = qs.get('venue');
+  if (urlVenue) venueEl.value = urlVenue;
+
+  roomEl.innerHTML = '';
+  CONFIG.rooms.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    roomEl.appendChild(opt);
+  });
+}
+
+async function initLiff() {
+  if (!CONFIG.liffId || !window.liff) {
+    blockAndRedirect('無法取得 LINE LIFF 設定，請從官方 LINE @jins888 重新開啟。', CONFIG?.accessRedirectSeconds || 30);
+    return false;
+  }
+
+  try {
+    await liff.init({ liffId: CONFIG.liffId });
+    if (!liff.isLoggedIn()) {
+      liff.login({ redirectUri: location.href });
+      return false;
+    }
+    const profile = await liff.getProfile();
+    USER_ID = profile.userId;
+    localStorage.setItem('baccarat_user_id', USER_ID);
+    return true;
+  } catch (e) {
+    console.warn('LIFF init failed', e);
+    blockAndRedirect('無法取得 LINE 使用者身分，請從官方 LINE @jins888 重新開啟。', CONFIG?.accessRedirectSeconds || 30);
+    return false;
+  }
+}
+
+async function refreshAccessStatus() {
+  const data = await api('/api/access/status?user_id=' + encodeURIComponent(USER_ID));
+  ACCESS = data.access;
+  renderAccess();
+
+  if (ACCESS && !ACCESS.active && !ACCESS.can_start_trial && ACCESS.state !== 'trial_available') {
+    blockAndRedirect(ACCESS.message || '請聯繫管理員官方 LINE：@jins888', ACCESS.redirect_after_seconds || 30);
+  }
+
+  return ACCESS;
+}
+
+function renderAccess() {
+  const access = ACCESS || {};
+  document.getElementById('uidText').textContent = USER_ID || access.user_id || '未取得';
+  document.getElementById('taipeiNow').textContent = formatTaipeiNow();
+  document.getElementById('planText').textContent = access.plan_label || '未檢查';
+  document.getElementById('expireText').textContent = access.expires_at_taipei || (access.plan === 'permanent' ? '永久' : '--');
+  document.getElementById('remainText').textContent = formatRemaining(access.remaining_seconds);
+  document.getElementById('accessNotice').textContent = access.message || '尚未檢查使用權限';
+
+  const box = document.getElementById('accessBox');
+  box.classList.remove('access-ok', 'access-bad');
+  if (access.active) box.classList.add('access-ok');
+  if (!access.active && !access.can_start_trial && access.state !== 'trial_available') box.classList.add('access-bad');
+}
+
+function formatTaipeiNow() {
+  return new Intl.DateTimeFormat('zh-TW', {
+    timeZone:'Asia/Taipei',
+    year:'numeric',
+    month:'2-digit',
+    day:'2-digit',
+    hour:'2-digit',
+    minute:'2-digit',
+    second:'2-digit',
+    hour12:false
+  }).format(new Date());
+}
+
+function formatRemaining(seconds) {
+  if (seconds === undefined || seconds === null || seconds === '' || isNaN(Number(seconds))) return '--';
+  const s = Math.max(0, Number(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (d > 0) return `${d}天 ${h}時 ${m}分`;
+  if (h > 0) return `${h}時 ${m}分 ${sec}秒`;
+  return `${m}分 ${sec}秒`;
+}
+
+function startRenderTimer() {
+  if (renderTimer) clearInterval(renderTimer);
+  renderTimer = setInterval(() => {
+    document.getElementById('taipeiNow').textContent = formatTaipeiNow();
+    if (ACCESS && ACCESS.remaining_seconds !== undefined && ACCESS.remaining_seconds !== null) {
+      ACCESS.remaining_seconds = Math.max(0, Number(ACCESS.remaining_seconds) - 1);
+      document.getElementById('remainText').textContent = formatRemaining(ACCESS.remaining_seconds);
+      if (ACCESS.active && ACCESS.remaining_seconds <= 0 && ACCESS.plan !== 'permanent') {
+        refreshAccessStatus().catch(console.warn);
+      }
+    }
+  }, 1000);
+}
+
+function blockAndRedirect(message, seconds) {
+  const wait = Number(seconds || 30);
+  const overlay = document.getElementById('blockedOverlay');
+  document.getElementById('blockedMessage').textContent = message || '請聯繫管理員官方 LINE：@jins888';
+  document.getElementById('redirectCountdown').textContent = wait;
+  overlay.classList.add('show');
+
+  if (redirectTimer) clearInterval(redirectTimer);
+  let left = wait;
+  redirectTimer = setInterval(() => {
+    left -= 1;
+    document.getElementById('redirectCountdown').textContent = Math.max(0, left);
+    if (left <= 0) {
+      clearInterval(redirectTimer);
+      goAdminLine();
+    }
+  }, 1000);
+}
+
+function goAdminLine() {
+  const url = (CONFIG && CONFIG.adminLineUrl) || 'https://line.me/R/ti/p/%40jins888';
+  location.href = url;
+}
+
+async function activateCode() {
+  const code = document.getElementById('activationCode').value.trim();
+  if (!code) {
+    alert('請先輸入開通碼');
+    return;
+  }
+  setLoading(true);
+  try {
+    const data = await api('/api/access/activate', {
+      method:'POST',
+      body:JSON.stringify({ user_id:USER_ID, code })
+    });
+    ACCESS = data.access;
+    renderAccess();
+    document.getElementById('blockedOverlay').classList.remove('show');
+    if (redirectTimer) clearInterval(redirectTimer);
+    document.getElementById('activationCode').value = '';
+    alert(ACCESS.message || '開通成功');
+  } catch (e) {
+    alert(e.message || '開通失敗，請聯繫管理員官方 LINE：@jins888');
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function loadCurrent() {
+  const data = await api('/api/session/current?user_id=' + encodeURIComponent(USER_ID));
+  SESSION = data.session;
+  render();
+}
+
+async function startSession() {
+  setLoading(true);
+  try {
+    const body = {
+      user_id: USER_ID,
+      venue: document.getElementById('venue').value,
+      room: document.getElementById('room').value,
+      shoe_id: document.getElementById('shoe').value.trim()
+    };
+    const data = await api('/api/session/start', { method:'POST', body:JSON.stringify(body) });
+    SESSION = data.session;
+    render();
+  } finally { setLoading(false); }
+}
+
+async function addRound(result) {
+  setLoading(true);
+  try {
+    const data = await api('/api/round/add', { method:'POST', body:JSON.stringify({user_id:USER_ID, result}) });
+    SESSION = data.session;
+    render();
+  } finally { setLoading(false); }
+}
+
+async function undoRound() {
+  setLoading(true);
+  try {
+    const data = await api('/api/round/undo', { method:'POST', body:JSON.stringify({user_id:USER_ID}) });
+    SESSION = data.session;
+    render();
+  } finally { setLoading(false); }
+}
+
+async function resetRounds() {
+  if (!confirm('確定清除本靴紀錄？')) return;
+  setLoading(true);
+  try {
+    const data = await api('/api/session/reset', { method:'POST', body:JSON.stringify({user_id:USER_ID}) });
+    SESSION = data.session;
+    render();
+  } finally { setLoading(false); }
+}
+
+async function runPredict() {
+  setLoading(true);
+  try {
+    const data = await api('/api/predict', { method:'POST', body:JSON.stringify({user_id:USER_ID}) });
+    SESSION = data.session;
+    if (data.access) {
+      ACCESS = data.access;
+      renderAccess();
+    } else {
+      await refreshAccessStatus();
+    }
+    render();
+  } catch (e) {
+    const msg = e.message || '分析失敗';
+    alert(msg);
+    if (msg.includes('權限') || msg.includes('到期') || msg.includes('管理員')) {
+      blockAndRedirect(msg, ACCESS?.redirect_after_seconds || CONFIG?.accessRedirectSeconds || 30);
+    }
+  } finally { setLoading(false); }
+}
+
+async function endSession() {
+  setLoading(true);
+  try {
+    const data = await api('/api/session/end', { method:'POST', body:JSON.stringify({user_id:USER_ID}) });
+    SESSION = data.session;
+    render();
+    alert('已結束分析');
+  } finally { setLoading(false); }
+}
+
+function render() {
+  if (!SESSION) return;
+  document.getElementById('statusPill').textContent = SESSION.status || '輸入中';
+  if (SESSION.venue) document.getElementById('venue').value = SESSION.venue;
+  if (SESSION.room) document.getElementById('room').value = SESSION.room;
+  if (SESSION.shoe_id) document.getElementById('shoe').value = SESSION.shoe_id;
+  document.getElementById('roundNo').textContent = '第 ' + (SESSION.round_no || 1) + ' 局';
+
+  const road = document.getElementById('road');
+  road.innerHTML = '';
+  const hist = SESSION.history || [];
+  if (!hist.length) {
+    road.innerHTML = '<span class="muted">尚未輸入</span>';
+  } else {
+    hist.slice(-60).forEach(x => {
+      const span = document.createElement('span');
+      span.className = 'chip ' + x;
+      span.textContent = x;
+      road.appendChild(span);
+    });
+  }
+
+  const pred = SESSION.last_prediction;
+  if (pred) {
+    document.getElementById('bRate').textContent = pred.banker_rate + '%';
+    document.getElementById('pRate').textContent = pred.player_rate + '%';
+    document.getElementById('tRate').textContent = pred.tie_rate + '%';
+    document.getElementById('rec').textContent = pred.recommend_text || '--';
+    document.getElementById('reason').textContent = (pred.signal_level || '') + '｜' + (pred.reason || '');
+  } else {
+    document.getElementById('bRate').textContent = '--';
+    document.getElementById('pRate').textContent = '--';
+    document.getElementById('tRate').textContent = '--';
+    document.getElementById('rec').textContent = '--';
+    document.getElementById('reason').textContent = '尚未分析';
+  }
+}
+
+init().catch(e => {
+  console.error(e);
+  alert('初始化失敗：' + e.message);
+});
+</script>
+</body>
+</html>
