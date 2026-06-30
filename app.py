@@ -143,15 +143,16 @@ def venue_name(venue_code: str) -> str:
 def build_liff_url(venue_code: str = "") -> str:
     """
     產生前端頁面網址。
-    優先使用 PUBLIC_BASE_URL，讓遊戲館點擊後直接開 Render 網頁。
-    若未設定 PUBLIC_BASE_URL，才退回 LIFF_ID。
+    優先使用 LIFF_ID，讓 LINE 先處理 LIFF 登入與授權，
+    再由 LIFF Endpoint 帶回 Render /liff 網頁面板。
+    若未設定 LIFF_ID，才退回 PUBLIC_BASE_URL。
     """
     query = urllib.parse.urlencode({"venue": venue_code}) if venue_code else ""
-    if PUBLIC_BASE_URL:
-        url = f"{PUBLIC_BASE_URL}/liff"
-        return f"{url}?{query}" if query else url
     if LIFF_ID:
         url = f"https://liff.line.me/{LIFF_ID}"
+        return f"{url}?{query}" if query else url
+    if PUBLIC_BASE_URL:
+        url = f"{PUBLIC_BASE_URL}/liff"
         return f"{url}?{query}" if query else url
     return f"/liff?{query}" if query else "/liff"
 
