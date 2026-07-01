@@ -157,8 +157,6 @@ def build_liff_url(venue_code: str = "") -> str:
     return f"/liff?{query}" if query else "/liff"
 
 
-
-
 class AccessDenied(Exception):
     pass
 
@@ -944,6 +942,7 @@ def result_panel_flex(session: Dict[str, Any], notice: str = "AI 判斷完成") 
 def result_flex(session: Dict[str, Any]) -> Dict[str, Any]:
     return result_panel_flex(session, "AI 判斷完成，結果已更新在面板內")
 
+
 def end_flex(session: Dict[str, Any]) -> Dict[str, Any]:
     total = len(session.get("history", []) or [])
     return start_menu_flex(
@@ -1075,19 +1074,40 @@ def push_predict_result(user_id: str) -> None:
         line_push(user_id, [text_msg(f"AI判斷失敗：{exc}")])
 
 
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.1"}
+# ===== UptimeRobot / Render keep-alive endpoints =====
+# 這三個路由只負責回傳 200 OK，不影響 LINE Bot、LIFF、預測、試用、開通碼邏輯。
+# UptimeRobot 建議監控：https://你的Render網址.onrender.com/health
+@app.api_route("/", methods=["GET", "HEAD"])
+def root() -> PlainTextResponse:
+    return PlainTextResponse(
+        "OK - baccarat-line-postback-ai-bot is running",
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "baccarat-line-postback-ai-bot", "version": "2.3.1"}
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": True,
+            "status": "healthy",
+            "service": "baccarat-line-postback-ai-bot",
+            "version": "2.3.1",
+            "time_taipei": dt_to_iso(now_taipei()),
+        },
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-@app.get("/ping")
+@app.api_route("/ping", methods=["GET", "HEAD"])
 def ping() -> PlainTextResponse:
-    return PlainTextResponse("pong")
+    return PlainTextResponse(
+        "pong",
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/liff")
