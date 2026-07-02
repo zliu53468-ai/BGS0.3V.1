@@ -81,7 +81,9 @@ COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.10"))
 # 舊版 RoadEngine 權重保留相容用；新版不再把下三路合成單一主權重
 ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.00"))
 TIE_WEIGHT = float(os.getenv("TIE_WEIGHT", "0.04"))
-AI_BLEND = float(os.getenv("AI_BLEND", "0.08"))
+# DeepSeek 硬開關：預設關閉，避免環境變數未吃到時誤呼叫 API
+USE_DEEPSEEK = os.getenv("USE_DEEPSEEK", "0").strip() == "1"
+AI_BLEND = float(os.getenv("AI_BLEND", "0")) if USE_DEEPSEEK else 0.0
 
 # 動態權重開關：調整融合比例；觀望由下方 ALLOW_OBSERVE 控制
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
@@ -2446,7 +2448,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     }
 
     ai_result = None
-    if len(history) >= MIN_HISTORY_FOR_AI and AI_BLEND > 0:
+    if USE_DEEPSEEK and len(history) >= MIN_HISTORY_FOR_AI and AI_BLEND > 0:
         try:
             ai_result = DeepSeekClient().calibrate(feature_payload)
         except Exception as e:
