@@ -187,6 +187,17 @@ ROAD_RHYTHM_BLUE_RISE_MIN = float(os.getenv("ROAD_RHYTHM_BLUE_RISE_MIN", "0.08")
 ROAD_RHYTHM_ML_SHRINK = float(os.getenv("ROAD_RHYTHM_ML_SHRINK", "0.35"))
 ROAD_RHYTHM_AI_SHRINK = float(os.getenv("ROAD_RHYTHM_AI_SHRINK", "0.32"))
 
+# Strict Turn Confirm：轉折二次確認層
+# 目的：避免 Rhythm 單層分數把短暫假斷誤判成真轉折。
+# 啟用後，RHYTHM_TURN_CONFIRM 需要至少 N 個確認來源同意。
+USE_STRICT_TURN_CONFIRM = os.getenv("USE_STRICT_TURN_CONFIRM", "1") == "1"
+TURN_CONFIRM_MIN_VOTES = int(os.getenv("TURN_CONFIRM_MIN_VOTES", "2"))
+TURN_CONFIRM_GAP = float(os.getenv("TURN_CONFIRM_GAP", "0.05"))
+TURN_CONFIRM_CONSENSUS_MIN = float(os.getenv("TURN_CONFIRM_CONSENSUS_MIN", "0.66"))
+TURN_CONFIRM_BLUE_PRESSURE_MIN = float(os.getenv("TURN_CONFIRM_BLUE_PRESSURE_MIN", "0.55"))
+TURN_CONFIRM_LIFECYCLE_BREAK_MIN = float(os.getenv("TURN_CONFIRM_LIFECYCLE_BREAK_MIN", "0.58"))
+TURN_CONFIRM_MEMORY_CONF_MIN = float(os.getenv("TURN_CONFIRM_MEMORY_CONF_MIN", "0.50"))
+
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
@@ -1843,6 +1854,71 @@ def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycl
         1.0,
     )
 
+    # 轉折候選方向：短週期明確反向時採短週期，否則採 dominant 的反邊。
+    turn_bias_side = short_side if short_side in {"B", "P"} and short_side != dominant_side else opp_side
+
+    # Strict Turn Confirm：多模組二次確認。
+    # 舊版只看 Rhythm 分數，容易把短暫假斷當成轉折；新版要求 Lifecycle / Memory / 四路 / 藍路 / 視窗 至少 N 票確認。
+    lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle else ""
+    memory_state = str(memory.get("state", "")).upper() if memory else ""
+    consensus_valid = consensus_side in {"B", "P"} and consensus_ratio >= TURN_CONFIRM_CONSENSUS_MIN
+
+    turn_confirmed_by_lifecycle = bool(
+        lifecycle_side == turn_bias_side
+        and (
+            lifecycle_state in {"BREAK_RISK", "BROKEN"}
+            or lifecycle_break >= TURN_CONFIRM_LIFECYCLE_BREAK_MIN
+        )
+    )
+    turn_confirmed_by_memory = bool(
+        memory_side == turn_bias_side
+        and memory_state == "MEMORY_BREAK"
+        and memory_conf >= TURN_CONFIRM_MEMORY_CONF_MIN
+    )
+    turn_confirmed_by_consensus = bool(
+        consensus_valid
+        and consensus_side == turn_bias_side
+        and consensus_side != dominant_side
+    )
+    turn_confirmed_by_blue = bool(
+        blue_rising_pressure >= TURN_CONFIRM_BLUE_PRESSURE_MIN
+        and blue_rise >= ROAD_RHYTHM_BLUE_RISE_MIN
+        and float(short_d.get("blue", 0.5)) >= float(mid_d.get("blue", 0.5))
+    )
+    turn_confirmed_by_window = bool(
+        short_side == turn_bias_side
+        and short_side != dominant_side
+        and (mid_against_long > 0 or mid_side == turn_bias_side)
+        and short_strength >= 0.18
+    )
+
+    turn_confirmations = {
+        "lifecycle": turn_confirmed_by_lifecycle,
+        "memory": turn_confirmed_by_memory,
+        "consensus": turn_confirmed_by_consensus,
+        "blue_pressure": turn_confirmed_by_blue,
+        "window": turn_confirmed_by_window,
+    }
+    turn_confirmation_votes = sum(1 for v in turn_confirmations.values() if v)
+
+    if USE_STRICT_TURN_CONFIRM:
+        turn_gap_required = max(0.0, TURN_CONFIRM_GAP)
+        turn_votes_required = max(0, TURN_CONFIRM_MIN_VOTES)
+        turn_base_ready = (
+            turn_score >= ROAD_RHYTHM_TURN_CONFIRM
+            and turn_score >= false_break_score + turn_gap_required
+        )
+        turn_confirmed = turn_base_ready and turn_confirmation_votes >= turn_votes_required
+    else:
+        # 相容舊版邏輯：只看 Rhythm 分數與假斷差距。
+        turn_gap_required = 0.03
+        turn_votes_required = 0
+        turn_base_ready = (
+            turn_score >= ROAD_RHYTHM_TURN_CONFIRM
+            and turn_score >= false_break_score + turn_gap_required
+        )
+        turn_confirmed = turn_base_ready
+
     state = "RHYTHM_NEUTRAL"
     bias_side = ""
     confidence = 0.0
@@ -1850,10 +1926,16 @@ def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycl
         state = "RHYTHM_FALSE_BREAK_GUARD"
         bias_side = dominant_side
         confidence = _clamp(false_break_score * 0.72 + inertia_score * 0.28, 0.0, 1.0)
-    elif turn_score >= ROAD_RHYTHM_TURN_CONFIRM and turn_score >= false_break_score + 0.03:
+    elif turn_confirmed:
         state = "RHYTHM_TURN_CONFIRM"
-        bias_side = short_side if short_side in {"B", "P"} and short_side != dominant_side else opp_side
-        confidence = _clamp(turn_score * 0.78 + blue_rising_pressure * 0.22, 0.0, 1.0)
+        bias_side = turn_bias_side
+        vote_boost = min(0.12, turn_confirmation_votes * 0.025) if USE_STRICT_TURN_CONFIRM else 0.0
+        confidence = _clamp(turn_score * 0.76 + blue_rising_pressure * 0.20 + vote_boost, 0.0, 1.0)
+    elif USE_STRICT_TURN_CONFIRM and turn_base_ready and turn_confirmation_votes < max(0, TURN_CONFIRM_MIN_VOTES):
+        # 轉折分數達標但確認票不足：先等確認，不直接反打，避免假斷。
+        state = "RHYTHM_TURN_WAIT"
+        bias_side = ""
+        confidence = _clamp(turn_score * 0.56 + blue_rising_pressure * 0.16, 0.0, 1.0)
     elif short_with and inertia_score >= ROAD_RHYTHM_INERTIA:
         state = "RHYTHM_CONTINUATION"
         bias_side = dominant_side
@@ -1866,6 +1948,7 @@ def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycl
     state_text = {
         "RHYTHM_FALSE_BREAK_GUARD": "疑似假斷保護",
         "RHYTHM_TURN_CONFIRM": "節奏轉折確認",
+        "RHYTHM_TURN_WAIT": "轉折等待確認",
         "RHYTHM_CONTINUATION": "中長節奏延續",
         "RHYTHM_CHOP": "節奏混亂",
         "RHYTHM_NEUTRAL": "節奏中性",
@@ -1886,6 +1969,13 @@ def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycl
         "inertia_score": round(inertia_score, 4),
         "blue_rise": round(blue_rise, 4),
         "red_stability": round(red_stability, 4),
+        "strict_turn_confirm": USE_STRICT_TURN_CONFIRM,
+        "turn_bias_side": turn_bias_side,
+        "turn_confirmation_votes": int(turn_confirmation_votes),
+        "turn_confirmation_required": int(max(0, TURN_CONFIRM_MIN_VOTES)) if USE_STRICT_TURN_CONFIRM else 0,
+        "turn_confirmations": turn_confirmations,
+        "turn_gap_required": round(float(turn_gap_required), 4),
+        "turn_base_ready": bool(turn_base_ready),
         "windows": {"short": short_f, "mid": mid_f, "long": long_f},
         "derived_windows": {"short": short_d, "mid": mid_d, "long": long_d},
     }
