@@ -198,6 +198,19 @@ TURN_CONFIRM_BLUE_PRESSURE_MIN = float(os.getenv("TURN_CONFIRM_BLUE_PRESSURE_MIN
 TURN_CONFIRM_LIFECYCLE_BREAK_MIN = float(os.getenv("TURN_CONFIRM_LIFECYCLE_BREAK_MIN", "0.58"))
 TURN_CONFIRM_MEMORY_CONF_MIN = float(os.getenv("TURN_CONFIRM_MEMORY_CONF_MIN", "0.50"))
 
+# Long Anchor Guard：長週期錨定層
+# 目的：降低系統太看當局/短線雜訊；短線要反向時必須被中長週期或嚴格轉折確認。
+USE_LONG_ANCHOR_GUARD = os.getenv("USE_LONG_ANCHOR_GUARD", "1") == "1"
+LONG_ANCHOR_MIN_HISTORY = int(os.getenv("LONG_ANCHOR_MIN_HISTORY", "32"))
+LONG_ANCHOR_WINDOW = int(os.getenv("LONG_ANCHOR_WINDOW", "54"))
+LONG_ANCHOR_WEIGHT = float(os.getenv("LONG_ANCHOR_WEIGHT", "0.22"))
+LONG_ANCHOR_MAX_PULL = float(os.getenv("LONG_ANCHOR_MAX_PULL", "0.055"))
+LONG_ANCHOR_MAX_OPPOSITE_EDGE = float(os.getenv("LONG_ANCHOR_MAX_OPPOSITE_EDGE", "0.035"))
+LONG_ANCHOR_CONF_MIN = float(os.getenv("LONG_ANCHOR_CONF_MIN", "0.52"))
+LONG_ANCHOR_CONSENSUS_MIN = float(os.getenv("LONG_ANCHOR_CONSENSUS_MIN", "0.64"))
+LONG_ANCHOR_TURN_BYPASS_VOTES = int(os.getenv("LONG_ANCHOR_TURN_BYPASS_VOTES", "3"))
+LONG_ANCHOR_BREAK_BYPASS_SCORE = float(os.getenv("LONG_ANCHOR_BREAK_BYPASS_SCORE", "0.70"))
+
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
@@ -1736,6 +1749,189 @@ def _derived_pressure_by_window(non_tie: List[str], window: int) -> Dict[str, An
         return {"red": 0.5, "blue": 0.5, "count": 0, "tails": {}}
 
 
+
+def _long_anchor_score(non_tie: List[str], road_family: Dict[str, Any], lifecycle: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Long Anchor Guard：長週期錨定層。
+
+    目的：
+    - 不取代原本四路 / Lifecycle / Memory / Rhythm，只提供長週期參考錨點。
+    - 當短線 Memory / Rhythm 想快速反邊時，用長週期錨定避免被當局一兩口帶走。
+    - 真轉折仍可放行，但要有 Strict Turn Confirm / Lifecycle break 明確確認。
+    """
+    default = {
+        "enabled": False,
+        "state": "ANCHOR_COLD",
+        "label": "長週期錨定資料不足",
+        "anchor_side": "",
+        "confidence": 0.0,
+        "anchor_b": 0.5,
+        "long_window": {},
+        "votes": {},
+    }
+
+    if not USE_LONG_ANCHOR_GUARD or len(non_tie) < LONG_ANCHOR_MIN_HISTORY:
+        return default
+
+    window = max(12, min(LONG_ANCHOR_WINDOW, len(non_tie)))
+    long_f = _window_rhythm_features(non_tie, window)
+    consensus = road_family.get("consensus", {}) if road_family else {}
+    consensus_side = consensus.get("pick", "")
+    consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
+    lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle else ""
+    lifecycle_trend = lifecycle.get("trend_side", "") if lifecycle else ""
+    lifecycle_bias = lifecycle.get("bias_side", "") if lifecycle else ""
+    lifecycle_follow = float(lifecycle.get("follow_score", 0.5)) if lifecycle else 0.5
+    lifecycle_break = float(lifecycle.get("break_score", 0.0)) if lifecycle else 0.0
+
+    long_side = long_f.get("side", "")
+    long_strength = float(long_f.get("strength", 0.0))
+    tail = non_tie[-window:]
+    b_rate = tail.count("B") / max(1, len(tail))
+    p_rate = 1.0 - b_rate
+    balance_side = "B" if b_rate > p_rate else "P" if p_rate > b_rate else ""
+    balance_strength = abs(b_rate - p_rate)
+
+    # 用多來源投票取得長週期錨點；避免只靠單一長窗比例。
+    votes = {"B": 0.0, "P": 0.0}
+    vote_details = {}
+
+    if long_side in {"B", "P"}:
+        w = 0.38 + min(0.18, long_strength * 0.35)
+        votes[long_side] += w
+        vote_details["long_window"] = {"side": long_side, "weight": round(w, 4), "strength": round(long_strength, 4)}
+
+    if consensus_side in {"B", "P"} and consensus_ratio >= LONG_ANCHOR_CONSENSUS_MIN:
+        w = 0.30 + min(0.18, (consensus_ratio - 0.5) * 0.55)
+        votes[consensus_side] += w
+        vote_details["consensus"] = {"side": consensus_side, "weight": round(w, 4), "ratio": round(consensus_ratio, 4)}
+
+    if lifecycle_trend in {"B", "P"} and lifecycle_follow >= lifecycle_break:
+        w = 0.18 + min(0.12, max(0.0, lifecycle_follow - 0.50) * 0.35)
+        votes[lifecycle_trend] += w
+        vote_details["lifecycle_trend"] = {"side": lifecycle_trend, "weight": round(w, 4), "follow": round(lifecycle_follow, 4)}
+
+    # 若 Lifecycle 已經明確斷點，錨點不硬跟舊趨勢，改把反向也納入投票。
+    if lifecycle_bias in {"B", "P"} and lifecycle_state in {"BREAK_RISK", "BROKEN"} and lifecycle_break >= LONG_ANCHOR_BREAK_BYPASS_SCORE:
+        w = 0.28 + min(0.16, max(0.0, lifecycle_break - 0.55) * 0.45)
+        votes[lifecycle_bias] += w
+        vote_details["lifecycle_break"] = {"side": lifecycle_bias, "weight": round(w, 4), "break": round(lifecycle_break, 4)}
+
+    if balance_side in {"B", "P"} and balance_strength >= 0.10:
+        w = 0.10 + min(0.08, balance_strength * 0.30)
+        votes[balance_side] += w
+        vote_details["balance"] = {"side": balance_side, "weight": round(w, 4), "b_rate": round(b_rate, 4)}
+
+    if votes["B"] == votes["P"]:
+        anchor_side = long_side if long_side in {"B", "P"} else consensus_side if consensus_side in {"B", "P"} else ""
+    else:
+        anchor_side = "B" if votes["B"] > votes["P"] else "P"
+
+    total_vote = max(0.0001, votes["B"] + votes["P"])
+    vote_ratio = max(votes["B"], votes["P"]) / total_vote if anchor_side else 0.5
+    confidence = _clamp(
+        (vote_ratio - 0.5) * 1.35
+        + min(0.30, long_strength * 0.55)
+        + max(0.0, consensus_ratio - 0.5) * 0.30,
+        0.0,
+        1.0,
+    )
+
+    if anchor_side not in {"B", "P"} or confidence < LONG_ANCHOR_CONF_MIN:
+        return {
+            **default,
+            "enabled": True,
+            "state": "ANCHOR_WEAK",
+            "label": f"長週期錨定不足 C{int(confidence*100)}",
+            "confidence": round(confidence, 4),
+            "anchor_side": anchor_side if anchor_side in {"B", "P"} else "",
+            "long_window": long_f,
+            "votes": {k: round(v, 4) for k, v in votes.items()},
+            "vote_details": vote_details,
+        }
+
+    signed = 1 if anchor_side == "B" else -1
+    anchor_pull = min(LONG_ANCHOR_MAX_PULL, 0.018 + confidence * LONG_ANCHOR_MAX_PULL)
+    anchor_b = _clamp(0.5 + signed * anchor_pull, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
+    side_text = "莊" if anchor_side == "B" else "閒"
+    return {
+        "enabled": True,
+        "state": "ANCHOR_ACTIVE",
+        "label": f"長週期錨定:{side_text} C{int(confidence*100)}",
+        "anchor_side": anchor_side,
+        "confidence": round(confidence, 4),
+        "anchor_b": round(anchor_b, 5),
+        "anchor_pull": round(anchor_pull, 5),
+        "long_window": long_f,
+        "votes": {k: round(v, 4) for k, v in votes.items()},
+        "vote_details": vote_details,
+    }
+
+
+def _apply_long_anchor_guard(b_side: float, anchor: Dict[str, Any], lifecycle: Dict[str, Any], memory: Dict[str, Any], rhythm: Dict[str, Any]) -> float:
+    """
+    將長週期錨點套用到最終 B/P 側機率。
+
+    注意：這不是硬鎖方向，而是「短線偏移護欄」：
+    - 若短線與長錨同向，輕微穩定。
+    - 若短線逆長錨，但沒有嚴格轉折確認，限制逆向幅度。
+    - 若 Strict Turn Confirm 票數足夠或 Lifecycle 明確 BREAK，允許放行。
+    """
+    if not USE_LONG_ANCHOR_GUARD or not anchor.get("enabled") or anchor.get("state") != "ANCHOR_ACTIVE":
+        return b_side
+
+    anchor_side = anchor.get("anchor_side", "")
+    if anchor_side not in {"B", "P"}:
+        return b_side
+
+    conf = float(anchor.get("confidence", 0.0))
+    if conf < LONG_ANCHOR_CONF_MIN:
+        return b_side
+
+    rhythm_state = str(rhythm.get("state", "")).upper() if rhythm else ""
+    turn_votes = int(rhythm.get("turn_confirmation_votes", 0) or 0) if rhythm else 0
+    lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle else ""
+    lifecycle_break = float(lifecycle.get("break_score", 0.0)) if lifecycle else 0.0
+    memory_state = str(memory.get("state", "")).upper() if memory else ""
+
+    confirmed_turn = bool(
+        rhythm_state == "RHYTHM_TURN_CONFIRM"
+        and turn_votes >= LONG_ANCHOR_TURN_BYPASS_VOTES
+    )
+    confirmed_break = bool(
+        lifecycle_state in {"BREAK_RISK", "BROKEN"}
+        and lifecycle_break >= LONG_ANCHOR_BREAK_BYPASS_SCORE
+    )
+
+    current_side = "B" if b_side >= 0.5 else "P"
+    anchor_b = float(anchor.get("anchor_b", 0.5))
+    weight = _clamp(LONG_ANCHOR_WEIGHT * conf, 0.0, 0.45)
+
+    if current_side == anchor_side:
+        # 同向時只做微量穩定，避免過度放大。
+        return _clamp(b_side * (1.0 - weight * 0.35) + anchor_b * (weight * 0.35), SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
+    # 逆向但已被多模組確認，放行，不硬拉回。
+    if confirmed_turn or confirmed_break:
+        return b_side
+
+    # Memory 單獨反向時最容易吃當局；逆長錨且只有 MEMORY_BREAK 時多拉回一點。
+    if memory_state == "MEMORY_BREAK":
+        weight = min(0.52, weight * 1.18)
+
+    guarded = b_side * (1.0 - weight) + anchor_b * weight
+
+    # 逆向邊際限制：避免短線把方向拉離 0.5 太遠。
+    max_opp = max(0.0, LONG_ANCHOR_MAX_OPPOSITE_EDGE)
+    if anchor_side == "B" and guarded < 0.5 - max_opp:
+        guarded = 0.5 - max_opp
+    elif anchor_side == "P" and guarded > 0.5 + max_opp:
+        guarded = 0.5 + max_opp
+
+    return _clamp(guarded, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
+
 def _road_rhythm_score(non_tie: List[str], road_family: Dict[str, Any], lifecycle: Dict[str, Any], regime_info: Dict[str, Any], memory: Dict[str, Any]) -> Dict[str, Any]:
     """
     Road Rhythm Controller：多週期牌路節奏控制器。
@@ -2415,6 +2611,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     lifecycle = _road_lifecycle_score(non_tie, road_family, regime_info)
     road_memory = _adaptive_road_memory_score(non_tie, road_family, lifecycle, regime_info)
     road_rhythm = _road_rhythm_score(non_tie, road_family, lifecycle, regime_info, road_memory)
+    long_anchor = _long_anchor_score(non_tie, road_family, lifecycle, regime_info)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
     dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
     dynamic_weights = _apply_road_memory_weighting(dynamic_weights, road_memory)
@@ -2450,6 +2647,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     b_side = _apply_road_memory_bias(b_side, road_memory)
     # Road Rhythm 會看短 / 中 / 長週期，避免太看當局，分辨假斷與真轉折。
     b_side = _apply_road_rhythm_bias(b_side, road_rhythm)
+    # Long Anchor Guard 會用長週期錨定限制短線偏移，降低太看當局。
+    b_side = _apply_long_anchor_guard(b_side, long_anchor, lifecycle, road_memory, road_rhythm)
     b_side = _clamp(b_side, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
     p_side = 1 - b_side
 
@@ -2521,6 +2720,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
         "road_rhythm": road_rhythm,
+        "long_anchor": long_anchor,
         "road_engine": road_engine,
         "markov": markov,
         "road": road,
@@ -2643,6 +2843,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         f"生命周期:{lifecycle.get('label', '')}",
         f"記憶:{road_memory.get('label', '')}",
         f"節奏:{road_rhythm.get('label', '')}",
+        f"長錨:{long_anchor.get('label', '')}",
         big_road.get("label", ""),
         big_eye.get("label", ""),
         small_road.get("label", ""),
@@ -2701,6 +2902,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_rhythm_false_break_score": road_rhythm.get("false_break_score", 0.0),
         "road_rhythm_turn_score": road_rhythm.get("turn_score", 0.0),
         "road_rhythm_inertia_score": road_rhythm.get("inertia_score", 0.0),
+        "long_anchor": long_anchor,
+        "long_anchor_state": long_anchor.get("state", ""),
+        "long_anchor_label": long_anchor.get("label", ""),
+        "long_anchor_side": long_anchor.get("anchor_side", ""),
+        "long_anchor_confidence": long_anchor.get("confidence", 0.0),
         "road_memory_state": road_memory.get("state", ""),
         "road_memory_label": road_memory.get("label", ""),
         "road_memory_sample": road_memory.get("sample", 0),
