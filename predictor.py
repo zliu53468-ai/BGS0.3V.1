@@ -34,7 +34,16 @@ except Exception as e:
     TF_AVAILABLE = False
     TF_IMPORT_ERROR = str(e)
 
-from deepseek_client import DeepSeekClient
+try:
+    from deepseek_client import DeepSeekClient
+except Exception as e:
+    class DeepSeekClient:  # type: ignore
+        """DeepSeek client fallback：回測或本機缺少 deepseek_client.py 時不讓 predictor 掛掉。"""
+        def __init__(self, *args, **kwargs):
+            self.import_error = str(e)
+
+        def calibrate(self, payload):
+            return {"error": True, "message": f"DeepSeekClient unavailable: {self.import_error}"}
 
 # 設置日誌
 logging.basicConfig(level=logging.INFO)
@@ -65,9 +74,9 @@ NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.060"))
 
 # 四路主模型權重：大路 / 大眼仔 / 小路 / 蟑螂路
 BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.30"))
-BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.24"))
-SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.20"))
-COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.17"))
+BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.16"))
+SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.13"))
+COCKROACH_WEIGHT = float(os.getenv("COCKROACH_WEIGHT", "0.10"))
 
 # 舊版 RoadEngine 權重保留相容用；新版不再把下三路合成單一主權重
 ROAD_ENGINE_WEIGHT = float(os.getenv("ROAD_ENGINE_WEIGHT", "0.00"))
@@ -78,11 +87,12 @@ AI_BLEND = float(os.getenv("AI_BLEND", "0.08"))
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
 USE_ONLINE_WEIGHTING = os.getenv("USE_ONLINE_WEIGHTING", "1") == "1"
 USE_ROAD_ENGINE = os.getenv("USE_ROAD_ENGINE", "1") == "1"
-ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "20"))
-ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "5"))
-ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.42"))
-ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.43"))
-ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.54"))
+ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "36"))
+ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "12"))
+ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.22"))
+ONLINE_BAYES_ALPHA = float(os.getenv("ONLINE_BAYES_ALPHA", "6.0"))
+ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.42"))
+ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.58"))
 
 # RoadEngine / 下三路路紙引擎參數
 ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
@@ -92,8 +102,8 @@ ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10
 ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.024"))
 ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.016"))
 DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "3"))
-ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.045"))
-ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.040"))
+ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.020"))
+ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.055"))
 
 # Road Lifecycle：用大路 + 下三路判斷「規律健康度 / 疲乏 / 斷點壓力」
 # 這層不是觀望/下注決策，而是讓程式知道規律該跟、該降權、還是偏反邊。
@@ -144,17 +154,17 @@ OBSERVE_LIFECYCLE_STATES = set(
 # 目的：不要只靠固定規則，而是看「目前這種類似路型」在本靴過去是跟路準，還是斷路準。
 USE_ADAPTIVE_ROAD_MEMORY = os.getenv("USE_ADAPTIVE_ROAD_MEMORY", "1") == "1"
 ROAD_MEMORY_LOOKBACK = int(os.getenv("ROAD_MEMORY_LOOKBACK", "48"))
-ROAD_MEMORY_MIN_SAMPLE = int(os.getenv("ROAD_MEMORY_MIN_SAMPLE", "3"))
-ROAD_MEMORY_FULL_SAMPLE = int(os.getenv("ROAD_MEMORY_FULL_SAMPLE", "8"))
-ROAD_MEMORY_ALPHA = float(os.getenv("ROAD_MEMORY_ALPHA", "1.2"))
+ROAD_MEMORY_MIN_SAMPLE = int(os.getenv("ROAD_MEMORY_MIN_SAMPLE", "10"))
+ROAD_MEMORY_FULL_SAMPLE = int(os.getenv("ROAD_MEMORY_FULL_SAMPLE", "24"))
+ROAD_MEMORY_ALPHA = float(os.getenv("ROAD_MEMORY_ALPHA", "3.0"))
 ROAD_MEMORY_MIN_MATCH_SCORE = float(os.getenv("ROAD_MEMORY_MIN_MATCH_SCORE", "4.0"))
 ROAD_MEMORY_EXACT_BONUS = float(os.getenv("ROAD_MEMORY_EXACT_BONUS", "1.0"))
 ROAD_MEMORY_RECENCY_BONUS = float(os.getenv("ROAD_MEMORY_RECENCY_BONUS", "0.35"))
 ROAD_MEMORY_WEIGHT = float(os.getenv("ROAD_MEMORY_WEIGHT", "0.22"))
 ROAD_MEMORY_MAX_BIAS = float(os.getenv("ROAD_MEMORY_MAX_BIAS", "0.055"))
-ROAD_MEMORY_FOLLOW_THRESHOLD = float(os.getenv("ROAD_MEMORY_FOLLOW_THRESHOLD", "0.56"))
-ROAD_MEMORY_BREAK_THRESHOLD = float(os.getenv("ROAD_MEMORY_BREAK_THRESHOLD", "0.56"))
-ROAD_MEMORY_MIN_ADVANTAGE = float(os.getenv("ROAD_MEMORY_MIN_ADVANTAGE", "0.08"))
+ROAD_MEMORY_FOLLOW_THRESHOLD = float(os.getenv("ROAD_MEMORY_FOLLOW_THRESHOLD", "0.58"))
+ROAD_MEMORY_BREAK_THRESHOLD = float(os.getenv("ROAD_MEMORY_BREAK_THRESHOLD", "0.58"))
+ROAD_MEMORY_MIN_ADVANTAGE = float(os.getenv("ROAD_MEMORY_MIN_ADVANTAGE", "0.12"))
 ROAD_MEMORY_PROTECT_MIN_CONF = float(os.getenv("ROAD_MEMORY_PROTECT_MIN_CONF", "0.62"))
 ROAD_MEMORY_ML_SHRINK = float(os.getenv("ROAD_MEMORY_ML_SHRINK", "0.45"))
 ROAD_MEMORY_AI_SHRINK = float(os.getenv("ROAD_MEMORY_AI_SHRINK", "0.40"))
@@ -465,6 +475,27 @@ def _get_ml_models(training_key: str) -> MLModels:
     _MODEL_CACHE[key] = model
     _MODEL_CACHE_ORDER.append(key)
     return model
+
+
+def clear_model_cache() -> Dict[str, Any]:
+    """清空 ML 模型快取。
+
+    用途：回測、重新開始新測試、或你想確保模型不沿用上一批資料時呼叫。
+    正常 LINE 使用流程不需要主動呼叫。
+    """
+    removed = len(_MODEL_CACHE)
+    _MODEL_CACHE.clear()
+    _MODEL_CACHE_ORDER.clear()
+    return {"ok": True, "removed": removed}
+
+
+def get_model_cache_info() -> Dict[str, Any]:
+    """回傳目前 ML 模型快取狀態，方便 debug / backtest 檢查。"""
+    return {
+        "size": len(_MODEL_CACHE),
+        "max_size": MAX_MODEL_CACHE,
+        "keys": list(_MODEL_CACHE_ORDER),
+    }
 
 # ============ 輔助函數 ============
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -2135,14 +2166,25 @@ def _detect_regime(non_tie: List[str]) -> Dict[str, Any]:
 def _rolling_model_performance(non_tie: List[str]) -> Dict[str, Any]:
     """
     用最近 N 局做本靴內部回測，估計各子模型近期準度。
-    新版四路獨立：big_road / big_eye / small_road / cockroach 各自統計。
+
+    2026-07 回測安全版：
+    - 原本直接用小樣本 acc 會讓 5~20 局的雜訊大幅改權重。
+    - 改用 Beta(alpha, alpha) 貝氏收縮，把小樣本準度拉回 0.5。
+    - 只有達到 ONLINE_WEIGHT_MIN_COUNT 後才會調整 factor。
     """
     model_names = [
         "big_road", "big_eye", "small_road", "cockroach",
         "ngram", "markov", "road", "recent", "streak", "balance"
     ]
     result = {
-        name: {"acc": 0.5, "count": 0, "correct": 0, "factor": 1.0}
+        name: {
+            "acc": 0.5,
+            "raw_acc": 0.5,
+            "count": 0,
+            "correct": 0,
+            "factor": 1.0,
+            "shrink_alpha": ONLINE_BAYES_ALPHA,
+        }
         for name in model_names
     }
 
@@ -2180,28 +2222,35 @@ def _rolling_model_performance(non_tie: List[str]) -> Dict[str, Any]:
                 result[name]["correct"] += 1
 
     for name in model_names:
-        cnt = result[name]["count"]
-        cor = result[name]["correct"]
+        cnt = int(result[name]["count"])
+        cor = int(result[name]["correct"])
+
         if cnt > 0:
-            acc = cor / cnt
+            raw_acc = cor / cnt
+            # Beta(alpha, alpha) prior，prior mean = 0.5。
+            # 樣本越少，acc 越接近 0.5；樣本越多，越接近 raw_acc。
+            alpha = max(0.0001, ONLINE_BAYES_ALPHA)
+            acc = (cor + alpha) / (cnt + 2 * alpha)
+            result[name]["raw_acc"] = round(raw_acc, 4)
             result[name]["acc"] = round(acc, 4)
         else:
+            raw_acc = 0.5
             acc = 0.5
+            result[name]["raw_acc"] = 0.5
             result[name]["acc"] = 0.5
 
         factor = 1.0
         if cnt >= ONLINE_WEIGHT_MIN_COUNT:
             factor = 1.0 + (acc - 0.5) * 2 * ONLINE_WEIGHT_ALPHA
             if acc <= ONLINE_DISABLE_BELOW:
-                factor = min(factor, 0.70)
+                factor = min(factor, 0.78)
             elif acc >= ONLINE_BOOST_ABOVE:
-                factor = max(factor, 1.08)
-            factor = _clamp(factor, 0.55, 1.35)
+                factor = max(factor, 1.05)
+            factor = _clamp(factor, 0.70, 1.20)
 
         result[name]["factor"] = round(factor, 4)
 
     return result
-
 
 def _apply_online_weighting(base_weights: Dict[str, float], performance: Dict[str, Any]) -> Dict[str, float]:
     if not USE_ONLINE_WEIGHTING:
@@ -2322,7 +2371,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     ml_models = _get_ml_models(training_key)
 
     should_train = (
-        len(non_tie) >= 30
+        ML_WEIGHT > 0
+        and len(non_tie) >= 30
         and (
             not ml_models.is_trained
             or getattr(ml_models, "last_training_key", "") != training_key
