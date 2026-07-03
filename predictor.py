@@ -96,6 +96,27 @@ ONLINE_BAYES_ALPHA = float(os.getenv("ONLINE_BAYES_ALPHA", "6.0"))
 ONLINE_DISABLE_BELOW = float(os.getenv("ONLINE_DISABLE_BELOW", "0.42"))
 ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.58"))
 
+# Walk-forward Learning：逐局前推學習 / 回測 / 每個 LINE UID 獨立權重
+# 目的：每個模型只能用當下以前的資料，並依每個使用者 / 場館 / 房間 / 靴號各自累積準度。
+USE_WALK_FORWARD_LEARNING = os.getenv("USE_WALK_FORWARD_LEARNING", "1") == "1"
+WALK_FORWARD_LIVE_PER_UID = os.getenv("WALK_FORWARD_LIVE_PER_UID", "1") == "1"
+WALK_FORWARD_WINDOW = int(os.getenv("WALK_FORWARD_WINDOW", "36"))
+WALK_FORWARD_MIN_COUNT = int(os.getenv("WALK_FORWARD_MIN_COUNT", "3"))
+WALK_FORWARD_ALPHA = float(os.getenv("WALK_FORWARD_ALPHA", "0.35"))
+WALK_FORWARD_BAYES_ALPHA = float(os.getenv("WALK_FORWARD_BAYES_ALPHA", "2.0"))
+WALK_FORWARD_MIN_FACTOR = float(os.getenv("WALK_FORWARD_MIN_FACTOR", "0.70"))
+WALK_FORWARD_MAX_FACTOR = float(os.getenv("WALK_FORWARD_MAX_FACTOR", "1.25"))
+WALK_FORWARD_DISABLE_BELOW = float(os.getenv("WALK_FORWARD_DISABLE_BELOW", "0.42"))
+WALK_FORWARD_BOOST_ABOVE = float(os.getenv("WALK_FORWARD_BOOST_ABOVE", "0.56"))
+WALK_FORWARD_MIN_EDGE = float(os.getenv("WALK_FORWARD_MIN_EDGE", "0.006"))
+WALK_FORWARD_ML_MIN_EDGE = float(os.getenv("WALK_FORWARD_ML_MIN_EDGE", "0.010"))
+WALK_FORWARD_AI_MIN_EDGE = float(os.getenv("WALK_FORWARD_AI_MIN_EDGE", "0.010"))
+WALK_FORWARD_APPLY_TO_ML = os.getenv("WALK_FORWARD_APPLY_TO_ML", "1") == "1"
+WALK_FORWARD_APPLY_TO_AI = os.getenv("WALK_FORWARD_APPLY_TO_AI", "1") == "1"
+WALK_FORWARD_STORE_PENDING = os.getenv("WALK_FORWARD_STORE_PENDING", "1") == "1"
+WALK_FORWARD_DEBUG = os.getenv("WALK_FORWARD_DEBUG", "0") == "1"
+
+
 # RoadEngine / 下三路路紙引擎參數
 ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
 ROAD_ENGINE_MIN_HISTORY = int(os.getenv("ROAD_ENGINE_MIN_HISTORY", "6"))
@@ -215,20 +236,20 @@ LONG_ANCHOR_BREAK_BYPASS_SCORE = float(os.getenv("LONG_ANCHOR_BREAK_BYPASS_SCORE
 LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
 LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
 LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
-ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
+ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "1"))
 
 
 # ============ 富濠式保守牌路多數決引擎 ============
 # 預設啟用 FUHAO_CLONE，讓覆蓋後不用再改程式碼即可使用富濠式邏輯。
 # 若要切回原本混合模型，Render 環境變數改成 PREDICT_ENGINE=HYBRID 即可。
-PREDICT_ENGINE = os.getenv("PREDICT_ENGINE", "FUHAO_CLONE").strip().upper()
+PREDICT_ENGINE = os.getenv("PREDICT_ENGINE", "HYBRID").strip().upper()
 FUHAO_HISTORY_LIMIT = int(os.getenv("FUHAO_HISTORY_LIMIT", "100"))
 FUHAO_MIN_VALID_ROUNDS = int(os.getenv("FUHAO_MIN_VALID_ROUNDS", "6"))
 FUHAO_IGNORE_TIE_FOR_PREDICT = os.getenv("FUHAO_IGNORE_TIE_FOR_PREDICT", "1") == "1"
 FUHAO_KEEP_TIE_COUNT = os.getenv("FUHAO_KEEP_TIE_COUNT", "1") == "1"
 FUHAO_LONG_THRESHOLD = int(os.getenv("FUHAO_LONG_THRESHOLD", "4"))
 FUHAO_FENG_LOOKBACK_COLS = int(os.getenv("FUHAO_FENG_LOOKBACK_COLS", "6"))
-FUHAO_DOWN3_TIE_BIAS = os.getenv("FUHAO_DOWN3_TIE_BIAS", "NONE").strip().upper()
+FUHAO_DOWN3_TIE_BIAS = os.getenv("FUHAO_DOWN3_TIE_BIAS", "BANKER").strip().upper()
 FUHAO_USE_BIG_ROAD = os.getenv("FUHAO_USE_BIG_ROAD", "1") == "1"
 FUHAO_USE_BIG_EYE = os.getenv("FUHAO_USE_BIG_EYE", "1") == "1"
 FUHAO_USE_SMALL_ROAD = os.getenv("FUHAO_USE_SMALL_ROAD", "1") == "1"
@@ -312,18 +333,6 @@ FUHAO_OBSERVE_ON_BIGROAD_ONLY = os.getenv("FUHAO_OBSERVE_ON_BIGROAD_ONLY", "1") 
 FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES = int(os.getenv("FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES", "2"))
 FUHAO_FINAL_REQUIRE_DERIVED_RATIO = float(os.getenv("FUHAO_FINAL_REQUIRE_DERIVED_RATIO", "0.62"))
 FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE = os.getenv("FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE", "1") == "1"
-
-# 嚴格牌路投票層：只有「清楚牌型 / 清楚下三路紅藍差」才允許投票。
-# 目的：避免每個模組都硬投 B/P，導致最後又變成多數方模型。
-FUHAO_STRICT_PATTERN_VOTE = os.getenv("FUHAO_STRICT_PATTERN_VOTE", "1") == "1"
-FUHAO_VOTE_MIN_EDGE = float(os.getenv("FUHAO_VOTE_MIN_EDGE", "0.020"))
-FUHAO_DERIVED_TIE_AS_NO_VOTE = os.getenv("FUHAO_DERIVED_TIE_AS_NO_VOTE", "1") == "1"
-FUHAO_DERIVED_MIN_RED_BLUE_DIFF = float(os.getenv("FUHAO_DERIVED_MIN_RED_BLUE_DIFF", "0.080"))
-FUHAO_REQUIRE_PATTERN_CLASS = os.getenv("FUHAO_REQUIRE_PATTERN_CLASS", "1") == "1"
-FUHAO_FORCE_NEUTRAL_ON_NO_PATTERN = os.getenv("FUHAO_FORCE_NEUTRAL_ON_NO_PATTERN", "1") == "1"
-FUHAO_DISABLE_RECENT_BALANCE_FALLBACK = os.getenv("FUHAO_DISABLE_RECENT_BALANCE_FALLBACK", "1") == "1"
-FUHAO_BIGROAD_SIGNAL_ONLY = os.getenv("FUHAO_BIGROAD_SIGNAL_ONLY", "1") == "1"
-FUHAO_MIN_PROB_EDGE = float(os.getenv("FUHAO_MIN_PROB_EDGE", "0.015"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
@@ -590,6 +599,11 @@ _MODEL_CACHE: Dict[str, MLModels] = {}
 _MODEL_CACHE_ORDER: List[str] = []
 
 
+# 每個 LINE UID / 場館 / 房間 / 靴號 的逐局前推狀態。
+# 只保存「上一局預測下一局」的 pending，以及最近 N 次各模型是否命中的紀錄。
+_WALK_FORWARD_STATE: Dict[str, Dict[str, Any]] = {}
+
+
 def _get_ml_models(training_key: str) -> MLModels:
     key = training_key or "global"
 
@@ -677,9 +691,7 @@ def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
 def _pick_from_score(score: Dict[str, Any], min_edge: float = 0.001) -> str:
     b = float(score.get("B", 0.5))
     p = float(score.get("P", 0.5))
-    # 嚴格牌路投票：弱訊號不投票，避免每個模型都硬產生 B/P。
-    effective_min_edge = max(min_edge, FUHAO_VOTE_MIN_EDGE if globals().get("FUHAO_STRICT_PATTERN_VOTE", False) else min_edge)
-    if abs(b - p) < effective_min_edge:
+    if abs(b - p) < min_edge:
         return ""
     return "B" if b > p else "P"
 
@@ -2661,6 +2673,153 @@ def _apply_online_weighting(base_weights: Dict[str, float], performance: Dict[st
     return _normalize_weights(adjusted)
 
 
+# ============ Walk-forward Learning：逐局前推 / 每個 LINE UID 獨立 ============
+def _wf_empty_model_stats() -> Dict[str, Any]:
+    return {"acc": 0.5, "raw_acc": 0.5, "count": 0, "correct": 0, "factor": 1.0}
+
+
+def _wf_state(training_key: str) -> Dict[str, Any]:
+    key = training_key or "anonymous|global"
+    state = _WALK_FORWARD_STATE.get(key)
+    if state is None:
+        state = {"pending": None, "records": []}
+        _WALK_FORWARD_STATE[key] = state
+    return state
+
+
+def _walk_forward_pick_from_score(score: Dict[str, Any], min_edge: Optional[float] = None) -> str:
+    edge = WALK_FORWARD_MIN_EDGE if min_edge is None else float(min_edge)
+    return _pick_from_score(score, min_edge=edge)
+
+
+def _walk_forward_pick_map(scores: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    picks: Dict[str, str] = {}
+    if not USE_WALK_FORWARD_LEARNING:
+        return picks
+    for name, score in scores.items():
+        try:
+            pick = _walk_forward_pick_from_score(score)
+        except Exception:
+            pick = ""
+        if pick in {"B", "P"}:
+            picks[name] = pick
+    return picks
+
+
+def _update_walk_forward_truth(training_key: str, non_tie: List[str]) -> None:
+    """把上一輪 pending 的預測，用這一輪新進來的真實結果結算。
+
+    pending 在 len=N 時代表「預測第 N+1 手」。
+    當目前 non_tie 長度 > N 時，truth = non_tie[N]，這樣完全不偷看未來。
+    """
+    if not (USE_WALK_FORWARD_LEARNING and WALK_FORWARD_LIVE_PER_UID):
+        return
+    state = _wf_state(training_key)
+    pending = state.get("pending")
+    if not pending:
+        return
+    pred_len = int(pending.get("non_tie_len", -1))
+    if pred_len < 0 or len(non_tie) <= pred_len:
+        return
+    truth = non_tie[pred_len]
+    if truth not in {"B", "P"}:
+        state["pending"] = None
+        return
+    preds = pending.get("predictions", {}) or {}
+    record = {"truth": truth, "at_len": pred_len, "models": {}}
+    for model_name, pick in preds.items():
+        if pick in {"B", "P"}:
+            record["models"][model_name] = 1 if pick == truth else 0
+    if record["models"]:
+        records = state.setdefault("records", [])
+        records.append(record)
+        max_keep = max(10, WALK_FORWARD_WINDOW * 3)
+        if len(records) > max_keep:
+            del records[:-max_keep]
+    state["pending"] = None
+
+
+def _get_walk_forward_performance(training_key: str) -> Dict[str, Any]:
+    if not (USE_WALK_FORWARD_LEARNING and WALK_FORWARD_LIVE_PER_UID):
+        return {}
+    state = _wf_state(training_key)
+    records = state.get("records", [])[-max(1, WALK_FORWARD_WINDOW):]
+    model_names = set()
+    for rec in records:
+        model_names.update((rec.get("models") or {}).keys())
+    result: Dict[str, Any] = {name: _wf_empty_model_stats() for name in sorted(model_names)}
+    alpha = max(0.0001, WALK_FORWARD_BAYES_ALPHA)
+    for name in list(result.keys()):
+        vals = [int((rec.get("models") or {}).get(name)) for rec in records if name in (rec.get("models") or {})]
+        cnt = len(vals)
+        cor = sum(vals)
+        if cnt <= 0:
+            continue
+        raw_acc = cor / cnt
+        acc = (cor + alpha) / (cnt + 2 * alpha)
+        factor = 1.0
+        if cnt >= WALK_FORWARD_MIN_COUNT:
+            factor = 1.0 + (acc - 0.5) * 2.0 * WALK_FORWARD_ALPHA
+            if acc <= WALK_FORWARD_DISABLE_BELOW:
+                factor = min(factor, 0.88)
+            elif acc >= WALK_FORWARD_BOOST_ABOVE:
+                factor = max(factor, 1.04)
+            factor = _clamp(factor, WALK_FORWARD_MIN_FACTOR, WALK_FORWARD_MAX_FACTOR)
+        result[name] = {
+            "acc": round(acc, 4),
+            "raw_acc": round(raw_acc, 4),
+            "count": cnt,
+            "correct": cor,
+            "factor": round(factor, 4),
+        }
+    return result
+
+
+def _apply_walk_forward_weighting(base_weights: Dict[str, float], live_performance: Dict[str, Any]) -> Dict[str, float]:
+    if not (USE_WALK_FORWARD_LEARNING and live_performance):
+        return _normalize_weights(base_weights)
+    adjusted: Dict[str, float] = {}
+    for name, weight in base_weights.items():
+        factor = float(live_performance.get(name, {}).get("factor", 1.0))
+        adjusted[name] = weight * factor
+    return _normalize_weights(adjusted)
+
+
+def _walk_forward_factor(live_performance: Dict[str, Any], model_name: str, default: float = 1.0) -> float:
+    try:
+        return float(live_performance.get(model_name, {}).get("factor", default))
+    except Exception:
+        return default
+
+
+def _store_walk_forward_pending(training_key: str, non_tie: List[str], predictions: Dict[str, str]) -> None:
+    if not (USE_WALK_FORWARD_LEARNING and WALK_FORWARD_LIVE_PER_UID and WALK_FORWARD_STORE_PENDING):
+        return
+    clean = {str(k): v for k, v in (predictions or {}).items() if v in {"B", "P"}}
+    if not clean:
+        return
+    state = _wf_state(training_key)
+    state["pending"] = {
+        "non_tie_len": len(non_tie),
+        "predictions": clean,
+    }
+
+
+def get_walk_forward_state_info() -> Dict[str, Any]:
+    """方便 debug：查看目前每個 LINE UID / 房間 / 靴號的逐局前推狀態。"""
+    return {
+        "enabled": USE_WALK_FORWARD_LEARNING,
+        "size": len(_WALK_FORWARD_STATE),
+        "keys": list(_WALK_FORWARD_STATE.keys())[-30:],
+    }
+
+
+def clear_walk_forward_state() -> Dict[str, Any]:
+    removed = len(_WALK_FORWARD_STATE)
+    _WALK_FORWARD_STATE.clear()
+    return {"ok": True, "removed": removed}
+
+
 def _tie_score(history: List[str]) -> float:
     if not history:
         return T_PRIOR
@@ -2732,7 +2891,7 @@ def _fuhao_majority(votes: List[str], big_road_pick: str = "") -> Dict[str, Any]
 
 def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
     if not non_tie:
-        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "pattern_class": "NO_DATA", "is_vote_valid": False, "details": {}}
+        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "details": {}}
 
     recent = non_tie[-16:]
     last_side, streak_n = _streak(non_tie)
@@ -2744,64 +2903,44 @@ def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
     last_col = int(last_pos.get("col", 0))
     current_col_height = int(layout.get("col_heights", {}).get(last_col, 0))
 
-    # 嚴格版：大路只在清楚路型時投票；一般「跟最新欄」不再投票。
-    pick = ""
-    label = "大路無明確牌型不投票"
-    confidence = 0.0
-    pattern_class = "NO_CLEAR_PATTERN"
-    is_vote_valid = False
+    # 富濠式大路核心：看最新欄/最新方向，規則命名只用來解釋。
+    pick = last_side
+    label = "大路跟最新欄"
+    confidence = 0.56
 
     if streak_n >= FUHAO_LONG_THRESHOLD:
-        pick = last_side
         label = f"大路長龍{_fuhao_side_name(last_side)}{streak_n}口"
         confidence = min(0.72, 0.58 + streak_n * 0.025)
-        pattern_class = "DRAGON"
-        is_vote_valid = True
     elif len(recent) >= 6 and switch_rate >= 0.72:
         # 單跳盤以反手作大路節奏判斷，避免固定死跟最後一欄。
         pick = opp
         label = "大路單跳節奏"
         confidence = min(0.70, 0.56 + (switch_rate - 0.72) * 0.35)
-        pattern_class = "PINGPONG"
-        is_vote_valid = True
     elif len(non_tie) >= 6 and "".join(non_tie[-6:]) in {"BBPPBB", "PPBBPP", "BPPBBP", "PBBPPB"}:
         pick = non_tie[-2]
         label = "大路雙跳/排排連"
         confidence = 0.62
-        pattern_class = "DOUBLE_OR_PAIR"
-        is_vote_valid = True
-    elif current_col_height >= 3 and not FUHAO_STRICT_PATTERN_VOTE:
-        # 非嚴格模式才允許欄高延續直接投票。
-        pick = last_side
+    elif current_col_height >= 3:
         label = "大路欄高延續"
         confidence = 0.60
-        pattern_class = "COLUMN_CONTINUE"
-        is_vote_valid = True
-
-    if FUHAO_BIGROAD_SIGNAL_ONLY:
-        # 大路保留當候選/說明，不直接參與最後投票。
-        is_vote_valid = False
 
     return {
-        "pick": pick if is_vote_valid or not FUHAO_BIGROAD_SIGNAL_ONLY else "",
-        "candidate_pick": pick,
+        "pick": pick,
         "label": label,
         "confidence": round(confidence, 4),
-        "pattern_class": pattern_class,
-        "is_vote_valid": is_vote_valid,
         "details": {
             "last_side": last_side,
             "streak": streak_n,
             "switch_rate": round(switch_rate, 4),
             "current_col_height": current_col_height,
             "last_col": last_col,
-            "candidate_pick": pick,
         },
     }
 
+
 def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
     if len(non_tie) < FUHAO_MIN_VALID_ROUNDS:
-        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}, "is_vote_valid": False}
+        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}}
 
     layout = _build_big_road(non_tie)
     series = _derived_series(layout, offset=offset)
@@ -2809,51 +2948,26 @@ def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, A
     count = int(stats.get("count", 0))
     last_side, _ = _streak(non_tie)
     if not last_side or count <= 0:
-        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats, "is_vote_valid": False}
+        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats}
 
     opp = "P" if last_side == "B" else "B"
     red_rate = float(stats.get("red_rate", 0.5))
     blue_rate = float(stats.get("blue_rate", 0.5))
-    diff = abs(red_rate - blue_rate)
 
-    # 嚴格牌路投票：紅藍差距太小或平手時不投票，不再預設偏莊。
-    if red_rate == blue_rate:
-        if FUHAO_DERIVED_TIE_AS_NO_VOTE or FUHAO_DOWN3_TIE_BIAS in {"NONE", "NO", "NO_VOTE", "OBSERVE", ""}:
-            return {
-                "pick": "",
-                "label": f"{name}紅藍平手不投票",
-                "confidence": 0.0,
-                "stats": stats,
-                "red_blue_diff": round(diff, 4),
-                "is_vote_valid": False,
-            }
-        pick = "B" if FUHAO_DOWN3_TIE_BIAS == "BANKER" else "P"
-        label = f"{name}紅藍平手偏{_fuhao_side_name(pick)}"
-    elif FUHAO_STRICT_PATTERN_VOTE and diff < FUHAO_DERIVED_MIN_RED_BLUE_DIFF:
-        return {
-            "pick": "",
-            "label": f"{name}紅藍差距{diff:.2f}不足不投票",
-            "confidence": 0.0,
-            "stats": stats,
-            "red_blue_diff": round(diff, 4),
-            "is_vote_valid": False,
-        }
-    elif red_rate > blue_rate:
+    # 紅：規律整齊，偏延續；藍：變化加重，偏反邊。
+    if red_rate > blue_rate:
         pick = last_side
         label = f"{name}紅路續勢"
-    else:
+    elif blue_rate > red_rate:
         pick = opp
         label = f"{name}藍路變化"
+    else:
+        pick = "B" if FUHAO_DOWN3_TIE_BIAS == "BANKER" else "P"
+        label = f"{name}紅藍平手偏{_fuhao_side_name(pick)}"
 
-    confidence = 0.50 + min(0.20, diff * 0.40) + min(0.08, count * 0.006)
-    return {
-        "pick": pick,
-        "label": label,
-        "confidence": round(confidence, 4),
-        "stats": stats,
-        "red_blue_diff": round(diff, 4),
-        "is_vote_valid": True,
-    }
+    confidence = 0.50 + min(0.20, abs(red_rate - blue_rate) * 0.40) + min(0.08, count * 0.006)
+    return {"pick": pick, "label": label, "confidence": round(confidence, 4), "stats": stats}
+
 
 def _fuhao_deep_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
     # 對應富濠 DeepLearningPredictor：莊數總和奇偶。
@@ -2884,7 +2998,7 @@ def _fuhao_probs_from_votes(main_pick: str, vote_ratio: float, tie_prob: float) 
     else:
         # vote_ratio 0.5~1.0 轉成柔性機率邊際，不讓畫面變成過度誇張的 90%。
         edge = FUHAO_PROB_EDGE + max(0.0, vote_ratio - 0.5) * 2 * (FUHAO_MAX_EDGE - FUHAO_PROB_EDGE)
-        edge = _clamp(edge, FUHAO_MIN_PROB_EDGE, FUHAO_MAX_EDGE)
+        edge = _clamp(edge, 0.035, FUHAO_MAX_EDGE)
         b_side = 0.5 + edge if main_pick == "B" else 0.5 - edge
     b_prob = b_side * (1 - tie_prob)
     p_prob = (1 - b_side) * (1 - tie_prob)
@@ -3523,12 +3637,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         final_pick = advanced_pick or road_pick or ("" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick)
         final_source = "advanced_majority" if advanced_pick else ("road_fallback" if road_pick else "bigroad_fallback")
 
-    raw_all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
-    # 嚴格版：大路只當候選說明，不計入最後票數與機率比例。
-    if FUHAO_BIGROAD_SIGNAL_ONLY:
-        all_votes = [v for v in derived_votes + advanced_votes if v in {"B", "P"}]
-    else:
-        all_votes = raw_all_votes
+    all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
     all_majority = _fuhao_majority(all_votes, big_road_pick=road_tiebreak_pick)
     vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
 
@@ -3769,7 +3878,6 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "fuhao_banker_rate": 1.0 if FUHAO_USE_BANKER_RATE else 0.0,
         "fuhao_deepseek_confirm": FUHAO_DEEPSEEK_WEIGHT if (USE_DEEPSEEK and FUHAO_USE_DEEPSEEK) else 0.0,
         "fuhao_fake_pattern_detector": 1.0 if FUHAO_USE_FAKE_PATTERN_DETECTOR else 0.0,
-        "fuhao_strict_pattern_vote": 1.0 if FUHAO_STRICT_PATTERN_VOTE else 0.0,
     }
 
     # 舊欄位相容：前端或 app.py 若讀舊 key 不會爆。
@@ -3827,11 +3935,6 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "observe_on_bigroad_only": FUHAO_OBSERVE_ON_BIGROAD_ONLY,
             "required_non_bigroad_votes": FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES,
             "derived_ratio": round(derived_ratio, 4),
-            "strict_pattern_vote": FUHAO_STRICT_PATTERN_VOTE,
-            "vote_min_edge": FUHAO_VOTE_MIN_EDGE,
-            "derived_tie_as_no_vote": FUHAO_DERIVED_TIE_AS_NO_VOTE,
-            "derived_min_red_blue_diff": FUHAO_DERIVED_MIN_RED_BLUE_DIFF,
-            "bigroad_signal_only": FUHAO_BIGROAD_SIGNAL_ONLY,
         },
         "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority},
         "road_lifecycle": empty_state,
@@ -3891,7 +3994,6 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "road_votes": road_votes,
             "advanced_votes": advanced_votes,
             "all_votes": all_votes,
-            "raw_all_votes": raw_all_votes,
             "road_majority": road_majority,
             "advanced_majority": advanced_majority,
             "all_majority": all_majority,
@@ -3965,6 +4067,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     non_tie = _last_non_tie(history)
 
+    # 每個 LINE UID / 場館 / 房間 / 靴號 都是獨立模型與獨立逐局前推狀態。
+    # 若 app.py 沒有傳入 user_id，會落到 anonymous；LINE 實戰務必傳 LINE UID。
+    identity = str(user_id or "anonymous")
+    training_key = f"{identity}|{venue or 'global'}|{room or 'global'}|{shoe_id or 'global'}"
+    _update_walk_forward_truth(training_key, non_tie)
+    live_walk_forward_performance = _get_walk_forward_performance(training_key)
+
     # ============ 1. 基礎模型 + 四路主模型 ==========
     markov = _transition_prob(non_tie)
     road = _road_pattern_score(non_tie)
@@ -3988,6 +4097,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     road_rhythm = _road_rhythm_score(non_tie, road_family, lifecycle, regime_info, road_memory)
     long_anchor = _long_anchor_score(non_tie, road_family, lifecycle, regime_info)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
+    # 逐局前推 live performance 是每個 LINE UID / 房間 / 靴號獨立累積，
+    # 會把這一靴目前準的模型加權、目前失效的模型降權。
+    dynamic_weights = _apply_walk_forward_weighting(dynamic_weights, live_walk_forward_performance)
     dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
     dynamic_weights = _apply_road_memory_weighting(dynamic_weights, road_memory)
     dynamic_weights = _apply_road_rhythm_weighting(dynamic_weights, road_rhythm)
@@ -4032,8 +4144,6 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     p_prob = p_side * (1 - tie_prob)
 
     # ============ 2. ML模型預測 ==========
-    identity = str(user_id or "anonymous")
-    training_key = f"{identity}|{venue}|{room}|{shoe_id}" if (venue or room or shoe_id) else f"{identity}|global"
     ml_models = _get_ml_models(training_key)
 
     should_train = (
@@ -4055,6 +4165,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     if ml_models.is_trained:
         ml_weight = ML_WEIGHT * (0.5 + 0.5 * min(1.0, ml_models.training_samples / 50))
+        if WALK_FORWARD_APPLY_TO_ML:
+            ml_weight *= _walk_forward_factor(live_walk_forward_performance, "ml_ensemble", 1.0)
         # 如果四路生命週期高信心偏某一邊，而 ML 強烈反向，就縮小 ML 影響，避免 ML 把「該跟/該斷」拉歪。
         lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
         lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
@@ -4106,6 +4218,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "regime": regime_info,
         "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
         "online_performance": online_performance,
+        "live_walk_forward_performance": live_walk_forward_performance,
         "ml_predictions": ml_pred,
         "tf_available": TF_AVAILABLE,
         "training_key": training_key,
@@ -4126,6 +4239,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
                 ta = _clamp(float(ai_result.get("tie_adjust", 0)), -0.020, 0.020)
                 ai_conf = _clamp(float(ai_result.get("confidence", 0.4)), 0, 1)
                 blend = AI_BLEND * (0.45 + ai_conf * 0.55)
+                if WALK_FORWARD_APPLY_TO_AI:
+                    blend *= _walk_forward_factor(live_walk_forward_performance, "ai", 1.0)
                 # AI 是校準器；若它與高信心生命周期方向反向，縮小校準幅度，避免覆蓋四路生命周期判斷。
                 lifecycle_bias_side = lifecycle.get("bias_side", "") if lifecycle.get("enabled") else ""
                 lifecycle_conf = float(lifecycle.get("confidence", 0.0)) if lifecycle.get("enabled") else 0.0
@@ -4156,19 +4271,29 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     # ============ 5. 投票一致性 ==========
     votes = []
-    for score in [big_road, big_eye, small_road, cockroach, ngram, markov, road, recent, streak, balance]:
-        pick = _pick_from_score(score)
+    current_model_scores = {
+        "big_road": big_road,
+        "big_eye": big_eye,
+        "small_road": small_road,
+        "cockroach": cockroach,
+        "ngram": ngram,
+        "markov": markov,
+        "road": road,
+        "recent": recent,
+        "streak": streak,
+        "balance": balance,
+    }
+    current_model_picks = _walk_forward_pick_map(current_model_scores)
+    for pick in current_model_picks.values():
         if pick:
             votes.append(pick)
 
-    if ml_models.is_trained:
-        votes.append("B" if ml_b_prob >= 0.5 else "P")
-
-    if not votes:
-        votes = ["B" if b_prob >= p_prob else "P"]
+    if ml_models.is_trained and abs(ml_b_prob - 0.5) >= WALK_FORWARD_ML_MIN_EDGE:
+        current_model_picks["ml_ensemble"] = "B" if ml_b_prob >= 0.5 else "P"
+        votes.append(current_model_picks["ml_ensemble"])
 
     main_pick = "B" if b_prob >= p_prob else "P"
-    agreement = votes.count(main_pick) / len(votes)
+    agreement = votes.count(main_pick) / len(votes) if votes else 0.5
 
     if ml_models.is_trained:
         ml_pick = "B" if ml_b_prob >= 0.5 else "P"
@@ -4236,7 +4361,20 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     elif ai_result and ai_result.get("error"):
         reason_parts.append("AI離線改本地判斷")
 
-    # ============ 8. 返回結果 ==========
+    # ============ 8. 逐局前推 pending：本輪各模型只預測下一局，等下一次使用者回報結果再結算 ==========
+    if ai_result and not ai_result.get("error"):
+        try:
+            ai_b = float(ai_result.get("banker_adjust", 0))
+            ai_p = float(ai_result.get("player_adjust", 0))
+            if abs(ai_b - ai_p) >= WALK_FORWARD_AI_MIN_EDGE:
+                current_model_picks["ai"] = "B" if ai_b > ai_p else "P"
+        except Exception:
+            pass
+    if recommend in {"B", "P"}:
+        current_model_picks["final"] = recommend
+    _store_walk_forward_pending(training_key, non_tie, current_model_picks)
+
+    # ============ 9. 返回結果 ==========
     return {
         "ok": True,
         "user_id": user_id,
@@ -4300,6 +4438,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_engine_derived": road_engine.get("derived", {}),
         "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
         "online_model_performance": online_performance,
+        "live_walk_forward_performance": live_walk_forward_performance,
+        "walk_forward_enabled": USE_WALK_FORWARD_LEARNING,
+        "walk_forward_state_size": len(_WALK_FORWARD_STATE),
         "reason": " / ".join([x for x in reason_parts if x]),
         "ai_used": bool(ai_result and not ai_result.get("error")),
         "ml_trained": ml_models.is_trained,
