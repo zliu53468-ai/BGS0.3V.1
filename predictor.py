@@ -116,6 +116,28 @@ WALK_FORWARD_APPLY_TO_AI = os.getenv("WALK_FORWARD_APPLY_TO_AI", "1") == "1"
 WALK_FORWARD_STORE_PENDING = os.getenv("WALK_FORWARD_STORE_PENDING", "1") == "1"
 WALK_FORWARD_DEBUG = os.getenv("WALK_FORWARD_DEBUG", "0") == "1"
 
+# Pattern Replay Memory：全靴逐局前推相似規律回放
+# 目的：不是只看最近幾口，而是用目前整靴已知資料，回找前面相似片段，判斷下一局延續/轉折。
+USE_PATTERN_REPLAY_MEMORY = os.getenv("USE_PATTERN_REPLAY_MEMORY", "1") == "1"
+PATTERN_REPLAY_MIN_HISTORY = int(os.getenv("PATTERN_REPLAY_MIN_HISTORY", "14"))
+PATTERN_REPLAY_LOOKBACK = int(os.getenv("PATTERN_REPLAY_LOOKBACK", "140"))
+PATTERN_REPLAY_FULL_SHOE = os.getenv("PATTERN_REPLAY_FULL_SHOE", "1") == "1"
+PATTERN_REPLAY_WINDOWS = os.getenv("PATTERN_REPLAY_WINDOWS", "5,6,7,8,10,12,16,20")
+PATTERN_REPLAY_MIN_MATCHES = int(os.getenv("PATTERN_REPLAY_MIN_MATCHES", "2"))
+PATTERN_REPLAY_MIN_SIMILARITY = float(os.getenv("PATTERN_REPLAY_MIN_SIMILARITY", "0.72"))
+PATTERN_REPLAY_EXACT_WEIGHT = float(os.getenv("PATTERN_REPLAY_EXACT_WEIGHT", "0.15"))
+PATTERN_REPLAY_SHAPE_WEIGHT = float(os.getenv("PATTERN_REPLAY_SHAPE_WEIGHT", "0.55"))
+PATTERN_REPLAY_TRANSITION_WEIGHT = float(os.getenv("PATTERN_REPLAY_TRANSITION_WEIGHT", "0.30"))
+PATTERN_REPLAY_RECENCY_WEIGHT = float(os.getenv("PATTERN_REPLAY_RECENCY_WEIGHT", "0.30"))
+PATTERN_REPLAY_LONG_WINDOW_WEIGHT = float(os.getenv("PATTERN_REPLAY_LONG_WINDOW_WEIGHT", "0.22"))
+PATTERN_REPLAY_BAYES_ALPHA = float(os.getenv("PATTERN_REPLAY_BAYES_ALPHA", "1.2"))
+PATTERN_REPLAY_MIN_EDGE = float(os.getenv("PATTERN_REPLAY_MIN_EDGE", "0.025"))
+PATTERN_REPLAY_MAX_BIAS = float(os.getenv("PATTERN_REPLAY_MAX_BIAS", "0.075"))
+PATTERN_REPLAY_WEIGHT = float(os.getenv("PATTERN_REPLAY_WEIGHT", "0.24"))
+PATTERN_REPLAY_APPLY_WF = os.getenv("PATTERN_REPLAY_APPLY_WF", "1") == "1"
+PATTERN_REPLAY_MAX_MATCHES = int(os.getenv("PATTERN_REPLAY_MAX_MATCHES", "160"))
+PATTERN_REPLAY_DEBUG = os.getenv("PATTERN_REPLAY_DEBUG", "0") == "1"
+
 
 # RoadEngine / 下三路路紙引擎參數
 ROAD_ENGINE_ROWS = int(os.getenv("ROAD_ENGINE_ROWS", "6"))
@@ -2820,6 +2842,247 @@ def clear_walk_forward_state() -> Dict[str, Any]:
     return {"ok": True, "removed": removed}
 
 
+
+# ============ Pattern Replay Memory：全靴逐局前推相似規律回放 ============
+def _parse_int_list(raw: str, default: List[int]) -> List[int]:
+    try:
+        vals = []
+        for x in str(raw or "").replace(";", ",").split(","):
+            x = x.strip()
+            if not x:
+                continue
+            vals.append(int(x))
+        vals = sorted(set(v for v in vals if v >= 2))
+        return vals or list(default)
+    except Exception:
+        return list(default)
+
+
+def _opp_side(side: str) -> str:
+    return "P" if side == "B" else "B" if side == "P" else ""
+
+
+def _relative_shape(seq: List[str]) -> List[str]:
+    """把 B/P 轉成相對形狀：第一個方向=A，另一邊=X。可跨莊閒方向比較節奏。"""
+    if not seq:
+        return []
+    first = seq[0]
+    other = _opp_side(first)
+    return ["A" if x == first else "X" if x == other else "?" for x in seq]
+
+
+def _transition_shape(seq: List[str]) -> List[str]:
+    if len(seq) < 2:
+        return []
+    return ["S" if a == b else "C" for a, b in zip(seq, seq[1:])]
+
+
+def _pattern_similarity(current: List[str], past: List[str]) -> Dict[str, float]:
+    """相似度不是只看 B/P 是否完全一樣，也看路型形狀與連斷節奏。"""
+    if not current or len(current) != len(past):
+        return {"score": 0.0, "exact": 0.0, "shape": 0.0, "transition": 0.0}
+    n = len(current)
+    exact = sum(1 for a, b in zip(current, past) if a == b) / max(1, n)
+    cshape = _relative_shape(current)
+    pshape = _relative_shape(past)
+    shape = sum(1 for a, b in zip(cshape, pshape) if a == b) / max(1, n)
+    ct = _transition_shape(current)
+    pt = _transition_shape(past)
+    trans = sum(1 for a, b in zip(ct, pt) if a == b) / max(1, len(ct)) if ct else 0.0
+    total_w = max(0.0001, PATTERN_REPLAY_EXACT_WEIGHT + PATTERN_REPLAY_SHAPE_WEIGHT + PATTERN_REPLAY_TRANSITION_WEIGHT)
+    score = (
+        exact * PATTERN_REPLAY_EXACT_WEIGHT
+        + shape * PATTERN_REPLAY_SHAPE_WEIGHT
+        + trans * PATTERN_REPLAY_TRANSITION_WEIGHT
+    ) / total_w
+    return {"score": round(score, 5), "exact": round(exact, 5), "shape": round(shape, 5), "transition": round(trans, 5)}
+
+
+def _map_past_truth_to_current(current: List[str], past: List[str], past_truth: str) -> str:
+    """把過去相似片段的下一口，映射到目前片段方向。
+
+    例如過去 PPBPPB 後接 P，而目前 BBPBBP 是同形狀反色，則映射成 B。
+    這樣學的是「規律形狀會延續或反轉」，不是死記莊/閒數量。
+    """
+    if not current or not past or past_truth not in {"B", "P"}:
+        return ""
+    past_first = past[0]
+    current_first = current[0]
+    current_opp = _opp_side(current_first)
+    if past_truth == past_first:
+        return current_first
+    return current_opp
+
+
+def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", live_performance: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """全靴逐局前推相似規律回放。
+
+    原則：
+    - 預測第 N+1 口時，只能使用第 1~N 口。
+    - 不是只看最近幾口，而是用多尺度窗口，把目前尾段拿去前面所有已知牌路找相似片段。
+    - 找到相似片段後，看當時下一口如何走，再映射成目前的 B/P 候選。
+    """
+    default = {
+        "enabled": False,
+        "state": "REPLAY_COLD",
+        "label": "Pattern Replay資料不足",
+        "B": 0.5,
+        "P": 0.5,
+        "bias_side": "",
+        "confidence": 0.0,
+        "edge": 0.0,
+        "sample": 0,
+        "weighted_sample": 0.0,
+        "b_weight": 0.0,
+        "p_weight": 0.0,
+        "windows_used": [],
+        "matched_examples": [],
+        "training_key": training_key,
+    }
+    if not USE_PATTERN_REPLAY_MEMORY:
+        return default
+    n = len(non_tie)
+    if n < PATTERN_REPLAY_MIN_HISTORY:
+        return {**default, "enabled": True, "state": "REPLAY_WARMUP", "label": f"Pattern Replay暖機中 {n}/{PATTERN_REPLAY_MIN_HISTORY}"}
+
+    windows = _parse_int_list(PATTERN_REPLAY_WINDOWS, [5, 6, 7, 8, 10, 12, 16, 20])
+    windows = [w for w in windows if 2 <= w < n]
+    if not windows:
+        return {**default, "enabled": True, "state": "REPLAY_NO_WINDOW", "label": "Pattern Replay沒有可用窗口"}
+
+    b_w = 0.0
+    p_w = 0.0
+    raw_matches = 0
+    exact_matches = 0
+    max_score = 0.0
+    examples: List[Dict[str, Any]] = []
+    windows_used = []
+    max_window = max(windows) if windows else 1
+
+    for w in windows:
+        current = non_tie[-w:]
+        if len(current) < w:
+            continue
+        start = 0 if PATTERN_REPLAY_FULL_SHOE else max(0, n - PATTERN_REPLAY_LOOKBACK - w - 1)
+        # j+w 必須 < n，因為 non_tie[j+w] 才是當時已知的下一口；不能用現在尚未發生的下一口。
+        end = n - w
+        local_matches = 0
+        for j in range(start, end):
+            truth_idx = j + w
+            if truth_idx >= n:
+                continue
+            past = non_tie[j:j + w]
+            truth = non_tie[truth_idx]
+            if truth not in {"B", "P"} or len(past) != w:
+                continue
+            sim_info = _pattern_similarity(current, past)
+            sim = float(sim_info.get("score", 0.0))
+            max_score = max(max_score, sim)
+            if sim < PATTERN_REPLAY_MIN_SIMILARITY:
+                continue
+            mapped = _map_past_truth_to_current(current, past, truth)
+            if mapped not in {"B", "P"}:
+                continue
+            recency = (truth_idx + 1) / max(1, n)
+            window_factor = 1.0 + PATTERN_REPLAY_LONG_WINDOW_WEIGHT * (w / max(1, max_window))
+            weight = sim * (1.0 + PATTERN_REPLAY_RECENCY_WEIGHT * recency) * window_factor
+            if mapped == "B":
+                b_w += weight
+            else:
+                p_w += weight
+            raw_matches += 1
+            local_matches += 1
+            if sim_info.get("exact", 0.0) >= 0.999:
+                exact_matches += 1
+            if len(examples) < PATTERN_REPLAY_MAX_MATCHES:
+                examples.append({
+                    "window": w,
+                    "start_round": j + 1,
+                    "truth_round": truth_idx + 1,
+                    "past": "".join(past),
+                    "current": "".join(current),
+                    "truth": truth,
+                    "mapped": mapped,
+                    "similarity": round(sim, 4),
+                    "exact": sim_info.get("exact", 0.0),
+                    "shape": sim_info.get("shape", 0.0),
+                    "transition": sim_info.get("transition", 0.0),
+                    "weight": round(weight, 4),
+                })
+        if local_matches:
+            windows_used.append({"window": w, "matches": local_matches})
+
+    weighted_sample = b_w + p_w
+    if raw_matches < PATTERN_REPLAY_MIN_MATCHES or weighted_sample <= 0:
+        return {
+            **default,
+            "enabled": True,
+            "state": "REPLAY_NO_MATCH",
+            "label": f"Pattern Replay相似樣本不足 M{raw_matches} MaxSim{max_score:.2f}",
+            "sample": raw_matches,
+            "weighted_sample": round(weighted_sample, 4),
+            "max_similarity": round(max_score, 4),
+            "matched_examples": examples[:8] if PATTERN_REPLAY_DEBUG else [],
+            "windows_used": windows_used,
+        }
+
+    alpha = max(0.0001, PATTERN_REPLAY_BAYES_ALPHA)
+    b_rate = (b_w + alpha) / (weighted_sample + 2 * alpha)
+    p_rate = 1.0 - b_rate
+    edge = abs(b_rate - 0.5)
+    sample_strength = _clamp(weighted_sample / max(4.0, PATTERN_REPLAY_MIN_MATCHES * 2.5), 0.0, 1.0)
+    confidence = _clamp(sample_strength * (0.24 + edge * 2.4) + min(0.18, exact_matches * 0.025), 0.0, 1.0)
+    bias_side = "B" if b_rate > p_rate else "P" if p_rate > b_rate else ""
+
+    state = "REPLAY_MATCH"
+    if edge < PATTERN_REPLAY_MIN_EDGE:
+        state = "REPLAY_NEUTRAL"
+        bias_side = ""
+    side_text = {"B": "莊", "P": "閒", "": "中性"}.get(bias_side, bias_side)
+    label = f"Pattern Replay:{side_text} B{int(b_rate*100)} P{int(p_rate*100)} 樣本{raw_matches} 窗口{','.join(str(x.get('window')) for x in windows_used[:5])}"
+
+    return {
+        "enabled": True,
+        "state": state,
+        "label": label,
+        "B": round(float(b_rate), 5),
+        "P": round(float(p_rate), 5),
+        "bias_side": bias_side,
+        "confidence": round(confidence, 4),
+        "edge": round(edge, 5),
+        "sample": raw_matches,
+        "weighted_sample": round(weighted_sample, 4),
+        "b_weight": round(b_w, 4),
+        "p_weight": round(p_w, 4),
+        "exact_matches": exact_matches,
+        "max_similarity": round(max_score, 4),
+        "windows_used": windows_used,
+        "matched_examples": examples[:12] if PATTERN_REPLAY_DEBUG else examples[:4],
+        "training_key": training_key,
+    }
+
+
+def _apply_pattern_replay_bias(b_side: float, pattern_replay: Dict[str, Any], live_performance: Optional[Dict[str, Any]] = None) -> float:
+    if not USE_PATTERN_REPLAY_MEMORY or not pattern_replay.get("enabled"):
+        return b_side
+    if pattern_replay.get("state") != "REPLAY_MATCH":
+        return b_side
+    side = pattern_replay.get("bias_side", "")
+    if side not in {"B", "P"}:
+        return b_side
+    conf = float(pattern_replay.get("confidence", 0.0) or 0.0)
+    edge = float(pattern_replay.get("edge", 0.0) or 0.0)
+    if conf <= 0 or edge < PATTERN_REPLAY_MIN_EDGE:
+        return b_side
+    wf_factor = 1.0
+    if PATTERN_REPLAY_APPLY_WF and live_performance:
+        wf_factor = _walk_forward_factor(live_performance, "pattern_replay", 1.0)
+    scale = _clamp(PATTERN_REPLAY_WEIGHT / 0.24, 0.10, 2.50)
+    strength = PATTERN_REPLAY_MAX_BIAS * conf * _clamp(edge * 3.0, 0.20, 1.0) * scale * wf_factor
+    signed = 1 if side == "B" else -1
+    return _clamp(b_side + signed * strength, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+
+
 def _tie_score(history: List[str]) -> float:
     if not history:
         return T_PRIOR
@@ -4096,6 +4359,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     road_memory = _adaptive_road_memory_score(non_tie, road_family, lifecycle, regime_info)
     road_rhythm = _road_rhythm_score(non_tie, road_family, lifecycle, regime_info, road_memory)
     long_anchor = _long_anchor_score(non_tie, road_family, lifecycle, regime_info)
+    pattern_replay = _pattern_replay_memory_score(non_tie, training_key=training_key, live_performance=live_walk_forward_performance)
     dynamic_weights = _apply_online_weighting(regime_info.get("weights", {}), online_performance)
     # 逐局前推 live performance 是每個 LINE UID / 房間 / 靴號獨立累積，
     # 會把這一靴目前準的模型加權、目前失效的模型降權。
@@ -4132,6 +4396,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     b_side = _apply_lifecycle_bias(b_side, lifecycle)
     # Adaptive Road Memory 會看本靴過去相似牌路到底是跟準還是斷準，再做柔性修正。
     b_side = _apply_road_memory_bias(b_side, road_memory)
+    # Pattern Replay 會拿目前尾段去整靴已知歷史中找相似規律，看當時下一口如何走。
+    b_side = _apply_pattern_replay_bias(b_side, pattern_replay, live_walk_forward_performance)
     # Road Rhythm 會看短 / 中 / 長週期，避免太看當局，分辨假斷與真轉折。
     b_side = _apply_road_rhythm_bias(b_side, road_rhythm)
     # Long Anchor Guard 會用長週期錨定限制短線偏移，降低太看當局。
@@ -4206,6 +4472,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_family": road_family,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
+        "pattern_replay_memory": pattern_replay,
         "road_rhythm": road_rhythm,
         "long_anchor": long_anchor,
         "road_engine": road_engine,
@@ -4276,6 +4543,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "big_eye": big_eye,
         "small_road": small_road,
         "cockroach": cockroach,
+        "pattern_replay": pattern_replay,
         "ngram": ngram,
         "markov": markov,
         "road": road,
@@ -4342,6 +4610,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         f"四路:{road_consensus.get('label', '')}",
         f"生命周期:{lifecycle.get('label', '')}",
         f"記憶:{road_memory.get('label', '')}",
+        f"歷史回放:{pattern_replay.get('label', '')}",
         f"節奏:{road_rhythm.get('label', '')}",
         f"長錨:{long_anchor.get('label', '')}",
         big_road.get("label", ""),
@@ -4408,6 +4677,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_family": road_family,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
+        "pattern_replay_memory": pattern_replay,
+        "pattern_replay_state": pattern_replay.get("state", ""),
+        "pattern_replay_label": pattern_replay.get("label", ""),
+        "pattern_replay_side": pattern_replay.get("bias_side", ""),
+        "pattern_replay_confidence": pattern_replay.get("confidence", 0.0),
+        "pattern_replay_sample": pattern_replay.get("sample", 0),
+        "pattern_replay_edge": pattern_replay.get("edge", 0.0),
         "road_rhythm": road_rhythm,
         "road_rhythm_state": road_rhythm.get("state", ""),
         "road_rhythm_label": road_rhythm.get("label", ""),
@@ -4426,6 +4702,11 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_memory_follow_rate": road_memory.get("follow_rate", 0.5),
         "road_memory_break_rate": road_memory.get("break_rate", 0.5),
         "road_memory_confidence": road_memory.get("confidence", 0.0),
+        "pattern_replay_state": pattern_replay.get("state", ""),
+        "pattern_replay_label": pattern_replay.get("label", ""),
+        "pattern_replay_sample": pattern_replay.get("sample", 0),
+        "pattern_replay_side": pattern_replay.get("bias_side", ""),
+        "pattern_replay_confidence": pattern_replay.get("confidence", 0.0),
         "road_lifecycle_state": lifecycle.get("state", ""),
         "road_lifecycle_label": lifecycle.get("label", ""),
         "road_follow_score": lifecycle.get("follow_score", 0.5),
