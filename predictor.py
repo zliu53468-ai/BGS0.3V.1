@@ -217,6 +217,53 @@ LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
 LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
 ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "10"))
 
+
+# ============ 富濠式保守牌路多數決引擎 ============
+# 預設啟用 FUHAO_CLONE，讓覆蓋後不用再改程式碼即可使用富濠式邏輯。
+# 若要切回原本混合模型，Render 環境變數改成 PREDICT_ENGINE=HYBRID 即可。
+PREDICT_ENGINE = os.getenv("PREDICT_ENGINE", "FUHAO_CLONE").strip().upper()
+FUHAO_HISTORY_LIMIT = int(os.getenv("FUHAO_HISTORY_LIMIT", "100"))
+FUHAO_MIN_VALID_ROUNDS = int(os.getenv("FUHAO_MIN_VALID_ROUNDS", "6"))
+FUHAO_IGNORE_TIE_FOR_PREDICT = os.getenv("FUHAO_IGNORE_TIE_FOR_PREDICT", "1") == "1"
+FUHAO_KEEP_TIE_COUNT = os.getenv("FUHAO_KEEP_TIE_COUNT", "1") == "1"
+FUHAO_LONG_THRESHOLD = int(os.getenv("FUHAO_LONG_THRESHOLD", "4"))
+FUHAO_FENG_LOOKBACK_COLS = int(os.getenv("FUHAO_FENG_LOOKBACK_COLS", "6"))
+FUHAO_DOWN3_TIE_BIAS = os.getenv("FUHAO_DOWN3_TIE_BIAS", "BANKER").strip().upper()
+FUHAO_USE_BIG_ROAD = os.getenv("FUHAO_USE_BIG_ROAD", "1") == "1"
+FUHAO_USE_BIG_EYE = os.getenv("FUHAO_USE_BIG_EYE", "1") == "1"
+FUHAO_USE_SMALL_ROAD = os.getenv("FUHAO_USE_SMALL_ROAD", "1") == "1"
+FUHAO_USE_COCKROACH = os.getenv("FUHAO_USE_COCKROACH", "1") == "1"
+FUHAO_USE_DEEP_PARITY = os.getenv("FUHAO_USE_DEEP_PARITY", "1") == "1"
+FUHAO_USE_LENGTH_PARITY = os.getenv("FUHAO_USE_LENGTH_PARITY", "1") == "1"
+FUHAO_USE_BANKER_RATE = os.getenv("FUHAO_USE_BANKER_RATE", "1") == "1"
+FUHAO_FINAL_METHOD = os.getenv("FUHAO_FINAL_METHOD", "MAJORITY").strip().upper()
+FUHAO_FINAL_TIE_BREAKER = os.getenv("FUHAO_FINAL_TIE_BREAKER", "BIGROAD").strip().upper()
+FUHAO_CONFIDENCE_MODE = os.getenv("FUHAO_CONFIDENCE_MODE", "VOTE_RATIO").strip().upper()
+FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME = os.getenv("FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME", "1") == "1"
+FUHAO_MIN_VOTE_AGREE = int(os.getenv("FUHAO_MIN_VOTE_AGREE", "2"))
+FUHAO_OBSERVE_ON_CONFLICT = os.getenv("FUHAO_OBSERVE_ON_CONFLICT", "1") == "1"
+FUHAO_OBSERVE_ON_UNKNOWN = os.getenv("FUHAO_OBSERVE_ON_UNKNOWN", "1") == "1"
+FUHAO_OBSERVE_ON_TIE_ONLY = os.getenv("FUHAO_OBSERVE_ON_TIE_ONLY", "1") == "1"
+FUHAO_PROB_EDGE = float(os.getenv("FUHAO_PROB_EDGE", "0.120"))
+FUHAO_MAX_EDGE = float(os.getenv("FUHAO_MAX_EDGE", "0.185"))
+FUHAO_TIE_BASE = float(os.getenv("FUHAO_TIE_BASE", "0.095"))
+FUHAO_TIE_SHRINK = float(os.getenv("FUHAO_TIE_SHRINK", "0.30"))
+FUHAO_DEBUG = os.getenv("FUHAO_DEBUG", "0") == "1"
+
+# 富濠式 DeepSeek 輔助確認層：主模型仍以牌路多數決為主，AI 只做確認/校準。
+# USE_DEEPSEEK=1 且 FUHAO_USE_DEEPSEEK=1 時才會啟用。
+FUHAO_USE_DEEPSEEK = os.getenv("FUHAO_USE_DEEPSEEK", "1" if USE_DEEPSEEK else "0") == "1"
+FUHAO_DEEPSEEK_MODE = os.getenv("FUHAO_DEEPSEEK_MODE", "CONFIRM").strip().upper()
+FUHAO_DEEPSEEK_WEIGHT = float(os.getenv("FUHAO_DEEPSEEK_WEIGHT", "0.10"))
+FUHAO_DEEPSEEK_MIN_HISTORY = int(os.getenv("FUHAO_DEEPSEEK_MIN_HISTORY", "8"))
+FUHAO_DEEPSEEK_OBSERVE_ON_CONFLICT = os.getenv("FUHAO_DEEPSEEK_OBSERVE_ON_CONFLICT", "1") == "1"
+FUHAO_DEEPSEEK_MAX_ADJUST = float(os.getenv("FUHAO_DEEPSEEK_MAX_ADJUST", "0.035"))
+FUHAO_DEEPSEEK_TIE_MAX_ADJUST = float(os.getenv("FUHAO_DEEPSEEK_TIE_MAX_ADJUST", "0.020"))
+FUHAO_DEEPSEEK_MIN_CONFIDENCE = float(os.getenv("FUHAO_DEEPSEEK_MIN_CONFIDENCE", "0.45"))
+FUHAO_DEEPSEEK_CONFIDENCE_BOOST = float(os.getenv("FUHAO_DEEPSEEK_CONFIDENCE_BOOST", "0.060"))
+FUHAO_DEEPSEEK_CONFIDENCE_SHRINK = float(os.getenv("FUHAO_DEEPSEEK_CONFIDENCE_SHRINK", "0.080"))
+FUHAO_DEEPSEEK_INCLUDE_PAYLOAD = os.getenv("FUHAO_DEEPSEEK_INCLUDE_PAYLOAD", "0") == "1"
+
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
     """機器學習模型容器：每個 user_id / 場館 / 房間 / 靴號 可建立獨立實例"""
@@ -2582,12 +2629,690 @@ def _confidence(b: float, p: float, t: float, history_len: int, agreement: float
     return conf, "弱訊號"
 
 # ============ 主要預測函數 ============
+
+# ============ 富濠式模型：規則多數決，不吃當局點數 / 不跑 ML / 不跑 DeepSeek ============
+def _fuhao_side_name(side: str) -> str:
+    return {"B": "莊", "P": "閒", "T": "和", "NONE": "觀望", "": "無"}.get(side, side)
+
+
+def _fuhao_tie_break_side(big_road_pick: str = "") -> str:
+    mode = FUHAO_FINAL_TIE_BREAKER
+    if mode == "BIGROAD" and big_road_pick in {"B", "P"}:
+        return big_road_pick
+    if mode in {"PLAYER", "P"}:
+        return "P"
+    # 富濠式原邏輯遇平手通常偏莊；保守一點可用 BIGROAD。
+    return "B"
+
+
+def _fuhao_majority(votes: List[str], big_road_pick: str = "") -> Dict[str, Any]:
+    clean = [v for v in votes if v in {"B", "P"}]
+    b_count = clean.count("B")
+    p_count = clean.count("P")
+    if not clean:
+        return {"pick": "", "B": 0, "P": 0, "total": 0, "ratio": 0.0, "tie": True}
+    if b_count > p_count:
+        pick = "B"
+        tie = False
+    elif p_count > b_count:
+        pick = "P"
+        tie = False
+    else:
+        pick = _fuhao_tie_break_side(big_road_pick)
+        tie = True
+    ratio = max(b_count, p_count) / max(1, len(clean))
+    if tie:
+        ratio = 0.5
+    return {"pick": pick, "B": b_count, "P": p_count, "total": len(clean), "ratio": round(ratio, 4), "tie": tie}
+
+
+def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
+    if not non_tie:
+        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "details": {}}
+
+    recent = non_tie[-16:]
+    last_side, streak_n = _streak(non_tie)
+    opp = "P" if last_side == "B" else "B"
+    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+    layout = _build_big_road(non_tie)
+    last_pos = layout.get("last", {})
+    last_col = int(last_pos.get("col", 0))
+    current_col_height = int(layout.get("col_heights", {}).get(last_col, 0))
+
+    # 富濠式大路核心：看最新欄/最新方向，規則命名只用來解釋。
+    pick = last_side
+    label = "大路跟最新欄"
+    confidence = 0.56
+
+    if streak_n >= FUHAO_LONG_THRESHOLD:
+        label = f"大路長龍{_fuhao_side_name(last_side)}{streak_n}口"
+        confidence = min(0.72, 0.58 + streak_n * 0.025)
+    elif len(recent) >= 6 and switch_rate >= 0.72:
+        # 單跳盤以反手作大路節奏判斷，避免固定死跟最後一欄。
+        pick = opp
+        label = "大路單跳節奏"
+        confidence = min(0.70, 0.56 + (switch_rate - 0.72) * 0.35)
+    elif len(non_tie) >= 6 and "".join(non_tie[-6:]) in {"BBPPBB", "PPBBPP", "BPPBBP", "PBBPPB"}:
+        pick = non_tie[-2]
+        label = "大路雙跳/排排連"
+        confidence = 0.62
+    elif current_col_height >= 3:
+        label = "大路欄高延續"
+        confidence = 0.60
+
+    return {
+        "pick": pick,
+        "label": label,
+        "confidence": round(confidence, 4),
+        "details": {
+            "last_side": last_side,
+            "streak": streak_n,
+            "switch_rate": round(switch_rate, 4),
+            "current_col_height": current_col_height,
+            "last_col": last_col,
+        },
+    }
+
+
+def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
+    if len(non_tie) < FUHAO_MIN_VALID_ROUNDS:
+        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}}
+
+    layout = _build_big_road(non_tie)
+    series = _derived_series(layout, offset=offset)
+    stats = _color_stats(series)
+    count = int(stats.get("count", 0))
+    last_side, _ = _streak(non_tie)
+    if not last_side or count <= 0:
+        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats}
+
+    opp = "P" if last_side == "B" else "B"
+    red_rate = float(stats.get("red_rate", 0.5))
+    blue_rate = float(stats.get("blue_rate", 0.5))
+
+    # 紅：規律整齊，偏延續；藍：變化加重，偏反邊。
+    if red_rate > blue_rate:
+        pick = last_side
+        label = f"{name}紅路續勢"
+    elif blue_rate > red_rate:
+        pick = opp
+        label = f"{name}藍路變化"
+    else:
+        pick = "B" if FUHAO_DOWN3_TIE_BIAS == "BANKER" else "P"
+        label = f"{name}紅藍平手偏{_fuhao_side_name(pick)}"
+
+    confidence = 0.50 + min(0.20, abs(red_rate - blue_rate) * 0.40) + min(0.08, count * 0.006)
+    return {"pick": pick, "label": label, "confidence": round(confidence, 4), "stats": stats}
+
+
+def _fuhao_deep_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
+    # 對應富濠 DeepLearningPredictor：莊數總和奇偶。
+    b_count = non_tie.count("B")
+    pick = "B" if b_count % 2 == 0 else "P"
+    return {"pick": pick, "label": f"DeepParity莊數{'偶' if b_count % 2 == 0 else '奇'}偏{_fuhao_side_name(pick)}", "confidence": 0.56, "b_count": b_count}
+
+
+def _fuhao_length_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
+    # 對應富濠 StatisticalPatternRecognizer：有效局數奇偶。
+    n = len(non_tie)
+    pick = "B" if n % 2 == 0 else "P"
+    return {"pick": pick, "label": f"LengthParity有效局{'偶' if n % 2 == 0 else '奇'}偏{_fuhao_side_name(pick)}", "confidence": 0.55, "valid_len": n}
+
+
+def _fuhao_banker_rate_vote(non_tie: List[str]) -> Dict[str, Any]:
+    # 對應富濠 MultiSourceDataFusion：莊率 > 50% 則莊，否則閒。
+    n = max(1, len(non_tie))
+    b_rate = non_tie.count("B") / n
+    pick = "B" if b_rate > 0.5 else "P"
+    confidence = 0.52 + min(0.18, abs(b_rate - 0.5) * 0.55)
+    return {"pick": pick, "label": f"BankerRate莊率{b_rate*100:.1f}%偏{_fuhao_side_name(pick)}", "confidence": round(confidence, 4), "b_rate": round(b_rate, 4)}
+
+
+def _fuhao_probs_from_votes(main_pick: str, vote_ratio: float, tie_prob: float) -> Tuple[float, float, float]:
+    if main_pick not in {"B", "P"}:
+        b_side = 0.5
+    else:
+        # vote_ratio 0.5~1.0 轉成柔性機率邊際，不讓畫面變成過度誇張的 90%。
+        edge = FUHAO_PROB_EDGE + max(0.0, vote_ratio - 0.5) * 2 * (FUHAO_MAX_EDGE - FUHAO_PROB_EDGE)
+        edge = _clamp(edge, 0.035, FUHAO_MAX_EDGE)
+        b_side = 0.5 + edge if main_pick == "B" else 0.5 - edge
+    b_prob = b_side * (1 - tie_prob)
+    p_prob = (1 - b_side) * (1 - tie_prob)
+    return _normalize_three(b_prob, p_prob, tie_prob)
+
+
+def _fuhao_parse_ai_side(ai_result: Optional[Dict[str, Any]]) -> str:
+    """從 DeepSeek 回傳中解析 AI 偏向。支援 adjust 與文字型欄位兩種格式。"""
+    if not isinstance(ai_result, dict) or ai_result.get("error"):
+        return ""
+
+    # 若 deepseek_client 回傳明確方向，優先採用。
+    for key in ("recommend", "prediction", "pick", "side", "direction"):
+        raw = str(ai_result.get(key, "")).strip().upper()
+        if raw in {"B", "BANKER", "莊"}:
+            return "B"
+        if raw in {"P", "PLAYER", "閒", "闲"}:
+            return "P"
+
+    # 兼容校準器格式：banker_adjust / player_adjust。
+    try:
+        ba = float(ai_result.get("banker_adjust", 0) or 0)
+        pa = float(ai_result.get("player_adjust", 0) or 0)
+    except Exception:
+        return ""
+
+    if abs(ba - pa) < 0.00001:
+        return ""
+    return "B" if ba > pa else "P"
+
+
+def _fuhao_build_deepseek_payload(
+    history: List[str],
+    non_tie: List[str],
+    venue: str,
+    room: str,
+    shoe_id: str,
+    user_id: str,
+    road_models: Dict[str, Any],
+    advanced_models: Dict[str, Any],
+    road_majority: Dict[str, Any],
+    advanced_majority: Dict[str, Any],
+    all_majority: Dict[str, Any],
+    final_pick: str,
+    recommend: str,
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    vote_ratio: float,
+    final_vote_count: int,
+) -> Dict[str, Any]:
+    """建立富濠式 DeepSeek 校準 payload。
+
+    注意：不傳當局點數；只傳 B/P/T、路紙模型、多數決與本次機率，
+    讓 DeepSeek 只作為確認層，不取代牌路主模型。
+    """
+    return {
+        "engine": "FUHAO_CLONE",
+        "ai_role": "confirmation_layer",
+        "instruction": (
+            "請只依照已整理好的百家樂 B/P/T 牌路、富濠式多數決、路紙票與Advanced票進行校準。"
+            "DeepSeek 只做輔助確認，不要因單一當局點數推翻主模型。"
+            "若與主模型反向且理由不強，請降低confidence或回傳小幅adjust。"
+        ),
+        "user_id": user_id,
+        "venue": venue,
+        "room": room,
+        "shoe_id": shoe_id,
+        "history_len": len(history),
+        "valid_history_len": len(non_tie),
+        "history_tail": "".join(history[-36:]),
+        "non_tie_tail": "".join(non_tie[-36:]),
+        "fuhao_models": {
+            "road": road_models,
+            "advanced": advanced_models,
+            "road_majority": road_majority,
+            "advanced_majority": advanced_majority,
+            "all_majority": all_majority,
+        },
+        "fuhao_decision": {
+            "final_pick": final_pick,
+            "recommend": recommend,
+            "vote_ratio": round(vote_ratio, 4),
+            "final_vote_count": final_vote_count,
+        },
+        "local_probs": {
+            "B": round(b_prob, 5),
+            "P": round(p_prob, 5),
+            "T": round(tie_prob, 5),
+        },
+        "expected_response_fields": {
+            "banker_adjust": "float between -0.035 and 0.035",
+            "player_adjust": "float between -0.035 and 0.035",
+            "tie_adjust": "float between -0.020 and 0.020",
+            "confidence": "float 0~1",
+            "reason": "short text",
+        },
+        "settings": {
+            "mode": FUHAO_DEEPSEEK_MODE,
+            "observe_on_conflict": FUHAO_DEEPSEEK_OBSERVE_ON_CONFLICT,
+            "max_adjust": FUHAO_DEEPSEEK_MAX_ADJUST,
+            "tie_max_adjust": FUHAO_DEEPSEEK_TIE_MAX_ADJUST,
+        },
+    }
+
+
+def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
+    """富濠式保守牌路多數決模型。
+
+    特性：
+    - 和局保留統計，但預測主方向只用 B/P。
+    - 預設只看最近 100 手有效牌，避免太舊資料污染。
+    - 大路 + 下三路提供路紙票；三個 Advanced 規則做最終多數決。
+    - 預設要求路紙方向與 Advanced 方向一致；不同就觀望。
+    """
+    history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
+    if FUHAO_IGNORE_TIE_FOR_PREDICT:
+        non_tie_all = _last_non_tie(history)
+    else:
+        non_tie_all = [x for x in history if x in {"B", "P"}]
+    non_tie = non_tie_all[-max(1, FUHAO_HISTORY_LIMIT):]
+
+    tie_count = history.count("T") if FUHAO_KEEP_TIE_COUNT else 0
+    valid_len = len(non_tie)
+    recommend_text_map = {"B": "莊", "P": "閒", "T": "和", "NONE": "觀望"}
+
+    # 冷啟動：有效 B/P 太少時只回基準，避免亂給方向。
+    if valid_len < FUHAO_MIN_VALID_ROUNDS:
+        tie_prob = _clamp(FUHAO_TIE_BASE, 0.001, TIE_MAX_PROB)
+        b_prob, p_prob, tie_prob = _normalize_three(0.5 * (1 - tie_prob), 0.5 * (1 - tie_prob), tie_prob)
+        observe_reason = f"有效牌局{valid_len}局，未達富濠式最小樣本{FUHAO_MIN_VALID_ROUNDS}局"
+        return {
+            "ok": True,
+            "engine": "FUHAO_CLONE",
+            "user_id": user_id,
+            "venue": venue,
+            "room": room,
+            "shoe_id": shoe_id,
+            "round_no": len(history) + 1,
+            "history_len": len(history),
+            "valid_history_len": valid_len,
+            "tie_count": tie_count,
+            "banker_rate": round(b_prob * 100, 1),
+            "player_rate": round(p_prob * 100, 1),
+            "tie_rate": round(tie_prob * 100, 1),
+            "recommend": "NONE",
+            "recommend_text": "觀望",
+            "is_observe": True,
+            "observe_reason": observe_reason,
+            "decision_edge": 0.0,
+            "confidence": 0.25,
+            "signal_level": "資料不足",
+            "pattern_label": "富濠式冷啟動",
+            "regime": "fuhao_cold",
+            "reason": observe_reason,
+            "ai_used": False,
+            "ml_trained": False,
+            "ml_samples": 0,
+            "tf_available": TF_AVAILABLE,
+            "training_key": f"{user_id or 'anonymous'}|FUHAO_CLONE",
+            "model_cache_size": len(_MODEL_CACHE),
+            "ml_predictions": None,
+            "ai_result": None,
+            "debug": None,
+        }
+
+    # 1) 路紙票：大路 + 下三路
+    road_votes = []
+    road_models: Dict[str, Any] = {}
+
+    if FUHAO_USE_BIG_ROAD:
+        road_models["big_road"] = _fuhao_big_road_vote(non_tie)
+        road_votes.append(road_models["big_road"].get("pick", ""))
+    else:
+        road_models["big_road"] = {"pick": "", "label": "大路關閉", "confidence": 0.0}
+
+    if FUHAO_USE_BIG_EYE:
+        road_models["big_eye"] = _fuhao_down3_vote(non_tie, 1, "大眼仔")
+        road_votes.append(road_models["big_eye"].get("pick", ""))
+    else:
+        road_models["big_eye"] = {"pick": "", "label": "大眼仔關閉", "confidence": 0.0}
+
+    if FUHAO_USE_SMALL_ROAD:
+        road_models["small_road"] = _fuhao_down3_vote(non_tie, 2, "小路")
+        road_votes.append(road_models["small_road"].get("pick", ""))
+    else:
+        road_models["small_road"] = {"pick": "", "label": "小路關閉", "confidence": 0.0}
+
+    if FUHAO_USE_COCKROACH:
+        road_models["cockroach"] = _fuhao_down3_vote(non_tie, 3, "蟑螂路")
+        road_votes.append(road_models["cockroach"].get("pick", ""))
+    else:
+        road_models["cockroach"] = {"pick": "", "label": "蟑螂路關閉", "confidence": 0.0}
+
+    big_road_pick = road_models.get("big_road", {}).get("pick", "")
+    road_majority = _fuhao_majority(road_votes, big_road_pick=big_road_pick)
+
+    # 2) Advanced 三票：DeepParity / LengthParity / BankerRate
+    advanced_votes = []
+    advanced_models: Dict[str, Any] = {}
+
+    if FUHAO_USE_DEEP_PARITY:
+        advanced_models["deep_parity"] = _fuhao_deep_parity_vote(non_tie)
+        advanced_votes.append(advanced_models["deep_parity"].get("pick", ""))
+    else:
+        advanced_models["deep_parity"] = {"pick": "", "label": "DeepParity關閉", "confidence": 0.0}
+
+    if FUHAO_USE_LENGTH_PARITY:
+        advanced_models["length_parity"] = _fuhao_length_parity_vote(non_tie)
+        advanced_votes.append(advanced_models["length_parity"].get("pick", ""))
+    else:
+        advanced_models["length_parity"] = {"pick": "", "label": "LengthParity關閉", "confidence": 0.0}
+
+    if FUHAO_USE_BANKER_RATE:
+        advanced_models["banker_rate"] = _fuhao_banker_rate_vote(non_tie)
+        advanced_votes.append(advanced_models["banker_rate"].get("pick", ""))
+    else:
+        advanced_models["banker_rate"] = {"pick": "", "label": "BankerRate關閉", "confidence": 0.0}
+
+    advanced_majority = _fuhao_majority(advanced_votes, big_road_pick=big_road_pick)
+
+    # 3) 最終方向：以 Advanced 多數決為主，沒有票才回大路。
+    final_pick = advanced_majority.get("pick") or road_majority.get("pick") or big_road_pick
+    final_source = "advanced_majority" if advanced_majority.get("pick") else "road_fallback"
+
+    all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
+    all_majority = _fuhao_majority(all_votes, big_road_pick=big_road_pick)
+    vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
+
+    # 若主方向票數低於指定門檻，改觀望。
+    final_vote_count = all_votes.count(final_pick) if final_pick in {"B", "P"} else 0
+    observe_reason = ""
+    recommend = final_pick if final_pick in {"B", "P"} else "NONE"
+
+    if recommend == "NONE" and FUHAO_OBSERVE_ON_UNKNOWN:
+        observe_reason = "富濠式多數決無明確方向"
+    elif final_vote_count < FUHAO_MIN_VOTE_AGREE:
+        recommend = "NONE"
+        observe_reason = f"主方向只有{final_vote_count}票，未達{FUHAO_MIN_VOTE_AGREE}票"
+    elif (
+        FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME
+        and road_majority.get("pick") in {"B", "P"}
+        and advanced_majority.get("pick") in {"B", "P"}
+        and road_majority.get("pick") != advanced_majority.get("pick")
+    ):
+        if FUHAO_OBSERVE_ON_CONFLICT:
+            recommend = "NONE"
+            observe_reason = f"路紙{_fuhao_side_name(road_majority.get('pick'))}與Advanced{_fuhao_side_name(advanced_majority.get('pick'))}衝突"
+
+    # 4) 機率與信心：主體仍只用富濠式票數強度；DeepSeek 在下一步做輔助確認。
+    # tie 不參與主方向；用固定基準 + 近期和局做柔性保留。
+    recent_tail = history[-max(12, min(36, len(history))):] if history else []
+    recent_tie_rate = recent_tail.count("T") / max(1, len(recent_tail)) if recent_tail else 0.0
+    tie_prob = _clamp(FUHAO_TIE_BASE * (1 - FUHAO_TIE_SHRINK) + recent_tie_rate * FUHAO_TIE_SHRINK, 0.001, TIE_MAX_PROB)
+    b_prob, p_prob, tie_prob = _fuhao_probs_from_votes(final_pick if final_pick in {"B", "P"} else "", max(0.5, vote_ratio), tie_prob)
+    edge = abs(b_prob - p_prob)
+
+    agreement = all_votes.count(final_pick) / max(1, len(all_votes)) if final_pick in {"B", "P"} else 0.0
+    conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, 0.0)
+    # 若觀望，信心顯示降一點，避免前端誤以為觀望也高信心。
+    if recommend == "NONE":
+        conf = min(conf, 0.48)
+        level = "觀望"
+
+    # 5) DeepSeek 輔助確認層：只做方向確認與小幅校準，不取代富濠式主模型。
+    ai_result = None
+    ai_used = False
+    ai_side = ""
+    ai_status = "disabled"
+    ai_conf = 0.0
+    ai_payload = None
+
+    if (
+        USE_DEEPSEEK
+        and FUHAO_USE_DEEPSEEK
+        and FUHAO_DEEPSEEK_WEIGHT > 0
+        and len(history) >= FUHAO_DEEPSEEK_MIN_HISTORY
+    ):
+        ai_payload = _fuhao_build_deepseek_payload(
+            history=history,
+            non_tie=non_tie,
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+            user_id=user_id,
+            road_models=road_models,
+            advanced_models=advanced_models,
+            road_majority=road_majority,
+            advanced_majority=advanced_majority,
+            all_majority=all_majority,
+            final_pick=final_pick,
+            recommend=recommend,
+            b_prob=b_prob,
+            p_prob=p_prob,
+            tie_prob=tie_prob,
+            vote_ratio=vote_ratio,
+            final_vote_count=final_vote_count,
+        )
+        try:
+            ai_result = DeepSeekClient().calibrate(ai_payload)
+        except Exception as e:
+            ai_result = {"error": True, "message": str(e)}
+
+        if ai_result and not ai_result.get("error"):
+            try:
+                ai_used = True
+                ai_status = "used"
+                ai_conf = _clamp(float(ai_result.get("confidence", 0.4) or 0.4), 0.0, 1.0)
+                ai_side = _fuhao_parse_ai_side(ai_result)
+
+                local_side = recommend if recommend in {"B", "P"} else final_pick if final_pick in {"B", "P"} else ""
+                conflict = bool(ai_side and local_side and ai_side != local_side and ai_conf >= FUHAO_DEEPSEEK_MIN_CONFIDENCE)
+                same_side = bool(ai_side and local_side and ai_side == local_side and ai_conf >= FUHAO_DEEPSEEK_MIN_CONFIDENCE)
+
+                if conflict and FUHAO_DEEPSEEK_MODE == "CONFIRM" and FUHAO_DEEPSEEK_OBSERVE_ON_CONFLICT:
+                    recommend = "NONE"
+                    ai_status = "conflict_observe"
+                    extra_reason = f"DeepSeek{_fuhao_side_name(ai_side)}與富濠主模型{_fuhao_side_name(local_side)}衝突"
+                    observe_reason = f"{observe_reason}；{extra_reason}" if observe_reason else extra_reason
+                    conf = min(conf, max(0.25, conf - FUHAO_DEEPSEEK_CONFIDENCE_SHRINK * ai_conf))
+                    level = "觀望"
+                else:
+                    ba = _clamp(float(ai_result.get("banker_adjust", 0) or 0), -FUHAO_DEEPSEEK_MAX_ADJUST, FUHAO_DEEPSEEK_MAX_ADJUST)
+                    pa = _clamp(float(ai_result.get("player_adjust", 0) or 0), -FUHAO_DEEPSEEK_MAX_ADJUST, FUHAO_DEEPSEEK_MAX_ADJUST)
+                    ta = _clamp(float(ai_result.get("tie_adjust", 0) or 0), -FUHAO_DEEPSEEK_TIE_MAX_ADJUST, FUHAO_DEEPSEEK_TIE_MAX_ADJUST)
+                    blend = FUHAO_DEEPSEEK_WEIGHT * (0.45 + ai_conf * 0.55)
+
+                    # CONFIRM 模式下，同向才明顯加權；無明確方向時只允許很小的概率校準。
+                    if FUHAO_DEEPSEEK_MODE == "CONFIRM" and not same_side:
+                        blend *= 0.35
+
+                    b_prob += ba * blend
+                    p_prob += pa * blend
+                    tie_prob += ta * blend
+                    b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+                    edge = abs(b_prob - p_prob)
+
+                    if same_side:
+                        conf = min(0.94, conf + FUHAO_DEEPSEEK_CONFIDENCE_BOOST * ai_conf)
+                        if conf >= 0.68:
+                            level = "強訊號"
+                        elif conf >= 0.48 and level != "觀望":
+                            level = "中訊號"
+                        ai_status = "same_side_confirm"
+            except Exception as e:
+                ai_status = "parse_error"
+                ai_result = {"error": True, "message": str(e), "raw": ai_result}
+    elif USE_DEEPSEEK and FUHAO_USE_DEEPSEEK and len(history) < FUHAO_DEEPSEEK_MIN_HISTORY:
+        ai_status = "not_enough_history"
+
+    road_consensus_label = f"富濠路紙多數決:{_fuhao_side_name(road_majority.get('pick', ''))} B{road_majority.get('B', 0)} / P{road_majority.get('P', 0)}"
+    advanced_label = f"富濠Advanced多數決:{_fuhao_side_name(advanced_majority.get('pick', ''))} B{advanced_majority.get('B', 0)} / P{advanced_majority.get('P', 0)}"
+
+    reason_parts = [
+        road_consensus_label,
+        advanced_label,
+        road_models.get("big_road", {}).get("label", ""),
+        road_models.get("big_eye", {}).get("label", ""),
+        road_models.get("small_road", {}).get("label", ""),
+        road_models.get("cockroach", {}).get("label", ""),
+        advanced_models.get("deep_parity", {}).get("label", ""),
+        advanced_models.get("length_parity", {}).get("label", ""),
+        advanced_models.get("banker_rate", {}).get("label", ""),
+        f"總票數{_fuhao_side_name(final_pick)}:{final_vote_count}/{len(all_votes)}",
+    ]
+    if observe_reason:
+        reason_parts.append(f"觀望:{observe_reason}")
+    if ai_result is not None:
+        ai_reason = ""
+        if isinstance(ai_result, dict):
+            ai_reason = str(ai_result.get("reason") or ai_result.get("message") or "")
+        reason_parts.append(f"DeepSeek:{ai_status} 偏{_fuhao_side_name(ai_side)} 信心{ai_conf:.2f}{(' ' + ai_reason) if ai_reason else ''}")
+
+    dynamic_weights = {
+        "fuhao_big_road": 1.0 if FUHAO_USE_BIG_ROAD else 0.0,
+        "fuhao_big_eye": 1.0 if FUHAO_USE_BIG_EYE else 0.0,
+        "fuhao_small_road": 1.0 if FUHAO_USE_SMALL_ROAD else 0.0,
+        "fuhao_cockroach": 1.0 if FUHAO_USE_COCKROACH else 0.0,
+        "fuhao_deep_parity": 1.0 if FUHAO_USE_DEEP_PARITY else 0.0,
+        "fuhao_length_parity": 1.0 if FUHAO_USE_LENGTH_PARITY else 0.0,
+        "fuhao_banker_rate": 1.0 if FUHAO_USE_BANKER_RATE else 0.0,
+        "fuhao_deepseek_confirm": FUHAO_DEEPSEEK_WEIGHT if (USE_DEEPSEEK and FUHAO_USE_DEEPSEEK) else 0.0,
+    }
+
+    # 舊欄位相容：前端或 app.py 若讀舊 key 不會爆。
+    empty_state = {"enabled": False, "state": "FUHAO_CLONE", "label": "富濠式模型不使用此層", "confidence": 0.0}
+    training_key = f"{user_id or 'anonymous'}|FUHAO_CLONE|{venue}|{room}|{shoe_id}"
+
+    result = {
+        "ok": True,
+        "engine": "FUHAO_CLONE",
+        "user_id": user_id,
+        "venue": venue,
+        "room": room,
+        "shoe_id": shoe_id,
+        "round_no": len(history) + 1,
+        "history_len": len(history),
+        "valid_history_len": valid_len,
+        "tie_count": tie_count,
+        "banker_rate": round(b_prob * 100, 1),
+        "player_rate": round(p_prob * 100, 1),
+        "tie_rate": round(tie_prob * 100, 1),
+        "recommend": recommend,
+        "recommend_text": recommend_text_map.get(recommend, "觀望"),
+        "is_observe": recommend == "NONE",
+        "observe_reason": observe_reason,
+        "decision_edge": round(edge, 5),
+        "side_clamp": {"min": 0.5 - FUHAO_MAX_EDGE, "max": 0.5 + FUHAO_MAX_EDGE},
+        "confidence": round(conf, 3),
+        "signal_level": level,
+        "pattern_label": advanced_label,
+        "regime": "fuhao_clone",
+        "ngram_label": "富濠式模型不使用NGram",
+        "ngram_sample": 0,
+        "big_road_label": road_models.get("big_road", {}).get("label", ""),
+        "big_eye_label": road_models.get("big_eye", {}).get("label", ""),
+        "small_road_label": road_models.get("small_road", {}).get("label", ""),
+        "cockroach_label": road_models.get("cockroach", {}).get("label", ""),
+        "road_consensus_label": road_consensus_label,
+        "road_consensus_ratio": road_majority.get("ratio", 0.5),
+        "road_conflict_ratio": round(1.0 - float(road_majority.get("ratio", 0.5)), 4),
+        "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority},
+        "road_lifecycle": empty_state,
+        "adaptive_road_memory": empty_state,
+        "road_rhythm": empty_state,
+        "road_rhythm_state": "FUHAO_CLONE",
+        "road_rhythm_label": "富濠式模型不使用Road Rhythm",
+        "road_rhythm_confidence": 0.0,
+        "road_rhythm_false_break_score": 0.0,
+        "road_rhythm_turn_score": 0.0,
+        "road_rhythm_inertia_score": 0.0,
+        "long_anchor": empty_state,
+        "long_anchor_state": "FUHAO_CLONE",
+        "long_anchor_label": "富濠式模型不使用Long Anchor",
+        "long_anchor_side": "",
+        "long_anchor_confidence": 0.0,
+        "road_memory_state": "FUHAO_CLONE",
+        "road_memory_label": "富濠式模型不使用Road Memory",
+        "road_memory_sample": 0,
+        "road_memory_follow_rate": 0.5,
+        "road_memory_break_rate": 0.5,
+        "road_memory_confidence": 0.0,
+        "road_lifecycle_state": "FUHAO_CLONE",
+        "road_lifecycle_label": "富濠式模型不使用Lifecycle",
+        "road_follow_score": 0.5,
+        "road_break_score": 0.0,
+        "road_fatigue_score": 0.0,
+        "road_engine_label": road_consensus_label,
+        "road_engine_break_risk": 0.0,
+        "road_engine_consistency": road_majority.get("ratio", 0.5),
+        "road_engine_big_road": road_models.get("big_road", {}).get("details", {}),
+        "road_engine_derived": {
+            "big_eye": road_models.get("big_eye", {}).get("stats", {}),
+            "small_road": road_models.get("small_road", {}).get("stats", {}),
+            "cockroach": road_models.get("cockroach", {}).get("stats", {}),
+        },
+        "dynamic_weights": dynamic_weights,
+        "online_model_performance": {},
+        "reason": " / ".join([x for x in reason_parts if x]),
+        "ai_used": ai_used,
+        "ai_side": ai_side,
+        "ai_status": ai_status,
+        "ai_confidence": round(ai_conf, 4),
+        "ml_trained": False,
+        "ml_samples": 0,
+        "tf_available": TF_AVAILABLE,
+        "training_key": training_key,
+        "model_cache_size": len(_MODEL_CACHE),
+        "ml_predictions": None,
+        "ai_result": ai_result if (FUHAO_DEBUG or os.getenv("DEBUG_AI_RESULT", "0") == "1") else None,
+        "fuhao": {
+            "final_source": final_source,
+            "final_pick": final_pick,
+            "recommend": recommend,
+            "road_votes": road_votes,
+            "advanced_votes": advanced_votes,
+            "all_votes": all_votes,
+            "road_majority": road_majority,
+            "advanced_majority": advanced_majority,
+            "all_majority": all_majority,
+            "vote_ratio": vote_ratio,
+            "final_vote_count": final_vote_count,
+            "deepseek": {
+                "enabled": bool(USE_DEEPSEEK and FUHAO_USE_DEEPSEEK),
+                "used": ai_used,
+                "status": ai_status,
+                "side": ai_side,
+                "confidence": round(ai_conf, 4),
+                "mode": FUHAO_DEEPSEEK_MODE,
+                "observe_on_conflict": FUHAO_DEEPSEEK_OBSERVE_ON_CONFLICT,
+                "weight": FUHAO_DEEPSEEK_WEIGHT,
+                "payload": ai_payload if FUHAO_DEEPSEEK_INCLUDE_PAYLOAD else None,
+            },
+            "models": {"road": road_models, "advanced": advanced_models},
+            "settings": {
+                "history_limit": FUHAO_HISTORY_LIMIT,
+                "min_valid_rounds": FUHAO_MIN_VALID_ROUNDS,
+                "require_road_and_advanced_same": FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME,
+                "min_vote_agree": FUHAO_MIN_VOTE_AGREE,
+                "ignore_tie_for_predict": FUHAO_IGNORE_TIE_FOR_PREDICT,
+                "use_deepseek": bool(USE_DEEPSEEK and FUHAO_USE_DEEPSEEK),
+                "deepseek_mode": FUHAO_DEEPSEEK_MODE,
+                "deepseek_min_history": FUHAO_DEEPSEEK_MIN_HISTORY,
+                "deepseek_weight": FUHAO_DEEPSEEK_WEIGHT,
+            },
+        },
+        "debug": {
+            "engine": "FUHAO_CLONE",
+            "history_tail": "".join(history[-36:]),
+            "non_tie_tail": "".join(non_tie[-36:]),
+            "fuhao": {
+                "road_models": road_models,
+                "advanced_models": advanced_models,
+                "road_majority": road_majority,
+                "advanced_majority": advanced_majority,
+                "all_majority": all_majority,
+                "deepseek": {
+                    "ai_result": ai_result,
+                    "ai_side": ai_side,
+                    "ai_status": ai_status,
+                    "ai_confidence": ai_conf,
+                    "ai_payload": ai_payload if FUHAO_DEEPSEEK_INCLUDE_PAYLOAD else None,
+                },
+            },
+        } if FUHAO_DEBUG or os.getenv("DEBUG_PREDICTOR", "0") == "1" else None,
+    }
+    return result
+
 def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """
     整合預測函數：四路主模型 + Road Lifecycle + Adaptive Road Memory + Road Rhythm + NGram + 動態權重 + ML模型 + DeepSeek校準
     注意：本版加入低信心/四路分歧觀望機制；仍不做下注金額/EV 配注決策。
     """
     history = [str(x).upper() for x in history if str(x).upper() in {"B", "P", "T"}]
+    if PREDICT_ENGINE in {"FUHAO", "FUHAO_CLONE", "FUHAOCLONE"}:
+        return _fuhao_clone_predict(history, venue=venue, room=room, shoe_id=shoe_id, user_id=user_id)
+
     non_tie = _last_non_tie(history)
 
     # ============ 1. 基礎模型 + 四路主模型 ==========
