@@ -228,7 +228,7 @@ FUHAO_IGNORE_TIE_FOR_PREDICT = os.getenv("FUHAO_IGNORE_TIE_FOR_PREDICT", "1") ==
 FUHAO_KEEP_TIE_COUNT = os.getenv("FUHAO_KEEP_TIE_COUNT", "1") == "1"
 FUHAO_LONG_THRESHOLD = int(os.getenv("FUHAO_LONG_THRESHOLD", "4"))
 FUHAO_FENG_LOOKBACK_COLS = int(os.getenv("FUHAO_FENG_LOOKBACK_COLS", "6"))
-FUHAO_DOWN3_TIE_BIAS = os.getenv("FUHAO_DOWN3_TIE_BIAS", "BANKER").strip().upper()
+FUHAO_DOWN3_TIE_BIAS = os.getenv("FUHAO_DOWN3_TIE_BIAS", "NONE").strip().upper()
 FUHAO_USE_BIG_ROAD = os.getenv("FUHAO_USE_BIG_ROAD", "1") == "1"
 FUHAO_USE_BIG_EYE = os.getenv("FUHAO_USE_BIG_EYE", "1") == "1"
 FUHAO_USE_SMALL_ROAD = os.getenv("FUHAO_USE_SMALL_ROAD", "1") == "1"
@@ -312,6 +312,18 @@ FUHAO_OBSERVE_ON_BIGROAD_ONLY = os.getenv("FUHAO_OBSERVE_ON_BIGROAD_ONLY", "1") 
 FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES = int(os.getenv("FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES", "2"))
 FUHAO_FINAL_REQUIRE_DERIVED_RATIO = float(os.getenv("FUHAO_FINAL_REQUIRE_DERIVED_RATIO", "0.62"))
 FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE = os.getenv("FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE", "1") == "1"
+
+# 嚴格牌路投票層：只有「清楚牌型 / 清楚下三路紅藍差」才允許投票。
+# 目的：避免每個模組都硬投 B/P，導致最後又變成多數方模型。
+FUHAO_STRICT_PATTERN_VOTE = os.getenv("FUHAO_STRICT_PATTERN_VOTE", "1") == "1"
+FUHAO_VOTE_MIN_EDGE = float(os.getenv("FUHAO_VOTE_MIN_EDGE", "0.020"))
+FUHAO_DERIVED_TIE_AS_NO_VOTE = os.getenv("FUHAO_DERIVED_TIE_AS_NO_VOTE", "1") == "1"
+FUHAO_DERIVED_MIN_RED_BLUE_DIFF = float(os.getenv("FUHAO_DERIVED_MIN_RED_BLUE_DIFF", "0.080"))
+FUHAO_REQUIRE_PATTERN_CLASS = os.getenv("FUHAO_REQUIRE_PATTERN_CLASS", "1") == "1"
+FUHAO_FORCE_NEUTRAL_ON_NO_PATTERN = os.getenv("FUHAO_FORCE_NEUTRAL_ON_NO_PATTERN", "1") == "1"
+FUHAO_DISABLE_RECENT_BALANCE_FALLBACK = os.getenv("FUHAO_DISABLE_RECENT_BALANCE_FALLBACK", "1") == "1"
+FUHAO_BIGROAD_SIGNAL_ONLY = os.getenv("FUHAO_BIGROAD_SIGNAL_ONLY", "1") == "1"
+FUHAO_MIN_PROB_EDGE = float(os.getenv("FUHAO_MIN_PROB_EDGE", "0.015"))
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
@@ -665,7 +677,9 @@ def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
 def _pick_from_score(score: Dict[str, Any], min_edge: float = 0.001) -> str:
     b = float(score.get("B", 0.5))
     p = float(score.get("P", 0.5))
-    if abs(b - p) < min_edge:
+    # 嚴格牌路投票：弱訊號不投票，避免每個模型都硬產生 B/P。
+    effective_min_edge = max(min_edge, FUHAO_VOTE_MIN_EDGE if globals().get("FUHAO_STRICT_PATTERN_VOTE", False) else min_edge)
+    if abs(b - p) < effective_min_edge:
         return ""
     return "B" if b > p else "P"
 
@@ -2718,7 +2732,7 @@ def _fuhao_majority(votes: List[str], big_road_pick: str = "") -> Dict[str, Any]
 
 def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
     if not non_tie:
-        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "details": {}}
+        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "pattern_class": "NO_DATA", "is_vote_valid": False, "details": {}}
 
     recent = non_tie[-16:]
     last_side, streak_n = _streak(non_tie)
@@ -2730,44 +2744,64 @@ def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
     last_col = int(last_pos.get("col", 0))
     current_col_height = int(layout.get("col_heights", {}).get(last_col, 0))
 
-    # 富濠式大路核心：看最新欄/最新方向，規則命名只用來解釋。
-    pick = last_side
-    label = "大路跟最新欄"
-    confidence = 0.56
+    # 嚴格版：大路只在清楚路型時投票；一般「跟最新欄」不再投票。
+    pick = ""
+    label = "大路無明確牌型不投票"
+    confidence = 0.0
+    pattern_class = "NO_CLEAR_PATTERN"
+    is_vote_valid = False
 
     if streak_n >= FUHAO_LONG_THRESHOLD:
+        pick = last_side
         label = f"大路長龍{_fuhao_side_name(last_side)}{streak_n}口"
         confidence = min(0.72, 0.58 + streak_n * 0.025)
+        pattern_class = "DRAGON"
+        is_vote_valid = True
     elif len(recent) >= 6 and switch_rate >= 0.72:
         # 單跳盤以反手作大路節奏判斷，避免固定死跟最後一欄。
         pick = opp
         label = "大路單跳節奏"
         confidence = min(0.70, 0.56 + (switch_rate - 0.72) * 0.35)
+        pattern_class = "PINGPONG"
+        is_vote_valid = True
     elif len(non_tie) >= 6 and "".join(non_tie[-6:]) in {"BBPPBB", "PPBBPP", "BPPBBP", "PBBPPB"}:
         pick = non_tie[-2]
         label = "大路雙跳/排排連"
         confidence = 0.62
-    elif current_col_height >= 3:
+        pattern_class = "DOUBLE_OR_PAIR"
+        is_vote_valid = True
+    elif current_col_height >= 3 and not FUHAO_STRICT_PATTERN_VOTE:
+        # 非嚴格模式才允許欄高延續直接投票。
+        pick = last_side
         label = "大路欄高延續"
         confidence = 0.60
+        pattern_class = "COLUMN_CONTINUE"
+        is_vote_valid = True
+
+    if FUHAO_BIGROAD_SIGNAL_ONLY:
+        # 大路保留當候選/說明，不直接參與最後投票。
+        is_vote_valid = False
 
     return {
-        "pick": pick,
+        "pick": pick if is_vote_valid or not FUHAO_BIGROAD_SIGNAL_ONLY else "",
+        "candidate_pick": pick,
         "label": label,
         "confidence": round(confidence, 4),
+        "pattern_class": pattern_class,
+        "is_vote_valid": is_vote_valid,
         "details": {
             "last_side": last_side,
             "streak": streak_n,
             "switch_rate": round(switch_rate, 4),
             "current_col_height": current_col_height,
             "last_col": last_col,
+            "candidate_pick": pick,
         },
     }
 
-
 def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
     if len(non_tie) < FUHAO_MIN_VALID_ROUNDS:
-        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}}
+        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}, "is_vote_valid": False}
 
     layout = _build_big_road(non_tie)
     series = _derived_series(layout, offset=offset)
@@ -2775,26 +2809,51 @@ def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, A
     count = int(stats.get("count", 0))
     last_side, _ = _streak(non_tie)
     if not last_side or count <= 0:
-        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats}
+        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats, "is_vote_valid": False}
 
     opp = "P" if last_side == "B" else "B"
     red_rate = float(stats.get("red_rate", 0.5))
     blue_rate = float(stats.get("blue_rate", 0.5))
+    diff = abs(red_rate - blue_rate)
 
-    # 紅：規律整齊，偏延續；藍：變化加重，偏反邊。
-    if red_rate > blue_rate:
-        pick = last_side
-        label = f"{name}紅路續勢"
-    elif blue_rate > red_rate:
-        pick = opp
-        label = f"{name}藍路變化"
-    else:
+    # 嚴格牌路投票：紅藍差距太小或平手時不投票，不再預設偏莊。
+    if red_rate == blue_rate:
+        if FUHAO_DERIVED_TIE_AS_NO_VOTE or FUHAO_DOWN3_TIE_BIAS in {"NONE", "NO", "NO_VOTE", "OBSERVE", ""}:
+            return {
+                "pick": "",
+                "label": f"{name}紅藍平手不投票",
+                "confidence": 0.0,
+                "stats": stats,
+                "red_blue_diff": round(diff, 4),
+                "is_vote_valid": False,
+            }
         pick = "B" if FUHAO_DOWN3_TIE_BIAS == "BANKER" else "P"
         label = f"{name}紅藍平手偏{_fuhao_side_name(pick)}"
+    elif FUHAO_STRICT_PATTERN_VOTE and diff < FUHAO_DERIVED_MIN_RED_BLUE_DIFF:
+        return {
+            "pick": "",
+            "label": f"{name}紅藍差距{diff:.2f}不足不投票",
+            "confidence": 0.0,
+            "stats": stats,
+            "red_blue_diff": round(diff, 4),
+            "is_vote_valid": False,
+        }
+    elif red_rate > blue_rate:
+        pick = last_side
+        label = f"{name}紅路續勢"
+    else:
+        pick = opp
+        label = f"{name}藍路變化"
 
-    confidence = 0.50 + min(0.20, abs(red_rate - blue_rate) * 0.40) + min(0.08, count * 0.006)
-    return {"pick": pick, "label": label, "confidence": round(confidence, 4), "stats": stats}
-
+    confidence = 0.50 + min(0.20, diff * 0.40) + min(0.08, count * 0.006)
+    return {
+        "pick": pick,
+        "label": label,
+        "confidence": round(confidence, 4),
+        "stats": stats,
+        "red_blue_diff": round(diff, 4),
+        "is_vote_valid": True,
+    }
 
 def _fuhao_deep_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
     # 對應富濠 DeepLearningPredictor：莊數總和奇偶。
@@ -2825,7 +2884,7 @@ def _fuhao_probs_from_votes(main_pick: str, vote_ratio: float, tie_prob: float) 
     else:
         # vote_ratio 0.5~1.0 轉成柔性機率邊際，不讓畫面變成過度誇張的 90%。
         edge = FUHAO_PROB_EDGE + max(0.0, vote_ratio - 0.5) * 2 * (FUHAO_MAX_EDGE - FUHAO_PROB_EDGE)
-        edge = _clamp(edge, 0.035, FUHAO_MAX_EDGE)
+        edge = _clamp(edge, FUHAO_MIN_PROB_EDGE, FUHAO_MAX_EDGE)
         b_side = 0.5 + edge if main_pick == "B" else 0.5 - edge
     b_prob = b_side * (1 - tie_prob)
     p_prob = (1 - b_side) * (1 - tie_prob)
@@ -3464,7 +3523,12 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         final_pick = advanced_pick or road_pick or ("" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick)
         final_source = "advanced_majority" if advanced_pick else ("road_fallback" if road_pick else "bigroad_fallback")
 
-    all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
+    raw_all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
+    # 嚴格版：大路只當候選說明，不計入最後票數與機率比例。
+    if FUHAO_BIGROAD_SIGNAL_ONLY:
+        all_votes = [v for v in derived_votes + advanced_votes if v in {"B", "P"}]
+    else:
+        all_votes = raw_all_votes
     all_majority = _fuhao_majority(all_votes, big_road_pick=road_tiebreak_pick)
     vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
 
@@ -3705,6 +3769,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "fuhao_banker_rate": 1.0 if FUHAO_USE_BANKER_RATE else 0.0,
         "fuhao_deepseek_confirm": FUHAO_DEEPSEEK_WEIGHT if (USE_DEEPSEEK and FUHAO_USE_DEEPSEEK) else 0.0,
         "fuhao_fake_pattern_detector": 1.0 if FUHAO_USE_FAKE_PATTERN_DETECTOR else 0.0,
+        "fuhao_strict_pattern_vote": 1.0 if FUHAO_STRICT_PATTERN_VOTE else 0.0,
     }
 
     # 舊欄位相容：前端或 app.py 若讀舊 key 不會爆。
@@ -3762,6 +3827,11 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "observe_on_bigroad_only": FUHAO_OBSERVE_ON_BIGROAD_ONLY,
             "required_non_bigroad_votes": FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES,
             "derived_ratio": round(derived_ratio, 4),
+            "strict_pattern_vote": FUHAO_STRICT_PATTERN_VOTE,
+            "vote_min_edge": FUHAO_VOTE_MIN_EDGE,
+            "derived_tie_as_no_vote": FUHAO_DERIVED_TIE_AS_NO_VOTE,
+            "derived_min_red_blue_diff": FUHAO_DERIVED_MIN_RED_BLUE_DIFF,
+            "bigroad_signal_only": FUHAO_BIGROAD_SIGNAL_ONLY,
         },
         "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority},
         "road_lifecycle": empty_state,
@@ -3821,6 +3891,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "road_votes": road_votes,
             "advanced_votes": advanced_votes,
             "all_votes": all_votes,
+            "raw_all_votes": raw_all_votes,
             "road_majority": road_majority,
             "advanced_majority": advanced_majority,
             "all_majority": all_majority,
