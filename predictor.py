@@ -233,9 +233,9 @@ FUHAO_USE_BIG_ROAD = os.getenv("FUHAO_USE_BIG_ROAD", "1") == "1"
 FUHAO_USE_BIG_EYE = os.getenv("FUHAO_USE_BIG_EYE", "1") == "1"
 FUHAO_USE_SMALL_ROAD = os.getenv("FUHAO_USE_SMALL_ROAD", "1") == "1"
 FUHAO_USE_COCKROACH = os.getenv("FUHAO_USE_COCKROACH", "1") == "1"
-FUHAO_USE_DEEP_PARITY = os.getenv("FUHAO_USE_DEEP_PARITY", "1") == "1"
-FUHAO_USE_LENGTH_PARITY = os.getenv("FUHAO_USE_LENGTH_PARITY", "1") == "1"
-FUHAO_USE_BANKER_RATE = os.getenv("FUHAO_USE_BANKER_RATE", "1") == "1"
+FUHAO_USE_DEEP_PARITY = os.getenv("FUHAO_USE_DEEP_PARITY", "0") == "1"
+FUHAO_USE_LENGTH_PARITY = os.getenv("FUHAO_USE_LENGTH_PARITY", "0") == "1"
+FUHAO_USE_BANKER_RATE = os.getenv("FUHAO_USE_BANKER_RATE", "0") == "1"
 FUHAO_FINAL_METHOD = os.getenv("FUHAO_FINAL_METHOD", "MAJORITY").strip().upper()
 FUHAO_FINAL_TIE_BREAKER = os.getenv("FUHAO_FINAL_TIE_BREAKER", "BIGROAD").strip().upper()
 FUHAO_CONFIDENCE_MODE = os.getenv("FUHAO_CONFIDENCE_MODE", "VOTE_RATIO").strip().upper()
@@ -244,8 +244,8 @@ FUHAO_MIN_VOTE_AGREE = int(os.getenv("FUHAO_MIN_VOTE_AGREE", "2"))
 FUHAO_OBSERVE_ON_CONFLICT = os.getenv("FUHAO_OBSERVE_ON_CONFLICT", "1") == "1"
 FUHAO_OBSERVE_ON_UNKNOWN = os.getenv("FUHAO_OBSERVE_ON_UNKNOWN", "1") == "1"
 FUHAO_OBSERVE_ON_TIE_ONLY = os.getenv("FUHAO_OBSERVE_ON_TIE_ONLY", "1") == "1"
-FUHAO_PROB_EDGE = float(os.getenv("FUHAO_PROB_EDGE", "0.120"))
-FUHAO_MAX_EDGE = float(os.getenv("FUHAO_MAX_EDGE", "0.185"))
+FUHAO_PROB_EDGE = float(os.getenv("FUHAO_PROB_EDGE", "0.060"))
+FUHAO_MAX_EDGE = float(os.getenv("FUHAO_MAX_EDGE", "0.100"))
 FUHAO_TIE_BASE = float(os.getenv("FUHAO_TIE_BASE", "0.095"))
 FUHAO_TIE_SHRINK = float(os.getenv("FUHAO_TIE_SHRINK", "0.30"))
 FUHAO_DEBUG = os.getenv("FUHAO_DEBUG", "0") == "1"
@@ -302,6 +302,16 @@ FUHAO_FAKE_PATTERN_REVERSE_DERIVED_MIN = int(os.getenv("FUHAO_FAKE_PATTERN_REVER
 FUHAO_FAKE_PATTERN_REVERSE_REQUIRE_ROAD = os.getenv("FUHAO_FAKE_PATTERN_REVERSE_REQUIRE_ROAD", "1") == "1"
 FUHAO_FAKE_PATTERN_REVERSE_MIN_RATIO = float(os.getenv("FUHAO_FAKE_PATTERN_REVERSE_MIN_RATIO", "0.62"))
 FUHAO_FAKE_PATTERN_OBSERVE_RESETS_EDGE = os.getenv("FUHAO_FAKE_PATTERN_OBSERVE_RESETS_EDGE", "1") == "1"
+
+# 最後整合裁決層：把大路 / 四路多數決降級成候選訊號。
+# 目的：避免 road_majority / big_road_pick 自己決定方向，造成仍然偏向多數方。
+FUHAO_ROAD_MAJORITY_AS_CANDIDATE_ONLY = os.getenv("FUHAO_ROAD_MAJORITY_AS_CANDIDATE_ONLY", "1") == "1"
+FUHAO_DISABLE_BIGROAD_FALLBACK = os.getenv("FUHAO_DISABLE_BIGROAD_FALLBACK", "1") == "1"
+FUHAO_REQUIRE_DERIVED_FOR_FINAL = os.getenv("FUHAO_REQUIRE_DERIVED_FOR_FINAL", "1") == "1"
+FUHAO_OBSERVE_ON_BIGROAD_ONLY = os.getenv("FUHAO_OBSERVE_ON_BIGROAD_ONLY", "1") == "1"
+FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES = int(os.getenv("FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES", "2"))
+FUHAO_FINAL_REQUIRE_DERIVED_RATIO = float(os.getenv("FUHAO_FINAL_REQUIRE_DERIVED_RATIO", "0.62"))
+FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE = os.getenv("FUHAO_NEUTRALIZE_ON_FINAL_GATE_OBSERVE", "1") == "1"
 
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
@@ -2697,7 +2707,8 @@ def _fuhao_majority(votes: List[str], big_road_pick: str = "") -> Dict[str, Any]
         pick = "P"
         tie = False
     else:
-        pick = _fuhao_tie_break_side(big_road_pick)
+        # 最後整合版：平手時預設不再用大路/莊家偏置硬拆，避免票數平手仍偏某一方。
+        pick = "" if FUHAO_DISABLE_BIGROAD_FALLBACK else _fuhao_tie_break_side(big_road_pick)
         tie = True
     ratio = max(b_count, p_count) / max(1, len(clean))
     if tie:
@@ -3393,7 +3404,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         road_models["cockroach"] = {"pick": "", "label": "蟑螂路關閉", "confidence": 0.0}
 
     big_road_pick = road_models.get("big_road", {}).get("pick", "")
-    road_majority = _fuhao_majority(road_votes, big_road_pick=big_road_pick)
+    road_tiebreak_pick = "" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick
+    road_majority = _fuhao_majority(road_votes, big_road_pick=road_tiebreak_pick)
 
     # 2) Advanced 三票：DeepParity / LengthParity / BankerRate
     advanced_votes = []
@@ -3417,26 +3429,69 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     else:
         advanced_models["banker_rate"] = {"pick": "", "label": "BankerRate關閉", "confidence": 0.0}
 
-    advanced_majority = _fuhao_majority(advanced_votes, big_road_pick=big_road_pick)
+    advanced_majority = _fuhao_majority(advanced_votes, big_road_pick=road_tiebreak_pick)
 
-    # 3) 最終方向：以 Advanced 多數決為主，沒有票才回大路。
-    final_pick = advanced_majority.get("pick") or road_majority.get("pick") or big_road_pick
-    final_source = "advanced_majority" if advanced_majority.get("pick") else "road_fallback"
+    # 3) 最後整合方向：主模型只提供候選，大路/四路多數決不再單獨決定最終方向。
+    #    最終方向需要「下三路/非大路票」確認，避免仍然偏向多數方或大路最後一欄。
+    derived_votes = [
+        road_models.get("big_eye", {}).get("pick", ""),
+        road_models.get("small_road", {}).get("pick", ""),
+        road_models.get("cockroach", {}).get("pick", ""),
+    ]
+    derived_votes = [v for v in derived_votes if v in {"B", "P"}]
+    derived_majority = _fuhao_majority(derived_votes, big_road_pick="")
+    derived_pick = derived_majority.get("pick", "")
+    road_pick = road_majority.get("pick", "")
+    advanced_pick = advanced_majority.get("pick", "")
+
+    if FUHAO_ROAD_MAJORITY_AS_CANDIDATE_ONLY:
+        if FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_pick in {"B", "P"}:
+            final_pick = derived_pick
+            final_source = "derived_confirmed"
+        elif advanced_pick in {"B", "P"} and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
+            final_pick = advanced_pick
+            final_source = "advanced_majority"
+        elif road_pick in {"B", "P"} and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
+            final_pick = road_pick
+            final_source = "road_candidate"
+        elif big_road_pick in {"B", "P"} and not FUHAO_DISABLE_BIGROAD_FALLBACK and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
+            final_pick = big_road_pick
+            final_source = "bigroad_fallback"
+        else:
+            final_pick = ""
+            final_source = "no_derived_confirmation"
+    else:
+        final_pick = advanced_pick or road_pick or ("" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick)
+        final_source = "advanced_majority" if advanced_pick else ("road_fallback" if road_pick else "bigroad_fallback")
 
     all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
-    all_majority = _fuhao_majority(all_votes, big_road_pick=big_road_pick)
+    all_majority = _fuhao_majority(all_votes, big_road_pick=road_tiebreak_pick)
     vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
 
-    # 若主方向票數低於指定門檻，改觀望。
+    # 若主方向票數低於指定門檻，或沒有足夠非大路確認，改觀望。
     final_vote_count = all_votes.count(final_pick) if final_pick in {"B", "P"} else 0
+    derived_confirm_count = derived_votes.count(final_pick) if final_pick in {"B", "P"} else 0
+    non_bigroad_votes = [v for v in derived_votes + advanced_votes if v in {"B", "P"}]
+    non_bigroad_confirm_count = non_bigroad_votes.count(final_pick) if final_pick in {"B", "P"} else 0
+    derived_ratio = derived_confirm_count / max(1, len(derived_votes)) if final_pick in {"B", "P"} else 0.0
+
     observe_reason = ""
     recommend = final_pick if final_pick in {"B", "P"} else "NONE"
 
     if recommend == "NONE" and FUHAO_OBSERVE_ON_UNKNOWN:
-        observe_reason = "富濠式多數決無明確方向"
+        observe_reason = "下三路/非大路未確認，最後裁決無明確方向"
     elif final_vote_count < FUHAO_MIN_VOTE_AGREE:
         recommend = "NONE"
         observe_reason = f"主方向只有{final_vote_count}票，未達{FUHAO_MIN_VOTE_AGREE}票"
+    elif FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_confirm_count < FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES:
+        recommend = "NONE"
+        observe_reason = f"下三路同向只有{derived_confirm_count}票，未達{FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES}票"
+    elif FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_ratio < FUHAO_FINAL_REQUIRE_DERIVED_RATIO:
+        recommend = "NONE"
+        observe_reason = f"下三路確認比例{derived_ratio:.2f}低於{FUHAO_FINAL_REQUIRE_DERIVED_RATIO:.2f}"
+    elif FUHAO_OBSERVE_ON_BIGROAD_ONLY and final_pick == big_road_pick and non_bigroad_confirm_count < FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES:
+        recommend = "NONE"
+        observe_reason = f"大路方向未取得至少{FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES}個非大路確認"
     elif (
         FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME
         and road_majority.get("pick") in {"B", "P"}
@@ -3697,6 +3752,17 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "road_consensus_label": road_consensus_label,
         "road_consensus_ratio": road_majority.get("ratio", 0.5),
         "road_conflict_ratio": round(1.0 - float(road_majority.get("ratio", 0.5)), 4),
+        "derived_majority": derived_majority,
+        "derived_confirm_count": derived_confirm_count,
+        "non_bigroad_confirm_count": non_bigroad_confirm_count,
+        "final_gate": {
+            "road_majority_as_candidate_only": FUHAO_ROAD_MAJORITY_AS_CANDIDATE_ONLY,
+            "disable_bigroad_fallback": FUHAO_DISABLE_BIGROAD_FALLBACK,
+            "require_derived_for_final": FUHAO_REQUIRE_DERIVED_FOR_FINAL,
+            "observe_on_bigroad_only": FUHAO_OBSERVE_ON_BIGROAD_ONLY,
+            "required_non_bigroad_votes": FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES,
+            "derived_ratio": round(derived_ratio, 4),
+        },
         "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority},
         "road_lifecycle": empty_state,
         "adaptive_road_memory": empty_state,
