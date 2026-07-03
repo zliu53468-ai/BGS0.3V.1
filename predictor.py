@@ -292,6 +292,17 @@ FUHAO_FAKE_PATTERN_DENSE_SWITCH_HIGH = float(os.getenv("FUHAO_FAKE_PATTERN_DENSE
 FUHAO_FAKE_PATTERN_MIN_VOTE_RATIO = float(os.getenv("FUHAO_FAKE_PATTERN_MIN_VOTE_RATIO", "0.64"))
 FUHAO_FAKE_PATTERN_DEBUG = os.getenv("FUHAO_FAKE_PATTERN_DEBUG", "0") == "1"
 
+# 假規律裁決層：讓假規律/轉折模型可以真正蓋掉主模型，而不只是降低信心。
+# 目的：避免 final_pick 已經被主模型決定後，畫面機率仍偏向多數方。
+FUHAO_FAKE_PATTERN_HARD_DECISION = os.getenv("FUHAO_FAKE_PATTERN_HARD_DECISION", "1") == "1"
+FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE = os.getenv("FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE", "1") == "1"
+FUHAO_FAKE_PATTERN_ALLOW_REVERSE = os.getenv("FUHAO_FAKE_PATTERN_ALLOW_REVERSE", "1") == "1"
+FUHAO_FAKE_PATTERN_REVERSE_SCORE = float(os.getenv("FUHAO_FAKE_PATTERN_REVERSE_SCORE", "0.72"))
+FUHAO_FAKE_PATTERN_REVERSE_DERIVED_MIN = int(os.getenv("FUHAO_FAKE_PATTERN_REVERSE_DERIVED_MIN", "2"))
+FUHAO_FAKE_PATTERN_REVERSE_REQUIRE_ROAD = os.getenv("FUHAO_FAKE_PATTERN_REVERSE_REQUIRE_ROAD", "1") == "1"
+FUHAO_FAKE_PATTERN_REVERSE_MIN_RATIO = float(os.getenv("FUHAO_FAKE_PATTERN_REVERSE_MIN_RATIO", "0.62"))
+FUHAO_FAKE_PATTERN_OBSERVE_RESETS_EDGE = os.getenv("FUHAO_FAKE_PATTERN_OBSERVE_RESETS_EDGE", "1") == "1"
+
 # ============ 全局模型實例（單例模式） ============
 class MLModels:
     """機器學習模型容器：每個 user_id / 場館 / 房間 / 靴號 可建立獨立實例"""
@@ -2990,8 +3001,11 @@ def _fuhao_fake_pattern_detector(
 ) -> Dict[str, Any]:
     """假規律 / 轉折保護模型。
 
-    目的：修正富濠式多數決容易一直押多數方的問題。
-    這層不直接預測莊閒，只回答：目前主方向是不是像假規律、疑似假斷或轉折未確認。
+    這一版是「裁決層」：
+    - 主模型只提供候選方向 final_pick。
+    - 假規律/轉折模型可以把候選方向改成觀望。
+    - 若轉折已被路紙 + 下三路確認，也可以反向覆蓋主模型。
+    - 觀望時會要求機率回到接近 50/50，避免畫面仍偏多數方。
     """
     default = {
         "enabled": False,
@@ -3002,6 +3016,11 @@ def _fuhao_fake_pattern_detector(
         "false_break_score": 0.0,
         "derived_agree": 0,
         "derived_oppose": 0,
+        "decision_pick": final_pick if final_pick in {"B", "P"} else "",
+        "reverse_side": "",
+        "neutralize_probs": False,
+        "hard_decision": False,
+        "decision_ratio": 0.5,
         "label": "假規律模型關閉",
         "reasons": [],
         "features": {},
@@ -3032,6 +3051,7 @@ def _fuhao_fake_pattern_detector(
     road_pick = road_majority.get("pick", "")
     adv_pick = advanced_majority.get("pick", "")
     vote_ratio = float(all_majority.get("ratio", 0.0) or 0.0)
+    road_ratio = float(road_majority.get("ratio", 0.0) or 0.0)
 
     derived_keys = ["big_eye", "small_road", "cockroach"]
     derived_picks = [str(road_models.get(k, {}).get("pick", "")) for k in derived_keys]
@@ -3039,25 +3059,30 @@ def _fuhao_fake_pattern_detector(
     derived_oppose = sum(1 for p in derived_picks if opp_side and p == opp_side)
     derived_valid = sum(1 for p in derived_picks if p in {"B", "P"})
 
+    # 主模型候選方向如果和路紙/下三路不一致，不能只是降信心，要提高裁決風險。
     if final_side:
         if vote_ratio and vote_ratio < FUHAO_FAKE_PATTERN_MIN_VOTE_RATIO:
             add = min(0.18, (FUHAO_FAKE_PATTERN_MIN_VOTE_RATIO - vote_ratio) * 0.70)
             fake_score += add
             reasons.append(f"總票比例{vote_ratio:.2f}偏低")
+
         if road_pick in {"B", "P"} and road_pick != final_side:
+            fake_score += 0.24
+            turn_score += 0.16
+            reasons.append(f"路紙主方向{_fuhao_side_name(road_pick)}與主模型{_fuhao_side_name(final_side)}不同")
+
+        if adv_pick in {"B", "P"} and road_pick in {"B", "P"} and adv_pick != road_pick:
             fake_score += 0.20
             turn_score += 0.10
-            reasons.append(f"路紙主方向{_fuhao_side_name(road_pick)}與最終{_fuhao_side_name(final_side)}不同")
-        if adv_pick in {"B", "P"} and road_pick in {"B", "P"} and adv_pick != road_pick:
-            fake_score += 0.18
-            turn_score += 0.08
             reasons.append("路紙與Advanced互相打架")
+
         if FUHAO_FAKE_PATTERN_REQUIRE_DERIVED_CONFIRM and derived_valid >= 2 and derived_agree < FUHAO_FAKE_PATTERN_DERIVED_MIN_AGREE:
-            fake_score += 0.18
-            reasons.append(f"下三路同向只有{derived_agree}票")
+            fake_score += 0.22
+            reasons.append(f"下三路同向只有{derived_agree}票，主方向不夠穩")
+
         if FUHAO_FAKE_PATTERN_OBSERVE_ON_DERIVED_CONFLICT and derived_oppose >= FUHAO_FAKE_PATTERN_DERIVED_MIN_AGREE:
-            fake_score += 0.20
-            turn_score += 0.14
+            fake_score += 0.26
+            turn_score += 0.18
             reasons.append(f"下三路有{derived_oppose}票反向")
 
     prev = _fuhao_previous_streak(non_tie)
@@ -3067,61 +3092,135 @@ def _fuhao_fake_pattern_detector(
     prev_side = str(prev.get("side", ""))
     short_sw = float(regime_info.get("switch_rate_short", 0.5))
     mid_sw = float(regime_info.get("switch_rate_mid", 0.5))
+    long_sw = float(regime_info.get("switch_rate_long", 0.5))
 
-    # 長龍剛斷 1~2 口：不要馬上反打，也不要盲目跟多數票。
+    # 長龍剛斷 1~2 口：這是最容易被主模型誤導的地方，優先觀望，不急著反打。
     if prev_count >= FUHAO_FAKE_PATTERN_FALSE_BREAK_MIN_STREAK and 1 <= current_count <= FUHAO_FAKE_PATTERN_FALSE_BREAK_CONFIRM_ROUNDS:
-        false_break_score += 0.48 + min(0.22, (prev_count - FUHAO_FAKE_PATTERN_FALSE_BREAK_MIN_STREAK) * 0.045)
-        turn_score += 0.18
-        fake_score += 0.14
+        false_break_score += 0.52 + min(0.24, (prev_count - FUHAO_FAKE_PATTERN_FALSE_BREAK_MIN_STREAK) * 0.05)
+        turn_score += 0.22
+        fake_score += 0.18
         reasons.append(f"{_fuhao_side_name(prev_side)}長龍{prev_count}口剛被{_fuhao_side_name(current_side)}斷{current_count}口，疑似假斷")
 
-    # 單跳路單剛破：第一段同邊不急著認定轉雙跳或真轉折。
+    # 單跳路單剛破：第一段兩口不能馬上當成真正轉雙跳。
     if len(non_tie) >= 8:
         before_last = non_tie[-8:-2]
         if _fuhao_is_alternating(before_last, tolerance=1) and current_count == 2:
-            turn_score += 0.36
-            fake_score += 0.18
+            turn_score += 0.40
+            fake_score += 0.22
             reasons.append("單跳路剛破成兩口，轉折未確認")
         elif _fuhao_is_alternating(non_tie[-8:], tolerance=1) and short_sw >= FUHAO_FAKE_PATTERN_CHAOS_SWITCH_RATE and mid_sw < FUHAO_FAKE_PATTERN_CHAOS_SWITCH_RATE:
-            fake_score += 0.18
+            fake_score += 0.20
             reasons.append("短線像單跳，但中週期不穩")
 
     # 密集盤 / 散盤中出現短暫規律，容易是假規律。
     if regime in {"DENSE", "CHOPPY", "FAKE_PINGPONG"}:
-        add = {"DENSE": 0.15, "CHOPPY": 0.18, "FAKE_PINGPONG": 0.22}.get(regime, 0.12)
+        add = {"DENSE": 0.17, "CHOPPY": 0.20, "FAKE_PINGPONG": 0.24}.get(regime, 0.14)
         fake_score += add
         reasons.append(f"{regime}盤中短暫規律風險")
     if short_sw >= FUHAO_FAKE_PATTERN_CHAOS_SWITCH_RATE and FUHAO_FAKE_PATTERN_DENSE_SWITCH_LOW <= mid_sw <= FUHAO_FAKE_PATTERN_DENSE_SWITCH_HIGH:
-        fake_score += 0.16
+        fake_score += 0.18
         reasons.append("短線很跳但中線混合，容易假規律")
 
     # 多數票過度偏向但下三路不支援，視為一直押多數方的高風險。
-    if final_side and vote_ratio >= 0.72 and derived_valid >= 2 and derived_agree < FUHAO_FAKE_PATTERN_DERIVED_MIN_AGREE:
-        fake_score += 0.16
+    if final_side and vote_ratio >= 0.70 and derived_valid >= 2 and derived_agree < FUHAO_FAKE_PATTERN_DERIVED_MIN_AGREE:
+        fake_score += 0.22
         reasons.append("總票偏一邊，但下三路未確認，避免一直押多數方")
+
+    # 大路與下三路共同反向時，代表可能不是假反彈，而是轉折已確認。
+    reverse_side = ""
+    reverse_score = 0.0
+    if final_side and opp_side:
+        road_support_reverse = road_pick == opp_side
+        derived_support_reverse = derived_oppose >= FUHAO_FAKE_PATTERN_REVERSE_DERIVED_MIN
+        ratio_support_reverse = max(road_ratio, derived_oppose / max(1, derived_valid)) >= FUHAO_FAKE_PATTERN_REVERSE_MIN_RATIO
+        not_early_false_break = false_break_score < FUHAO_FAKE_PATTERN_FALSE_BREAK_SCORE
+
+        if road_support_reverse:
+            reverse_score += 0.34
+        if derived_support_reverse:
+            reverse_score += 0.34
+        if ratio_support_reverse:
+            reverse_score += 0.16
+        if turn_score >= FUHAO_FAKE_PATTERN_TURN_SCORE:
+            reverse_score += 0.16
+        if not not_early_false_break:
+            reverse_score *= 0.45
+
+        if (
+            FUHAO_FAKE_PATTERN_ALLOW_REVERSE
+            and opp_side
+            and reverse_score >= FUHAO_FAKE_PATTERN_REVERSE_SCORE
+            and derived_support_reverse
+            and (not FUHAO_FAKE_PATTERN_REVERSE_REQUIRE_ROAD or road_support_reverse)
+            and not_early_false_break
+        ):
+            reverse_side = opp_side
+            reasons.append(f"路紙與下三路共同確認轉折，裁決反向{_fuhao_side_name(reverse_side)}")
 
     fake_score = _clamp(fake_score, 0.0, 1.0)
     turn_score = _clamp(turn_score, 0.0, 1.0)
     false_break_score = _clamp(false_break_score, 0.0, 1.0)
+    reverse_score = _clamp(reverse_score, 0.0, 1.0)
 
     action = "ALLOW"
+    decision_pick = final_side
+    neutralize_probs = False
+    hard_decision = False
+
     if FUHAO_FAKE_PATTERN_OBSERVE_ON_FALSE_BREAK and false_break_score >= FUHAO_FAKE_PATTERN_FALSE_BREAK_SCORE:
         action = "OBSERVE_FALSE_BREAK"
+        decision_pick = ""
+        neutralize_probs = FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE
+        hard_decision = FUHAO_FAKE_PATTERN_HARD_DECISION
+    elif reverse_side:
+        action = "REVERSE_TURN"
+        decision_pick = reverse_side
+        neutralize_probs = False
+        hard_decision = FUHAO_FAKE_PATTERN_HARD_DECISION
     elif FUHAO_FAKE_PATTERN_OBSERVE_ON_TURN and turn_score >= FUHAO_FAKE_PATTERN_TURN_SCORE:
         action = "OBSERVE_TURN"
+        decision_pick = ""
+        neutralize_probs = FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE
+        hard_decision = FUHAO_FAKE_PATTERN_HARD_DECISION
     elif FUHAO_FAKE_PATTERN_OBSERVE_ON_SCORE and fake_score >= FUHAO_FAKE_PATTERN_HARD_OBSERVE_SCORE:
         action = "OBSERVE_HARD_FAKE"
+        decision_pick = ""
+        neutralize_probs = FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE
+        hard_decision = FUHAO_FAKE_PATTERN_HARD_DECISION
     elif FUHAO_FAKE_PATTERN_OBSERVE_ON_SCORE and fake_score >= FUHAO_FAKE_PATTERN_OBSERVE_SCORE:
         action = "OBSERVE_FAKE"
+        decision_pick = ""
+        neutralize_probs = FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE
+        hard_decision = FUHAO_FAKE_PATTERN_HARD_DECISION
     elif fake_score >= FUHAO_FAKE_PATTERN_SHRINK_SCORE:
         action = "SHRINK"
+        decision_pick = final_side
+        neutralize_probs = False
+        hard_decision = False
+
+    if not FUHAO_FAKE_PATTERN_HARD_DECISION and action != "SHRINK":
+        # 關閉硬裁決時，只退回原本行為：不蓋掉 final_pick，只給標籤/降信心。
+        decision_pick = final_side
+        neutralize_probs = False
+        hard_decision = False
 
     if action == "ALLOW":
         label = f"假規律檢測通過:{regime} F{int(fake_score*100)} T{int(turn_score*100)} FB{int(false_break_score*100)}"
     elif action == "SHRINK":
         label = f"假規律偏弱降信心:{regime} F{int(fake_score*100)}"
+    elif action == "REVERSE_TURN":
+        label = f"假規律裁決反向:{regime} → {_fuhao_side_name(decision_pick)} R{int(reverse_score*100)}"
     else:
-        label = f"假規律/轉折保護觀望:{regime} F{int(fake_score*100)} T{int(turn_score*100)} FB{int(false_break_score*100)}"
+        label = f"假規律/轉折裁決觀望:{regime} F{int(fake_score*100)} T{int(turn_score*100)} FB{int(false_break_score*100)}"
+
+    decision_ratio = 0.5
+    if decision_pick in {"B", "P"}:
+        if decision_pick == final_side:
+            decision_ratio = max(0.5, vote_ratio)
+        elif decision_pick == reverse_side:
+            decision_ratio = max(0.5, min(0.78, max(road_ratio, derived_oppose / max(1, derived_valid))))
+    if neutralize_probs:
+        decision_ratio = 0.5
 
     return {
         "enabled": True,
@@ -3130,40 +3229,80 @@ def _fuhao_fake_pattern_detector(
         "fake_score": round(fake_score, 4),
         "turn_score": round(turn_score, 4),
         "false_break_score": round(false_break_score, 4),
+        "reverse_score": round(reverse_score, 4),
         "derived_agree": derived_agree,
         "derived_oppose": derived_oppose,
+        "decision_pick": decision_pick,
+        "reverse_side": reverse_side,
+        "neutralize_probs": bool(neutralize_probs),
+        "hard_decision": bool(hard_decision),
+        "decision_ratio": round(decision_ratio, 4),
         "label": label,
         "reasons": reasons,
         "features": {
             **regime_info,
             "vote_ratio": round(vote_ratio, 4),
+            "road_ratio": round(road_ratio, 4),
             "road_pick": road_pick,
             "advanced_pick": adv_pick,
             "final_pick": final_side,
+            "decision_pick": decision_pick,
             "derived_picks": derived_picks,
+            "derived_valid": derived_valid,
             "previous_streak_side": prev_side,
             "previous_streak_count": prev_count,
             "current_streak_side": current_side,
             "current_streak_count": current_count,
+            "reverse_score": round(reverse_score, 4),
+            "short_switch_rate": round(short_sw, 4),
+            "mid_switch_rate": round(mid_sw, 4),
+            "long_switch_rate": round(long_sw, 4),
         },
     }
 
 
+
 def _fuhao_apply_fake_pattern_shrink(b_prob: float, p_prob: float, tie_prob: float, detector: Dict[str, Any]) -> Tuple[float, float, float]:
-    """假規律偏弱時，把莊/閒邊際往 50/50 拉回，避免畫面仍顯示過度高信心。"""
+    """假規律裁決後的機率校正。
+
+    重點：
+    - 如果裁決觀望，莊/閒機率直接回到接近 50/50。
+    - 如果只是 SHRINK，才用原本降信心方式。
+    - 如果裁決反向，機率已在前一步用 decision_pick 重算，這裡不再拉回。
+    """
     if not detector.get("enabled"):
         return b_prob, p_prob, tie_prob
+
     action = str(detector.get("action", "ALLOW"))
-    score = float(detector.get("fake_score", 0.0) or 0.0)
-    if action == "ALLOW" or score < FUHAO_FAKE_PATTERN_SHRINK_SCORE:
+    if action.startswith("OBSERVE") and detector.get("neutralize_probs") and FUHAO_FAKE_PATTERN_OBSERVE_RESETS_EDGE:
+        b_prob = 0.5 * (1 - tie_prob)
+        p_prob = 0.5 * (1 - tie_prob)
+        return _normalize_three(b_prob, p_prob, tie_prob)
+
+    if action in {"ALLOW", "REVERSE_TURN"}:
         return b_prob, p_prob, tie_prob
+
+    score = float(detector.get("fake_score", 0.0) or 0.0)
+    if score < FUHAO_FAKE_PATTERN_SHRINK_SCORE:
+        return b_prob, p_prob, tie_prob
+
     side_total = max(0.0001, b_prob + p_prob)
     b_side = b_prob / side_total
-    factor = _clamp(1.0 - FUHAO_FAKE_PATTERN_CONF_SHRINK * max(score, float(detector.get("turn_score", 0.0) or 0.0), float(detector.get("false_break_score", 0.0) or 0.0)), 0.25, 0.92)
+    factor = _clamp(
+        1.0 - FUHAO_FAKE_PATTERN_CONF_SHRINK * max(
+            score,
+            float(detector.get("turn_score", 0.0) or 0.0),
+            float(detector.get("false_break_score", 0.0) or 0.0),
+        ),
+        0.25,
+        0.92,
+    )
     b_side = 0.5 + (b_side - 0.5) * factor
     b_prob = b_side * (1 - tie_prob)
     p_prob = (1 - b_side) * (1 - tie_prob)
     return _normalize_three(b_prob, p_prob, tie_prob)
+
+
 
 def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "") -> Dict[str, Any]:
     """富濠式保守牌路多數決模型。
@@ -3318,23 +3457,53 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         final_pick=final_pick,
     )
     fake_action = str(fake_pattern.get("action", "ALLOW"))
-    if fake_action.startswith("OBSERVE"):
+
+    # 3.6) 假規律裁決層：主模型 final_pick 只當候選，真正輸出改用 decision_pick。
+    decision_pick = final_pick
+    decision_source = final_source
+    decision_vote_ratio = max(0.5, vote_ratio)
+    if fake_pattern.get("enabled") and FUHAO_FAKE_PATTERN_HARD_DECISION:
+        guarded_pick = str(fake_pattern.get("decision_pick", "") or "")
+        guarded_ratio = float(fake_pattern.get("decision_ratio", 0.5) or 0.5)
+
+        if fake_action.startswith("OBSERVE"):
+            decision_pick = ""
+            decision_source = f"{final_source}+fake_pattern_observe"
+            decision_vote_ratio = 0.5
+            recommend = "NONE"
+            fake_reason = fake_pattern.get("label", "假規律/轉折風險")
+            fake_detail = "、".join(fake_pattern.get("reasons", [])[:3])
+            fake_reason = f"{fake_reason}：{fake_detail}" if fake_detail else fake_reason
+            observe_reason = f"{observe_reason}；{fake_reason}" if observe_reason else fake_reason
+        elif fake_action == "REVERSE_TURN" and guarded_pick in {"B", "P"}:
+            decision_pick = guarded_pick
+            decision_source = f"{final_source}+fake_pattern_reverse"
+            decision_vote_ratio = max(0.5, guarded_ratio)
+            recommend = decision_pick
+            observe_reason = ""
+        else:
+            decision_pick = guarded_pick if guarded_pick in {"B", "P"} else final_pick
+            decision_vote_ratio = max(0.5, guarded_ratio if guarded_pick else vote_ratio)
+    elif fake_action.startswith("OBSERVE"):
         recommend = "NONE"
         fake_reason = fake_pattern.get("label", "假規律/轉折風險")
         fake_detail = "、".join(fake_pattern.get("reasons", [])[:3])
         fake_reason = f"{fake_reason}：{fake_detail}" if fake_detail else fake_reason
         observe_reason = f"{observe_reason}；{fake_reason}" if observe_reason else fake_reason
 
-    # 4) 機率與信心：主體仍只用富濠式票數強度；DeepSeek 在下一步做輔助確認。
+    # 如果裁決後沒有方向，後續機率不能再用原 final_pick，避免畫面仍偏多數方。
+    prob_pick = decision_pick if (recommend in {"B", "P"} and decision_pick in {"B", "P"}) else ""
+
+    # 4) 機率與信心：主體改用「裁決後方向」；觀望時回到接近 50/50。
     # tie 不參與主方向；用固定基準 + 近期和局做柔性保留。
     recent_tail = history[-max(12, min(36, len(history))):] if history else []
     recent_tie_rate = recent_tail.count("T") / max(1, len(recent_tail)) if recent_tail else 0.0
     tie_prob = _clamp(FUHAO_TIE_BASE * (1 - FUHAO_TIE_SHRINK) + recent_tie_rate * FUHAO_TIE_SHRINK, 0.001, TIE_MAX_PROB)
-    b_prob, p_prob, tie_prob = _fuhao_probs_from_votes(final_pick if final_pick in {"B", "P"} else "", max(0.5, vote_ratio), tie_prob)
+    b_prob, p_prob, tie_prob = _fuhao_probs_from_votes(prob_pick if prob_pick in {"B", "P"} else "", max(0.5, decision_vote_ratio), tie_prob)
     b_prob, p_prob, tie_prob = _fuhao_apply_fake_pattern_shrink(b_prob, p_prob, tie_prob, fake_pattern)
     edge = abs(b_prob - p_prob)
 
-    agreement = all_votes.count(final_pick) / max(1, len(all_votes)) if final_pick in {"B", "P"} else 0.0
+    agreement = all_votes.count(decision_pick) / max(1, len(all_votes)) if decision_pick in {"B", "P"} else 0.0
     conf, level = _confidence(b_prob, p_prob, tie_prob, len(history), agreement, 0.0)
     if fake_pattern.get("enabled") and fake_pattern.get("action") != "ALLOW":
         shrink_score = max(
@@ -3358,11 +3527,19 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     ai_conf = 0.0
     ai_payload = None
 
+    skip_deepseek_by_fake_guard = bool(
+        recommend == "NONE"
+        and fake_pattern.get("enabled")
+        and str(fake_pattern.get("action", "")).startswith("OBSERVE")
+        and bool(fake_pattern.get("neutralize_probs"))
+    )
+
     if (
         USE_DEEPSEEK
         and FUHAO_USE_DEEPSEEK
         and FUHAO_DEEPSEEK_WEIGHT > 0
         and len(history) >= FUHAO_DEEPSEEK_MIN_HISTORY
+        and not skip_deepseek_by_fake_guard
     ):
         ai_payload = _fuhao_build_deepseek_payload(
             history=history,
@@ -3396,7 +3573,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
                 ai_conf = _clamp(float(ai_result.get("confidence", 0.4) or 0.4), 0.0, 1.0)
                 ai_side = _fuhao_parse_ai_side(ai_result)
 
-                local_side = recommend if recommend in {"B", "P"} else final_pick if final_pick in {"B", "P"} else ""
+                local_side = recommend if recommend in {"B", "P"} else ""
                 conflict = bool(ai_side and local_side and ai_side != local_side and ai_conf >= FUHAO_DEEPSEEK_MIN_CONFIDENCE)
                 same_side = bool(ai_side and local_side and ai_side == local_side and ai_conf >= FUHAO_DEEPSEEK_MIN_CONFIDENCE)
 
@@ -3433,6 +3610,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             except Exception as e:
                 ai_status = "parse_error"
                 ai_result = {"error": True, "message": str(e), "raw": ai_result}
+    elif USE_DEEPSEEK and FUHAO_USE_DEEPSEEK and skip_deepseek_by_fake_guard:
+        ai_status = "skipped_fake_pattern_observe"
     elif USE_DEEPSEEK and FUHAO_USE_DEEPSEEK and len(history) < FUHAO_DEEPSEEK_MIN_HISTORY:
         ai_status = "not_enough_history"
 
@@ -3450,7 +3629,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         advanced_models.get("length_parity", {}).get("label", ""),
         advanced_models.get("banker_rate", {}).get("label", ""),
         fake_pattern.get("label", ""),
-        f"總票數{_fuhao_side_name(final_pick)}:{final_vote_count}/{len(all_votes)}",
+        f"候選方向{_fuhao_side_name(final_pick)} 票數:{final_vote_count}/{len(all_votes)}",
+        f"裁決方向:{_fuhao_side_name(decision_pick) if decision_pick in {'B', 'P'} else '觀望'} 來源:{decision_source}",
     ]
     if observe_reason:
         reason_parts.append(f"觀望:{observe_reason}")
@@ -3492,6 +3672,9 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "tie_rate": round(tie_prob * 100, 1),
         "recommend": recommend,
         "recommend_text": recommend_text_map.get(recommend, "觀望"),
+        "candidate_pick": final_pick,
+        "decision_pick": decision_pick if decision_pick in {"B", "P"} else "",
+        "decision_source": decision_source,
         "is_observe": recommend == "NONE",
         "observe_reason": observe_reason,
         "decision_edge": round(edge, 5),
@@ -3566,6 +3749,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "fuhao": {
             "final_source": final_source,
             "final_pick": final_pick,
+            "decision_source": decision_source,
+            "decision_pick": decision_pick if decision_pick in {"B", "P"} else "",
             "recommend": recommend,
             "road_votes": road_votes,
             "advanced_votes": advanced_votes,
@@ -3599,6 +3784,10 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
                 "deepseek_min_history": FUHAO_DEEPSEEK_MIN_HISTORY,
                 "deepseek_weight": FUHAO_DEEPSEEK_WEIGHT,
                 "use_fake_pattern_detector": FUHAO_USE_FAKE_PATTERN_DETECTOR,
+                "fake_pattern_hard_decision": FUHAO_FAKE_PATTERN_HARD_DECISION,
+                "fake_pattern_neutralize_on_observe": FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE,
+                "fake_pattern_allow_reverse": FUHAO_FAKE_PATTERN_ALLOW_REVERSE,
+                "fake_pattern_reverse_score": FUHAO_FAKE_PATTERN_REVERSE_SCORE,
                 "fake_pattern_observe_score": FUHAO_FAKE_PATTERN_OBSERVE_SCORE,
                 "fake_pattern_hard_observe_score": FUHAO_FAKE_PATTERN_HARD_OBSERVE_SCORE,
                 "fake_pattern_turn_score": FUHAO_FAKE_PATTERN_TURN_SCORE,
