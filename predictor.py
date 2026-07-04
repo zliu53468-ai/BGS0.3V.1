@@ -17,22 +17,32 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 import logging
 
-# 保留 LSTM：有安裝 tensorflow-cpu 時會啟用；若環境還沒裝好，不會讓整個服務直接掛掉
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-    from tensorflow.keras.optimizers import Adam
+# LSTM / TensorFlow 在 Render CPU 上很容易造成冷啟動慢、記憶體爆掉或每局重訓卡住。
+# 因此改成可開關：預設 USE_LSTM=0，穩定優先；若你升級 Render 規格再打開。
+USE_LSTM = os.getenv("USE_LSTM", "0").strip() == "1"
+if USE_LSTM:
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+        from tensorflow.keras.optimizers import Adam
 
-    TF_AVAILABLE = True
-    TF_IMPORT_ERROR = ""
-except Exception as e:
+        TF_AVAILABLE = True
+        TF_IMPORT_ERROR = ""
+    except Exception as e:
+        tf = None
+        Sequential = None
+        LSTM = Dense = Dropout = Input = None
+        Adam = None
+        TF_AVAILABLE = False
+        TF_IMPORT_ERROR = str(e)
+else:
     tf = None
     Sequential = None
     LSTM = Dense = Dropout = Input = None
     Adam = None
     TF_AVAILABLE = False
-    TF_IMPORT_ERROR = str(e)
+    TF_IMPORT_ERROR = "USE_LSTM=0，Render 穩定模式下略過 TensorFlow 匯入"
 
 try:
     from deepseek_client import DeepSeekClient
@@ -89,7 +99,7 @@ AI_BLEND = float(os.getenv("AI_BLEND", "0")) if USE_DEEPSEEK else 0.0
 USE_DYNAMIC_REGIME_WEIGHTS = os.getenv("USE_DYNAMIC_REGIME_WEIGHTS", "1") == "1"
 USE_ONLINE_WEIGHTING = os.getenv("USE_ONLINE_WEIGHTING", "1") == "1"
 USE_ROAD_ENGINE = os.getenv("USE_ROAD_ENGINE", "1") == "1"
-ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "36"))
+ONLINE_WEIGHT_WINDOW = int(os.getenv("ONLINE_WEIGHT_WINDOW", "24"))
 ONLINE_WEIGHT_MIN_COUNT = int(os.getenv("ONLINE_WEIGHT_MIN_COUNT", "12"))
 ONLINE_WEIGHT_ALPHA = float(os.getenv("ONLINE_WEIGHT_ALPHA", "0.22"))
 ONLINE_BAYES_ALPHA = float(os.getenv("ONLINE_BAYES_ALPHA", "6.0"))
@@ -100,7 +110,7 @@ ONLINE_BOOST_ABOVE = float(os.getenv("ONLINE_BOOST_ABOVE", "0.58"))
 # 目的：每個模型只能用當下以前的資料，並依每個使用者 / 場館 / 房間 / 靴號各自累積準度。
 USE_WALK_FORWARD_LEARNING = os.getenv("USE_WALK_FORWARD_LEARNING", "1") == "1"
 WALK_FORWARD_LIVE_PER_UID = os.getenv("WALK_FORWARD_LIVE_PER_UID", "1") == "1"
-WALK_FORWARD_WINDOW = int(os.getenv("WALK_FORWARD_WINDOW", "36"))
+WALK_FORWARD_WINDOW = int(os.getenv("WALK_FORWARD_WINDOW", "24"))
 WALK_FORWARD_MIN_COUNT = int(os.getenv("WALK_FORWARD_MIN_COUNT", "3"))
 WALK_FORWARD_ALPHA = float(os.getenv("WALK_FORWARD_ALPHA", "0.35"))
 WALK_FORWARD_BAYES_ALPHA = float(os.getenv("WALK_FORWARD_BAYES_ALPHA", "2.0"))
@@ -120,9 +130,9 @@ WALK_FORWARD_DEBUG = os.getenv("WALK_FORWARD_DEBUG", "0") == "1"
 # 目的：不是只看最近幾口，而是用目前整靴已知資料，回找前面相似片段，判斷下一局延續/轉折。
 USE_PATTERN_REPLAY_MEMORY = os.getenv("USE_PATTERN_REPLAY_MEMORY", "1") == "1"
 PATTERN_REPLAY_MIN_HISTORY = int(os.getenv("PATTERN_REPLAY_MIN_HISTORY", "14"))
-PATTERN_REPLAY_LOOKBACK = int(os.getenv("PATTERN_REPLAY_LOOKBACK", "140"))
-PATTERN_REPLAY_FULL_SHOE = os.getenv("PATTERN_REPLAY_FULL_SHOE", "1") == "1"
-PATTERN_REPLAY_WINDOWS = os.getenv("PATTERN_REPLAY_WINDOWS", "5,6,7,8,10,12,16,20")
+PATTERN_REPLAY_LOOKBACK = int(os.getenv("PATTERN_REPLAY_LOOKBACK", "80"))
+PATTERN_REPLAY_FULL_SHOE = os.getenv("PATTERN_REPLAY_FULL_SHOE", "0") == "1"
+PATTERN_REPLAY_WINDOWS = os.getenv("PATTERN_REPLAY_WINDOWS", "5,6,8,10,12,16")
 PATTERN_REPLAY_MIN_MATCHES = int(os.getenv("PATTERN_REPLAY_MIN_MATCHES", "2"))
 PATTERN_REPLAY_MIN_SIMILARITY = float(os.getenv("PATTERN_REPLAY_MIN_SIMILARITY", "0.72"))
 PATTERN_REPLAY_EXACT_WEIGHT = float(os.getenv("PATTERN_REPLAY_EXACT_WEIGHT", "0.15"))
@@ -135,7 +145,10 @@ PATTERN_REPLAY_MIN_EDGE = float(os.getenv("PATTERN_REPLAY_MIN_EDGE", "0.025"))
 PATTERN_REPLAY_MAX_BIAS = float(os.getenv("PATTERN_REPLAY_MAX_BIAS", "0.075"))
 PATTERN_REPLAY_WEIGHT = float(os.getenv("PATTERN_REPLAY_WEIGHT", "0.24"))
 PATTERN_REPLAY_APPLY_WF = os.getenv("PATTERN_REPLAY_APPLY_WF", "1") == "1"
-PATTERN_REPLAY_MAX_MATCHES = int(os.getenv("PATTERN_REPLAY_MAX_MATCHES", "160"))
+PATTERN_REPLAY_MAX_MATCHES = int(os.getenv("PATTERN_REPLAY_MAX_MATCHES", "40"))
+# Render 防當機保護：單次預測最多掃描多少個候選片段，避免牌靴變長時 O(n*w) 卡住。
+PATTERN_REPLAY_MAX_SCAN = int(os.getenv("PATTERN_REPLAY_MAX_SCAN", "360"))
+PATTERN_REPLAY_CACHE_SIZE = int(os.getenv("PATTERN_REPLAY_CACHE_SIZE", "200"))
 PATTERN_REPLAY_DEBUG = os.getenv("PATTERN_REPLAY_DEBUG", "0") == "1"
 
 
@@ -198,8 +211,8 @@ OBSERVE_LIFECYCLE_STATES = set(
 # Adaptive Road Memory：本靴內相似牌路狀態回測記憶
 # 目的：不要只靠固定規則，而是看「目前這種類似路型」在本靴過去是跟路準，還是斷路準。
 USE_ADAPTIVE_ROAD_MEMORY = os.getenv("USE_ADAPTIVE_ROAD_MEMORY", "1") == "1"
-ROAD_MEMORY_LOOKBACK = int(os.getenv("ROAD_MEMORY_LOOKBACK", "48"))
-ROAD_MEMORY_MIN_SAMPLE = int(os.getenv("ROAD_MEMORY_MIN_SAMPLE", "10"))
+ROAD_MEMORY_LOOKBACK = int(os.getenv("ROAD_MEMORY_LOOKBACK", "32"))
+ROAD_MEMORY_MIN_SAMPLE = int(os.getenv("ROAD_MEMORY_MIN_SAMPLE", "6"))
 ROAD_MEMORY_FULL_SAMPLE = int(os.getenv("ROAD_MEMORY_FULL_SAMPLE", "24"))
 ROAD_MEMORY_ALPHA = float(os.getenv("ROAD_MEMORY_ALPHA", "3.0"))
 ROAD_MEMORY_MIN_MATCH_SCORE = float(os.getenv("ROAD_MEMORY_MIN_MATCH_SCORE", "4.0"))
@@ -255,10 +268,10 @@ LONG_ANCHOR_TURN_BYPASS_VOTES = int(os.getenv("LONG_ANCHOR_TURN_BYPASS_VOTES", "
 LONG_ANCHOR_BREAK_BYPASS_SCORE = float(os.getenv("LONG_ANCHOR_BREAK_BYPASS_SCORE", "0.70"))
 
 # LSTM參數：預設改保守，避免單靴資料少時過擬合
-LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "10"))
-LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "5"))
+LSTM_SEQUENCE_LENGTH = int(os.getenv("LSTM_SEQUENCE_LENGTH", "8"))
+LSTM_EPOCHS = int(os.getenv("LSTM_EPOCHS", "2"))
 LSTM_BATCH_SIZE = int(os.getenv("LSTM_BATCH_SIZE", "8"))
-ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "1"))
+ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "8"))
 
 
 # ============ 富濠式保守牌路多數決引擎 ============
@@ -616,7 +629,7 @@ class MLModels:
             return default_result
 
 # ============ 模型快取池 ============
-MAX_MODEL_CACHE = int(os.getenv("MAX_MODEL_CACHE", "30"))
+MAX_MODEL_CACHE = int(os.getenv("MAX_MODEL_CACHE", "12"))
 _MODEL_CACHE: Dict[str, MLModels] = {}
 _MODEL_CACHE_ORDER: List[str] = []
 
@@ -624,6 +637,10 @@ _MODEL_CACHE_ORDER: List[str] = []
 # 每個 LINE UID / 場館 / 房間 / 靴號 的逐局前推狀態。
 # 只保存「上一局預測下一局」的 pending，以及最近 N 次各模型是否命中的紀錄。
 _WALK_FORWARD_STATE: Dict[str, Dict[str, Any]] = {}
+
+# Pattern Replay 快取：同一個 LINE UID/房間/靴號、同一段歷史重複按「開始分析」時，不重新掃描整靴。
+_PATTERN_REPLAY_CACHE: Dict[str, Dict[str, Any]] = {}
+_PATTERN_REPLAY_CACHE_ORDER: List[str] = []
 
 
 def _get_ml_models(training_key: str) -> MLModels:
@@ -2945,10 +2962,18 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
     if n < PATTERN_REPLAY_MIN_HISTORY:
         return {**default, "enabled": True, "state": "REPLAY_WARMUP", "label": f"Pattern Replay暖機中 {n}/{PATTERN_REPLAY_MIN_HISTORY}"}
 
-    windows = _parse_int_list(PATTERN_REPLAY_WINDOWS, [5, 6, 7, 8, 10, 12, 16, 20])
+    windows = _parse_int_list(PATTERN_REPLAY_WINDOWS, [5, 6, 8, 10, 12, 16])
     windows = [w for w in windows if 2 <= w < n]
     if not windows:
         return {**default, "enabled": True, "state": "REPLAY_NO_WINDOW", "label": "Pattern Replay沒有可用窗口"}
+
+    # 同一段牌路重複分析時直接吃快取，避免 Render 重複掃描導致卡住。
+    seq_key = "".join(non_tie)
+    cache_key = f"{training_key or 'global'}|{n}|{seq_key[-80:]}|{','.join(map(str, windows))}"
+    if cache_key in _PATTERN_REPLAY_CACHE:
+        cached = dict(_PATTERN_REPLAY_CACHE[cache_key])
+        cached["cache_hit"] = True
+        return cached
 
     b_w = 0.0
     p_w = 0.0
@@ -2959,7 +2984,11 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
     windows_used = []
     max_window = max(windows) if windows else 1
 
+    total_scanned = 0
+    scan_budget = max(60, PATTERN_REPLAY_MAX_SCAN)
     for w in windows:
+        if total_scanned >= scan_budget:
+            break
         current = non_tie[-w:]
         if len(current) < w:
             continue
@@ -2968,6 +2997,9 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
         end = n - w
         local_matches = 0
         for j in range(start, end):
+            total_scanned += 1
+            if total_scanned > scan_budget:
+                break
             truth_idx = j + w
             if truth_idx >= n:
                 continue
@@ -3014,17 +3046,25 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
 
     weighted_sample = b_w + p_w
     if raw_matches < PATTERN_REPLAY_MIN_MATCHES or weighted_sample <= 0:
-        return {
+        result_no_match = {
             **default,
             "enabled": True,
             "state": "REPLAY_NO_MATCH",
-            "label": f"Pattern Replay相似樣本不足 M{raw_matches} MaxSim{max_score:.2f}",
+            "label": f"Pattern Replay相似樣本不足 M{raw_matches} MaxSim{max_score:.2f} Scan{total_scanned}",
             "sample": raw_matches,
             "weighted_sample": round(weighted_sample, 4),
             "max_similarity": round(max_score, 4),
+            "scanned": int(total_scanned),
+            "scan_budget": int(scan_budget),
             "matched_examples": examples[:8] if PATTERN_REPLAY_DEBUG else [],
             "windows_used": windows_used,
         }
+        _PATTERN_REPLAY_CACHE[cache_key] = result_no_match
+        _PATTERN_REPLAY_CACHE_ORDER.append(cache_key)
+        while len(_PATTERN_REPLAY_CACHE_ORDER) > PATTERN_REPLAY_CACHE_SIZE:
+            old = _PATTERN_REPLAY_CACHE_ORDER.pop(0)
+            _PATTERN_REPLAY_CACHE.pop(old, None)
+        return result_no_match
 
     alpha = max(0.0001, PATTERN_REPLAY_BAYES_ALPHA)
     b_rate = (b_w + alpha) / (weighted_sample + 2 * alpha)
@@ -3041,10 +3081,10 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
     side_text = {"B": "莊", "P": "閒", "": "中性"}.get(bias_side, bias_side)
     label = f"Pattern Replay:{side_text} B{int(b_rate*100)} P{int(p_rate*100)} 樣本{raw_matches} 窗口{','.join(str(x.get('window')) for x in windows_used[:5])}"
 
-    return {
+    result_match = {
         "enabled": True,
         "state": state,
-        "label": label,
+        "label": label + f" Scan{total_scanned}",
         "B": round(float(b_rate), 5),
         "P": round(float(p_rate), 5),
         "bias_side": bias_side,
@@ -3056,10 +3096,18 @@ def _pattern_replay_memory_score(non_tie: List[str], training_key: str = "", liv
         "p_weight": round(p_w, 4),
         "exact_matches": exact_matches,
         "max_similarity": round(max_score, 4),
+        "scanned": int(total_scanned),
+        "scan_budget": int(scan_budget),
         "windows_used": windows_used,
         "matched_examples": examples[:12] if PATTERN_REPLAY_DEBUG else examples[:4],
         "training_key": training_key,
     }
+    _PATTERN_REPLAY_CACHE[cache_key] = result_match
+    _PATTERN_REPLAY_CACHE_ORDER.append(cache_key)
+    while len(_PATTERN_REPLAY_CACHE_ORDER) > PATTERN_REPLAY_CACHE_SIZE:
+        old = _PATTERN_REPLAY_CACHE_ORDER.pop(0)
+        _PATTERN_REPLAY_CACHE.pop(old, None)
+    return result_match
 
 
 def _apply_pattern_replay_bias(b_side: float, pattern_replay: Dict[str, Any], live_performance: Optional[Dict[str, Any]] = None) -> float:
