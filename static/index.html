@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>富百家 AI Pro</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root{
+      --yellow:#ffd000;
+      --yellow2:#ffbd00;
+      --black:#111;
+      --gray:#f4f4f4;
+      --red:#e60012;
+      --blue:#0033cc;
+      --green:#00a000;
+      --card:#ffffff;
+      --bg:#fff3c4;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif;
+      background:radial-gradient(circle at top,#fff8d9,#ffe8a3 45%,#ffd98e);
+      color:#111;
+    }
+    .wrap{
+      max-width:480px;
+      min-height:100vh;
+      margin:0 auto;
+      padding:14px;
+    }
+    .hero{
+      background:linear-gradient(135deg,#111,#333);
+      color:#fff;
+      border-radius:22px;
+      padding:18px;
+      box-shadow:0 8px 22px rgba(0,0,0,.18);
+      position:relative;
+      overflow:hidden;
+    }
+    .hero:after{
+      content:"";
+      position:absolute;
+      right:-40px;
+      top:-40px;
+      width:140px;
+      height:140px;
+      border-radius:50%;
+      background:rgba(255,208,0,.14);
+    }
+    .brand{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      position:relative;
+      z-index:1;
+    }
+    .brand h1{
+      margin:0;
+      color:var(--yellow);
+      font-size:24px;
+      letter-spacing:.5px;
+    }
+    .pill{
+      background:rgba(255,208,0,.16);
+      color:var(--yellow);
+      border:1px solid rgba(255,208,0,.55);
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .muted{
+      color:#777;
+      font-size:13px;
+      line-height:1.55;
+    }
+    .hero .muted{color:#ddd;margin:10px 0 0;position:relative;z-index:1}
+    .card{
+      background:var(--card);
+      border:1px solid rgba(0,0,0,.06);
+      border-radius:20px;
+      padding:15px;
+      margin-top:13px;
+      box-shadow:0 5px 16px rgba(0,0,0,.08);
+    }
+    .title{
+      font-weight:900;
+      font-size:18px;
+      border-bottom:2px solid var(--yellow);
+      padding-bottom:9px;
+      margin-bottom:12px;
+      color:#444;
+    }
+    .step{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      background:#fff4bb;
+      border:1px solid #ffe280;
+      color:#7a5200;
+      border-radius:999px;
+      padding:5px 10px;
+      font-size:12px;
+      font-weight:900;
+      margin-bottom:8px;
+    }
+    .btn{
+      border:0;
+      border-radius:14px;
+      min-height:46px;
+      padding:12px 14px;
+      font-size:16px;
+      font-weight:900;
+      cursor:pointer;
+      transition:.12s;
+    }
+    .btn:active{transform:scale(.985)}
+    .btn-yellow{
+      background:linear-gradient(180deg,var(--yellow),var(--yellow2));
+      color:#111;
+      box-shadow:inset 0 -2px 0 rgba(0,0,0,.1);
+    }
+    .btn-dark{
+      background:#222;
+      color:#fff;
+    }
+    .btn-outline{
+      background:#fff;
+      color:#111;
+      border:2px solid var(--yellow);
+    }
+    .full{width:100%}
+    .grid{display:grid;gap:10px}
+    .grid2{grid-template-columns:1fr 1fr}
+    .grid3{grid-template-columns:1fr 1fr 1fr}
+    .platform-grid{
+      display:grid;
+      grid-template-columns:repeat(2,1fr);
+      gap:10px;
+    }
+    .platform-card,.table-card{
+      border:1px solid #eee;
+      border-radius:18px;
+      overflow:hidden;
+      background:#fff;
+      box-shadow:0 4px 12px rgba(0,0,0,.06);
+    }
+    .banner{
+      min-height:82px;
+      background:linear-gradient(135deg,#050505,#1b1b1b 60%,#493b00);
+      color:var(--yellow);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-weight:900;
+      font-size:24px;
+      letter-spacing:1px;
+    }
+    .platform-body,.table-body{padding:12px}
+    .platform-name{
+      text-align:center;
+      font-weight:900;
+      color:#d9a300;
+      font-size:19px;
+      margin-bottom:10px;
+    }
+    .selected{
+      outline:3px solid var(--yellow);
+      box-shadow:0 0 0 5px rgba(255,208,0,.18);
+    }
+    .hall-btns{display:grid;gap:10px}
+    .table-grid{display:grid;gap:12px}
+    .row{
+      display:flex;
+      justify-content:space-between;
+      align-items:flex-start;
+      gap:12px;
+      padding:6px 0;
+      font-size:14px;
+    }
+    .row span:first-child{color:#555;font-weight:700}
+    .row b{text-align:right;word-break:break-all}
+    .stats{
+      display:grid;
+      grid-template-columns:1fr 1fr 1fr;
+      gap:8px;
+      margin-top:8px;
+    }
+    .stat{
+      background:#fafafa;
+      border:1px solid #eee;
+      border-radius:14px;
+      padding:11px 8px;
+      text-align:center;
+    }
+    .stat small{display:block;color:#666;font-size:12px}
+    .stat b{font-size:22px}
+    .recommend{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      background:linear-gradient(180deg,var(--yellow),var(--yellow2));
+      border-radius:14px;
+      padding:13px;
+      font-size:22px;
+      font-weight:900;
+      margin-top:12px;
+    }
+    .road{
+      display:flex;
+      flex-wrap:wrap;
+      gap:6px;
+      min-height:40px;
+      padding:10px;
+      background:#fafafa;
+      border-radius:14px;
+      border:1px solid #eee;
+      margin-top:10px;
+    }
+    .chip{
+      width:28px;
+      height:28px;
+      border-radius:999px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-weight:900;
+      font-size:13px;
+    }
+    .B{color:var(--red);background:#fff0f0;border:1px solid #ffb7b7}
+    .P{color:var(--blue);background:#eef2ff;border:1px solid #bac6ff}
+    .T{color:var(--green);background:#efffee;border:1px solid #b8ebb6}
+    .hide{display:none!important}
+    .loading{
+      opacity:.55;
+      pointer-events:none;
+      filter:grayscale(.1);
+    }
+    .error{
+      color:#b00020;
+      background:#fff1f1;
+      border:1px solid #ffc9c9;
+      padding:10px;
+      border-radius:14px;
+      margin-top:10px;
+      font-size:13px;
+      word-break:break-word;
+    }
+    @media(max-width:380px){
+      .platform-grid{grid-template-columns:1fr}
+      .brand h1{font-size:21px}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap" id="app">
+    <div class="hero">
+      <div class="brand">
+        <h1>富百家 AI Pro</h1>
+        <span class="pill" id="statusPill">初始化</span>
+      </div>
+      <p class="muted">選平台 → 選遊戲廳 → 選桌號 → 系統自動讀取牌路並回傳分析數據。</p>
+    </div>
+
+    <div class="card" id="guideCard">
+      <span class="step">STEP 1</span>
+      <div class="title">富百家使用指南</div>
+      <p><b>📍 操作 3 步驟：</b><br>選擇平台 → 選擇遊戲廳 → 選擇桌號後自動分析。</p>
+      <p><b>⚠️ 讀取規則：</b><br>僅讀取你有權限進入的頁面，不處理繞過登入、驗證碼或平台限制。</p>
+      <p><b>✅ 分析提醒：</b><br>模型僅供資料判讀參考，請保持紀律與風險控管。</p>
+      <button class="btn btn-yellow full" onclick="startFlow()">開始預測</button>
+    </div>
+
+    <div class="card hide" id="platformCard">
+      <span class="step">STEP 2</span>
+      <div class="title">選擇平台</div>
+      <div class="platform-grid" id="platformList"></div>
+    </div>
+
+    <div class="card hide" id="hallCard">
+      <span class="step">STEP 3</span>
+      <div class="title">選擇遊戲廳</div>
+      <div class="hall-btns" id="hallList"></div>
+    </div>
+
+    <div class="card hide" id="tableCard">
+      <span class="step">STEP 4</span>
+      <div class="title">選擇桌號</div>
+      <p class="muted">若平台資料讀取失敗，會先顯示預設桌號讓你測試流程。</p>
+      <div class="table-grid" id="tableList"></div>
+    </div>
+
+    <div class="card hide" id="analysisCard">
+      <span class="step">STEP 5</span>
+      <div class="title">分析數據</div>
+
+      <div class="row"><span>平台</span><b id="vPlatform">--</b></div>
+      <div class="row"><span>遊戲廳</span><b id="vHall">--</b></div>
+      <div class="row"><span>桌號</span><b id="vTable">--</b></div>
+      <div class="row"><span>遊戲編號</span><b id="vGameNo">讀取中</b></div>
+      <div class="row"><span>倒數計時</span><b id="vCountdown">0 秒</b></div>
+      <div class="row"><span>遊戲狀態</span><b id="vGameStatus">讀取中</b></div>
+
+      <div class="stats">
+        <div class="stat"><small>莊</small><b style="color:var(--red)" id="bRate">--</b></div>
+        <div class="stat"><small>閒</small><b style="color:var(--blue)" id="pRate">--</b></div>
+        <div class="stat"><small>和</small><b style="color:var(--green)" id="tRate">--</b></div>
+      </div>
+
+      <div class="recommend"><span>推薦</span><span id="rec">--</span></div>
+      <p class="muted" id="reason">尚未分析</p>
+
+      <div class="road" id="road"></div>
+
+      <div class="grid grid2" style="margin-top:12px">
+        <button class="btn btn-yellow" onclick="continueAnalyze(true)">繼續分析</button>
+        <button class="btn btn-dark" onclick="stopAnalyze()">結束分析</button>
+      </div>
+    </div>
+
+    <div id="errorBox" class="error hide"></div>
+  </div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+let CONFIG = null;
+let USER_ID = localStorage.getItem('baccarat_user_id') || '';
+let SESSION = null;
+let TABLES = [];
+let autoTimer = null;
+
+function api(path, options={}){
+  return fetch(path,{
+    headers:{'Content-Type':'application/json'},
+    ...options
+  }).then(async r=>{
+    const data = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(data.detail || data.error || 'API error');
+    return data;
+  });
+}
+
+function body(obj){ return {method:'POST', body:JSON.stringify(obj)}; }
+
+function setLoading(on){
+  document.getElementById('app').classList.toggle('loading', !!on);
+}
+
+function showError(msg){
+  const el = document.getElementById('errorBox');
+  if(!msg){
+    el.classList.add('hide');
+    el.textContent = '';
+    return;
+  }
+  el.textContent = msg;
+  el.classList.remove('hide');
+}
+
+async function init(){
+  CONFIG = await api('/api/config');
+  await initLiff();
+  renderOptions();
+  const data = await api('/api/session/current?user_id=' + encodeURIComponent(USER_ID));
+  SESSION = data.session;
+  render();
+}
+
+async function initLiff(){
+  try{
+    if(CONFIG.liffId && window.liff){
+      await liff.init({liffId: CONFIG.liffId});
+      if(!liff.isLoggedIn()){
+        liff.login({redirectUri: location.href});
+        return;
+      }
+      const profile = await liff.getProfile();
+      USER_ID = profile.userId;
+    }
+  }catch(e){
+    console.warn('LIFF init failed, fallback local user', e);
+  }
+
+  if(!USER_ID){
+    USER_ID = 'local_' + Math.random().toString(36).slice(2);
+  }
+  localStorage.setItem('baccarat_user_id', USER_ID);
+}
+
+function renderOptions(){
+  const platformList = document.getElementById('platformList');
+  platformList.innerHTML = '';
+
+  (CONFIG.platforms || []).forEach(p=>{
+    const div = document.createElement('div');
+    div.className = 'platform-card';
+    div.id = 'platform_' + p.key;
+    div.innerHTML = `
+      <div class="banner">${p.logo_text || p.key}</div>
+      <div class="platform-body">
+        <div class="platform-name">${p.name}</div>
+        <button class="btn btn-yellow full">選擇</button>
+      </div>
+    `;
+    div.querySelector('button').onclick = ()=>selectPlatform(p.key);
+    platformList.appendChild(div);
+  });
+
+  const hallList = document.getElementById('hallList');
+  hallList.innerHTML = '';
+  (CONFIG.halls || []).forEach(h=>{
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-yellow full';
+    btn.textContent = h.name;
+    btn.onclick = ()=>selectHall(h.key);
+    hallList.appendChild(btn);
+  });
+}
+
+async function startFlow(){
+  clearAuto();
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/flow/start', body({user_id: USER_ID}));
+    SESSION = data.session;
+    render();
+  }catch(e){ showError(e.message); }
+  finally{ setLoading(false); }
+}
+
+async function selectPlatform(platform){
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/flow/platform', body({user_id: USER_ID, platform}));
+    SESSION = data.session;
+    TABLES = [];
+    render();
+  }catch(e){ showError(e.message); }
+  finally{ setLoading(false); }
+}
+
+async function selectHall(hall){
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/flow/hall', body({user_id: USER_ID, hall}));
+    SESSION = data.session;
+    TABLES = data.tables || [];
+    if(data.warning) showError('桌號讀取提醒：' + data.warning);
+    render();
+  }catch(e){ showError(e.message); }
+  finally{ setLoading(false); }
+}
+
+async function selectTable(tableId){
+  clearAuto();
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/flow/table', body({user_id: USER_ID, table_id: tableId}));
+    SESSION = data.session;
+    render();
+    startAuto();
+  }catch(e){ showError(e.message); }
+  finally{ setLoading(false); }
+}
+
+async function continueAnalyze(manual=false){
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/analyze/continue', body({user_id: USER_ID}));
+    SESSION = data.session;
+    render();
+    if(manual) startAuto();
+  }catch(e){
+    showError(e.message);
+    clearAuto();
+  }finally{ setLoading(false); }
+}
+
+async function stopAnalyze(){
+  clearAuto();
+  setLoading(true);
+  showError('');
+  try{
+    const data = await api('/api/analyze/stop', body({user_id: USER_ID}));
+    SESSION = data.session;
+    render();
+  }catch(e){ showError(e.message); }
+  finally{ setLoading(false); }
+}
+
+function startAuto(){
+  clearAuto();
+  const ms = Number(CONFIG.autoPollMs || 6000);
+  autoTimer = setInterval(()=>continueAnalyze(false), ms);
+}
+
+function clearAuto(){
+  if(autoTimer){
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
+}
+
+function show(id, yes){
+  document.getElementById(id).classList.toggle('hide', !yes);
+}
+
+function renderTables(){
+  const list = document.getElementById('tableList');
+  list.innerHTML = '';
+
+  TABLES.forEach(t=>{
+    const div = document.createElement('div');
+    const selected = SESSION && SESSION.table_id === t.table_id;
+    div.className = 'table-card' + (selected ? ' selected' : '');
+    div.innerHTML = `
+      <div class="banner">DG</div>
+      <div class="table-body">
+        <div class="row"><span>桌號</span><b>${t.table_id || '--'}</b></div>
+        <div class="row"><span>遊戲編號</span><b>${t.game_no || '讀取中'}</b></div>
+        <div class="row"><span>荷官姓名</span><b>${t.dealer || '讀取中'}</b></div>
+        <div class="row"><span>在線人數</span><b>${t.online_count || 0}</b></div>
+        <button class="btn btn-yellow full">選擇</button>
+      </div>
+    `;
+    div.querySelector('button').onclick = ()=>selectTable(t.table_id);
+    list.appendChild(div);
+  });
+}
+
+function renderRoad(){
+  const road = document.getElementById('road');
+  road.innerHTML = '';
+
+  const hist = (SESSION && (SESSION.history || SESSION.road)) || [];
+  if(!hist.length){
+    road.innerHTML = '<span class="muted">目前尚未讀取到牌路，若平台是圖片/canvas，請開啟 USE_COLOR_READER 並設定 ROAD_X/ROAD_Y。</span>';
+    return;
+  }
+
+  hist.slice(-80).forEach(x=>{
+    const span = document.createElement('span');
+    span.className = 'chip ' + x;
+    span.textContent = x;
+    road.appendChild(span);
+  });
+}
+
+function render(){
+  if(!SESSION) return;
+
+  document.getElementById('statusPill').textContent = SESSION.status || '待開始';
+
+  const step = SESSION.step || 'IDLE';
+
+  show('guideCard', step === 'IDLE' || step === 'STOPPED');
+  show('platformCard', ['PLATFORM_SELECT','HALL_SELECT','TABLE_SELECT','ANALYZING'].includes(step));
+  show('hallCard', ['HALL_SELECT','TABLE_SELECT','ANALYZING'].includes(step));
+  show('tableCard', ['TABLE_SELECT','ANALYZING'].includes(step));
+  show('analysisCard', step === 'ANALYZING');
+
+  document.querySelectorAll('.platform-card').forEach(x=>x.classList.remove('selected'));
+  if(SESSION.platform){
+    const el = document.getElementById('platform_' + SESSION.platform);
+    if(el) el.classList.add('selected');
+  }
+
+  renderTables();
+
+  document.getElementById('vPlatform').textContent = SESSION.platform_name || SESSION.platform || '--';
+  document.getElementById('vHall').textContent = SESSION.hall_name || SESSION.hall || '--';
+  document.getElementById('vTable').textContent = SESSION.table_id || '--';
+  document.getElementById('vGameNo').textContent = SESSION.game_no || '讀取中';
+  document.getElementById('vCountdown').textContent = (SESSION.countdown || 0) + ' 秒';
+  document.getElementById('vGameStatus').textContent = SESSION.game_status || '讀取中';
+
+  const pred = SESSION.last_prediction;
+  if(pred){
+    document.getElementById('bRate').textContent = pred.banker_rate + '%';
+    document.getElementById('pRate').textContent = pred.player_rate + '%';
+    document.getElementById('tRate').textContent = pred.tie_rate + '%';
+    document.getElementById('rec').textContent = pred.recommend_text || '--';
+    document.getElementById('reason').textContent = (pred.signal_level || '') + '｜' + (pred.reason || '');
+  }else{
+    document.getElementById('bRate').textContent = '--';
+    document.getElementById('pRate').textContent = '--';
+    document.getElementById('tRate').textContent = '--';
+    document.getElementById('rec').textContent = '--';
+    document.getElementById('reason').textContent = '尚未分析';
+  }
+
+  renderRoad();
+
+  if(SESSION.error) showError(SESSION.error);
+}
+
+init().catch(e=>{
+  console.error(e);
+  showError('初始化失敗：' + e.message);
+});
+</script>
+</body>
+</html>
