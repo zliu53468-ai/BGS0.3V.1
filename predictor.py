@@ -160,6 +160,52 @@ ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10
 ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.024"))
 ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.016"))
 DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "3"))
+# Candidate Down-Road Simulation：下三路候選模擬參數
+DERIVED_CANDIDATE_LOOKBACK = int(os.getenv("DERIVED_CANDIDATE_LOOKBACK", str(ROAD_ENGINE_DERIVED_LOOKBACK)))
+DERIVED_CANDIDATE_MAX_EDGE = float(os.getenv("DERIVED_CANDIDATE_MAX_EDGE", "0.078"))
+DERIVED_CANDIDATE_MIN_EDGE = float(os.getenv("DERIVED_CANDIDATE_MIN_EDGE", "0.008"))
+DERIVED_COLOR_JUMP_RATE = float(os.getenv("DERIVED_COLOR_JUMP_RATE", "0.68"))
+DERIVED_COLOR_STREAK_MIN = int(os.getenv("DERIVED_COLOR_STREAK_MIN", "3"))
+DERIVED_COLOR_RATIO_GAP = float(os.getenv("DERIVED_COLOR_RATIO_GAP", "0.22"))
+DERIVED_COLOR_NGRAM_MAX = int(os.getenv("DERIVED_COLOR_NGRAM_MAX", "5"))
+FUHAO_DOWN3_MIN_DIFF = float(os.getenv("FUHAO_DOWN3_MIN_DIFF", "0.020"))
+
+# Down-Road Structure：下三路齊整 / 有無 / 直落結構分
+DERIVED_COLOR_SCORE_WEIGHT = float(os.getenv("DERIVED_COLOR_SCORE_WEIGHT", "0.55"))
+DERIVED_STRUCTURE_SCORE_WEIGHT = float(os.getenv("DERIVED_STRUCTURE_SCORE_WEIGHT", "0.45"))
+DERIVED_STRUCTURE_NEAT_BONUS = float(os.getenv("DERIVED_STRUCTURE_NEAT_BONUS", "0.055"))
+DERIVED_STRUCTURE_MISMATCH_PENALTY = float(os.getenv("DERIVED_STRUCTURE_MISMATCH_PENALTY", "0.045"))
+DERIVED_STRUCTURE_DROP_BONUS = float(os.getenv("DERIVED_STRUCTURE_DROP_BONUS", "0.035"))
+DERIVED_STRUCTURE_SIDE_DRAG_PENALTY = float(os.getenv("DERIVED_STRUCTURE_SIDE_DRAG_PENALTY", "0.020"))
+DERIVED_STRUCTURE_NEWCOL_BONUS = float(os.getenv("DERIVED_STRUCTURE_NEWCOL_BONUS", "0.025"))
+DERIVED_STRUCTURE_MAX_EDGE = float(os.getenv("DERIVED_STRUCTURE_MAX_EDGE", "0.090"))
+# End Candidate Down-Road Simulation
+# Ask Road Hit Memory：問路命中率記憶
+# 目的：讓每一靴依照最近實際命中率，微調大眼仔 / 小路 / 蟑螂路的可信度。
+USE_ASK_ROAD_MEMORY = os.getenv("USE_ASK_ROAD_MEMORY", "1") == "1"
+ASK_ROAD_MEMORY_WINDOW = int(os.getenv("ASK_ROAD_MEMORY_WINDOW", "24"))
+ASK_ROAD_MEMORY_MIN_COUNT = int(os.getenv("ASK_ROAD_MEMORY_MIN_COUNT", "4"))
+ASK_ROAD_MEMORY_ALPHA = float(os.getenv("ASK_ROAD_MEMORY_ALPHA", "0.35"))
+ASK_ROAD_MEMORY_BAYES_ALPHA = float(os.getenv("ASK_ROAD_MEMORY_BAYES_ALPHA", "2.0"))
+ASK_ROAD_MEMORY_MIN_FACTOR = float(os.getenv("ASK_ROAD_MEMORY_MIN_FACTOR", "0.72"))
+ASK_ROAD_MEMORY_MAX_FACTOR = float(os.getenv("ASK_ROAD_MEMORY_MAX_FACTOR", "1.28"))
+ASK_ROAD_MEMORY_DISABLE_BELOW = float(os.getenv("ASK_ROAD_MEMORY_DISABLE_BELOW", "0.43"))
+ASK_ROAD_MEMORY_BOOST_ABOVE = float(os.getenv("ASK_ROAD_MEMORY_BOOST_ABOVE", "0.57"))
+ASK_ROAD_MEMORY_APPLY_TO_HYBRID = os.getenv("ASK_ROAD_MEMORY_APPLY_TO_HYBRID", "1") == "1"
+ASK_ROAD_MEMORY_APPLY_TO_FUHAO = os.getenv("ASK_ROAD_MEMORY_APPLY_TO_FUHAO", "1") == "1"
+ASK_ROAD_MEMORY_DROP_BAD_VOTE = os.getenv("ASK_ROAD_MEMORY_DROP_BAD_VOTE", "1") == "1"
+ASK_ROAD_MEMORY_BAD_VOTE_ACC = float(os.getenv("ASK_ROAD_MEMORY_BAD_VOTE_ACC", "0.40"))
+ASK_ROAD_MEMORY_DEBUG = os.getenv("ASK_ROAD_MEMORY_DEBUG", "0") == "1"
+
+# Column Shape Score：前排大路欄型分
+# 目的：讓問路不只看紅藍與有無，也看候選落點是否符合前排欄高節奏。
+USE_DERIVED_COLUMN_SHAPE = os.getenv("USE_DERIVED_COLUMN_SHAPE", "1") == "1"
+DERIVED_COLUMN_SHAPE_WEIGHT = float(os.getenv("DERIVED_COLUMN_SHAPE_WEIGHT", "0.18"))
+DERIVED_COLUMN_SHAPE_LOOKBACK = int(os.getenv("DERIVED_COLUMN_SHAPE_LOOKBACK", "5"))
+DERIVED_COLUMN_NEAT_BONUS = float(os.getenv("DERIVED_COLUMN_NEAT_BONUS", "0.040"))
+DERIVED_COLUMN_BREAK_PENALTY = float(os.getenv("DERIVED_COLUMN_BREAK_PENALTY", "0.035"))
+DERIVED_COLUMN_DRAG_PENALTY = float(os.getenv("DERIVED_COLUMN_DRAG_PENALTY", "0.020"))
+DERIVED_COLUMN_MAX_EDGE = float(os.getenv("DERIVED_COLUMN_MAX_EDGE", "0.070"))
 ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.020"))
 ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.055"))
 
@@ -638,6 +684,11 @@ _MODEL_CACHE_ORDER: List[str] = []
 # 只保存「上一局預測下一局」的 pending，以及最近 N 次各模型是否命中的紀錄。
 _WALK_FORWARD_STATE: Dict[str, Dict[str, Any]] = {}
 
+
+# Ask Road Hit Memory：每個 LINE UID / 場館 / 房間 / 靴號 的問路命中率記憶。
+# 只保存上一輪問路票 pending，以及最近 N 次問路票是否命中的紀錄。
+_ASK_ROAD_STATE: Dict[str, Dict[str, Any]] = {}
+
 # Pattern Replay 快取：同一個 LINE UID/房間/靴號、同一段歷史重複按「開始分析」時，不重新掃描整靴。
 _PATTERN_REPLAY_CACHE: Dict[str, Dict[str, Any]] = {}
 _PATTERN_REPLAY_CACHE_ORDER: List[str] = []
@@ -901,47 +952,35 @@ def _streak_score(non_tie: List[str]) -> Dict[str, float]:
 
 # ============ RoadEngine：大路 / 下三路獨立主模型 ============
 def _build_big_road(non_tie: List[str], rows: int = ROAD_ENGINE_ROWS) -> Dict[str, Any]:
-    """
-    建立簡化且穩定的大路矩陣。
-    - 同邊：往下排；到底或被占用則往右延伸。
-    - 換邊：新欄第一列。
-    回傳位置、欄高、最後位置等，供大路與下三路使用。
-    """
+    # 百家樂大路盤面：同邊直落；到底/卡位橫拖；換邊開新欄。
     rows = max(3, int(rows or 6))
+    sequence = [x for x in non_tie if x in {"B", "P"}]
     grid: Dict[Tuple[int, int], str] = {}
     positions: List[Dict[str, Any]] = []
-
     last_side = ""
     row = 0
     col = 0
 
-    for idx, side in enumerate(non_tie):
-        if side not in {"B", "P"}:
-            continue
-
+    for idx, side in enumerate(sequence):
         if idx == 0:
-            row, col = 0, 0
+            row, col, move_type = 0, 0, "START"
         elif side != last_side:
-            col = col + 1
-            row = 0
-            while (row, col) in grid:
-                col += 1
+            target_row, target_col = 0, col + 1
+            while (target_row, target_col) in grid:
+                target_col += 1
+            row, col, move_type = target_row, target_col, "NEW_COLUMN"
         else:
-            target_row = row + 1
-            target_col = col
+            target_row, target_col = row + 1, col
             if target_row < rows and (target_row, target_col) not in grid:
-                row = target_row
+                row, col, move_type = target_row, target_col, "VERTICAL_DROP"
             else:
-                # 到底或下方被占用，往右黏邊延伸
-                target_row = row
-                target_col = col + 1
+                target_row, target_col = row, col + 1
                 while (target_row, target_col) in grid:
                     target_col += 1
-                col = target_col
-                row = target_row
+                row, col, move_type = target_row, target_col, "SIDE_DRAG"
 
         grid[(row, col)] = side
-        positions.append({"i": idx, "side": side, "row": row, "col": col})
+        positions.append({"i": idx, "side": side, "row": row, "col": col, "move_type": move_type})
         last_side = side
 
     col_heights = Counter()
@@ -952,10 +991,10 @@ def _build_big_road(non_tie: List[str], rows: int = ROAD_ENGINE_ROWS) -> Dict[st
             col_sides[c] = side
 
     max_col = max([p["col"] for p in positions], default=0)
-    last_pos = positions[-1] if positions else {"i": -1, "side": "", "row": 0, "col": 0}
-
+    last_pos = positions[-1] if positions else {"i": -1, "side": "", "row": 0, "col": 0, "move_type": "NONE"}
     return {
         "rows": rows,
+        "sequence": sequence,
         "grid": grid,
         "positions": positions,
         "col_heights": dict(col_heights),
@@ -966,34 +1005,52 @@ def _build_big_road(non_tie: List[str], rows: int = ROAD_ENGINE_ROWS) -> Dict[st
 
 
 def _derived_color_at(layout: Dict[str, Any], pos: Dict[str, Any], offset: int) -> int:
-    """
-    衍生路紙紅藍簡化規則。
-    回傳：1=紅，-1=藍，0=資料不足。
-    用途：把大眼仔 / 小路 / 蟑螂路的「整齊或變化」量化。
-    """
+    # 下三路紅藍：offset=1 大眼仔；2 小路；3 蟑螂路。1=紅，-1=藍，0=資料不足。
     col = int(pos.get("col", 0))
     row = int(pos.get("row", 0))
-    heights = layout.get("col_heights", {})
-
+    offset = int(offset)
+    grid = layout.get("grid", {}) or {}
+    heights = layout.get("col_heights", {}) or {}
     if col <= offset:
         return 0
-
     if row == 0:
         left_h = int(heights.get(col - 1, 0))
         compare_h = int(heights.get(col - 1 - offset, 0))
-        if left_h == 0 or compare_h == 0:
+        if left_h <= 0 or compare_h <= 0:
             return 0
         return 1 if left_h == compare_h else -1
-
-    # 同一欄向下時，看左側相對欄位是否同樣有該列；越整齊越偏紅
-    has_left_same_row = ((row, col - offset) in layout.get("grid", {}))
-    has_left_prev_row = ((row - 1, col - offset) in layout.get("grid", {}))
-    if has_left_same_row == has_left_prev_row:
-        return 1
-    return -1
+    compare_col = col - offset
+    has_same_row = ((row, compare_col) in grid)
+    has_prev_row = ((row - 1, compare_col) in grid)
+    return 1 if has_same_row == has_prev_row else -1
 
 
 def _derived_series(layout: Dict[str, Any], offset: int) -> List[int]:
+    # 下三路必須逐局生成，不能用最後版面倒回去重算，避免未來格子污染過去紅藍。
+    seq = layout.get("sequence")
+    if seq:
+        clean_seq = [x for x in seq if x in {"B", "P"}]
+        cache_key = (int(offset), "".join(clean_seq))
+        cache = getattr(_derived_series, "_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(_derived_series, "_cache", cache)
+        if cache_key in cache:
+            return list(cache[cache_key])
+        series: List[int] = []
+        for i in range(1, len(clean_seq) + 1):
+            partial_layout = _build_big_road(clean_seq[:i])
+            positions = partial_layout.get("positions", []) or []
+            if not positions:
+                continue
+            color = _derived_color_at(partial_layout, positions[-1], offset)
+            if color != 0:
+                series.append(color)
+        if len(cache) > 500:
+            cache.clear()
+        cache[cache_key] = list(series)
+        return series
+
     series = []
     for pos in layout.get("positions", []):
         color = _derived_color_at(layout, pos, offset)
@@ -1016,6 +1073,287 @@ def _color_stats(series: List[int], lookback: int = ROAD_ENGINE_DERIVED_LOOKBACK
         "count": total,
         "tail": "".join("R" if x == 1 else "B" for x in tail),
     }
+
+
+def _classify_bigroad_move(before_layout: Dict[str, Any], after_layout: Dict[str, Any], candidate: str) -> Dict[str, Any]:
+    before_positions = before_layout.get("positions", []) or []
+    after_positions = after_layout.get("positions", []) or []
+    if not after_positions:
+        return {"move_type": "NONE", "before": {}, "after": {}}
+    after_pos = after_positions[-1]
+    before_pos = before_positions[-1] if before_positions else {}
+    if not before_pos:
+        return {"move_type": "START", "before": before_pos, "after": after_pos}
+    before_side = before_pos.get("side", "")
+    before_row = int(before_pos.get("row", 0))
+    before_col = int(before_pos.get("col", 0))
+    after_row = int(after_pos.get("row", 0))
+    after_col = int(after_pos.get("col", 0))
+    if candidate != before_side:
+        move_type = "NEW_COLUMN"
+    elif after_col == before_col and after_row == before_row + 1:
+        move_type = "VERTICAL_DROP"
+    elif after_col > before_col and after_row == before_row:
+        move_type = "SIDE_DRAG"
+    else:
+        move_type = after_pos.get("move_type", "CONTINUE_OTHER")
+    return {"move_type": move_type, "before": before_pos, "after": after_pos,
+            "before_row": before_row, "before_col": before_col, "after_row": after_row, "after_col": after_col}
+
+
+def _candidate_derived_color_info(non_tie: List[str], candidate: str, offset: int) -> Dict[str, Any]:
+    if candidate not in {"B", "P"}:
+        return {"candidate": candidate, "new_color": 0, "new_color_text": "N", "before_len": 0, "after_len": 0, "pos": {}, "move": {}, "structure": {}}
+
+    before_layout = _build_big_road(non_tie)
+    before_series = _derived_series(before_layout, offset)
+    after_layout = _build_big_road(non_tie + [candidate])
+    after_series = _derived_series(after_layout, offset)
+    new_color = after_series[-1] if len(after_series) > len(before_series) else 0
+    move_info = _classify_bigroad_move(before_layout, after_layout, candidate)
+    pos = move_info.get("after", {}) or {}
+    row = int(pos.get("row", 0))
+    col = int(pos.get("col", 0))
+    grid = after_layout.get("grid", {}) or {}
+    heights = after_layout.get("col_heights", {}) or {}
+    structure: Dict[str, Any] = {
+        "move_type": move_info.get("move_type", "NONE"), "row": row, "col": col, "offset": offset,
+        "is_new_column": row == 0, "is_vertical_drop": move_info.get("move_type") == "VERTICAL_DROP",
+        "is_side_drag": move_info.get("move_type") == "SIDE_DRAG", "is_neat": False,
+        "has_same_row": None, "has_prev_row": None, "left_height": None, "compare_height": None, "relation": "",
+    }
+    if col <= offset:
+        structure["relation"] = "資料不足"
+    elif row == 0:
+        left_col = col - 1
+        compare_col = col - 1 - offset
+        left_h = int(heights.get(left_col, 0))
+        compare_h = int(heights.get(compare_col, 0))
+        is_neat = bool(left_h > 0 and compare_h > 0 and left_h == compare_h)
+        structure.update({"left_col": left_col, "compare_col": compare_col, "left_height": left_h,
+                          "compare_height": compare_h, "is_neat": is_neat,
+                          "relation": f"新欄高度{'齊整' if is_neat else '不齊'}:{left_h}/{compare_h}"})
+    else:
+        compare_col = col - offset
+        has_same_row = ((row, compare_col) in grid)
+        has_prev_row = ((row - 1, compare_col) in grid)
+        is_neat = bool(has_same_row == has_prev_row)
+        relation = ("有" if has_same_row else "無") + "/" + ("有" if has_prev_row else "無")
+        structure.update({"compare_col": compare_col, "has_same_row": has_same_row, "has_prev_row": has_prev_row,
+                          "is_neat": is_neat, "relation": f"有無{relation}:{'齊整' if is_neat else '不齊'}"})
+    return {"candidate": candidate, "new_color": new_color, "new_color_text": "R" if new_color == 1 else "B" if new_color == -1 else "N",
+            "before_len": len(before_series), "after_len": len(after_series), "pos": pos, "move": move_info, "structure": structure}
+
+
+def _score_candidate_color_pattern(series: List[int], candidate_color: int, lookback: Optional[int] = None) -> Dict[str, Any]:
+    if lookback is None:
+        lookback = DERIVED_CANDIDATE_LOOKBACK
+    if candidate_color not in {1, -1}:
+        return {"score": 0.5, "confidence": 0.0, "expected_color": 0, "expected_color_text": "N", "candidate_color_text": "N", "label": "候選無新色"}
+    tail = series[-lookback:] if series else []
+    if len(tail) < 3:
+        return {"score": 0.5, "confidence": 0.0, "expected_color": 0, "expected_color_text": "N", "candidate_color_text": "R" if candidate_color == 1 else "B", "label": "紅藍樣本不足"}
+    last_color = tail[-1]
+    color_streak = 1
+    for x in reversed(tail[:-1]):
+        if x == last_color:
+            color_streak += 1
+        else:
+            break
+    switches = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
+    switch_rate = _safe_div(switches, max(1, len(tail) - 1), 0.5)
+    red_rate = tail.count(1) / len(tail)
+    blue_rate = tail.count(-1) / len(tail)
+    expected_color, edge, label = 0, 0.0, "紅藍中性"
+    if switch_rate >= DERIVED_COLOR_JUMP_RATE and len(tail) >= 6:
+        expected_color = -last_color
+        edge = min(0.16, 0.09 + (switch_rate - DERIVED_COLOR_JUMP_RATE) * 0.28)
+        label = "下三路紅藍單跳"
+    elif color_streak >= DERIVED_COLOR_STREAK_MIN:
+        expected_color = last_color
+        edge = min(0.17, 0.09 + (color_streak - DERIVED_COLOR_STREAK_MIN) * 0.025)
+        label = f"下三路{'紅' if last_color == 1 else '藍'}連{color_streak}"
+    elif abs(red_rate - blue_rate) >= DERIVED_COLOR_RATIO_GAP:
+        expected_color = 1 if red_rate > blue_rate else -1
+        edge = min(0.11, abs(red_rate - blue_rate) * 0.22)
+        label = "下三路紅藍比例偏態"
+    else:
+        found = False
+        max_k = min(max(2, DERIVED_COLOR_NGRAM_MAX), len(tail) - 1)
+        for k in range(max_k, 1, -1):
+            key = tail[-k:]
+            follows = [tail[i + k] for i in range(0, len(tail) - k) if tail[i:i + k] == key and i + k < len(tail)]
+            if len(follows) >= 2:
+                red_follow = follows.count(1)
+                blue_follow = follows.count(-1)
+                if red_follow != blue_follow:
+                    expected_color = 1 if red_follow > blue_follow else -1
+                    edge = min(0.12, abs(red_follow - blue_follow) / len(follows) * 0.16)
+                    label = f"下三路紅藍NGram{k}"
+                    found = True
+                    break
+        if not found:
+            expected_color, edge, label = last_color, 0.035, "下三路弱續勢"
+    score = 0.5 + edge if candidate_color == expected_color else 0.5 - edge
+    return {"score": round(score, 5), "confidence": round(min(1.0, abs(score - 0.5) * 2.8), 4),
+            "expected_color": expected_color, "expected_color_text": "R" if expected_color == 1 else "B" if expected_color == -1 else "N",
+            "candidate_color_text": "R" if candidate_color == 1 else "B", "label": label,
+            "switch_rate": round(switch_rate, 4), "color_streak": color_streak, "red_rate": round(red_rate, 4),
+            "blue_rate": round(blue_rate, 4), "tail": "".join("R" if x == 1 else "B" for x in tail)}
+
+
+def _score_candidate_structure(info: Dict[str, Any], series: List[int]) -> Dict[str, Any]:
+    structure = info.get("structure", {}) or {}
+    move_type = structure.get("move_type", "NONE")
+    is_neat = bool(structure.get("is_neat", False))
+    new_color = int(info.get("new_color", 0) or 0)
+    edge, reasons = 0.0, []
+    if is_neat:
+        edge += DERIVED_STRUCTURE_NEAT_BONUS; reasons.append("齊整")
+    else:
+        edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY; reasons.append("不齊")
+    if move_type == "VERTICAL_DROP":
+        edge += DERIVED_STRUCTURE_DROP_BONUS; reasons.append("直落")
+    elif move_type == "SIDE_DRAG":
+        edge -= DERIVED_STRUCTURE_SIDE_DRAG_PENALTY; reasons.append("黏邊橫拖")
+    elif move_type == "NEW_COLUMN":
+        edge += DERIVED_STRUCTURE_NEWCOL_BONUS; reasons.append("新欄")
+    if new_color in {1, -1}:
+        if is_neat and new_color == -1:
+            edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY * 0.55; reasons.append("齊整卻出藍")
+        elif (not is_neat) and new_color == 1:
+            edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY * 0.35; reasons.append("不齊卻出紅")
+    edge = _clamp(edge, -DERIVED_STRUCTURE_MAX_EDGE, DERIVED_STRUCTURE_MAX_EDGE)
+    return {"score": round(0.5 + edge, 5), "edge": round(edge, 5), "label": "+".join(reasons),
+            "move_type": move_type, "is_neat": is_neat, "relation": structure.get("relation", ""), "structure": structure}
+
+
+def _score_column_shape(non_tie: List[str], candidate: str) -> Dict[str, Any]:
+    # 前排大路欄型分：
+    # 讓候選判斷不只看下三路紅藍，也看下一口落點是否符合最近欄高節奏。
+    if not USE_DERIVED_COLUMN_SHAPE or candidate not in {"B", "P"} or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
+        return {"score": 0.5, "edge": 0.0, "label": "欄型關閉或資料不足", "tail_heights": []}
+
+    try:
+        before_layout = _build_big_road(non_tie)
+        after_layout = _build_big_road(non_tie + [candidate])
+        move = _classify_bigroad_move(before_layout, after_layout, candidate)
+        move_type = move.get("move_type", "NONE")
+
+        after_last = after_layout.get("last", {}) or {}
+        col = int(after_last.get("col", 0))
+        row = int(after_last.get("row", 0))
+        heights = after_layout.get("col_heights", {}) or {}
+
+        lookback = max(3, DERIVED_COLUMN_SHAPE_LOOKBACK)
+        start_col = max(0, col - lookback)
+        prev_heights = [int(heights.get(c, 0)) for c in range(start_col, col) if int(heights.get(c, 0)) > 0]
+        tail_heights = prev_heights[-lookback:]
+        current_height = int(heights.get(col, 0))
+
+        if not tail_heights:
+            return {"score": 0.5, "edge": 0.0, "label": "欄型樣本不足", "tail_heights": [], "current_height": current_height, "move_type": move_type}
+
+        avg_h = sum(tail_heights) / len(tail_heights)
+        max_h = max(tail_heights)
+        min_h = min(tail_heights)
+        last_h = tail_heights[-1]
+        repeated = tail_heights.count(last_h) >= max(2, len(tail_heights) // 2)
+
+        edge = 0.0
+        reasons = []
+
+        if move_type == "VERTICAL_DROP":
+            # 直落如果仍在前排欄高範圍內，視為欄型延續；若超出太多，視為可能疲乏。
+            if current_height <= max_h + 1:
+                edge += DERIVED_COLUMN_NEAT_BONUS
+                reasons.append("直落貼近前排欄高")
+            else:
+                edge -= DERIVED_COLUMN_BREAK_PENALTY
+                reasons.append("直落超出前排欄高")
+        elif move_type == "NEW_COLUMN":
+            # 換邊開新欄：如果前一欄高度接近近期欄型，代表上一欄完成得較漂亮。
+            prev_col_h = int(heights.get(col - 1, 0))
+            if repeated and prev_col_h == last_h:
+                edge += DERIVED_COLUMN_NEAT_BONUS * 0.85
+                reasons.append("新欄承接重複欄型")
+            elif abs(prev_col_h - avg_h) <= 1.0:
+                edge += DERIVED_COLUMN_NEAT_BONUS * 0.55
+                reasons.append("新欄承接平均欄高")
+            else:
+                edge -= DERIVED_COLUMN_BREAK_PENALTY * 0.60
+                reasons.append("新欄前欄破欄型")
+        elif move_type == "SIDE_DRAG":
+            # 橫拖代表到底/卡位，通常要保守一點；若近期欄高本來就很高，扣分較小。
+            if max_h >= ROAD_ENGINE_ROWS - 1:
+                edge -= DERIVED_COLUMN_DRAG_PENALTY * 0.55
+                reasons.append("高欄橫拖")
+            else:
+                edge -= DERIVED_COLUMN_DRAG_PENALTY
+                reasons.append("黏邊橫拖")
+        else:
+            if abs(current_height - avg_h) <= 1.0:
+                edge += DERIVED_COLUMN_NEAT_BONUS * 0.35
+                reasons.append("欄高接近平均")
+
+        # 如果最近欄型很整齊，候選造成明顯偏離就扣分。
+        if repeated and current_height not in {last_h, last_h + 1, 1}:
+            edge -= DERIVED_COLUMN_BREAK_PENALTY * 0.45
+            reasons.append("偏離重複欄型")
+
+        edge = _clamp(edge, -DERIVED_COLUMN_MAX_EDGE, DERIVED_COLUMN_MAX_EDGE)
+
+        return {
+            "score": round(0.5 + edge, 5),
+            "edge": round(edge, 5),
+            "label": "+".join(reasons) if reasons else "欄型中性",
+            "move_type": move_type,
+            "row": row,
+            "col": col,
+            "current_height": current_height,
+            "tail_heights": tail_heights,
+            "avg_height": round(avg_h, 3),
+            "max_height": max_h,
+            "min_height": min_h,
+        }
+    except Exception as e:
+        return {"score": 0.5, "edge": 0.0, "label": f"欄型錯誤:{e}", "tail_heights": []}
+
+
+def _combine_candidate_scores(color_score: float, structure_score: float, column_score: Optional[float] = None) -> float:
+    # 合併候選分數：
+    # color_score=紅藍節奏分；structure_score=齊整 / 有無 / 直落結構分；column_score=前排大路欄型分。
+    cw_raw = DERIVED_COLOR_SCORE_WEIGHT
+    sw_raw = DERIVED_STRUCTURE_SCORE_WEIGHT
+    col_raw = DERIVED_COLUMN_SHAPE_WEIGHT if (USE_DERIVED_COLUMN_SHAPE and column_score is not None) else 0.0
+
+    total_w = max(0.0001, cw_raw + sw_raw + col_raw)
+    cw = cw_raw / total_w
+    sw = sw_raw / total_w
+    colw = col_raw / total_w
+
+    result = float(color_score) * cw + float(structure_score) * sw
+    if column_score is not None and colw > 0:
+        result += float(column_score) * colw
+    return result
+
+
+def _candidate_scores_to_side_prob(b_score: float, p_score: float, max_edge: Optional[float] = None) -> Tuple[float, float, float]:
+    if max_edge is None:
+        max_edge = DERIVED_CANDIDATE_MAX_EDGE
+    edge = _clamp((float(b_score) - float(p_score)) * 0.18, -max_edge, max_edge)
+    return 0.5 + edge, 0.5 - edge, abs(edge)
+
+
+def _roadmap_ask_road_debug(non_tie: List[str]) -> Dict[str, Any]:
+    layout = _build_big_road(non_tie)
+    result: Dict[str, Any] = {"current_big_road": {"last": layout.get("last", {}), "max_col": layout.get("max_col", 0), "col_heights": layout.get("col_heights", {})}}
+    for candidate in ["B", "P"]:
+        result[f"ask_{candidate}"] = {"candidate": candidate, "candidate_text": "莊" if candidate == "B" else "閒", "roads": {}}
+        for offset, road_key in {1: "big_eye", 2: "small_road", 3: "cockroach"}.items():
+            info = _candidate_derived_color_info(non_tie, candidate, offset)
+            result[f"ask_{candidate}"]["roads"][road_key] = {"color": info.get("new_color_text", "N"), "pos": info.get("pos", {}), "move_type": info.get("move", {}).get("move_type", ""), "structure": info.get("structure", {})}
+    return result
 
 
 def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
@@ -1125,81 +1463,109 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
 
 
 def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_name: str) -> Dict[str, Any]:
-    """
-    下三路獨立模型：
-    - 紅偏多：路型整齊，偏向延續目前大路方向。
-    - 藍偏多：路型變化，偏向反邊/斷點方向。
-    offset=1 大眼仔；offset=2 小路；offset=3 蟑螂路。
-    """
+    # 下三路候選模擬 + 路單結構 + 前排欄型判斷版。
+    # 不再用「紅=跟、藍=反」這種簡化邏輯。
     default = {
-        "B": 0.5, "P": 0.5, "label": f"{display_name}資料不足", "strength": 0.0,
-        "road_key": road_key, "stats": {"last": 0, "red_rate": 0.5, "blue_rate": 0.5, "count": 0, "tail": ""},
-        "red_pressure": 0.5, "blue_pressure": 0.5,
+        "B": 0.5,
+        "P": 0.5,
+        "label": f"{display_name}資料不足",
+        "strength": 0.0,
+        "road_key": road_key,
+        "stats": {"last": 0, "red_rate": 0.5, "blue_rate": 0.5, "count": 0, "tail": ""},
+        "red_pressure": 0.5,
+        "blue_pressure": 0.5,
+        "candidate": {},
     }
+
     if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
         return default
 
     layout = _build_big_road(non_tie)
     series = _derived_series(layout, offset=offset)
     stats = _color_stats(series)
-    last_side, streak_n = _streak(non_tie)
-    if not last_side:
-        return default
-    opp = "P" if last_side == "B" else "B"
-
     count = int(stats.get("count", 0))
-    red_rate = float(stats.get("red_rate", 0.5))
-    blue_rate = float(stats.get("blue_rate", 0.5))
-    diff = abs(red_rate - blue_rate)
 
     if count < DERIVED_ROAD_MIN_COUNT:
-        return {**default, "stats": stats, "label": f"{display_name}樣本不足"}
+        return {
+            **default,
+            "stats": stats,
+            "label": f"{display_name}樣本不足",
+        }
 
-    recent = non_tie[-16:]
-    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
-    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
+    b_info = _candidate_derived_color_info(non_tie, "B", offset)
+    p_info = _candidate_derived_color_info(non_tie, "P", offset)
 
-    # 三條路敏感度不同：蟑螂路最短線，小路居中，大眼仔較穩。
-    sensitivity = {1: 0.95, 2: 1.00, 3: 1.10}.get(offset, 1.0)
-    base_edge = 0.024 + min(0.034, diff * 0.080 * sensitivity)
+    b_color_eval = _score_candidate_color_pattern(series, int(b_info.get("new_color", 0)))
+    p_color_eval = _score_candidate_color_pattern(series, int(p_info.get("new_color", 0)))
 
-    if red_rate > blue_rate:
-        side = last_side
-        edge = base_edge + ROAD_ENGINE_RED_CONT_BIAS * sensitivity
-        label = f"{display_name}紅路續勢"
-    elif blue_rate > red_rate:
-        side = opp
-        edge = base_edge + ROAD_ENGINE_BLUE_BREAK_BIAS * sensitivity
-        label = f"{display_name}藍路變化"
+    b_struct_eval = _score_candidate_structure(b_info, series)
+    p_struct_eval = _score_candidate_structure(p_info, series)
+
+    b_column_eval = _score_column_shape(non_tie, "B")
+    p_column_eval = _score_column_shape(non_tie, "P")
+
+    b_score = _combine_candidate_scores(
+        float(b_color_eval.get("score", 0.5)),
+        float(b_struct_eval.get("score", 0.5)),
+        float(b_column_eval.get("score", 0.5)),
+    )
+    p_score = _combine_candidate_scores(
+        float(p_color_eval.get("score", 0.5)),
+        float(p_struct_eval.get("score", 0.5)),
+        float(p_column_eval.get("score", 0.5)),
+    )
+
+    b, p, edge = _candidate_scores_to_side_prob(b_score, p_score, max_edge=DERIVED_CANDIDATE_MAX_EDGE)
+
+    if edge < DERIVED_CANDIDATE_MIN_EDGE:
+        label = f"{display_name}候選接近"
+        strength = 0.06
     else:
-        side = opp if switch_rate >= 0.66 else last_side
-        edge = 0.020
-        label = f"{display_name}紅藍均衡"
+        pick = "莊" if b > p else "閒"
+        label = f"{display_name}路單候選偏{pick}"
+        strength = 0.10 + min(0.15, edge * 2.0)
 
-    # 單跳盤時，下三路若藍偏多，短線反邊訊號加強；長龍時紅路延續加強。
-    if switch_rate >= 0.72 and blue_rate >= 0.56:
-        side = opp
-        edge += 0.010 * sensitivity
-        label = f"{display_name}跳路變化"
-    if streak_n >= 4 and red_rate >= 0.58:
-        side = last_side
-        edge += 0.008 * sensitivity
-        label = f"{display_name}紅路跟龍"
-
-    edge = _clamp(edge, 0.012, 0.078)
-    b = 0.5 + edge if side == "B" else 0.5 - edge
-    p = 1 - b
+    red_rate = float(stats.get("red_rate", 0.5))
+    blue_rate = float(stats.get("blue_rate", 0.5))
 
     return {
-        "B": b,
-        "P": p,
+        "B": round(b, 5),
+        "P": round(p, 5),
         "label": label,
-        "strength": round(0.10 + min(0.10, diff * 0.22) + min(0.04, count * 0.004), 4),
+        "strength": round(strength, 4),
         "road_key": road_key,
         "stats": stats,
         "red_pressure": round(red_rate, 4),
         "blue_pressure": round(blue_rate, 4),
         "tail": stats.get("tail", ""),
+        "candidate": {
+            "B": {
+                "new_color": b_info.get("new_color_text", "N"),
+                "color_score": round(float(b_color_eval.get("score", 0.5)), 5),
+                "structure_score": round(float(b_struct_eval.get("score", 0.5)), 5),
+                "column_score": round(float(b_column_eval.get("score", 0.5)), 5),
+                "score": round(b_score, 5),
+                "color_eval": b_color_eval,
+                "structure_eval": b_struct_eval,
+                "column_eval": b_column_eval,
+                "pos": b_info.get("pos", {}),
+                "structure": b_info.get("structure", {}),
+            },
+            "P": {
+                "new_color": p_info.get("new_color_text", "N"),
+                "color_score": round(float(p_color_eval.get("score", 0.5)), 5),
+                "structure_score": round(float(p_struct_eval.get("score", 0.5)), 5),
+                "column_score": round(float(p_column_eval.get("score", 0.5)), 5),
+                "score": round(p_score, 5),
+                "color_eval": p_color_eval,
+                "structure_eval": p_struct_eval,
+                "column_eval": p_column_eval,
+                "pos": p_info.get("pos", {}),
+                "structure": p_info.get("structure", {}),
+            },
+            "edge": round(edge, 5),
+            "diff": round(b_score - p_score, 5),
+        },
     }
 
 
@@ -2860,6 +3226,231 @@ def clear_walk_forward_state() -> Dict[str, Any]:
 
 
 
+# ============ Ask Road Hit Memory：問路命中率記憶 ============
+def _ask_road_state(training_key: str) -> Dict[str, Any]:
+    key = training_key or "anonymous|ask_road"
+    state = _ASK_ROAD_STATE.get(key)
+    if state is None:
+        state = {"pending": None, "records": []}
+        _ASK_ROAD_STATE[key] = state
+    return state
+
+
+def _update_ask_road_truth(training_key: str, non_tie: List[str]) -> None:
+    # 將上一輪問路票用本輪新增結果結算。
+    # pending 的 non_tie_len=N，代表上一輪在 N 口時預測第 N+1 口。
+    # 本輪 len(non_tie)>N 時，truth=non_tie[N]，完全不偷看未來。
+    if not USE_ASK_ROAD_MEMORY:
+        return
+
+    state = _ask_road_state(training_key)
+    pending = state.get("pending")
+    if not pending:
+        return
+
+    pred_len = int(pending.get("non_tie_len", -1))
+    if pred_len < 0 or len(non_tie) <= pred_len:
+        return
+
+    truth = non_tie[pred_len]
+    if truth not in {"B", "P"}:
+        state["pending"] = None
+        return
+
+    predictions = pending.get("predictions", {}) or {}
+    record = {"truth": truth, "at_len": pred_len, "models": {}}
+    for name, pick in predictions.items():
+        if pick in {"B", "P"}:
+            record["models"][name] = 1 if pick == truth else 0
+
+    if record["models"]:
+        records = state.setdefault("records", [])
+        records.append(record)
+        max_keep = max(20, ASK_ROAD_MEMORY_WINDOW * 4)
+        if len(records) > max_keep:
+            del records[:-max_keep]
+
+    state["pending"] = None
+
+
+def _get_ask_road_performance(training_key: str) -> Dict[str, Any]:
+    # 回傳每條問路最近命中率與動態 factor。
+    default_models = ["big_eye", "small_road", "cockroach", "road_majority", "final"]
+    result: Dict[str, Any] = {
+        "enabled": USE_ASK_ROAD_MEMORY,
+        "window": ASK_ROAD_MEMORY_WINDOW,
+        "models": {
+            name: {
+                "acc": 0.5,
+                "raw_acc": 0.5,
+                "count": 0,
+                "correct": 0,
+                "factor": 1.0,
+            }
+            for name in default_models
+        },
+        "label": "問路記憶尚未啟用" if not USE_ASK_ROAD_MEMORY else "問路記憶暖機中",
+    }
+
+    if not USE_ASK_ROAD_MEMORY:
+        return result
+
+    state = _ask_road_state(training_key)
+    records = state.get("records", [])[-max(1, ASK_ROAD_MEMORY_WINDOW):]
+    alpha = max(0.0001, ASK_ROAD_MEMORY_BAYES_ALPHA)
+
+    model_names = set(default_models)
+    for rec in records:
+        model_names.update((rec.get("models") or {}).keys())
+
+    models: Dict[str, Any] = {}
+    best_name = ""
+    best_acc = 0.5
+
+    for name in sorted(model_names):
+        vals = [
+            int((rec.get("models") or {}).get(name))
+            for rec in records
+            if name in (rec.get("models") or {})
+        ]
+        count = len(vals)
+        correct = sum(vals)
+        raw_acc = correct / count if count else 0.5
+        acc = (correct + alpha) / (count + 2 * alpha) if count else 0.5
+
+        factor = 1.0
+        if count >= ASK_ROAD_MEMORY_MIN_COUNT:
+            factor = 1.0 + (acc - 0.5) * 2.0 * ASK_ROAD_MEMORY_ALPHA
+            if acc <= ASK_ROAD_MEMORY_DISABLE_BELOW:
+                factor = min(factor, 0.90)
+            elif acc >= ASK_ROAD_MEMORY_BOOST_ABOVE:
+                factor = max(factor, 1.05)
+            factor = _clamp(factor, ASK_ROAD_MEMORY_MIN_FACTOR, ASK_ROAD_MEMORY_MAX_FACTOR)
+
+        models[name] = {
+            "acc": round(acc, 4),
+            "raw_acc": round(raw_acc, 4),
+            "count": count,
+            "correct": correct,
+            "factor": round(factor, 4),
+        }
+
+        if count >= ASK_ROAD_MEMORY_MIN_COUNT and acc > best_acc:
+            best_acc = acc
+            best_name = name
+
+    result["models"] = models
+    if best_name:
+        result["label"] = f"問路記憶:{best_name}較準 {int(best_acc * 100)}%"
+    else:
+        result["label"] = f"問路記憶暖機中 樣本{len(records)}"
+
+    return result
+
+
+def _ask_road_factor(performance: Optional[Dict[str, Any]], road_key: str, default: float = 1.0) -> float:
+    try:
+        if not (USE_ASK_ROAD_MEMORY and performance):
+            return default
+        return float((performance.get("models") or {}).get(road_key, {}).get("factor", default))
+    except Exception:
+        return default
+
+
+def _apply_ask_road_factor_to_score(score: Dict[str, Any], road_key: str, performance: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # 用問路近期命中率微調 HYBRID 下三路 B/P 邊際。
+    # factor>1：放大這條路的邊際；factor<1：縮小這條路的邊際。
+    if not (USE_ASK_ROAD_MEMORY and ASK_ROAD_MEMORY_APPLY_TO_HYBRID and performance and isinstance(score, dict)):
+        return score
+
+    factor = _ask_road_factor(performance, road_key, 1.0)
+    if abs(factor - 1.0) < 0.0001:
+        return score
+
+    try:
+        b = float(score.get("B", 0.5))
+        p = float(score.get("P", 0.5))
+        side_total = max(0.0001, b + p)
+        b_side = b / side_total
+        edge = b_side - 0.5
+        new_b_side = _clamp(0.5 + edge * factor, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+        new_score = dict(score)
+        new_score["B"] = round(new_b_side, 5)
+        new_score["P"] = round(1.0 - new_b_side, 5)
+        new_score["ask_road_memory_factor"] = round(factor, 4)
+        new_score["ask_road_memory"] = (performance.get("models") or {}).get(road_key, {})
+        old_label = str(new_score.get("label", ""))
+        new_score["label"] = f"{old_label}|問路記憶x{factor:.2f}" if old_label else f"問路記憶x{factor:.2f}"
+        return new_score
+    except Exception:
+        return score
+
+
+def _apply_ask_road_factor_to_vote(vote: Dict[str, Any], road_key: str, performance: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    # 用問路近期命中率微調 FUHAO 下三路票。
+    # 若某條路近期明顯失準，且設定允許，會暫時清掉該票，避免壞路拖累多數決。
+    if not (USE_ASK_ROAD_MEMORY and ASK_ROAD_MEMORY_APPLY_TO_FUHAO and performance and isinstance(vote, dict)):
+        return vote
+
+    models = performance.get("models") or {}
+    stat = models.get(road_key, {})
+    if not stat:
+        return vote
+
+    factor = float(stat.get("factor", 1.0))
+    count = int(stat.get("count", 0))
+    acc = float(stat.get("acc", 0.5))
+
+    new_vote = dict(vote)
+    old_conf = float(new_vote.get("confidence", 0.0) or 0.0)
+    new_vote["confidence"] = round(_clamp(old_conf * factor, 0.0, 0.88), 4)
+    new_vote["ask_road_memory_factor"] = round(factor, 4)
+    new_vote["ask_road_memory"] = stat
+
+    if (
+        ASK_ROAD_MEMORY_DROP_BAD_VOTE
+        and count >= ASK_ROAD_MEMORY_MIN_COUNT
+        and acc <= ASK_ROAD_MEMORY_BAD_VOTE_ACC
+        and new_vote.get("pick") in {"B", "P"}
+    ):
+        old_pick = new_vote.get("pick", "")
+        new_vote["pick"] = ""
+        new_vote["label"] = f"{new_vote.get('label', '')}|問路記憶暫停{_fuhao_side_name(old_pick)}票 acc{acc:.2f}"
+    else:
+        new_vote["label"] = f"{new_vote.get('label', '')}|問路記憶x{factor:.2f}"
+
+    return new_vote
+
+
+def _store_ask_road_pending(training_key: str, non_tie: List[str], predictions: Dict[str, str]) -> None:
+    if not (USE_ASK_ROAD_MEMORY and predictions):
+        return
+
+    clean = {str(k): v for k, v in predictions.items() if v in {"B", "P"}}
+    if not clean:
+        return
+
+    state = _ask_road_state(training_key)
+    state["pending"] = {
+        "non_tie_len": len(non_tie),
+        "predictions": clean,
+    }
+
+
+def get_ask_road_state_info() -> Dict[str, Any]:
+    return {
+        "enabled": USE_ASK_ROAD_MEMORY,
+        "size": len(_ASK_ROAD_STATE),
+        "keys": list(_ASK_ROAD_STATE.keys())[-30:],
+    }
+
+
+def clear_ask_road_state() -> Dict[str, Any]:
+    removed = len(_ASK_ROAD_STATE)
+    _ASK_ROAD_STATE.clear()
+    return {"ok": True, "removed": removed}
+
+
 # ============ Pattern Replay Memory：全靴逐局前推相似規律回放 ============
 def _parse_int_list(raw: str, default: List[int]) -> List[int]:
     try:
@@ -3250,34 +3841,97 @@ def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
 
 
 def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
+    # 富濠式下三路候選模擬 + 路單結構 + 前排欄型判斷版。
     if len(non_tie) < FUHAO_MIN_VALID_ROUNDS:
-        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "stats": {}}
+        return {
+            "pick": "",
+            "label": f"{name}資料不足",
+            "confidence": 0.0,
+            "stats": {},
+            "candidate": {},
+        }
 
     layout = _build_big_road(non_tie)
     series = _derived_series(layout, offset=offset)
     stats = _color_stats(series)
     count = int(stats.get("count", 0))
-    last_side, _ = _streak(non_tie)
-    if not last_side or count <= 0:
-        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "stats": stats}
 
-    opp = "P" if last_side == "B" else "B"
-    red_rate = float(stats.get("red_rate", 0.5))
-    blue_rate = float(stats.get("blue_rate", 0.5))
+    if count < DERIVED_ROAD_MIN_COUNT:
+        return {
+            "pick": "",
+            "label": f"{name}樣本不足",
+            "confidence": 0.0,
+            "stats": stats,
+            "candidate": {},
+        }
 
-    # 紅：規律整齊，偏延續；藍：變化加重，偏反邊。
-    if red_rate > blue_rate:
-        pick = last_side
-        label = f"{name}紅路續勢"
-    elif blue_rate > red_rate:
-        pick = opp
-        label = f"{name}藍路變化"
+    b_info = _candidate_derived_color_info(non_tie, "B", offset)
+    p_info = _candidate_derived_color_info(non_tie, "P", offset)
+
+    b_color_eval = _score_candidate_color_pattern(series, int(b_info.get("new_color", 0)))
+    p_color_eval = _score_candidate_color_pattern(series, int(p_info.get("new_color", 0)))
+
+    b_struct_eval = _score_candidate_structure(b_info, series)
+    p_struct_eval = _score_candidate_structure(p_info, series)
+
+    b_column_eval = _score_column_shape(non_tie, "B")
+    p_column_eval = _score_column_shape(non_tie, "P")
+
+    b_score = _combine_candidate_scores(
+        float(b_color_eval.get("score", 0.5)),
+        float(b_struct_eval.get("score", 0.5)),
+        float(b_column_eval.get("score", 0.5)),
+    )
+    p_score = _combine_candidate_scores(
+        float(p_color_eval.get("score", 0.5)),
+        float(p_struct_eval.get("score", 0.5)),
+        float(p_column_eval.get("score", 0.5)),
+    )
+
+    diff = b_score - p_score
+
+    if abs(diff) < FUHAO_DOWN3_MIN_DIFF:
+        pick = ""
+        label = f"{name}候選差距不足"
+        confidence = 0.42
     else:
-        pick = "B" if FUHAO_DOWN3_TIE_BIAS == "BANKER" else "P"
-        label = f"{name}紅藍平手偏{_fuhao_side_name(pick)}"
+        pick = "B" if diff > 0 else "P"
+        label = f"{name}路單候選偏{_fuhao_side_name(pick)}"
+        confidence = min(0.80, 0.50 + abs(diff) * 1.35 + min(0.08, count * 0.006))
 
-    confidence = 0.50 + min(0.20, abs(red_rate - blue_rate) * 0.40) + min(0.08, count * 0.006)
-    return {"pick": pick, "label": label, "confidence": round(confidence, 4), "stats": stats}
+    return {
+        "pick": pick,
+        "label": label,
+        "confidence": round(confidence, 4),
+        "stats": stats,
+        "candidate": {
+            "B": {
+                "new_color": b_info.get("new_color_text", "N"),
+                "color_score": round(float(b_color_eval.get("score", 0.5)), 5),
+                "structure_score": round(float(b_struct_eval.get("score", 0.5)), 5),
+                "column_score": round(float(b_column_eval.get("score", 0.5)), 5),
+                "score": round(b_score, 5),
+                "color_eval": b_color_eval,
+                "structure_eval": b_struct_eval,
+                "column_eval": b_column_eval,
+                "pos": b_info.get("pos", {}),
+                "structure": b_info.get("structure", {}),
+            },
+            "P": {
+                "new_color": p_info.get("new_color_text", "N"),
+                "color_score": round(float(p_color_eval.get("score", 0.5)), 5),
+                "structure_score": round(float(p_struct_eval.get("score", 0.5)), 5),
+                "column_score": round(float(p_column_eval.get("score", 0.5)), 5),
+                "score": round(p_score, 5),
+                "color_eval": p_color_eval,
+                "structure_eval": p_struct_eval,
+                "column_eval": p_column_eval,
+                "pos": p_info.get("pos", {}),
+                "structure": p_info.get("structure", {}),
+            },
+            "diff": round(diff, 5),
+        },
+    }
 
 
 def _fuhao_deep_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
@@ -3817,6 +4471,9 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
 
     tie_count = history.count("T") if FUHAO_KEEP_TIE_COUNT else 0
     valid_len = len(non_tie)
+    training_key = f"{user_id or 'anonymous'}|FUHAO_CLONE|{venue}|{room}|{shoe_id}"
+    _update_ask_road_truth(training_key, non_tie)
+    ask_road_performance = _get_ask_road_performance(training_key)
     recommend_text_map = {"B": "莊", "P": "閒", "T": "和", "NONE": "觀望"}
 
     # 冷啟動：有效 B/P 太少時只回基準，避免亂給方向。
@@ -3852,7 +4509,10 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "ml_trained": False,
             "ml_samples": 0,
             "tf_available": TF_AVAILABLE,
-            "training_key": f"{user_id or 'anonymous'}|FUHAO_CLONE",
+            "training_key": training_key,
+            "ask_road_memory": ask_road_performance,
+            "ask_road_memory_label": ask_road_performance.get("label", ""),
+            "ask_road_memory_enabled": USE_ASK_ROAD_MEMORY,
             "model_cache_size": len(_MODEL_CACHE),
             "ml_predictions": None,
             "ai_result": None,
@@ -3871,18 +4531,21 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
 
     if FUHAO_USE_BIG_EYE:
         road_models["big_eye"] = _fuhao_down3_vote(non_tie, 1, "大眼仔")
+        road_models["big_eye"] = _apply_ask_road_factor_to_vote(road_models["big_eye"], "big_eye", ask_road_performance)
         road_votes.append(road_models["big_eye"].get("pick", ""))
     else:
         road_models["big_eye"] = {"pick": "", "label": "大眼仔關閉", "confidence": 0.0}
 
     if FUHAO_USE_SMALL_ROAD:
         road_models["small_road"] = _fuhao_down3_vote(non_tie, 2, "小路")
+        road_models["small_road"] = _apply_ask_road_factor_to_vote(road_models["small_road"], "small_road", ask_road_performance)
         road_votes.append(road_models["small_road"].get("pick", ""))
     else:
         road_models["small_road"] = {"pick": "", "label": "小路關閉", "confidence": 0.0}
 
     if FUHAO_USE_COCKROACH:
         road_models["cockroach"] = _fuhao_down3_vote(non_tie, 3, "蟑螂路")
+        road_models["cockroach"] = _apply_ask_road_factor_to_vote(road_models["cockroach"], "cockroach", ask_road_performance)
         road_votes.append(road_models["cockroach"].get("pick", ""))
     else:
         road_models["cockroach"] = {"pick": "", "label": "蟑螂路關閉", "confidence": 0.0}
@@ -4160,6 +4823,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     reason_parts = [
         road_consensus_label,
         advanced_label,
+        f"問路記憶:{ask_road_performance.get('label', '')}",
         road_models.get("big_road", {}).get("label", ""),
         road_models.get("big_eye", {}).get("label", ""),
         road_models.get("small_road", {}).get("label", ""),
@@ -4193,7 +4857,17 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
 
     # 舊欄位相容：前端或 app.py 若讀舊 key 不會爆。
     empty_state = {"enabled": False, "state": "FUHAO_CLONE", "label": "富濠式模型不使用此層", "confidence": 0.0}
-    training_key = f"{user_id or 'anonymous'}|FUHAO_CLONE|{venue}|{room}|{shoe_id}"
+    # training_key 已於函數前段建立，供 Ask Road Memory 使用。
+
+    ask_road_pending = {
+        "big_road": road_models.get("big_road", {}).get("pick", ""),
+        "big_eye": road_models.get("big_eye", {}).get("pick", ""),
+        "small_road": road_models.get("small_road", {}).get("pick", ""),
+        "cockroach": road_models.get("cockroach", {}).get("pick", ""),
+        "road_majority": road_majority.get("pick", ""),
+        "final": recommend if recommend in {"B", "P"} else "",
+    }
+    _store_ask_road_pending(training_key, non_tie, ask_road_pending)
 
     result = {
         "ok": True,
@@ -4283,6 +4957,9 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "cockroach": road_models.get("cockroach", {}).get("stats", {}),
         },
         "dynamic_weights": dynamic_weights,
+        "ask_road_memory": ask_road_performance,
+        "ask_road_memory_label": ask_road_performance.get("label", ""),
+        "ask_road_memory_enabled": USE_ASK_ROAD_MEMORY,
         "online_model_performance": {},
         "reason": " / ".join([x for x in reason_parts if x]),
         "ai_used": ai_used,
@@ -4338,6 +5015,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
                 "fake_pattern_neutralize_on_observe": FUHAO_FAKE_PATTERN_NEUTRALIZE_ON_OBSERVE,
                 "fake_pattern_allow_reverse": FUHAO_FAKE_PATTERN_ALLOW_REVERSE,
                 "fake_pattern_reverse_score": FUHAO_FAKE_PATTERN_REVERSE_SCORE,
+                "use_ask_road_memory": USE_ASK_ROAD_MEMORY,
+                "ask_road_memory_window": ASK_ROAD_MEMORY_WINDOW,
                 "fake_pattern_observe_score": FUHAO_FAKE_PATTERN_OBSERVE_SCORE,
                 "fake_pattern_hard_observe_score": FUHAO_FAKE_PATTERN_HARD_OBSERVE_SCORE,
                 "fake_pattern_turn_score": FUHAO_FAKE_PATTERN_TURN_SCORE,
@@ -4383,7 +5062,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     identity = str(user_id or "anonymous")
     training_key = f"{identity}|{venue or 'global'}|{room or 'global'}|{shoe_id or 'global'}"
     _update_walk_forward_truth(training_key, non_tie)
+    _update_ask_road_truth(training_key, non_tie)
     live_walk_forward_performance = _get_walk_forward_performance(training_key)
+    ask_road_performance = _get_ask_road_performance(training_key)
 
     # ============ 1. 基礎模型 + 四路主模型 ==========
     markov = _transition_prob(non_tie)
@@ -4394,6 +5075,22 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     ngram = _ngram_score(non_tie)
 
     road_family = _road_family_scores(non_tie)
+
+    # Ask Road Hit Memory：依本靴最近問路命中率，微調大眼仔 / 小路 / 蟑螂路邊際。
+    if USE_ASK_ROAD_MEMORY and ASK_ROAD_MEMORY_APPLY_TO_HYBRID:
+        for _rk in ["big_eye", "small_road", "cockroach"]:
+            if _rk in road_family:
+                road_family[_rk] = _apply_ask_road_factor_to_score(road_family[_rk], _rk, ask_road_performance)
+        try:
+            road_family["consensus"] = _road_consensus_score({
+                "big_road": road_family.get("big_road", {}),
+                "big_eye": road_family.get("big_eye", {}),
+                "small_road": road_family.get("small_road", {}),
+                "cockroach": road_family.get("cockroach", {}),
+            })
+        except Exception:
+            pass
+
     big_road = road_family.get("big_road", {"B": 0.5, "P": 0.5, "label": "大路資料不足"})
     big_eye = road_family.get("big_eye", {"B": 0.5, "P": 0.5, "label": "大眼仔資料不足"})
     small_road = road_family.get("small_road", {"B": 0.5, "P": 0.5, "label": "小路資料不足"})
@@ -4656,6 +5353,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     # ============ 7. 原因說明 ==========
     reason_parts = [
         f"四路:{road_consensus.get('label', '')}",
+        f"問路記憶:{ask_road_performance.get('label', '')}",
         f"生命周期:{lifecycle.get('label', '')}",
         f"記憶:{road_memory.get('label', '')}",
         f"歷史回放:{pattern_replay.get('label', '')}",
@@ -4690,6 +5388,15 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     if recommend in {"B", "P"}:
         current_model_picks["final"] = recommend
     _store_walk_forward_pending(training_key, non_tie, current_model_picks)
+
+    ask_road_pending = {
+        "big_eye": _pick_from_score(big_eye, min_edge=0.002),
+        "small_road": _pick_from_score(small_road, min_edge=0.002),
+        "cockroach": _pick_from_score(cockroach, min_edge=0.002),
+        "road_majority": road_consensus.get("pick", ""),
+        "final": recommend if recommend in {"B", "P"} else "",
+    }
+    _store_ask_road_pending(training_key, non_tie, ask_road_pending)
 
     # ============ 9. 返回結果 ==========
     return {
@@ -4768,6 +5475,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "dynamic_weights": {k: round(v, 4) for k, v in dynamic_weights.items()},
         "online_model_performance": online_performance,
         "live_walk_forward_performance": live_walk_forward_performance,
+        "ask_road_memory": ask_road_performance,
+        "ask_road_memory_label": ask_road_performance.get("label", ""),
+        "ask_road_memory_enabled": USE_ASK_ROAD_MEMORY,
         "walk_forward_enabled": USE_WALK_FORWARD_LEARNING,
         "walk_forward_state_size": len(_WALK_FORWARD_STATE),
         "reason": " / ".join([x for x in reason_parts if x]),
