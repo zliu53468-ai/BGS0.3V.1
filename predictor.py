@@ -82,7 +82,7 @@ BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.015"))
 RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.040"))
 NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.060"))
 
-# 四路主模型權重：大路 / 大眼仔 / 小路 / 蟑螂路
+# 四路明細權重（實際融合會把三條下路合併成一個家族權重）
 BIG_ROAD_WEIGHT = float(os.getenv("BIG_ROAD_WEIGHT", "0.30"))
 BIG_EYE_WEIGHT = float(os.getenv("BIG_EYE_WEIGHT", "0.16"))
 SMALL_ROAD_WEIGHT = float(os.getenv("SMALL_ROAD_WEIGHT", "0.13"))
@@ -168,11 +168,11 @@ DERIVED_COLOR_JUMP_RATE = float(os.getenv("DERIVED_COLOR_JUMP_RATE", "0.68"))
 DERIVED_COLOR_STREAK_MIN = int(os.getenv("DERIVED_COLOR_STREAK_MIN", "3"))
 DERIVED_COLOR_RATIO_GAP = float(os.getenv("DERIVED_COLOR_RATIO_GAP", "0.22"))
 DERIVED_COLOR_NGRAM_MAX = int(os.getenv("DERIVED_COLOR_NGRAM_MAX", "5"))
-FUHAO_DOWN3_MIN_DIFF = float(os.getenv("FUHAO_DOWN3_MIN_DIFF", "0.020"))
+FUHAO_DOWN3_MIN_DIFF = float(os.getenv("FUHAO_DOWN3_MIN_DIFF", "0.030"))
 
 # Down-Road Structure：下三路齊整 / 有無 / 直落結構分
-DERIVED_COLOR_SCORE_WEIGHT = float(os.getenv("DERIVED_COLOR_SCORE_WEIGHT", "0.55"))
-DERIVED_STRUCTURE_SCORE_WEIGHT = float(os.getenv("DERIVED_STRUCTURE_SCORE_WEIGHT", "0.45"))
+DERIVED_COLOR_SCORE_WEIGHT = float(os.getenv("DERIVED_COLOR_SCORE_WEIGHT", "0.78"))
+DERIVED_STRUCTURE_SCORE_WEIGHT = float(os.getenv("DERIVED_STRUCTURE_SCORE_WEIGHT", "0.22"))
 DERIVED_STRUCTURE_NEAT_BONUS = float(os.getenv("DERIVED_STRUCTURE_NEAT_BONUS", "0.055"))
 DERIVED_STRUCTURE_MISMATCH_PENALTY = float(os.getenv("DERIVED_STRUCTURE_MISMATCH_PENALTY", "0.045"))
 DERIVED_STRUCTURE_DROP_BONUS = float(os.getenv("DERIVED_STRUCTURE_DROP_BONUS", "0.035"))
@@ -184,7 +184,7 @@ DERIVED_STRUCTURE_MAX_EDGE = float(os.getenv("DERIVED_STRUCTURE_MAX_EDGE", "0.09
 # 目的：讓每一靴依照最近實際命中率，微調大眼仔 / 小路 / 蟑螂路的可信度。
 USE_ASK_ROAD_MEMORY = os.getenv("USE_ASK_ROAD_MEMORY", "1") == "1"
 ASK_ROAD_MEMORY_WINDOW = int(os.getenv("ASK_ROAD_MEMORY_WINDOW", "24"))
-ASK_ROAD_MEMORY_MIN_COUNT = int(os.getenv("ASK_ROAD_MEMORY_MIN_COUNT", "4"))
+ASK_ROAD_MEMORY_MIN_COUNT = max(8, int(os.getenv("ASK_ROAD_MEMORY_MIN_COUNT", "10")))
 ASK_ROAD_MEMORY_ALPHA = float(os.getenv("ASK_ROAD_MEMORY_ALPHA", "0.35"))
 ASK_ROAD_MEMORY_BAYES_ALPHA = float(os.getenv("ASK_ROAD_MEMORY_BAYES_ALPHA", "2.0"))
 ASK_ROAD_MEMORY_MIN_FACTOR = float(os.getenv("ASK_ROAD_MEMORY_MIN_FACTOR", "0.72"))
@@ -206,6 +206,41 @@ DERIVED_COLUMN_NEAT_BONUS = float(os.getenv("DERIVED_COLUMN_NEAT_BONUS", "0.040"
 DERIVED_COLUMN_BREAK_PENALTY = float(os.getenv("DERIVED_COLUMN_BREAK_PENALTY", "0.035"))
 DERIVED_COLUMN_DRAG_PENALTY = float(os.getenv("DERIVED_COLUMN_DRAG_PENALTY", "0.020"))
 DERIVED_COLUMN_MAX_EDGE = float(os.getenv("DERIVED_COLUMN_MAX_EDGE", "0.070"))
+
+# Down-Three Family：大眼仔 / 小路 / 蟑螂路先在家族內整合，對外最多只算一票。
+# 避免三條同源衍生路被當成三個獨立模型，造成假共識與重複加權。
+USE_DOWN3_FAMILY = os.getenv("USE_DOWN3_FAMILY", "1") == "1"
+DOWN3_FAMILY_MIN_VALID_ROADS = int(os.getenv("DOWN3_FAMILY_MIN_VALID_ROADS", "2"))
+DOWN3_FAMILY_MIN_AGREE = int(os.getenv("DOWN3_FAMILY_MIN_AGREE", "2"))
+DOWN3_FAMILY_ROAD_MIN_GAP = float(os.getenv("DOWN3_FAMILY_ROAD_MIN_GAP", "0.010"))
+DOWN3_FAMILY_MIN_GAP = max(0.030, float(os.getenv("DOWN3_FAMILY_MIN_GAP", "0.030")))
+DOWN3_FAMILY_STRONG_GAP = float(os.getenv("DOWN3_FAMILY_STRONG_GAP", "0.055"))
+DOWN3_FAMILY_MAX_GAP = float(os.getenv("DOWN3_FAMILY_MAX_GAP", "0.100"))
+DOWN3_FAMILY_MAX_WEIGHT = float(os.getenv("DOWN3_FAMILY_MAX_WEIGHT", "0.24"))
+DOWN3_FAMILY_COLUMN_SCALE = float(os.getenv("DOWN3_FAMILY_COLUMN_SCALE", "0.10"))
+DOWN3_FAMILY_DISAGREE_SHRINK = float(os.getenv("DOWN3_FAMILY_DISAGREE_SHRINK", "0.62"))
+DOWN3_FAMILY_DENSE_SHRINK = float(os.getenv("DOWN3_FAMILY_DENSE_SHRINK", "0.72"))
+DOWN3_FAMILY_BIG_EYE_FACTOR = float(os.getenv("DOWN3_FAMILY_BIG_EYE_FACTOR", "1.00"))
+DOWN3_FAMILY_SMALL_ROAD_FACTOR = float(os.getenv("DOWN3_FAMILY_SMALL_ROAD_FACTOR", "0.85"))
+DOWN3_FAMILY_COCKROACH_FACTOR = float(os.getenv("DOWN3_FAMILY_COCKROACH_FACTOR", "0.70"))
+
+# Dense Board Guard：短欄密集、欄高變化大時，下三路與大路衝突會提高最終確認門檻。
+USE_DENSE_BOARD_GUARD = os.getenv("USE_DENSE_BOARD_GUARD", "1") == "1"
+DENSE_BOARD_MIN_HISTORY = int(os.getenv("DENSE_BOARD_MIN_HISTORY", "12"))
+DENSE_BOARD_MIN_COLUMNS = int(os.getenv("DENSE_BOARD_MIN_COLUMNS", "6"))
+DENSE_BOARD_MAX_AVG_HEIGHT = float(os.getenv("DENSE_BOARD_MAX_AVG_HEIGHT", "3.20"))
+DENSE_BOARD_SHORT_COLUMN_RATIO = float(os.getenv("DENSE_BOARD_SHORT_COLUMN_RATIO", "0.65"))
+DENSE_BOARD_HEIGHT_CHANGE_RATE = float(os.getenv("DENSE_BOARD_HEIGHT_CHANGE_RATE", "0.45"))
+DENSE_BOARD_SWITCH_LOW = float(os.getenv("DENSE_BOARD_SWITCH_LOW", "0.30"))
+DENSE_BOARD_SWITCH_HIGH = float(os.getenv("DENSE_BOARD_SWITCH_HIGH", "0.80"))
+ASK_ROAD_MEMORY_NO_BOOST_DENSE = os.getenv("ASK_ROAD_MEMORY_NO_BOOST_DENSE", "1") == "1"
+
+# Final Confirmation Gate：下三路家族只提供候選，至少需要一個獨立來源確認。
+FINAL_CONFIRM_MIN_SOURCES = int(os.getenv("FINAL_CONFIRM_MIN_SOURCES", "1"))
+FINAL_CONFIRM_SCORE_GAP = float(os.getenv("FINAL_CONFIRM_SCORE_GAP", "0.018"))
+FINAL_CONFIRM_PATTERN_CONF = float(os.getenv("FINAL_CONFIRM_PATTERN_CONF", "0.40"))
+FINAL_CONFIRM_PATTERN_EDGE = float(os.getenv("FINAL_CONFIRM_PATTERN_EDGE", "0.025"))
+DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM = os.getenv("DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM", "1") == "1"
 ROAD_CONSENSUS_BOOST = float(os.getenv("ROAD_CONSENSUS_BOOST", "0.020"))
 ROAD_CONFLICT_SHRINK = float(os.getenv("ROAD_CONFLICT_SHRINK", "0.055"))
 
@@ -1203,30 +1238,48 @@ def _score_candidate_color_pattern(series: List[int], candidate_color: int, look
 
 
 def _score_candidate_structure(info: Dict[str, Any], series: List[int]) -> Dict[str, Any]:
+    """只評估「候選落點移動風險」，不重複把紅藍的齊整/不齊再算一次。
+
+    下三路紅藍本身已由欄高、有無與齊整關係推導；舊版再次對 is_neat
+    加減分，等於同一特徵重複計分。這裡只保留較獨立的落點型態：
+    直落 / 新欄 / 黏邊橫拖，且幅度刻意限制在小範圍。
+    """
     structure = info.get("structure", {}) or {}
     move_type = structure.get("move_type", "NONE")
-    is_neat = bool(structure.get("is_neat", False))
     new_color = int(info.get("new_color", 0) or 0)
-    edge, reasons = 0.0, []
-    if is_neat:
-        edge += DERIVED_STRUCTURE_NEAT_BONUS; reasons.append("齊整")
-    else:
-        edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY; reasons.append("不齊")
-    if move_type == "VERTICAL_DROP":
-        edge += DERIVED_STRUCTURE_DROP_BONUS; reasons.append("直落")
-    elif move_type == "SIDE_DRAG":
-        edge -= DERIVED_STRUCTURE_SIDE_DRAG_PENALTY; reasons.append("黏邊橫拖")
-    elif move_type == "NEW_COLUMN":
-        edge += DERIVED_STRUCTURE_NEWCOL_BONUS; reasons.append("新欄")
-    if new_color in {1, -1}:
-        if is_neat and new_color == -1:
-            edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY * 0.55; reasons.append("齊整卻出藍")
-        elif (not is_neat) and new_color == 1:
-            edge -= DERIVED_STRUCTURE_MISMATCH_PENALTY * 0.35; reasons.append("不齊卻出紅")
-    edge = _clamp(edge, -DERIVED_STRUCTURE_MAX_EDGE, DERIVED_STRUCTURE_MAX_EDGE)
-    return {"score": round(0.5 + edge, 5), "edge": round(edge, 5), "label": "+".join(reasons),
-            "move_type": move_type, "is_neat": is_neat, "relation": structure.get("relation", ""), "structure": structure}
 
+    edge = 0.0
+    reasons: List[str] = []
+
+    # 不再使用 DERIVED_STRUCTURE_NEAT_BONUS / MISMATCH_PENALTY，避免與紅藍重複。
+    if move_type == "VERTICAL_DROP":
+        edge += min(0.015, max(0.0, DERIVED_STRUCTURE_DROP_BONUS))
+        reasons.append("直落移動")
+    elif move_type == "NEW_COLUMN":
+        edge += min(0.010, max(0.0, DERIVED_STRUCTURE_NEWCOL_BONUS))
+        reasons.append("新欄移動")
+    elif move_type == "SIDE_DRAG":
+        edge -= min(0.018, max(0.0, DERIVED_STRUCTURE_SIDE_DRAG_PENALTY))
+        reasons.append("黏邊橫拖")
+    else:
+        reasons.append("移動中性")
+
+    # 沒有產生新下路顏色時，結構訊號只保留一半，避免空資料被硬加分。
+    if new_color not in {1, -1}:
+        edge *= 0.5
+        reasons.append("無新色降權")
+
+    edge = _clamp(edge, -0.025, 0.025)
+    return {
+        "score": round(0.5 + edge, 5),
+        "edge": round(edge, 5),
+        "label": "+".join(reasons),
+        "move_type": move_type,
+        "is_neat": bool(structure.get("is_neat", False)),
+        "relation": structure.get("relation", ""),
+        "structure": structure,
+        "deduplicated": True,
+    }
 
 def _score_column_shape(non_tie: List[str], candidate: str) -> Dict[str, Any]:
     # 前排大路欄型分：
@@ -1321,22 +1374,311 @@ def _score_column_shape(non_tie: List[str], candidate: str) -> Dict[str, Any]:
 
 
 def _combine_candidate_scores(color_score: float, structure_score: float, column_score: Optional[float] = None) -> float:
-    # 合併候選分數：
-    # color_score=紅藍節奏分；structure_score=齊整 / 有無 / 直落結構分；column_score=前排大路欄型分。
-    cw_raw = DERIVED_COLOR_SCORE_WEIGHT
-    sw_raw = DERIVED_STRUCTURE_SCORE_WEIGHT
-    col_raw = DERIVED_COLUMN_SHAPE_WEIGHT if (USE_DERIVED_COLUMN_SHAPE and column_score is not None) else 0.0
+    """合併單一衍生路候選分數。
 
-    total_w = max(0.0001, cw_raw + sw_raw + col_raw)
-    cw = cw_raw / total_w
-    sw = sw_raw / total_w
-    colw = col_raw / total_w
+    單一路只合併紅藍節奏與小幅移動風險；欄型分不在此函數重複加入。
+    欄型分只會在 _down3_family_score() 對整個下三路家族加入一次。
+    即使 Render 還留著舊的 0.55/0.45，這裡仍限制結構權重最多 28%。
+    """
+    color_w = max(0.72, float(DERIVED_COLOR_SCORE_WEIGHT))
+    struct_w = min(0.28, max(0.0, float(DERIVED_STRUCTURE_SCORE_WEIGHT)))
+    total = max(0.0001, color_w + struct_w)
+    result = float(color_score) * (color_w / total) + float(structure_score) * (struct_w / total)
 
-    result = float(color_score) * cw + float(structure_score) * sw
-    if column_score is not None and colw > 0:
-        result += float(column_score) * colw
-    return result
+    # 相容舊呼叫，但欄型最多只給極小權重；新版正常流程不會在單一路傳入。
+    if column_score is not None:
+        col_w = min(0.08, max(0.0, float(DERIVED_COLUMN_SHAPE_WEIGHT)))
+        result = result * (1.0 - col_w) + float(column_score) * col_w
+    return float(result)
 
+
+def _detect_dense_board(non_tie: List[str]) -> Dict[str, Any]:
+    """偵測短欄密集且欄高變化大的盤面。
+
+    這不是預測方向，只用來降低高度相關的下三路訊號，並在與大路衝突時
+    提高最後確認門檻。
+    """
+    default = {
+        "enabled": USE_DENSE_BOARD_GUARD,
+        "is_dense": False,
+        "score": 0.0,
+        "label": "密集盤資料不足",
+        "columns": 0,
+        "avg_height": 0.0,
+        "short_ratio": 0.0,
+        "height_change_rate": 0.0,
+        "switch_rate": 0.5,
+        "tail_heights": [],
+    }
+    if not USE_DENSE_BOARD_GUARD or len(non_tie) < DENSE_BOARD_MIN_HISTORY:
+        return default
+
+    layout = _build_big_road(non_tie)
+    heights_map = layout.get("col_heights", {}) or {}
+    ordered_cols = sorted(int(c) for c in heights_map.keys())
+    heights = [int(heights_map.get(c, 0)) for c in ordered_cols if int(heights_map.get(c, 0)) > 0]
+    tail = heights[-10:]
+    if len(tail) < DENSE_BOARD_MIN_COLUMNS:
+        return {**default, "columns": len(tail), "tail_heights": tail, "label": "密集盤欄數不足"}
+
+    avg_h = sum(tail) / len(tail)
+    short_ratio = sum(1 for h in tail if h <= 3) / len(tail)
+    height_changes = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
+    height_change_rate = _safe_div(height_changes, max(1, len(tail) - 1), 0.0)
+    recent = non_tie[-16:]
+    switch_rate = _safe_div(sum(1 for a, b in zip(recent, recent[1:]) if a != b), max(1, len(recent) - 1), 0.5)
+
+    avg_component = _clamp((DENSE_BOARD_MAX_AVG_HEIGHT - avg_h + 1.0) / max(1.0, DENSE_BOARD_MAX_AVG_HEIGHT), 0.0, 1.0)
+    short_component = _clamp(short_ratio, 0.0, 1.0)
+    change_component = _clamp(height_change_rate, 0.0, 1.0)
+    switch_component = 1.0 if DENSE_BOARD_SWITCH_LOW <= switch_rate <= DENSE_BOARD_SWITCH_HIGH else 0.35
+    score = _clamp(avg_component * 0.25 + short_component * 0.30 + change_component * 0.30 + switch_component * 0.15, 0.0, 1.0)
+
+    is_dense = bool(
+        len(tail) >= DENSE_BOARD_MIN_COLUMNS
+        and avg_h <= DENSE_BOARD_MAX_AVG_HEIGHT
+        and short_ratio >= DENSE_BOARD_SHORT_COLUMN_RATIO
+        and height_change_rate >= DENSE_BOARD_HEIGHT_CHANGE_RATE
+        and DENSE_BOARD_SWITCH_LOW <= switch_rate <= DENSE_BOARD_SWITCH_HIGH
+    )
+    label = (
+        f"密集盤保護:欄{len(tail)} 均高{avg_h:.2f} 短欄{short_ratio:.0%} 變高{height_change_rate:.0%}"
+        if is_dense else
+        f"非密集盤:均高{avg_h:.2f} 短欄{short_ratio:.0%} 變高{height_change_rate:.0%}"
+    )
+    return {
+        "enabled": True,
+        "is_dense": is_dense,
+        "score": round(score, 4),
+        "label": label,
+        "columns": len(tail),
+        "avg_height": round(avg_h, 4),
+        "short_ratio": round(short_ratio, 4),
+        "height_change_rate": round(height_change_rate, 4),
+        "switch_rate": round(switch_rate, 4),
+        "tail_heights": tail,
+    }
+
+
+def _limit_ask_road_performance_for_dense(performance: Dict[str, Any], dense_board: Dict[str, Any]) -> Dict[str, Any]:
+    """密集盤仍保留問路記憶降權，但禁止短樣本把下三路放大。"""
+    if not (
+        USE_ASK_ROAD_MEMORY
+        and ASK_ROAD_MEMORY_NO_BOOST_DENSE
+        and dense_board.get("is_dense")
+        and isinstance(performance, dict)
+    ):
+        return performance
+
+    cloned = dict(performance)
+    models = {}
+    for name, stat in (performance.get("models") or {}).items():
+        new_stat = dict(stat or {})
+        old_factor = float(new_stat.get("factor", 1.0) or 1.0)
+        new_stat["factor"] = round(min(1.0, old_factor), 4)
+        if old_factor > 1.0:
+            new_stat["dense_boost_blocked"] = True
+        models[name] = new_stat
+    cloned["models"] = models
+    cloned["dense_boost_blocked"] = True
+    cloned["label"] = f"{performance.get('label', '問路記憶')}|密集盤禁止加權"
+    return cloned
+
+
+def _down3_family_score(non_tie: List[str], road_scores: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """將大眼仔、小路、蟑螂路整合成單一家庭訊號。
+
+    三條路仍各自保留紅藍與命中記憶，但對外最多只產生一個方向。
+    欄型分在這裡對 B/P 候選各計算一次，不再在三條路重複加入。
+    """
+    default = {
+        "B": 0.5,
+        "P": 0.5,
+        "pick": "",
+        "label": "下三路家族資料不足",
+        "confidence": 0.0,
+        "strength": 0.0,
+        "valid_roads": 0,
+        "agree_count": 0,
+        "agreement_ratio": 0.0,
+        "gap": 0.0,
+        "raw_gap": 0.0,
+        "column_gap": 0.0,
+        "details": {},
+        "dense_board": _detect_dense_board(non_tie),
+    }
+    if not USE_DOWN3_FAMILY or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
+        return default
+
+    weights = {
+        "big_eye": max(0.0, DOWN3_FAMILY_BIG_EYE_FACTOR),
+        "small_road": max(0.0, DOWN3_FAMILY_SMALL_ROAD_FACTOR),
+        "cockroach": max(0.0, DOWN3_FAMILY_COCKROACH_FACTOR),
+    }
+    valid = []
+    details: Dict[str, Any] = {}
+    for name, base_w in weights.items():
+        score = road_scores.get(name, {}) or {}
+        stats_count = int((score.get("stats") or {}).get("count", 0) or 0)
+        b = float(score.get("B", 0.5) or 0.5)
+        p = float(score.get("P", 0.5) or 0.5)
+        gap = b - p
+        candidate = score.get("candidate") or {}
+        has_candidate = bool(candidate) or stats_count >= DERIVED_ROAD_MIN_COUNT
+        directional = abs(gap) >= DOWN3_FAMILY_ROAD_MIN_GAP
+        pick = "B" if gap > 0 else "P" if gap < 0 else ""
+        details[name] = {
+            "B": round(b, 5),
+            "P": round(p, 5),
+            "gap": round(gap, 5),
+            "pick": pick if directional else "",
+            "directional": directional,
+            "weight": round(base_w, 4),
+            "count": stats_count,
+            "label": score.get("label", ""),
+        }
+        if has_candidate and stats_count >= DERIVED_ROAD_MIN_COUNT and base_w > 0:
+            valid.append((name, base_w, gap, directional, pick))
+
+    if len(valid) < DOWN3_FAMILY_MIN_VALID_ROADS:
+        return {**default, "details": details, "valid_roads": len(valid), "label": f"下三路家族有效路僅{len(valid)}條"}
+
+    total_w = sum(x[1] for x in valid) or 1.0
+    raw_gap = sum(w * gap for _, w, gap, _, _ in valid) / total_w
+    directional = [x for x in valid if x[3] and x[4] in {"B", "P"}]
+    b_agree = sum(w for _, w, _, _, pick in directional if pick == "B")
+    p_agree = sum(w for _, w, _, _, pick in directional if pick == "P")
+    agree_side = "B" if b_agree > p_agree else "P" if p_agree > b_agree else ""
+    agree_count = sum(1 for _, _, _, _, pick in directional if pick == agree_side) if agree_side else 0
+    directional_w = b_agree + p_agree
+    agreement_ratio = max(b_agree, p_agree) / directional_w if directional_w > 0 else 0.0
+
+    # 三路不同向時只保留柔性偏移，不讓弱多數變成完整一票。
+    if directional and agreement_ratio < 0.999:
+        raw_gap *= _clamp(DOWN3_FAMILY_DISAGREE_SHRINK + (agreement_ratio - 0.5) * 0.35, 0.35, 0.90)
+
+    # 全局大路欄型只加入一次。
+    b_column = _score_column_shape(non_tie, "B")
+    p_column = _score_column_shape(non_tie, "P")
+    column_raw_diff = float(b_column.get("score", 0.5)) - float(p_column.get("score", 0.5))
+    column_gap = _clamp(column_raw_diff * DOWN3_FAMILY_COLUMN_SCALE, -0.014, 0.014)
+
+    dense_board = _detect_dense_board(non_tie)
+    family_gap = raw_gap + column_gap
+    if dense_board.get("is_dense"):
+        family_gap *= _clamp(DOWN3_FAMILY_DENSE_SHRINK, 0.30, 1.0)
+
+    family_gap = _clamp(family_gap, -DOWN3_FAMILY_MAX_GAP, DOWN3_FAMILY_MAX_GAP)
+    enough_agree = agree_count >= DOWN3_FAMILY_MIN_AGREE
+    enough_gap = abs(family_gap) >= DOWN3_FAMILY_MIN_GAP
+    pick = ("B" if family_gap > 0 else "P") if enough_agree and enough_gap else ""
+
+    # 未過門檻仍保留少量柔性偏移供融合，但不投方向票。
+    output_gap = family_gap if pick else family_gap * 0.35
+    b = _clamp(0.5 + output_gap / 2.0, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+    p = 1.0 - b
+    confidence = 0.0
+    if pick:
+        gap_strength = _clamp((abs(family_gap) - DOWN3_FAMILY_MIN_GAP) / max(0.001, DOWN3_FAMILY_STRONG_GAP - DOWN3_FAMILY_MIN_GAP), 0.0, 1.0)
+        confidence = _clamp(0.46 + agreement_ratio * 0.22 + gap_strength * 0.22, 0.0, 0.88)
+        label = f"下三路家族偏{'莊' if pick == 'B' else '閒'} 路{agree_count}/{len(valid)} 差{abs(family_gap)*100:.1f}%"
+    else:
+        confidence = _clamp(0.20 + agreement_ratio * 0.18 + abs(family_gap) * 2.0, 0.0, 0.48)
+        if not enough_agree:
+            label = f"下三路家族分歧 路{agree_count}/{len(valid)}"
+        else:
+            label = f"下三路家族差距不足 {abs(family_gap)*100:.1f}%<{DOWN3_FAMILY_MIN_GAP*100:.1f}%"
+
+    return {
+        "B": round(b, 5),
+        "P": round(p, 5),
+        "pick": pick,
+        "label": label,
+        "confidence": round(confidence, 4),
+        "strength": round(confidence * 0.25, 4),
+        "valid_roads": len(valid),
+        "agree_count": agree_count,
+        "agreement_ratio": round(agreement_ratio, 4),
+        "gap": round(family_gap, 5),
+        "raw_gap": round(raw_gap, 5),
+        "column_gap": round(column_gap, 5),
+        "column_once": {"B": b_column, "P": p_column},
+        "details": details,
+        "dense_board": dense_board,
+    }
+
+
+def _collapse_down3_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    """把三條下路權重合併成一個家族權重，並限制家族總影響。"""
+    adjusted = dict(weights or {})
+    original_total = sum(max(0.0, float(v)) for v in adjusted.values())
+    down_total = sum(max(0.0, float(adjusted.get(k, 0.0))) for k in ("big_eye", "small_road", "cockroach"))
+    for k in ("big_eye", "small_road", "cockroach"):
+        adjusted[k] = 0.0
+    adjusted["down3_family"] = min(max(0.0, down_total), min(0.28, max(0.0, DOWN3_FAMILY_MAX_WEIGHT))) if USE_DOWN3_FAMILY else 0.0
+
+    # 重新正規化會把被移除的重複權重自然分配給大路與其他獨立模型。
+    if original_total <= 0:
+        return _normalize_weights(adjusted)
+    return _normalize_weights(adjusted)
+
+
+def _strong_pick_from_score(score: Dict[str, Any], min_gap: float = FINAL_CONFIRM_SCORE_GAP) -> str:
+    try:
+        b = float(score.get("B", 0.5))
+        p = float(score.get("P", 0.5))
+        if abs(b - p) < min_gap:
+            return ""
+        return "B" if b > p else "P"
+    except Exception:
+        return ""
+
+
+def _final_confirmation_summary(
+    target: str,
+    big_road: Dict[str, Any],
+    pattern_replay: Dict[str, Any],
+    independent_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+    ml_pick: str = "",
+    ml_gap: float = 0.0,
+) -> Dict[str, Any]:
+    """計算下三路家族候選是否取得真正較獨立來源確認。"""
+    sources: Dict[str, str] = {}
+    if target not in {"B", "P"}:
+        return {"target": target, "count": 0, "confirmed": False, "sources": sources, "non_road_count": 0}
+
+    br_pick = _strong_pick_from_score(big_road, min_gap=FINAL_CONFIRM_SCORE_GAP)
+    if br_pick == target:
+        sources["big_road"] = br_pick
+
+    pr_pick = ""
+    if (
+        pattern_replay.get("state") == "REPLAY_MATCH"
+        and float(pattern_replay.get("confidence", 0.0) or 0.0) >= FINAL_CONFIRM_PATTERN_CONF
+        and float(pattern_replay.get("edge", 0.0) or 0.0) >= FINAL_CONFIRM_PATTERN_EDGE
+    ):
+        pr_pick = str(pattern_replay.get("bias_side", ""))
+        if pr_pick == target:
+            sources["pattern_replay"] = pr_pick
+
+    for name, score in (independent_scores or {}).items():
+        pick = _strong_pick_from_score(score, min_gap=FINAL_CONFIRM_SCORE_GAP)
+        if pick == target:
+            sources[name] = pick
+
+    if ml_pick == target and ml_gap >= FINAL_CONFIRM_SCORE_GAP:
+        sources["ml"] = ml_pick
+
+    non_road_count = sum(1 for name in sources if name != "big_road")
+    return {
+        "target": target,
+        "count": len(sources),
+        "non_road_count": non_road_count,
+        "confirmed": len(sources) >= max(1, FINAL_CONFIRM_MIN_SOURCES),
+        "sources": sources,
+        "pattern_replay_pick": pr_pick,
+        "big_road_pick": br_pick,
+    }
 
 def _candidate_scores_to_side_prob(b_score: float, p_score: float, max_edge: Optional[float] = None) -> Tuple[float, float, float]:
     if max_edge is None:
@@ -1463,8 +1805,10 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
 
 
 def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_name: str) -> Dict[str, Any]:
-    # 下三路候選模擬 + 路單結構 + 前排欄型判斷版。
-    # 不再用「紅=跟、藍=反」這種簡化邏輯。
+    """單一衍生路：只評估該路紅藍節奏 + 小幅落點移動風險。
+
+    欄型分不在這裡加入；三路完成後由 _down3_family_score() 全局只算一次。
+    """
     default = {
         "B": 0.5,
         "P": 0.5,
@@ -1476,7 +1820,6 @@ def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_
         "blue_pressure": 0.5,
         "candidate": {},
     }
-
     if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
         return default
 
@@ -1484,49 +1827,27 @@ def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_
     series = _derived_series(layout, offset=offset)
     stats = _color_stats(series)
     count = int(stats.get("count", 0))
-
     if count < DERIVED_ROAD_MIN_COUNT:
-        return {
-            **default,
-            "stats": stats,
-            "label": f"{display_name}樣本不足",
-        }
+        return {**default, "stats": stats, "label": f"{display_name}樣本不足"}
 
     b_info = _candidate_derived_color_info(non_tie, "B", offset)
     p_info = _candidate_derived_color_info(non_tie, "P", offset)
-
     b_color_eval = _score_candidate_color_pattern(series, int(b_info.get("new_color", 0)))
     p_color_eval = _score_candidate_color_pattern(series, int(p_info.get("new_color", 0)))
-
     b_struct_eval = _score_candidate_structure(b_info, series)
     p_struct_eval = _score_candidate_structure(p_info, series)
 
-    b_column_eval = _score_column_shape(non_tie, "B")
-    p_column_eval = _score_column_shape(non_tie, "P")
-
-    b_score = _combine_candidate_scores(
-        float(b_color_eval.get("score", 0.5)),
-        float(b_struct_eval.get("score", 0.5)),
-        float(b_column_eval.get("score", 0.5)),
-    )
-    p_score = _combine_candidate_scores(
-        float(p_color_eval.get("score", 0.5)),
-        float(p_struct_eval.get("score", 0.5)),
-        float(p_column_eval.get("score", 0.5)),
-    )
-
+    b_score = _combine_candidate_scores(float(b_color_eval.get("score", 0.5)), float(b_struct_eval.get("score", 0.5)))
+    p_score = _combine_candidate_scores(float(p_color_eval.get("score", 0.5)), float(p_struct_eval.get("score", 0.5)))
     b, p, edge = _candidate_scores_to_side_prob(b_score, p_score, max_edge=DERIVED_CANDIDATE_MAX_EDGE)
 
     if edge < DERIVED_CANDIDATE_MIN_EDGE:
         label = f"{display_name}候選接近"
-        strength = 0.06
+        strength = 0.05
     else:
-        pick = "莊" if b > p else "閒"
-        label = f"{display_name}路單候選偏{pick}"
-        strength = 0.10 + min(0.15, edge * 2.0)
-
-    red_rate = float(stats.get("red_rate", 0.5))
-    blue_rate = float(stats.get("blue_rate", 0.5))
+        pick_text = "莊" if b > p else "閒"
+        label = f"{display_name}候選偏{pick_text}"
+        strength = 0.08 + min(0.12, edge * 1.8)
 
     return {
         "B": round(b, 5),
@@ -1535,19 +1856,19 @@ def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_
         "strength": round(strength, 4),
         "road_key": road_key,
         "stats": stats,
-        "red_pressure": round(red_rate, 4),
-        "blue_pressure": round(blue_rate, 4),
+        "red_pressure": round(float(stats.get("red_rate", 0.5)), 4),
+        "blue_pressure": round(float(stats.get("blue_rate", 0.5)), 4),
         "tail": stats.get("tail", ""),
         "candidate": {
             "B": {
                 "new_color": b_info.get("new_color_text", "N"),
                 "color_score": round(float(b_color_eval.get("score", 0.5)), 5),
                 "structure_score": round(float(b_struct_eval.get("score", 0.5)), 5),
-                "column_score": round(float(b_column_eval.get("score", 0.5)), 5),
+                "column_score": 0.5,
                 "score": round(b_score, 5),
                 "color_eval": b_color_eval,
                 "structure_eval": b_struct_eval,
-                "column_eval": b_column_eval,
+                "column_eval": {"score": 0.5, "label": "欄型由家族層只算一次"},
                 "pos": b_info.get("pos", {}),
                 "structure": b_info.get("structure", {}),
             },
@@ -1555,19 +1876,19 @@ def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_
                 "new_color": p_info.get("new_color_text", "N"),
                 "color_score": round(float(p_color_eval.get("score", 0.5)), 5),
                 "structure_score": round(float(p_struct_eval.get("score", 0.5)), 5),
-                "column_score": round(float(p_column_eval.get("score", 0.5)), 5),
+                "column_score": 0.5,
                 "score": round(p_score, 5),
                 "color_eval": p_color_eval,
                 "structure_eval": p_struct_eval,
-                "column_eval": p_column_eval,
+                "column_eval": {"score": 0.5, "label": "欄型由家族層只算一次"},
                 "pos": p_info.get("pos", {}),
                 "structure": p_info.get("structure", {}),
             },
             "edge": round(edge, 5),
             "diff": round(b_score - p_score, 5),
+            "column_applied_here": False,
         },
     }
-
 
 def _big_eye_score(non_tie: List[str]) -> Dict[str, Any]:
     return _derived_road_score(non_tie, offset=1, road_key="big_eye", display_name="大眼仔")
@@ -1582,64 +1903,76 @@ def _cockroach_score(non_tie: List[str]) -> Dict[str, Any]:
 
 
 def _road_consensus_score(road_scores: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """四路共識：大路、大眼仔、小路、蟑螂路各自投票後整合。"""
-    vote_weights = _normalize_weights({
-        "big_road": BIG_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
-        "big_eye": BIG_EYE_WEIGHT if USE_ROAD_ENGINE else 0.0,
-        "small_road": SMALL_ROAD_WEIGHT if USE_ROAD_ENGINE else 0.0,
-        "cockroach": COCKROACH_WEIGHT if USE_ROAD_ENGINE else 0.0,
-    })
-    vote_score = {"B": 0.0, "P": 0.0}
-    votes = []
-    details = {}
-    for name, score in road_scores.items():
-        pick = _pick_from_score(score, min_edge=0.002)
-        weight = vote_weights.get(name, 0.0)
-        if pick:
-            vote_score[pick] += weight
-            votes.append(pick)
+    """大路 + 下三路家族的二來源共識。
+
+    大眼仔、小路、蟑螂路只保留為家族內部明細，不再各自對外投票。
+    """
+    big_road = road_scores.get("big_road", {}) or {}
+    family = road_scores.get("down3_family", {}) or {}
+    source_scores = {"big_road": big_road, "down3_family": family}
+    source_weights = {"big_road": 0.56, "down3_family": 0.44}
+
+    details: Dict[str, Any] = {}
+    valid_picks: List[Tuple[str, str, float]] = []
+    for name, score in source_scores.items():
+        pick = score.get("pick", "") if name == "down3_family" else _strong_pick_from_score(score, min_gap=0.012)
+        confidence = float(score.get("confidence", score.get("strength", 0.0)) or 0.0)
         details[name] = {
             "pick": pick,
-            "weight": round(weight, 4),
+            "weight": source_weights[name],
             "label": score.get("label", ""),
             "B": round(float(score.get("B", 0.5)), 4),
             "P": round(float(score.get("P", 0.5)), 4),
+            "confidence": round(confidence, 4),
         }
+        if pick in {"B", "P"}:
+            valid_picks.append((name, pick, source_weights[name]))
 
-    if vote_score["B"] == vote_score["P"]:
-        side = ""
-    else:
-        side = "B" if vote_score["B"] > vote_score["P"] else "P"
-
-    total_vote = max(0.0001, vote_score["B"] + vote_score["P"])
-    consensus_ratio = max(vote_score["B"], vote_score["P"]) / total_vote
-    conflict_ratio = 1.0 - consensus_ratio
-
-    b_raw = sum(float(road_scores[k].get("B", 0.5)) * vote_weights.get(k, 0.0) for k in road_scores)
-    p_raw = sum(float(road_scores[k].get("P", 0.5)) * vote_weights.get(k, 0.0) for k in road_scores)
+    b_raw = sum(float(source_scores[k].get("B", 0.5)) * source_weights[k] for k in source_scores)
+    p_raw = sum(float(source_scores[k].get("P", 0.5)) * source_weights[k] for k in source_scores)
     b, p = (0.5, 0.5) if b_raw + p_raw <= 0 else (b_raw / (b_raw + p_raw), p_raw / (b_raw + p_raw))
 
-    if side:
-        label = f"四路共識:{'莊' if side == 'B' else '閒'} {int(consensus_ratio * 100)}%"
+    if len(valid_picks) == 2 and valid_picks[0][1] == valid_picks[1][1]:
+        side = valid_picks[0][1]
+        consensus_ratio = _clamp(0.72 + abs(b - p) * 1.8, 0.72, 0.95)
+        conflict_ratio = 1.0 - consensus_ratio
+        label = f"大路/下三路家族共識:{'莊' if side == 'B' else '閒'}"
+    elif len(valid_picks) == 2:
+        side = ""
+        consensus_ratio = 0.50
+        conflict_ratio = 0.50
+        label = "大路與下三路家族衝突"
+    elif len(valid_picks) == 1:
+        side = valid_picks[0][1]
+        consensus_ratio = 0.58
+        conflict_ratio = 0.42
+        label = f"僅{valid_picks[0][0]}有方向"
     else:
-        label = "四路分歧"
+        side = ""
+        consensus_ratio = 0.50
+        conflict_ratio = 0.50
+        label = "大路/下三路家族皆無明確方向"
 
     return {
-        "B": b,
-        "P": p,
+        "B": round(b, 5),
+        "P": round(p, 5),
         "label": label,
         "pick": side,
-        "votes": votes,
-        "vote_score": {"B": round(vote_score["B"], 4), "P": round(vote_score["P"], 4)},
+        "votes": [pick for _, pick, _ in valid_picks],
+        "vote_score": {
+            "B": round(sum(w for _, pick, w in valid_picks if pick == "B"), 4),
+            "P": round(sum(w for _, pick, w in valid_picks if pick == "P"), 4),
+        },
         "consensus_ratio": round(consensus_ratio, 4),
         "conflict_ratio": round(conflict_ratio, 4),
         "details": details,
-        "strength": round(0.10 + max(0.0, consensus_ratio - 0.5) * 0.30, 4),
+        "strength": round(0.08 + max(0.0, consensus_ratio - 0.5) * 0.28, 4),
+        "source_count": len(valid_picks),
+        "family_vote_counted_once": True,
     }
 
-
 def _road_family_scores(non_tie: List[str]) -> Dict[str, Any]:
-    """一次取得大路與下三路四個獨立模型 + 四路共識。"""
+    """取得大路、三條下路明細、下三路家族，以及二來源共識。"""
     big_road = _big_road_score(non_tie)
     big_eye = _big_eye_score(non_tie)
     small_road = _small_road_score(non_tie)
@@ -1650,11 +1983,10 @@ def _road_family_scores(non_tie: List[str]) -> Dict[str, Any]:
         "small_road": small_road,
         "cockroach": cockroach,
     }
+    down3_family = _down3_family_score(non_tie, scores)
+    scores["down3_family"] = down3_family
     consensus = _road_consensus_score(scores)
     return {**scores, "consensus": consensus}
-
-
-
 
 def _road_lifecycle_score(non_tie: List[str], road_family: Dict[str, Any], regime_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -2759,7 +3091,7 @@ def _apply_road_rhythm_bias(b_side: float, rhythm: Dict[str, Any]) -> float:
 def _road_engine_score(non_tie: List[str]) -> Dict[str, Any]:
     """
     舊欄位相容：把四路共識包裝成 road_engine。
-    新版真正參與融合的是 big_road / big_eye / small_road / cockroach 四個獨立模型。
+    新版真正參與融合的是 big_road + down3_family；三條下路只保留明細。
     """
     family = _road_family_scores(non_tie)
     consensus = family.get("consensus", {})
@@ -3275,7 +3607,7 @@ def _update_ask_road_truth(training_key: str, non_tie: List[str]) -> None:
 
 def _get_ask_road_performance(training_key: str) -> Dict[str, Any]:
     # 回傳每條問路最近命中率與動態 factor。
-    default_models = ["big_eye", "small_road", "cockroach", "road_majority", "final"]
+    default_models = ["big_eye", "small_road", "cockroach", "down3_family", "road_majority", "final"]
     result: Dict[str, Any] = {
         "enabled": USE_ASK_ROAD_MEMORY,
         "window": ASK_ROAD_MEMORY_WINDOW,
@@ -3387,16 +3719,13 @@ def _apply_ask_road_factor_to_score(score: Dict[str, Any], road_key: str, perfor
 
 
 def _apply_ask_road_factor_to_vote(vote: Dict[str, Any], road_key: str, performance: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    # 用問路近期命中率微調 FUHAO 下三路票。
-    # 若某條路近期明顯失準，且設定允許，會暫時清掉該票，避免壞路拖累多數決。
+    """用近期命中率微調 FUHAO 票的柔性邊際；不把弱票變成新方向。"""
     if not (USE_ASK_ROAD_MEMORY and ASK_ROAD_MEMORY_APPLY_TO_FUHAO and performance and isinstance(vote, dict)):
         return vote
 
-    models = performance.get("models") or {}
-    stat = models.get(road_key, {})
+    stat = (performance.get("models") or {}).get(road_key, {})
     if not stat:
         return vote
-
     factor = float(stat.get("factor", 1.0))
     count = int(stat.get("count", 0))
     acc = float(stat.get("acc", 0.5))
@@ -3406,6 +3735,16 @@ def _apply_ask_road_factor_to_vote(vote: Dict[str, Any], road_key: str, performa
     new_vote["confidence"] = round(_clamp(old_conf * factor, 0.0, 0.88), 4)
     new_vote["ask_road_memory_factor"] = round(factor, 4)
     new_vote["ask_road_memory"] = stat
+
+    # 若票中有 B/P，僅縮放原本邊際，絕不憑記憶創造反向票。
+    if "B" in new_vote and "P" in new_vote:
+        b = float(new_vote.get("B", 0.5))
+        p = float(new_vote.get("P", 0.5))
+        total = max(0.0001, b + p)
+        b_side = b / total
+        b_side = _clamp(0.5 + (b_side - 0.5) * factor, SIDE_CLAMP_MIN, SIDE_CLAMP_MAX)
+        new_vote["B"] = round(b_side, 5)
+        new_vote["P"] = round(1.0 - b_side, 5)
 
     if (
         ASK_ROAD_MEMORY_DROP_BAD_VOTE
@@ -3418,9 +3757,7 @@ def _apply_ask_road_factor_to_vote(vote: Dict[str, Any], road_key: str, performa
         new_vote["label"] = f"{new_vote.get('label', '')}|問路記憶暫停{_fuhao_side_name(old_pick)}票 acc{acc:.2f}"
     else:
         new_vote["label"] = f"{new_vote.get('label', '')}|問路記憶x{factor:.2f}"
-
     return new_vote
-
 
 def _store_ask_road_pending(training_key: str, non_tie: List[str], predictions: Dict[str, str]) -> None:
     if not (USE_ASK_ROAD_MEMORY and predictions):
@@ -3841,79 +4178,55 @@ def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
 
 
 def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
-    # 富濠式下三路候選模擬 + 路單結構 + 前排欄型判斷版。
+    """FUHAO 單一下路明細；不加入全局欄型，也不直接成為外部完整票。"""
     if len(non_tie) < FUHAO_MIN_VALID_ROUNDS:
-        return {
-            "pick": "",
-            "label": f"{name}資料不足",
-            "confidence": 0.0,
-            "stats": {},
-            "candidate": {},
-        }
+        return {"pick": "", "label": f"{name}資料不足", "confidence": 0.0, "B": 0.5, "P": 0.5, "stats": {}, "candidate": {}}
 
     layout = _build_big_road(non_tie)
     series = _derived_series(layout, offset=offset)
     stats = _color_stats(series)
     count = int(stats.get("count", 0))
-
     if count < DERIVED_ROAD_MIN_COUNT:
-        return {
-            "pick": "",
-            "label": f"{name}樣本不足",
-            "confidence": 0.0,
-            "stats": stats,
-            "candidate": {},
-        }
+        return {"pick": "", "label": f"{name}樣本不足", "confidence": 0.0, "B": 0.5, "P": 0.5, "stats": stats, "candidate": {}}
 
     b_info = _candidate_derived_color_info(non_tie, "B", offset)
     p_info = _candidate_derived_color_info(non_tie, "P", offset)
-
     b_color_eval = _score_candidate_color_pattern(series, int(b_info.get("new_color", 0)))
     p_color_eval = _score_candidate_color_pattern(series, int(p_info.get("new_color", 0)))
-
     b_struct_eval = _score_candidate_structure(b_info, series)
     p_struct_eval = _score_candidate_structure(p_info, series)
+    b_score = _combine_candidate_scores(float(b_color_eval.get("score", 0.5)), float(b_struct_eval.get("score", 0.5)))
+    p_score = _combine_candidate_scores(float(p_color_eval.get("score", 0.5)), float(p_struct_eval.get("score", 0.5)))
 
-    b_column_eval = _score_column_shape(non_tie, "B")
-    p_column_eval = _score_column_shape(non_tie, "P")
-
-    b_score = _combine_candidate_scores(
-        float(b_color_eval.get("score", 0.5)),
-        float(b_struct_eval.get("score", 0.5)),
-        float(b_column_eval.get("score", 0.5)),
-    )
-    p_score = _combine_candidate_scores(
-        float(p_color_eval.get("score", 0.5)),
-        float(p_struct_eval.get("score", 0.5)),
-        float(p_column_eval.get("score", 0.5)),
-    )
-
-    diff = b_score - p_score
-
-    if abs(diff) < FUHAO_DOWN3_MIN_DIFF:
+    raw_diff = b_score - p_score
+    b_prob, p_prob, _ = _candidate_scores_to_side_prob(b_score, p_score, max_edge=DERIVED_CANDIDATE_MAX_EDGE)
+    prob_gap = b_prob - p_prob
+    if abs(prob_gap) < DOWN3_FAMILY_ROAD_MIN_GAP:
         pick = ""
-        label = f"{name}候選差距不足"
-        confidence = 0.42
+        label = f"{name}弱訊號"
+        confidence = 0.30
     else:
-        pick = "B" if diff > 0 else "P"
-        label = f"{name}路單候選偏{_fuhao_side_name(pick)}"
-        confidence = min(0.80, 0.50 + abs(diff) * 1.35 + min(0.08, count * 0.006))
+        pick = "B" if prob_gap > 0 else "P"
+        label = f"{name}內部偏{_fuhao_side_name(pick)}"
+        confidence = min(0.68, 0.38 + abs(prob_gap) * 3.0 + min(0.06, count * 0.004))
 
     return {
         "pick": pick,
         "label": label,
         "confidence": round(confidence, 4),
+        "B": round(b_prob, 5),
+        "P": round(p_prob, 5),
         "stats": stats,
         "candidate": {
             "B": {
                 "new_color": b_info.get("new_color_text", "N"),
                 "color_score": round(float(b_color_eval.get("score", 0.5)), 5),
                 "structure_score": round(float(b_struct_eval.get("score", 0.5)), 5),
-                "column_score": round(float(b_column_eval.get("score", 0.5)), 5),
+                "column_score": 0.5,
                 "score": round(b_score, 5),
                 "color_eval": b_color_eval,
                 "structure_eval": b_struct_eval,
-                "column_eval": b_column_eval,
+                "column_eval": {"score": 0.5, "label": "欄型由家族層只算一次"},
                 "pos": b_info.get("pos", {}),
                 "structure": b_info.get("structure", {}),
             },
@@ -3921,18 +4234,38 @@ def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, A
                 "new_color": p_info.get("new_color_text", "N"),
                 "color_score": round(float(p_color_eval.get("score", 0.5)), 5),
                 "structure_score": round(float(p_struct_eval.get("score", 0.5)), 5),
-                "column_score": round(float(p_column_eval.get("score", 0.5)), 5),
+                "column_score": 0.5,
                 "score": round(p_score, 5),
                 "color_eval": p_color_eval,
                 "structure_eval": p_struct_eval,
-                "column_eval": p_column_eval,
+                "column_eval": {"score": 0.5, "label": "欄型由家族層只算一次"},
                 "pos": p_info.get("pos", {}),
                 "structure": p_info.get("structure", {}),
             },
-            "diff": round(diff, 5),
+            "diff": round(raw_diff, 5),
+            "prob_gap": round(prob_gap, 5),
+            "column_applied_here": False,
         },
     }
 
+
+def _fuhao_down3_family_vote(non_tie: List[str], road_models: Dict[str, Any]) -> Dict[str, Any]:
+    family = _down3_family_score(non_tie, {
+        "big_eye": road_models.get("big_eye", {}),
+        "small_road": road_models.get("small_road", {}),
+        "cockroach": road_models.get("cockroach", {}),
+    })
+    return {
+        **family,
+        "pick": family.get("pick", ""),
+        "confidence": family.get("confidence", 0.0),
+        "label": family.get("label", "下三路家族資料不足"),
+        "candidate": {
+            "family_gap": family.get("gap", 0.0),
+            "column_once": family.get("column_once", {}),
+            "details": family.get("details", {}),
+        },
+    }
 
 def _fuhao_deep_parity_vote(non_tie: List[str]) -> Dict[str, Any]:
     # 對應富濠 DeepLearningPredictor：莊數總和奇偶。
@@ -4519,135 +4852,149 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "debug": None,
         }
 
-    # 1) 路紙票：大路 + 下三路
-    road_votes = []
+    # 1) 路紙明細：大路 + 三條下路；對外票只保留「大路」與「下三路家族」。
+    dense_board = _detect_dense_board(non_tie)
+    ask_road_performance = _limit_ask_road_performance_for_dense(ask_road_performance, dense_board)
     road_models: Dict[str, Any] = {}
 
     if FUHAO_USE_BIG_ROAD:
         road_models["big_road"] = _fuhao_big_road_vote(non_tie)
-        road_votes.append(road_models["big_road"].get("pick", ""))
     else:
         road_models["big_road"] = {"pick": "", "label": "大路關閉", "confidence": 0.0}
 
     if FUHAO_USE_BIG_EYE:
         road_models["big_eye"] = _fuhao_down3_vote(non_tie, 1, "大眼仔")
         road_models["big_eye"] = _apply_ask_road_factor_to_vote(road_models["big_eye"], "big_eye", ask_road_performance)
-        road_votes.append(road_models["big_eye"].get("pick", ""))
     else:
-        road_models["big_eye"] = {"pick": "", "label": "大眼仔關閉", "confidence": 0.0}
+        road_models["big_eye"] = {"pick": "", "label": "大眼仔關閉", "confidence": 0.0, "B": 0.5, "P": 0.5}
 
     if FUHAO_USE_SMALL_ROAD:
         road_models["small_road"] = _fuhao_down3_vote(non_tie, 2, "小路")
         road_models["small_road"] = _apply_ask_road_factor_to_vote(road_models["small_road"], "small_road", ask_road_performance)
-        road_votes.append(road_models["small_road"].get("pick", ""))
     else:
-        road_models["small_road"] = {"pick": "", "label": "小路關閉", "confidence": 0.0}
+        road_models["small_road"] = {"pick": "", "label": "小路關閉", "confidence": 0.0, "B": 0.5, "P": 0.5}
 
     if FUHAO_USE_COCKROACH:
         road_models["cockroach"] = _fuhao_down3_vote(non_tie, 3, "蟑螂路")
         road_models["cockroach"] = _apply_ask_road_factor_to_vote(road_models["cockroach"], "cockroach", ask_road_performance)
-        road_votes.append(road_models["cockroach"].get("pick", ""))
     else:
-        road_models["cockroach"] = {"pick": "", "label": "蟑螂路關閉", "confidence": 0.0}
+        road_models["cockroach"] = {"pick": "", "label": "蟑螂路關閉", "confidence": 0.0, "B": 0.5, "P": 0.5}
+
+    road_models["down3_family"] = _fuhao_down3_family_vote(non_tie, road_models)
+    road_models["down3_family"] = _apply_ask_road_factor_to_vote(
+        road_models["down3_family"], "down3_family", ask_road_performance
+    )
 
     big_road_pick = road_models.get("big_road", {}).get("pick", "")
+    down3_family_pick = road_models.get("down3_family", {}).get("pick", "")
+    road_votes = [v for v in [big_road_pick, down3_family_pick] if v in {"B", "P"}]
     road_tiebreak_pick = "" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick
     road_majority = _fuhao_majority(road_votes, big_road_pick=road_tiebreak_pick)
 
-    # 2) Advanced 三票：DeepParity / LengthParity / BankerRate
+    # 2) Advanced 規則保留為「一個家族多數票」，避免三個規則各自灌票。
     advanced_votes = []
     advanced_models: Dict[str, Any] = {}
-
     if FUHAO_USE_DEEP_PARITY:
         advanced_models["deep_parity"] = _fuhao_deep_parity_vote(non_tie)
         advanced_votes.append(advanced_models["deep_parity"].get("pick", ""))
     else:
         advanced_models["deep_parity"] = {"pick": "", "label": "DeepParity關閉", "confidence": 0.0}
-
     if FUHAO_USE_LENGTH_PARITY:
         advanced_models["length_parity"] = _fuhao_length_parity_vote(non_tie)
         advanced_votes.append(advanced_models["length_parity"].get("pick", ""))
     else:
         advanced_models["length_parity"] = {"pick": "", "label": "LengthParity關閉", "confidence": 0.0}
-
     if FUHAO_USE_BANKER_RATE:
         advanced_models["banker_rate"] = _fuhao_banker_rate_vote(non_tie)
         advanced_votes.append(advanced_models["banker_rate"].get("pick", ""))
     else:
         advanced_models["banker_rate"] = {"pick": "", "label": "BankerRate關閉", "confidence": 0.0}
-
-    advanced_majority = _fuhao_majority(advanced_votes, big_road_pick=road_tiebreak_pick)
-
-    # 3) 最後整合方向：主模型只提供候選，大路/四路多數決不再單獨決定最終方向。
-    #    最終方向需要「下三路/非大路票」確認，避免仍然偏向多數方或大路最後一欄。
-    derived_votes = [
-        road_models.get("big_eye", {}).get("pick", ""),
-        road_models.get("small_road", {}).get("pick", ""),
-        road_models.get("cockroach", {}).get("pick", ""),
-    ]
-    derived_votes = [v for v in derived_votes if v in {"B", "P"}]
-    derived_majority = _fuhao_majority(derived_votes, big_road_pick="")
-    derived_pick = derived_majority.get("pick", "")
-    road_pick = road_majority.get("pick", "")
+    advanced_majority = _fuhao_majority(advanced_votes, big_road_pick="")
     advanced_pick = advanced_majority.get("pick", "")
 
-    if FUHAO_ROAD_MAJORITY_AS_CANDIDATE_ONLY:
-        if FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_pick in {"B", "P"}:
-            final_pick = derived_pick
-            final_source = "derived_confirmed"
-        elif advanced_pick in {"B", "P"} and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
-            final_pick = advanced_pick
-            final_source = "advanced_majority"
-        elif road_pick in {"B", "P"} and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
-            final_pick = road_pick
-            final_source = "road_candidate"
-        elif big_road_pick in {"B", "P"} and not FUHAO_DISABLE_BIGROAD_FALLBACK and not FUHAO_REQUIRE_DERIVED_FOR_FINAL:
-            final_pick = big_road_pick
-            final_source = "bigroad_fallback"
-        else:
-            final_pick = ""
-            final_source = "no_derived_confirmation"
-    else:
-        final_pick = advanced_pick or road_pick or ("" if FUHAO_DISABLE_BIGROAD_FALLBACK else big_road_pick)
-        final_source = "advanced_majority" if advanced_pick else ("road_fallback" if road_pick else "bigroad_fallback")
+    # Pattern Replay 是獨立歷史回放確認，不把下三路家族直接當 final。
+    pattern_replay = _pattern_replay_memory_score(non_tie, training_key=training_key, live_performance=None)
+    pattern_pick = ""
+    if (
+        pattern_replay.get("state") == "REPLAY_MATCH"
+        and float(pattern_replay.get("confidence", 0.0) or 0.0) >= FINAL_CONFIRM_PATTERN_CONF
+        and float(pattern_replay.get("edge", 0.0) or 0.0) >= FINAL_CONFIRM_PATTERN_EDGE
+    ):
+        pattern_pick = str(pattern_replay.get("bias_side", ""))
 
-    all_votes = [v for v in road_votes + advanced_votes if v in {"B", "P"}]
+    # 3) 最後整合：下三路家族只提供候選，必須取得大路 / Pattern Replay / Advanced 之一確認。
+    candidate_pick = down3_family_pick if down3_family_pick in {"B", "P"} else ""
+    confirm_sources: Dict[str, str] = {}
+    if candidate_pick:
+        if big_road_pick == candidate_pick:
+            confirm_sources["big_road"] = big_road_pick
+        if pattern_pick == candidate_pick:
+            confirm_sources["pattern_replay"] = pattern_pick
+        if advanced_pick == candidate_pick:
+            confirm_sources["advanced"] = advanced_pick
+
+    dense_conflict = bool(
+        dense_board.get("is_dense")
+        and candidate_pick in {"B", "P"}
+        and big_road_pick in {"B", "P"}
+        and candidate_pick != big_road_pick
+    )
+    non_road_confirm = sum(1 for k in confirm_sources if k != "big_road")
+
+    if candidate_pick and len(confirm_sources) >= max(1, FINAL_CONFIRM_MIN_SOURCES):
+        if dense_conflict and DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM and non_road_confirm < 1:
+            final_pick = ""
+            final_source = "dense_conflict_unconfirmed"
+        else:
+            final_pick = candidate_pick
+            final_source = "down3_family+" + "+".join(sorted(confirm_sources.keys()))
+    elif not candidate_pick and big_road_pick in {"B", "P"} and pattern_pick == big_road_pick:
+        final_pick = big_road_pick
+        final_source = "big_road+pattern_replay"
+        confirm_sources = {"big_road": big_road_pick, "pattern_replay": pattern_pick}
+    elif not candidate_pick and advanced_pick in {"B", "P"} and pattern_pick == advanced_pick:
+        final_pick = advanced_pick
+        final_source = "advanced+pattern_replay"
+        confirm_sources = {"advanced": advanced_pick, "pattern_replay": pattern_pick}
+    else:
+        final_pick = ""
+        final_source = "no_independent_confirmation"
+
+    # 外部票最多四個家族來源：大路、下三路家族、Pattern Replay、Advanced 家族。
+    all_votes = [v for v in [big_road_pick, down3_family_pick, pattern_pick, advanced_pick] if v in {"B", "P"}]
     all_majority = _fuhao_majority(all_votes, big_road_pick=road_tiebreak_pick)
     vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
-
-    # 若主方向票數低於指定門檻，或沒有足夠非大路確認，改觀望。
     final_vote_count = all_votes.count(final_pick) if final_pick in {"B", "P"} else 0
-    derived_confirm_count = derived_votes.count(final_pick) if final_pick in {"B", "P"} else 0
-    non_bigroad_votes = [v for v in derived_votes + advanced_votes if v in {"B", "P"}]
-    non_bigroad_confirm_count = non_bigroad_votes.count(final_pick) if final_pick in {"B", "P"} else 0
-    derived_ratio = derived_confirm_count / max(1, len(derived_votes)) if final_pick in {"B", "P"} else 0.0
+    derived_votes = [down3_family_pick] if down3_family_pick in {"B", "P"} else []
+    derived_majority = {"pick": down3_family_pick, "B": 1 if down3_family_pick == "B" else 0, "P": 1 if down3_family_pick == "P" else 0, "total": len(derived_votes), "ratio": 1.0 if derived_votes else 0.0, "tie": False}
+    derived_confirm_count = 1 if final_pick and down3_family_pick == final_pick else 0
+    non_bigroad_confirm_count = sum(1 for k, v in confirm_sources.items() if k != "big_road" and v == final_pick)
+    derived_ratio = float(road_models.get("down3_family", {}).get("agreement_ratio", 0.0) or 0.0)
 
     observe_reason = ""
     recommend = final_pick if final_pick in {"B", "P"} else "NONE"
+    if recommend == "NONE":
+        if dense_conflict:
+            observe_reason = "密集盤中下三路家族與大路衝突，未取得 Pattern Replay/獨立模型確認"
+        elif candidate_pick and not confirm_sources:
+            observe_reason = "下三路家族只有候選方向，沒有大路、Pattern Replay或獨立模型確認"
+        elif candidate_pick and len(confirm_sources) < max(1, FINAL_CONFIRM_MIN_SOURCES):
+            observe_reason = f"候選僅取得{len(confirm_sources)}個獨立確認，未達{FINAL_CONFIRM_MIN_SOURCES}"
+        else:
+            observe_reason = "沒有形成可被獨立來源確認的最終方向"
+    elif final_vote_count < 2:
+        recommend = "NONE"
+        observe_reason = "最終方向未形成至少兩個家族來源同向"
 
-    if recommend == "NONE" and FUHAO_OBSERVE_ON_UNKNOWN:
-        observe_reason = "下三路/非大路未確認，最後裁決無明確方向"
-    elif final_vote_count < FUHAO_MIN_VOTE_AGREE:
-        recommend = "NONE"
-        observe_reason = f"主方向只有{final_vote_count}票，未達{FUHAO_MIN_VOTE_AGREE}票"
-    elif FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_confirm_count < FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES:
-        recommend = "NONE"
-        observe_reason = f"下三路同向只有{derived_confirm_count}票，未達{FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES}票"
-    elif FUHAO_REQUIRE_DERIVED_FOR_FINAL and derived_ratio < FUHAO_FINAL_REQUIRE_DERIVED_RATIO:
-        recommend = "NONE"
-        observe_reason = f"下三路確認比例{derived_ratio:.2f}低於{FUHAO_FINAL_REQUIRE_DERIVED_RATIO:.2f}"
-    elif FUHAO_OBSERVE_ON_BIGROAD_ONLY and final_pick == big_road_pick and non_bigroad_confirm_count < FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES:
-        recommend = "NONE"
-        observe_reason = f"大路方向未取得至少{FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES}個非大路確認"
-    elif (
-        FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME
-        and road_majority.get("pick") in {"B", "P"}
-        and advanced_majority.get("pick") in {"B", "P"}
-        and road_majority.get("pick") != advanced_majority.get("pick")
+    if (
+        recommend in {"B", "P"}
+        and FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME
+        and advanced_pick in {"B", "P"}
+        and advanced_pick != recommend
+        and FUHAO_OBSERVE_ON_CONFLICT
     ):
-        if FUHAO_OBSERVE_ON_CONFLICT:
-            recommend = "NONE"
-            observe_reason = f"路紙{_fuhao_side_name(road_majority.get('pick'))}與Advanced{_fuhao_side_name(advanced_majority.get('pick'))}衝突"
+        recommend = "NONE"
+        observe_reason = f"最終方向{_fuhao_side_name(final_pick)}與Advanced{_fuhao_side_name(advanced_pick)}衝突"
 
     # 3.5) 假規律 / 轉折保護模型：修正一直押多數方、長龍假斷、路單轉折慢。
     fake_pattern = _fuhao_fake_pattern_detector(
@@ -4817,7 +5164,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     elif USE_DEEPSEEK and FUHAO_USE_DEEPSEEK and len(history) < FUHAO_DEEPSEEK_MIN_HISTORY:
         ai_status = "not_enough_history"
 
-    road_consensus_label = f"富濠路紙多數決:{_fuhao_side_name(road_majority.get('pick', ''))} B{road_majority.get('B', 0)} / P{road_majority.get('P', 0)}"
+    road_consensus_label = f"大路+下三路家族:{_fuhao_side_name(road_majority.get('pick', ''))} B{road_majority.get('B', 0)} / P{road_majority.get('P', 0)}"
     advanced_label = f"富濠Advanced多數決:{_fuhao_side_name(advanced_majority.get('pick', ''))} B{advanced_majority.get('B', 0)} / P{advanced_majority.get('P', 0)}"
 
     reason_parts = [
@@ -4828,6 +5175,9 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         road_models.get("big_eye", {}).get("label", ""),
         road_models.get("small_road", {}).get("label", ""),
         road_models.get("cockroach", {}).get("label", ""),
+        road_models.get("down3_family", {}).get("label", ""),
+        dense_board.get("label", ""),
+        pattern_replay.get("label", ""),
         advanced_models.get("deep_parity", {}).get("label", ""),
         advanced_models.get("length_parity", {}).get("label", ""),
         advanced_models.get("banker_rate", {}).get("label", ""),
@@ -4847,7 +5197,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "fuhao_big_road": 1.0 if FUHAO_USE_BIG_ROAD else 0.0,
         "fuhao_big_eye": 1.0 if FUHAO_USE_BIG_EYE else 0.0,
         "fuhao_small_road": 1.0 if FUHAO_USE_SMALL_ROAD else 0.0,
-        "fuhao_cockroach": 1.0 if FUHAO_USE_COCKROACH else 0.0,
+        "fuhao_cockroach": 0.0,
+        "fuhao_down3_family": 1.0 if USE_DOWN3_FAMILY else 0.0,
         "fuhao_deep_parity": 1.0 if FUHAO_USE_DEEP_PARITY else 0.0,
         "fuhao_length_parity": 1.0 if FUHAO_USE_LENGTH_PARITY else 0.0,
         "fuhao_banker_rate": 1.0 if FUHAO_USE_BANKER_RATE else 0.0,
@@ -4864,6 +5215,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "big_eye": road_models.get("big_eye", {}).get("pick", ""),
         "small_road": road_models.get("small_road", {}).get("pick", ""),
         "cockroach": road_models.get("cockroach", {}).get("pick", ""),
+        "down3_family": road_models.get("down3_family", {}).get("pick", ""),
         "road_majority": road_majority.get("pick", ""),
         "final": recommend if recommend in {"B", "P"} else "",
     }
@@ -4921,7 +5273,12 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             "required_non_bigroad_votes": FUHAO_FINAL_REQUIRE_NON_BIGROAD_VOTES,
             "derived_ratio": round(derived_ratio, 4),
         },
-        "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority},
+        "road_family": {"fuhao_road_models": road_models, "fuhao_road_majority": road_majority, "down3_family": road_models.get("down3_family", {})},
+        "down3_family": road_models.get("down3_family", {}),
+        "down3_family_label": road_models.get("down3_family", {}).get("label", ""),
+        "dense_board": dense_board,
+        "final_confirmation": {"sources": confirm_sources, "count": len(confirm_sources), "dense_conflict": dense_conflict, "source": final_source},
+        "pattern_replay_memory": pattern_replay,
         "road_lifecycle": empty_state,
         "adaptive_road_memory": empty_state,
         "road_rhythm": empty_state,
@@ -5065,8 +5422,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     _update_ask_road_truth(training_key, non_tie)
     live_walk_forward_performance = _get_walk_forward_performance(training_key)
     ask_road_performance = _get_ask_road_performance(training_key)
+    dense_board = _detect_dense_board(non_tie)
+    ask_road_performance = _limit_ask_road_performance_for_dense(ask_road_performance, dense_board)
 
-    # ============ 1. 基礎模型 + 四路主模型 ==========
+    # ============ 1. 基礎模型 + 大路 / 下三路家族 ==========
     markov = _transition_prob(non_tie)
     road = _road_pattern_score(non_tie)
     recent = _recent_score(non_tie)
@@ -5082,12 +5441,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             if _rk in road_family:
                 road_family[_rk] = _apply_ask_road_factor_to_score(road_family[_rk], _rk, ask_road_performance)
         try:
-            road_family["consensus"] = _road_consensus_score({
-                "big_road": road_family.get("big_road", {}),
+            road_family["down3_family"] = _down3_family_score(non_tie, {
                 "big_eye": road_family.get("big_eye", {}),
                 "small_road": road_family.get("small_road", {}),
                 "cockroach": road_family.get("cockroach", {}),
             })
+            road_family["consensus"] = _road_consensus_score(road_family)
         except Exception:
             pass
 
@@ -5095,6 +5454,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     big_eye = road_family.get("big_eye", {"B": 0.5, "P": 0.5, "label": "大眼仔資料不足"})
     small_road = road_family.get("small_road", {"B": 0.5, "P": 0.5, "label": "小路資料不足"})
     cockroach = road_family.get("cockroach", {"B": 0.5, "P": 0.5, "label": "蟑螂路資料不足"})
+    down3_family = road_family.get("down3_family", {"B": 0.5, "P": 0.5, "pick": "", "label": "下三路家族資料不足"})
     road_consensus = road_family.get("consensus", {"B": 0.5, "P": 0.5, "label": "四路共識資料不足"})
     road_engine = _road_engine_score(non_tie)  # 舊欄位相容用
 
@@ -5112,13 +5472,12 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     dynamic_weights = _apply_lifecycle_weighting(dynamic_weights, lifecycle)
     dynamic_weights = _apply_road_memory_weighting(dynamic_weights, road_memory)
     dynamic_weights = _apply_road_rhythm_weighting(dynamic_weights, road_rhythm)
+    dynamic_weights = _collapse_down3_weights(dynamic_weights)
 
     total_w = sum(dynamic_weights.values()) or 1.0
     b_side = (
         big_road["B"] * dynamic_weights.get("big_road", 0.0)
-        + big_eye["B"] * dynamic_weights.get("big_eye", 0.0)
-        + small_road["B"] * dynamic_weights.get("small_road", 0.0)
-        + cockroach["B"] * dynamic_weights.get("cockroach", 0.0)
+        + down3_family["B"] * dynamic_weights.get("down3_family", 0.0)
         + ngram["B"] * dynamic_weights.get("ngram", 0.0)
         + markov["B"] * dynamic_weights.get("markov", 0.0)
         + road["B"] * dynamic_weights.get("road", 0.0)
@@ -5215,6 +5574,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "cockroach_model": cockroach,
         "road_consensus": road_consensus,
         "road_family": road_family,
+        "down3_family": down3_family,
+        "down3_family_label": down3_family.get("label", ""),
+        "dense_board": dense_board,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
         "pattern_replay_memory": pattern_replay,
@@ -5285,9 +5647,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     votes = []
     current_model_scores = {
         "big_road": big_road,
-        "big_eye": big_eye,
-        "small_road": small_road,
-        "cockroach": cockroach,
+        "down3_family": down3_family,
         "pattern_replay": pattern_replay,
         "ngram": ngram,
         "markov": markov,
@@ -5321,9 +5681,42 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     edge = abs(b_prob - p_prob)
     observe_reason = ""
     lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle.get("enabled") else ""
+    down3_pick = str(down3_family.get("pick", "") or "")
+    big_road_pick = _strong_pick_from_score(big_road, min_gap=FINAL_CONFIRM_SCORE_GAP)
+    ml_pick_for_confirm = ("B" if ml_b_prob >= 0.5 else "P") if ml_models.is_trained else ""
+    final_confirmation = _final_confirmation_summary(
+        target=main_pick,
+        big_road=big_road,
+        pattern_replay=pattern_replay,
+        independent_scores={"ngram": ngram, "markov": markov, "road_pattern": road},
+        ml_pick=ml_pick_for_confirm,
+        ml_gap=abs(ml_b_prob - 0.5) * 2 if ml_models.is_trained else 0.0,
+    )
+    dense_conflict = bool(
+        dense_board.get("is_dense")
+        and down3_pick in {"B", "P"}
+        and big_road_pick in {"B", "P"}
+        and down3_pick != big_road_pick
+    )
 
     if ALLOW_TIE_RECOMMEND and tie_prob >= TIE_RECOMMEND_MIN and tie_prob > max(b_prob, p_prob) * 0.55:
         recommend = "T"
+    elif (
+        ALLOW_OBSERVE
+        and down3_pick == main_pick
+        and not final_confirmation.get("confirmed")
+    ):
+        recommend = "NONE"
+        observe_reason = "下三路家族只有候選方向，尚未取得大路、Pattern Replay或獨立模型確認"
+    elif (
+        ALLOW_OBSERVE
+        and dense_conflict
+        and down3_pick == main_pick
+        and DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM
+        and int(final_confirmation.get("non_road_count", 0)) < 1
+    ):
+        recommend = "NONE"
+        observe_reason = "密集盤下三路家族與大路衝突，未取得非大路獨立確認"
     elif (
         ALLOW_OBSERVE
         and edge < OBSERVE_EDGE_MIN
@@ -5352,7 +5745,9 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     # ============ 7. 原因說明 ==========
     reason_parts = [
-        f"四路:{road_consensus.get('label', '')}",
+        f"大路/下三路家族:{road_consensus.get('label', '')}",
+        f"下三路家族:{down3_family.get('label', '')}",
+        f"密集盤:{dense_board.get('label', '')}",
         f"問路記憶:{ask_road_performance.get('label', '')}",
         f"生命周期:{lifecycle.get('label', '')}",
         f"記憶:{road_memory.get('label', '')}",
@@ -5393,6 +5788,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "big_eye": _pick_from_score(big_eye, min_edge=0.002),
         "small_road": _pick_from_score(small_road, min_edge=0.002),
         "cockroach": _pick_from_score(cockroach, min_edge=0.002),
+        "down3_family": down3_family.get("pick", ""),
         "road_majority": road_consensus.get("pick", ""),
         "final": recommend if recommend in {"B", "P"} else "",
     }
@@ -5430,6 +5826,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "road_consensus_ratio": road_consensus.get("consensus_ratio", 0.5),
         "road_conflict_ratio": road_consensus.get("conflict_ratio", 0.5),
         "road_family": road_family,
+        "down3_family": down3_family,
+        "down3_family_label": down3_family.get("label", ""),
+        "dense_board": dense_board,
+        "final_confirmation": final_confirmation,
         "road_lifecycle": lifecycle,
         "adaptive_road_memory": road_memory,
         "pattern_replay_memory": pattern_replay,
