@@ -77,9 +77,9 @@ T_PRIOR = float(os.getenv("T_PRIOR", "0.0952"))
 # 本版核心：大路 + 下三路為主，Markov / NGram / ML / DeepSeek 為輔
 MARKOV_WEIGHT = float(os.getenv("MARKOV_WEIGHT", "0.055"))
 ROAD_WEIGHT = float(os.getenv("ROAD_WEIGHT", "0.055"))
-STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.030"))
+STREAK_WEIGHT = float(os.getenv("STREAK_WEIGHT", "0.010"))
 BALANCE_WEIGHT = float(os.getenv("BALANCE_WEIGHT", "0.015"))
-RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.040"))
+RECENT_WEIGHT = float(os.getenv("RECENT_WEIGHT", "0.015"))
 NGRAM_WEIGHT = float(os.getenv("NGRAM_WEIGHT", "0.060"))
 
 # 四路明細權重（實際融合會把三條下路合併成一個家族權重）
@@ -159,7 +159,7 @@ ROAD_ENGINE_BREAK_STREAK = int(os.getenv("ROAD_ENGINE_BREAK_STREAK", "5"))
 ROAD_ENGINE_DERIVED_LOOKBACK = int(os.getenv("ROAD_ENGINE_DERIVED_LOOKBACK", "10"))
 ROAD_ENGINE_BLUE_BREAK_BIAS = float(os.getenv("ROAD_ENGINE_BLUE_BREAK_BIAS", "0.024"))
 ROAD_ENGINE_RED_CONT_BIAS = float(os.getenv("ROAD_ENGINE_RED_CONT_BIAS", "0.016"))
-DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "3"))
+DERIVED_ROAD_MIN_COUNT = int(os.getenv("DERIVED_ROAD_MIN_COUNT", "6"))
 # Candidate Down-Road Simulation：下三路候選模擬參數
 DERIVED_CANDIDATE_LOOKBACK = int(os.getenv("DERIVED_CANDIDATE_LOOKBACK", str(ROAD_ENGINE_DERIVED_LOOKBACK)))
 DERIVED_CANDIDATE_MAX_EDGE = float(os.getenv("DERIVED_CANDIDATE_MAX_EDGE", "0.078"))
@@ -216,13 +216,17 @@ DOWN3_FAMILY_ROAD_MIN_GAP = float(os.getenv("DOWN3_FAMILY_ROAD_MIN_GAP", "0.010"
 DOWN3_FAMILY_MIN_GAP = max(0.030, float(os.getenv("DOWN3_FAMILY_MIN_GAP", "0.030")))
 DOWN3_FAMILY_STRONG_GAP = float(os.getenv("DOWN3_FAMILY_STRONG_GAP", "0.055"))
 DOWN3_FAMILY_MAX_GAP = float(os.getenv("DOWN3_FAMILY_MAX_GAP", "0.100"))
-DOWN3_FAMILY_MAX_WEIGHT = float(os.getenv("DOWN3_FAMILY_MAX_WEIGHT", "0.24"))
+DOWN3_FAMILY_MAX_WEIGHT = float(os.getenv("DOWN3_FAMILY_MAX_WEIGHT", "0.45"))
 DOWN3_FAMILY_COLUMN_SCALE = float(os.getenv("DOWN3_FAMILY_COLUMN_SCALE", "0.10"))
 DOWN3_FAMILY_DISAGREE_SHRINK = float(os.getenv("DOWN3_FAMILY_DISAGREE_SHRINK", "0.62"))
 DOWN3_FAMILY_DENSE_SHRINK = float(os.getenv("DOWN3_FAMILY_DENSE_SHRINK", "0.72"))
 DOWN3_FAMILY_BIG_EYE_FACTOR = float(os.getenv("DOWN3_FAMILY_BIG_EYE_FACTOR", "1.00"))
 DOWN3_FAMILY_SMALL_ROAD_FACTOR = float(os.getenv("DOWN3_FAMILY_SMALL_ROAD_FACTOR", "0.85"))
 DOWN3_FAMILY_COCKROACH_FACTOR = float(os.getenv("DOWN3_FAMILY_COCKROACH_FACTOR", "0.70"))
+
+# Down3 Direction Core：最終莊/閒方向由下三路候選模擬鎖定。
+# 大路、Pattern Replay、ML、AI、Lifecycle 只提供結構、風險與信心校準，不可反向覆蓋。
+DOWN3_CORE_LOCK_DIRECTION = os.getenv("DOWN3_CORE_LOCK_DIRECTION", "1") == "1"
 
 # Dense Board Guard：短欄密集、欄高變化大時，下三路與大路衝突會提高最終確認門檻。
 USE_DENSE_BOARD_GUARD = os.getenv("USE_DENSE_BOARD_GUARD", "1") == "1"
@@ -236,7 +240,7 @@ DENSE_BOARD_SWITCH_HIGH = float(os.getenv("DENSE_BOARD_SWITCH_HIGH", "0.80"))
 ASK_ROAD_MEMORY_NO_BOOST_DENSE = os.getenv("ASK_ROAD_MEMORY_NO_BOOST_DENSE", "1") == "1"
 
 # Final Confirmation Gate：下三路家族只提供候選，至少需要一個獨立來源確認。
-FINAL_CONFIRM_MIN_SOURCES = int(os.getenv("FINAL_CONFIRM_MIN_SOURCES", "1"))
+FINAL_CONFIRM_MIN_SOURCES = int(os.getenv("FINAL_CONFIRM_MIN_SOURCES", "0"))
 FINAL_CONFIRM_SCORE_GAP = float(os.getenv("FINAL_CONFIRM_SCORE_GAP", "0.018"))
 FINAL_CONFIRM_PATTERN_CONF = float(os.getenv("FINAL_CONFIRM_PATTERN_CONF", "0.40"))
 FINAL_CONFIRM_PATTERN_EDGE = float(os.getenv("FINAL_CONFIRM_PATTERN_EDGE", "0.025"))
@@ -376,7 +380,7 @@ FUHAO_USE_BANKER_RATE = os.getenv("FUHAO_USE_BANKER_RATE", "0") == "1"
 FUHAO_FINAL_METHOD = os.getenv("FUHAO_FINAL_METHOD", "MAJORITY").strip().upper()
 FUHAO_FINAL_TIE_BREAKER = os.getenv("FUHAO_FINAL_TIE_BREAKER", "BIGROAD").strip().upper()
 FUHAO_CONFIDENCE_MODE = os.getenv("FUHAO_CONFIDENCE_MODE", "VOTE_RATIO").strip().upper()
-FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME = os.getenv("FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME", "1") == "1"
+FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME = os.getenv("FUHAO_REQUIRE_ROAD_AND_ADVANCED_SAME", "0") == "1"
 FUHAO_MIN_VOTE_AGREE = int(os.getenv("FUHAO_MIN_VOTE_AGREE", "2"))
 FUHAO_OBSERVE_ON_CONFLICT = os.getenv("FUHAO_OBSERVE_ON_CONFLICT", "1") == "1"
 FUHAO_OBSERVE_ON_UNKNOWN = os.getenv("FUHAO_OBSERVE_ON_UNKNOWN", "1") == "1"
@@ -1608,20 +1612,22 @@ def _down3_family_score(non_tie: List[str], road_scores: Dict[str, Dict[str, Any
     }
 
 
+
 def _collapse_down3_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    """把三條下路權重合併成一個家族權重，並限制家族總影響。"""
+    """三條下路合併為唯一方向家族；大路保留結構資料但方向權重固定為 0。"""
     adjusted = dict(weights or {})
-    original_total = sum(max(0.0, float(v)) for v in adjusted.values())
     down_total = sum(max(0.0, float(adjusted.get(k, 0.0))) for k in ("big_eye", "small_road", "cockroach"))
+
     for k in ("big_eye", "small_road", "cockroach"):
         adjusted[k] = 0.0
-    adjusted["down3_family"] = min(max(0.0, down_total), min(0.28, max(0.0, DOWN3_FAMILY_MAX_WEIGHT))) if USE_DOWN3_FAMILY else 0.0
 
-    # 重新正規化會把被移除的重複權重自然分配給大路與其他獨立模型。
-    if original_total <= 0:
-        return _normalize_weights(adjusted)
+    # 大路已改為結構報告器，不應在數值融合中以 0.5 稀釋下三路方向。
+    adjusted["big_road"] = 0.0
+    adjusted["down3_family"] = (
+        min(max(0.0, down_total), max(0.0, DOWN3_FAMILY_MAX_WEIGHT))
+        if USE_DOWN3_FAMILY else 0.0
+    )
     return _normalize_weights(adjusted)
-
 
 def _strong_pick_from_score(score: Dict[str, Any], min_gap: float = FINAL_CONFIRM_SCORE_GAP) -> str:
     try:
@@ -1634,6 +1640,7 @@ def _strong_pick_from_score(score: Dict[str, Any], min_gap: float = FINAL_CONFIR
         return ""
 
 
+
 def _final_confirmation_summary(
     target: str,
     big_road: Dict[str, Any],
@@ -1642,14 +1649,22 @@ def _final_confirmation_summary(
     ml_pick: str = "",
     ml_gap: float = 0.0,
 ) -> Dict[str, Any]:
-    """計算下三路家族候選是否取得真正較獨立來源確認。"""
+    """記錄外部來源是否同向；預設 required=0，外部來源只做資訊與信心校準，不再卡 final。"""
     sources: Dict[str, str] = {}
+    required = max(0, int(FINAL_CONFIRM_MIN_SOURCES))
     if target not in {"B", "P"}:
-        return {"target": target, "count": 0, "confirmed": False, "sources": sources, "non_road_count": 0}
+        return {
+            "target": target,
+            "count": 0,
+            "required": required,
+            "confirmed": False,
+            "self_confirmed": False,
+            "sources": sources,
+            "non_road_count": 0,
+        }
 
-    br_pick = _strong_pick_from_score(big_road, min_gap=FINAL_CONFIRM_SCORE_GAP)
-    if br_pick == target:
-        sources["big_road"] = br_pick
+    # 大路不再投方向，因此只保留空值供相容欄位顯示。
+    br_pick = ""
 
     pr_pick = ""
     if (
@@ -1669,15 +1684,18 @@ def _final_confirmation_summary(
     if ml_pick == target and ml_gap >= FINAL_CONFIRM_SCORE_GAP:
         sources["ml"] = ml_pick
 
-    non_road_count = sum(1 for name in sources if name != "big_road")
+    non_road_count = len(sources)
     return {
         "target": target,
         "count": len(sources),
+        "required": required,
         "non_road_count": non_road_count,
-        "confirmed": len(sources) >= max(1, FINAL_CONFIRM_MIN_SOURCES),
+        "confirmed": len(sources) >= required,
+        "self_confirmed": required == 0,
         "sources": sources,
         "pattern_replay_pick": pr_pick,
         "big_road_pick": br_pick,
+        "gate_mode": "DOWN3_SELF_GATE" if required == 0 else "EXTERNAL_CONFIRM",
     }
 
 def _candidate_scores_to_side_prob(b_score: float, p_score: float, max_edge: Optional[float] = None) -> Tuple[float, float, float]:
@@ -1685,6 +1703,35 @@ def _candidate_scores_to_side_prob(b_score: float, p_score: float, max_edge: Opt
         max_edge = DERIVED_CANDIDATE_MAX_EDGE
     edge = _clamp((float(b_score) - float(p_score)) * 0.18, -max_edge, max_edge)
     return 0.5 + edge, 0.5 - edge, abs(edge)
+
+
+
+def _anchor_probs_to_down3_pick(
+    b_prob: float,
+    p_prob: float,
+    tie_prob: float,
+    pick: str,
+    family_gap: float = 0.0,
+) -> Tuple[float, float, float]:
+    """鎖定機率顯示方向與下三路 final 一致；其他模型只可調整強弱，不可把方向翻面。"""
+    if not DOWN3_CORE_LOCK_DIRECTION or pick not in {"B", "P"}:
+        return _normalize_three(b_prob, p_prob, tie_prob)
+
+    b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+    side_total = max(0.002, b_prob + p_prob)
+    current_gap = abs(b_prob - p_prob)
+    family_gap_abs = abs(float(family_gap or 0.0))
+    minimum_gap = max(
+        current_gap,
+        family_gap_abs * side_total * 0.75,
+        DOWN3_FAMILY_MIN_GAP * side_total * 0.65,
+    )
+    minimum_gap = min(minimum_gap, side_total * 0.42)
+    high = (side_total + minimum_gap) / 2.0
+    low = (side_total - minimum_gap) / 2.0
+    if pick == "B":
+        return _normalize_three(high, low, tie_prob)
+    return _normalize_three(low, high, tie_prob)
 
 
 def _roadmap_ask_road_debug(non_tie: List[str]) -> Dict[str, Any]:
@@ -1698,11 +1745,20 @@ def _roadmap_ask_road_debug(non_tie: List[str]) -> Dict[str, Any]:
     return result
 
 
+
 def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
-    """大路獨立模型：負責長龍、跳路、欄高、黏邊、斷龍壓力。"""
+    """大路結構報告器：只描述欄型、龍長、切換率與斷點壓力，不投 B/P 方向票。"""
     default = {
-        "B": 0.5, "P": 0.5, "label": "大路資料不足", "strength": 0.0,
-        "break_risk": 0.0, "big_road": {}, "red_pressure": 0.5, "blue_pressure": 0.5,
+        "B": 0.5,
+        "P": 0.5,
+        "pick": "",
+        "label": "大路結構資料不足(不投票)",
+        "strength": 0.0,
+        "break_risk": 0.0,
+        "big_road": {},
+        "red_pressure": 0.5,
+        "blue_pressure": 0.5,
+        "directional_vote": False,
     }
     if not USE_ROAD_ENGINE or len(non_tie) < ROAD_ENGINE_MIN_HISTORY:
         return default
@@ -1711,7 +1767,6 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
     last_side, streak_n = _streak(non_tie)
     if not last_side:
         return default
-    opp = "P" if last_side == "B" else "B"
 
     recent = non_tie[-16:]
     switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
@@ -1722,15 +1777,24 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
     last_row = int(last.get("row", 0))
     col_heights = layout.get("col_heights", {})
     current_col_height = int(col_heights.get(last_col, 0))
+    height_tail = [int(col_heights.get(c, 0)) for c in sorted(col_heights)[-8:]]
 
     big_eye_stats = _color_stats(_derived_series(layout, 1))
     small_road_stats = _color_stats(_derived_series(layout, 2))
     cockroach_stats = _color_stats(_derived_series(layout, 3))
 
-    red_rates = [float(x.get("red_rate", 0.5)) for x in [big_eye_stats, small_road_stats, cockroach_stats] if x.get("count", 0) > 0]
-    blue_rates = [float(x.get("blue_rate", 0.5)) for x in [big_eye_stats, small_road_stats, cockroach_stats] if x.get("count", 0) > 0]
-    red_pressure = sum(red_rates) / len(red_rates) if red_rates else 0.5
-    blue_pressure = sum(blue_rates) / len(blue_rates) if blue_rates else 0.5
+    valid_stats = [
+        x for x in (big_eye_stats, small_road_stats, cockroach_stats)
+        if int(x.get("count", 0) or 0) >= DERIVED_ROAD_MIN_COUNT
+    ]
+    red_pressure = (
+        sum(float(x.get("red_rate", 0.5)) for x in valid_stats) / len(valid_stats)
+        if valid_stats else 0.5
+    )
+    blue_pressure = (
+        sum(float(x.get("blue_rate", 0.5)) for x in valid_stats) / len(valid_stats)
+        if valid_stats else 0.5
+    )
 
     break_risk = 0.0
     if streak_n >= ROAD_ENGINE_BREAK_STREAK:
@@ -1741,56 +1805,30 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
         break_risk += min(0.24, (blue_pressure - 0.5) * 0.70)
     if switch_rate >= 0.72:
         break_risk += 0.10
+    if len(height_tail) >= 4:
+        height_changes = sum(1 for a, b in zip(height_tail, height_tail[1:]) if a != b)
+        break_risk += min(0.10, _safe_div(height_changes, len(height_tail) - 1, 0.0) * 0.10)
     break_risk = _clamp(break_risk, 0.0, 0.85)
 
-    label = "大路混合"
-    strength = 0.10
-    side = last_side
-    edge = 0.022
-
-    if switch_rate >= 0.72:
-        side = opp
-        edge = 0.050 + min(0.018, (switch_rate - 0.72) * 0.12)
-        label = "大路單跳"
-        strength = 0.16
-    elif streak_n >= 4:
-        cont_edge = 0.050 + min(0.030, (streak_n - 4) * 0.007)
-        label = "大路長龍延續"
-        if blue_pressure >= 0.60 or break_risk >= 0.62:
-            side = opp
-            edge = min(0.052, cont_edge * 0.68 + ROAD_ENGINE_BLUE_BREAK_BIAS * 0.50)
-            label = "大路斷龍壓力"
-        else:
-            side = last_side
-            edge = cont_edge + (ROAD_ENGINE_RED_CONT_BIAS if red_pressure >= 0.58 else 0.0)
-        edge = _clamp(edge, 0.025, 0.085)
-        strength = 0.18 + min(0.06, streak_n * 0.006)
+    if streak_n >= 4:
+        structure_label = f"長龍結構{streak_n}口"
+    elif switch_rate >= 0.72:
+        structure_label = "單跳密集結構"
     elif current_col_height >= 3:
-        side = last_side
-        edge = 0.038
-        label = "大路欄高延續"
-        strength = 0.14
-    elif blue_pressure >= 0.64:
-        side = opp
-        edge = 0.034 + ROAD_ENGINE_BLUE_BREAK_BIAS * 0.35
-        label = "大路藍路變化"
-        strength = 0.13
-    elif red_pressure >= 0.64:
-        side = last_side
-        edge = 0.034 + ROAD_ENGINE_RED_CONT_BIAS * 0.35
-        label = "大路紅路整齊"
-        strength = 0.13
+        structure_label = f"欄高結構{current_col_height}格"
+    else:
+        structure_label = "混合欄型結構"
 
-    b = 0.5 + edge if side == "B" else 0.5 - edge
-    p = 1 - b
     return {
-        "B": b,
-        "P": p,
-        "label": label,
-        "strength": round(strength, 4),
+        "B": 0.5,
+        "P": 0.5,
+        "pick": "",
+        "label": f"大路結構分析(不投票):{structure_label}",
+        "strength": 0.0,
         "break_risk": round(break_risk, 4),
         "red_pressure": round(red_pressure, 4),
         "blue_pressure": round(blue_pressure, 4),
+        "directional_vote": False,
         "big_road": {
             "last_side": last_side,
             "last_col": last_col,
@@ -1800,9 +1838,15 @@ def _big_road_score(non_tie: List[str]) -> Dict[str, Any]:
             "is_dragon": streak_n >= 4,
             "streak": streak_n,
             "switch_rate_16": round(switch_rate, 4),
+            "height_tail": height_tail,
+            "structure_label": structure_label,
+        },
+        "derived_background": {
+            "big_eye": big_eye_stats,
+            "small_road": small_road_stats,
+            "cockroach": cockroach_stats,
         },
     }
-
 
 def _derived_road_score(non_tie: List[str], offset: int, road_key: str, display_name: str) -> Dict[str, Any]:
     """單一衍生路：只評估該路紅藍節奏 + 小幅落點移動風險。
@@ -1902,73 +1946,71 @@ def _cockroach_score(non_tie: List[str]) -> Dict[str, Any]:
     return _derived_road_score(non_tie, offset=3, road_key="cockroach", display_name="蟑螂路")
 
 
-def _road_consensus_score(road_scores: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """大路 + 下三路家族的二來源共識。
 
-    大眼仔、小路、蟑螂路只保留為家族內部明細，不再各自對外投票。
-    """
+def _road_consensus_score(road_scores: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """下三路家族方向共識；大路只列為結構背景，不再參與方向或衝突票。"""
     big_road = road_scores.get("big_road", {}) or {}
     family = road_scores.get("down3_family", {}) or {}
-    source_scores = {"big_road": big_road, "down3_family": family}
-    source_weights = {"big_road": 0.56, "down3_family": 0.44}
 
-    details: Dict[str, Any] = {}
-    valid_picks: List[Tuple[str, str, float]] = []
-    for name, score in source_scores.items():
-        pick = score.get("pick", "") if name == "down3_family" else _strong_pick_from_score(score, min_gap=0.012)
-        confidence = float(score.get("confidence", score.get("strength", 0.0)) or 0.0)
-        details[name] = {
-            "pick": pick,
-            "weight": source_weights[name],
-            "label": score.get("label", ""),
-            "B": round(float(score.get("B", 0.5)), 4),
-            "P": round(float(score.get("P", 0.5)), 4),
-            "confidence": round(confidence, 4),
-        }
-        if pick in {"B", "P"}:
-            valid_picks.append((name, pick, source_weights[name]))
-
-    b_raw = sum(float(source_scores[k].get("B", 0.5)) * source_weights[k] for k in source_scores)
-    p_raw = sum(float(source_scores[k].get("P", 0.5)) * source_weights[k] for k in source_scores)
-    b, p = (0.5, 0.5) if b_raw + p_raw <= 0 else (b_raw / (b_raw + p_raw), p_raw / (b_raw + p_raw))
-
-    if len(valid_picks) == 2 and valid_picks[0][1] == valid_picks[1][1]:
-        side = valid_picks[0][1]
-        consensus_ratio = _clamp(0.72 + abs(b - p) * 1.8, 0.72, 0.95)
-        conflict_ratio = 1.0 - consensus_ratio
-        label = f"大路/下三路家族共識:{'莊' if side == 'B' else '閒'}"
-    elif len(valid_picks) == 2:
-        side = ""
-        consensus_ratio = 0.50
-        conflict_ratio = 0.50
-        label = "大路與下三路家族衝突"
-    elif len(valid_picks) == 1:
-        side = valid_picks[0][1]
-        consensus_ratio = 0.58
-        conflict_ratio = 0.42
-        label = f"僅{valid_picks[0][0]}有方向"
+    family_pick = str(family.get("pick", "") or "")
+    b = float(family.get("B", 0.5) or 0.5)
+    p = float(family.get("P", 0.5) or 0.5)
+    total = b + p
+    if total <= 0:
+        b, p = 0.5, 0.5
     else:
-        side = ""
+        b, p = b / total, p / total
+
+    agreement_ratio = float(family.get("agreement_ratio", 0.0) or 0.0)
+    family_conf = float(family.get("confidence", 0.0) or 0.0)
+    if family_pick in {"B", "P"}:
+        consensus_ratio = _clamp(max(agreement_ratio, 0.50 + family_conf * 0.35), 0.50, 0.95)
+        conflict_ratio = 1.0 - consensus_ratio
+        label = f"下三路家族主判:{'莊' if family_pick == 'B' else '閒'}"
+        votes = [family_pick]
+        source_count = 1
+    else:
         consensus_ratio = 0.50
         conflict_ratio = 0.50
-        label = "大路/下三路家族皆無明確方向"
+        label = "下三路家族未達方向門檻"
+        votes = []
+        source_count = 0
 
     return {
         "B": round(b, 5),
         "P": round(p, 5),
         "label": label,
-        "pick": side,
-        "votes": [pick for _, pick, _ in valid_picks],
+        "pick": family_pick if family_pick in {"B", "P"} else "",
+        "votes": votes,
         "vote_score": {
-            "B": round(sum(w for _, pick, w in valid_picks if pick == "B"), 4),
-            "P": round(sum(w for _, pick, w in valid_picks if pick == "P"), 4),
+            "B": 1.0 if family_pick == "B" else 0.0,
+            "P": 1.0 if family_pick == "P" else 0.0,
         },
         "consensus_ratio": round(consensus_ratio, 4),
         "conflict_ratio": round(conflict_ratio, 4),
-        "details": details,
-        "strength": round(0.08 + max(0.0, consensus_ratio - 0.5) * 0.28, 4),
-        "source_count": len(valid_picks),
+        "details": {
+            "big_road": {
+                "pick": "",
+                "weight": 0.0,
+                "label": big_road.get("label", "大路結構分析(不投票)"),
+                "B": 0.5,
+                "P": 0.5,
+                "confidence": 0.0,
+                "break_risk": big_road.get("break_risk", 0.0),
+            },
+            "down3_family": {
+                "pick": family_pick if family_pick in {"B", "P"} else "",
+                "weight": 1.0,
+                "label": family.get("label", ""),
+                "B": round(b, 4),
+                "P": round(p, 4),
+                "confidence": round(family_conf, 4),
+            },
+        },
+        "strength": round(family_conf * 0.25, 4),
+        "source_count": source_count,
         "family_vote_counted_once": True,
+        "big_road_direction_disabled": True,
     }
 
 def _road_family_scores(non_tie: List[str]) -> Dict[str, Any]:
@@ -2028,7 +2070,7 @@ def _road_lifecycle_score(non_tie: List[str], road_family: Dict[str, Any], regim
     small_road = road_family.get("small_road", {})
     cockroach = road_family.get("cockroach", {})
 
-    trend_side = consensus.get("pick", "") or last_side
+    trend_side = consensus.get("pick", "")
     consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
     conflict_ratio = float(consensus.get("conflict_ratio", 0.5))
 
@@ -2109,11 +2151,11 @@ def _road_lifecycle_score(non_tie: List[str], road_family: Dict[str, Any], regim
         bias_side = ""
     elif break_score >= BREAK_FORCE_SCORE:
         state = "BROKEN"
-        bias_side = opp if trend_side == last_side else ("P" if trend_side == "B" else "B")
+        bias_side = (opp if trend_side == last_side else ("P" if trend_side == "B" else "B")) if trend_side in {"B", "P"} else ""
     elif break_score >= BREAK_SCORE_MIN:
         state = "BREAK_RISK"
-        bias_side = opp if trend_side == last_side else ("P" if trend_side == "B" else "B")
-    elif follow_score >= FOLLOW_SCORE_MIN and break_score < BREAK_SCORE_MIN:
+        bias_side = (opp if trend_side == last_side else ("P" if trend_side == "B" else "B")) if trend_side in {"B", "P"} else ""
+    elif trend_side in {"B", "P"} and follow_score >= FOLLOW_SCORE_MIN and break_score < BREAK_SCORE_MIN:
         state = "FOLLOW"
         bias_side = trend_side
     elif fatigue_score >= 0.48 or break_score >= 0.52:
@@ -2207,6 +2249,8 @@ def _apply_lifecycle_bias(b_side: float, lifecycle: Dict[str, Any]) -> float:
     state = lifecycle.get("state", "NEUTRAL")
     bias_side = lifecycle.get("bias_side", "")
     trend_side = lifecycle.get("trend_side", "")
+    if trend_side not in {"B", "P"}:
+        return b_side
     follow_score = float(lifecycle.get("follow_score", 0.5))
     break_score = float(lifecycle.get("break_score", 0.0))
     fatigue_score = float(lifecycle.get("fatigue_score", 0.0))
@@ -2250,7 +2294,7 @@ def _road_state_fingerprint(non_tie: List[str], road_family: Dict[str, Any], lif
     last_side, streak_n = _streak(non_tie)
     opp = "P" if last_side == "B" else "B" if last_side == "P" else ""
     consensus = road_family.get("consensus", {}) if road_family else {}
-    trend_side = lifecycle.get("trend_side", "") or consensus.get("pick", "") or last_side
+    trend_side = lifecycle.get("trend_side", "") or consensus.get("pick", "")
 
     consensus_ratio = float(consensus.get("consensus_ratio", 0.5))
     conflict_ratio = float(consensus.get("conflict_ratio", 0.5))
@@ -4128,54 +4172,28 @@ def _fuhao_majority(votes: List[str], big_road_pick: str = "") -> Dict[str, Any]
     return {"pick": pick, "B": b_count, "P": p_count, "total": len(clean), "ratio": round(ratio, 4), "tie": tie}
 
 
+
 def _fuhao_big_road_vote(non_tie: List[str]) -> Dict[str, Any]:
+    """FUHAO 相容的大路結構報告器；不再跟最新一手，也不提供 B/P 票。"""
     if not non_tie:
-        return {"pick": "", "label": "大路資料不足", "confidence": 0.0, "details": {}}
+        return {"pick": "", "B": 0.5, "P": 0.5, "label": "大路資料不足(不投票)", "confidence": 0.0, "details": {}}
 
-    recent = non_tie[-16:]
-    last_side, streak_n = _streak(non_tie)
-    opp = "P" if last_side == "B" else "B"
-    switches = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
-    switch_rate = _safe_div(switches, max(1, len(recent) - 1), 0.5)
-    layout = _build_big_road(non_tie)
-    last_pos = layout.get("last", {})
-    last_col = int(last_pos.get("col", 0))
-    current_col_height = int(layout.get("col_heights", {}).get(last_col, 0))
-
-    # 富濠式大路核心：看最新欄/最新方向，規則命名只用來解釋。
-    pick = last_side
-    label = "大路跟最新欄"
-    confidence = 0.56
-
-    if streak_n >= FUHAO_LONG_THRESHOLD:
-        label = f"大路長龍{_fuhao_side_name(last_side)}{streak_n}口"
-        confidence = min(0.72, 0.58 + streak_n * 0.025)
-    elif len(recent) >= 6 and switch_rate >= 0.72:
-        # 單跳盤以反手作大路節奏判斷，避免固定死跟最後一欄。
-        pick = opp
-        label = "大路單跳節奏"
-        confidence = min(0.70, 0.56 + (switch_rate - 0.72) * 0.35)
-    elif len(non_tie) >= 6 and "".join(non_tie[-6:]) in {"BBPPBB", "PPBBPP", "BPPBBP", "PBBPPB"}:
-        pick = non_tie[-2]
-        label = "大路雙跳/排排連"
-        confidence = 0.62
-    elif current_col_height >= 3:
-        label = "大路欄高延續"
-        confidence = 0.60
-
+    structure = _big_road_score(non_tie)
+    details = dict(structure.get("big_road", {}) or {})
+    details.update({
+        "break_risk": structure.get("break_risk", 0.0),
+        "red_pressure": structure.get("red_pressure", 0.5),
+        "blue_pressure": structure.get("blue_pressure", 0.5),
+        "directional_vote": False,
+    })
     return {
-        "pick": pick,
-        "label": label,
-        "confidence": round(confidence, 4),
-        "details": {
-            "last_side": last_side,
-            "streak": streak_n,
-            "switch_rate": round(switch_rate, 4),
-            "current_col_height": current_col_height,
-            "last_col": last_col,
-        },
+        "pick": "",
+        "B": 0.5,
+        "P": 0.5,
+        "label": structure.get("label", "大路結構分析(不投票)"),
+        "confidence": 0.0,
+        "details": details,
     }
-
 
 def _fuhao_down3_vote(non_tie: List[str], offset: int, name: str) -> Dict[str, Any]:
     """FUHAO 單一下路明細；不加入全局欄型，也不直接成為外部完整票。"""
@@ -4922,69 +4940,48 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     ):
         pattern_pick = str(pattern_replay.get("bias_side", ""))
 
-    # 3) 最後整合：下三路家族只提供候選，必須取得大路 / Pattern Replay / Advanced 之一確認。
+    # 3) 最後整合：下三路家族通過自身有效路數、同向數與差距門檻後，直接成為 final。
+    # Pattern Replay / Advanced 僅保留為資訊與信心校準，不再具有否決或反向定案權。
     candidate_pick = down3_family_pick if down3_family_pick in {"B", "P"} else ""
     confirm_sources: Dict[str, str] = {}
     if candidate_pick:
-        if big_road_pick == candidate_pick:
-            confirm_sources["big_road"] = big_road_pick
         if pattern_pick == candidate_pick:
             confirm_sources["pattern_replay"] = pattern_pick
         if advanced_pick == candidate_pick:
             confirm_sources["advanced"] = advanced_pick
 
-    dense_conflict = bool(
-        dense_board.get("is_dense")
-        and candidate_pick in {"B", "P"}
-        and big_road_pick in {"B", "P"}
-        and candidate_pick != big_road_pick
-    )
-    non_road_confirm = sum(1 for k in confirm_sources if k != "big_road")
+    dense_conflict = False  # 大路不投方向後，不再存在大路/下三路方向衝突門檻。
+    non_road_confirm = len(confirm_sources)
 
-    if candidate_pick and len(confirm_sources) >= max(1, FINAL_CONFIRM_MIN_SOURCES):
-        if dense_conflict and DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM and non_road_confirm < 1:
-            final_pick = ""
-            final_source = "dense_conflict_unconfirmed"
-        else:
-            final_pick = candidate_pick
-            final_source = "down3_family+" + "+".join(sorted(confirm_sources.keys()))
-    elif not candidate_pick and big_road_pick in {"B", "P"} and pattern_pick == big_road_pick:
-        final_pick = big_road_pick
-        final_source = "big_road+pattern_replay"
-        confirm_sources = {"big_road": big_road_pick, "pattern_replay": pattern_pick}
-    elif not candidate_pick and advanced_pick in {"B", "P"} and pattern_pick == advanced_pick:
-        final_pick = advanced_pick
-        final_source = "advanced+pattern_replay"
-        confirm_sources = {"advanced": advanced_pick, "pattern_replay": pattern_pick}
+    if candidate_pick:
+        final_pick = candidate_pick
+        final_source = "down3_family_self_gate"
     else:
         final_pick = ""
-        final_source = "no_independent_confirmation"
+        final_source = "down3_family_not_ready"
 
-    # 外部票最多四個家族來源：大路、下三路家族、Pattern Replay、Advanced 家族。
-    all_votes = [v for v in [big_road_pick, down3_family_pick, pattern_pick, advanced_pick] if v in {"B", "P"}]
-    all_majority = _fuhao_majority(all_votes, big_road_pick=road_tiebreak_pick)
-    vote_ratio = float(all_majority.get("ratio", 0.0)) if all_majority.get("total", 0) else 0.0
-    final_vote_count = all_votes.count(final_pick) if final_pick in {"B", "P"} else 0
-    derived_votes = [down3_family_pick] if down3_family_pick in {"B", "P"} else []
-    derived_majority = {"pick": down3_family_pick, "B": 1 if down3_family_pick == "B" else 0, "P": 1 if down3_family_pick == "P" else 0, "total": len(derived_votes), "ratio": 1.0 if derived_votes else 0.0, "tie": False}
-    derived_confirm_count = 1 if final_pick and down3_family_pick == final_pick else 0
-    non_bigroad_confirm_count = sum(1 for k, v in confirm_sources.items() if k != "big_road" and v == final_pick)
+    # 外部票只供 debug；最終方向與機率強度以家族內 agreement_ratio 為主。
+    all_votes = [v for v in [down3_family_pick, pattern_pick, advanced_pick] if v in {"B", "P"}]
+    all_majority = _fuhao_majority(all_votes, big_road_pick="")
     derived_ratio = float(road_models.get("down3_family", {}).get("agreement_ratio", 0.0) or 0.0)
+    vote_ratio = max(0.5, derived_ratio) if final_pick in {"B", "P"} else 0.5
+    final_vote_count = 1 if final_pick in {"B", "P"} else 0
+    derived_votes = [down3_family_pick] if down3_family_pick in {"B", "P"} else []
+    derived_majority = {
+        "pick": down3_family_pick,
+        "B": 1 if down3_family_pick == "B" else 0,
+        "P": 1 if down3_family_pick == "P" else 0,
+        "total": len(derived_votes),
+        "ratio": derived_ratio if derived_votes else 0.0,
+        "tie": False,
+    }
+    derived_confirm_count = 1 if final_pick and down3_family_pick == final_pick else 0
+    non_bigroad_confirm_count = sum(1 for _, v in confirm_sources.items() if v == final_pick)
 
     observe_reason = ""
     recommend = final_pick if final_pick in {"B", "P"} else "NONE"
     if recommend == "NONE":
-        if dense_conflict:
-            observe_reason = "密集盤中下三路家族與大路衝突，未取得 Pattern Replay/獨立模型確認"
-        elif candidate_pick and not confirm_sources:
-            observe_reason = "下三路家族只有候選方向，沒有大路、Pattern Replay或獨立模型確認"
-        elif candidate_pick and len(confirm_sources) < max(1, FINAL_CONFIRM_MIN_SOURCES):
-            observe_reason = f"候選僅取得{len(confirm_sources)}個獨立確認，未達{FINAL_CONFIRM_MIN_SOURCES}"
-        else:
-            observe_reason = "沒有形成可被獨立來源確認的最終方向"
-    elif final_vote_count < 2:
-        recommend = "NONE"
-        observe_reason = "最終方向未形成至少兩個家族來源同向"
+        observe_reason = "下三路家族未達有效路數、同向數或最小差距門檻"
 
     if (
         recommend in {"B", "P"}
@@ -4993,8 +4990,9 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         and advanced_pick != recommend
         and FUHAO_OBSERVE_ON_CONFLICT
     ):
+        # 相容舊環境變數；預設已關閉。打開時也只允許觀望，不可改成 Advanced 方向。
         recommend = "NONE"
-        observe_reason = f"最終方向{_fuhao_side_name(final_pick)}與Advanced{_fuhao_side_name(advanced_pick)}衝突"
+        observe_reason = f"下三路方向{_fuhao_side_name(final_pick)}與Advanced{_fuhao_side_name(advanced_pick)}衝突"
 
     # 3.5) 假規律 / 轉折保護模型：修正一直押多數方、長龍假斷、路單轉折慢。
     fake_pattern = _fuhao_fake_pattern_detector(
@@ -5025,14 +5023,25 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
             fake_reason = f"{fake_reason}：{fake_detail}" if fake_detail else fake_reason
             observe_reason = f"{observe_reason}；{fake_reason}" if observe_reason else fake_reason
         elif fake_action == "REVERSE_TURN" and guarded_pick in {"B", "P"}:
-            decision_pick = guarded_pick
-            decision_source = f"{final_source}+fake_pattern_reverse"
-            decision_vote_ratio = max(0.5, guarded_ratio)
-            recommend = decision_pick
-            observe_reason = ""
+            if DOWN3_CORE_LOCK_DIRECTION and final_pick in {"B", "P"}:
+                decision_pick = final_pick
+                decision_source = f"{final_source}+fake_pattern_reverse_blocked"
+                decision_vote_ratio = max(0.5, vote_ratio)
+                recommend = final_pick
+                observe_reason = ""
+            else:
+                decision_pick = guarded_pick
+                decision_source = f"{final_source}+fake_pattern_reverse"
+                decision_vote_ratio = max(0.5, guarded_ratio)
+                recommend = decision_pick
+                observe_reason = ""
         else:
-            decision_pick = guarded_pick if guarded_pick in {"B", "P"} else final_pick
-            decision_vote_ratio = max(0.5, guarded_ratio if guarded_pick else vote_ratio)
+            if DOWN3_CORE_LOCK_DIRECTION and final_pick in {"B", "P"}:
+                decision_pick = final_pick
+                decision_vote_ratio = max(0.5, vote_ratio)
+            else:
+                decision_pick = guarded_pick if guarded_pick in {"B", "P"} else final_pick
+                decision_vote_ratio = max(0.5, guarded_ratio if guarded_pick else vote_ratio)
     elif fake_action.startswith("OBSERVE"):
         recommend = "NONE"
         fake_reason = fake_pattern.get("label", "假規律/轉折風險")
@@ -5050,6 +5059,13 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     tie_prob = _clamp(FUHAO_TIE_BASE * (1 - FUHAO_TIE_SHRINK) + recent_tie_rate * FUHAO_TIE_SHRINK, 0.001, TIE_MAX_PROB)
     b_prob, p_prob, tie_prob = _fuhao_probs_from_votes(prob_pick if prob_pick in {"B", "P"} else "", max(0.5, decision_vote_ratio), tie_prob)
     b_prob, p_prob, tie_prob = _fuhao_apply_fake_pattern_shrink(b_prob, p_prob, tie_prob, fake_pattern)
+    b_prob, p_prob, tie_prob = _anchor_probs_to_down3_pick(
+        b_prob,
+        p_prob,
+        tie_prob,
+        prob_pick,
+        float(road_models.get("down3_family", {}).get("gap", 0.0) or 0.0),
+    )
     edge = abs(b_prob - p_prob)
 
     agreement = all_votes.count(decision_pick) / max(1, len(all_votes)) if decision_pick in {"B", "P"} else 0.0
@@ -5147,6 +5163,13 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
                     p_prob += pa * blend
                     tie_prob += ta * blend
                     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+                    b_prob, p_prob, tie_prob = _anchor_probs_to_down3_pick(
+                        b_prob,
+                        p_prob,
+                        tie_prob,
+                        local_side,
+                        float(road_models.get("down3_family", {}).get("gap", 0.0) or 0.0),
+                    )
                     edge = abs(b_prob - p_prob)
 
                     if same_side:
@@ -5164,7 +5187,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
     elif USE_DEEPSEEK and FUHAO_USE_DEEPSEEK and len(history) < FUHAO_DEEPSEEK_MIN_HISTORY:
         ai_status = "not_enough_history"
 
-    road_consensus_label = f"大路+下三路家族:{_fuhao_side_name(road_majority.get('pick', ''))} B{road_majority.get('B', 0)} / P{road_majority.get('P', 0)}"
+    road_consensus_label = f"下三路家族主判:{_fuhao_side_name(down3_family_pick)} / 大路僅結構不投票"
     advanced_label = f"富濠Advanced多數決:{_fuhao_side_name(advanced_majority.get('pick', ''))} B{advanced_majority.get('B', 0)} / P{advanced_majority.get('P', 0)}"
 
     reason_parts = [
@@ -5194,7 +5217,7 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         reason_parts.append(f"DeepSeek:{ai_status} 偏{_fuhao_side_name(ai_side)} 信心{ai_conf:.2f}{(' ' + ai_reason) if ai_reason else ''}")
 
     dynamic_weights = {
-        "fuhao_big_road": 1.0 if FUHAO_USE_BIG_ROAD else 0.0,
+        "fuhao_big_road": 0.0,
         "fuhao_big_eye": 1.0 if FUHAO_USE_BIG_EYE else 0.0,
         "fuhao_small_road": 1.0 if FUHAO_USE_SMALL_ROAD else 0.0,
         "fuhao_cockroach": 0.0,
@@ -5244,6 +5267,8 @@ def _fuhao_clone_predict(history: List[str], venue: str = "", room: str = "", sh
         "observe_reason": observe_reason,
         "decision_edge": round(edge, 5),
         "side_clamp": {"min": 0.5 - FUHAO_MAX_EDGE, "max": 0.5 + FUHAO_MAX_EDGE},
+        "direction_core": "DOWN3_CANDIDATE_SIMULATION",
+        "direction_locked": DOWN3_CORE_LOCK_DIRECTION,
         "confidence": round(conf, 3),
         "signal_level": level,
         "pattern_label": advanced_label,
@@ -5486,7 +5511,7 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         + balance["B"] * dynamic_weights.get("balance", 0.0)
     ) / total_w
 
-    # 四路共識很高時，輕微加強；四路分歧時，輕微回收到 0.5，避免互打。
+    # 下三路家族共識只調整強弱；大路不再參與方向共識。
     consensus_pick = road_consensus.get("pick", "")
     consensus_ratio = float(road_consensus.get("consensus_ratio", 0.5))
     conflict_ratio = float(road_consensus.get("conflict_ratio", 0.5))
@@ -5640,8 +5665,16 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
             except Exception:
                 pass
 
-    # ============ 4. 正規化 ==========
+    # ============ 4. 正規化 + 下三路方向鎖定 ==========
     b_prob, p_prob, tie_prob = _normalize_three(b_prob, p_prob, tie_prob)
+    down3_pick = str(down3_family.get("pick", "") or "")
+    b_prob, p_prob, tie_prob = _anchor_probs_to_down3_pick(
+        b_prob,
+        p_prob,
+        tie_prob,
+        down3_pick,
+        float(down3_family.get("gap", 0.0) or 0.0),
+    )
 
     # ============ 5. 投票一致性 ==========
     votes = []
@@ -5665,13 +5698,14 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         current_model_picks["ml_ensemble"] = "B" if ml_b_prob >= 0.5 else "P"
         votes.append(current_model_picks["ml_ensemble"])
 
-    main_pick = "B" if b_prob >= p_prob else "P"
-    agreement = votes.count(main_pick) / len(votes) if votes else 0.5
+    probability_pick = "B" if b_prob >= p_prob else "P"
+    main_pick = down3_pick if down3_pick in {"B", "P"} else ""
+    agreement = votes.count(main_pick) / len(votes) if (votes and main_pick) else 0.5
 
     if ml_models.is_trained:
         ml_pick = "B" if ml_b_prob >= 0.5 else "P"
         ml_strength = abs(ml_b_prob - 0.5) * 2
-        ml_agreement = ml_strength if ml_pick == main_pick else 0.0
+        ml_agreement = ml_strength if main_pick and ml_pick == main_pick else 0.0
     else:
         ml_agreement = 0.0
 
@@ -5681,11 +5715,10 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
     edge = abs(b_prob - p_prob)
     observe_reason = ""
     lifecycle_state = str(lifecycle.get("state", "")).upper() if lifecycle.get("enabled") else ""
-    down3_pick = str(down3_family.get("pick", "") or "")
-    big_road_pick = _strong_pick_from_score(big_road, min_gap=FINAL_CONFIRM_SCORE_GAP)
+    big_road_pick = ""  # 大路僅結構，不再提供方向票
     ml_pick_for_confirm = ("B" if ml_b_prob >= 0.5 else "P") if ml_models.is_trained else ""
     final_confirmation = _final_confirmation_summary(
-        target=main_pick,
+        target=down3_pick,
         big_road=big_road,
         pattern_replay=pattern_replay,
         independent_scores={"ngram": ngram, "markov": markov, "road_pattern": road},
@@ -5701,36 +5734,16 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
 
     if ALLOW_TIE_RECOMMEND and tie_prob >= TIE_RECOMMEND_MIN and tie_prob > max(b_prob, p_prob) * 0.55:
         recommend = "T"
-    elif (
-        ALLOW_OBSERVE
-        and down3_pick == main_pick
-        and not final_confirmation.get("confirmed")
-    ):
+    elif down3_pick not in {"B", "P"}:
         recommend = "NONE"
-        observe_reason = "下三路家族只有候選方向，尚未取得大路、Pattern Replay或獨立模型確認"
-    elif (
-        ALLOW_OBSERVE
-        and dense_conflict
-        and down3_pick == main_pick
-        and DENSE_CONFLICT_REQUIRE_NON_ROAD_CONFIRM
-        and int(final_confirmation.get("non_road_count", 0)) < 1
-    ):
-        recommend = "NONE"
-        observe_reason = "密集盤下三路家族與大路衝突，未取得非大路獨立確認"
+        observe_reason = "下三路家族未達有效路數、同向數或最小差距門檻"
     elif (
         ALLOW_OBSERVE
         and edge < OBSERVE_EDGE_MIN
         and conf < OBSERVE_CONF_MAX
     ):
         recommend = "NONE"
-        observe_reason = f"莊閒差距{edge * 100:.1f}%且信心不足"
-    elif (
-        ALLOW_OBSERVE
-        and conflict_ratio >= OBSERVE_CONFLICT_MIN
-        and conf < OBSERVE_CONFLICT_CONF_MAX
-    ):
-        recommend = "NONE"
-        observe_reason = f"四路分歧{int(conflict_ratio * 100)}%且信心不足"
+        observe_reason = f"下三路方向已形成，但莊閒差距{edge * 100:.1f}%且信心不足"
     elif (
         ALLOW_OBSERVE
         and lifecycle_state in OBSERVE_LIFECYCLE_STATES
@@ -5739,13 +5752,13 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         recommend = "NONE"
         observe_reason = f"生命周期{lifecycle_state}且信心不足"
     else:
-        recommend = main_pick
+        recommend = down3_pick
 
     recommend_text_map = {"B": "莊", "P": "閒", "T": "和", "NONE": "觀望"}
 
     # ============ 7. 原因說明 ==========
     reason_parts = [
-        f"大路/下三路家族:{road_consensus.get('label', '')}",
+        f"下三路主判:{road_consensus.get('label', '')}",
         f"下三路家族:{down3_family.get('label', '')}",
         f"密集盤:{dense_board.get('label', '')}",
         f"問路記憶:{ask_road_performance.get('label', '')}",
@@ -5812,6 +5825,8 @@ def predict(history: List[str], venue: str = "", room: str = "", shoe_id: str = 
         "observe_reason": observe_reason,
         "decision_edge": round(edge, 5),
         "side_clamp": {"min": SIDE_CLAMP_MIN, "max": SIDE_CLAMP_MAX},
+        "direction_core": "DOWN3_CANDIDATE_SIMULATION",
+        "direction_locked": DOWN3_CORE_LOCK_DIRECTION,
         "confidence": round(conf, 3),
         "signal_level": level,
         "pattern_label": road.get("label", ""),
