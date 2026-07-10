@@ -1,8 +1,5 @@
-fastapi==0.115.8
-uvicorn[standard]==0.34.0
-requests==2.32.3
-python-dotenv==1.0.1
-pydantic==2.10.6
-numpy
-scikit-learn
+fastapi[standard]==0.139.0
+pydantic>=2.0,<3.0
+requests>=2.31,<3.0
+numpy>=1.26,<2.4
 tensorflow-cpu==2.21.0
