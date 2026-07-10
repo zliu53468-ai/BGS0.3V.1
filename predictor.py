@@ -1,3 +1,4 @@
+"""
 Baccarat predictor: per-UID LSTM + Markov + DeepSeek hybrid model.
 
 Core design
