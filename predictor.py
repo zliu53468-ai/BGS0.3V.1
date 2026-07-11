@@ -4,9 +4,9 @@ Baccarat predictor: per-UID LSTM + Markov + DeepSeek hybrid model.
 Core design
 -----------
 1. Input: Big Road sequence containing B / P / T.
-2. LSTM: sequence_length=12, units=128, 3-class softmax output.
-3. Markov: transition probabilities from the latest result with alpha smoothing.
-4. Fusion: LSTM 0.55 + Markov 0.30 + DeepSeek 0.15.
+2. LSTM: two-layer Bidirectional LSTM with class weighting and replay training.
+3. Markov: 3-5 hand n-gram transitions with first-order backoff and alpha smoothing.
+4. Fusion: LSTM 0.60 + Markov 0.25 + DeepSeek 0.15, followed by configurable streak anti-follow calibration.
 5. Each LINE UID / venue / room / shoe gets an isolated model state.
 
 The public ``predict`` signature and the most commonly used response fields are
@@ -88,17 +88,20 @@ MAX_UID_MODELS = _env_int("MAX_UID_MODELS", 12, minimum=1)
 
 USE_LSTM = _env_bool("USE_LSTM", True)
 LSTM_SEQUENCE_LENGTH = _env_int("LSTM_SEQUENCE_LENGTH", 12, minimum=2)
-LSTM_UNITS = _env_int("LSTM_UNITS", 128, minimum=4)
-LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.20, minimum=0.0, maximum=0.80)
-LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 32, minimum=3)
-LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.001, minimum=0.000001)
-LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 8, minimum=1)
-LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 2, minimum=1)
+LSTM_UNITS = _env_int("LSTM_UNITS", 160, minimum=8)
+LSTM_SECOND_UNITS = _env_int("LSTM_SECOND_UNITS", 80, minimum=4)
+LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.35, minimum=0.0, maximum=0.80)
+LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 48, minimum=3)
+LSTM_L2 = _env_float("LSTM_L2", 0.0005, minimum=0.0, maximum=0.10)
+LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.0008, minimum=0.000001)
+LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 16, minimum=1)
+LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 4, minimum=1)
 LSTM_BATCH_SIZE = _env_int("LSTM_BATCH_SIZE", 8, minimum=1)
-LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 12, minimum=1)
+LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 10, minimum=1)
 LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 5, minimum=1)
-LSTM_VALIDATION_MIN_SAMPLES = _env_int("LSTM_VALIDATION_MIN_SAMPLES", 30, minimum=4)
-LSTM_EARLY_STOP_PATIENCE = _env_int("LSTM_EARLY_STOP_PATIENCE", 2, minimum=0)
+LSTM_ONLINE_REPLAY_SAMPLES = _env_int("LSTM_ONLINE_REPLAY_SAMPLES", 24, minimum=0)
+LSTM_VALIDATION_MIN_SAMPLES = _env_int("LSTM_VALIDATION_MIN_SAMPLES", 24, minimum=4)
+LSTM_EARLY_STOP_PATIENCE = _env_int("LSTM_EARLY_STOP_PATIENCE", 3, minimum=0)
 LSTM_CLASS_WEIGHT = _env_bool("LSTM_CLASS_WEIGHT", True)
 LSTM_CLASS_WEIGHT_MAX = _env_float("LSTM_CLASS_WEIGHT_MAX", 3.0, minimum=1.0)
 LSTM_VERBOSE = _env_int("LSTM_VERBOSE", 0, minimum=0)
@@ -107,6 +110,10 @@ LSTM_FALLBACK_PRIOR_STRENGTH = _env_float(
 )
 
 MARKOV_ALPHA = _env_float("MARKOV_ALPHA", 2.5, minimum=0.000001)
+MARKOV_NGRAM_MIN = _env_int("MARKOV_NGRAM_MIN", 3, minimum=1)
+MARKOV_NGRAM_MAX = _env_int("MARKOV_NGRAM_MAX", 5, minimum=1)
+MARKOV_BACKOFF_WEIGHT = _env_float("MARKOV_BACKOFF_WEIGHT", 0.60, minimum=0.0)
+MARKOV_ORDER_POWER = _env_float("MARKOV_ORDER_POWER", 1.25, minimum=0.0)
 
 USE_DEEPSEEK = _env_bool("USE_DEEPSEEK", True)
 DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.15, minimum=0.0)
@@ -114,8 +121,24 @@ DEEPSEEK_MIN_HISTORY = _env_int("DEEPSEEK_MIN_HISTORY", 6, minimum=0)
 DEEPSEEK_TIMEOUT_SECONDS = _env_float("DEEPSEEK_TIMEOUT_SECONDS", 8.0, minimum=1.0)
 DEEPSEEK_FALLBACK_MODE = os.getenv("DEEPSEEK_FALLBACK_MODE", "REDISTRIBUTE").strip().upper()
 
-LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.55, minimum=0.0)
-MARKOV_WEIGHT = _env_float("MARKOV_WEIGHT", 0.30, minimum=0.0)
+LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.60, minimum=0.0)
+MARKOV_WEIGHT = _env_float("MARKOV_WEIGHT", 0.25, minimum=0.0)
+
+STREAK_ANTI_FOLLOW_ENABLED = _env_bool("STREAK_ANTI_FOLLOW_ENABLED", True)
+STREAK_ANTI_FOLLOW_START = _env_int("STREAK_ANTI_FOLLOW_START", 4, minimum=2)
+STREAK_ANTI_FOLLOW_BASE = _env_float(
+    "STREAK_ANTI_FOLLOW_BASE", 0.30, minimum=0.0, maximum=0.90
+)
+STREAK_ANTI_FOLLOW_STEP = _env_float(
+    "STREAK_ANTI_FOLLOW_STEP", 0.02, minimum=0.0, maximum=0.50
+)
+STREAK_ANTI_FOLLOW_MAX = _env_float(
+    "STREAK_ANTI_FOLLOW_MAX", 0.38, minimum=0.0, maximum=0.95
+)
+STREAK_TIE_REDIRECT = _env_float(
+    "STREAK_TIE_REDIRECT", 0.08, minimum=0.0, maximum=0.50
+)
+STREAK_ONLY_WHEN_MODEL_FOLLOWS = _env_bool("STREAK_ONLY_WHEN_MODEL_FOLLOWS", True)
 
 B_PRIOR = _env_float("B_PRIOR", 0.4586, minimum=0.0001)
 P_PRIOR = _env_float("P_PRIOR", 0.4462, minimum=0.0001)
@@ -142,18 +165,27 @@ tf = None
 Sequential = None
 Input = None
 LSTM = None
+Bidirectional = None
 Dense = None
 Dropout = None
 Adam = None
 EarlyStopping = None
+l2 = None
 
 if USE_LSTM:
     try:
         import tensorflow as tf  # type: ignore[assignment]
         from tensorflow.keras.callbacks import EarlyStopping  # type: ignore[assignment]
-        from tensorflow.keras.layers import Dense, Dropout, Input, LSTM  # type: ignore[assignment]
+        from tensorflow.keras.layers import (  # type: ignore[assignment]
+            Bidirectional,
+            Dense,
+            Dropout,
+            Input,
+            LSTM,
+        )
         from tensorflow.keras.models import Sequential  # type: ignore[assignment]
         from tensorflow.keras.optimizers import Adam  # type: ignore[assignment]
+        from tensorflow.keras.regularizers import l2  # type: ignore[assignment]
 
         TF_AVAILABLE = True
         tf.random.set_seed(RANDOM_SEED)
@@ -398,12 +430,34 @@ def _build_lstm_model() -> Any:
     if not (USE_LSTM and TF_AVAILABLE):
         return None
 
+    regularizer = l2(LSTM_L2) if LSTM_L2 > 0.0 else None
     model = Sequential(
         [
             Input(shape=(LSTM_SEQUENCE_LENGTH, len(CLASS_NAMES))),
-            LSTM(LSTM_UNITS, return_sequences=False),
+            Bidirectional(
+                LSTM(
+                    LSTM_UNITS,
+                    return_sequences=True,
+                    kernel_regularizer=regularizer,
+                    recurrent_regularizer=regularizer,
+                )
+            ),
             Dropout(LSTM_DROPOUT),
-            Dense(LSTM_DENSE_UNITS, activation="relu"),
+            Bidirectional(
+                LSTM(
+                    LSTM_SECOND_UNITS,
+                    return_sequences=False,
+                    kernel_regularizer=regularizer,
+                    recurrent_regularizer=regularizer,
+                )
+            ),
+            Dropout(LSTM_DROPOUT),
+            Dense(
+                LSTM_DENSE_UNITS,
+                activation="relu",
+                kernel_regularizer=regularizer,
+            ),
+            Dropout(LSTM_DROPOUT * 0.5),
             Dense(len(CLASS_NAMES), activation="softmax"),
         ]
     )
@@ -524,8 +578,12 @@ def _train_lstm_if_needed(state: UIDModelState, history: Sequence[str], force: b
         target_start = LSTM_SEQUENCE_LENGTH
         epochs = LSTM_EPOCHS
     else:
-        # Online update: only train on targets that arrived after the previous fit.
-        target_start = max(LSTM_SEQUENCE_LENGTH, state.last_train_history_len)
+        # Online update replays recent targets together with new samples. This
+        # prevents a tiny 1-5 hand update from overfitting the newest direction.
+        target_start = max(
+            LSTM_SEQUENCE_LENGTH,
+            state.last_train_history_len - LSTM_ONLINE_REPLAY_SAMPLES,
+        )
         epochs = LSTM_ONLINE_EPOCHS
 
     if state.model is None:
@@ -585,6 +643,7 @@ def _train_lstm_if_needed(state: UIDModelState, history: Sequence[str], force: b
         "status": state.status,
         "samples": state.training_samples,
         "new_samples": len(X),
+        "replay_samples": max(0, state.last_train_history_len - target_start),
         "epochs": epochs,
         "train_count": state.train_count,
         "loss": state.last_loss,
@@ -614,6 +673,26 @@ def _predict_lstm(state: UIDModelState, history: Sequence[str]) -> Tuple[np.ndar
 # ---------------------------------------------------------------------------
 # Markov model
 # ---------------------------------------------------------------------------
+def _ngram_next_counts(
+    history: Sequence[str],
+    context_length: int,
+) -> Tuple[np.ndarray, str, int]:
+    """Count next outcomes after every historical match of the current suffix."""
+    counts = np.zeros(len(CLASS_NAMES), dtype=np.float64)
+    if context_length <= 0 or len(history) <= context_length:
+        return counts, "", 0
+
+    context = tuple(history[-context_length:])
+    # The current suffix has no known next result, so only scan earlier starts.
+    for start_index in range(0, len(history) - context_length):
+        if tuple(history[start_index : start_index + context_length]) != context:
+            continue
+        next_item = history[start_index + context_length]
+        counts[CLASS_TO_INDEX[next_item]] += 1.0
+
+    return counts, "".join(context), int(counts.sum())
+
+
 def _markov_probs(history: Sequence[str]) -> Tuple[np.ndarray, Dict[str, Any]]:
     prior = _prior_probs()
     transitions = np.zeros((len(CLASS_NAMES), len(CLASS_NAMES)), dtype=np.float64)
@@ -627,16 +706,78 @@ def _markov_probs(history: Sequence[str]) -> Tuple[np.ndarray, Dict[str, Any]]:
             "sample": 0,
             "alpha": MARKOV_ALPHA,
             "counts": {name: 0 for name in CLASS_NAMES},
+            "ngram_min": MARKOV_NGRAM_MIN,
+            "ngram_max": MARKOV_NGRAM_MAX,
+            "ngram_sample": 0,
+            "best_ngram_order": 0,
+            "best_ngram_context": "",
+            "ngrams": {},
         }
 
     last = history[-1]
     row = transitions[CLASS_TO_INDEX[last]]
     sample = int(row.sum())
 
-    # Dirichlet alpha smoothing around realistic B/P/T priors.
-    # Total pseudo-count strength is MARKOV_ALPHA.
-    smoothed = row + prior * MARKOV_ALPHA
-    probs = _normalize(smoothed, fallback=prior)
+    # First-order transition remains as a stable backoff when 3-5 hand
+    # contexts have few or no historical matches.
+    base_probs = _normalize(row + prior * MARKOV_ALPHA, fallback=prior)
+    components: List[Tuple[np.ndarray, float]] = []
+    if MARKOV_BACKOFF_WEIGHT > 0.0:
+        components.append((base_probs, MARKOV_BACKOFF_WEIGHT))
+
+    ngram_details: Dict[str, Any] = {}
+    ngram_total_sample = 0
+    best_order = 0
+    best_context = ""
+    best_score = -1.0
+
+    minimum_order = min(MARKOV_NGRAM_MIN, MARKOV_NGRAM_MAX)
+    maximum_order = max(MARKOV_NGRAM_MIN, MARKOV_NGRAM_MAX)
+    for order in range(minimum_order, maximum_order + 1):
+        counts, context, order_sample = _ngram_next_counts(history, order)
+        smoothed = counts + prior * MARKOV_ALPHA
+        order_probs = _normalize(smoothed, fallback=base_probs)
+
+        # Reliability rises with sample count. Higher orders receive more weight
+        # only when the exact current context has actually appeared before.
+        reliability = (
+            float(order_sample) / (float(order_sample) + MARKOV_ALPHA)
+            if order_sample > 0
+            else 0.0
+        )
+        order_scale = (float(order) / max(1.0, float(minimum_order))) ** MARKOV_ORDER_POWER
+        component_weight = reliability * order_scale
+        if component_weight > 0.0:
+            components.append((order_probs, component_weight))
+
+        score = float(order_sample) * order_scale
+        if score > best_score and order_sample > 0:
+            best_score = score
+            best_order = order
+            best_context = context
+
+        ngram_total_sample += order_sample
+        ngram_details[str(order)] = {
+            "order": order,
+            "context": context,
+            "sample": order_sample,
+            "counts": {
+                name: int(counts[CLASS_TO_INDEX[name]]) for name in CLASS_NAMES
+            },
+            "probabilities": _to_prob_dict(order_probs, digits=6),
+            "reliability": round(reliability, 6),
+            "weight": round(component_weight, 6),
+        }
+
+    if not components:
+        probs = base_probs
+    else:
+        weighted = np.zeros(len(CLASS_NAMES), dtype=np.float64)
+        total_weight = 0.0
+        for component_probs, component_weight in components:
+            weighted += component_probs * component_weight
+            total_weight += component_weight
+        probs = _normalize(weighted / max(total_weight, 1e-12), fallback=base_probs)
 
     return probs, {
         "last": last,
@@ -645,6 +786,13 @@ def _markov_probs(history: Sequence[str]) -> Tuple[np.ndarray, Dict[str, Any]]:
         "counts": {
             name: int(row[CLASS_TO_INDEX[name]]) for name in CLASS_NAMES
         },
+        "ngram_min": minimum_order,
+        "ngram_max": maximum_order,
+        "ngram_sample": ngram_total_sample,
+        "best_ngram_order": best_order,
+        "best_ngram_context": best_context,
+        "ngrams": ngram_details,
+        "backoff_weight": MARKOV_BACKOFF_WEIGHT,
         "transition_matrix": {
             source: {
                 target: int(transitions[CLASS_TO_INDEX[source], CLASS_TO_INDEX[target]])
@@ -794,7 +942,7 @@ def _deepseek_probs(
 def _configured_weights() -> Dict[str, float]:
     normalized = _normalize(
         [LSTM_WEIGHT, MARKOV_WEIGHT, DEEPSEEK_WEIGHT],
-        fallback=[0.55, 0.30, 0.15],
+        fallback=[0.60, 0.25, 0.15],
     )
     return {
         "lstm": float(normalized[0]),
@@ -843,6 +991,82 @@ def _fusion(
         + ai_component * weights["deepseek"]
     )
     return _normalize(final, fallback=_prior_probs()), weights
+
+
+def _streak(history: Sequence[str]) -> Tuple[str, int]:
+    """Return the current non-tie B/P streak; ties do not break a dragon."""
+    non_tie = [item for item in history if item in {"B", "P"}]
+    if not non_tie:
+        return "", 0
+
+    side = non_tie[-1]
+    length = 1
+    for item in reversed(non_tie[:-1]):
+        if item != side:
+            break
+        length += 1
+    return side, length
+
+
+def _apply_streak_anti_follow(
+    probabilities: Sequence[float],
+    history: Sequence[str],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Downweight following a B/P streak once it reaches the configured length."""
+    before = _normalize(probabilities, fallback=_prior_probs())
+    side, length = _streak(history)
+    info: Dict[str, Any] = {
+        "enabled": STREAK_ANTI_FOLLOW_ENABLED,
+        "applied": False,
+        "side": side,
+        "length": length,
+        "start": STREAK_ANTI_FOLLOW_START,
+        "penalty": 0.0,
+        "before": _to_prob_dict(before, digits=6),
+        "after": _to_prob_dict(before, digits=6),
+        "reason": "",
+    }
+
+    if not STREAK_ANTI_FOLLOW_ENABLED:
+        info["reason"] = "disabled"
+        return before, info
+    if side not in {"B", "P"} or length < STREAK_ANTI_FOLLOW_START:
+        info["reason"] = "streak_below_threshold"
+        return before, info
+
+    side_index = CLASS_TO_INDEX[side]
+    opposite = "P" if side == "B" else "B"
+    opposite_index = CLASS_TO_INDEX[opposite]
+    if STREAK_ONLY_WHEN_MODEL_FOLLOWS and before[side_index] < before[opposite_index]:
+        info["reason"] = "model_already_predicts_break"
+        return before, info
+
+    penalty = min(
+        STREAK_ANTI_FOLLOW_MAX,
+        STREAK_ANTI_FOLLOW_BASE
+        + max(0, length - STREAK_ANTI_FOLLOW_START) * STREAK_ANTI_FOLLOW_STEP,
+    )
+    penalty = _clamp(penalty, 0.0, 0.95)
+
+    adjusted = before.copy()
+    removed = float(adjusted[side_index]) * penalty
+    adjusted[side_index] = max(0.0, adjusted[side_index] - removed)
+    tie_share = removed * STREAK_TIE_REDIRECT
+    adjusted[CLASS_TO_INDEX["T"]] += tie_share
+    adjusted[opposite_index] += removed - tie_share
+    adjusted = _normalize(adjusted, fallback=before)
+
+    info.update(
+        {
+            "applied": True,
+            "penalty": round(penalty, 6),
+            "removed_probability": round(removed, 6),
+            "opposite": opposite,
+            "after": _to_prob_dict(adjusted, digits=6),
+            "reason": "long_streak_continuation_downweighted",
+        }
+    )
+    return adjusted, info
 
 
 def fit_history(
@@ -919,7 +1143,7 @@ def predict(
 
         markov_probs, markov_info = _markov_probs(cleaned)
 
-        local_weights = _normalize([LSTM_WEIGHT, MARKOV_WEIGHT], fallback=[0.55, 0.30])
+        local_weights = _normalize([LSTM_WEIGHT, MARKOV_WEIGHT], fallback=[0.60, 0.25])
         local_probs = _normalize(
             lstm_probs * local_weights[0] + markov_probs * local_weights[1],
             fallback=_prior_probs(),
@@ -936,10 +1160,14 @@ def predict(
             local_probs=local_probs,
         )
 
-        final_probs, effective_weights = _fusion(
+        pre_streak_probs, effective_weights = _fusion(
             lstm_probs=lstm_probs,
             markov_probs=markov_probs,
             deepseek_probs=ai_probs,
+        )
+        final_probs, streak_info = _apply_streak_anti_follow(
+            pre_streak_probs,
+            cleaned,
         )
 
         b_prob = float(final_probs[CLASS_TO_INDEX["B"]])
@@ -959,6 +1187,7 @@ def predict(
             "lstm": _to_prob_dict(lstm_probs, digits=6),
             "markov": _to_prob_dict(markov_probs, digits=6),
             "deepseek": _to_prob_dict(ai_probs, digits=6) if ai_probs is not None else None,
+            "pre_streak_final": _to_prob_dict(pre_streak_probs, digits=6),
             "final": _to_prob_dict(final_probs, digits=6),
         }
 
@@ -967,6 +1196,9 @@ def predict(
             f"Markov({effective_weights['markov']:.2f}) + "
             f"DeepSeek({effective_weights['deepseek']:.2f}); "
             f"LSTM={lstm_status}; DeepSeek={ai_status}; "
+            f"N-gram={markov_info.get('best_ngram_order', 0)}手/"
+            f"樣本{markov_info.get('ngram_sample', 0)}; "
+            f"長龍反跟={'已套用' if streak_info.get('applied') else '未套用'}; "
             f"莊閒方向信心={confidence * 100:.1f}%"
         )
 
@@ -996,8 +1228,11 @@ def predict(
             "signal_level": signal_level,
             "pattern_label": "LSTM+Markov+DeepSeek 三分類融合",
             "regime": "LSTM_MARKOV_DEEPSEEK",
-            "ngram_label": "",
-            "ngram_sample": 0,
+            "ngram_label": (
+                f"{markov_info.get('best_ngram_order', 0)}手N-gram "
+                f"{markov_info.get('best_ngram_context', '') or '無匹配'}"
+            ),
+            "ngram_sample": int(markov_info.get("ngram_sample", 0)),
             "big_road_label": "大路 B/P/T 序列作為 LSTM 輸入",
             "big_eye_label": "",
             "small_road_label": "",
@@ -1014,7 +1249,8 @@ def predict(
             "adaptive_road_memory": {},
             "pattern_replay_memory": {},
             "road_rhythm": {},
-            "long_anchor": {},
+            "long_anchor": streak_info,
+            "streak_anti_follow": streak_info,
             "online_model_performance": {},
             "live_walk_forward_performance": {},
             "ask_road_memory": {},
@@ -1033,7 +1269,10 @@ def predict(
             },
             "component_probs": component_probs,
             "markov": markov_info,
-            "markov_label": f"最後一手{markov_info.get('last') or '無'}轉移樣本{markov_info.get('sample', 0)}",
+            "markov_label": (
+                f"3-5手N-gram樣本{markov_info.get('ngram_sample', 0)}，"
+                f"一階後援樣本{markov_info.get('sample', 0)}"
+            ),
             "ai_used": ai_probs is not None,
             "ai_status": ai_status,
             "ai_result": ai_result if DEBUG_AI_RESULT else None,
@@ -1045,6 +1284,9 @@ def predict(
             "lstm_training": training_result,
             "lstm_sequence_length": LSTM_SEQUENCE_LENGTH,
             "lstm_units": LSTM_UNITS,
+            "lstm_second_units": LSTM_SECOND_UNITS,
+            "lstm_bidirectional": True,
+            "lstm_dropout": LSTM_DROPOUT,
             "training_key": training_key,
             "model_cache_size": len(_MODEL_CACHE),
             # Compatibility with older app/debug displays.
@@ -1072,6 +1314,8 @@ def predict(
                     "status": state.status,
                 },
                 "deepseek_import_error": _DEEPSEEK_IMPORT_ERROR,
+                "markov_ngram": markov_info.get("ngrams", {}),
+                "streak_anti_follow": streak_info,
             }
         else:
             result["debug"] = None
