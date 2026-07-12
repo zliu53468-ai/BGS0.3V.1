@@ -1,22 +1,36 @@
-"""Baccarat predictor: per-UID LSTM + Monte Carlo Dropout + DeepSeek.
+"""Baccarat predictor: B/P LSTM + cross-shoe memory + regime control.
 
-Core compatibility retained from the previous predictor:
+Compatibility goals
+-------------------
+* Input remains a Big Road sequence containing B / P / T.
+* ``predict`` and ``fit_history`` signatures are unchanged.
+* Per-UID / venue / room / shoe isolation is retained.
+* Common response keys used by older app.py versions are preserved.
+* The active statistical model is LSTM only.
+* GRU, TCN/1D-CNN, GBM, and Markov remain disabled.
+* DeepSeek remains available as a low-weight calibration/confirmation layer.
 
-* Input is a Big Road sequence containing B / P / T.
-* Every LINE UID / venue / room / shoe has isolated online model state.
-* Public ``predict`` and ``fit_history`` signatures remain compatible.
-* Common response keys used by app.py are preserved.
-* The active local prediction model is LSTM only.
-* GRU, TCN/1D-CNN, GBM, and Markov do not participate in training or fusion.
-* Monte Carlo Dropout performs repeated stochastic LSTM forward passes to
-  estimate next-hand probabilities and prediction uncertainty.
-* DeepSeek calibration remains available and can be fused with the LSTM result.
+Model changes
+-------------
+* The LSTM target is binary B/P. A tie is retained in the input features but
+  is skipped as a training target, so rare ties no longer compress the B/P
+  decision boundary.
+* A cross-shoe base LSTM is maintained per UID + venue + room while the Python
+  process remains alive. Finished shoes are archived into this memory.
+* A local shoe LSTM is initialized from the base LSTM when possible and then
+  updated with a replay buffer rather than only the latest hand.
+* Early, middle, and late shoe phases use different base/local weights and
+  different entry/uncertainty thresholds.
+* A short-vs-long road regime-change detector can pause recommendations for a
+  small cooldown window after a material rhythm transition.
+* Monte Carlo Dropout estimates uncertainty for both base and local LSTMs.
 
-Important limitation:
-B/P/T history alone cannot guarantee a stable predictive edge or continuous
-winning streaks in a fair baccarat game. Monte Carlo Dropout estimates model
-uncertainty; it does not change the underlying randomness of the cards. Use
-strict walk-forward testing and loss limits when evaluating this module.
+Important limitation
+--------------------
+B/P/T history alone cannot guarantee a long-run predictive edge or a stable
+70 percent next-hand hit rate in a fair baccarat game. This module is designed
+for stricter walk-forward evaluation and uncertainty filtering, not guaranteed
+betting returns.
 """
 
 from __future__ import annotations
@@ -83,53 +97,58 @@ def _env_float(
     return value
 
 
-def _env_csv_ints(name: str, default: Sequence[int]) -> Tuple[int, ...]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return tuple(int(v) for v in default)
-    values: List[int] = []
-    for part in raw.split(","):
-        try:
-            values.append(max(1, int(part.strip())))
-        except (TypeError, ValueError):
-            continue
-    return tuple(values) if values else tuple(int(v) for v in default)
-
-
 # ---------------------------------------------------------------------------
 # Core settings
 # ---------------------------------------------------------------------------
 
-PREDICT_ENGINE = os.getenv("PREDICT_ENGINE", "LSTM_MC_DEEPSEEK").strip().upper()
+PREDICT_ENGINE = os.getenv(
+    "PREDICT_ENGINE", "LSTM_BP_REGIME_MC_DEEPSEEK"
+).strip().upper()
 PER_UID_MODELS = _env_bool("PER_UID_MODELS", True)
 REQUIRE_USER_ID = _env_bool("REQUIRE_USER_ID", False)
-MAX_UID_MODELS = _env_int("MAX_UID_MODELS", 12, minimum=1)
+MAX_UID_MODELS = _env_int("MAX_UID_MODELS", 16, minimum=1)
+MAX_SCOPE_MEMORIES = _env_int("MAX_SCOPE_MEMORIES", 16, minimum=1)
 
-# Active local model: LSTM only.
-# Padded sequence training lets the model begin learning from roughly five
-# recorded hands while still expanding to a longer context as the shoe grows.
+# Active local/base model: LSTM only.
 USE_LSTM = True
-LSTM_SEQUENCE_LENGTH = _env_int("LSTM_SEQUENCE_LENGTH", 12, minimum=4)
-LSTM_UNITS = _env_int("LSTM_UNITS", 48, minimum=8)
-LSTM_SECOND_UNITS = _env_int("LSTM_SECOND_UNITS", 24, minimum=4)
-LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.30, 0.05, 0.80)
-LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 24, minimum=3)
-LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.0005, 0.000001)
-LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 10, minimum=1)
-LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 2, minimum=1)
-LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 4, minimum=2)
-LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 1, minimum=1)
+LSTM_SEQUENCE_LENGTH = _env_int("LSTM_SEQUENCE_LENGTH", 16, minimum=4)
+LSTM_UNITS = _env_int("LSTM_UNITS", 24, minimum=8)
+LSTM_SECOND_UNITS = _env_int("LSTM_SECOND_UNITS", 12, minimum=4)
+LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 12, minimum=3)
+LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.40, 0.05, 0.80)
+LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.0002, 0.000001)
+LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 4, minimum=1)
+LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 1, minimum=1)
+LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 10, minimum=2)
+LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 2, minimum=1)
+LOCAL_FREEZE_FIRST_LSTM = _env_bool("LOCAL_FREEZE_FIRST_LSTM", True)
 
-# Monte Carlo Dropout settings. One batch contains many stochastic forward
-# passes, so increasing the simulation count is much cheaper than calling
-# model.predict hundreds of times one by one.
-LSTM_MC_SIMULATIONS = _env_int("LSTM_MC_SIMULATIONS", 256, minimum=8)
+# Replay buffer. Targets are B/P only; T targets are skipped.
+REPLAY_RECENT_WINDOW = _env_int("REPLAY_RECENT_WINDOW", 24, minimum=4)
+REPLAY_BATCH_SAMPLES = _env_int("REPLAY_BATCH_SAMPLES", 32, minimum=4)
+REPLAY_RECENT_RATIO = _env_float("REPLAY_RECENT_RATIO", 0.70, 0.0, 1.0)
+REPLAY_RECENCY_DECAY = _env_float("REPLAY_RECENCY_DECAY", 0.985, 0.80, 1.0)
+
+# Cross-shoe base memory. It is process-memory based; a Render restart clears it.
+GLOBAL_MEMORY_ENABLED = _env_bool("GLOBAL_MEMORY_ENABLED", True)
+GLOBAL_MEMORY_MIN_SAMPLES = _env_int("GLOBAL_MEMORY_MIN_SAMPLES", 24, minimum=4)
+GLOBAL_MEMORY_MAX_SHOES = _env_int("GLOBAL_MEMORY_MAX_SHOES", 40, minimum=1)
+GLOBAL_MEMORY_MAX_SAMPLES = _env_int("GLOBAL_MEMORY_MAX_SAMPLES", 1800, minimum=32)
+GLOBAL_MEMORY_EPOCHS = _env_int("GLOBAL_MEMORY_EPOCHS", 3, minimum=1)
+GLOBAL_MEMORY_ONLINE_EPOCHS = _env_int(
+    "GLOBAL_MEMORY_ONLINE_EPOCHS", 1, minimum=1
+)
+GLOBAL_MEMORY_BATCH_SIZE = _env_int("GLOBAL_MEMORY_BATCH_SIZE", 16, minimum=1)
+
+# Monte Carlo Dropout.
+LSTM_MC_SIMULATIONS = _env_int("LSTM_MC_SIMULATIONS", 64, minimum=8)
+GLOBAL_MC_SIMULATIONS = _env_int("GLOBAL_MC_SIMULATIONS", 32, minimum=8)
 LSTM_MC_BATCH_SIZE = _env_int("LSTM_MC_BATCH_SIZE", 64, minimum=1)
 LSTM_MC_TEMPERATURE = _env_float(
-    "LSTM_MC_TEMPERATURE", 1.0, minimum=0.25, maximum=3.0
+    "LSTM_MC_TEMPERATURE", 1.10, minimum=0.25, maximum=3.0
 )
 LSTM_MC_VOTE_BLEND = _env_float(
-    "LSTM_MC_VOTE_BLEND", 0.15, minimum=0.0, maximum=0.50
+    "LSTM_MC_VOTE_BLEND", 0.0, minimum=0.0, maximum=0.50
 )
 LSTM_MC_UNCERTAINTY_SCALE = _env_float(
     "LSTM_MC_UNCERTAINTY_SCALE", 3.0, minimum=0.0, maximum=20.0
@@ -138,8 +157,114 @@ LSTM_MC_MIN_RELIABILITY = _env_float(
     "LSTM_MC_MIN_RELIABILITY", 0.35, minimum=0.0, maximum=1.0
 )
 
-# Removed from the active path. Constants are kept only so old environment
-# variables and compatibility fields cannot break app.py.
+# Training controls.
+NEURAL_BATCH_SIZE = _env_int("NEURAL_BATCH_SIZE", 4, minimum=1)
+NEURAL_VALIDATION_MIN_SAMPLES = _env_int(
+    "NEURAL_VALIDATION_MIN_SAMPLES", 48, minimum=4
+)
+NEURAL_EARLY_STOP_PATIENCE = _env_int(
+    "NEURAL_EARLY_STOP_PATIENCE", 2, minimum=0
+)
+NEURAL_CLASS_WEIGHT = _env_bool("NEURAL_CLASS_WEIGHT", False)
+NEURAL_CLASS_WEIGHT_MAX = _env_float("NEURAL_CLASS_WEIGHT_MAX", 1.50, 1.0)
+NEURAL_VERBOSE = _env_int("NEURAL_VERBOSE", 0, minimum=0)
+
+# Small-sample B/P calibration.
+MODEL_CALIBRATION_STRENGTH = _env_float(
+    "MODEL_CALIBRATION_STRENGTH", 40.0, 0.0
+)
+COMPONENT_MAX_PROB = _env_float("COMPONENT_MAX_PROB", 0.68, 0.50, 0.95)
+FINAL_MAX_PROB = _env_float("FINAL_MAX_PROB", 0.65, 0.50, 0.95)
+
+# Tie is estimated separately for display. It is not an LSTM output class.
+B_PRIOR = _env_float("B_PRIOR", 0.4586, 0.0001)
+P_PRIOR = _env_float("P_PRIOR", 0.4462, 0.0001)
+T_PRIOR = _env_float("T_PRIOR", 0.0952, 0.0001)
+TIE_PRIOR_STRENGTH = _env_float("TIE_PRIOR_STRENGTH", 24.0, 0.0)
+TIE_RATE_MIN = _env_float("TIE_RATE_MIN", 0.06, 0.0, 0.30)
+TIE_RATE_MAX = _env_float("TIE_RATE_MAX", 0.14, 0.0, 0.40)
+FALLBACK_PRIOR_STRENGTH = _env_float(
+    "FALLBACK_PRIOR_STRENGTH",
+    _env_float("LSTM_FALLBACK_PRIOR_STRENGTH", 18.0, 0.0),
+    0.0,
+)
+
+# Shoe phases.
+EARLY_PHASE_END = _env_int("EARLY_PHASE_END", 12, minimum=4)
+MID_PHASE_END = _env_int("MID_PHASE_END", 36, minimum=EARLY_PHASE_END + 1)
+
+# Phase model weights. They are renormalized when a component is unavailable.
+EARLY_GLOBAL_WEIGHT = _env_float("EARLY_GLOBAL_WEIGHT", 0.85, 0.0, 1.0)
+EARLY_LOCAL_WEIGHT = _env_float("EARLY_LOCAL_WEIGHT", 0.10, 0.0, 1.0)
+EARLY_DEEPSEEK_WEIGHT = _env_float("EARLY_DEEPSEEK_WEIGHT", 0.05, 0.0, 1.0)
+MID_GLOBAL_WEIGHT = _env_float("MID_GLOBAL_WEIGHT", 0.40, 0.0, 1.0)
+MID_LOCAL_WEIGHT = _env_float("MID_LOCAL_WEIGHT", 0.55, 0.0, 1.0)
+MID_DEEPSEEK_WEIGHT = _env_float("MID_DEEPSEEK_WEIGHT", 0.05, 0.0, 1.0)
+LATE_GLOBAL_WEIGHT = _env_float("LATE_GLOBAL_WEIGHT", 0.35, 0.0, 1.0)
+LATE_LOCAL_WEIGHT = _env_float("LATE_LOCAL_WEIGHT", 0.60, 0.0, 1.0)
+LATE_DEEPSEEK_WEIGHT = _env_float("LATE_DEEPSEEK_WEIGHT", 0.05, 0.0, 1.0)
+
+# Legacy weights remain supported. LSTM_WEIGHT scales base + local together;
+# DEEPSEEK_WEIGHT can disable or cap the phase DeepSeek contribution.
+LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.95, 0.0)
+DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.05, 0.0)
+GRU_WEIGHT = 0.0
+TCN_WEIGHT = 0.0
+GBM_WEIGHT = 0.0
+
+# Phase-specific entry thresholds.
+EARLY_MIN_ENTRY_EDGE = _env_float("EARLY_MIN_ENTRY_EDGE", 0.055, 0.0, 0.50)
+MID_MIN_ENTRY_EDGE = _env_float("MID_MIN_ENTRY_EDGE", 0.035, 0.0, 0.50)
+LATE_MIN_ENTRY_EDGE = _env_float("LATE_MIN_ENTRY_EDGE", 0.045, 0.0, 0.50)
+EARLY_MIN_BP_CONFIDENCE = _env_float(
+    "EARLY_MIN_BP_CONFIDENCE", 0.56, 0.50, 1.0
+)
+MID_MIN_BP_CONFIDENCE = _env_float(
+    "MID_MIN_BP_CONFIDENCE", 0.54, 0.50, 1.0
+)
+LATE_MIN_BP_CONFIDENCE = _env_float(
+    "LATE_MIN_BP_CONFIDENCE", 0.55, 0.50, 1.0
+)
+EARLY_MC_MAX_UNCERTAINTY = _env_float(
+    "EARLY_MC_MAX_UNCERTAINTY", 0.030, 0.0, 1.0
+)
+MID_MC_MAX_UNCERTAINTY = _env_float(
+    "MID_MC_MAX_UNCERTAINTY", 0.040, 0.0, 1.0
+)
+LATE_MC_MAX_UNCERTAINTY = _env_float(
+    "LATE_MC_MAX_UNCERTAINTY", 0.030, 0.0, 1.0
+)
+REQUIRE_MODEL_READY_FOR_ENTRY = _env_bool(
+    "REQUIRE_MODEL_READY_FOR_ENTRY", True
+)
+
+# Regime-change detector.
+REGIME_SHORT_WINDOW = _env_int("REGIME_SHORT_WINDOW", 6, minimum=3)
+REGIME_LONG_WINDOW = _env_int(
+    "REGIME_LONG_WINDOW", 18, minimum=REGIME_SHORT_WINDOW + 2
+)
+REGIME_CHANGE_THRESHOLD = _env_float(
+    "REGIME_CHANGE_THRESHOLD", 0.18, 0.01, 1.0
+)
+REGIME_CHANGE_COOLDOWN_HANDS = _env_int(
+    "REGIME_CHANGE_COOLDOWN_HANDS", 2, minimum=0
+)
+REGIME_CROSSING_RELEASE_RATIO = _env_float(
+    "REGIME_CROSSING_RELEASE_RATIO", 0.90, 0.10, 1.0
+)
+
+# DeepSeek remains, but mainly confirms the LSTM direction.
+USE_DEEPSEEK = _env_bool("USE_DEEPSEEK", True)
+DEEPSEEK_MIN_HISTORY = _env_int("DEEPSEEK_MIN_HISTORY", 12, minimum=0)
+DEEPSEEK_TIMEOUT_SECONDS = _env_float(
+    "DEEPSEEK_TIMEOUT_SECONDS", 8.0, minimum=1.0
+)
+DEEPSEEK_CONFLICT_OBSERVE = _env_bool("DEEPSEEK_CONFLICT_OBSERVE", True)
+DEEPSEEK_CONFLICT_OVERRIDE_EDGE = _env_float(
+    "DEEPSEEK_CONFLICT_OVERRIDE_EDGE", 0.06, 0.0, 0.50
+)
+
+# Removed components retained as compatibility constants.
 USE_GRU = False
 USE_TCN = False
 USE_GBM = False
@@ -149,49 +274,6 @@ TCN_SEQUENCE_LENGTH = _env_int("TCN_SEQUENCE_LENGTH", 20, minimum=4)
 TCN_FILTERS = _env_int("TCN_FILTERS", 24, minimum=4)
 GBM_BACKEND = "DISABLED_LSTM_ONLY"
 
-NEURAL_BATCH_SIZE = _env_int("NEURAL_BATCH_SIZE", 8, minimum=1)
-NEURAL_VALIDATION_MIN_SAMPLES = _env_int(
-    "NEURAL_VALIDATION_MIN_SAMPLES", 36, minimum=4
-)
-NEURAL_EARLY_STOP_PATIENCE = _env_int(
-    "NEURAL_EARLY_STOP_PATIENCE", 2, minimum=0
-)
-NEURAL_CLASS_WEIGHT = _env_bool("NEURAL_CLASS_WEIGHT", True)
-NEURAL_CLASS_WEIGHT_MAX = _env_float("NEURAL_CLASS_WEIGHT_MAX", 3.0, 1.0)
-NEURAL_VERBOSE = _env_int("NEURAL_VERBOSE", 0, minimum=0)
-
-# Small-sample calibration prevents the first few hands from producing
-# misleading 80-99% confidence while still allowing the LSTM to begin early.
-MODEL_CALIBRATION_STRENGTH = _env_float(
-    "MODEL_CALIBRATION_STRENGTH", 24.0, 0.0
-)
-COMPONENT_MAX_PROB = _env_float("COMPONENT_MAX_PROB", 0.72, 0.34, 0.95)
-FINAL_MAX_PROB = _env_float("FINAL_MAX_PROB", 0.68, 0.34, 0.95)
-
-# DeepSeek remains in the prediction path. If the client/API is unavailable,
-# the local LSTM result automatically becomes the full effective weight.
-USE_DEEPSEEK = _env_bool("USE_DEEPSEEK", True)
-DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.20, 0.0)
-DEEPSEEK_MIN_HISTORY = _env_int("DEEPSEEK_MIN_HISTORY", 8, minimum=0)
-DEEPSEEK_TIMEOUT_SECONDS = _env_float(
-    "DEEPSEEK_TIMEOUT_SECONDS", 8.0, minimum=1.0
-)
-
-LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.80, 0.0)
-GRU_WEIGHT = 0.0
-TCN_WEIGHT = 0.0
-GBM_WEIGHT = 0.0
-
-FALLBACK_PRIOR_STRENGTH = _env_float(
-    "FALLBACK_PRIOR_STRENGTH",
-    _env_float("LSTM_FALLBACK_PRIOR_STRENGTH", 12.0, 0.0),
-    0.0,
-)
-
-B_PRIOR = _env_float("B_PRIOR", 0.4586, 0.0001)
-P_PRIOR = _env_float("P_PRIOR", 0.4462, 0.0001)
-T_PRIOR = _env_float("T_PRIOR", 0.0952, 0.0001)
-
 RANDOM_SEED = _env_int("RANDOM_SEED", 42)
 DEBUG_PREDICTOR = _env_bool("DEBUG_PREDICTOR", False)
 DEBUG_AI_RESULT = _env_bool("DEBUG_AI_RESULT", False)
@@ -199,9 +281,12 @@ DEBUG_AI_RESULT = _env_bool("DEBUG_AI_RESULT", False)
 CLASS_NAMES: Tuple[str, str, str] = ("B", "P", "T")
 CLASS_TO_INDEX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 INDEX_TO_CLASS = {idx: name for name, idx in CLASS_TO_INDEX.items()}
+BP_NAMES: Tuple[str, str] = ("B", "P")
+BP_TO_INDEX = {name: idx for idx, name in enumerate(BP_NAMES)}
 
-# 3 result one-hot values + 7 road/rhythm context values.
-LSTM_FEATURE_DIM = 10
+# 3 result one-hot + run + switch + ABA + pair block + short/medium balance
+# + tie rate + local switch rates + lifecycle progress.
+LSTM_FEATURE_DIM = 14
 
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
@@ -245,23 +330,18 @@ try:
         pass
 except Exception as exc:  # pragma: no cover - deployment dependent
     TF_IMPORT_ERROR = str(exc)
-    logger.warning(
-        "TensorFlow unavailable; LSTM uses fallback probabilities: %s",
-        exc,
-    )
+    logger.warning("TensorFlow unavailable; LSTM uses fallback probabilities: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Removed GBM backends
+# Disabled backend compatibility
 # ---------------------------------------------------------------------------
 
-# These names remain for backward-compatible debug fields only. No tree model
-# package is imported and no GBM model participates in prediction.
 LIGHTGBM_AVAILABLE = False
 XGBOOST_AVAILABLE = False
 SKLEARN_GBM_AVAILABLE = False
 GBM_IMPORT_ERRORS: Dict[str, str] = {
-    "disabled": "GRU/TCN/GBM removed from active path; LSTM-only mode"
+    "disabled": "GRU/TCN/GBM removed; B/P LSTM-only mode"
 }
 LGBMClassifier = None
 XGBClassifier = None
@@ -306,44 +386,28 @@ def _normalize(
     arr = np.maximum(arr, 0.0)
     total = float(arr.sum())
     if total <= 0.0:
-        if fallback is None:
-            arr = np.ones(len(arr), dtype=np.float64)
-        else:
-            arr = np.asarray(fallback, dtype=np.float64)
-            arr = np.maximum(arr, 0.0)
+        arr = np.asarray(
+            fallback if fallback is not None else np.ones(len(arr)),
+            dtype=np.float64,
+        )
+        arr = np.maximum(arr, 0.0)
         total = float(arr.sum())
     if total <= 0.0:
         return np.ones(len(arr), dtype=np.float64) / max(1, len(arr))
     return arr / total
 
 
+def _bp_prior_probs() -> np.ndarray:
+    return _normalize([B_PRIOR, P_PRIOR], fallback=[1.0, 1.0])
+
+
 def _prior_probs() -> np.ndarray:
     return _normalize([B_PRIOR, P_PRIOR, T_PRIOR], fallback=[1.0, 1.0, 1.0])
-
-
-def _empirical_fallback_probs(history: Sequence[str]) -> np.ndarray:
-    prior = _prior_probs()
-    pseudo = prior * FALLBACK_PRIOR_STRENGTH
-    counts = np.zeros(len(CLASS_NAMES), dtype=np.float64)
-    for item in history:
-        counts[CLASS_TO_INDEX[item]] += 1.0
-    return _normalize(counts + pseudo, fallback=prior)
-
-
-def _to_prob_dict(
-    values: Sequence[float], digits: Optional[int] = None
-) -> Dict[str, float]:
-    probs = _normalize(values, fallback=_prior_probs())
-    result = {name: float(probs[idx]) for idx, name in enumerate(CLASS_NAMES)}
-    if digits is not None:
-        result = {key: round(value, digits) for key, value in result.items()}
-    return result
 
 
 def _clean_history(history: Union[str, Iterable[Any], None]) -> List[str]:
     if history is None:
         return []
-
     if isinstance(history, str):
         raw = history.strip().upper()
         allowed = {"B", "P", "T", ",", " ", "|", "/", "-", "_"}
@@ -353,7 +417,6 @@ def _clean_history(history: Union[str, Iterable[Any], None]) -> List[str]:
             items = [part.strip().upper() for part in raw.replace("|", ",").split(",")]
     else:
         items = [str(value).strip().upper() for value in history]
-
     return [item for item in items if item in CLASS_TO_INDEX]
 
 
@@ -362,17 +425,64 @@ def _history_fingerprint(history: Sequence[str]) -> str:
 
 
 def _is_extension(previous: Sequence[str], current: Sequence[str]) -> bool:
-    return len(current) >= len(previous) and list(current[: len(previous)]) == list(
-        previous
+    return len(current) >= len(previous) and list(current[: len(previous)]) == list(previous)
+
+
+def _bp_fallback_probs(history: Sequence[str]) -> np.ndarray:
+    prior = _bp_prior_probs()
+    pseudo = prior * FALLBACK_PRIOR_STRENGTH
+    counts = np.asarray(
+        [sum(item == "B" for item in history), sum(item == "P" for item in history)],
+        dtype=np.float64,
+    )
+    return _normalize(counts + pseudo, fallback=prior)
+
+
+def _estimate_tie_rate(history: Sequence[str]) -> float:
+    prior = float(_prior_probs()[CLASS_TO_INDEX["T"]])
+    tie_count = float(sum(item == "T" for item in history))
+    denominator = float(len(history)) + TIE_PRIOR_STRENGTH
+    estimated = (
+        (tie_count + prior * TIE_PRIOR_STRENGTH) / denominator
+        if denominator > 0
+        else prior
+    )
+    lower = min(TIE_RATE_MIN, TIE_RATE_MAX)
+    upper = max(TIE_RATE_MIN, TIE_RATE_MAX)
+    return _clamp(estimated, lower, upper)
+
+
+def _bp_to_triplet(bp_probs: Sequence[float], tie_rate: float) -> np.ndarray:
+    bp = _normalize(bp_probs, fallback=_bp_prior_probs())
+    tie = _clamp(tie_rate, 0.0, 0.60)
+    remaining = max(0.0, 1.0 - tie)
+    return _normalize(
+        [float(bp[0]) * remaining, float(bp[1]) * remaining, tie],
+        fallback=_prior_probs(),
     )
 
 
-def _signal_level(confidence: float, edge: float) -> str:
-    if confidence >= 0.62 and edge >= 0.10:
-        return "HIGH"
-    if confidence >= 0.56 and edge >= 0.045:
-        return "MEDIUM"
-    return "LOW"
+def _triplet_to_bp(values: Sequence[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if len(arr) < 2:
+        return _bp_prior_probs()
+    return _normalize([arr[0], arr[1]], fallback=_bp_prior_probs())
+
+
+def _to_prob_dict(
+    values: Sequence[float], digits: Optional[int] = None
+) -> Dict[str, float]:
+    probs = _normalize(values, fallback=_prior_probs())
+    if len(probs) == 2:
+        result = {"B": float(probs[0]), "P": float(probs[1])}
+    else:
+        result = {
+            name: float(probs[idx])
+            for idx, name in enumerate(CLASS_NAMES[: len(probs)])
+        }
+    if digits is not None:
+        result = {key: round(value, digits) for key, value in result.items()}
+    return result
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -380,9 +490,7 @@ def _safe_float(value: Any) -> Optional[float]:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if not np.isfinite(number):
-        return None
-    return number
+    return number if np.isfinite(number) else None
 
 
 def _as_probability(value: Any) -> Optional[float]:
@@ -394,47 +502,39 @@ def _as_probability(value: Any) -> Optional[float]:
     return _clamp(number, 0.0, 1.0)
 
 
-
-
-def _cap_probability_vector(
-    values: Sequence[float],
-    maximum: float,
-    fallback: Sequence[float],
-) -> np.ndarray:
-    """Cap one class without breaking normalization or class ordering."""
-    probs = _normalize(values, fallback=fallback)
-    max_index = int(np.argmax(probs))
-    max_value = float(probs[max_index])
-    if max_value <= maximum:
+def _cap_binary_probability(values: Sequence[float], maximum: float) -> np.ndarray:
+    probs = _normalize(values, fallback=_bp_prior_probs())
+    maximum = _clamp(maximum, 0.50, 0.99)
+    winner = int(np.argmax(probs))
+    if float(probs[winner]) <= maximum:
         return probs
-
-    remainder_before = max(1e-12, 1.0 - max_value)
-    remainder_after = max(0.0, 1.0 - maximum)
-    result = probs.copy()
-    result[max_index] = maximum
-    for index in range(len(result)):
-        if index == max_index:
-            continue
-        result[index] = probs[index] / remainder_before * remainder_after
-    return _normalize(result, fallback=fallback)
+    result = np.asarray([1.0 - maximum, 1.0 - maximum], dtype=np.float64)
+    result[winner] = maximum
+    result[1 - winner] = 1.0 - maximum
+    return result
 
 
-def _calibrate_component_probs(
-    values: Sequence[float],
-    sample_count: int,
-    fallback: Sequence[float],
+def _calibrate_binary_probs(
+    values: Sequence[float], sample_count: int
 ) -> np.ndarray:
-    """Shrink small-sample predictions toward the fixed long-term prior."""
-    raw = _normalize(values, fallback=fallback)
-    base = _prior_probs()
+    raw = _normalize(values, fallback=_bp_prior_probs())
+    prior = _bp_prior_probs()
     strength = max(0.0, MODEL_CALIBRATION_STRENGTH)
     reliability = (
         float(sample_count) / (float(sample_count) + strength)
         if strength > 0.0
         else 1.0
     )
-    calibrated = base * (1.0 - reliability) + raw * reliability
-    return _cap_probability_vector(calibrated, COMPONENT_MAX_PROB, base)
+    calibrated = prior * (1.0 - reliability) + raw * reliability
+    return _cap_binary_probability(calibrated, COMPONENT_MAX_PROB)
+
+
+def _signal_level(confidence: float, edge: float) -> str:
+    if confidence >= 0.62 and edge >= 0.12:
+        return "HIGH"
+    if confidence >= 0.56 and edge >= 0.06:
+        return "MEDIUM"
+    return "LOW"
 
 
 def _class_weight_mapping(labels: np.ndarray) -> Optional[Dict[int, float]]:
@@ -454,15 +554,8 @@ def _class_weight_mapping(labels: np.ndarray) -> Optional[Dict[int, float]]:
     }
 
 
-def _sample_weights(labels: np.ndarray) -> Optional[np.ndarray]:
-    mapping = _class_weight_mapping(labels)
-    if not mapping:
-        return None
-    return np.asarray([mapping.get(int(label), 1.0) for label in labels], dtype=float)
-
-
 # ---------------------------------------------------------------------------
-# Per-UID model state
+# State
 # ---------------------------------------------------------------------------
 
 
@@ -478,7 +571,8 @@ class ComponentState:
     last_accuracy: Optional[float] = None
     status: str = "not_trained"
     backend: str = ""
-    class_labels: List[int] = field(default_factory=list)
+    class_labels: List[int] = field(default_factory=lambda: [0, 1])
+    initialized_from_base: bool = False
 
     def reset(self) -> None:
         self.model = None
@@ -491,12 +585,15 @@ class ComponentState:
         self.last_accuracy = None
         self.status = "reset"
         self.backend = ""
-        self.class_labels = []
+        self.class_labels = [0, 1]
+        self.initialized_from_base = False
 
 
 @dataclass
 class UIDModelState:
     key: str
+    scope_key: str
+    shoe_id: str
     lstm: ComponentState = field(default_factory=ComponentState)
     gru: ComponentState = field(default_factory=ComponentState)
     tcn: ComponentState = field(default_factory=ComponentState)
@@ -504,7 +601,7 @@ class UIDModelState:
     last_history: List[str] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
-    def reset(self) -> None:
+    def reset_local(self) -> None:
         self.lstm.reset()
         self.gru.reset()
         self.tcn.reset()
@@ -512,14 +609,27 @@ class UIDModelState:
         self.last_history = []
 
 
+@dataclass
+class ScopeMemoryState:
+    key: str
+    base_lstm: ComponentState = field(default_factory=ComponentState)
+    shoe_histories: List[List[str]] = field(default_factory=list)
+    archived_fingerprints: List[str] = field(default_factory=list)
+    total_archived_samples: int = 0
+    active_training_key: str = ""
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
 _MODEL_CACHE: "OrderedDict[str, UIDModelState]" = OrderedDict()
+_SCOPE_MEMORY_CACHE: "OrderedDict[str, ScopeMemoryState]" = OrderedDict()
 _MODEL_CACHE_LOCK = threading.RLock()
+_SCOPE_MEMORY_CACHE_LOCK = threading.RLock()
 _TF_LOCK = threading.RLock()
 _DEEPSEEK_LOCK = threading.RLock()
 _DEEPSEEK_CLIENT: Optional[Any] = None
 
 
-def _make_training_key(user_id: str, venue: str, room: str, shoe_id: str) -> str:
+def _make_scope_key(user_id: str, venue: str, room: str) -> str:
     identity = str(user_id or "anonymous").strip() or "anonymous"
     if not PER_UID_MODELS:
         identity = "global"
@@ -528,40 +638,92 @@ def _make_training_key(user_id: str, venue: str, room: str, shoe_id: str) -> str
             identity,
             str(venue or "global").strip() or "global",
             str(room or "global").strip() or "global",
+        ]
+    )
+
+
+def _make_training_key(user_id: str, venue: str, room: str, shoe_id: str) -> str:
+    return "|".join(
+        [
+            _make_scope_key(user_id, venue, room),
             str(shoe_id or "global").strip() or "global",
         ]
     )
 
 
-def _get_model_state(training_key: str) -> UIDModelState:
+def _get_scope_memory(scope_key: str) -> ScopeMemoryState:
+    with _SCOPE_MEMORY_CACHE_LOCK:
+        state = _SCOPE_MEMORY_CACHE.get(scope_key)
+        if state is not None:
+            _SCOPE_MEMORY_CACHE.move_to_end(scope_key)
+            return state
+        while len(_SCOPE_MEMORY_CACHE) >= MAX_SCOPE_MEMORIES:
+            _SCOPE_MEMORY_CACHE.popitem(last=False)
+        state = ScopeMemoryState(key=scope_key)
+        _SCOPE_MEMORY_CACHE[scope_key] = state
+        return state
+
+
+def _get_model_state(
+    training_key: str, scope_key: str, shoe_id: str
+) -> UIDModelState:
     with _MODEL_CACHE_LOCK:
         state = _MODEL_CACHE.get(training_key)
         if state is not None:
             _MODEL_CACHE.move_to_end(training_key)
             return state
-
         while len(_MODEL_CACHE) >= MAX_UID_MODELS:
-            evicted_key, _ = _MODEL_CACHE.popitem(last=False)
-            logger.info("Evicted inactive UID model: %s", evicted_key)
-
-        state = UIDModelState(key=training_key)
+            _MODEL_CACHE.popitem(last=False)
+        state = UIDModelState(
+            key=training_key,
+            scope_key=scope_key,
+            shoe_id=str(shoe_id or "global"),
+        )
         _MODEL_CACHE[training_key] = state
         return state
 
 
+def _component_info(component: ComponentState) -> Dict[str, Any]:
+    return {
+        "trained": component.trained,
+        "training_samples": component.training_samples,
+        "last_train_history_len": component.last_train_history_len,
+        "train_count": component.train_count,
+        "status": component.status,
+        "backend": component.backend,
+        "last_loss": component.last_loss,
+        "last_accuracy": component.last_accuracy,
+        "class_labels": list(component.class_labels),
+        "initialized_from_base": component.initialized_from_base,
+    }
+
+
 def clear_model_cache(user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Clear every cached model, or only models belonging to one UID."""
-    with _MODEL_CACHE_LOCK:
+    with _MODEL_CACHE_LOCK, _SCOPE_MEMORY_CACHE_LOCK:
         if not user_id:
             removed = len(_MODEL_CACHE)
+            memory_removed = len(_SCOPE_MEMORY_CACHE)
             _MODEL_CACHE.clear()
-            return {"ok": True, "removed": removed, "user_id": None}
-
+            _SCOPE_MEMORY_CACHE.clear()
+            return {
+                "ok": True,
+                "removed": removed,
+                "memory_removed": memory_removed,
+                "user_id": None,
+            }
         prefix = f"{str(user_id).strip()}|"
-        keys = [key for key in _MODEL_CACHE if key.startswith(prefix)]
-        for key in keys:
+        model_keys = [key for key in _MODEL_CACHE if key.startswith(prefix)]
+        memory_keys = [key for key in _SCOPE_MEMORY_CACHE if key.startswith(prefix)]
+        for key in model_keys:
             _MODEL_CACHE.pop(key, None)
-        return {"ok": True, "removed": len(keys), "user_id": user_id}
+        for key in memory_keys:
+            _SCOPE_MEMORY_CACHE.pop(key, None)
+        return {
+            "ok": True,
+            "removed": len(model_keys),
+            "memory_removed": len(memory_keys),
+            "user_id": user_id,
+        }
 
 
 def reset_uid_model(
@@ -576,25 +738,12 @@ def reset_uid_model(
     return {"ok": True, "removed": int(removed), "training_key": key}
 
 
-def _component_info(component: ComponentState) -> Dict[str, Any]:
-    return {
-        "trained": component.trained,
-        "training_samples": component.training_samples,
-        "last_train_history_len": component.last_train_history_len,
-        "train_count": component.train_count,
-        "status": component.status,
-        "backend": component.backend,
-        "last_loss": component.last_loss,
-        "last_accuracy": component.last_accuracy,
-        "class_labels": list(component.class_labels),
-    }
-
-
 def get_model_cache_info() -> Dict[str, Any]:
-    with _MODEL_CACHE_LOCK:
+    with _MODEL_CACHE_LOCK, _SCOPE_MEMORY_CACHE_LOCK:
         return {
             "size": len(_MODEL_CACHE),
             "max_size": MAX_UID_MODELS,
+            "scope_memory_size": len(_SCOPE_MEMORY_CACHE),
             "per_uid_models": PER_UID_MODELS,
             "keys": list(_MODEL_CACHE.keys()),
             "models": {
@@ -606,11 +755,20 @@ def get_model_cache_info() -> Dict[str, Any]:
                 }
                 for key, state in _MODEL_CACHE.items()
             },
+            "scope_memories": {
+                key: {
+                    "base_lstm": _component_info(state.base_lstm),
+                    "archived_shoes": len(state.shoe_histories),
+                    "total_archived_samples": state.total_archived_samples,
+                    "active_training_key": state.active_training_key,
+                }
+                for key, state in _SCOPE_MEMORY_CACHE.items()
+            },
         }
 
 
 # ---------------------------------------------------------------------------
-# LSTM sequence model and Monte Carlo Dropout
+# LSTM data and model
 # ---------------------------------------------------------------------------
 
 
@@ -629,35 +787,33 @@ class NeuralConfig:
     retrain_interval: int
 
 
-def _neural_configs() -> Dict[str, NeuralConfig]:
-    return {
-        "lstm": NeuralConfig(
-            "lstm",
-            USE_LSTM,
-            LSTM_SEQUENCE_LENGTH,
-            LSTM_UNITS,
-            LSTM_DROPOUT,
-            LSTM_DENSE_UNITS,
-            LSTM_LEARNING_RATE,
-            LSTM_EPOCHS,
-            LSTM_ONLINE_EPOCHS,
-            LSTM_MIN_SAMPLES,
-            LSTM_RETRAIN_INTERVAL,
-        )
-    }
+def _neural_config() -> NeuralConfig:
+    return NeuralConfig(
+        "lstm",
+        USE_LSTM,
+        LSTM_SEQUENCE_LENGTH,
+        LSTM_UNITS,
+        LSTM_DROPOUT,
+        LSTM_DENSE_UNITS,
+        LSTM_LEARNING_RATE,
+        LSTM_EPOCHS,
+        LSTM_ONLINE_EPOCHS,
+        LSTM_MIN_SAMPLES,
+        LSTM_RETRAIN_INTERVAL,
+    )
+
+
+def _switch_rate(sequence: Sequence[str]) -> float:
+    bp = [item for item in sequence if item in BP_TO_INDEX]
+    if len(bp) < 2:
+        return 0.5
+    changes = sum(current != previous for previous, current in zip(bp, bp[1:]))
+    return changes / max(1, len(bp) - 1)
 
 
 def _road_feature_sequence(
-    sequence: Sequence[str],
-    sequence_length: int,
+    sequence: Sequence[str], sequence_length: int
 ) -> np.ndarray:
-    """Encode B/P/T plus local road/rhythm features for one LSTM window.
-
-    The model is still purely LSTM. These inputs only expose patterns that are
-    otherwise difficult to learn from a three-value one-hot stream when each
-    shoe contains limited samples: current run length, switch rhythm, ABA
-    rhythm, two-by-two blocks, short/medium B-P balance, and recent tie rate.
-    """
     recent = list(sequence[-sequence_length:])
     encoded = np.zeros((sequence_length, LSTM_FEATURE_DIM), dtype=np.float32)
     if not recent:
@@ -666,7 +822,6 @@ def _road_feature_sequence(
     rows: List[List[float]] = []
     run_side = ""
     run_length = 0
-
     for index, item in enumerate(recent):
         if item == run_side:
             run_length += 1
@@ -676,6 +831,7 @@ def _road_feature_sequence(
 
         tail4 = recent[max(0, index - 3) : index + 1]
         tail8 = recent[max(0, index - 7) : index + 1]
+        tail12 = recent[max(0, index - 11) : index + 1]
         count4 = Counter(tail4)
         count8 = Counter(tail8)
         denom4 = float(max(1, len(tail4)))
@@ -697,6 +853,7 @@ def _road_feature_sequence(
             and recent[index] != recent[index - 2]
             else 0.0
         )
+        progress = min(1.0, (index + 1) / max(1.0, float(sequence_length)))
 
         rows.append(
             [
@@ -710,6 +867,10 @@ def _road_feature_sequence(
                 (count4.get("B", 0) - count4.get("P", 0)) / denom4,
                 (count8.get("B", 0) - count8.get("P", 0)) / denom8,
                 count8.get("T", 0) / denom8,
+                _switch_rate(tail4),
+                _switch_rate(tail8),
+                _switch_rate(tail12),
+                progress,
             ]
         )
 
@@ -718,75 +879,258 @@ def _road_feature_sequence(
     return encoded
 
 
-def _prepare_sequence_data(
-    history: Sequence[str],
-    sequence_length: int,
-    target_start_index: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    # Left padding allows four training examples to exist after five hands.
-    if len(history) < 2:
-        return (
-            np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
-            np.empty((0,), dtype=np.int64),
-        )
-
-    start = 1
-    if target_start_index is not None:
-        start = max(start, int(target_start_index))
-
+def _all_binary_samples(
+    history: Sequence[str], sequence_length: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     X: List[np.ndarray] = []
     y: List[int] = []
-    for target_index in range(start, len(history)):
+    target_indices: List[int] = []
+    for target_index in range(1, len(history)):
+        target = history[target_index]
+        if target not in BP_TO_INDEX:
+            continue
         window = history[max(0, target_index - sequence_length) : target_index]
         X.append(_road_feature_sequence(window, sequence_length))
-        y.append(CLASS_TO_INDEX[history[target_index]])
-
+        y.append(BP_TO_INDEX[target])
+        target_indices.append(target_index)
     if not X:
         return (
             np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+        )
+    return (
+        np.asarray(X, dtype=np.float32),
+        np.asarray(y, dtype=np.int64),
+        np.asarray(target_indices, dtype=np.int64),
+    )
+
+
+def _select_replay_indices(
+    target_indices: np.ndarray,
+    history: Sequence[str],
+    max_samples: int,
+) -> np.ndarray:
+    count = len(target_indices)
+    if count <= max_samples:
+        return np.arange(count, dtype=np.int64)
+
+    recent_cutoff = max(0, len(history) - REPLAY_RECENT_WINDOW)
+    recent_positions = np.where(target_indices >= recent_cutoff)[0]
+    old_positions = np.where(target_indices < recent_cutoff)[0]
+
+    recent_target = min(
+        len(recent_positions),
+        max(1, int(round(max_samples * REPLAY_RECENT_RATIO))),
+    )
+    old_target = max_samples - recent_target
+
+    seed = (int(_history_fingerprint(history), 16) + RANDOM_SEED) % (2**31 - 1)
+    rng = np.random.default_rng(seed)
+
+    if len(recent_positions) > recent_target:
+        recent_selected = rng.choice(recent_positions, recent_target, replace=False)
+    else:
+        recent_selected = recent_positions
+
+    old_target = min(old_target, len(old_positions))
+    if old_target > 0:
+        old_selected = rng.choice(old_positions, old_target, replace=False)
+    else:
+        old_selected = np.empty((0,), dtype=np.int64)
+
+    selected = np.unique(np.concatenate([old_selected, recent_selected])).astype(np.int64)
+    if len(selected) < max_samples:
+        remaining = np.setdiff1d(np.arange(count), selected, assume_unique=False)
+        need = min(max_samples - len(selected), len(remaining))
+        if need > 0:
+            selected = np.concatenate([selected, remaining[-need:]])
+    return np.sort(selected)
+
+
+def _prepare_local_replay_data(
+    history: Sequence[str], sequence_length: int, initial: bool
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    X_all, y_all, target_indices = _all_binary_samples(history, sequence_length)
+    total_samples = len(y_all)
+    if total_samples == 0:
+        return X_all, y_all, np.empty((0,), dtype=np.float64), 0
+
+    if initial:
+        selected = np.arange(total_samples, dtype=np.int64)
+    else:
+        selected = _select_replay_indices(
+            target_indices, history, max(4, REPLAY_BATCH_SAMPLES)
         )
 
-    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64)
+    X = X_all[selected]
+    y = y_all[selected]
+    selected_targets = target_indices[selected]
+    ages = np.maximum(0, len(history) - 1 - selected_targets)
+    sample_weight = np.power(REPLAY_RECENCY_DECAY, ages.astype(np.float64))
+
+    class_map = _class_weight_mapping(y)
+    if class_map:
+        sample_weight *= np.asarray(
+            [class_map.get(int(label), 1.0) for label in y], dtype=np.float64
+        )
+    return X, y, sample_weight, total_samples
 
 
-def _build_neural_model(config: NeuralConfig) -> Any:
+def _prepare_global_data(
+    histories: Sequence[Sequence[str]], sequence_length: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    X_parts: List[np.ndarray] = []
+    y_parts: List[np.ndarray] = []
+    for history in histories:
+        X, y, _ = _all_binary_samples(history, sequence_length)
+        if len(y):
+            X_parts.append(X)
+            y_parts.append(y)
+    if not X_parts:
+        return (
+            np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.float64),
+            0,
+        )
+    X_all = np.concatenate(X_parts, axis=0)
+    y_all = np.concatenate(y_parts, axis=0)
+    total = len(y_all)
+    if total > GLOBAL_MEMORY_MAX_SAMPLES:
+        seed_text = "|".join(_history_fingerprint(h) for h in histories)
+        seed = (int(hashlib.sha1(seed_text.encode()).hexdigest()[:16], 16) + RANDOM_SEED) % (
+            2**31 - 1
+        )
+        rng = np.random.default_rng(seed)
+        selected = np.sort(
+            rng.choice(total, GLOBAL_MEMORY_MAX_SAMPLES, replace=False)
+        )
+        X_all = X_all[selected]
+        y_all = y_all[selected]
+    weights = np.ones(len(y_all), dtype=np.float64)
+    class_map = _class_weight_mapping(y_all)
+    if class_map:
+        weights *= np.asarray(
+            [class_map.get(int(label), 1.0) for label in y_all], dtype=np.float64
+        )
+    return X_all, y_all, weights, total
+
+
+def _build_lstm_model(config: NeuralConfig) -> Any:
     if not (config.enabled and TF_AVAILABLE):
         return None
-    if config.name != "lstm":
-        raise ValueError("Only LSTM is available in LSTM-only mode")
-
     model = Sequential(
         [
             Input(shape=(config.sequence_length, LSTM_FEATURE_DIM)),
             Masking(mask_value=0.0),
-            LSTM(config.units, return_sequences=True),
+            LSTM(config.units, return_sequences=True, name="base_lstm_layer"),
             Dropout(config.dropout),
-            LSTM(LSTM_SECOND_UNITS, return_sequences=False),
+            LSTM(LSTM_SECOND_UNITS, return_sequences=False, name="adapt_lstm_layer"),
             Dropout(config.dropout),
-            Dense(config.dense_units, activation="relu"),
+            Dense(config.dense_units, activation="relu", name="direction_dense"),
             Dropout(min(0.50, config.dropout * 0.50)),
-            Dense(len(CLASS_NAMES), activation="softmax"),
+            Dense(2, activation="softmax", name="bp_output"),
         ],
-        name="baccarat_lstm_mc",
+        name="baccarat_bp_lstm_mc",
     )
-    model.compile(
-        optimizer=Adam(learning_rate=config.learning_rate),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
+    _compile_lstm_model(model, config.learning_rate)
     return model
 
 
-def _train_neural_if_needed(
+def _compile_lstm_model(model: Any, learning_rate: float) -> None:
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+
+def _set_first_lstm_trainable(model: Any, trainable: bool) -> None:
+    try:
+        layer = model.get_layer("base_lstm_layer")
+        if bool(layer.trainable) != bool(trainable):
+            layer.trainable = bool(trainable)
+            _compile_lstm_model(model, LSTM_LEARNING_RATE)
+    except Exception:
+        pass
+
+
+def _copy_base_weights(local: ComponentState, base: ComponentState) -> bool:
+    if not (base.trained and base.model is not None and local.model is not None):
+        return False
+    try:
+        local.model.set_weights(base.model.get_weights())
+        local.initialized_from_base = True
+        return True
+    except Exception as exc:
+        logger.warning("Unable to copy base LSTM weights: %s", exc)
+        return False
+
+
+def _fit_component(
     component: ComponentState,
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    validation_allowed: bool,
+    backend: str,
+) -> Dict[str, Any]:
+    callbacks: List[Any] = []
+    validation_split = 0.0
+    if validation_allowed and len(X) >= NEURAL_VALIDATION_MIN_SAMPLES:
+        validation_split = 0.20
+        if NEURAL_EARLY_STOP_PATIENCE > 0:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="val_loss",
+                    patience=NEURAL_EARLY_STOP_PATIENCE,
+                    restore_best_weights=True,
+                )
+            )
+    batch_size = min(max(1, batch_size), len(X))
+    with _TF_LOCK:
+        fit_result = component.model.fit(
+            X,
+            y,
+            epochs=max(1, epochs),
+            batch_size=batch_size,
+            verbose=NEURAL_VERBOSE,
+            shuffle=True,
+            validation_split=validation_split,
+            callbacks=callbacks,
+            sample_weight=sample_weight if len(sample_weight) else None,
+        )
+    component.trained = True
+    component.train_count += 1
+    component.status = "trained"
+    component.backend = backend
+    metrics = getattr(fit_result, "history", {}) or {}
+    if metrics.get("loss"):
+        component.last_loss = float(metrics["loss"][-1])
+    if metrics.get("accuracy"):
+        component.last_accuracy = float(metrics["accuracy"][-1])
+    return {
+        "trained": True,
+        "status": component.status,
+        "samples_used": len(X),
+        "epochs": max(1, epochs),
+        "train_count": component.train_count,
+        "loss": component.last_loss,
+        "accuracy": component.last_accuracy,
+        "backend": backend,
+    }
+
+
+def _train_local_if_needed(
+    component: ComponentState,
+    base_component: ComponentState,
     config: NeuralConfig,
     history: Sequence[str],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if not config.enabled:
-        component.status = "disabled"
-        return {"trained": False, "status": component.status, "samples": 0}
     if not TF_AVAILABLE:
         component.status = "tensorflow_unavailable"
         return {
@@ -796,10 +1140,11 @@ def _train_neural_if_needed(
             "error": TF_IMPORT_ERROR,
         }
 
-    total_samples = max(0, len(history) - 1)
+    _, y_all, _ = _all_binary_samples(history, config.sequence_length)
+    total_samples = len(y_all)
+    component.training_samples = total_samples
     if total_samples < config.min_samples:
-        component.status = "not_enough_samples"
-        component.training_samples = total_samples
+        component.status = "not_enough_bp_samples"
         return {
             "trained": component.trained,
             "status": component.status,
@@ -816,87 +1161,175 @@ def _train_neural_if_needed(
         return {
             "trained": True,
             "status": component.status,
-            "samples": component.training_samples,
+            "samples": total_samples,
             "skipped": True,
         }
 
-    initial_training = component.model is None or not component.trained or force
-    if initial_training:
-        component.model = _build_neural_model(config)
-        target_start = 1
+    initial = component.model is None or not component.trained or force
+    if initial:
+        component.model = _build_lstm_model(config)
+        if component.model is None:
+            component.status = "model_build_failed"
+            return {"trained": False, "status": component.status, "samples": total_samples}
+        copied = _copy_base_weights(component, base_component)
+        if copied and LOCAL_FREEZE_FIRST_LSTM:
+            _set_first_lstm_trainable(component.model, False)
         epochs = config.epochs
     else:
-        target_start = max(1, component.last_train_history_len)
+        if component.initialized_from_base and LOCAL_FREEZE_FIRST_LSTM:
+            _set_first_lstm_trainable(component.model, False)
         epochs = config.online_epochs
 
-    if component.model is None:
-        component.status = "model_build_failed"
-        return {"trained": False, "status": component.status, "samples": 0}
-
-    X, y = _prepare_sequence_data(
-        history,
-        config.sequence_length,
-        target_start_index=target_start,
+    X, y, weights, total_samples = _prepare_local_replay_data(
+        history, config.sequence_length, initial=initial
     )
-    if len(X) == 0:
-        component.status = "no_new_samples"
-        return {
-            "trained": component.trained,
-            "status": component.status,
-            "samples": component.training_samples,
-        }
+    if len(y) == 0:
+        component.status = "no_bp_samples"
+        return {"trained": component.trained, "status": component.status, "samples": 0}
 
-    callbacks: List[Any] = []
-    validation_split = 0.0
-    if initial_training and len(X) >= NEURAL_VALIDATION_MIN_SAMPLES:
-        validation_split = 0.20
-        if NEURAL_EARLY_STOP_PATIENCE > 0:
-            callbacks.append(
-                EarlyStopping(
-                    monitor="val_loss",
-                    patience=NEURAL_EARLY_STOP_PATIENCE,
-                    restore_best_weights=True,
-                )
-            )
-
-    batch_size = min(max(1, NEURAL_BATCH_SIZE), len(X))
-    with _TF_LOCK:
-        fit_result = component.model.fit(
-            X,
-            y,
-            epochs=epochs,
-            batch_size=batch_size,
-            verbose=NEURAL_VERBOSE,
-            shuffle=True,
-            validation_split=validation_split,
-            callbacks=callbacks,
-            class_weight=_class_weight_mapping(y),
-        )
-
-    component.trained = True
+    result = _fit_component(
+        component,
+        X,
+        y,
+        weights,
+        epochs=epochs,
+        batch_size=NEURAL_BATCH_SIZE,
+        validation_allowed=initial,
+        backend="tensorflow_bp_lstm_local_replay",
+    )
     component.training_samples = total_samples
     component.last_train_history_len = len(history)
     component.last_train_fingerprint = _history_fingerprint(history)
-    component.train_count += 1
-    component.status = "trained"
-    component.backend = "tensorflow_lstm_mc"
+    result.update(
+        {
+            "samples": total_samples,
+            "replay_samples": len(y),
+            "initialized_from_base": component.initialized_from_base,
+            "first_lstm_frozen": bool(
+                component.initialized_from_base and LOCAL_FREEZE_FIRST_LSTM
+            ),
+        }
+    )
+    return result
 
-    metrics = getattr(fit_result, "history", {}) or {}
-    if metrics.get("loss"):
-        component.last_loss = float(metrics["loss"][-1])
-    if metrics.get("accuracy"):
-        component.last_accuracy = float(metrics["accuracy"][-1])
 
+def _train_base_memory(memory: ScopeMemoryState, config: NeuralConfig) -> Dict[str, Any]:
+    if not GLOBAL_MEMORY_ENABLED:
+        memory.base_lstm.status = "global_memory_disabled"
+        return {"trained": False, "status": memory.base_lstm.status, "samples": 0}
+    if not TF_AVAILABLE:
+        memory.base_lstm.status = "tensorflow_unavailable"
+        return {
+            "trained": False,
+            "status": memory.base_lstm.status,
+            "samples": 0,
+            "error": TF_IMPORT_ERROR,
+        }
+
+    X, y, weights, total_samples = _prepare_global_data(
+        memory.shoe_histories, config.sequence_length
+    )
+    memory.total_archived_samples = total_samples
+    memory.base_lstm.training_samples = total_samples
+    if total_samples < GLOBAL_MEMORY_MIN_SAMPLES:
+        memory.base_lstm.status = "not_enough_global_samples"
+        return {
+            "trained": memory.base_lstm.trained,
+            "status": memory.base_lstm.status,
+            "samples": total_samples,
+            "required_samples": GLOBAL_MEMORY_MIN_SAMPLES,
+        }
+
+    initial = memory.base_lstm.model is None or not memory.base_lstm.trained
+    if initial:
+        memory.base_lstm.model = _build_lstm_model(config)
+        epochs = GLOBAL_MEMORY_EPOCHS
+    else:
+        _set_first_lstm_trainable(memory.base_lstm.model, True)
+        epochs = GLOBAL_MEMORY_ONLINE_EPOCHS
+    if memory.base_lstm.model is None:
+        memory.base_lstm.status = "model_build_failed"
+        return {"trained": False, "status": memory.base_lstm.status, "samples": total_samples}
+
+    result = _fit_component(
+        memory.base_lstm,
+        X,
+        y,
+        weights,
+        epochs=epochs,
+        batch_size=GLOBAL_MEMORY_BATCH_SIZE,
+        validation_allowed=initial,
+        backend="tensorflow_bp_lstm_cross_shoe",
+    )
+    memory.base_lstm.training_samples = total_samples
+    memory.base_lstm.last_train_history_len = sum(len(h) for h in memory.shoe_histories)
+    memory.base_lstm.last_train_fingerprint = hashlib.sha1(
+        "|".join(_history_fingerprint(h) for h in memory.shoe_histories).encode()
+    ).hexdigest()[:16]
+    result.update(
+        {
+            "samples": total_samples,
+            "archived_shoes": len(memory.shoe_histories),
+            "memory_persistent": False,
+        }
+    )
+    return result
+
+
+def _archive_shoe_history(
+    memory: ScopeMemoryState,
+    history: Sequence[str],
+    config: NeuralConfig,
+) -> Dict[str, Any]:
+    cleaned = _clean_history(history)
+    fingerprint = _history_fingerprint(cleaned)
+    bp_count = sum(item in BP_TO_INDEX for item in cleaned[1:])
+    if not GLOBAL_MEMORY_ENABLED:
+        return {"archived": False, "status": "global_memory_disabled"}
+    if bp_count < max(4, LSTM_MIN_SAMPLES):
+        return {
+            "archived": False,
+            "status": "shoe_too_short",
+            "bp_samples": bp_count,
+        }
+    with memory.lock:
+        if fingerprint in memory.archived_fingerprints:
+            return {"archived": False, "status": "already_archived"}
+        memory.shoe_histories.append(list(cleaned))
+        memory.archived_fingerprints.append(fingerprint)
+        if len(memory.shoe_histories) > GLOBAL_MEMORY_MAX_SHOES:
+            overflow = len(memory.shoe_histories) - GLOBAL_MEMORY_MAX_SHOES
+            del memory.shoe_histories[:overflow]
+            del memory.archived_fingerprints[:overflow]
+        training = _train_base_memory(memory, config)
     return {
-        "trained": True,
-        "status": component.status,
-        "samples": component.training_samples,
-        "new_samples": len(X),
-        "epochs": epochs,
-        "train_count": component.train_count,
-        "loss": component.last_loss,
-        "accuracy": component.last_accuracy,
+        "archived": True,
+        "status": "archived",
+        "bp_samples": bp_count,
+        "base_training": training,
     }
+
+
+def _activate_training_key(
+    memory: ScopeMemoryState,
+    training_key: str,
+    config: NeuralConfig,
+) -> Dict[str, Any]:
+    previous_key = ""
+    with memory.lock:
+        previous_key = memory.active_training_key
+        memory.active_training_key = training_key
+    if previous_key and previous_key != training_key:
+        with _MODEL_CACHE_LOCK:
+            previous_state = _MODEL_CACHE.get(previous_key)
+        if previous_state is not None and previous_state.last_history:
+            return _archive_shoe_history(memory, previous_state.last_history, config)
+    return {"archived": False, "status": "same_or_first_shoe"}
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo prediction
+# ---------------------------------------------------------------------------
 
 
 def _temperature_scale_rows(values: np.ndarray, temperature: float) -> np.ndarray:
@@ -909,96 +1342,95 @@ def _temperature_scale_rows(values: np.ndarray, temperature: float) -> np.ndarra
     return exp_values / totals
 
 
-def _predict_lstm_mc(
-    component: ComponentState,
-    config: NeuralConfig,
-    history: Sequence[str],
-) -> Tuple[np.ndarray, str, bool, Dict[str, Any]]:
-    fallback = _empirical_fallback_probs(history)
-    empty_diag: Dict[str, Any] = {
+def _empty_mc_diag(simulations: int, fallback: Sequence[float]) -> Dict[str, Any]:
+    return {
         "enabled": True,
-        "simulations_requested": LSTM_MC_SIMULATIONS,
+        "simulations_requested": simulations,
         "simulations_completed": 0,
         "uncertainty": None,
         "reliability": 0.0,
-        "std": _to_prob_dict([0.0, 0.0, 0.0], digits=6),
+        "std": {"B": 0.0, "P": 0.0},
         "vote_probs": _to_prob_dict(fallback, digits=6),
     }
 
-    if not config.enabled:
-        return fallback, "disabled", False, empty_diag
+
+def _predict_component_mc(
+    component: ComponentState,
+    config: NeuralConfig,
+    history: Sequence[str],
+    simulations: int,
+    label: str,
+) -> Tuple[np.ndarray, str, bool, Dict[str, Any]]:
+    fallback = _bp_fallback_probs(history)
+    diag = _empty_mc_diag(simulations, fallback)
     if not TF_AVAILABLE:
-        return fallback, "tensorflow_unavailable", False, empty_diag
+        return fallback, "tensorflow_unavailable", False, diag
     if not component.trained or component.model is None:
-        return fallback, component.status, False, empty_diag
+        return fallback, component.status, False, diag
     if not history:
-        return fallback, "empty_history", False, empty_diag
+        return fallback, "empty_history", False, diag
 
     X = _road_feature_sequence(history, config.sequence_length).reshape(
         1, config.sequence_length, LSTM_FEATURE_DIM
     )
-
     try:
         with _TF_LOCK:
             deterministic_tensor = component.model(X, training=False)
             if hasattr(deterministic_tensor, "numpy"):
                 deterministic_tensor = deterministic_tensor.numpy()
-            deterministic = np.asarray(
-                deterministic_tensor[0], dtype=np.float64
+            deterministic = _normalize(
+                np.asarray(deterministic_tensor[0], dtype=np.float64),
+                fallback=fallback,
             )
-            deterministic = _normalize(deterministic, fallback=fallback)
 
-            fingerprint_seed = int(_history_fingerprint(history), 16) % (2**31 - 1)
+            seed_source = f"{label}:{_history_fingerprint(history)}"
+            fingerprint_seed = int(
+                hashlib.sha1(seed_source.encode()).hexdigest()[:16], 16
+            ) % (2**31 - 1)
             tf.random.set_seed((RANDOM_SEED + fingerprint_seed) % (2**31 - 1))
 
             samples: List[np.ndarray] = []
-            remaining = int(LSTM_MC_SIMULATIONS)
+            remaining = int(simulations)
             while remaining > 0:
                 current_batch = min(remaining, max(1, LSTM_MC_BATCH_SIZE))
                 batch_input = np.repeat(X, current_batch, axis=0)
                 stochastic = component.model(batch_input, training=True)
                 if hasattr(stochastic, "numpy"):
                     stochastic = stochastic.numpy()
-                batch_probs = np.asarray(stochastic, dtype=np.float64)
-                batch_probs = _temperature_scale_rows(
-                    batch_probs, LSTM_MC_TEMPERATURE
+                samples.append(
+                    _temperature_scale_rows(
+                        np.asarray(stochastic, dtype=np.float64),
+                        LSTM_MC_TEMPERATURE,
+                    )
                 )
-                samples.append(batch_probs)
                 remaining -= current_batch
-
             matrix = np.concatenate(samples, axis=0)
+
         mc_mean = _normalize(matrix.mean(axis=0), fallback=fallback)
         mc_std = np.std(matrix, axis=0)
-
         winners = np.argmax(matrix, axis=1)
-        vote_counts = np.bincount(winners, minlength=len(CLASS_NAMES)).astype(float)
+        vote_counts = np.bincount(winners, minlength=2).astype(float)
         vote_probs = _normalize(vote_counts, fallback=mc_mean)
-
         blended = _normalize(
             mc_mean * (1.0 - LSTM_MC_VOTE_BLEND)
             + vote_probs * LSTM_MC_VOTE_BLEND,
             fallback=mc_mean,
         )
-
         uncertainty = float(np.mean(mc_std))
         reliability = _clamp(
             1.0 - uncertainty * LSTM_MC_UNCERTAINTY_SCALE,
             LSTM_MC_MIN_RELIABILITY,
             1.0,
         )
-        uncertainty_adjusted = _normalize(
+        adjusted = _normalize(
             blended * reliability + fallback * (1.0 - reliability),
             fallback=deterministic,
         )
-        calibrated = _calibrate_component_probs(
-            uncertainty_adjusted,
-            component.training_samples,
-            fallback,
-        )
-
+        calibrated = _calibrate_binary_probs(adjusted, component.training_samples)
         diag = {
             "enabled": True,
-            "simulations_requested": LSTM_MC_SIMULATIONS,
+            "component": label,
+            "simulations_requested": simulations,
             "simulations_completed": int(len(matrix)),
             "temperature": round(LSTM_MC_TEMPERATURE, 6),
             "vote_blend": round(LSTM_MC_VOTE_BLEND, 6),
@@ -1007,59 +1439,210 @@ def _predict_lstm_mc(
             "deterministic_probs": _to_prob_dict(deterministic, digits=6),
             "mean_probs": _to_prob_dict(mc_mean, digits=6),
             "std": {
-                name: round(float(mc_std[index]), 6)
-                for index, name in enumerate(CLASS_NAMES)
+                "B": round(float(mc_std[0]), 6),
+                "P": round(float(mc_std[1]), 6),
             },
             "vote_probs": _to_prob_dict(vote_probs, digits=6),
-            "final_lstm_probs": _to_prob_dict(calibrated, digits=6),
+            "final_bp_probs": _to_prob_dict(calibrated, digits=6),
         }
         return calibrated, "ready_mc", True, diag
     except Exception as exc:
-        logger.exception("LSTM Monte Carlo prediction failed")
-        empty_diag["error"] = str(exc)
-        return fallback, f"predict_error:{exc}", False, empty_diag
+        logger.exception("%s Monte Carlo prediction failed", label)
+        diag["error"] = str(exc)
+        return fallback, f"predict_error:{exc}", False, diag
 
 
 # ---------------------------------------------------------------------------
-# Removed GRU / TCN / GBM compatibility stubs
+# Regime and phase logic
 # ---------------------------------------------------------------------------
 
 
-def _select_gbm_backend() -> str:
-    return ""
+def _phase_name(history_len: int) -> str:
+    if history_len <= EARLY_PHASE_END:
+        return "EARLY"
+    if history_len <= MID_PHASE_END:
+        return "MID"
+    return "LATE"
 
 
-def _disabled_component_result(name: str) -> Dict[str, Any]:
+def _phase_settings(phase: str) -> Dict[str, float]:
+    if phase == "EARLY":
+        return {
+            "global_weight": EARLY_GLOBAL_WEIGHT,
+            "local_weight": EARLY_LOCAL_WEIGHT,
+            "deepseek_weight": EARLY_DEEPSEEK_WEIGHT,
+            "min_edge": EARLY_MIN_ENTRY_EDGE,
+            "min_confidence": EARLY_MIN_BP_CONFIDENCE,
+            "max_uncertainty": EARLY_MC_MAX_UNCERTAINTY,
+        }
+    if phase == "MID":
+        return {
+            "global_weight": MID_GLOBAL_WEIGHT,
+            "local_weight": MID_LOCAL_WEIGHT,
+            "deepseek_weight": MID_DEEPSEEK_WEIGHT,
+            "min_edge": MID_MIN_ENTRY_EDGE,
+            "min_confidence": MID_MIN_BP_CONFIDENCE,
+            "max_uncertainty": MID_MC_MAX_UNCERTAINTY,
+        }
     return {
-        "trained": False,
-        "status": "disabled_lstm_only",
-        "samples": 0,
-        "model": name,
+        "global_weight": LATE_GLOBAL_WEIGHT,
+        "local_weight": LATE_LOCAL_WEIGHT,
+        "deepseek_weight": LATE_DEEPSEEK_WEIGHT,
+        "min_edge": LATE_MIN_ENTRY_EDGE,
+        "min_confidence": LATE_MIN_BP_CONFIDENCE,
+        "max_uncertainty": LATE_MC_MAX_UNCERTAINTY,
     }
 
 
-def _train_gbm_if_needed(
-    component: ComponentState,
-    history: Sequence[str],
-    force: bool = False,
-) -> Dict[str, Any]:
-    del history, force
-    component.status = "disabled_lstm_only"
-    component.trained = False
-    component.model = None
-    return _disabled_component_result("gbm")
+def _run_lengths(bp: Sequence[str]) -> List[int]:
+    if not bp:
+        return []
+    lengths: List[int] = []
+    side = bp[0]
+    length = 1
+    for item in bp[1:]:
+        if item == side:
+            length += 1
+        else:
+            lengths.append(length)
+            side = item
+            length = 1
+    lengths.append(length)
+    return lengths
 
 
-def _predict_gbm(
-    component: ComponentState,
-    history: Sequence[str],
-) -> Tuple[np.ndarray, str, bool]:
-    component.status = "disabled_lstm_only"
-    return _empirical_fallback_probs(history), component.status, False
+def _regime_vector(sequence: Sequence[str]) -> np.ndarray:
+    bp = [item for item in sequence if item in BP_TO_INDEX]
+    if not bp:
+        return np.asarray([0.5, 0.5, 0.0], dtype=np.float64)
+    b_share = sum(item == "B" for item in bp) / len(bp)
+    switch = _switch_rate(bp)
+    lengths = _run_lengths(bp)
+    mean_run = float(np.mean(lengths)) if lengths else 1.0
+    mean_run_scaled = min(1.0, mean_run / 5.0)
+    return np.asarray([b_share, switch, mean_run_scaled], dtype=np.float64)
+
+
+def _regime_score_at(history: Sequence[str], end: int) -> float:
+    prefix = list(history[:end])
+    if len(prefix) < REGIME_LONG_WINDOW:
+        return 0.0
+    short = _regime_vector(prefix[-REGIME_SHORT_WINDOW:])
+    long = _regime_vector(prefix[-REGIME_LONG_WINDOW:])
+    diff = np.abs(short - long)
+    return float(diff[0] * 0.40 + diff[1] * 0.35 + diff[2] * 0.25)
+
+
+def _regime_change_info(history: Sequence[str]) -> Dict[str, Any]:
+    if len(history) < REGIME_LONG_WINDOW + 1:
+        return {
+            "detected": False,
+            "score": 0.0,
+            "threshold": REGIME_CHANGE_THRESHOLD,
+            "cooldown_remaining": 0,
+            "hands_since_change": None,
+            "short_window": REGIME_SHORT_WINDOW,
+            "long_window": REGIME_LONG_WINDOW,
+        }
+
+    start = max(REGIME_LONG_WINDOW + 1, len(history) - REGIME_CHANGE_COOLDOWN_HANDS - 2)
+    scores: List[Tuple[int, float]] = []
+    for end in range(start, len(history) + 1):
+        scores.append((end, _regime_score_at(history, end)))
+
+    event_end: Optional[int] = None
+    for index, (end, score) in enumerate(scores):
+        previous = scores[index - 1][1] if index > 0 else _regime_score_at(history, end - 1)
+        if (
+            score >= REGIME_CHANGE_THRESHOLD
+            and previous < REGIME_CHANGE_THRESHOLD * REGIME_CROSSING_RELEASE_RATIO
+        ):
+            event_end = end
+
+    current_score = scores[-1][1] if scores else 0.0
+    if event_end is None:
+        return {
+            "detected": False,
+            "score": round(current_score, 6),
+            "threshold": REGIME_CHANGE_THRESHOLD,
+            "cooldown_remaining": 0,
+            "hands_since_change": None,
+            "short_window": REGIME_SHORT_WINDOW,
+            "long_window": REGIME_LONG_WINDOW,
+        }
+
+    hands_since = len(history) - event_end
+    detected = hands_since <= REGIME_CHANGE_COOLDOWN_HANDS
+    cooldown_remaining = max(0, REGIME_CHANGE_COOLDOWN_HANDS - hands_since)
+    return {
+        "detected": detected,
+        "score": round(current_score, 6),
+        "threshold": REGIME_CHANGE_THRESHOLD,
+        "cooldown_remaining": cooldown_remaining,
+        "hands_since_change": hands_since,
+        "event_end": event_end,
+        "short_window": REGIME_SHORT_WINDOW,
+        "long_window": REGIME_LONG_WINDOW,
+    }
+
+
+def _combine_model_probs(
+    phase: str,
+    global_probs: Sequence[float],
+    local_probs: Sequence[float],
+    deepseek_probs: Optional[Sequence[float]],
+    availability: Mapping[str, bool],
+    fallback: Sequence[float],
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    settings = _phase_settings(phase)
+    weights = {
+        "global_lstm": (
+            settings["global_weight"] * LSTM_WEIGHT
+            if availability.get("global_lstm", False)
+            else 0.0
+        ),
+        "local_lstm": (
+            settings["local_weight"] * LSTM_WEIGHT
+            if availability.get("local_lstm", False)
+            else 0.0
+        ),
+        "deepseek": (
+            min(settings["deepseek_weight"], DEEPSEEK_WEIGHT)
+            if availability.get("deepseek", False) and DEEPSEEK_WEIGHT > 0.0
+            else 0.0
+        ),
+    }
+    total = sum(weights.values())
+    if total <= 0.0:
+        return _normalize(fallback, fallback=_bp_prior_probs()), {
+            **weights,
+            "lstm": 0.0,
+            "gru": 0.0,
+            "tcn": 0.0,
+            "gbm": 0.0,
+            "markov": 0.0,
+        }
+    effective = {key: value / total for key, value in weights.items()}
+    final = np.zeros(2, dtype=np.float64)
+    final += _normalize(global_probs, fallback=fallback) * effective["global_lstm"]
+    final += _normalize(local_probs, fallback=fallback) * effective["local_lstm"]
+    if deepseek_probs is not None:
+        final += _normalize(deepseek_probs, fallback=fallback) * effective["deepseek"]
+    final = _cap_binary_probability(_normalize(final, fallback=fallback), FINAL_MAX_PROB)
+    effective.update(
+        {
+            "lstm": effective["global_lstm"] + effective["local_lstm"],
+            "gru": 0.0,
+            "tcn": 0.0,
+            "gbm": 0.0,
+            "markov": 0.0,
+        }
+    )
+    return final, effective
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek compatibility layer
+# DeepSeek
 # ---------------------------------------------------------------------------
 
 
@@ -1070,76 +1653,53 @@ def _get_deepseek_client() -> Any:
     return _DEEPSEEK_CLIENT
 
 
-def _extract_triplet_from_mapping(
-    data: Mapping[str, Any],
-    base_probs: Sequence[float],
+def _extract_bp_from_mapping(
+    data: Mapping[str, Any], base_probs: Sequence[float]
 ) -> Optional[np.ndarray]:
-    for nested_key in (
-        "probabilities",
-        "probs",
-        "prediction",
-        "result",
-        "distribution",
-    ):
+    for nested_key in ("probabilities", "probs", "prediction", "result", "distribution"):
         nested = data.get(nested_key)
         if isinstance(nested, Mapping):
-            parsed = _extract_triplet_from_mapping(nested, base_probs)
+            parsed = _extract_bp_from_mapping(nested, base_probs)
             if parsed is not None:
                 return parsed
 
-    key_sets = [
-        ("B", "P", "T"),
-        ("b", "p", "t"),
-        ("banker", "player", "tie"),
-        ("banker_prob", "player_prob", "tie_prob"),
-        ("banker_probability", "player_probability", "tie_probability"),
-        ("banker_rate", "player_rate", "tie_rate"),
+    bp_key_sets = [
+        ("B", "P"),
+        ("b", "p"),
+        ("banker", "player"),
+        ("banker_prob", "player_prob"),
+        ("banker_probability", "player_probability"),
+        ("banker_rate", "player_rate"),
     ]
-    for keys in key_sets:
+    for keys in bp_key_sets:
         values = [_as_probability(data.get(key)) for key in keys]
         if all(value is not None for value in values):
             return _normalize([float(value) for value in values], fallback=base_probs)
 
-    adjustment_keys = ("banker_adjust", "player_adjust", "tie_adjust")
-    if any(key in data for key in adjustment_keys):
-        adjusted = np.asarray(base_probs, dtype=np.float64).copy()
-        for index, key in enumerate(adjustment_keys):
-            value = _safe_float(data.get(key, 0.0))
-            adjusted[index] += _clamp(value or 0.0, -0.20, 0.20)
-        return _normalize(adjusted, fallback=base_probs)
+    triplet_sets = [
+        ("B", "P", "T"),
+        ("b", "p", "t"),
+        ("banker", "player", "tie"),
+        ("banker_prob", "player_prob", "tie_prob"),
+        ("banker_rate", "player_rate", "tie_rate"),
+    ]
+    for keys in triplet_sets:
+        values = [_as_probability(data.get(key)) for key in keys]
+        if all(value is not None for value in values):
+            return _normalize([float(values[0]), float(values[1])], fallback=base_probs)
 
     recommendation = str(
-        data.get("recommend")
-        or data.get("recommendation")
-        or data.get("side")
-        or ""
+        data.get("recommend") or data.get("recommendation") or data.get("side") or ""
     ).strip().upper()
-    aliases = {
-        "BANKER": "B",
-        "PLAYER": "P",
-        "TIE": "T",
-        "莊": "B",
-        "闲": "P",
-        "閒": "P",
-        "和": "T",
-    }
+    aliases = {"BANKER": "B", "PLAYER": "P", "莊": "B", "闲": "P", "閒": "P"}
     recommendation = aliases.get(recommendation, recommendation)
-    if recommendation in CLASS_TO_INDEX:
+    if recommendation in BP_TO_INDEX:
         confidence = _as_probability(data.get("confidence"))
-        confidence = 0.60 if confidence is None else _clamp(confidence, 0.34, 0.95)
-        base = _normalize(base_probs, fallback=_prior_probs())
-        target_index = CLASS_TO_INDEX[recommendation]
-        remaining = max(0.0, 1.0 - confidence)
-        other_total = float(base.sum() - base[target_index])
-        result = np.zeros(len(CLASS_NAMES), dtype=np.float64)
-        result[target_index] = confidence
-        for idx in range(len(CLASS_NAMES)):
-            if idx == target_index:
-                continue
-            ratio = base[idx] / other_total if other_total > 0 else 0.5
-            result[idx] = remaining * ratio
-        return _normalize(result, fallback=base)
-
+        confidence = 0.58 if confidence is None else _clamp(confidence, 0.50, 0.90)
+        result = np.asarray([1.0 - confidence, 1.0 - confidence], dtype=np.float64)
+        result[BP_TO_INDEX[recommendation]] = confidence
+        result[1 - BP_TO_INDEX[recommendation]] = 1.0 - confidence
+        return result
     return None
 
 
@@ -1158,11 +1718,12 @@ def _deepseek_probs(
         return None, None, "not_enough_history"
 
     payload: Dict[str, Any] = {
-        "task": "baccarat_next_result_probability",
-        "classes": list(CLASS_NAMES),
+        "task": "baccarat_next_banker_or_player_probability",
+        "classes": ["B", "P"],
         "instruction": (
-            "Return next-hand B/P/T probabilities. Do not return betting advice. "
-            "Probabilities must sum to 1."
+            "Return next non-tie direction probabilities for B and P only. "
+            "A tie in history is context, not a target. Do not return betting advice. "
+            "B and P probabilities must sum to 1."
         ),
         "user_id": user_id,
         "venue": venue,
@@ -1170,85 +1731,44 @@ def _deepseek_probs(
         "shoe_id": shoe_id,
         "history_len": len(history),
         "history_tail": "".join(history[-48:]),
-        "component_probs": {
-            key: _to_prob_dict(value, digits=6)
-            for key, value in component_probs.items()
+        "component_bp_probs": {
+            key: _to_prob_dict(value, digits=6) for key, value in component_probs.items()
         },
-        "local_probs": _to_prob_dict(local_probs, digits=6),
+        "local_bp_probs": _to_prob_dict(local_probs, digits=6),
         "timeout_seconds": DEEPSEEK_TIMEOUT_SECONDS,
     }
-
     try:
         with _DEEPSEEK_LOCK:
             raw = _get_deepseek_client().calibrate(payload)
     except Exception as exc:
         logger.warning("DeepSeek calibration failed: %s", exc)
         return None, {"error": True, "message": str(exc)}, "call_error"
-
     if not isinstance(raw, Mapping):
         return None, {"error": True, "message": "DeepSeek response is not a mapping"}, "invalid_response"
     if raw.get("error"):
         return None, dict(raw), "api_error"
-
-    parsed = _extract_triplet_from_mapping(raw, local_probs)
+    parsed = _extract_bp_from_mapping(raw, local_probs)
     if parsed is None:
         return None, dict(raw), "unrecognized_response"
     return parsed, dict(raw), "ready"
 
 
 # ---------------------------------------------------------------------------
-# Fusion
+# Disabled component stubs
 # ---------------------------------------------------------------------------
 
 
-def _configured_weights() -> Dict[str, float]:
+def _select_gbm_backend() -> str:
+    return ""
+
+
+def _disabled_component_result(name: str) -> Dict[str, Any]:
     return {
-        "lstm": max(0.0, LSTM_WEIGHT),
-        "gru": 0.0,
-        "tcn": 0.0,
-        "gbm": 0.0,
-        "deepseek": max(0.0, DEEPSEEK_WEIGHT),
-        "markov": 0.0,
+        "trained": False,
+        "status": "disabled_lstm_only",
+        "samples": 0,
+        "model": name,
     }
-
-
-def _fusion(
-    component_probs: Mapping[str, Sequence[float]],
-    availability: Mapping[str, bool],
-    fallback: Sequence[float],
-) -> Tuple[np.ndarray, Dict[str, float]]:
-    configured = _configured_weights()
-    active_weights = {
-        "lstm": configured["lstm"] if availability.get("lstm", False) else 0.0,
-        "gru": 0.0,
-        "tcn": 0.0,
-        "gbm": 0.0,
-        "deepseek": (
-            configured["deepseek"]
-            if availability.get("deepseek", False)
-            else 0.0
-        ),
-    }
-
-    total = sum(active_weights.values())
-    if total <= 0.0:
-        return _normalize(fallback, fallback=_prior_probs()), {
-            **active_weights,
-            "markov": 0.0,
-        }
-
-    effective = {key: value / total for key, value in active_weights.items()}
-    final = np.zeros(len(CLASS_NAMES), dtype=np.float64)
-    for name in ("lstm", "deepseek"):
-        weight = effective.get(name, 0.0)
-        if weight <= 0.0:
-            continue
-        final += _normalize(
-            component_probs.get(name, fallback), fallback=fallback
-        ) * weight
-
-    effective["markov"] = 0.0
-    return _normalize(final, fallback=fallback), effective
 
 
 # ---------------------------------------------------------------------------
@@ -1264,44 +1784,60 @@ def fit_history(
     user_id: str = "",
     force: bool = True,
 ) -> Dict[str, Any]:
-    """Explicitly fit/update the isolated LSTM model for one UID."""
+    """Explicitly fit/update the current-shoe B/P LSTM for one UID."""
     cleaned = _clean_history(history)
-    if REQUIRE_USER_ID and not str(user_id or "").strip():
-        return {
-            "ok": False,
-            "error": "user_id is required when REQUIRE_USER_ID=1",
-        }
+    uid = str(user_id or "").strip()
+    if REQUIRE_USER_ID and not uid:
+        return {"ok": False, "error": "user_id is required when REQUIRE_USER_ID=1"}
 
-    key = _make_training_key(user_id, venue, room, shoe_id)
-    state = _get_model_state(key)
-    config = _neural_configs()["lstm"]
+    scope_key = _make_scope_key(uid, venue, room)
+    training_key = _make_training_key(uid, venue, room, shoe_id)
+    config = _neural_config()
+    memory = _get_scope_memory(scope_key)
+    activation = _activate_training_key(memory, training_key, config)
+    state = _get_model_state(training_key, scope_key, shoe_id)
 
     with state.lock:
         if state.last_history and not _is_extension(state.last_history, cleaned):
-            state.reset()
-
-        results = {
-            "lstm": _train_neural_if_needed(
-                state.lstm, config, cleaned, force=force
-            ),
-            "gru": _disabled_component_result("gru"),
-            "tcn": _disabled_component_result("tcn"),
-            "gbm": _disabled_component_result("gbm"),
-        }
+            archive = _archive_shoe_history(memory, state.last_history, config)
+            state.reset_local()
+        else:
+            archive = {"archived": False, "status": "extension"}
+        local_training = _train_local_if_needed(
+            state.lstm, memory.base_lstm, config, cleaned, force=force
+        )
         state.gru.status = "disabled_lstm_only"
         state.tcn.status = "disabled_lstm_only"
         state.gbm.status = "disabled_lstm_only"
         state.last_history = list(cleaned)
 
+    results = {
+        "lstm": local_training,
+        "global_lstm": _component_info(memory.base_lstm),
+        "gru": _disabled_component_result("gru"),
+        "tcn": _disabled_component_result("tcn"),
+        "gbm": _disabled_component_result("gbm"),
+    }
     return {
         "ok": True,
-        "training_key": key,
-        "user_id": user_id,
+        "training_key": training_key,
+        "scope_key": scope_key,
+        "user_id": uid,
         "history_len": len(cleaned),
+        "bp_training_samples": state.lstm.training_samples,
         "tf_available": TF_AVAILABLE,
         "gbm_backend": "DISABLED_LSTM_ONLY",
         "models": results,
-        "lstm": results["lstm"],
+        "lstm": local_training,
+        "shoe_activation": activation,
+        "shoe_archive": archive,
+        "cross_shoe_memory": {
+            "enabled": GLOBAL_MEMORY_ENABLED,
+            "archived_shoes": len(memory.shoe_histories),
+            "samples": memory.total_archived_samples,
+            "base_trained": memory.base_lstm.trained,
+            "persistent_across_restart": False,
+        },
     }
 
 
@@ -1312,16 +1848,9 @@ def predict(
     shoe_id: str = "",
     user_id: str = "",
 ) -> Dict[str, Any]:
-    """Predict next B/P/T probabilities with LSTM Monte Carlo + DeepSeek.
-
-    Every user gets an isolated model key:
-        user_id | venue | room | shoe_id
-
-    Pass the LINE UID as ``user_id`` to guarantee isolation.
-    """
+    """Predict B/P direction with phase-aware base/local LSTM + DeepSeek."""
     cleaned = _clean_history(history)
     uid = str(user_id or "").strip()
-
     if REQUIRE_USER_ID and not uid:
         return {
             "ok": False,
@@ -1330,9 +1859,12 @@ def predict(
             "recommend_text": "觀望",
         }
 
+    scope_key = _make_scope_key(uid, venue, room)
     training_key = _make_training_key(uid, venue, room, shoe_id)
-    state = _get_model_state(training_key)
-    config = _neural_configs()["lstm"]
+    config = _neural_config()
+    memory = _get_scope_memory(scope_key)
+    activation = _activate_training_key(memory, training_key, config)
+    state = _get_model_state(training_key, scope_key, shoe_id)
 
     try:
         with state.lock:
@@ -1340,123 +1872,211 @@ def predict(
                 state.last_history and not _is_extension(state.last_history, cleaned)
             )
             if reset_detected:
-                state.reset()
+                archive_result = _archive_shoe_history(
+                    memory, state.last_history, config
+                )
+                state.reset_local()
+            else:
+                archive_result = {"archived": False, "status": "no_reset"}
 
-            training_results = {
-                "lstm": _train_neural_if_needed(
-                    state.lstm, config, cleaned, force=False
-                ),
-                "gru": _disabled_component_result("gru"),
-                "tcn": _disabled_component_result("tcn"),
-                "gbm": _disabled_component_result("gbm"),
-            }
+            local_training = _train_local_if_needed(
+                state.lstm, memory.base_lstm, config, cleaned, force=False
+            )
             state.gru.status = "disabled_lstm_only"
             state.tcn.status = "disabled_lstm_only"
             state.gbm.status = "disabled_lstm_only"
 
-            lstm_probs, lstm_status, lstm_available, mc_diagnostics = (
-                _predict_lstm_mc(state.lstm, config, cleaned)
+            local_bp, local_status, local_available, local_mc = _predict_component_mc(
+                state.lstm,
+                config,
+                cleaned,
+                simulations=LSTM_MC_SIMULATIONS,
+                label="local_lstm",
             )
+            with memory.lock:
+                global_bp, global_status, global_available, global_mc = (
+                    _predict_component_mc(
+                        memory.base_lstm,
+                        config,
+                        cleaned,
+                        simulations=GLOBAL_MC_SIMULATIONS,
+                        label="global_lstm",
+                    )
+                )
             state.last_history = list(cleaned)
 
-        fallback = _empirical_fallback_probs(cleaned)
-        local_components: Dict[str, np.ndarray] = {"lstm": lstm_probs}
-        local_availability = {"lstm": lstm_available}
+        fallback_bp = _bp_fallback_probs(cleaned)
+        phase = _phase_name(len(cleaned))
+        phase_settings = _phase_settings(phase)
 
-        local_probs, local_effective = _fusion(
-            component_probs=local_components,
-            availability={**local_availability, "deepseek": False},
-            fallback=fallback,
+        # Local LSTM aggregate used as DeepSeek context before DeepSeek is called.
+        pre_ai_availability = {
+            "global_lstm": global_available,
+            "local_lstm": local_available,
+            "deepseek": False,
+        }
+        pre_ai_bp, pre_ai_weights = _combine_model_probs(
+            phase,
+            global_bp,
+            local_bp,
+            None,
+            pre_ai_availability,
+            fallback_bp,
         )
 
-        ai_probs, ai_result, ai_status = _deepseek_probs(
+        ai_bp, ai_result, ai_status = _deepseek_probs(
             history=cleaned,
             user_id=uid,
             venue=venue,
             room=room,
             shoe_id=shoe_id,
-            component_probs=local_components,
-            local_probs=local_probs,
+            component_probs={
+                "global_lstm": global_bp,
+                "local_lstm": local_bp,
+                "phase_lstm": pre_ai_bp,
+            },
+            local_probs=pre_ai_bp,
         )
 
-        all_components: Dict[str, Sequence[float]] = {
-            "lstm": lstm_probs,
-            "deepseek": ai_probs if ai_probs is not None else fallback,
-        }
         availability = {
-            "lstm": lstm_available,
+            "global_lstm": global_available,
+            "local_lstm": local_available,
+            "deepseek": ai_bp is not None,
             "gru": False,
             "tcn": False,
             "gbm": False,
-            "deepseek": ai_probs is not None,
         }
-        final_probs, effective_weights = _fusion(
-            component_probs=all_components,
-            availability=availability,
-            fallback=fallback,
-        )
-        final_probs = _cap_probability_vector(
-            final_probs, FINAL_MAX_PROB, fallback
+        final_bp, effective_weights = _combine_model_probs(
+            phase,
+            global_bp,
+            local_bp,
+            ai_bp,
+            availability,
+            fallback_bp,
         )
 
-        b_prob = float(final_probs[CLASS_TO_INDEX["B"]])
-        p_prob = float(final_probs[CLASS_TO_INDEX["P"]])
-        t_prob = float(final_probs[CLASS_TO_INDEX["T"]])
-
-        # Existing low-edge recommendation behavior is retained unchanged.
-        bp_total = max(1e-12, b_prob + p_prob)
-        confidence = max(b_prob, p_prob) / bp_total
-        edge = abs(b_prob - p_prob)
+        b_bp = float(final_bp[0])
+        p_bp = float(final_bp[1])
+        confidence = max(b_bp, p_bp)
+        edge = abs(b_bp - p_bp)
         signal_level = _signal_level(confidence, edge)
+        primary_side = "B" if b_bp >= p_bp else "P"
 
-        fp = _history_fingerprint(cleaned)
-        local_seed = int(fp, 16) % (2**31)
-        rng = random.Random(local_seed)
+        tie_rate = _estimate_tie_rate(cleaned)
+        final_triplet = _bp_to_triplet(final_bp, tie_rate)
+        global_triplet = _bp_to_triplet(global_bp, tie_rate)
+        local_triplet = _bp_to_triplet(local_bp, tie_rate)
+        pre_ai_triplet = _bp_to_triplet(pre_ai_bp, tie_rate)
+        ai_triplet = _bp_to_triplet(ai_bp, tie_rate) if ai_bp is not None else None
 
-        if signal_level == "LOW" and edge < 0.02:
-            recommend = "B" if rng.random() < 0.5 else "P"
-            recommend_text = "莊" if recommend == "B" else "閒"
-            reason_extra = (
-                f" (邊緣極小 edge={edge:.4f}，使用歷史指紋隨機打破固定偏好)"
+        b_prob = float(final_triplet[CLASS_TO_INDEX["B"]])
+        p_prob = float(final_triplet[CLASS_TO_INDEX["P"]])
+        t_prob = float(final_triplet[CLASS_TO_INDEX["T"]])
+
+        regime_change = _regime_change_info(cleaned)
+        local_uncertainty = local_mc.get("uncertainty")
+        global_uncertainty = global_mc.get("uncertainty")
+        uncertainty_values: List[float] = []
+        if local_available and local_uncertainty is not None:
+            uncertainty_values.append(float(local_uncertainty))
+        if global_available and global_uncertainty is not None:
+            uncertainty_values.append(float(global_uncertainty))
+        combined_uncertainty = (
+            float(np.average(uncertainty_values)) if uncertainty_values else None
+        )
+
+        lstm_reference_bp = pre_ai_bp
+        lstm_side = "B" if float(lstm_reference_bp[0]) >= float(lstm_reference_bp[1]) else "P"
+        deepseek_side = None
+        if ai_bp is not None:
+            deepseek_side = "B" if float(ai_bp[0]) >= float(ai_bp[1]) else "P"
+        deepseek_conflict = bool(
+            deepseek_side is not None and deepseek_side != lstm_side
+        )
+
+        observe_reasons: List[str] = []
+        model_ready = global_available or local_available
+        if REQUIRE_MODEL_READY_FOR_ENTRY and not model_ready:
+            observe_reasons.append("跨靴與當靴LSTM皆尚未完成訓練")
+        if edge < phase_settings["min_edge"]:
+            observe_reasons.append(
+                f"{phase}階段莊閒差距{edge * 100:.1f}%低於"
+                f"{phase_settings['min_edge'] * 100:.1f}%"
             )
-        else:
-            recommend = "B" if b_prob >= p_prob else "P"
-            recommend_text = "莊" if recommend == "B" else "閒"
-            reason_extra = ""
+        if confidence < phase_settings["min_confidence"]:
+            observe_reasons.append(
+                f"莊閒信心{confidence * 100:.1f}%低於"
+                f"{phase_settings['min_confidence'] * 100:.1f}%"
+            )
+        if (
+            combined_uncertainty is not None
+            and combined_uncertainty > phase_settings["max_uncertainty"]
+        ):
+            observe_reasons.append(
+                f"MC不確定度{combined_uncertainty:.4f}高於"
+                f"{phase_settings['max_uncertainty']:.4f}"
+            )
+        if regime_change.get("detected"):
+            observe_reasons.append(
+                "偵測到前後牌路節奏轉換，冷卻"
+                f"{regime_change.get('cooldown_remaining', 0)}手"
+            )
+        if (
+            DEEPSEEK_CONFLICT_OBSERVE
+            and deepseek_conflict
+            and edge < DEEPSEEK_CONFLICT_OVERRIDE_EDGE
+        ):
+            observe_reasons.append(
+                f"LSTM與DeepSeek方向衝突且差距未達"
+                f"{DEEPSEEK_CONFLICT_OVERRIDE_EDGE * 100:.1f}%"
+            )
 
-        disabled_probs = _to_prob_dict(fallback, digits=6)
-        component_prob_dict = {
-            "lstm": _to_prob_dict(lstm_probs, digits=6),
-            "gru": disabled_probs,
-            "tcn": disabled_probs,
-            "gbm": disabled_probs,
-            "deepseek": _to_prob_dict(ai_probs, digits=6)
-            if ai_probs is not None
-            else None,
-            "local": _to_prob_dict(local_probs, digits=6),
-            "final": _to_prob_dict(final_probs, digits=6),
-        }
+        is_observe = bool(observe_reasons)
+        recommend = "NONE" if is_observe else primary_side
+        recommend_text = (
+            "觀望" if is_observe else ("莊" if recommend == "B" else "閒")
+        )
+        observe_reason = "；".join(observe_reasons)
 
         active_labels = [
             name.upper()
-            for name, available in availability.items()
-            if available and effective_weights.get(name, 0.0) > 0.0
+            for name in ("global_lstm", "local_lstm", "deepseek")
+            if availability.get(name, False) and effective_weights.get(name, 0.0) > 0.0
         ]
-        active_text = "+".join(active_labels) if active_labels else "PRIOR_FALLBACK"
-        mc_completed = int(mc_diagnostics.get("simulations_completed") or 0)
-        mc_uncertainty = mc_diagnostics.get("uncertainty")
+        active_text = "+".join(active_labels) if active_labels else "BP_PRIOR_FALLBACK"
         reason = (
-            f"{active_text} 融合；LSTM={lstm_status}; "
-            f"MonteCarlo={mc_completed}/{LSTM_MC_SIMULATIONS}; "
-            f"MC不確定度={mc_uncertainty}; DeepSeek={ai_status}; "
-            f"GRU/TCN/GBM=disabled_lstm_only; "
-            f"莊閒方向信心={confidence * 100:.1f}%{reason_extra}"
+            f"{active_text}；phase={phase}; global={global_status}; "
+            f"local={local_status}; DeepSeek={ai_status}; "
+            f"B/P信心={confidence * 100:.1f}%; edge={edge * 100:.1f}%; "
+            f"MC不確定度={combined_uncertainty}; "
+            f"regime_change={regime_change.get('detected', False)}"
         )
+        if is_observe:
+            reason += f"；觀望原因={observe_reason}"
 
-        configured_weights = _configured_weights()
+        disabled_triplet = _bp_to_triplet(fallback_bp, tie_rate)
+        configured_weights = {
+            "lstm": LSTM_WEIGHT,
+            "deepseek": DEEPSEEK_WEIGHT,
+            "global_lstm": phase_settings["global_weight"],
+            "local_lstm": phase_settings["local_weight"],
+            "phase_deepseek": phase_settings["deepseek_weight"],
+            "gru": 0.0,
+            "tcn": 0.0,
+            "gbm": 0.0,
+            "markov": 0.0,
+        }
+        model_training = {
+            "lstm": local_training,
+            "global_lstm": _component_info(memory.base_lstm),
+            "gru": _disabled_component_result("gru"),
+            "tcn": _disabled_component_result("tcn"),
+            "gbm": _disabled_component_result("gbm"),
+        }
+
         result: Dict[str, Any] = {
             "ok": True,
-            "engine": "LSTM_MONTE_CARLO_DEEPSEEK",
+            "engine": "LSTM_BP_REGIME_MC_DEEPSEEK",
             "predict_engine_env": PREDICT_ENGINE,
             "user_id": uid,
             "uid_isolated": bool(PER_UID_MODELS and uid),
@@ -1469,105 +2089,174 @@ def predict(
             "banker_rate": round(b_prob * 100.0, 1),
             "player_rate": round(p_prob * 100.0, 1),
             "tie_rate": round(t_prob * 100.0, 1),
-            "probabilities": _to_prob_dict(final_probs, digits=6),
+            "probabilities": _to_prob_dict(final_triplet, digits=6),
+            "bp_probabilities": _to_prob_dict(final_bp, digits=6),
             "recommend": recommend,
             "recommend_text": recommend_text,
-            "is_observe": False,
-            "observe_reason": "",
+            "is_observe": is_observe,
+            "observe_reason": observe_reason,
             "confidence": round(confidence, 4),
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(edge, 6),
             "signal_level": signal_level,
-            "pattern_label": "LSTM 多尺度牌路特徵 + Monte Carlo Dropout",
-            "regime": "LSTM_MC_DEEPSEEK",
+            "pattern_label": "B/P二分類LSTM＋跨靴記憶＋Replay＋MC",
+            "regime": phase,
             "ngram_label": "",
             "ngram_sample": 0,
             "big_road_label": (
-                "大路 B/P/T、連續長度、切換、單跳、雙跳區塊與短中期比例輸入 LSTM"
+                "B/P/T作為輸入；僅B/P作為訓練目標；和局目標跳過"
             ),
             "big_eye_label": "",
             "small_road_label": "",
             "cockroach_label": "",
-            "road_consensus_label": "",
-            "road_consensus_ratio": 0.5,
-            "road_conflict_ratio": 0.5,
+            "road_consensus_label": (
+                "DeepSeek與LSTM一致" if not deepseek_conflict else "DeepSeek與LSTM衝突"
+            ),
+            "road_consensus_ratio": 1.0 if ai_bp is not None and not deepseek_conflict else 0.5,
+            "road_conflict_ratio": 1.0 if deepseek_conflict else 0.0,
             "road_family": {},
             "down3_family": {},
             "down3_family_label": "",
             "dense_board": {},
-            "final_confirmation": {},
-            "road_lifecycle": {},
-            "adaptive_road_memory": {},
-            "pattern_replay_memory": {},
-            "road_rhythm": {},
-            "long_anchor": {},
+            "final_confirmation": {
+                "lstm_side": lstm_side,
+                "deepseek_side": deepseek_side,
+                "conflict": deepseek_conflict,
+                "override_edge": DEEPSEEK_CONFLICT_OVERRIDE_EDGE,
+                "passed": not is_observe,
+            },
+            "road_lifecycle": {
+                "phase": phase,
+                "early_end": EARLY_PHASE_END,
+                "mid_end": MID_PHASE_END,
+                "phase_settings": phase_settings,
+            },
+            "adaptive_road_memory": {
+                "enabled": GLOBAL_MEMORY_ENABLED,
+                "scope_key": scope_key,
+                "archived_shoes": len(memory.shoe_histories),
+                "archived_samples": memory.total_archived_samples,
+                "base_trained": memory.base_lstm.trained,
+                "persistent_across_restart": False,
+                "activation": activation,
+                "archive_result": archive_result,
+            },
+            "pattern_replay_memory": {
+                "enabled": True,
+                "recent_window": REPLAY_RECENT_WINDOW,
+                "batch_samples": REPLAY_BATCH_SAMPLES,
+                "recent_ratio": REPLAY_RECENT_RATIO,
+                "recency_decay": REPLAY_RECENCY_DECAY,
+                "local_training": local_training,
+            },
+            "road_rhythm": {
+                "regime_change": regime_change,
+                "short_switch_rate": _switch_rate(cleaned[-REGIME_SHORT_WINDOW:]),
+                "long_switch_rate": _switch_rate(cleaned[-REGIME_LONG_WINDOW:]),
+            },
+            "long_anchor": {
+                "global_available": global_available,
+                "global_status": global_status,
+                "global_bp_probs": _to_prob_dict(global_bp, digits=6),
+            },
             "online_model_performance": {},
             "live_walk_forward_performance": {},
             "ask_road_memory": {},
-            "walk_forward_enabled": False,
-            "direction_core": "LSTM_MONTE_CARLO_DEEPSEEK",
+            "walk_forward_enabled": True,
+            "direction_core": "LSTM_BP_GLOBAL_LOCAL_REGIME",
             "direction_locked": False,
             "reason": reason,
             "configured_weights": {
-                key: round(value, 6) for key, value in configured_weights.items()
+                key: round(float(value), 6)
+                for key, value in configured_weights.items()
             },
             "effective_weights": {
-                key: round(value, 6) for key, value in effective_weights.items()
+                key: round(float(value), 6)
+                for key, value in effective_weights.items()
             },
             "dynamic_weights": {
-                key: round(value, 6) for key, value in effective_weights.items()
+                key: round(float(value), 6)
+                for key, value in effective_weights.items()
             },
             "local_effective_weights": {
-                key: round(value, 6) for key, value in local_effective.items()
+                key: round(float(value), 6) for key, value in pre_ai_weights.items()
             },
-            "component_probs": component_prob_dict,
-            "monte_carlo": mc_diagnostics,
+            "component_probs": {
+                "global_lstm": _to_prob_dict(global_triplet, digits=6),
+                "local_lstm": _to_prob_dict(local_triplet, digits=6),
+                "lstm": _to_prob_dict(pre_ai_triplet, digits=6),
+                "gru": _to_prob_dict(disabled_triplet, digits=6),
+                "tcn": _to_prob_dict(disabled_triplet, digits=6),
+                "gbm": _to_prob_dict(disabled_triplet, digits=6),
+                "deepseek": _to_prob_dict(ai_triplet, digits=6)
+                if ai_triplet is not None
+                else None,
+                "local": _to_prob_dict(pre_ai_triplet, digits=6),
+                "final": _to_prob_dict(final_triplet, digits=6),
+            },
+            "monte_carlo": {
+                "local": local_mc,
+                "global": global_mc,
+                "combined_uncertainty": combined_uncertainty,
+            },
             "mc_simulations": LSTM_MC_SIMULATIONS,
-            "mc_simulations_completed": mc_completed,
+            "mc_simulations_completed": int(
+                local_mc.get("simulations_completed") or 0
+            ),
             "markov": {
                 "enabled": False,
                 "removed": True,
                 "reason": "Markov removed from prediction fusion",
             },
             "markov_label": "Markov 已移除，不參與方向判斷",
-            "ai_used": ai_probs is not None,
+            "ai_used": ai_bp is not None,
             "ai_status": ai_status,
             "ai_result": ai_result if DEBUG_AI_RESULT else None,
-            "ml_trained": state.lstm.trained,
-            "ml_samples": state.lstm.training_samples,
+            "ml_trained": bool(state.lstm.trained or memory.base_lstm.trained),
+            "ml_samples": max(
+                state.lstm.training_samples,
+                memory.base_lstm.training_samples,
+            ),
             "tf_available": TF_AVAILABLE,
             "tf_import_error": TF_IMPORT_ERROR if not TF_AVAILABLE else "",
-            "lstm_status": lstm_status,
+            "lstm_status": local_status,
+            "global_lstm_status": global_status,
             "gru_status": "disabled_lstm_only",
             "tcn_status": "disabled_lstm_only",
             "gbm_status": "disabled_lstm_only",
             "gbm_backend": "DISABLED_LSTM_ONLY",
-            "lstm_training": training_results["lstm"],
-            "gru_training": training_results["gru"],
-            "tcn_training": training_results["tcn"],
-            "gbm_training": training_results["gbm"],
-            "model_training": training_results,
+            "lstm_training": local_training,
+            "global_lstm_training": _component_info(memory.base_lstm),
+            "gru_training": model_training["gru"],
+            "tcn_training": model_training["tcn"],
+            "gbm_training": model_training["gbm"],
+            "model_training": model_training,
             "lstm_sequence_length": LSTM_SEQUENCE_LENGTH,
             "gru_sequence_length": GRU_SEQUENCE_LENGTH,
             "tcn_sequence_length": TCN_SEQUENCE_LENGTH,
             "lstm_units": LSTM_UNITS,
+            "lstm_second_units": LSTM_SECOND_UNITS,
             "gru_units": GRU_UNITS,
             "tcn_filters": TCN_FILTERS,
             "training_key": training_key,
+            "scope_key": scope_key,
             "model_cache_size": len(_MODEL_CACHE),
             "ml_predictions": {
-                # Legacy keys retained so older app.py code does not fail.
-                "lr": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
-                "rf": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
-                "lstm": round(float(lstm_probs[CLASS_TO_INDEX["B"]]), 6),
-                "gru": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
-                "tcn": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
-                "gbm": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
+                "lr": round(float(disabled_triplet[0]), 6),
+                "rf": round(float(disabled_triplet[0]), 6),
+                "lstm": round(float(pre_ai_triplet[0]), 6),
+                "global_lstm": round(float(global_triplet[0]), 6),
+                "local_lstm": round(float(local_triplet[0]), 6),
+                "gru": round(float(disabled_triplet[0]), 6),
+                "tcn": round(float(disabled_triplet[0]), 6),
+                "gbm": round(float(disabled_triplet[0]), 6),
                 "ensemble": round(b_prob, 6),
-                "lstm_probs": _to_prob_dict(lstm_probs, digits=6),
-                "gru_probs": disabled_probs,
-                "tcn_probs": disabled_probs,
-                "gbm_probs": disabled_probs,
+                "lstm_probs": _to_prob_dict(pre_ai_triplet, digits=6),
+                "global_lstm_probs": _to_prob_dict(global_triplet, digits=6),
+                "local_lstm_probs": _to_prob_dict(local_triplet, digits=6),
+                "gru_probs": _to_prob_dict(disabled_triplet, digits=6),
+                "tcn_probs": _to_prob_dict(disabled_triplet, digits=6),
+                "gbm_probs": _to_prob_dict(disabled_triplet, digits=6),
             },
         }
 
@@ -1577,31 +2266,30 @@ def predict(
                 "reset_detected": reset_detected,
                 "availability": availability,
                 "state": {
-                    "lstm": _component_info(state.lstm),
+                    "local_lstm": _component_info(state.lstm),
+                    "global_lstm": _component_info(memory.base_lstm),
                     "gru": _component_info(state.gru),
                     "tcn": _component_info(state.tcn),
                     "gbm": _component_info(state.gbm),
                 },
-                "gbm_import_errors": GBM_IMPORT_ERRORS,
                 "deepseek_import_error": _DEEPSEEK_IMPORT_ERROR,
-                "monte_carlo": mc_diagnostics,
+                "regime_change": regime_change,
             }
         else:
             result["debug"] = None
-
         return result
 
     except Exception as exc:
         logger.exception("Predictor failed for key=%s", training_key)
-        fallback = _empirical_fallback_probs(cleaned)
+        fallback_bp = _bp_fallback_probs(cleaned)
+        tie_rate = _estimate_tie_rate(cleaned)
+        fallback = _bp_to_triplet(fallback_bp, tie_rate)
         b_prob, p_prob, t_prob = [float(value) for value in fallback]
-        recommend = "B" if b_prob >= p_prob else "P"
-        bp_total = max(1e-12, b_prob + p_prob)
-        confidence = max(b_prob, p_prob) / bp_total
+        confidence = max(float(fallback_bp[0]), float(fallback_bp[1]))
         return {
             "ok": False,
             "error": str(exc),
-            "engine": "LSTM_MONTE_CARLO_DEEPSEEK",
+            "engine": "LSTM_BP_REGIME_MC_DEEPSEEK",
             "user_id": uid,
             "venue": venue,
             "room": room,
@@ -1612,16 +2300,18 @@ def predict(
             "player_rate": round(p_prob * 100.0, 1),
             "tie_rate": round(t_prob * 100.0, 1),
             "probabilities": _to_prob_dict(fallback, digits=6),
-            "recommend": recommend,
-            "recommend_text": "莊" if recommend == "B" else "閒",
-            "is_observe": False,
-            "observe_reason": "",
+            "bp_probabilities": _to_prob_dict(fallback_bp, digits=6),
+            "recommend": "NONE",
+            "recommend_text": "觀望",
+            "is_observe": True,
+            "observe_reason": "模型執行失敗，不使用先驗機率強制選邊",
             "confidence": round(confidence, 4),
             "confidence_pct": round(confidence * 100.0, 1),
-            "decision_edge": round(abs(b_prob - p_prob), 6),
+            "decision_edge": round(abs(float(fallback_bp[0]) - float(fallback_bp[1])), 6),
             "signal_level": "LOW",
-            "reason": "LSTM/DeepSeek 執行失敗，暫時使用 B/P/T 基礎與當前樣本先驗機率",
+            "reason": "LSTM/DeepSeek 執行失敗，已改為觀望",
             "training_key": training_key,
+            "scope_key": scope_key,
             "tf_available": TF_AVAILABLE,
             "ai_used": False,
             "monte_carlo": {
