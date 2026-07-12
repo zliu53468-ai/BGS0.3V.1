@@ -459,9 +459,9 @@ def _calibrate_component_probs(
     sample_count: int,
     fallback: Sequence[float],
 ) -> np.ndarray:
-    """Shrink small-sample predictions toward the empirical baccarat prior."""
+    """Shrink small-sample predictions toward the fixed long-term prior."""
     raw = _normalize(values, fallback=fallback)
-    base = _normalize(fallback, fallback=_prior_probs())
+    base = _prior_probs()
     strength = max(0.0, MODEL_CALIBRATION_STRENGTH)
     reliability = (
         float(sample_count) / (float(sample_count) + strength)
