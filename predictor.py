@@ -1,20 +1,22 @@
-"""Baccarat predictor: per-UID GRU + TCN/1D-CNN + GBM ensemble.
+"""Baccarat predictor: per-UID LSTM + Monte Carlo Dropout + DeepSeek.
 
-Core design retained from the previous predictor:
+Core compatibility retained from the previous predictor:
 
 * Input is a Big Road sequence containing B / P / T.
 * Every LINE UID / venue / room / shoe has isolated online model state.
 * Public ``predict`` and ``fit_history`` signatures remain compatible.
 * Common response keys used by app.py are preserved.
-* Markov has been removed from the actual prediction path.
-* LSTM code is retained as an optional A/B-test component, but is disabled by
-  default because it overlaps strongly with GRU and consumes more resources.
-* GBM backend supports LightGBM, XGBoost, or an automatic sklearn fallback.
+* The active local prediction model is LSTM only.
+* GRU, TCN/1D-CNN, GBM, and Markov do not participate in training or fusion.
+* Monte Carlo Dropout performs repeated stochastic LSTM forward passes to
+  estimate next-hand probabilities and prediction uncertainty.
+* DeepSeek calibration remains available and can be fused with the LSTM result.
 
 Important limitation:
-B/P/T history alone cannot guarantee a stable predictive edge in a fair
-baccarat game. This module is an experimental sequence classifier and should
-be evaluated with strict walk-forward testing rather than training accuracy.
+B/P/T history alone cannot guarantee a stable predictive edge or continuous
+winning streaks in a fair baccarat game. Monte Carlo Dropout estimates model
+uncertainty; it does not change the underlying randomness of the cards. Use
+strict walk-forward testing and loss limits when evaluating this module.
 """
 
 from __future__ import annotations
@@ -98,47 +100,54 @@ def _env_csv_ints(name: str, default: Sequence[int]) -> Tuple[int, ...]:
 # Core settings
 # ---------------------------------------------------------------------------
 
-PREDICT_ENGINE = os.getenv(
-    "PREDICT_ENGINE", "GRU_TCN_GBM_ENSEMBLE"
-).strip().upper()
+PREDICT_ENGINE = os.getenv("PREDICT_ENGINE", "LSTM_MC_DEEPSEEK").strip().upper()
 PER_UID_MODELS = _env_bool("PER_UID_MODELS", True)
 REQUIRE_USER_ID = _env_bool("REQUIRE_USER_ID", False)
 MAX_UID_MODELS = _env_int("MAX_UID_MODELS", 12, minimum=1)
 
-# LSTM is retained for A/B testing, but disabled by default.
-USE_LSTM = _env_bool("USE_LSTM", False)
-LSTM_SEQUENCE_LENGTH = _env_int("LSTM_SEQUENCE_LENGTH", 16, minimum=4)
-LSTM_UNITS = _env_int("LSTM_UNITS", 24, minimum=4)
-LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.30, 0.0, 0.80)
-LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 16, minimum=3)
+# Active local model: LSTM only.
+# Padded sequence training lets the model begin learning from roughly five
+# recorded hands while still expanding to a longer context as the shoe grows.
+USE_LSTM = True
+LSTM_SEQUENCE_LENGTH = _env_int("LSTM_SEQUENCE_LENGTH", 12, minimum=4)
+LSTM_UNITS = _env_int("LSTM_UNITS", 48, minimum=8)
+LSTM_SECOND_UNITS = _env_int("LSTM_SECOND_UNITS", 24, minimum=4)
+LSTM_DROPOUT = _env_float("LSTM_DROPOUT", 0.30, 0.05, 0.80)
+LSTM_DENSE_UNITS = _env_int("LSTM_DENSE_UNITS", 24, minimum=3)
 LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.0005, 0.000001)
-LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 6, minimum=1)
-LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 1, minimum=1)
-LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 18, minimum=2)
-LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 6, minimum=1)
+LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 10, minimum=1)
+LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 2, minimum=1)
+LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 4, minimum=2)
+LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 1, minimum=1)
 
-USE_GRU = _env_bool("USE_GRU", True)
+# Monte Carlo Dropout settings. One batch contains many stochastic forward
+# passes, so increasing the simulation count is much cheaper than calling
+# model.predict hundreds of times one by one.
+LSTM_MC_SIMULATIONS = _env_int("LSTM_MC_SIMULATIONS", 256, minimum=8)
+LSTM_MC_BATCH_SIZE = _env_int("LSTM_MC_BATCH_SIZE", 64, minimum=1)
+LSTM_MC_TEMPERATURE = _env_float(
+    "LSTM_MC_TEMPERATURE", 1.0, minimum=0.25, maximum=3.0
+)
+LSTM_MC_VOTE_BLEND = _env_float(
+    "LSTM_MC_VOTE_BLEND", 0.15, minimum=0.0, maximum=0.50
+)
+LSTM_MC_UNCERTAINTY_SCALE = _env_float(
+    "LSTM_MC_UNCERTAINTY_SCALE", 3.0, minimum=0.0, maximum=20.0
+)
+LSTM_MC_MIN_RELIABILITY = _env_float(
+    "LSTM_MC_MIN_RELIABILITY", 0.35, minimum=0.0, maximum=1.0
+)
+
+# Removed from the active path. Constants are kept only so old environment
+# variables and compatibility fields cannot break app.py.
+USE_GRU = False
+USE_TCN = False
+USE_GBM = False
 GRU_SEQUENCE_LENGTH = _env_int("GRU_SEQUENCE_LENGTH", 16, minimum=4)
 GRU_UNITS = _env_int("GRU_UNITS", 32, minimum=4)
-GRU_DROPOUT = _env_float("GRU_DROPOUT", 0.30, 0.0, 0.80)
-GRU_DENSE_UNITS = _env_int("GRU_DENSE_UNITS", 16, minimum=3)
-GRU_LEARNING_RATE = _env_float("GRU_LEARNING_RATE", 0.0005, 0.000001)
-GRU_EPOCHS = _env_int("GRU_EPOCHS", 6, minimum=1)
-GRU_ONLINE_EPOCHS = _env_int("GRU_ONLINE_EPOCHS", 1, minimum=1)
-GRU_MIN_SAMPLES = _env_int("GRU_MIN_SAMPLES", 18, minimum=2)
-GRU_RETRAIN_INTERVAL = _env_int("GRU_RETRAIN_INTERVAL", 6, minimum=1)
-
-USE_TCN = _env_bool("USE_TCN", True)
 TCN_SEQUENCE_LENGTH = _env_int("TCN_SEQUENCE_LENGTH", 20, minimum=4)
 TCN_FILTERS = _env_int("TCN_FILTERS", 24, minimum=4)
-TCN_KERNEL_SIZE = _env_int("TCN_KERNEL_SIZE", 3, minimum=2)
-TCN_DROPOUT = _env_float("TCN_DROPOUT", 0.25, 0.0, 0.80)
-TCN_DENSE_UNITS = _env_int("TCN_DENSE_UNITS", 16, minimum=3)
-TCN_LEARNING_RATE = _env_float("TCN_LEARNING_RATE", 0.0005, 0.000001)
-TCN_EPOCHS = _env_int("TCN_EPOCHS", 6, minimum=1)
-TCN_ONLINE_EPOCHS = _env_int("TCN_ONLINE_EPOCHS", 1, minimum=1)
-TCN_MIN_SAMPLES = _env_int("TCN_MIN_SAMPLES", 18, minimum=2)
-TCN_RETRAIN_INTERVAL = _env_int("TCN_RETRAIN_INTERVAL", 6, minimum=1)
+GBM_BACKEND = "DISABLED_LSTM_ONLY"
 
 NEURAL_BATCH_SIZE = _env_int("NEURAL_BATCH_SIZE", 8, minimum=1)
 NEURAL_VALIDATION_MIN_SAMPLES = _env_int(
@@ -148,52 +157,30 @@ NEURAL_EARLY_STOP_PATIENCE = _env_int(
     "NEURAL_EARLY_STOP_PATIENCE", 2, minimum=0
 )
 NEURAL_CLASS_WEIGHT = _env_bool("NEURAL_CLASS_WEIGHT", True)
-NEURAL_CLASS_WEIGHT_MAX = _env_float(
-    "NEURAL_CLASS_WEIGHT_MAX", 3.0, 1.0
-)
+NEURAL_CLASS_WEIGHT_MAX = _env_float("NEURAL_CLASS_WEIGHT_MAX", 3.0, 1.0)
 NEURAL_VERBOSE = _env_int("NEURAL_VERBOSE", 0, minimum=0)
 
-USE_GBM = _env_bool("USE_GBM", True)
-GBM_BACKEND = os.getenv("GBM_BACKEND", "AUTO").strip().upper()
-GBM_HISTORY_WINDOW = _env_int("GBM_HISTORY_WINDOW", 24, minimum=6)
-GBM_CONTEXT_WINDOWS = _env_csv_ints(
-    "GBM_CONTEXT_WINDOWS", (4, 6, 8, 12, 16, 24)
-)
-GBM_MIN_CONTEXT = _env_int("GBM_MIN_CONTEXT", 6, minimum=2)
-GBM_MIN_SAMPLES = _env_int("GBM_MIN_SAMPLES", 18, minimum=4)
-GBM_RETRAIN_INTERVAL = _env_int("GBM_RETRAIN_INTERVAL", 5, minimum=1)
-GBM_N_ESTIMATORS = _env_int("GBM_N_ESTIMATORS", 70, minimum=10)
-GBM_LEARNING_RATE = _env_float("GBM_LEARNING_RATE", 0.05, 0.001, 1.0)
-GBM_MAX_DEPTH = _env_int("GBM_MAX_DEPTH", 3, minimum=1)
-GBM_NUM_LEAVES = _env_int("GBM_NUM_LEAVES", 7, minimum=3)
-GBM_MIN_CHILD_SAMPLES = _env_int("GBM_MIN_CHILD_SAMPLES", 5, minimum=1)
-GBM_SUBSAMPLE = _env_float("GBM_SUBSAMPLE", 0.85, 0.30, 1.0)
-GBM_COLSAMPLE = _env_float("GBM_COLSAMPLE", 0.85, 0.30, 1.0)
-
-# Probability calibration prevents small per-shoe datasets from producing
-# misleading 80-99% component confidence.
+# Small-sample calibration prevents the first few hands from producing
+# misleading 80-99% confidence while still allowing the LSTM to begin early.
 MODEL_CALIBRATION_STRENGTH = _env_float(
-    "MODEL_CALIBRATION_STRENGTH", 70.0, 0.0
+    "MODEL_CALIBRATION_STRENGTH", 24.0, 0.0
 )
 COMPONENT_MAX_PROB = _env_float("COMPONENT_MAX_PROB", 0.72, 0.34, 0.95)
 FINAL_MAX_PROB = _env_float("FINAL_MAX_PROB", 0.68, 0.34, 0.95)
 
-# Optional DeepSeek compatibility layer. It is supported but disabled by
-# default so the statistical ensemble remains deterministic.
-USE_DEEPSEEK = _env_bool("USE_DEEPSEEK", False)
-DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.0, 0.0)
+# DeepSeek remains in the prediction path. If the client/API is unavailable,
+# the local LSTM result automatically becomes the full effective weight.
+USE_DEEPSEEK = _env_bool("USE_DEEPSEEK", True)
+DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.20, 0.0)
 DEEPSEEK_MIN_HISTORY = _env_int("DEEPSEEK_MIN_HISTORY", 8, minimum=0)
 DEEPSEEK_TIMEOUT_SECONDS = _env_float(
     "DEEPSEEK_TIMEOUT_SECONDS", 8.0, minimum=1.0
 )
 
-# Default fusion: GRU is the primary sequence model; TCN captures local road
-# shapes; GBM consumes engineered rhythm/streak features. LSTM stays at zero
-# unless explicitly enabled and assigned a positive weight.
-LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.0, 0.0)
-GRU_WEIGHT = _env_float("GRU_WEIGHT", 0.40, 0.0)
-TCN_WEIGHT = _env_float("TCN_WEIGHT", 0.32, 0.0)
-GBM_WEIGHT = _env_float("GBM_WEIGHT", 0.28, 0.0)
+LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.80, 0.0)
+GRU_WEIGHT = 0.0
+TCN_WEIGHT = 0.0
+GBM_WEIGHT = 0.0
 
 FALLBACK_PRIOR_STRENGTH = _env_float(
     "FALLBACK_PRIOR_STRENGTH",
@@ -213,6 +200,9 @@ CLASS_NAMES: Tuple[str, str, str] = ("B", "P", "T")
 CLASS_TO_INDEX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 INDEX_TO_CLASS = {idx: name for name, idx in CLASS_TO_INDEX.items()}
 
+# 3 result one-hot values + 7 road/rhythm context values.
+LSTM_FEATURE_DIM = 10
+
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
@@ -224,83 +214,58 @@ np.random.seed(RANDOM_SEED)
 TF_AVAILABLE = False
 TF_IMPORT_ERROR = ""
 tf = None
-Model = None
 Sequential = None
 Input = None
+Masking = None
 LSTM = None
-GRU = None
 Dense = None
 Dropout = None
-Conv1D = None
-GlobalAveragePooling1D = None
 Adam = None
 EarlyStopping = None
 
-if USE_LSTM or USE_GRU or USE_TCN:
+try:
+    import tensorflow as tf  # type: ignore[assignment]
+    from tensorflow.keras.callbacks import EarlyStopping  # type: ignore[assignment]
+    from tensorflow.keras.layers import (  # type: ignore[assignment]
+        Dense,
+        Dropout,
+        Input,
+        LSTM,
+        Masking,
+    )
+    from tensorflow.keras.models import Sequential  # type: ignore[assignment]
+    from tensorflow.keras.optimizers import Adam  # type: ignore[assignment]
+
+    TF_AVAILABLE = True
+    tf.random.set_seed(RANDOM_SEED)
     try:
-        import tensorflow as tf  # type: ignore[assignment]
-        from tensorflow.keras.callbacks import EarlyStopping  # type: ignore[assignment]
-        from tensorflow.keras.layers import (  # type: ignore[assignment]
-            Conv1D,
-            Dense,
-            Dropout,
-            GlobalAveragePooling1D,
-            GRU,
-            Input,
-            LSTM,
-        )
-        from tensorflow.keras.models import Model, Sequential  # type: ignore[assignment]
-        from tensorflow.keras.optimizers import Adam  # type: ignore[assignment]
-
-        TF_AVAILABLE = True
-        tf.random.set_seed(RANDOM_SEED)
-        try:
-            tf.config.threading.set_intra_op_parallelism_threads(1)
-            tf.config.threading.set_inter_op_parallelism_threads(1)
-        except Exception:
-            pass
-    except Exception as exc:  # pragma: no cover - deployment dependent
-        TF_IMPORT_ERROR = str(exc)
-        logger.warning(
-            "TensorFlow unavailable; neural components use fallback probabilities: %s",
-            exc,
-        )
-else:
-    TF_IMPORT_ERROR = "all neural components disabled"
+        tf.config.threading.set_intra_op_parallelism_threads(1)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+    except Exception:
+        pass
+except Exception as exc:  # pragma: no cover - deployment dependent
+    TF_IMPORT_ERROR = str(exc)
+    logger.warning(
+        "TensorFlow unavailable; LSTM uses fallback probabilities: %s",
+        exc,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Optional GBM imports
+# Removed GBM backends
 # ---------------------------------------------------------------------------
 
+# These names remain for backward-compatible debug fields only. No tree model
+# package is imported and no GBM model participates in prediction.
 LIGHTGBM_AVAILABLE = False
 XGBOOST_AVAILABLE = False
 SKLEARN_GBM_AVAILABLE = False
-GBM_IMPORT_ERRORS: Dict[str, str] = {}
+GBM_IMPORT_ERRORS: Dict[str, str] = {
+    "disabled": "GRU/TCN/GBM removed from active path; LSTM-only mode"
+}
 LGBMClassifier = None
 XGBClassifier = None
 HistGradientBoostingClassifier = None
-
-try:
-    from lightgbm import LGBMClassifier  # type: ignore[assignment]
-
-    LIGHTGBM_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - deployment dependent
-    GBM_IMPORT_ERRORS["lightgbm"] = str(exc)
-
-try:
-    from xgboost import XGBClassifier  # type: ignore[assignment]
-
-    XGBOOST_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - deployment dependent
-    GBM_IMPORT_ERRORS["xgboost"] = str(exc)
-
-try:
-    from sklearn.ensemble import HistGradientBoostingClassifier  # type: ignore[assignment]
-
-    SKLEARN_GBM_AVAILABLE = True
-except Exception as exc:  # pragma: no cover - deployment dependent
-    GBM_IMPORT_ERRORS["sklearn"] = str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +514,7 @@ class UIDModelState:
 
 _MODEL_CACHE: "OrderedDict[str, UIDModelState]" = OrderedDict()
 _MODEL_CACHE_LOCK = threading.RLock()
+_TF_LOCK = threading.RLock()
 _DEEPSEEK_LOCK = threading.RLock()
 _DEEPSEEK_CLIENT: Optional[Any] = None
 
@@ -644,7 +610,7 @@ def get_model_cache_info() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Neural sequence models
+# LSTM sequence model and Monte Carlo Dropout
 # ---------------------------------------------------------------------------
 
 
@@ -677,40 +643,78 @@ def _neural_configs() -> Dict[str, NeuralConfig]:
             LSTM_ONLINE_EPOCHS,
             LSTM_MIN_SAMPLES,
             LSTM_RETRAIN_INTERVAL,
-        ),
-        "gru": NeuralConfig(
-            "gru",
-            USE_GRU,
-            GRU_SEQUENCE_LENGTH,
-            GRU_UNITS,
-            GRU_DROPOUT,
-            GRU_DENSE_UNITS,
-            GRU_LEARNING_RATE,
-            GRU_EPOCHS,
-            GRU_ONLINE_EPOCHS,
-            GRU_MIN_SAMPLES,
-            GRU_RETRAIN_INTERVAL,
-        ),
-        "tcn": NeuralConfig(
-            "tcn",
-            USE_TCN,
-            TCN_SEQUENCE_LENGTH,
-            TCN_FILTERS,
-            TCN_DROPOUT,
-            TCN_DENSE_UNITS,
-            TCN_LEARNING_RATE,
-            TCN_EPOCHS,
-            TCN_ONLINE_EPOCHS,
-            TCN_MIN_SAMPLES,
-            TCN_RETRAIN_INTERVAL,
-        ),
+        )
     }
 
 
-def _one_hot_sequence(sequence: Sequence[str]) -> np.ndarray:
-    encoded = np.zeros((len(sequence), len(CLASS_NAMES)), dtype=np.float32)
-    for row, item in enumerate(sequence):
-        encoded[row, CLASS_TO_INDEX[item]] = 1.0
+def _road_feature_sequence(
+    sequence: Sequence[str],
+    sequence_length: int,
+) -> np.ndarray:
+    """Encode B/P/T plus local road/rhythm features for one LSTM window.
+
+    The model is still purely LSTM. These inputs only expose patterns that are
+    otherwise difficult to learn from a three-value one-hot stream when each
+    shoe contains limited samples: current run length, switch rhythm, ABA
+    rhythm, two-by-two blocks, short/medium B-P balance, and recent tie rate.
+    """
+    recent = list(sequence[-sequence_length:])
+    encoded = np.zeros((sequence_length, LSTM_FEATURE_DIM), dtype=np.float32)
+    if not recent:
+        return encoded
+
+    rows: List[List[float]] = []
+    run_side = ""
+    run_length = 0
+
+    for index, item in enumerate(recent):
+        if item == run_side:
+            run_length += 1
+        else:
+            run_side = item
+            run_length = 1
+
+        tail4 = recent[max(0, index - 3) : index + 1]
+        tail8 = recent[max(0, index - 7) : index + 1]
+        count4 = Counter(tail4)
+        count8 = Counter(tail8)
+        denom4 = float(max(1, len(tail4)))
+        denom8 = float(max(1, len(tail8)))
+
+        changed = 1.0 if index >= 1 and item != recent[index - 1] else 0.0
+        aba = (
+            1.0
+            if index >= 2
+            and item == recent[index - 2]
+            and item != recent[index - 1]
+            else 0.0
+        )
+        pair_block = (
+            1.0
+            if index >= 3
+            and recent[index] == recent[index - 1]
+            and recent[index - 2] == recent[index - 3]
+            and recent[index] != recent[index - 2]
+            else 0.0
+        )
+
+        rows.append(
+            [
+                1.0 if item == "B" else 0.0,
+                1.0 if item == "P" else 0.0,
+                1.0 if item == "T" else 0.0,
+                min(1.0, run_length / 8.0),
+                changed,
+                aba,
+                pair_block,
+                (count4.get("B", 0) - count4.get("P", 0)) / denom4,
+                (count8.get("B", 0) - count8.get("P", 0)) / denom8,
+                count8.get("T", 0) / denom8,
+            ]
+        )
+
+    row_array = np.asarray(rows, dtype=np.float32)
+    encoded[-len(row_array) :] = row_array
     return encoded
 
 
@@ -719,26 +723,27 @@ def _prepare_sequence_data(
     sequence_length: int,
     target_start_index: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if len(history) <= sequence_length:
+    # Left padding allows four training examples to exist after five hands.
+    if len(history) < 2:
         return (
-            np.empty((0, sequence_length, len(CLASS_NAMES)), dtype=np.float32),
+            np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
         )
 
-    start = sequence_length
+    start = 1
     if target_start_index is not None:
         start = max(start, int(target_start_index))
 
     X: List[np.ndarray] = []
     y: List[int] = []
     for target_index in range(start, len(history)):
-        window = history[target_index - sequence_length : target_index]
-        X.append(_one_hot_sequence(window))
+        window = history[max(0, target_index - sequence_length) : target_index]
+        X.append(_road_feature_sequence(window, sequence_length))
         y.append(CLASS_TO_INDEX[history[target_index]])
 
     if not X:
         return (
-            np.empty((0, sequence_length, len(CLASS_NAMES)), dtype=np.float32),
+            np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
         )
 
@@ -748,61 +753,23 @@ def _prepare_sequence_data(
 def _build_neural_model(config: NeuralConfig) -> Any:
     if not (config.enabled and TF_AVAILABLE):
         return None
+    if config.name != "lstm":
+        raise ValueError("Only LSTM is available in LSTM-only mode")
 
-    if config.name == "lstm":
-        model = Sequential(
-            [
-                Input(shape=(config.sequence_length, len(CLASS_NAMES))),
-                LSTM(config.units, return_sequences=False),
-                Dropout(config.dropout),
-                Dense(config.dense_units, activation="relu"),
-                Dense(len(CLASS_NAMES), activation="softmax"),
-            ],
-            name="baccarat_lstm",
-        )
-    elif config.name == "gru":
-        model = Sequential(
-            [
-                Input(shape=(config.sequence_length, len(CLASS_NAMES))),
-                GRU(config.units, return_sequences=False),
-                Dropout(config.dropout),
-                Dense(config.dense_units, activation="relu"),
-                Dense(len(CLASS_NAMES), activation="softmax"),
-            ],
-            name="baccarat_gru",
-        )
-    elif config.name == "tcn":
-        inputs = Input(shape=(config.sequence_length, len(CLASS_NAMES)))
-        x = Conv1D(
-            filters=config.units,
-            kernel_size=TCN_KERNEL_SIZE,
-            padding="causal",
-            dilation_rate=1,
-            activation="relu",
-        )(inputs)
-        x = Dropout(config.dropout)(x)
-        x = Conv1D(
-            filters=config.units,
-            kernel_size=TCN_KERNEL_SIZE,
-            padding="causal",
-            dilation_rate=2,
-            activation="relu",
-        )(x)
-        x = Dropout(config.dropout)(x)
-        x = Conv1D(
-            filters=max(8, config.units // 2),
-            kernel_size=TCN_KERNEL_SIZE,
-            padding="causal",
-            dilation_rate=4,
-            activation="relu",
-        )(x)
-        x = GlobalAveragePooling1D()(x)
-        x = Dense(config.dense_units, activation="relu")(x)
-        outputs = Dense(len(CLASS_NAMES), activation="softmax")(x)
-        model = Model(inputs=inputs, outputs=outputs, name="baccarat_tcn")
-    else:
-        raise ValueError(f"Unknown neural model: {config.name}")
-
+    model = Sequential(
+        [
+            Input(shape=(config.sequence_length, LSTM_FEATURE_DIM)),
+            Masking(mask_value=0.0),
+            LSTM(config.units, return_sequences=True),
+            Dropout(config.dropout),
+            LSTM(LSTM_SECOND_UNITS, return_sequences=False),
+            Dropout(config.dropout),
+            Dense(config.dense_units, activation="relu"),
+            Dropout(min(0.50, config.dropout * 0.50)),
+            Dense(len(CLASS_NAMES), activation="softmax"),
+        ],
+        name="baccarat_lstm_mc",
+    )
     model.compile(
         optimizer=Adam(learning_rate=config.learning_rate),
         loss="sparse_categorical_crossentropy",
@@ -829,7 +796,7 @@ def _train_neural_if_needed(
             "error": TF_IMPORT_ERROR,
         }
 
-    total_samples = max(0, len(history) - config.sequence_length)
+    total_samples = max(0, len(history) - 1)
     if total_samples < config.min_samples:
         component.status = "not_enough_samples"
         component.training_samples = total_samples
@@ -856,10 +823,10 @@ def _train_neural_if_needed(
     initial_training = component.model is None or not component.trained or force
     if initial_training:
         component.model = _build_neural_model(config)
-        target_start = config.sequence_length
+        target_start = 1
         epochs = config.epochs
     else:
-        target_start = max(config.sequence_length, component.last_train_history_len)
+        target_start = max(1, component.last_train_history_len)
         epochs = config.online_epochs
 
     if component.model is None:
@@ -893,17 +860,18 @@ def _train_neural_if_needed(
             )
 
     batch_size = min(max(1, NEURAL_BATCH_SIZE), len(X))
-    fit_history = component.model.fit(
-        X,
-        y,
-        epochs=epochs,
-        batch_size=batch_size,
-        verbose=NEURAL_VERBOSE,
-        shuffle=True,
-        validation_split=validation_split,
-        callbacks=callbacks,
-        class_weight=_class_weight_mapping(y),
-    )
+    with _TF_LOCK:
+        fit_result = component.model.fit(
+            X,
+            y,
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=NEURAL_VERBOSE,
+            shuffle=True,
+            validation_split=validation_split,
+            callbacks=callbacks,
+            class_weight=_class_weight_mapping(y),
+        )
 
     component.trained = True
     component.training_samples = total_samples
@@ -911,9 +879,9 @@ def _train_neural_if_needed(
     component.last_train_fingerprint = _history_fingerprint(history)
     component.train_count += 1
     component.status = "trained"
-    component.backend = "tensorflow"
+    component.backend = "tensorflow_lstm_mc"
 
-    metrics = getattr(fit_history, "history", {}) or {}
+    metrics = getattr(fit_result, "history", {}) or {}
     if metrics.get("loss"):
         component.last_loss = float(metrics["loss"][-1])
     if metrics.get("accuracy"):
@@ -931,246 +899,143 @@ def _train_neural_if_needed(
     }
 
 
-def _predict_neural(
+def _temperature_scale_rows(values: np.ndarray, temperature: float) -> np.ndarray:
+    probs = np.asarray(values, dtype=np.float64)
+    probs = np.maximum(probs, 1e-12)
+    logits = np.log(probs) / max(1e-6, float(temperature))
+    logits -= np.max(logits, axis=1, keepdims=True)
+    exp_values = np.exp(logits)
+    totals = np.maximum(exp_values.sum(axis=1, keepdims=True), 1e-12)
+    return exp_values / totals
+
+
+def _predict_lstm_mc(
     component: ComponentState,
     config: NeuralConfig,
     history: Sequence[str],
-) -> Tuple[np.ndarray, str, bool]:
+) -> Tuple[np.ndarray, str, bool, Dict[str, Any]]:
     fallback = _empirical_fallback_probs(history)
-    if not config.enabled:
-        return fallback, "disabled", False
-    if not TF_AVAILABLE:
-        return fallback, "tensorflow_unavailable", False
-    if not component.trained or component.model is None:
-        return fallback, component.status, False
-    if len(history) < config.sequence_length:
-        return fallback, "history_shorter_than_sequence", False
-
-    window = history[-config.sequence_length :]
-    X = _one_hot_sequence(window).reshape(
-        1, config.sequence_length, len(CLASS_NAMES)
-    )
-    try:
-        predicted = component.model.predict(X, verbose=0)[0]
-        calibrated = _calibrate_component_probs(
-            predicted, component.training_samples, fallback
-        )
-        return calibrated, "ready", True
-    except Exception as exc:
-        logger.exception("%s prediction failed", config.name.upper())
-        return fallback, f"predict_error:{exc}", False
-
-
-# ---------------------------------------------------------------------------
-# GBM features and model
-# ---------------------------------------------------------------------------
-
-
-def _current_streak(history: Sequence[str]) -> Tuple[str, int]:
-    if not history:
-        return "", 0
-    last = history[-1]
-    length = 1
-    for item in reversed(history[:-1]):
-        if item != last:
-            break
-        length += 1
-    return last, length
-
-
-def _run_statistics(history: Sequence[str]) -> Dict[str, float]:
-    if not history:
-        return {
-            "runs": 0.0,
-            "longest_b": 0.0,
-            "longest_p": 0.0,
-            "longest_t": 0.0,
-            "mean_run": 0.0,
-        }
-
-    runs: List[Tuple[str, int]] = []
-    side = history[0]
-    length = 1
-    for item in history[1:]:
-        if item == side:
-            length += 1
-        else:
-            runs.append((side, length))
-            side = item
-            length = 1
-    runs.append((side, length))
-
-    return {
-        "runs": float(len(runs)),
-        "longest_b": float(max((n for s, n in runs if s == "B"), default=0)),
-        "longest_p": float(max((n for s, n in runs if s == "P"), default=0)),
-        "longest_t": float(max((n for s, n in runs if s == "T"), default=0)),
-        "mean_run": float(sum(n for _, n in runs) / max(1, len(runs))),
+    empty_diag: Dict[str, Any] = {
+        "enabled": True,
+        "simulations_requested": LSTM_MC_SIMULATIONS,
+        "simulations_completed": 0,
+        "uncertainty": None,
+        "reliability": 0.0,
+        "std": _to_prob_dict([0.0, 0.0, 0.0], digits=6),
+        "vote_probs": _to_prob_dict(fallback, digits=6),
     }
 
+    if not config.enabled:
+        return fallback, "disabled", False, empty_diag
+    if not TF_AVAILABLE:
+        return fallback, "tensorflow_unavailable", False, empty_diag
+    if not component.trained or component.model is None:
+        return fallback, component.status, False, empty_diag
+    if not history:
+        return fallback, "empty_history", False, empty_diag
 
-def _alternation_rate(history: Sequence[str]) -> float:
-    if len(history) < 2:
-        return 0.5
-    comparisons = 0
-    changes = 0
-    for previous, current in zip(history, history[1:]):
-        if previous == "T" or current == "T":
-            continue
-        comparisons += 1
-        changes += int(previous != current)
-    return changes / comparisons if comparisons else 0.5
-
-
-def _extract_gbm_features(history: Sequence[str]) -> np.ndarray:
-    """Create fixed-length sequence/rhythm features without a Markov model."""
-    features: List[float] = []
-    prior = _prior_probs()
-
-    # Positional one-hot encoding for the latest fixed window.
-    padded = [""] * max(0, GBM_HISTORY_WINDOW - len(history)) + list(
-        history[-GBM_HISTORY_WINDOW:]
-    )
-    for item in padded:
-        features.extend(
-            [
-                1.0 if item == "B" else 0.0,
-                1.0 if item == "P" else 0.0,
-                1.0 if item == "T" else 0.0,
-            ]
-        )
-
-    # Multi-scale context statistics.
-    for window_size in GBM_CONTEXT_WINDOWS:
-        window = list(history[-window_size:])
-        denominator = max(1, len(window))
-        counts = Counter(window)
-        features.extend(
-            [
-                counts.get("B", 0) / denominator,
-                counts.get("P", 0) / denominator,
-                counts.get("T", 0) / denominator,
-                (counts.get("B", 0) - counts.get("P", 0)) / denominator,
-                _alternation_rate(window),
-            ]
-        )
-        side, streak_len = _current_streak(window)
-        features.extend(
-            [
-                1.0 if side == "B" else 0.0,
-                1.0 if side == "P" else 0.0,
-                1.0 if side == "T" else 0.0,
-                min(1.0, streak_len / max(1.0, float(window_size))),
-            ]
-        )
-
-    recent = list(history[-GBM_HISTORY_WINDOW:])
-    stats = _run_statistics(recent)
-    norm = max(1.0, float(len(recent)))
-    side, streak_len = _current_streak(recent)
-    features.extend(
-        [
-            min(1.0, len(history) / 100.0),
-            1.0 if side == "B" else 0.0,
-            1.0 if side == "P" else 0.0,
-            1.0 if side == "T" else 0.0,
-            min(1.0, streak_len / 10.0),
-            stats["runs"] / norm,
-            stats["longest_b"] / norm,
-            stats["longest_p"] / norm,
-            stats["longest_t"] / norm,
-            stats["mean_run"] / norm,
-            _alternation_rate(recent),
-            1.0 if len(recent) >= 2 and recent[-1] != recent[-2] else 0.0,
-            1.0
-            if len(recent) >= 3 and recent[-1] == recent[-3] != recent[-2]
-            else 0.0,
-            float(prior[0]),
-            float(prior[1]),
-            float(prior[2]),
-        ]
+    X = _road_feature_sequence(history, config.sequence_length).reshape(
+        1, config.sequence_length, LSTM_FEATURE_DIM
     )
 
-    return np.asarray(features, dtype=np.float32)
+    try:
+        with _TF_LOCK:
+            deterministic_tensor = component.model(X, training=False)
+            if hasattr(deterministic_tensor, "numpy"):
+                deterministic_tensor = deterministic_tensor.numpy()
+            deterministic = np.asarray(
+                deterministic_tensor[0], dtype=np.float64
+            )
+            deterministic = _normalize(deterministic, fallback=fallback)
 
+            fingerprint_seed = int(_history_fingerprint(history), 16) % (2**31 - 1)
+            tf.random.set_seed((RANDOM_SEED + fingerprint_seed) % (2**31 - 1))
 
-def _prepare_gbm_data(history: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
-    X: List[np.ndarray] = []
-    y: List[int] = []
-    for target_index in range(GBM_MIN_CONTEXT, len(history)):
-        X.append(_extract_gbm_features(history[:target_index]))
-        y.append(CLASS_TO_INDEX[history[target_index]])
-    if not X:
-        return (
-            np.empty((0, 0), dtype=np.float32),
-            np.empty((0,), dtype=np.int64),
+            samples: List[np.ndarray] = []
+            remaining = int(LSTM_MC_SIMULATIONS)
+            while remaining > 0:
+                current_batch = min(remaining, max(1, LSTM_MC_BATCH_SIZE))
+                batch_input = np.repeat(X, current_batch, axis=0)
+                stochastic = component.model(batch_input, training=True)
+                if hasattr(stochastic, "numpy"):
+                    stochastic = stochastic.numpy()
+                batch_probs = np.asarray(stochastic, dtype=np.float64)
+                batch_probs = _temperature_scale_rows(
+                    batch_probs, LSTM_MC_TEMPERATURE
+                )
+                samples.append(batch_probs)
+                remaining -= current_batch
+
+            matrix = np.concatenate(samples, axis=0)
+        mc_mean = _normalize(matrix.mean(axis=0), fallback=fallback)
+        mc_std = np.std(matrix, axis=0)
+
+        winners = np.argmax(matrix, axis=1)
+        vote_counts = np.bincount(winners, minlength=len(CLASS_NAMES)).astype(float)
+        vote_probs = _normalize(vote_counts, fallback=mc_mean)
+
+        blended = _normalize(
+            mc_mean * (1.0 - LSTM_MC_VOTE_BLEND)
+            + vote_probs * LSTM_MC_VOTE_BLEND,
+            fallback=mc_mean,
         )
-    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64)
+
+        uncertainty = float(np.mean(mc_std))
+        reliability = _clamp(
+            1.0 - uncertainty * LSTM_MC_UNCERTAINTY_SCALE,
+            LSTM_MC_MIN_RELIABILITY,
+            1.0,
+        )
+        uncertainty_adjusted = _normalize(
+            blended * reliability + fallback * (1.0 - reliability),
+            fallback=deterministic,
+        )
+        calibrated = _calibrate_component_probs(
+            uncertainty_adjusted,
+            component.training_samples,
+            fallback,
+        )
+
+        diag = {
+            "enabled": True,
+            "simulations_requested": LSTM_MC_SIMULATIONS,
+            "simulations_completed": int(len(matrix)),
+            "temperature": round(LSTM_MC_TEMPERATURE, 6),
+            "vote_blend": round(LSTM_MC_VOTE_BLEND, 6),
+            "uncertainty": round(uncertainty, 8),
+            "reliability": round(reliability, 6),
+            "deterministic_probs": _to_prob_dict(deterministic, digits=6),
+            "mean_probs": _to_prob_dict(mc_mean, digits=6),
+            "std": {
+                name: round(float(mc_std[index]), 6)
+                for index, name in enumerate(CLASS_NAMES)
+            },
+            "vote_probs": _to_prob_dict(vote_probs, digits=6),
+            "final_lstm_probs": _to_prob_dict(calibrated, digits=6),
+        }
+        return calibrated, "ready_mc", True, diag
+    except Exception as exc:
+        logger.exception("LSTM Monte Carlo prediction failed")
+        empty_diag["error"] = str(exc)
+        return fallback, f"predict_error:{exc}", False, empty_diag
+
+
+# ---------------------------------------------------------------------------
+# Removed GRU / TCN / GBM compatibility stubs
+# ---------------------------------------------------------------------------
 
 
 def _select_gbm_backend() -> str:
-    requested = GBM_BACKEND
-    if requested in {"LIGHTGBM", "LGBM"}:
-        return "LIGHTGBM" if LIGHTGBM_AVAILABLE else ""
-    if requested in {"XGBOOST", "XGB"}:
-        return "XGBOOST" if XGBOOST_AVAILABLE else ""
-    if requested in {"SKLEARN", "HISTGB"}:
-        return "SKLEARN" if SKLEARN_GBM_AVAILABLE else ""
-
-    # AUTO priority: LightGBM is fastest for this small tabular workload;
-    # XGBoost follows; sklearn is a dependency-safe final fallback.
-    if LIGHTGBM_AVAILABLE:
-        return "LIGHTGBM"
-    if XGBOOST_AVAILABLE:
-        return "XGBOOST"
-    if SKLEARN_GBM_AVAILABLE:
-        return "SKLEARN"
     return ""
 
 
-def _build_gbm_model(backend: str, class_count: int) -> Any:
-    if backend == "LIGHTGBM":
-        return LGBMClassifier(
-            objective="multiclass" if class_count > 2 else "binary",
-            num_class=3 if class_count > 2 else None,
-            n_estimators=GBM_N_ESTIMATORS,
-            learning_rate=GBM_LEARNING_RATE,
-            max_depth=GBM_MAX_DEPTH,
-            num_leaves=GBM_NUM_LEAVES,
-            min_child_samples=GBM_MIN_CHILD_SAMPLES,
-            subsample=GBM_SUBSAMPLE,
-            colsample_bytree=GBM_COLSAMPLE,
-            random_state=RANDOM_SEED,
-            n_jobs=1,
-            verbosity=-1,
-        )
-    if backend == "XGBOOST":
-        kwargs: Dict[str, Any] = {
-            "n_estimators": GBM_N_ESTIMATORS,
-            "learning_rate": GBM_LEARNING_RATE,
-            "max_depth": GBM_MAX_DEPTH,
-            "subsample": GBM_SUBSAMPLE,
-            "colsample_bytree": GBM_COLSAMPLE,
-            "min_child_weight": max(1, GBM_MIN_CHILD_SAMPLES),
-            "random_state": RANDOM_SEED,
-            "n_jobs": 1,
-            "tree_method": "hist",
-            "eval_metric": "mlogloss" if class_count > 2 else "logloss",
-        }
-        if class_count > 2:
-            kwargs.update({"objective": "multi:softprob", "num_class": 3})
-        else:
-            kwargs.update({"objective": "binary:logistic"})
-        return XGBClassifier(**kwargs)
-    if backend == "SKLEARN":
-        return HistGradientBoostingClassifier(
-            learning_rate=GBM_LEARNING_RATE,
-            max_iter=GBM_N_ESTIMATORS,
-            max_depth=GBM_MAX_DEPTH,
-            min_samples_leaf=GBM_MIN_CHILD_SAMPLES,
-            random_state=RANDOM_SEED,
-        )
-    return None
+def _disabled_component_result(name: str) -> Dict[str, Any]:
+    return {
+        "trained": False,
+        "status": "disabled_lstm_only",
+        "samples": 0,
+        "model": name,
+    }
 
 
 def _train_gbm_if_needed(
@@ -1178,143 +1043,19 @@ def _train_gbm_if_needed(
     history: Sequence[str],
     force: bool = False,
 ) -> Dict[str, Any]:
-    if not USE_GBM:
-        component.status = "disabled"
-        return {"trained": False, "status": component.status, "samples": 0}
-
-    backend = _select_gbm_backend()
-    if not backend:
-        component.status = "backend_unavailable"
-        return {
-            "trained": False,
-            "status": component.status,
-            "samples": 0,
-            "errors": dict(GBM_IMPORT_ERRORS),
-        }
-
-    X, y = _prepare_gbm_data(history)
-    total_samples = len(y)
-    component.training_samples = total_samples
-    if total_samples < GBM_MIN_SAMPLES:
-        component.status = "not_enough_samples"
-        return {
-            "trained": component.trained,
-            "status": component.status,
-            "samples": total_samples,
-            "required_samples": GBM_MIN_SAMPLES,
-            "backend": backend,
-        }
-
-    present_classes = sorted(set(int(v) for v in y.tolist()))
-    if len(present_classes) < 2:
-        component.status = "not_enough_classes"
-        return {
-            "trained": component.trained,
-            "status": component.status,
-            "samples": total_samples,
-            "classes": present_classes,
-            "backend": backend,
-        }
-
-    # Encode any two-class subset (for example B/P when no tie occurred yet)
-    # into contiguous labels required by LightGBM/XGBoost binary objectives.
-    label_to_encoded = {label: index for index, label in enumerate(present_classes)}
-    encoded_y = np.asarray(
-        [label_to_encoded[int(label)] for label in y], dtype=np.int64
-    )
-
-    if (
-        not force
-        and component.trained
-        and len(history) - component.last_train_history_len < GBM_RETRAIN_INTERVAL
-    ):
-        component.status = "ready"
-        return {
-            "trained": True,
-            "status": component.status,
-            "samples": total_samples,
-            "skipped": True,
-            "backend": component.backend or backend,
-        }
-
-    # Tree ensembles are retrained on the complete current shoe so they retain
-    # both early and recent context. The dataset is intentionally small.
-    model = _build_gbm_model(backend, class_count=len(present_classes))
-    if model is None:
-        component.status = "model_build_failed"
-        return {"trained": False, "status": component.status, "samples": total_samples}
-
-    try:
-        weights = _sample_weights(encoded_y)
-        if weights is None:
-            model.fit(X, encoded_y)
-        else:
-            model.fit(X, encoded_y, sample_weight=weights)
-    except Exception as exc:
-        logger.exception("GBM training failed with backend=%s", backend)
-        component.status = f"train_error:{exc}"
-        return {
-            "trained": component.trained,
-            "status": component.status,
-            "samples": total_samples,
-            "backend": backend,
-        }
-
-    component.model = model
-    component.trained = True
-    component.last_train_history_len = len(history)
-    component.last_train_fingerprint = _history_fingerprint(history)
-    component.train_count += 1
-    component.status = "trained"
-    component.backend = backend
-    component.class_labels = list(present_classes)
-
-    return {
-        "trained": True,
-        "status": component.status,
-        "samples": total_samples,
-        "train_count": component.train_count,
-        "backend": backend,
-        "classes": present_classes,
-        "feature_count": int(X.shape[1]),
-    }
+    del history, force
+    component.status = "disabled_lstm_only"
+    component.trained = False
+    component.model = None
+    return _disabled_component_result("gbm")
 
 
 def _predict_gbm(
     component: ComponentState,
     history: Sequence[str],
 ) -> Tuple[np.ndarray, str, bool]:
-    fallback = _empirical_fallback_probs(history)
-    if not USE_GBM:
-        return fallback, "disabled", False
-    if not component.trained or component.model is None:
-        return fallback, component.status, False
-    if len(history) < GBM_MIN_CONTEXT:
-        return fallback, "history_shorter_than_context", False
-
-    X = _extract_gbm_features(history).reshape(1, -1)
-    try:
-        raw = np.asarray(component.model.predict_proba(X)[0], dtype=np.float64)
-        encoded_classes = getattr(
-            component.model, "classes_", np.arange(len(raw))
-        )
-        original_labels = component.class_labels or [
-            int(value) for value in encoded_classes
-        ]
-        mapped = np.zeros(len(CLASS_NAMES), dtype=np.float64)
-        for probability, encoded_class in zip(raw, encoded_classes):
-            encoded_index = int(encoded_class)
-            if 0 <= encoded_index < len(original_labels):
-                original_index = int(original_labels[encoded_index])
-                if 0 <= original_index < len(mapped):
-                    mapped[original_index] = float(probability)
-        calibrated = _calibrate_component_probs(
-            mapped, component.training_samples, fallback
-        )
-        return calibrated, "ready", True
-    except Exception as exc:
-        logger.exception("GBM prediction failed")
-        return fallback, f"predict_error:{exc}", False
+    component.status = "disabled_lstm_only"
+    return _empirical_fallback_probs(history), component.status, False
 
 
 # ---------------------------------------------------------------------------
@@ -1463,9 +1204,9 @@ def _deepseek_probs(
 def _configured_weights() -> Dict[str, float]:
     return {
         "lstm": max(0.0, LSTM_WEIGHT),
-        "gru": max(0.0, GRU_WEIGHT),
-        "tcn": max(0.0, TCN_WEIGHT),
-        "gbm": max(0.0, GBM_WEIGHT),
+        "gru": 0.0,
+        "tcn": 0.0,
+        "gbm": 0.0,
         "deepseek": max(0.0, DEEPSEEK_WEIGHT),
         "markov": 0.0,
     }
@@ -1477,22 +1218,31 @@ def _fusion(
     fallback: Sequence[float],
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     configured = _configured_weights()
-    active_weights: Dict[str, float] = {}
-    for name in ("lstm", "gru", "tcn", "gbm", "deepseek"):
-        active_weights[name] = (
-            configured.get(name, 0.0) if availability.get(name, False) else 0.0
-        )
+    active_weights = {
+        "lstm": configured["lstm"] if availability.get("lstm", False) else 0.0,
+        "gru": 0.0,
+        "tcn": 0.0,
+        "gbm": 0.0,
+        "deepseek": (
+            configured["deepseek"]
+            if availability.get("deepseek", False)
+            else 0.0
+        ),
+    }
 
     total = sum(active_weights.values())
     if total <= 0.0:
         return _normalize(fallback, fallback=_prior_probs()), {
-            **{key: 0.0 for key in active_weights},
+            **active_weights,
             "markov": 0.0,
         }
 
     effective = {key: value / total for key, value in active_weights.items()}
     final = np.zeros(len(CLASS_NAMES), dtype=np.float64)
-    for name, weight in effective.items():
+    for name in ("lstm", "deepseek"):
+        weight = effective.get(name, 0.0)
+        if weight <= 0.0:
+            continue
         final += _normalize(
             component_probs.get(name, fallback), fallback=fallback
         ) * weight
@@ -1514,7 +1264,7 @@ def fit_history(
     user_id: str = "",
     force: bool = True,
 ) -> Dict[str, Any]:
-    """Explicitly fit/update all isolated model components for one UID."""
+    """Explicitly fit/update the isolated LSTM model for one UID."""
     cleaned = _clean_history(history)
     if REQUIRE_USER_ID and not str(user_id or "").strip():
         return {
@@ -1524,7 +1274,7 @@ def fit_history(
 
     key = _make_training_key(user_id, venue, room, shoe_id)
     state = _get_model_state(key)
-    configs = _neural_configs()
+    config = _neural_configs()["lstm"]
 
     with state.lock:
         if state.last_history and not _is_extension(state.last_history, cleaned):
@@ -1532,16 +1282,15 @@ def fit_history(
 
         results = {
             "lstm": _train_neural_if_needed(
-                state.lstm, configs["lstm"], cleaned, force=force
+                state.lstm, config, cleaned, force=force
             ),
-            "gru": _train_neural_if_needed(
-                state.gru, configs["gru"], cleaned, force=force
-            ),
-            "tcn": _train_neural_if_needed(
-                state.tcn, configs["tcn"], cleaned, force=force
-            ),
-            "gbm": _train_gbm_if_needed(state.gbm, cleaned, force=force),
+            "gru": _disabled_component_result("gru"),
+            "tcn": _disabled_component_result("tcn"),
+            "gbm": _disabled_component_result("gbm"),
         }
+        state.gru.status = "disabled_lstm_only"
+        state.tcn.status = "disabled_lstm_only"
+        state.gbm.status = "disabled_lstm_only"
         state.last_history = list(cleaned)
 
     return {
@@ -1550,9 +1299,8 @@ def fit_history(
         "user_id": user_id,
         "history_len": len(cleaned),
         "tf_available": TF_AVAILABLE,
-        "gbm_backend": state.gbm.backend or _select_gbm_backend(),
+        "gbm_backend": "DISABLED_LSTM_ONLY",
         "models": results,
-        # Old compatibility key.
         "lstm": results["lstm"],
     }
 
@@ -1564,7 +1312,7 @@ def predict(
     shoe_id: str = "",
     user_id: str = "",
 ) -> Dict[str, Any]:
-    """Predict next B/P/T probabilities and recommend B or P.
+    """Predict next B/P/T probabilities with LSTM Monte Carlo + DeepSeek.
 
     Every user gets an isolated model key:
         user_id | venue | room | shoe_id
@@ -1584,7 +1332,7 @@ def predict(
 
     training_key = _make_training_key(uid, venue, room, shoe_id)
     state = _get_model_state(training_key)
-    configs = _neural_configs()
+    config = _neural_configs()["lstm"]
 
     try:
         with state.lock:
@@ -1596,44 +1344,24 @@ def predict(
 
             training_results = {
                 "lstm": _train_neural_if_needed(
-                    state.lstm, configs["lstm"], cleaned, force=False
+                    state.lstm, config, cleaned, force=False
                 ),
-                "gru": _train_neural_if_needed(
-                    state.gru, configs["gru"], cleaned, force=False
-                ),
-                "tcn": _train_neural_if_needed(
-                    state.tcn, configs["tcn"], cleaned, force=False
-                ),
-                "gbm": _train_gbm_if_needed(state.gbm, cleaned, force=False),
+                "gru": _disabled_component_result("gru"),
+                "tcn": _disabled_component_result("tcn"),
+                "gbm": _disabled_component_result("gbm"),
             }
+            state.gru.status = "disabled_lstm_only"
+            state.tcn.status = "disabled_lstm_only"
+            state.gbm.status = "disabled_lstm_only"
 
-            lstm_probs, lstm_status, lstm_available = _predict_neural(
-                state.lstm, configs["lstm"], cleaned
-            )
-            gru_probs, gru_status, gru_available = _predict_neural(
-                state.gru, configs["gru"], cleaned
-            )
-            tcn_probs, tcn_status, tcn_available = _predict_neural(
-                state.tcn, configs["tcn"], cleaned
-            )
-            gbm_probs, gbm_status, gbm_available = _predict_gbm(
-                state.gbm, cleaned
+            lstm_probs, lstm_status, lstm_available, mc_diagnostics = (
+                _predict_lstm_mc(state.lstm, config, cleaned)
             )
             state.last_history = list(cleaned)
 
         fallback = _empirical_fallback_probs(cleaned)
-        local_components: Dict[str, np.ndarray] = {
-            "lstm": lstm_probs,
-            "gru": gru_probs,
-            "tcn": tcn_probs,
-            "gbm": gbm_probs,
-        }
-        local_availability = {
-            "lstm": lstm_available,
-            "gru": gru_available,
-            "tcn": tcn_available,
-            "gbm": gbm_available,
-        }
+        local_components: Dict[str, np.ndarray] = {"lstm": lstm_probs}
+        local_availability = {"lstm": lstm_available}
 
         local_probs, local_effective = _fusion(
             component_probs=local_components,
@@ -1652,11 +1380,14 @@ def predict(
         )
 
         all_components: Dict[str, Sequence[float]] = {
-            **local_components,
+            "lstm": lstm_probs,
             "deepseek": ai_probs if ai_probs is not None else fallback,
         }
         availability = {
-            **local_availability,
+            "lstm": lstm_available,
+            "gru": False,
+            "tcn": False,
+            "gbm": False,
             "deepseek": ai_probs is not None,
         }
         final_probs, effective_weights = _fusion(
@@ -1672,26 +1403,17 @@ def predict(
         p_prob = float(final_probs[CLASS_TO_INDEX["P"]])
         t_prob = float(final_probs[CLASS_TO_INDEX["T"]])
 
-        # ------------------------------------------------------------------
-        # NEW: avoid consistently recommending the same side when the edge
-        # is extremely small and the signal is low. The recommendation is
-        # then determined by a reproducible random seed derived from the
-        # history fingerprint, so the same shoe always yields the same
-        # outcome but different shoes can vary.
-        # ------------------------------------------------------------------
+        # Existing low-edge recommendation behavior is retained unchanged.
         bp_total = max(1e-12, b_prob + p_prob)
         confidence = max(b_prob, p_prob) / bp_total
         edge = abs(b_prob - p_prob)
         signal_level = _signal_level(confidence, edge)
 
-        # Convert fingerprint to a local seed – deterministic per history.
         fp = _history_fingerprint(cleaned)
         local_seed = int(fp, 16) % (2**31)
         rng = random.Random(local_seed)
 
         if signal_level == "LOW" and edge < 0.02:
-            # Randomly pick B or P with equal probability to break the
-            # monotonic side bias while retaining full reproducibility.
             recommend = "B" if rng.random() < 0.5 else "P"
             recommend_text = "莊" if recommend == "B" else "閒"
             reason_extra = (
@@ -1702,11 +1424,12 @@ def predict(
             recommend_text = "莊" if recommend == "B" else "閒"
             reason_extra = ""
 
+        disabled_probs = _to_prob_dict(fallback, digits=6)
         component_prob_dict = {
             "lstm": _to_prob_dict(lstm_probs, digits=6),
-            "gru": _to_prob_dict(gru_probs, digits=6),
-            "tcn": _to_prob_dict(tcn_probs, digits=6),
-            "gbm": _to_prob_dict(gbm_probs, digits=6),
+            "gru": disabled_probs,
+            "tcn": disabled_probs,
+            "gbm": disabled_probs,
             "deepseek": _to_prob_dict(ai_probs, digits=6)
             if ai_probs is not None
             else None,
@@ -1720,18 +1443,20 @@ def predict(
             if available and effective_weights.get(name, 0.0) > 0.0
         ]
         active_text = "+".join(active_labels) if active_labels else "PRIOR_FALLBACK"
+        mc_completed = int(mc_diagnostics.get("simulations_completed") or 0)
+        mc_uncertainty = mc_diagnostics.get("uncertainty")
         reason = (
-            f"{active_text} 融合；"
-            f"LSTM={lstm_status}; GRU={gru_status}; TCN={tcn_status}; "
-            f"GBM={gbm_status}/{state.gbm.backend or _select_gbm_backend() or 'NONE'}; "
-            f"DeepSeek={ai_status}; 莊閒方向信心={confidence * 100:.1f}%"
-            f"{reason_extra}"
+            f"{active_text} 融合；LSTM={lstm_status}; "
+            f"MonteCarlo={mc_completed}/{LSTM_MC_SIMULATIONS}; "
+            f"MC不確定度={mc_uncertainty}; DeepSeek={ai_status}; "
+            f"GRU/TCN/GBM=disabled_lstm_only; "
+            f"莊閒方向信心={confidence * 100:.1f}%{reason_extra}"
         )
 
         configured_weights = _configured_weights()
         result: Dict[str, Any] = {
             "ok": True,
-            "engine": "LSTM_GRU_TCN_GBM_DEEPSEEK",
+            "engine": "LSTM_MONTE_CARLO_DEEPSEEK",
             "predict_engine_env": PREDICT_ENGINE,
             "user_id": uid,
             "uid_isolated": bool(PER_UID_MODELS and uid),
@@ -1753,11 +1478,13 @@ def predict(
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(edge, 6),
             "signal_level": signal_level,
-            "pattern_label": "GRU+TCN/1D-CNN+GBM 融合（LSTM可選）",
-            "regime": "GRU_TCN_GBM_ENSEMBLE",
+            "pattern_label": "LSTM 多尺度牌路特徵 + Monte Carlo Dropout",
+            "regime": "LSTM_MC_DEEPSEEK",
             "ngram_label": "",
             "ngram_sample": 0,
-            "big_road_label": "大路 B/P/T 序列作為神經網路與GBM特徵輸入",
+            "big_road_label": (
+                "大路 B/P/T、連續長度、切換、單跳、雙跳區塊與短中期比例輸入 LSTM"
+            ),
             "big_eye_label": "",
             "small_road_label": "",
             "cockroach_label": "",
@@ -1778,7 +1505,7 @@ def predict(
             "live_walk_forward_performance": {},
             "ask_road_memory": {},
             "walk_forward_enabled": False,
-            "direction_core": "GRU_TCN_GBM_ENSEMBLE",
+            "direction_core": "LSTM_MONTE_CARLO_DEEPSEEK",
             "direction_locked": False,
             "reason": reason,
             "configured_weights": {
@@ -1794,7 +1521,9 @@ def predict(
                 key: round(value, 6) for key, value in local_effective.items()
             },
             "component_probs": component_prob_dict,
-            # Markov compatibility fields remain but no Markov calculation is used.
+            "monte_carlo": mc_diagnostics,
+            "mc_simulations": LSTM_MC_SIMULATIONS,
+            "mc_simulations_completed": mc_completed,
             "markov": {
                 "enabled": False,
                 "removed": True,
@@ -1804,27 +1533,15 @@ def predict(
             "ai_used": ai_probs is not None,
             "ai_status": ai_status,
             "ai_result": ai_result if DEBUG_AI_RESULT else None,
-            "ml_trained": any(
-                [
-                    state.lstm.trained,
-                    state.gru.trained,
-                    state.tcn.trained,
-                    state.gbm.trained,
-                ]
-            ),
-            "ml_samples": max(
-                state.lstm.training_samples,
-                state.gru.training_samples,
-                state.tcn.training_samples,
-                state.gbm.training_samples,
-            ),
+            "ml_trained": state.lstm.trained,
+            "ml_samples": state.lstm.training_samples,
             "tf_available": TF_AVAILABLE,
             "tf_import_error": TF_IMPORT_ERROR if not TF_AVAILABLE else "",
             "lstm_status": lstm_status,
-            "gru_status": gru_status,
-            "tcn_status": tcn_status,
-            "gbm_status": gbm_status,
-            "gbm_backend": state.gbm.backend or _select_gbm_backend(),
+            "gru_status": "disabled_lstm_only",
+            "tcn_status": "disabled_lstm_only",
+            "gbm_status": "disabled_lstm_only",
+            "gbm_backend": "DISABLED_LSTM_ONLY",
             "lstm_training": training_results["lstm"],
             "gru_training": training_results["gru"],
             "tcn_training": training_results["tcn"],
@@ -1839,17 +1556,18 @@ def predict(
             "training_key": training_key,
             "model_cache_size": len(_MODEL_CACHE),
             "ml_predictions": {
-                "lr": round(float(gbm_probs[CLASS_TO_INDEX["B"]]), 6),
-                "rf": round(float(tcn_probs[CLASS_TO_INDEX["B"]]), 6),
+                # Legacy keys retained so older app.py code does not fail.
+                "lr": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
+                "rf": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
                 "lstm": round(float(lstm_probs[CLASS_TO_INDEX["B"]]), 6),
-                "gru": round(float(gru_probs[CLASS_TO_INDEX["B"]]), 6),
-                "tcn": round(float(tcn_probs[CLASS_TO_INDEX["B"]]), 6),
-                "gbm": round(float(gbm_probs[CLASS_TO_INDEX["B"]]), 6),
+                "gru": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
+                "tcn": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
+                "gbm": round(float(fallback[CLASS_TO_INDEX["B"]]), 6),
                 "ensemble": round(b_prob, 6),
                 "lstm_probs": _to_prob_dict(lstm_probs, digits=6),
-                "gru_probs": _to_prob_dict(gru_probs, digits=6),
-                "tcn_probs": _to_prob_dict(tcn_probs, digits=6),
-                "gbm_probs": _to_prob_dict(gbm_probs, digits=6),
+                "gru_probs": disabled_probs,
+                "tcn_probs": disabled_probs,
+                "gbm_probs": disabled_probs,
             },
         }
 
@@ -1866,6 +1584,7 @@ def predict(
                 },
                 "gbm_import_errors": GBM_IMPORT_ERRORS,
                 "deepseek_import_error": _DEEPSEEK_IMPORT_ERROR,
+                "monte_carlo": mc_diagnostics,
             }
         else:
             result["debug"] = None
@@ -1882,7 +1601,7 @@ def predict(
         return {
             "ok": False,
             "error": str(exc),
-            "engine": "LSTM_GRU_TCN_GBM_DEEPSEEK",
+            "engine": "LSTM_MONTE_CARLO_DEEPSEEK",
             "user_id": uid,
             "venue": venue,
             "room": room,
@@ -1901,10 +1620,15 @@ def predict(
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(abs(b_prob - p_prob), 6),
             "signal_level": "LOW",
-            "reason": "模型執行失敗，暫時使用 B/P/T 基礎與當前樣本先驗機率",
+            "reason": "LSTM/DeepSeek 執行失敗，暫時使用 B/P/T 基礎與當前樣本先驗機率",
             "training_key": training_key,
             "tf_available": TF_AVAILABLE,
             "ai_used": False,
+            "monte_carlo": {
+                "enabled": True,
+                "simulations_requested": LSTM_MC_SIMULATIONS,
+                "simulations_completed": 0,
+            },
             "markov": {"enabled": False, "removed": True},
             "markov_label": "Markov 已移除",
             "debug": {"exception": repr(exc)} if DEBUG_PREDICTOR else None,
