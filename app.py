@@ -287,6 +287,25 @@ def root() -> PlainTextResponse:
     return PlainTextResponse("OK")
 
 
+
+
+@app.get("/liff")
+async def liff_compatibility() -> PlainTextResponse:
+    """Compatibility route for old LIFF/rich-menu links.
+
+    The V3 bot no longer uses a web panel. Users should return to LINE and
+    send「開始分析」to receive the Flex prediction panel in chat.
+    """
+    return PlainTextResponse(
+        "此版本已改為直接在 LINE 聊天室顯示預測面板。請返回 LINE 並輸入「開始分析」。"
+    )
+
+
+@app.get("/favicon.ico")
+async def favicon() -> PlainTextResponse:
+    return PlainTextResponse("", status_code=204)
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health() -> JSONResponse:
     return JSONResponse({"ok": True, "version": "3.0.0", "time": _iso(now_taipei())})
@@ -374,3 +393,8 @@ async def webhook(request: Request) -> JSONResponse:
         except Exception as exc:
             line_reply(reply_token, [text_message(f"操作失敗：{exc}")])
     return JSONResponse({"ok": True})
+
+@app.post("/callback")
+async def callback_compatibility(request: Request) -> JSONResponse:
+    """Compatibility alias for LINE Developers projects still using /callback."""
+    return await webhook(request)
