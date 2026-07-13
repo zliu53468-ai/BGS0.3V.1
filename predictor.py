@@ -1,4 +1,4 @@
-"""Baccarat predictor: B/P LSTM + cross-shoe memory + regime control.
+"""Baccarat predictor: B/P LSTM + 10M pattern DB + cross-shoe memory.
 
 Compatibility goals
 -------------------
@@ -53,6 +53,11 @@ os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import numpy as np
 
+try:
+    from pattern_database import PatternDatabase  # type: ignore
+except Exception:
+    PatternDatabase = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -102,7 +107,7 @@ def _env_float(
 # ---------------------------------------------------------------------------
 
 PREDICT_ENGINE = os.getenv(
-    "PREDICT_ENGINE", "LSTM_BP_REGIME_MC_DEEPSEEK"
+    "PREDICT_ENGINE", "LSTM_BP_PATTERN_DB_MC_DEEPSEEK"
 ).strip().upper()
 PER_UID_MODELS = _env_bool("PER_UID_MODELS", True)
 REQUIRE_USER_ID = _env_bool("REQUIRE_USER_ID", False)
@@ -128,6 +133,20 @@ REPLAY_RECENT_WINDOW = _env_int("REPLAY_RECENT_WINDOW", 24, minimum=4)
 REPLAY_BATCH_SAMPLES = _env_int("REPLAY_BATCH_SAMPLES", 32, minimum=4)
 REPLAY_RECENT_RATIO = _env_float("REPLAY_RECENT_RATIO", 0.70, 0.0, 1.0)
 REPLAY_RECENCY_DECAY = _env_float("REPLAY_RECENCY_DECAY", 0.985, 0.80, 1.0)
+
+# External large-scale pattern database. The database contains aggregated
+# suffix/context counts built from the user's real historical shoe dataset.
+USE_PATTERN_DATABASE = _env_bool("USE_PATTERN_DATABASE", True)
+PATTERN_DB_PATH = os.getenv("PATTERN_DB_PATH", "pattern_10m.sqlite3").strip()
+PATTERN_DB_WEIGHT = _env_float("PATTERN_DB_WEIGHT", 0.45, 0.0, 1.0)
+PATTERN_DB_MAX_ORDER = _env_int("PATTERN_DB_MAX_ORDER", 24, minimum=1)
+PATTERN_DB_MIN_MATCHES = _env_int("PATTERN_DB_MIN_MATCHES", 12, minimum=1)
+PATTERN_DB_SMOOTHING = _env_float("PATTERN_DB_SMOOTHING", 4.0, 0.0, 1000.0)
+PATTERN_DB_FIRST_HAND_ENABLED = _env_bool("PATTERN_DB_FIRST_HAND_ENABLED", True)
+
+# Recommendations are always returned. Entry thresholds and regime/AI conflict
+# checks remain diagnostic only and no longer produce an observe result.
+DISABLE_OBSERVE = _env_bool("DISABLE_OBSERVE", True)
 
 # Cross-shoe base memory. It is process-memory based; a Render restart clears it.
 GLOBAL_MEMORY_ENABLED = _env_bool("GLOBAL_MEMORY_ENABLED", True)
@@ -627,6 +646,8 @@ _SCOPE_MEMORY_CACHE_LOCK = threading.RLock()
 _TF_LOCK = threading.RLock()
 _DEEPSEEK_LOCK = threading.RLock()
 _DEEPSEEK_CLIENT: Optional[Any] = None
+_PATTERN_DB_LOCK = threading.RLock()
+_PATTERN_DB_CLIENT: Optional[Any] = None
 
 
 def _make_scope_key(user_id: str, venue: str, room: str) -> str:
@@ -1453,6 +1474,60 @@ def _predict_component_mc(
 
 
 # ---------------------------------------------------------------------------
+# Large pattern database
+# ---------------------------------------------------------------------------
+
+
+def _get_pattern_db_client() -> Optional[Any]:
+    global _PATTERN_DB_CLIENT
+    if not USE_PATTERN_DATABASE or PatternDatabase is None:
+        return None
+    with _PATTERN_DB_LOCK:
+        if _PATTERN_DB_CLIENT is None:
+            _PATTERN_DB_CLIENT = PatternDatabase(
+                path=PATTERN_DB_PATH,
+                max_order=PATTERN_DB_MAX_ORDER,
+                min_matches=PATTERN_DB_MIN_MATCHES,
+                smoothing=PATTERN_DB_SMOOTHING,
+                b_prior=float(_bp_prior_probs()[0]),
+            )
+        return _PATTERN_DB_CLIENT
+
+
+def _pattern_db_probs(history: Sequence[str]) -> Tuple[np.ndarray, str, bool, Dict[str, Any]]:
+    fallback = _bp_fallback_probs(history)
+    if not USE_PATTERN_DATABASE:
+        return fallback, "disabled", False, {"enabled": False}
+    if not history and not PATTERN_DB_FIRST_HAND_ENABLED:
+        return fallback, "first_hand_disabled", False, {"enabled": True}
+    client = _get_pattern_db_client()
+    if client is None:
+        status = "module_unavailable" if PatternDatabase is None else "client_unavailable"
+        return fallback, status, False, {"enabled": True, "status": status}
+    try:
+        lookup = client.lookup(history)
+        probs = _normalize(lookup.probs, fallback=fallback)
+        info = {
+            "enabled": True,
+            "path": PATTERN_DB_PATH,
+            "status": lookup.status,
+            "available": bool(lookup.available),
+            "context": lookup.context,
+            "order": int(lookup.order),
+            "matches": int(lookup.matches),
+            "b_count": int(lookup.b_count),
+            "p_count": int(lookup.p_count),
+            "bp_probs": _to_prob_dict(probs, digits=6),
+        }
+        return probs, lookup.status, bool(lookup.available), info
+    except Exception as exc:
+        logger.warning("Pattern database lookup failed: %s", exc)
+        return fallback, f"lookup_error:{exc}", False, {
+            "enabled": True, "path": PATTERN_DB_PATH, "error": str(exc)
+        }
+
+
+# ---------------------------------------------------------------------------
 # Regime and phase logic
 # ---------------------------------------------------------------------------
 
@@ -1590,12 +1665,16 @@ def _combine_model_probs(
     phase: str,
     global_probs: Sequence[float],
     local_probs: Sequence[float],
+    pattern_probs: Sequence[float],
     deepseek_probs: Optional[Sequence[float]],
     availability: Mapping[str, bool],
     fallback: Sequence[float],
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     settings = _phase_settings(phase)
     weights = {
+        "pattern_db": (
+            PATTERN_DB_WEIGHT if availability.get("pattern_db", False) else 0.0
+        ),
         "global_lstm": (
             settings["global_weight"] * LSTM_WEIGHT
             if availability.get("global_lstm", False)
@@ -1624,6 +1703,7 @@ def _combine_model_probs(
         }
     effective = {key: value / total for key, value in weights.items()}
     final = np.zeros(2, dtype=np.float64)
+    final += _normalize(pattern_probs, fallback=fallback) * effective["pattern_db"]
     final += _normalize(global_probs, fallback=fallback) * effective["global_lstm"]
     final += _normalize(local_probs, fallback=fallback) * effective["local_lstm"]
     if deepseek_probs is not None:
@@ -1848,7 +1928,7 @@ def predict(
     shoe_id: str = "",
     user_id: str = "",
 ) -> Dict[str, Any]:
-    """Predict B/P direction with phase-aware base/local LSTM + DeepSeek."""
+    """Predict B/P from first record with pattern DB + phase-aware LSTM + DeepSeek."""
     cleaned = _clean_history(history)
     uid = str(user_id or "").strip()
     if REQUIRE_USER_ID and not uid:
@@ -1908,9 +1988,13 @@ def predict(
         fallback_bp = _bp_fallback_probs(cleaned)
         phase = _phase_name(len(cleaned))
         phase_settings = _phase_settings(phase)
+        pattern_bp, pattern_status, pattern_available, pattern_info = (
+            _pattern_db_probs(cleaned)
+        )
 
         # Local LSTM aggregate used as DeepSeek context before DeepSeek is called.
         pre_ai_availability = {
+            "pattern_db": pattern_available,
             "global_lstm": global_available,
             "local_lstm": local_available,
             "deepseek": False,
@@ -1919,6 +2003,7 @@ def predict(
             phase,
             global_bp,
             local_bp,
+            pattern_bp,
             None,
             pre_ai_availability,
             fallback_bp,
@@ -1931,6 +2016,7 @@ def predict(
             room=room,
             shoe_id=shoe_id,
             component_probs={
+                "pattern_db": pattern_bp,
                 "global_lstm": global_bp,
                 "local_lstm": local_bp,
                 "phase_lstm": pre_ai_bp,
@@ -1939,6 +2025,7 @@ def predict(
         )
 
         availability = {
+            "pattern_db": pattern_available,
             "global_lstm": global_available,
             "local_lstm": local_available,
             "deepseek": ai_bp is not None,
@@ -1950,6 +2037,7 @@ def predict(
             phase,
             global_bp,
             local_bp,
+            pattern_bp,
             ai_bp,
             availability,
             fallback_bp,
@@ -1964,6 +2052,7 @@ def predict(
 
         tie_rate = _estimate_tie_rate(cleaned)
         final_triplet = _bp_to_triplet(final_bp, tie_rate)
+        pattern_triplet = _bp_to_triplet(pattern_bp, tie_rate)
         global_triplet = _bp_to_triplet(global_bp, tie_rate)
         local_triplet = _bp_to_triplet(local_bp, tie_rate)
         pre_ai_triplet = _bp_to_triplet(pre_ai_bp, tie_rate)
@@ -1994,68 +2083,52 @@ def predict(
             deepseek_side is not None and deepseek_side != lstm_side
         )
 
-        observe_reasons: List[str] = []
-        model_ready = global_available or local_available
-        if REQUIRE_MODEL_READY_FOR_ENTRY and not model_ready:
-            observe_reasons.append("跨靴與當靴LSTM皆尚未完成訓練")
+        # Observation filters are retained as diagnostics only. The user requested
+        # a B/P recommendation from the first record onward, so no condition can
+        # replace the direction with NONE/observe.
+        diagnostic_flags: List[str] = []
+        model_ready = pattern_available or global_available or local_available
+        if not model_ready:
+            diagnostic_flags.append("模型與規律資料庫尚未就緒，使用B/P先驗")
         if edge < phase_settings["min_edge"]:
-            observe_reasons.append(
-                f"{phase}階段莊閒差距{edge * 100:.1f}%低於"
-                f"{phase_settings['min_edge'] * 100:.1f}%"
-            )
+            diagnostic_flags.append("edge_below_old_threshold")
         if confidence < phase_settings["min_confidence"]:
-            observe_reasons.append(
-                f"莊閒信心{confidence * 100:.1f}%低於"
-                f"{phase_settings['min_confidence'] * 100:.1f}%"
-            )
+            diagnostic_flags.append("confidence_below_old_threshold")
         if (
             combined_uncertainty is not None
             and combined_uncertainty > phase_settings["max_uncertainty"]
         ):
-            observe_reasons.append(
-                f"MC不確定度{combined_uncertainty:.4f}高於"
-                f"{phase_settings['max_uncertainty']:.4f}"
-            )
+            diagnostic_flags.append("mc_uncertainty_above_old_threshold")
         if regime_change.get("detected"):
-            observe_reasons.append(
-                "偵測到前後牌路節奏轉換，冷卻"
-                f"{regime_change.get('cooldown_remaining', 0)}手"
-            )
-        if (
-            DEEPSEEK_CONFLICT_OBSERVE
-            and deepseek_conflict
-            and edge < DEEPSEEK_CONFLICT_OVERRIDE_EDGE
-        ):
-            observe_reasons.append(
-                f"LSTM與DeepSeek方向衝突且差距未達"
-                f"{DEEPSEEK_CONFLICT_OVERRIDE_EDGE * 100:.1f}%"
-            )
+            diagnostic_flags.append("regime_change_detected")
+        if deepseek_conflict:
+            diagnostic_flags.append("deepseek_conflict")
 
-        is_observe = bool(observe_reasons)
-        recommend = "NONE" if is_observe else primary_side
-        recommend_text = (
-            "觀望" if is_observe else ("莊" if recommend == "B" else "閒")
-        )
-        observe_reason = "；".join(observe_reasons)
+        is_observe = False
+        recommend = primary_side
+        recommend_text = "莊" if recommend == "B" else "閒"
+        observe_reason = ""
+
 
         active_labels = [
             name.upper()
-            for name in ("global_lstm", "local_lstm", "deepseek")
+            for name in ("pattern_db", "global_lstm", "local_lstm", "deepseek")
             if availability.get(name, False) and effective_weights.get(name, 0.0) > 0.0
         ]
         active_text = "+".join(active_labels) if active_labels else "BP_PRIOR_FALLBACK"
         reason = (
-            f"{active_text}；phase={phase}; global={global_status}; "
-            f"local={local_status}; DeepSeek={ai_status}; "
+            f"{active_text}；phase={phase}; pattern_db={pattern_status}; "
+            f"global={global_status}; local={local_status}; DeepSeek={ai_status}; "
             f"B/P信心={confidence * 100:.1f}%; edge={edge * 100:.1f}%; "
             f"MC不確定度={combined_uncertainty}; "
             f"regime_change={regime_change.get('detected', False)}"
         )
-        if is_observe:
-            reason += f"；觀望原因={observe_reason}"
+        if diagnostic_flags:
+            reason += "；診斷=" + ",".join(diagnostic_flags)
 
         disabled_triplet = _bp_to_triplet(fallback_bp, tie_rate)
         configured_weights = {
+            "pattern_db": PATTERN_DB_WEIGHT,
             "lstm": LSTM_WEIGHT,
             "deepseek": DEEPSEEK_WEIGHT,
             "global_lstm": phase_settings["global_weight"],
@@ -2076,7 +2149,7 @@ def predict(
 
         result: Dict[str, Any] = {
             "ok": True,
-            "engine": "LSTM_BP_REGIME_MC_DEEPSEEK",
+            "engine": "LSTM_BP_PATTERN_DB_MC_DEEPSEEK",
             "predict_engine_env": PREDICT_ENGINE,
             "user_id": uid,
             "uid_isolated": bool(PER_UID_MODELS and uid),
@@ -2099,7 +2172,7 @@ def predict(
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(edge, 6),
             "signal_level": signal_level,
-            "pattern_label": "B/P二分類LSTM＋跨靴記憶＋Replay＋MC",
+            "pattern_label": "千萬筆規律資料庫＋B/P LSTM＋跨靴記憶＋Replay＋MC",
             "regime": phase,
             "ngram_label": "",
             "ngram_sample": 0,
@@ -2182,6 +2255,7 @@ def predict(
                 key: round(float(value), 6) for key, value in pre_ai_weights.items()
             },
             "component_probs": {
+                "pattern_db": _to_prob_dict(pattern_triplet, digits=6),
                 "global_lstm": _to_prob_dict(global_triplet, digits=6),
                 "local_lstm": _to_prob_dict(local_triplet, digits=6),
                 "lstm": _to_prob_dict(pre_ai_triplet, digits=6),
@@ -2194,6 +2268,11 @@ def predict(
                 "local": _to_prob_dict(pre_ai_triplet, digits=6),
                 "final": _to_prob_dict(final_triplet, digits=6),
             },
+            "pattern_database": pattern_info,
+            "pattern_db_status": pattern_status,
+            "pattern_db_available": pattern_available,
+            "pattern_db_matches": int(pattern_info.get("matches") or 0),
+            "pattern_db_order": int(pattern_info.get("order") or 0),
             "monte_carlo": {
                 "local": local_mc,
                 "global": global_mc,
@@ -2245,6 +2324,7 @@ def predict(
                 "lr": round(float(disabled_triplet[0]), 6),
                 "rf": round(float(disabled_triplet[0]), 6),
                 "lstm": round(float(pre_ai_triplet[0]), 6),
+                "pattern_db": round(float(pattern_triplet[0]), 6),
                 "global_lstm": round(float(global_triplet[0]), 6),
                 "local_lstm": round(float(local_triplet[0]), 6),
                 "gru": round(float(disabled_triplet[0]), 6),
@@ -2252,6 +2332,7 @@ def predict(
                 "gbm": round(float(disabled_triplet[0]), 6),
                 "ensemble": round(b_prob, 6),
                 "lstm_probs": _to_prob_dict(pre_ai_triplet, digits=6),
+                "pattern_db_probs": _to_prob_dict(pattern_triplet, digits=6),
                 "global_lstm_probs": _to_prob_dict(global_triplet, digits=6),
                 "local_lstm_probs": _to_prob_dict(local_triplet, digits=6),
                 "gru_probs": _to_prob_dict(disabled_triplet, digits=6),
@@ -2289,7 +2370,7 @@ def predict(
         return {
             "ok": False,
             "error": str(exc),
-            "engine": "LSTM_BP_REGIME_MC_DEEPSEEK",
+            "engine": "LSTM_BP_PATTERN_DB_MC_DEEPSEEK",
             "user_id": uid,
             "venue": venue,
             "room": room,
@@ -2301,15 +2382,15 @@ def predict(
             "tie_rate": round(t_prob * 100.0, 1),
             "probabilities": _to_prob_dict(fallback, digits=6),
             "bp_probabilities": _to_prob_dict(fallback_bp, digits=6),
-            "recommend": "NONE",
-            "recommend_text": "觀望",
-            "is_observe": True,
-            "observe_reason": "模型執行失敗，不使用先驗機率強制選邊",
+            "recommend": "B" if float(fallback_bp[0]) >= float(fallback_bp[1]) else "P",
+            "recommend_text": "莊" if float(fallback_bp[0]) >= float(fallback_bp[1]) else "閒",
+            "is_observe": False,
+            "observe_reason": "",
             "confidence": round(confidence, 4),
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(abs(float(fallback_bp[0]) - float(fallback_bp[1])), 6),
             "signal_level": "LOW",
-            "reason": "LSTM/DeepSeek 執行失敗，已改為觀望",
+            "reason": "模型執行失敗，使用B/P先驗機率持續給出方向",
             "training_key": training_key,
             "scope_key": scope_key,
             "tf_available": TF_AVAILABLE,
