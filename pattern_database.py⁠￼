@@ -1,0 +1,260 @@
+"""Scalable baccarat B/P pattern database backed by SQLite.
+
+This module does not fabricate data. It builds an aggregated suffix/context
+index from user-supplied historical shoe sequences. Millions of source rows can
+be streamed without loading them all into memory.
+
+Accepted input for the CLI builder: one shoe per line, containing B/P/T with
+optional separators. Example: BPPBTTPBBP
+
+Build:
+    python pattern_database.py build --input shoes.txt --db pattern_10m.sqlite3
+
+Inspect:
+    python pattern_database.py info --db pattern_10m.sqlite3
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sqlite3
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+_ALLOWED = {"B", "P", "T"}
+
+
+def clean_sequence(value: str) -> List[str]:
+    return [ch for ch in str(value).upper() if ch in _ALLOWED]
+
+
+@dataclass(frozen=True)
+class PatternLookup:
+    probs: Tuple[float, float]
+    available: bool
+    context: str
+    order: int
+    matches: int
+    b_count: int
+    p_count: int
+    status: str
+
+
+class PatternDatabase:
+    """Read-only runtime lookup over aggregated context counts."""
+
+    def __init__(
+        self,
+        path: str,
+        max_order: int = 24,
+        min_matches: int = 8,
+        smoothing: float = 2.0,
+        b_prior: float = 0.5068,
+    ) -> None:
+        self.path = str(path or "").strip()
+        self.max_order = max(1, int(max_order))
+        self.min_matches = max(1, int(min_matches))
+        self.smoothing = max(0.0, float(smoothing))
+        self.b_prior = min(0.999, max(0.001, float(b_prior)))
+        self._local = threading.local()
+
+    @property
+    def exists(self) -> bool:
+        return bool(self.path and Path(self.path).is_file())
+
+    def _connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            if not self.exists:
+                raise FileNotFoundError(self.path)
+            uri = f"file:{Path(self.path).resolve()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=3.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._local.conn = conn
+        return conn
+
+    def lookup(self, history: Sequence[str]) -> PatternLookup:
+        if not self.exists:
+            return PatternLookup(
+                (self.b_prior, 1.0 - self.b_prior), False, "", 0, 0, 0, 0,
+                "database_missing",
+            )
+        cleaned = [str(x).upper() for x in history if str(x).upper() in _ALLOWED]
+        conn = self._connection()
+        max_order = min(self.max_order, len(cleaned))
+        # Longest suffix first. Empty context is the global/root fallback.
+        contexts = [("".join(cleaned[-order:]), order) for order in range(max_order, 0, -1)]
+        contexts.append(("", 0))
+        try:
+            for context, order in contexts:
+                row = conn.execute(
+                    "SELECT b_count, p_count FROM patterns WHERE context=?",
+                    (context,),
+                ).fetchone()
+                if row is None:
+                    continue
+                b_count = int(row["b_count"] or 0)
+                p_count = int(row["p_count"] or 0)
+                matches = b_count + p_count
+                if order > 0 and matches < self.min_matches:
+                    continue
+                alpha_b = self.smoothing * self.b_prior
+                alpha_p = self.smoothing * (1.0 - self.b_prior)
+                total = matches + alpha_b + alpha_p
+                b_prob = (b_count + alpha_b) / total if total > 0 else self.b_prior
+                return PatternLookup(
+                    (float(b_prob), float(1.0 - b_prob)),
+                    True,
+                    context,
+                    order,
+                    matches,
+                    b_count,
+                    p_count,
+                    "ready",
+                )
+        except sqlite3.Error as exc:
+            return PatternLookup(
+                (self.b_prior, 1.0 - self.b_prior), False, "", 0, 0, 0, 0,
+                f"sqlite_error:{exc}",
+            )
+        return PatternLookup(
+            (self.b_prior, 1.0 - self.b_prior), False, "", 0, 0, 0, 0,
+            "no_match",
+        )
+
+
+def initialize_database(path: str) -> sqlite3.Connection:
+    db_path = Path(path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS patterns (
+            context TEXT PRIMARY KEY,
+            b_count INTEGER NOT NULL DEFAULT 0,
+            p_count INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    return conn
+
+
+def build_database(
+    input_path: str,
+    db_path: str,
+    max_order: int = 24,
+    commit_every: int = 5000,
+) -> Dict[str, Any]:
+    """Stream source shoes and aggregate next-B/P counts by suffix context."""
+    max_order = max(1, int(max_order))
+    commit_every = max(1, int(commit_every))
+    conn = initialize_database(db_path)
+    upsert = (
+        "INSERT INTO patterns(context,b_count,p_count) VALUES(?,?,?) "
+        "ON CONFLICT(context) DO UPDATE SET "
+        "b_count=b_count+excluded.b_count,p_count=p_count+excluded.p_count"
+    )
+    shoes = 0
+    transitions = 0
+    updates = 0
+    batch: Dict[str, List[int]] = {}
+
+    def flush() -> None:
+        nonlocal updates
+        if not batch:
+            return
+        conn.executemany(
+            upsert,
+            ((ctx, counts[0], counts[1]) for ctx, counts in batch.items()),
+        )
+        updates += len(batch)
+        batch.clear()
+        conn.commit()
+
+    with open(input_path, "r", encoding="utf-8", errors="ignore") as source:
+        for line in source:
+            seq = clean_sequence(line)
+            if not seq:
+                continue
+            shoes += 1
+            # Root context enables predictions before/after the first recorded hand.
+            for target_index, target in enumerate(seq):
+                if target not in {"B", "P"}:
+                    continue
+                transitions += 1
+                max_here = min(max_order, target_index)
+                for order in range(0, max_here + 1):
+                    context = "" if order == 0 else "".join(seq[target_index - order:target_index])
+                    counts = batch.setdefault(context, [0, 0])
+                    counts[0 if target == "B" else 1] += 1
+            if shoes % commit_every == 0:
+                flush()
+    flush()
+    conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('source_shoes',?)", (str(shoes),))
+    conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('transitions',?)", (str(transitions),))
+    conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('max_order',?)", (str(max_order),))
+    conn.commit()
+    contexts = int(conn.execute("SELECT COUNT(*) FROM patterns").fetchone()[0])
+    conn.close()
+    return {
+        "ok": True,
+        "source_shoes": shoes,
+        "transitions": transitions,
+        "contexts": contexts,
+        "max_order": max_order,
+        "db_path": str(Path(db_path).resolve()),
+        "flush_updates": updates,
+    }
+
+
+def database_info(db_path: str) -> Dict[str, Any]:
+    conn = sqlite3.connect(db_path)
+    metadata = dict(conn.execute("SELECT key,value FROM metadata").fetchall())
+    contexts = int(conn.execute("SELECT COUNT(*) FROM patterns").fetchone()[0])
+    root = conn.execute("SELECT b_count,p_count FROM patterns WHERE context='' ").fetchone()
+    conn.close()
+    return {
+        "db_path": str(Path(db_path).resolve()),
+        "contexts": contexts,
+        "root_counts": {"B": int(root[0]), "P": int(root[1])} if root else None,
+        "metadata": metadata,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build/query baccarat pattern SQLite DB")
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser("build")
+    build.add_argument("--input", required=True)
+    build.add_argument("--db", required=True)
+    build.add_argument("--max-order", type=int, default=24)
+    build.add_argument("--commit-every", type=int, default=5000)
+    info = sub.add_parser("info")
+    info.add_argument("--db", required=True)
+    args = parser.parse_args()
+    result = (
+        build_database(args.input, args.db, args.max_order, args.commit_every)
+        if args.command == "build"
+        else database_info(args.db)
+    )
+    import json
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
