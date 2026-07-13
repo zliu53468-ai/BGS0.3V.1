@@ -54,7 +54,7 @@ os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 import numpy as np
 
 try:
-    from pattern_database import PatternDatabase  # type: ignore
+    from pattern_database_shape import PatternDatabase  # type: ignore
 except Exception:
     PatternDatabase = None  # type: ignore
 
@@ -107,7 +107,7 @@ def _env_float(
 # ---------------------------------------------------------------------------
 
 PREDICT_ENGINE = os.getenv(
-    "PREDICT_ENGINE", "LSTM_BP_PATTERN_DB_MC_DEEPSEEK"
+    "PREDICT_ENGINE", "LSTM_SHAPE_PATTERN_DB_MC_DEEPSEEK"
 ).strip().upper()
 PER_UID_MODELS = _env_bool("PER_UID_MODELS", True)
 REQUIRE_USER_ID = _env_bool("REQUIRE_USER_ID", False)
@@ -125,20 +125,20 @@ LSTM_LEARNING_RATE = _env_float("LSTM_LEARNING_RATE", 0.0002, 0.000001)
 LSTM_EPOCHS = _env_int("LSTM_EPOCHS", 4, minimum=1)
 LSTM_ONLINE_EPOCHS = _env_int("LSTM_ONLINE_EPOCHS", 1, minimum=1)
 LSTM_MIN_SAMPLES = _env_int("LSTM_MIN_SAMPLES", 10, minimum=2)
-LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 2, minimum=1)
+LSTM_RETRAIN_INTERVAL = _env_int("LSTM_RETRAIN_INTERVAL", 3, minimum=1)
 LOCAL_FREEZE_FIRST_LSTM = _env_bool("LOCAL_FREEZE_FIRST_LSTM", True)
 
 # Replay buffer. Targets are B/P only; T targets are skipped.
 REPLAY_RECENT_WINDOW = _env_int("REPLAY_RECENT_WINDOW", 24, minimum=4)
 REPLAY_BATCH_SAMPLES = _env_int("REPLAY_BATCH_SAMPLES", 32, minimum=4)
-REPLAY_RECENT_RATIO = _env_float("REPLAY_RECENT_RATIO", 0.70, 0.0, 1.0)
-REPLAY_RECENCY_DECAY = _env_float("REPLAY_RECENCY_DECAY", 0.985, 0.80, 1.0)
+REPLAY_RECENT_RATIO = _env_float("REPLAY_RECENT_RATIO", 0.45, 0.0, 1.0)
+REPLAY_RECENCY_DECAY = _env_float("REPLAY_RECENCY_DECAY", 0.995, 0.80, 1.0)
 
 # External large-scale pattern database. The database contains aggregated
 # suffix/context counts built from the user's real historical shoe dataset.
 USE_PATTERN_DATABASE = _env_bool("USE_PATTERN_DATABASE", True)
 PATTERN_DB_PATH = os.getenv("PATTERN_DB_PATH", "pattern_10m.sqlite3").strip()
-PATTERN_DB_WEIGHT = _env_float("PATTERN_DB_WEIGHT", 0.45, 0.0, 1.0)
+PATTERN_DB_WEIGHT = _env_float("PATTERN_DB_WEIGHT", 0.25, 0.0, 1.0)
 PATTERN_DB_MAX_ORDER = _env_int("PATTERN_DB_MAX_ORDER", 24, minimum=1)
 PATTERN_DB_MIN_MATCHES = _env_int("PATTERN_DB_MIN_MATCHES", 12, minimum=1)
 PATTERN_DB_SMOOTHING = _env_float("PATTERN_DB_SMOOTHING", 4.0, 0.0, 1000.0)
@@ -225,8 +225,8 @@ LATE_DEEPSEEK_WEIGHT = _env_float("LATE_DEEPSEEK_WEIGHT", 0.05, 0.0, 1.0)
 
 # Legacy weights remain supported. LSTM_WEIGHT scales base + local together;
 # DEEPSEEK_WEIGHT can disable or cap the phase DeepSeek contribution.
-LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.95, 0.0)
-DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.05, 0.0)
+LSTM_WEIGHT = _env_float("LSTM_WEIGHT", 0.72, 0.0)
+DEEPSEEK_WEIGHT = _env_float("DEEPSEEK_WEIGHT", 0.03, 0.0)
 GRU_WEIGHT = 0.0
 TCN_WEIGHT = 0.0
 GBM_WEIGHT = 0.0
@@ -447,14 +447,30 @@ def _is_extension(previous: Sequence[str], current: Sequence[str]) -> bool:
     return len(current) >= len(previous) and list(current[: len(previous)]) == list(previous)
 
 
+def _last_bp_side(history: Sequence[str]) -> Optional[str]:
+    for item in reversed(history):
+        if item in {"B", "P"}:
+            return item
+    return None
+
+
+def _continuation_to_bp_probs(
+    continuation_probs: Sequence[float], history: Sequence[str]
+) -> np.ndarray:
+    """Map [continue, switch] probabilities back to absolute B/P."""
+    cs = _normalize(continuation_probs, fallback=[0.5, 0.5])
+    last_side = _last_bp_side(history)
+    if last_side == "B":
+        return np.asarray([cs[0], cs[1]], dtype=np.float64)
+    if last_side == "P":
+        return np.asarray([cs[1], cs[0]], dtype=np.float64)
+    return np.asarray([0.5, 0.5], dtype=np.float64)
+
+
 def _bp_fallback_probs(history: Sequence[str]) -> np.ndarray:
-    prior = _bp_prior_probs()
-    pseudo = prior * FALLBACK_PRIOR_STRENGTH
-    counts = np.asarray(
-        [sum(item == "B" for item in history), sum(item == "P" for item in history)],
-        dtype=np.float64,
-    )
-    return _normalize(counts + pseudo, fallback=prior)
+    """Neutral fallback; never follows the side that currently appears more."""
+    del history
+    return np.asarray([0.5, 0.5], dtype=np.float64)
 
 
 def _estimate_tie_rate(history: Sequence[str]) -> float:
@@ -835,85 +851,95 @@ def _switch_rate(sequence: Sequence[str]) -> float:
 def _road_feature_sequence(
     sequence: Sequence[str], sequence_length: int
 ) -> np.ndarray:
+    """Encode only road shape, never absolute Banker/Player advantage.
+
+    B/P mirror pairs therefore produce the same tensor. The first three values
+    represent SAME / CHANGE / TIE relative to the previous non-tie result.
+    """
     recent = list(sequence[-sequence_length:])
     encoded = np.zeros((sequence_length, LSTM_FEATURE_DIM), dtype=np.float32)
     if not recent:
         return encoded
 
     rows: List[List[float]] = []
-    run_side = ""
+    previous_bp: Optional[str] = None
     run_length = 0
+    shape_events: List[str] = []
+
     for index, item in enumerate(recent):
-        if item == run_side:
-            run_length += 1
-        else:
-            run_side = item
-            run_length = 1
+        same = change = tie = 0.0
+        if item == "T":
+            tie = 1.0
+            if previous_bp is not None:
+                shape_events.append("T")
+        elif item in {"B", "P"}:
+            if previous_bp is None:
+                run_length = 1
+            elif item == previous_bp:
+                same = 1.0
+                run_length += 1
+                shape_events.append("S")
+            else:
+                change = 1.0
+                run_length = 1
+                shape_events.append("C")
+            previous_bp = item
 
-        tail4 = recent[max(0, index - 3) : index + 1]
-        tail8 = recent[max(0, index - 7) : index + 1]
-        tail12 = recent[max(0, index - 11) : index + 1]
-        count4 = Counter(tail4)
-        count8 = Counter(tail8)
-        denom4 = float(max(1, len(tail4)))
-        denom8 = float(max(1, len(tail8)))
-
-        changed = 1.0 if index >= 1 and item != recent[index - 1] else 0.0
-        aba = (
-            1.0
-            if index >= 2
-            and item == recent[index - 2]
-            and item != recent[index - 1]
-            else 0.0
-        )
-        pair_block = (
-            1.0
-            if index >= 3
-            and recent[index] == recent[index - 1]
-            and recent[index - 2] == recent[index - 3]
-            and recent[index] != recent[index - 2]
-            else 0.0
-        )
+        tail4 = shape_events[-4:]
+        tail8 = shape_events[-8:]
+        tail12 = shape_events[-12:]
+        switch4 = tail4.count("C") / max(1.0, float(sum(x != "T" for x in tail4)))
+        switch8 = tail8.count("C") / max(1.0, float(sum(x != "T" for x in tail8)))
+        switch12 = tail12.count("C") / max(1.0, float(sum(x != "T" for x in tail12)))
+        tie8 = tail8.count("T") / max(1.0, float(len(tail8)))
+        alternating = 1.0 if len(tail4) >= 3 and tail4[-3:] == ["C", "C", "C"] else 0.0
+        pair_rhythm = 1.0 if len(tail8) >= 4 and tail8[-4:] in (["S", "C", "S", "C"], ["C", "S", "C", "S"]) else 0.0
+        run_stability = min(1.0, run_length / 8.0)
+        short_long_gap = abs(switch4 - switch12)
         progress = min(1.0, (index + 1) / max(1.0, float(sequence_length)))
 
-        rows.append(
-            [
-                1.0 if item == "B" else 0.0,
-                1.0 if item == "P" else 0.0,
-                1.0 if item == "T" else 0.0,
-                min(1.0, run_length / 8.0),
-                changed,
-                aba,
-                pair_block,
-                (count4.get("B", 0) - count4.get("P", 0)) / denom4,
-                (count8.get("B", 0) - count8.get("P", 0)) / denom8,
-                count8.get("T", 0) / denom8,
-                _switch_rate(tail4),
-                _switch_rate(tail8),
-                _switch_rate(tail12),
-                progress,
-            ]
-        )
+        rows.append([
+            same,
+            change,
+            tie,
+            run_stability,
+            switch4,
+            switch8,
+            switch12,
+            tie8,
+            alternating,
+            pair_rhythm,
+            short_long_gap,
+            1.0 - switch4,
+            1.0 - switch12,
+            progress,
+        ])
 
     row_array = np.asarray(rows, dtype=np.float32)
-    encoded[-len(row_array) :] = row_array
+    encoded[-len(row_array):] = row_array
     return encoded
-
 
 def _all_binary_samples(
     history: Sequence[str], sequence_length: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build continuation/switch targets instead of absolute B/P targets."""
     X: List[np.ndarray] = []
     y: List[int] = []
     target_indices: List[int] = []
-    for target_index in range(1, len(history)):
-        target = history[target_index]
-        if target not in BP_TO_INDEX:
+    previous_bp: Optional[str] = None
+    for target_index, target in enumerate(history):
+        if target == "T":
             continue
-        window = history[max(0, target_index - sequence_length) : target_index]
+        if target not in {"B", "P"}:
+            continue
+        if previous_bp is None:
+            previous_bp = target
+            continue
+        window = history[max(0, target_index - sequence_length):target_index]
         X.append(_road_feature_sequence(window, sequence_length))
-        y.append(BP_TO_INDEX[target])
+        y.append(0 if target == previous_bp else 1)
         target_indices.append(target_index)
+        previous_bp = target
     if not X:
         return (
             np.empty((0, sequence_length, LSTM_FEATURE_DIM), dtype=np.float32),
@@ -925,7 +951,6 @@ def _all_binary_samples(
         np.asarray(y, dtype=np.int64),
         np.asarray(target_indices, dtype=np.int64),
     )
-
 
 def _select_replay_indices(
     target_indices: np.ndarray,
@@ -1399,10 +1424,11 @@ def _predict_component_mc(
             deterministic_tensor = component.model(X, training=False)
             if hasattr(deterministic_tensor, "numpy"):
                 deterministic_tensor = deterministic_tensor.numpy()
-            deterministic = _normalize(
+            deterministic_cs = _normalize(
                 np.asarray(deterministic_tensor[0], dtype=np.float64),
-                fallback=fallback,
+                fallback=[0.5, 0.5],
             )
+            deterministic = _continuation_to_bp_probs(deterministic_cs, history)
 
             seed_source = f"{label}:{_history_fingerprint(history)}"
             fingerprint_seed = int(
@@ -1425,7 +1451,14 @@ def _predict_component_mc(
                     )
                 )
                 remaining -= current_batch
-            matrix = np.concatenate(samples, axis=0)
+            matrix_cs = np.concatenate(samples, axis=0)
+            last_side = _last_bp_side(history)
+            if last_side == "P":
+                matrix = matrix_cs[:, [1, 0]]
+            elif last_side == "B":
+                matrix = matrix_cs
+            else:
+                matrix = np.repeat(np.asarray([[0.5, 0.5]]), len(matrix_cs), axis=0)
 
         mc_mean = _normalize(matrix.mean(axis=0), fallback=fallback)
         mc_std = np.std(matrix, axis=0)
@@ -1489,7 +1522,7 @@ def _get_pattern_db_client() -> Optional[Any]:
                 max_order=PATTERN_DB_MAX_ORDER,
                 min_matches=PATTERN_DB_MIN_MATCHES,
                 smoothing=PATTERN_DB_SMOOTHING,
-                b_prior=float(_bp_prior_probs()[0]),
+                b_prior=0.5,
             )
         return _PATTERN_DB_CLIENT
 
@@ -1517,6 +1550,12 @@ def _pattern_db_probs(history: Sequence[str]) -> Tuple[np.ndarray, str, bool, Di
             "matches": int(lookup.matches),
             "b_count": int(lookup.b_count),
             "p_count": int(lookup.p_count),
+            "continue_count": int(getattr(lookup, "continue_count", 0)),
+            "switch_count": int(getattr(lookup, "switch_count", 0)),
+            "continue_prob": round(float(getattr(lookup, "continue_prob", 0.5)), 6),
+            "switch_prob": round(float(getattr(lookup, "switch_prob", 0.5)), 6),
+            "last_side": str(getattr(lookup, "last_side", "")),
+            "shape_context": str(getattr(lookup, "shape_context", lookup.context)),
             "bp_probs": _to_prob_dict(probs, digits=6),
         }
         return probs, lookup.status, bool(lookup.available), info
@@ -1589,13 +1628,16 @@ def _run_lengths(bp: Sequence[str]) -> List[int]:
 def _regime_vector(sequence: Sequence[str]) -> np.ndarray:
     bp = [item for item in sequence if item in BP_TO_INDEX]
     if not bp:
-        return np.asarray([0.5, 0.5, 0.0], dtype=np.float64)
-    b_share = sum(item == "B" for item in bp) / len(bp)
+        return np.asarray([0.5, 0.2, 0.0], dtype=np.float64)
     switch = _switch_rate(bp)
     lengths = _run_lengths(bp)
     mean_run = float(np.mean(lengths)) if lengths else 1.0
-    mean_run_scaled = min(1.0, mean_run / 5.0)
-    return np.asarray([b_share, switch, mean_run_scaled], dtype=np.float64)
+    run_std = float(np.std(lengths)) if lengths else 0.0
+    return np.asarray([
+        switch,
+        min(1.0, mean_run / 5.0),
+        min(1.0, run_std / 4.0),
+    ], dtype=np.float64)
 
 
 def _regime_score_at(history: Sequence[str], end: int) -> float:
@@ -1605,7 +1647,7 @@ def _regime_score_at(history: Sequence[str], end: int) -> float:
     short = _regime_vector(prefix[-REGIME_SHORT_WINDOW:])
     long = _regime_vector(prefix[-REGIME_LONG_WINDOW:])
     diff = np.abs(short - long)
-    return float(diff[0] * 0.40 + diff[1] * 0.35 + diff[2] * 0.25)
+    return float(diff[0] * 0.45 + diff[1] * 0.35 + diff[2] * 0.20)
 
 
 def _regime_change_info(history: Sequence[str]) -> Dict[str, Any]:
@@ -1801,9 +1843,9 @@ def _deepseek_probs(
         "task": "baccarat_next_banker_or_player_probability",
         "classes": ["B", "P"],
         "instruction": (
-            "Return next non-tie direction probabilities for B and P only. "
-            "A tie in history is context, not a target. Do not return betting advice. "
-            "B and P probabilities must sum to 1."
+            "Analyze only road shape: continuation versus transition, run lengths, chop rhythm, "
+            "and regime change. Do not use which side has appeared more often as a reason. "
+            "Return next non-tie B and P probabilities only; probabilities must sum to 1."
         ),
         "user_id": user_id,
         "venue": venue,
@@ -2149,7 +2191,7 @@ def predict(
 
         result: Dict[str, Any] = {
             "ok": True,
-            "engine": "LSTM_BP_PATTERN_DB_MC_DEEPSEEK",
+            "engine": "LSTM_SHAPE_PATTERN_DB_MC_DEEPSEEK",
             "predict_engine_env": PREDICT_ENGINE,
             "user_id": uid,
             "uid_isolated": bool(PER_UID_MODELS and uid),
@@ -2172,7 +2214,7 @@ def predict(
             "confidence_pct": round(confidence * 100.0, 1),
             "decision_edge": round(edge, 6),
             "signal_level": signal_level,
-            "pattern_label": "千萬筆規律資料庫＋B/P LSTM＋跨靴記憶＋Replay＋MC",
+            "pattern_label": "牌路形狀資料庫＋延續/轉折LSTM＋跨靴記憶＋Replay＋MC",
             "regime": phase,
             "ngram_label": "",
             "ngram_sample": 0,
@@ -2236,7 +2278,7 @@ def predict(
             "live_walk_forward_performance": {},
             "ask_road_memory": {},
             "walk_forward_enabled": True,
-            "direction_core": "LSTM_BP_GLOBAL_LOCAL_REGIME",
+            "direction_core": "LSTM_SHAPE_CONTINUE_SWITCH_REGIME",
             "direction_locked": False,
             "reason": reason,
             "configured_weights": {
@@ -2370,7 +2412,7 @@ def predict(
         return {
             "ok": False,
             "error": str(exc),
-            "engine": "LSTM_BP_PATTERN_DB_MC_DEEPSEEK",
+            "engine": "LSTM_SHAPE_PATTERN_DB_MC_DEEPSEEK",
             "user_id": uid,
             "venue": venue,
             "room": room,
