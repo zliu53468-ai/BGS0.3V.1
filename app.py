@@ -1,4 +1,4 @@
-"""LINE point-input baccarat bot.
+"""LINE point-input baccarat bot for V5 independent point prediction.
 
 Operation flow
 --------------
@@ -8,7 +8,8 @@ Operation flow
 4. Enter two digits directly in chat, e.g. 65:
       first digit  = Player point
       second digit = Banker point
-5. The bot immediately stores the observation and predicts the next hand.
+5. The bot stores the observation for display/statistics, but V5 prediction
+   uses only the newest point observation.
 6. The result panel only keeps the End Analysis button.
 7. Enter the next two-digit point result directly in chat to continue.
 
@@ -37,7 +38,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 import store
-from predictor import predict, parse_point_observation, reset_uid_model
+from predictor import predict, parse_point_observation
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -91,8 +92,8 @@ TEMP_CODES = {
 ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 app = FastAPI(
-    title="Baccarat Point Particle Filter Bot",
-    version="1.1.0",
+    title="Baccarat V5 Independent Point Bot",
+    version="5.0.0",
 )
 
 
@@ -403,7 +404,6 @@ def parse_chat_point_observation(
     """
     value = str(text or "").strip()
 
-    # Exactly two digits: first Player, second Banker.
     if re.fullmatch(r"\d{2}", value):
         return {
             "player": int(value[0]),
@@ -421,7 +421,7 @@ def parse_chat_point_observation(
 def venue_panel(user_id: str) -> Dict[str, Any]:
     user_status = status(user_id)
     return flex(
-        "AI 點數粒子模型",
+        "AI 點數粒子模型 V5",
         (
             f"UID權限：{user_status['label']}"
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n"
@@ -462,7 +462,8 @@ def ready_panel(
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
             "請直接在聊天室輸入兩位數：\n"
             "例如 65＝閒6點、莊5點。\n\n"
-            "輸入後會立即分析下一局，不必再按按鈕。"
+            "V5 每次只使用本次最新點數，"
+            "不沿用上一筆點數或上一局粒子狀態。"
         ),
         [
             action(
@@ -473,6 +474,15 @@ def ready_panel(
     )
 
 
+def _decision_source_text(value: Any) -> str:
+    source = str(value or "")
+    if source == "VALIDATED_MODEL":
+        return "驗證模型"
+    if source == "LOW_CONFIDENCE_BALANCED":
+        return "低信心平衡"
+    return source or "V5模型"
+
+
 def result_panel(
     user_id: str,
     session: Dict[str, Any],
@@ -480,24 +490,26 @@ def result_panel(
     prediction = session.get("last_prediction") or {}
     observations = session.get("observations") or []
     user_status = status(user_id)
+    source_text = _decision_source_text(
+        prediction.get("decision_source")
+    )
 
     body = (
-        f"第 {len(observations) + 1} 局\n"
+        f"本次第 {len(observations)} 次獨立分析\n"
         f"莊 {prediction.get('banker_rate', 0):.1f}%\n"
         f"閒 {prediction.get('player_rate', 0):.1f}%\n"
         f"和 {prediction.get('tie_rate', 0):.1f}%\n\n"
         f"推薦：{prediction.get('recommend_text', '-')}\n"
-        f"{prediction.get('signal_level', '')}"
-        f"｜{prediction.get('reason', '')}\n\n"
+        f"訊號：{prediction.get('signal_level', '-')}\n"
+        f"來源：{source_text}\n\n"
         f"UID權限：{user_status['label']}"
         f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-        "請直接輸入下一局點數，例如：65\n"
-        "第一位是閒點，第二位是莊點。"
+        "請直接輸入下一組點數，例如：65\n"
+        "每次分析完全獨立，不沿用上一筆點數。"
     )
 
-    # Per user request, the result panel keeps only End Analysis.
     return flex(
-        "下一局點數模擬",
+        "V5 下一局點數模擬",
         body,
         [
             action(
@@ -510,10 +522,8 @@ def result_panel(
 
 def ended_panel() -> Dict[str, Any]:
     return flex(
-        "本靴分析已結束",
-        (
-            "需要下一靴時，請輸入「開始分析」。"
-        ),
+        "本次分析已結束",
+        "需要再次分析時，請輸入「開始分析」。",
     )
 
 
@@ -561,31 +571,24 @@ def expired_panel() -> Dict[str, Any]:
 def predict_session(
     user_id: str,
 ) -> Dict[str, Any]:
+    """Return the last stored V5 prediction without running the model again."""
     session = (
         store.get_session(user_id)
         or store.new_session(user_id)
     )
     ensure(user_id)
 
-    prediction = predict(
-        session.get("observations") or [],
-        venue=session.get("venue", ""),
-        room=session.get("room", ""),
-        shoe_id=session.get("shoe_id", ""),
-        user_id=user_id,
-    )
+    if not session.get("last_prediction"):
+        raise ValueError("尚未輸入點數，請先輸入例如：65")
 
-    session["last_prediction"] = prediction
-    return store.upsert_session(
-        user_id,
-        session,
-    )
+    return session
 
 
 def add_points_and_predict(
     user_id: str,
     observation: Dict[str, int],
 ) -> Dict[str, Any]:
+    """Store the point for UI/statistics, but pass only this point to V5."""
     ensure(user_id)
 
     session = store.add_point_observation(
@@ -595,12 +598,19 @@ def add_points_and_predict(
     )
 
     prediction = predict(
-        session.get("observations") or [],
+        [observation],
         venue=session.get("venue", ""),
         room=session.get("room", ""),
         shoe_id=session.get("shoe_id", ""),
         user_id=user_id,
     )
+
+    if not prediction.get("ok"):
+        raise ValueError(
+            prediction.get("message")
+            or prediction.get("error")
+            or "V5預測失敗"
+        )
 
     session["last_prediction"] = prediction
     return store.upsert_session(
@@ -630,7 +640,8 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "point-pf-1.1",
+            "version": "v5-independent-point-line",
+            "engine": "V5_INDEPENDENT_POINT_PF_LINE",
         }
     )
 
@@ -706,7 +717,6 @@ async def webhook(
                     or store.new_session(user_id)
                 )
 
-                # After venue selection, the next ordinary text is the room.
                 if (
                     session.get("venue")
                     and not session.get("room")
@@ -778,6 +788,11 @@ async def webhook(
                             token,
                             [expired_panel()],
                         )
+                    except ValueError as exception:
+                        reply(
+                            token,
+                            [text_message(str(exception))],
+                        )
                     continue
 
                 if text in {
@@ -823,6 +838,9 @@ async def webhook(
                         {
                             "venue": query.get("venue", ""),
                             "room": "",
+                            "shoe_id": "",
+                            "observations": [],
+                            "last_prediction": None,
                         }
                     )
                     store.upsert_session(
