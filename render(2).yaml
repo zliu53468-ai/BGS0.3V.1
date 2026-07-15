@@ -1,0 +1,80 @@
+services:
+  - type: web
+    name: v5-1-6-500p-line-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: ACTIVATION_CODES
+        sync: false
+      - key: ADMIN_LINE_ID
+        value: "@jins888"
+      - key: ADMIN_LINE_URL
+        value: https://line.me/R/ti/p/%40jins888
+      - key: TRIAL_MINUTES
+        value: "30"
+      - key: RESULT_DELIVERY_MODE
+        value: push
+      - key: PREDICT_WORKERS
+        value: "2"
+      - key: ALLOW_UNSIGNED_WEBHOOK
+        value: "0"
+      - key: PF_DECKS
+        value: "8"
+      - key: PF_PARTICLES
+        value: "500"
+      - key: PF_REPLICAS
+        value: "5"
+      - key: PF_TARGET_MATCHES
+        value: "320"
+      - key: PF_TARGET_ESS
+        value: "210"
+      - key: PF_MIN_MATCHES
+        value: "40"
+      - key: PF_MAX_UPDATE_PROPOSALS
+        value: "45000"
+      - key: PF_DRAW_PATH_TARGET_MATCHES
+        value: "16"
+      - key: PF_DRAW_PATH_MIN_MATCHES
+        value: "5"
+      - key: PF_DRAW_PATH_MIN_ESS
+        value: "3"
+      - key: PF_MIN_DRAW_PATH_COVERAGE
+        value: "0.80"
+      - key: PF_DRAW_PATH_UNCERTAINTY
+        value: "0.40"
+      - key: PF_PREDICT_SIMULATIONS_PER_REPLICA
+        value: "600"
+      - key: PF_POINT_JOINT_SIMULATIONS_PER_REPLICA
+        value: "600"
+      - key: PF_SPLIT_UNCERTAINTY
+        value: "0.50"
+      - key: PF_MIN_EFFECTIVE_REPLICAS
+        value: "3.5"
+      - key: PF_ADAPTIVE_REPLICA_WEIGHT
+        value: "1"
+      - key: PF_DATABASE_WEIGHT
+        value: "0"
+      - key: PF_DATABASE_VALIDATION_MODE
+        value: diagnostic
+      - key: PF_DECISION_MODE
+        value: validated
+      - key: PF_UNCERTAINTY_PENALTY
+        value: "1.28"
+      - key: PF_MIN_VALIDATED_EDGE
+        value: "0.0012"
+      - key: PF_MIN_REPLICA_AGREEMENT
+        value: "0.71"
+      - key: PF_RANDOMIZE_EACH_CALL
+        value: "1"
