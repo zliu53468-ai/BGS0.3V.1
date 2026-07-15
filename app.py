@@ -483,12 +483,30 @@ def _decision_source_text(value: Any) -> str:
     return source or "V5模型"
 
 
+def _stored_prediction(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Read prediction data from the new store.py, with legacy fallback."""
+    return (
+        session.get("pending_prediction")
+        or session.get("last_prediction")
+        or {}
+    )
+
+
+def _stored_points(session: Dict[str, Any]) -> List[Any]:
+    """Read point history from the new store.py, with legacy fallback."""
+    return (
+        session.get("point_history")
+        or session.get("observations")
+        or []
+    )
+
+
 def result_panel(
     user_id: str,
     session: Dict[str, Any],
 ) -> Dict[str, Any]:
-    prediction = session.get("last_prediction") or {}
-    observations = session.get("observations") or []
+    prediction = _stored_prediction(session)
+    observations = _stored_points(session)
     user_status = status(user_id)
     source_text = _decision_source_text(
         prediction.get("decision_source")
@@ -572,13 +590,10 @@ def predict_session(
     user_id: str,
 ) -> Dict[str, Any]:
     """Return the last stored V5 prediction without running the model again."""
-    session = (
-        store.get_session(user_id)
-        or store.new_session(user_id)
-    )
+    session = store.get_session(user_id)
     ensure(user_id)
 
-    if not session.get("last_prediction"):
+    if not _stored_prediction(session):
         raise ValueError("尚未輸入點數，請先輸入例如：65")
 
     return session
@@ -588,13 +603,16 @@ def add_points_and_predict(
     user_id: str,
     observation: Dict[str, int],
 ) -> Dict[str, Any]:
-    """Store the point for UI/statistics, but pass only this point to V5."""
+    """Store/settle through the new store.py, while V5 uses only this point."""
     ensure(user_id)
 
-    session = store.add_point_observation(
+    point = (
+        f"{int(observation['player']) % 10}"
+        f"{int(observation['banker']) % 10}"
+    )
+    session = store.record_point_and_settle(
         user_id,
-        observation["player"],
-        observation["banker"],
+        point,
     )
 
     prediction = predict(
@@ -612,10 +630,9 @@ def add_points_and_predict(
             or "V5預測失敗"
         )
 
-    session["last_prediction"] = prediction
-    return store.upsert_session(
+    return store.save_prediction(
         user_id,
-        session,
+        prediction,
     )
 
 
@@ -712,10 +729,7 @@ async def webhook(
                     )
                     continue
 
-                session = (
-                    store.get_session(user_id)
-                    or store.new_session(user_id)
-                )
+                session = store.get_session(user_id)
 
                 if (
                     session.get("venue")
@@ -830,17 +844,15 @@ async def webhook(
                 action_name = query.get("action")
 
                 if action_name == "venue":
-                    session = (
-                        store.get_session(user_id)
-                        or store.new_session(user_id)
-                    )
+                    session = store.start_session(user_id)
                     session.update(
                         {
                             "venue": query.get("venue", ""),
                             "room": "",
                             "shoe_id": "",
-                            "observations": [],
-                            "last_prediction": None,
+                            "point_history": [],
+                            "pending_prediction": {},
+                            "last_settlement": {},
                         }
                     )
                     store.upsert_session(
