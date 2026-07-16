@@ -1,4 +1,4 @@
-"""V5.6 1000-particle database-candidate revalidation baccarat engine.
+"""V5.7 1000-particle EV-direction database-candidate revalidation baccarat engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
@@ -127,9 +127,9 @@ BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.72, 0.0, 1.0)
 PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.50, 0.0, 1.0)
 PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 40, 4, 10000)
 
-# V5.6 database-assisted candidate point generation. The existing 5M database
+# V5.7 database-assisted candidate point generation. The existing 5M database
 # stores outcome and legal draw-path aggregates by remaining-shoe state. It does
-# not contain a native 00-99 matrix, so V5.6 uses those aggregates as priors to
+# not contain a native 00-99 matrix, so V5.7 uses those aggregates as priors to
 # re-rank particle-generated point candidates, then validates them with a second
 # independent simulation stream.
 DB_CANDIDATE_ENABLED = _env_bool("PF_DB_CANDIDATE_ENABLED", True)
@@ -227,6 +227,7 @@ class ReplicaResult:
     database_draw_paths: np.ndarray
     top_points: List[Dict[str, Any]]
     paired_center: float
+    relative_control_center: float
     split_centers: Tuple[float, float]
     split_agreement: float
     split_disagreement: float
@@ -515,9 +516,22 @@ def _outcome_index(outcome: str) -> int:
 
 
 def _center(conditioned: Sequence[float], control: Sequence[float]) -> float:
+    """Relative conditioned-vs-control diagnostic; never chooses the final side."""
     cp = normalize_array(conditioned, BASELINE)
     up = normalize_array(control, BASELINE)
     return float((cp[0] - up[0]) - (cp[1] - up[1]))
+
+
+def _decision_score(probabilities: Sequence[float], commission: float) -> float:
+    """Banker EV minus Player EV from the final B/P/T distribution.
+
+    Positive selects Banker; negative selects Player. Ties are pushes for both
+    wagers and therefore cancel from this directional comparison.
+    """
+    probs = normalize_array(probabilities, BASELINE)
+    banker_ev = float(probs[0] * (1.0 - commission) - probs[1])
+    player_ev = float(probs[1] - probs[0])
+    return banker_ev - player_ev
 
 
 def _composition(particles: Sequence[np.ndarray], decks: int) -> Dict[str, Any]:
@@ -853,9 +867,10 @@ class V5ReplicaEngine:
             normalize_array(split_u[0], BASELINE),
             normalize_array(split_u[1], BASELINE),
         )
+        commission = float(settings["banker_commission"])
         split_centers = (
-            _center(split_c[0], split_u[0]),
-            _center(split_c[1], split_u[1]),
+            _decision_score(split_c[0], commission),
+            _decision_score(split_c[1], commission),
         )
         split_agreement = 1.0 if (split_centers[0] >= 0) == (split_centers[1] >= 0) else 0.0
         split_disagreement = abs(split_centers[0] - split_centers[1])
@@ -865,9 +880,9 @@ class V5ReplicaEngine:
         for path in range(4):
             path_n = float(path_outcome_c[path].sum())
             if path_n >= float(settings["path_min_samples_for_signal"]):
-                next_path_centers[path] = _center(
+                next_path_centers[path] = _decision_score(
                     path_outcome_c[path],
-                    path_outcome_u[path],
+                    commission,
                 )
         positive_mass = negative_mass = decisive_mass = 0.0
         for path in range(4):
@@ -886,7 +901,7 @@ class V5ReplicaEngine:
             else:
                 negative_mass += mass
         draw_agreement = max(positive_mass, negative_mass) / decisive_mass if decisive_mass else 0.5
-        base_paired_center = _center(conditioned, control)
+        base_paired_center = _decision_score(conditioned, commission)
         current_centers = np.zeros(4, dtype=float)
         current_directions = ["—"] * 4
         cp_positive = cp_negative = cp_decisive = 0.0
@@ -896,7 +911,7 @@ class V5ReplicaEngine:
             mass = n / max(1.0, samples)
             if n < 8:
                 continue
-            value = _center(current_path_c[path], current_path_u[path])
+            value = _decision_score(current_path_c[path], commission)
             current_centers[path] = value
             current_directions[path] = "B" if value >= 0 else "P"
             cp_decisive += mass
@@ -1007,14 +1022,15 @@ class V5ReplicaEngine:
         )
 
         # Convert the final point distribution into B/P/T probabilities. This is
-        # the V5.6 decision distribution; it is no longer just a diagnostic list.
+        # the V5.7 decision distribution; it is no longer just a diagnostic list.
         candidate_outcomes = np.zeros(3, dtype=float)
         for idx, probability in enumerate(matrix):
             candidate_outcomes[_point_outcome_index(idx)] += float(probability)
         pf = normalize_array(candidate_outcomes, BASELINE)
         control_probs = normalize_array(control, BASELINE)
         fused = pf.copy()
-        paired_center = _center(fused, control_probs)
+        relative_control_center = _center(fused, control_probs)
+        paired_center = _decision_score(fused, float(settings["banker_commission"]))
 
         top_idx = np.argsort(matrix)[::-1][:10]
         top_points = []
@@ -1066,6 +1082,7 @@ class V5ReplicaEngine:
             database_draw_paths=db_draw,
             top_points=top_points,
             paired_center=paired_center,
+            relative_control_center=relative_control_center,
             split_centers=split_centers,
             split_agreement=split_agreement,
             split_disagreement=split_disagreement,
@@ -1179,15 +1196,15 @@ def _apply_robust_weights(rows: Sequence[ReplicaResult], enabled: bool) -> Tuple
 
 
 def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str, Any]:
-    centered = float((fused[0] - BASELINE[0]) - (fused[1] - BASELINE[1]))
     banker_ev = float(fused[0] * (1.0 - commission) - fused[1])
     player_ev = float(fused[1] - fused[0])
+    centered = banker_ev - player_ev
     if mode == "raw":
         side, reason = ("B" if fused[0] >= fused[1] else "P"), "原始最大機率"
     elif mode == "ev":
         side, reason = ("B" if banker_ev >= player_ev else "P"), "抽水後EV"
     else:
-        side, reason = ("B" if centered >= 0 else "P"), "相對基準偏移"
+        side, reason = ("B" if centered >= 0 else "P"), "融合機率抽水後EV"
     edge = abs(centered)
     return {
         "recommend": side,
@@ -1271,8 +1288,9 @@ def decide_ensemble(
     robust = 0.50 * mean + 0.50 * med
     lower = max(0.0, abs(robust) - float(settings["uncertainty_penalty"]) * se)
     model_side = "B" if robust >= 0 else "P"
-    global_center = _center(fused, control)
-    direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
+    decision_center = _decision_score(fused, commission)
+    relative_control_center = _center(fused, control)
+    direction_consistency = abs(decision_center) < 1e-12 or (decision_center >= 0) == (robust >= 0)
     updated_ratio = sum(
         1 for row in rows if row.updated and row.ancestry_paired
     ) / max(1, len(rows))
@@ -1327,23 +1345,23 @@ def decide_ensemble(
         decision_tier = "STRICT"
         signal = "HIGH" if lower >= 0.005 else "MEDIUM"
         edge = lower
-        reason = "補牌路徑分層、統一配對樣本池與穩健誤差修正後通過正式品質閘門"
+        reason = "資料庫候選、補牌二次驗證與抽水後EV方向通過正式品質閘門"
     elif general_quality_pass:
         recommend = model_side
         decision_source = "LOW_CONFIDENCE_BALANCED"
         decision_tier = "GENERAL"
         signal = "LOW"
         edge = abs(robust)
-        reason = "通過一般品質閘門；保留方向但未標示為正式驗證訊號"
+        reason = "通過一般品質閘門；依融合後抽水EV保留方向"
     else:
-        # V5.5 always returns the 1000-particle path-conditioned direction. Quality remains visible
+        # V5.7 always returns the 1000-particle EV-selected direction. Quality remains visible
         # as FALLBACK, but path disagreement no longer suppresses the result.
         recommend = model_side
         decision_source = "DRAW_PATH_FUSION"
         decision_tier = "FALLBACK"
         signal = "LOW"
         edge = abs(robust)
-        reason = "未通過正式品質閘門；改用當局與下一局四種補牌路徑融合方向"
+        reason = "未通過正式品質閘門；仍依資料庫候選與補牌再驗證後的抽水EV方向"
 
     return {
         "recommend": recommend,
@@ -1368,6 +1386,8 @@ def decide_ensemble(
         "decision_source": decision_source,
         "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
         "player_ev": float(fused[1] - fused[0]),
+        "decision_center": decision_center,
+        "relative_control_center": relative_control_center,
         "fallback_score": robust,
         "effective_replicas": effective_replicas,
         "direction_consistency": direction_consistency,
