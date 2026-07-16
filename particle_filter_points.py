@@ -1,4 +1,4 @@
-"""V5.4 draw-path-fusion point-conditioned baccarat particle engine.
+"""V5.5 1000-particle draw-path-conditioned baccarat particle engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
@@ -50,19 +50,19 @@ def _env_choice(name: str, default: str, allowed: Sequence[str]) -> str:
 
 
 DECKS = _env_int("PF_DECKS", 8, 1, 16)
-PARTICLE_COUNT = _env_int("PF_PARTICLES", 500, 64, 1000)
+PARTICLE_COUNT = _env_int("PF_PARTICLES", 1000, 64, 2000)
 REPLICA_COUNT = _env_int("PF_REPLICAS", 5, 3, 11)
-TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 320, 32, 4000)
-TARGET_ESS = _env_float("PF_TARGET_ESS", 210.0, 8.0, 4000.0)
-MIN_MATCHES = _env_int("PF_MIN_MATCHES", 40, 1, 4000)
-MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 45_000, 500, 500_000)
-PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 16, 4, 256)
-PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 5, 1, 128)
-PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 3.0, 1.0, 128.0)
+TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 520, 32, 8000)
+TARGET_ESS = _env_float("PF_TARGET_ESS", 360.0, 8.0, 8000.0)
+MIN_MATCHES = _env_int("PF_MIN_MATCHES", 80, 1, 8000)
+MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 60_000, 500, 750_000)
+PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 32, 4, 512)
+PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 10, 1, 256)
+PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 6.0, 1.0, 256.0)
 MIN_PATH_COVERAGE = _env_float("PF_MIN_DRAW_PATH_COVERAGE", 0.80, 0.0, 1.0)
 PATH_UNCERTAINTY = _env_float("PF_DRAW_PATH_UNCERTAINTY", 0.40, 0.0, 2.0)
-PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
-POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
+PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 1000, 100, 200_000)
+POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 1000, 100, 200_000)
 SPLIT_UNCERTAINTY = _env_float("PF_SPLIT_UNCERTAINTY", 0.50, 0.0, 2.0)
 MIN_EFFECTIVE_REPLICAS = _env_float("PF_MIN_EFFECTIVE_REPLICAS", 3.5, 1.0, 11.0)
 ADAPTIVE_REPLICA_WEIGHT = _env_bool("PF_ADAPTIVE_REPLICA_WEIGHT", True)
@@ -82,15 +82,15 @@ DECISION_MODE = _env_choice("PF_DECISION_MODE", "validated", ("validated", "cent
 FAST_MODE = _env_bool("PF_FAST_MODE", True)
 CACHE_STRATIFIED_PRIORS = _env_bool("PF_CACHE_STRATIFIED_PRIORS", True)
 SKIP_UNUSED_DB_DIAGNOSTICS = _env_bool("PF_SKIP_UNUSED_DB_DIAGNOSTICS", True)
-FORECAST_SAMPLE_CAP = _env_int("PF_FORECAST_SAMPLE_CAP", 1000, 200, 200_000)
-FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 500, 64, 1000)
-FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 180, 32, 4000)
-FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 120.0, 8.0, 4000.0)
+FORECAST_SAMPLE_CAP = _env_int("PF_FORECAST_SAMPLE_CAP", 2000, 200, 400_000)
+FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 1000, 64, 2000)
+FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 420, 32, 8000)
+FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 300.0, 8.0, 8000.0)
 FAST_MAX_UPDATE_PROPOSALS = _env_int(
-    "PF_FAST_MAX_UPDATE_PROPOSALS", 10_000, 500, 500_000
+    "PF_FAST_MAX_UPDATE_PROPOSALS", 40_000, 500, 750_000
 )
 FAST_PATH_TARGET_MATCHES_CAP = _env_int(
-    "PF_FAST_PATH_TARGET_MATCHES_CAP", 10, 4, 256
+    "PF_FAST_PATH_TARGET_MATCHES_CAP", 24, 4, 512
 )
 
 # Three-level decision gate. V5.3 deliberately restores meaningful general
@@ -121,11 +121,11 @@ GENERAL_REQUIRE_DIRECTION_CONSISTENCY = _env_bool(
 # V5.4 directly fuses the observed-hand draw-path posterior and the simulated
 # next-hand draw-path-specific outcome effect into the final direction. These
 # are predictive weights, not observe gates.
-CURRENT_PATH_SIGNAL_WEIGHT = _env_float("PF_CURRENT_PATH_SIGNAL_WEIGHT", 0.28, 0.0, 0.75)
-NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.34, 0.0, 0.75)
-BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.38, 0.0, 1.0)
-PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.72, 0.0, 1.0)
-PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 12, 4, 5000)
+CURRENT_PATH_SIGNAL_WEIGHT = _env_float("PF_CURRENT_PATH_SIGNAL_WEIGHT", 0.0, 0.0, 0.75)
+NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.28, 0.0, 0.75)
+BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.72, 0.0, 1.0)
+PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.50, 0.0, 1.0)
+PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 40, 4, 10000)
 
 _PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
 _PRIOR_CACHE_LOCK = threading.RLock()
@@ -1129,11 +1129,10 @@ def decide_ensemble(
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
 
-    # Fuse three complementary signals per replica:
-    # 1) overall conditioned-vs-control effect,
-    # 2) posterior-weighted effect of how the observed hand was completed,
-    # 3) probability-weighted effect of the next hand's four draw paths.
-    # Sparse path effects are shrunk rather than used as a hard observe gate.
+    # Fuse the full next-hand simulation with a reliability-shrunk next-draw-path signal:
+    # The observed-hand draw path already conditions/resamples the particle population,
+    # so it is not counted a second time as a direct directional vote. The next-hand
+    # path layer remains a modest auxiliary signal to avoid double-counting.
     base_w = float(settings["base_signal_weight"])
     current_w = float(settings["current_path_signal_weight"])
     next_w = float(settings["next_path_signal_weight"])
@@ -1235,7 +1234,7 @@ def decide_ensemble(
         edge = abs(robust)
         reason = "通過一般品質閘門；保留方向但未標示為正式驗證訊號"
     else:
-        # V5.4 always returns the path-fused direction. Quality remains visible
+        # V5.5 always returns the 1000-particle path-conditioned direction. Quality remains visible
         # as FALLBACK, but path disagreement no longer suppresses the result.
         recommend = model_side
         decision_source = "DRAW_PATH_FUSION"
