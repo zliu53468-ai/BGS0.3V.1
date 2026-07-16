@@ -1,4 +1,4 @@
-"""LINE-compatible V5.3 conservative multi-seed point predictor."""
+"""LINE-compatible V5.4 draw-path-fusion point predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -348,21 +348,15 @@ def predict(
         seed,
         latest.get("path"),
     )
-    validators: List[Dict[str, Any]] = []
-    # Do not spend two extra model runs on a point that already failed the main
-    # quality gate. Independent validators are only used to confirm an eligible
-    # primary signal, never to rescue an OBSERVE result.
-    if str(primary.get("recommend", "NONE")).upper() in {"B", "P"}:
-        for index in range(1, CONSENSUS_RUNS):
-            validators.append(
-                _VALIDATOR_ENGINE.analyze(
-                    latest["player"],
-                    latest["banker"],
-                    mix_seed(seed, 10_000 + index),
-                    latest.get("path"),
-                )
-            )
-    result = _combine_master_seed_results(primary, validators)
+    # V5.4 no longer launches extra consensus models. The 500-particle primary
+    # run already fuses current-hand and next-hand draw-path effects, which is
+    # faster and guarantees one direction per request.
+    result = primary
+    result["master_seed_count"] = 1
+    result["master_seed_directions"] = [str(result.get("recommend", "B"))]
+    result["master_seed_agreement"] = 1.0
+    result["master_seed_consensus_pass"] = True
+    result["master_seed_minimum_edge"] = abs(float(result.get("center", 0.0)))
     probabilities = _probability_dict(result["fused"])
     pf_probabilities = _probability_dict(result["pf"])
     control_probabilities = _probability_dict(result["control"])
@@ -373,8 +367,8 @@ def predict(
     elif recommend == "P":
         recommend_text = "閒"
     else:
-        recommend = "NONE"
-        recommend_text = "觀望"
+        recommend = "B" if float(result.get("center", 0.0)) >= 0 else "P"
+        recommend_text = "莊" if recommend == "B" else "閒"
 
     confidence = max(probabilities["B"], probabilities["P"]) / max(
         1e-12,
@@ -384,8 +378,8 @@ def predict(
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": "V5_3_CONSERVATIVE_MULTI_SEED_POINT_PF_LINE",
-        "model_version": "V5.3-CONSERVATIVE-MULTI-SEED-20260717",
+        "engine": "V5_4_DRAW_PATH_FUSION_500P_LINE",
+        "model_version": "V5.4-DRAW-PATH-FUSION-500P-20260717",
         "user_id": user_id,
         "venue": venue,
         "room": room,
@@ -409,7 +403,7 @@ def predict(
         "shoe_database_probabilities": db_probabilities,
         "recommend": recommend,
         "recommend_text": recommend_text,
-        "is_observe": recommend == "NONE",
+        "is_observe": False,
         "confidence": round(confidence, 6),
         "confidence_pct": round(confidence * 100.0, 1),
         "decision_edge": round(float(result["edge"]), 8),
@@ -469,10 +463,10 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            "V5.3單局獨立粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
+            "V5.4單局獨立500粒子模型；只使用本次最新點數；當局與下一局四種合法補牌路徑直接融合；"
             f"每副本實際模擬總數約"
             f"{int(result['total_forecast_simulations']) // max(1, int(result['replicas']))}；"
-            "不使用歷史或牌路；採正式、一般、觀望三層品質判定，並加入多主種子共識驗證。"
+            "不使用歷史或牌路；品質層級只作標示，不再以觀望阻斷方向。"
             f"決策來源={result['decision_source']}；{result['reason']}。"
         ),
         "debug": None,
