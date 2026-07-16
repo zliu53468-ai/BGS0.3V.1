@@ -553,7 +553,13 @@ def result_panel(
 def ended_panel() -> Dict[str, Any]:
     return flex(
         "本次分析已結束",
-        "需要再次分析時，請輸入「開始分析」。",
+        "需要再次分析時，請點擊下方「開始分析」。",
+        [
+            action(
+                "開始分析",
+                "start",
+            )
+        ],
     )
 
 
@@ -879,6 +885,12 @@ async def webhook(
                                 query.get("venue", "")
                             )
                         ],
+                    )
+
+                elif action_name == "start":
+                    reply(
+                        token,
+                        [venue_panel(user_id)],
                     )
 
                 elif action_name == "end":
