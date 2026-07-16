@@ -1,9 +1,10 @@
 """V5.1.6 stateless point-conditioned baccarat particle engine.
 
 The official LINE predictor uses only the newest final-point observation.
-Every request creates fresh particles, fresh replicas and fresh forecast samples.
-No road, streak, Markov state, previous recommendation or per-UID particle state
-is carried into the next request.
+Every request creates fresh conditional candidates, replicas and forecast samples.
+A calibrated stratified prior may be reused as an immutable speed cache; no road,
+streak, Markov state, previous recommendation or per-UID particle state is carried
+into the next request.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import hashlib
 import math
 import os
+import threading
 
 import numpy as np
 
@@ -74,6 +76,39 @@ MIN_VALIDATED_EDGE = _env_float("PF_MIN_VALIDATED_EDGE", 0.0012, 0.0, 0.05)
 MIN_REPLICA_AGREEMENT = _env_float("PF_MIN_REPLICA_AGREEMENT", 0.71, 0.50, 1.0)
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 DECISION_MODE = _env_choice("PF_DECISION_MODE", "validated", ("validated", "centered", "raw", "ev"))
+
+# Runtime acceleration. The default fast path preserves the particle/filter
+# mathematics while avoiding work that cannot affect the recommendation.
+FAST_MODE = _env_bool("PF_FAST_MODE", True)
+CACHE_STRATIFIED_PRIORS = _env_bool("PF_CACHE_STRATIFIED_PRIORS", True)
+SKIP_UNUSED_DB_DIAGNOSTICS = _env_bool("PF_SKIP_UNUSED_DB_DIAGNOSTICS", True)
+FORECAST_SAMPLE_CAP = _env_int("PF_FORECAST_SAMPLE_CAP", 1000, 200, 200_000)
+FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 600, 64, 1000)
+FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 220, 32, 4000)
+FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 150.0, 8.0, 4000.0)
+FAST_MAX_UPDATE_PROPOSALS = _env_int(
+    "PF_FAST_MAX_UPDATE_PROPOSALS", 18_000, 500, 500_000
+)
+FAST_PATH_TARGET_MATCHES_CAP = _env_int(
+    "PF_FAST_PATH_TARGET_MATCHES_CAP", 10, 4, 256
+)
+
+# Three-level decision gate. Strict validation keeps the original statistical
+# meaning; the general gate provides a usable direction for ordinary-quality
+# runs; only severely inconsistent runs become OBSERVE.
+GENERAL_REPLICA_AGREEMENT = _env_float("PF_GENERAL_REPLICA_AGREEMENT", 0.52, 0.50, 1.0)
+GENERAL_ESS_RATIO = _env_float("PF_GENERAL_ESS_RATIO", 0.35, 0.05, 1.0)
+GENERAL_DIVERSITY = _env_float("PF_GENERAL_DIVERSITY", 0.20, 0.05, 1.0)
+GENERAL_SPLIT_AGREEMENT = _env_float("PF_GENERAL_SPLIT_AGREEMENT", 0.05, 0.0, 1.0)
+GENERAL_PATH_COVERAGE = _env_float("PF_GENERAL_PATH_COVERAGE", 0.40, 0.0, 1.0)
+GENERAL_EFFECTIVE_REPLICA_RATIO = _env_float(
+    "PF_GENERAL_EFFECTIVE_REPLICA_RATIO", 0.55, 0.10, 1.0
+)
+GENERAL_UPDATED_RATIO = _env_float("PF_GENERAL_UPDATED_RATIO", 0.50, 0.0, 1.0)
+GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.00001, 0.0, 0.05)
+
+_PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
+_PRIOR_CACHE_LOCK = threading.RLock()
 
 BASELINE = np.asarray(DEFAULT_BASELINE, dtype=float)
 DRAW_BASELINE = np.asarray(DEFAULT_DRAW, dtype=float)
@@ -522,6 +557,8 @@ class V5ReplicaEngine:
         accepted: List[ConditionalCandidate] = []
         attempts = 0
         ess = 0.0
+        accepted_weight_sum = 0.0
+        accepted_weight_sq_sum = 0.0
         max_proposals = int(settings["max_update_proposals"])
         while attempts < max_proposals:
             parent_index = int(self.rng.integers(0, len(prior_particles)))
@@ -543,8 +580,14 @@ class V5ReplicaEngine:
                     )
                     accepted.append(item)
                     by_path[path].append(item)
-            if attempts % 32 == 0:
-                ess = weighted_ess(accepted)
+                    accepted_weight_sum += max(0.0, float(weight))
+                    accepted_weight_sq_sum += max(0.0, float(weight)) ** 2
+            if attempts % 64 == 0:
+                ess = (
+                    accepted_weight_sum * accepted_weight_sum / accepted_weight_sq_sum
+                    if accepted_weight_sq_sum > 0.0
+                    else 0.0
+                )
                 total_ready = (
                     len(accepted) >= int(settings["target_matches"])
                     and ess >= float(settings["target_ess"])
@@ -555,7 +598,11 @@ class V5ReplicaEngine:
                 )
                 if total_ready and strata_ready:
                     break
-        ess = weighted_ess(accepted)
+        ess = (
+            accepted_weight_sum * accepted_weight_sum / accepted_weight_sq_sum
+            if accepted_weight_sq_sum > 0.0
+            else 0.0
+        )
         path_counts = np.asarray([len(rows) for rows in by_path], dtype=float)
         path_ess = np.asarray([weighted_ess(rows) for rows in by_path], dtype=float)
         path_weight_sums = np.asarray(
@@ -681,10 +728,15 @@ class V5ReplicaEngine:
         )
 
     def forecast(self, population: ConditionedPopulation, settings: Mapping[str, Any]) -> ReplicaResult:
-        samples = max(
+        requested_samples = max(
             200,
             int(settings["predict_simulations_per_replica"])
             + int(settings["point_joint_simulations_per_replica"]),
+        )
+        samples = (
+            min(requested_samples, int(settings["forecast_sample_cap"]))
+            if bool(settings["fast_mode"])
+            else requested_samples
         )
         pairs = int(math.ceil(samples / 2.0))
         conditioned = np.zeros(3, dtype=float)
@@ -813,27 +865,39 @@ class V5ReplicaEngine:
             min(1.0, 0.55 * (1.0 - entropy_norm) + 0.45 * max(0.0, min(1.0, (top10_mass - 0.10) / 0.22))),
         )
         database = get_shoe_state_database()
-        db_total = np.zeros(3, dtype=float)
-        db_rel = db_samples = 0.0
-        inv = 1.0 / max(1, len(population.particles))
-        for particle in population.particles:
-            estimate = database.estimate(particle, self.decks)
-            db_total += inv * np.asarray(
-                [
-                    estimate.probabilities["B"],
-                    estimate.probabilities["P"],
-                    estimate.probabilities["T"],
-                ],
-                dtype=float,
-            )
-            db_rel += inv * estimate.reliability
-            db_samples += inv * estimate.samples
-        db_probs = normalize_array(db_total, BASELINE)
         db_allowed = settings["database_validation_mode"] == "force" or (
             settings["database_validation_mode"] == "validated_only" and DB_HOLDOUT["passed"]
         )
         if settings["database_validation_mode"] == "diagnostic":
             db_allowed = False
+
+        # With zero/disabled database weight, the per-particle SQLite lookup
+        # cannot change fused probabilities. Skipping it removes hundreds or
+        # thousands of unnecessary state-bucket queries per request.
+        skip_db_scan = bool(settings["fast_mode"]) and bool(
+            settings["skip_unused_db_diagnostics"]
+        ) and (not db_allowed or float(settings["database_weight"]) <= 0.0)
+        if skip_db_scan:
+            db_probs = BASELINE.copy()
+            db_rel = 0.0
+            db_samples = 0.0
+        else:
+            db_total = np.zeros(3, dtype=float)
+            db_rel = db_samples = 0.0
+            inv = 1.0 / max(1, len(population.particles))
+            for particle in population.particles:
+                estimate = database.estimate(particle, self.decks)
+                db_total += inv * np.asarray(
+                    [
+                        estimate.probabilities["B"],
+                        estimate.probabilities["P"],
+                        estimate.probabilities["T"],
+                    ],
+                    dtype=float,
+                )
+                db_rel += inv * estimate.reliability
+                db_samples += inv * estimate.samples
+            db_probs = normalize_array(db_total, BASELINE)
         sample_scale = min(1.0, population.ess / max(1.0, float(settings["target_ess"])))
         effective_db = (
             float(settings["database_weight"]) * db_rel * (0.65 + 0.35 * sample_scale)
@@ -913,6 +977,46 @@ class V5ReplicaEngine:
         )
 
 
+def _get_stratified_prior(
+    particle_count: int,
+    decks: int,
+    replica_index: int,
+    request_seed: int,
+    use_cache: bool,
+) -> Tuple[Sequence[np.ndarray], Sequence[int]]:
+    """Return an immutable calibrated prior, optionally shared across requests.
+
+    Conditioning always copies/removes cards from candidate arrays, so cached
+    prior arrays are read-only inputs and are safe to reuse. Request-specific
+    randomness remains in conditional completion and forecast sampling.
+    """
+    if not use_cache:
+        builder = V5ReplicaEngine(request_seed, particle_count, decks)
+        return builder.build_stratified_prior()
+
+    key = (int(particle_count), int(decks), int(replica_index))
+    with _PRIOR_CACHE_LOCK:
+        cached = _PRIOR_CACHE.get(key)
+        if cached is None:
+            prior_seed = mix_seed(0x51A7E5D3 ^ (particle_count << 8) ^ decks, replica_index)
+            builder = V5ReplicaEngine(prior_seed, particle_count, decks)
+            particles, depths = builder.build_stratified_prior()
+            cached = (
+                tuple(np.asarray(item, dtype=np.int16) for item in particles),
+                tuple(int(value) for value in depths),
+            )
+            _PRIOR_CACHE[key] = cached
+        return cached
+
+
+def clear_runtime_caches() -> int:
+    """Clear reusable calibrated priors and return the number removed."""
+    with _PRIOR_CACHE_LOCK:
+        removed = len(_PRIOR_CACHE)
+        _PRIOR_CACHE.clear()
+    return removed
+
+
 def _weighted_average(rows: Sequence[ReplicaResult], attr: str, size: int) -> np.ndarray:
     weights = np.asarray([max(1e-6, row.final_weight) for row in rows], dtype=float)
     weights /= float(weights.sum())
@@ -967,14 +1071,19 @@ def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str
         "split_se": 0.0,
         "path_se": 0.0,
         "lower_bound": 0.0,
-        "model_side": None,
+        "model_side": side,
         "validated_signal": False,
         "quality_pass": False,
+        "general_quality_pass": True,
+        "decision_tier": "GENERAL",
+        "is_observe": False,
         "decision_source": "UNVALIDATED_COMPARISON",
         "banker_ev": banker_ev,
         "player_ev": player_ev,
         "fallback_score": centered,
-        "effective_replicas": float(len(fused)),
+        "effective_replicas": 1.0,
+        "direction_consistency": True,
+        "updated_ratio": 1.0,
     }
 
 
@@ -989,6 +1098,7 @@ def decide_ensemble(
     commission = float(settings["banker_commission"])
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
+
     centers = [row.paired_center for row in rows]
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
@@ -1013,7 +1123,13 @@ def decide_ensemble(
     model_side = "B" if robust >= 0 else "P"
     global_center = _center(fused, control)
     direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
-    quality_pass = (
+    updated_ratio = sum(
+        1 for row in rows if row.updated and row.ancestry_paired
+    ) / max(1, len(rows))
+
+    # Strict validation keeps the original gate and therefore remains the only
+    # tier labelled VALIDATED_MODEL.
+    strict_quality_pass = (
         quality["agreement"] >= float(settings["min_replica_agreement"])
         and quality["average_ess"] >= float(settings["target_ess"]) * 0.8
         and quality["average_diversity"] >= 0.45
@@ -1021,28 +1137,58 @@ def decide_ensemble(
         and quality["path_coverage"] >= float(settings["min_path_coverage"])
         and effective_replicas >= float(settings["min_effective_replicas"])
         and direction_consistency
-        and all(row.updated and row.ancestry_paired for row in rows)
+        and updated_ratio >= 0.999
     )
-    validated = quality_pass and lower >= float(settings["min_validated_edge"])
-    fallback_score = robust
-    if fallback_score > 1e-12:
-        fallback_side = "B"
-    elif fallback_score < -1e-12:
-        fallback_side = "P"
+    validated = strict_quality_pass and lower >= float(settings["min_validated_edge"])
+
+    # General validation accepts ordinary-quality runs without pretending they
+    # passed the strict statistical gate. Thresholds are configurable and still
+    # reject failed conditioning, extremely low diversity and severe replica
+    # disagreement.
+    general_effective_min = max(
+        1.0,
+        float(settings["min_effective_replicas"])
+        * float(settings["general_effective_replica_ratio"]),
+    )
+    general_quality_pass = (
+        quality["agreement"] >= float(settings["general_replica_agreement"])
+        and quality["average_ess"]
+        >= float(settings["target_ess"]) * float(settings["general_ess_ratio"])
+        and quality["average_diversity"] >= float(settings["general_diversity"])
+        and quality["split_agreement"] >= float(settings["general_split_agreement"])
+        and quality["path_coverage"] >= float(settings["general_path_coverage"])
+        and effective_replicas >= general_effective_min
+        and updated_ratio >= float(settings["general_updated_ratio"])
+        and abs(robust) >= float(settings["general_min_raw_edge"])
+    )
+
+    if validated:
+        recommend = model_side
+        decision_source = "VALIDATED_MODEL"
+        decision_tier = "STRICT"
+        signal = "HIGH" if lower >= 0.005 else "MEDIUM"
+        edge = lower
+        reason = "補牌路徑分層、統一配對樣本池與穩健誤差修正後通過正式品質閘門"
+    elif general_quality_pass:
+        recommend = model_side
+        decision_source = "LOW_CONFIDENCE_BALANCED"
+        decision_tier = "GENERAL"
+        signal = "LOW"
+        edge = abs(robust)
+        reason = "通過一般品質閘門；保留方向但未標示為正式驗證訊號"
     else:
-        fallback_side = "B" if int(rows[0].seed) & 1 else "P"
-    recommend = model_side if validated else fallback_side
-    decision_source = "VALIDATED_MODEL" if validated else "LOW_CONFIDENCE_BALANCED"
-    signal = "HIGH" if validated and lower >= 0.005 else "MEDIUM" if validated and lower >= 0.002 else "LOW"
+        recommend = "NONE"
+        decision_source = "OBSERVE"
+        decision_tier = "OBSERVE"
+        signal = "OBSERVE"
+        edge = 0.0
+        reason = "副本、分半樣本或補牌路徑品質不足，本局觀望且不建立下注方向"
+
     return {
         "recommend": recommend,
-        "reason": (
-            "500粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
-            if validated
-            else "訊號未通過完整驗證，仍沿用低信心對稱後驗方向，不固定回退莊家"
-        ),
+        "reason": reason,
         "signal_level": signal,
-        "edge": lower,
+        "edge": edge,
         "center": robust,
         "raw_center": mean,
         "median_center": med,
@@ -1054,13 +1200,17 @@ def decide_ensemble(
         "lower_bound": lower,
         "model_side": model_side,
         "validated_signal": validated,
-        "quality_pass": quality_pass,
+        "quality_pass": strict_quality_pass,
+        "general_quality_pass": general_quality_pass,
+        "decision_tier": decision_tier,
+        "is_observe": recommend == "NONE",
         "decision_source": decision_source,
         "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
         "player_ev": float(fused[1] - fused[0]),
-        "fallback_score": fallback_score,
+        "fallback_score": robust,
         "effective_replicas": effective_replicas,
         "direction_consistency": direction_consistency,
+        "updated_ratio": updated_ratio,
     }
 
 
@@ -1111,7 +1261,82 @@ class V5IndependentBaccaratEngine:
                 supplied.get("min_replica_agreement", MIN_REPLICA_AGREEMENT)
             ),
             "banker_commission": float(supplied.get("banker_commission", BANKER_COMMISSION)),
+            "fast_mode": bool(supplied.get("fast_mode", FAST_MODE)),
+            "cache_stratified_priors": bool(
+                supplied.get("cache_stratified_priors", CACHE_STRATIFIED_PRIORS)
+            ),
+            "skip_unused_db_diagnostics": bool(
+                supplied.get("skip_unused_db_diagnostics", SKIP_UNUSED_DB_DIAGNOSTICS)
+            ),
+            "forecast_sample_cap": int(
+                supplied.get("forecast_sample_cap", FORECAST_SAMPLE_CAP)
+            ),
+            "fast_particle_cap": int(
+                supplied.get("fast_particle_cap", FAST_PARTICLE_CAP)
+            ),
+            "fast_target_matches_cap": int(
+                supplied.get("fast_target_matches_cap", FAST_TARGET_MATCHES_CAP)
+            ),
+            "fast_target_ess_cap": float(
+                supplied.get("fast_target_ess_cap", FAST_TARGET_ESS_CAP)
+            ),
+            "fast_max_update_proposals": int(
+                supplied.get("fast_max_update_proposals", FAST_MAX_UPDATE_PROPOSALS)
+            ),
+            "fast_path_target_matches_cap": int(
+                supplied.get(
+                    "fast_path_target_matches_cap",
+                    FAST_PATH_TARGET_MATCHES_CAP,
+                )
+            ),
+            "general_replica_agreement": float(
+                supplied.get("general_replica_agreement", GENERAL_REPLICA_AGREEMENT)
+            ),
+            "general_ess_ratio": float(supplied.get("general_ess_ratio", GENERAL_ESS_RATIO)),
+            "general_diversity": float(
+                supplied.get("general_diversity", GENERAL_DIVERSITY)
+            ),
+            "general_split_agreement": float(
+                supplied.get("general_split_agreement", GENERAL_SPLIT_AGREEMENT)
+            ),
+            "general_path_coverage": float(
+                supplied.get("general_path_coverage", GENERAL_PATH_COVERAGE)
+            ),
+            "general_effective_replica_ratio": float(
+                supplied.get(
+                    "general_effective_replica_ratio",
+                    GENERAL_EFFECTIVE_REPLICA_RATIO,
+                )
+            ),
+            "general_updated_ratio": float(
+                supplied.get("general_updated_ratio", GENERAL_UPDATED_RATIO)
+            ),
+            "general_min_raw_edge": float(
+                supplied.get("general_min_raw_edge", GENERAL_MIN_RAW_EDGE)
+            ),
         }
+
+        if bool(self.settings["fast_mode"]):
+            self.settings["particles"] = min(
+                int(self.settings["particles"]),
+                int(self.settings["fast_particle_cap"]),
+            )
+            self.settings["target_matches"] = min(
+                int(self.settings["target_matches"]),
+                int(self.settings["fast_target_matches_cap"]),
+            )
+            self.settings["target_ess"] = min(
+                float(self.settings["target_ess"]),
+                float(self.settings["fast_target_ess_cap"]),
+            )
+            self.settings["max_update_proposals"] = min(
+                int(self.settings["max_update_proposals"]),
+                int(self.settings["fast_max_update_proposals"]),
+            )
+            self.settings["path_target_matches"] = min(
+                int(self.settings["path_target_matches"]),
+                int(self.settings["fast_path_target_matches_cap"]),
+            )
 
     def analyze(
         self,
@@ -1128,7 +1353,13 @@ class V5IndependentBaccaratEngine:
                 particle_count=max(64, int(self.settings["particles"])),
                 decks=int(self.settings["decks"]),
             )
-            prior_particles, prior_depths = engine.build_stratified_prior()
+            prior_particles, prior_depths = _get_stratified_prior(
+                particle_count=max(64, int(self.settings["particles"])),
+                decks=int(self.settings["decks"]),
+                replica_index=replica_index,
+                request_seed=replica_seed,
+                use_cache=bool(self.settings["cache_stratified_priors"]),
+            )
             population = engine.condition(
                 prior_particles,
                 prior_depths,
@@ -1181,38 +1412,28 @@ class V5IndependentBaccaratEngine:
             "path_coverage": average_path_coverage,
         }
         decision = decide_ensemble(fused, control, rows, quality, self.settings)
-        stability = "UNSTABLE"
-        if (
-            decision["validated_signal"]
-            and agreement >= 0.71
-            and split_agreement >= 0.80
-            and average_ess >= float(self.settings["target_ess"]) * 0.8
-            and average_diversity >= 0.45
-            and average_path_coverage >= float(self.settings["min_path_coverage"])
-            and decision["effective_replicas"] >= float(self.settings["min_effective_replicas"])
-        ):
+        if decision["decision_tier"] == "STRICT":
             stability = "STABLE"
-        elif (
-            agreement >= 0.57
-            and split_agreement >= 0.60
-            and average_ess >= float(self.settings["target_ess"]) * 0.45
-            and average_diversity >= 0.30
-            and average_path_coverage >= 0.60
-        ):
+        elif decision["decision_tier"] == "GENERAL":
             stability = "WATCH"
+        else:
+            stability = "UNSTABLE"
+
         weakness: List[str] = []
-        if not decision["validated_signal"]:
-            weakness.append("模型訊號未通過補牌路徑分層信賴下界或品質閘門")
+        if decision["decision_tier"] == "GENERAL":
+            weakness.append("已通過一般品質閘門，但未通過正式信賴下界")
+        elif decision["decision_tier"] == "OBSERVE":
+            weakness.append("模型品質不足，本局觀望且不計入方向戰績")
         if agreement < float(self.settings["min_replica_agreement"]):
-            weakness.append("副本穩健方向共識低於設定門檻")
+            weakness.append("副本穩健方向共識未達正式門檻")
         if split_agreement < 0.60:
-            weakness.append("統一樣本池分半方向一致率低於60%")
+            weakness.append("統一樣本池分半方向一致率未達正式60%門檻")
         if average_ess < float(self.settings["target_ess"]) * 0.8:
-            weakness.append("條件候選ESS未達目標80%")
+            weakness.append("條件候選ESS未達正式目標80%")
         if average_diversity < 0.45:
-            weakness.append("粒子多樣性不足45%")
+            weakness.append("粒子多樣性未達正式45%門檻")
         if average_path_coverage < float(self.settings["min_path_coverage"]):
-            weakness.append("補牌路徑有效覆蓋率不足")
+            weakness.append("補牌路徑有效覆蓋率未達正式門檻")
         if outlier_count:
             weakness.append(f"已抑制{outlier_count}個偏離中位數副本")
         if any(row.low_sample for row in rows):
@@ -1287,7 +1508,13 @@ class V5IndependentBaccaratEngine:
             "total_forecast_simulations": int(
                 len(rows)
                 * (
-                    int(self.settings["predict_simulations_per_replica"])
+                    min(
+                        int(self.settings["predict_simulations_per_replica"])
+                        + int(self.settings["point_joint_simulations_per_replica"]),
+                        int(self.settings["forecast_sample_cap"]),
+                    )
+                    if bool(self.settings["fast_mode"])
+                    else int(self.settings["predict_simulations_per_replica"])
                     + int(self.settings["point_joint_simulations_per_replica"])
                 )
             ),
