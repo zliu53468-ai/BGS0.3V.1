@@ -1,4 +1,4 @@
-"""V5.1.6 stateless point-conditioned baccarat particle engine.
+"""V5.3 conservative multi-seed-ready point-conditioned baccarat particle engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
@@ -83,29 +83,40 @@ FAST_MODE = _env_bool("PF_FAST_MODE", True)
 CACHE_STRATIFIED_PRIORS = _env_bool("PF_CACHE_STRATIFIED_PRIORS", True)
 SKIP_UNUSED_DB_DIAGNOSTICS = _env_bool("PF_SKIP_UNUSED_DB_DIAGNOSTICS", True)
 FORECAST_SAMPLE_CAP = _env_int("PF_FORECAST_SAMPLE_CAP", 1000, 200, 200_000)
-FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 600, 64, 1000)
-FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 220, 32, 4000)
-FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 150.0, 8.0, 4000.0)
+FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 500, 64, 1000)
+FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 180, 32, 4000)
+FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 120.0, 8.0, 4000.0)
 FAST_MAX_UPDATE_PROPOSALS = _env_int(
-    "PF_FAST_MAX_UPDATE_PROPOSALS", 18_000, 500, 500_000
+    "PF_FAST_MAX_UPDATE_PROPOSALS", 10_000, 500, 500_000
 )
 FAST_PATH_TARGET_MATCHES_CAP = _env_int(
     "PF_FAST_PATH_TARGET_MATCHES_CAP", 10, 4, 256
 )
 
-# Three-level decision gate. Strict validation keeps the original statistical
-# meaning; the general gate provides a usable direction for ordinary-quality
-# runs; only severely inconsistent runs become OBSERVE.
-GENERAL_REPLICA_AGREEMENT = _env_float("PF_GENERAL_REPLICA_AGREEMENT", 0.52, 0.50, 1.0)
-GENERAL_ESS_RATIO = _env_float("PF_GENERAL_ESS_RATIO", 0.35, 0.05, 1.0)
-GENERAL_DIVERSITY = _env_float("PF_GENERAL_DIVERSITY", 0.20, 0.05, 1.0)
-GENERAL_SPLIT_AGREEMENT = _env_float("PF_GENERAL_SPLIT_AGREEMENT", 0.05, 0.0, 1.0)
-GENERAL_PATH_COVERAGE = _env_float("PF_GENERAL_PATH_COVERAGE", 0.40, 0.0, 1.0)
+# Three-level decision gate. V5.3 deliberately restores meaningful general
+# thresholds: a GENERAL signal must be internally stable, uncertainty-adjusted,
+# path-consistent and materially separated from zero. This lowers entry
+# frequency instead of relabelling nearly-random output as a usable signal.
+GENERAL_REPLICA_AGREEMENT = _env_float("PF_GENERAL_REPLICA_AGREEMENT", 0.70, 0.50, 1.0)
+GENERAL_ESS_RATIO = _env_float("PF_GENERAL_ESS_RATIO", 0.65, 0.05, 1.0)
+GENERAL_DIVERSITY = _env_float("PF_GENERAL_DIVERSITY", 0.35, 0.05, 1.0)
+GENERAL_SPLIT_AGREEMENT = _env_float("PF_GENERAL_SPLIT_AGREEMENT", 0.60, 0.0, 1.0)
+GENERAL_PATH_COVERAGE = _env_float("PF_GENERAL_PATH_COVERAGE", 0.70, 0.0, 1.0)
 GENERAL_EFFECTIVE_REPLICA_RATIO = _env_float(
-    "PF_GENERAL_EFFECTIVE_REPLICA_RATIO", 0.55, 0.10, 1.0
+    "PF_GENERAL_EFFECTIVE_REPLICA_RATIO", 0.85, 0.10, 1.0
 )
-GENERAL_UPDATED_RATIO = _env_float("PF_GENERAL_UPDATED_RATIO", 0.50, 0.0, 1.0)
-GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.00001, 0.0, 0.05)
+GENERAL_UPDATED_RATIO = _env_float("PF_GENERAL_UPDATED_RATIO", 0.80, 0.0, 1.0)
+GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.0030, 0.0, 0.05)
+GENERAL_MIN_LOWER_EDGE = _env_float("PF_GENERAL_MIN_LOWER_EDGE", 0.0, 0.0, 0.05)
+GENERAL_MIN_CURRENT_PATH_AGREEMENT = _env_float(
+    "PF_GENERAL_MIN_CURRENT_PATH_AGREEMENT", 0.55, 0.0, 1.0
+)
+GENERAL_MIN_NEXT_DRAW_AGREEMENT = _env_float(
+    "PF_GENERAL_MIN_NEXT_DRAW_AGREEMENT", 0.55, 0.0, 1.0
+)
+GENERAL_REQUIRE_DIRECTION_CONSISTENCY = _env_bool(
+    "PF_GENERAL_REQUIRE_DIRECTION_CONSISTENCY", True
+)
 
 _PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
 _PRIOR_CACHE_LOCK = threading.RLock()
@@ -1160,6 +1171,15 @@ def decide_ensemble(
         and effective_replicas >= general_effective_min
         and updated_ratio >= float(settings["general_updated_ratio"])
         and abs(robust) >= float(settings["general_min_raw_edge"])
+        and lower >= float(settings["general_min_lower_edge"])
+        and quality.get("current_path_agreement", 0.0)
+        >= float(settings["general_min_current_path_agreement"])
+        and quality.get("next_draw_agreement", 0.0)
+        >= float(settings["general_min_next_draw_agreement"])
+        and (
+            direction_consistency
+            or not bool(settings["general_require_direction_consistency"])
+        )
     )
 
     if validated:
@@ -1314,6 +1334,27 @@ class V5IndependentBaccaratEngine:
             "general_min_raw_edge": float(
                 supplied.get("general_min_raw_edge", GENERAL_MIN_RAW_EDGE)
             ),
+            "general_min_lower_edge": float(
+                supplied.get("general_min_lower_edge", GENERAL_MIN_LOWER_EDGE)
+            ),
+            "general_min_current_path_agreement": float(
+                supplied.get(
+                    "general_min_current_path_agreement",
+                    GENERAL_MIN_CURRENT_PATH_AGREEMENT,
+                )
+            ),
+            "general_min_next_draw_agreement": float(
+                supplied.get(
+                    "general_min_next_draw_agreement",
+                    GENERAL_MIN_NEXT_DRAW_AGREEMENT,
+                )
+            ),
+            "general_require_direction_consistency": bool(
+                supplied.get(
+                    "general_require_direction_consistency",
+                    GENERAL_REQUIRE_DIRECTION_CONSISTENCY,
+                )
+            ),
         }
 
         if bool(self.settings["fast_mode"]):
@@ -1404,12 +1445,18 @@ class V5IndependentBaccaratEngine:
         average_ess = float(np.mean([row.ess for row in rows]))
         average_diversity = float(np.mean([row.diversity for row in rows]))
         average_path_coverage = float(np.mean([row.path_coverage for row in rows]))
+        average_current_path_agreement = float(
+            np.mean([row.current_path_agreement for row in rows])
+        )
+        average_draw_agreement = float(np.mean([row.draw_agreement for row in rows]))
         quality = {
             "agreement": agreement,
             "average_ess": average_ess,
             "average_diversity": average_diversity,
             "split_agreement": split_agreement,
             "path_coverage": average_path_coverage,
+            "current_path_agreement": average_current_path_agreement,
+            "next_draw_agreement": average_draw_agreement,
         }
         decision = decide_ensemble(fused, control, rows, quality, self.settings)
         if decision["decision_tier"] == "STRICT":
@@ -1474,10 +1521,8 @@ class V5IndependentBaccaratEngine:
                 np.mean([row.legacy_path_coverage for row in rows])
             ),
             "average_path_ess_quality": float(np.mean([row.path_ess_quality for row in rows])),
-            "average_current_path_agreement": float(
-                np.mean([row.current_path_agreement for row in rows])
-            ),
-            "average_draw_agreement": float(np.mean([row.draw_agreement for row in rows])),
+            "average_current_path_agreement": average_current_path_agreement,
+            "average_draw_agreement": average_draw_agreement,
             "average_point_concentration": float(
                 np.mean([row.point_concentration for row in rows])
             ),
