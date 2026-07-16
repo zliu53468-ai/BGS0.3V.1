@@ -1,4 +1,4 @@
-"""V5.5 1000-particle draw-path-conditioned baccarat particle engine.
+"""V5.6 1000-particle database-candidate revalidation baccarat engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
@@ -127,6 +127,22 @@ BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.72, 0.0, 1.0)
 PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.50, 0.0, 1.0)
 PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 40, 4, 10000)
 
+# V5.6 database-assisted candidate point generation. The existing 5M database
+# stores outcome and legal draw-path aggregates by remaining-shoe state. It does
+# not contain a native 00-99 matrix, so V5.6 uses those aggregates as priors to
+# re-rank particle-generated point candidates, then validates them with a second
+# independent simulation stream.
+DB_CANDIDATE_ENABLED = _env_bool("PF_DB_CANDIDATE_ENABLED", True)
+DB_CANDIDATE_SCAN_PARTICLES = _env_int("PF_DB_CANDIDATE_SCAN_PARTICLES", 192, 32, 1000)
+DB_CANDIDATE_TOP_K = _env_int("PF_DB_CANDIDATE_TOP_K", 20, 5, 60)
+DB_CANDIDATE_WEIGHT = _env_float("PF_DB_CANDIDATE_WEIGHT", 0.35, 0.0, 0.80)
+PARTICLE_POINT_WEIGHT = _env_float("PF_PARTICLE_POINT_WEIGHT", 0.40, 0.0, 1.0)
+POINT_REVALIDATION_WEIGHT = _env_float("PF_POINT_REVALIDATION_WEIGHT", 0.25, 0.0, 0.80)
+POINT_REVALIDATION_SIMS = _env_int("PF_POINT_REVALIDATION_SIMS", 800, 100, 10000)
+POINT_REVALIDATION_PRIOR = _env_float("PF_POINT_REVALIDATION_PRIOR", 120.0, 1.0, 5000.0)
+DB_OUTCOME_RATIO_CLIP = _env_float("PF_DB_OUTCOME_RATIO_CLIP", 1.35, 1.0, 3.0)
+DB_PATH_RATIO_CLIP = _env_float("PF_DB_PATH_RATIO_CLIP", 1.35, 1.0, 3.0)
+
 _PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
 _PRIOR_CACHE_LOCK = threading.RLock()
 
@@ -206,6 +222,9 @@ class ReplicaResult:
     next_draw_paths: np.ndarray
     next_path_centers: np.ndarray
     point_matrix: np.ndarray
+    database_candidate_matrix: np.ndarray
+    revalidated_point_matrix: np.ndarray
+    database_draw_paths: np.ndarray
     top_points: List[Dict[str, Any]]
     paired_center: float
     split_centers: Tuple[float, float]
@@ -529,6 +548,23 @@ def _weighted_median(values: Sequence[float], weights: Sequence[float]) -> float
     return float(pairs[-1][0])
 
 
+def _point_outcome_index(index: int) -> int:
+    player, banker = divmod(int(index), 10)
+    return 0 if banker > player else 1 if player > banker else 2
+
+
+def _point_feasible_path_mass(index: int, draw_probs: np.ndarray) -> float:
+    player, banker = divmod(int(index), 10)
+    feasible = feasible_current_paths(player, banker, None)
+    mass = float(np.asarray(draw_probs, dtype=float)[feasible].sum())
+    return max(1e-12, mass)
+
+
+def _normalize_weight_triplet(a: float, b: float, c: float) -> Tuple[float, float, float]:
+    total = max(1e-12, float(a) + float(b) + float(c))
+    return float(a) / total, float(b) / total, float(c) / total
+
+
 class V5ReplicaEngine:
     def __init__(self, seed: int, particle_count: int, decks: int) -> None:
         self.seed = int(seed) & 0xFFFFFFFF
@@ -833,18 +869,6 @@ class V5ReplicaEngine:
                     path_outcome_c[path],
                     path_outcome_u[path],
                 )
-        matrix = point_matrix / max(1.0, float(point_matrix.sum()))
-        top_idx = np.argsort(matrix)[::-1][:10]
-        top_points = []
-        for idx in top_idx:
-            p, b = int(idx // 10), int(idx % 10)
-            top_points.append(
-                {
-                    "point": f"{p}{b}",
-                    "probability": float(matrix[idx]),
-                    "outcome": "B" if b > p else "P" if p > b else "T",
-                }
-            )
         positive_mass = negative_mass = decisive_mass = 0.0
         for path in range(4):
             c_mass = float(path_outcome_c[path].sum()) / max(1.0, samples)
@@ -862,7 +886,7 @@ class V5ReplicaEngine:
             else:
                 negative_mass += mass
         draw_agreement = max(positive_mass, negative_mass) / decisive_mass if decisive_mass else 0.5
-        paired_center = _center(conditioned, control)
+        base_paired_center = _center(conditioned, control)
         current_centers = np.zeros(4, dtype=float)
         current_directions = ["—"] * 4
         cp_positive = cp_negative = cp_decisive = 0.0
@@ -880,12 +904,131 @@ class V5ReplicaEngine:
                 cp_positive += mass
             else:
                 cp_negative += mass
-            disp_num += mass * (value - paired_center) ** 2
+            disp_num += mass * (value - base_paired_center) ** 2
             disp_mass += mass
         current_agreement = max(cp_positive, cp_negative) / cp_decisive if cp_decisive else 0.5
         current_dispersion = math.sqrt(disp_num / disp_mass) if disp_mass else 0.0
         effective_paths = max(1, int(np.count_nonzero(current_path_samples >= 8)))
         current_internal_se = current_dispersion / math.sqrt(effective_paths)
+
+        raw_matrix = normalize_array(point_matrix, np.full(100, 0.01))
+        database = get_shoe_state_database()
+
+        # Aggregate the existing 5M state database over a deterministic, evenly
+        # spaced subset of the conditioned particles. This keeps latency bounded
+        # while still using the repository database on every request.
+        db_total = np.zeros(3, dtype=float)
+        db_draw_total = np.zeros(4, dtype=float)
+        db_rel = db_samples = 0.0
+        scan_n = min(len(population.particles), int(settings["db_candidate_scan_particles"]))
+        if bool(settings["db_candidate_enabled"]) and scan_n > 0:
+            scan_idx = np.linspace(0, len(population.particles) - 1, scan_n, dtype=int)
+            inv = 1.0 / float(scan_n)
+            for particle_index in scan_idx:
+                estimate = database.estimate(population.particles[int(particle_index)], self.decks)
+                db_total += inv * np.asarray([
+                    estimate.probabilities["B"],
+                    estimate.probabilities["P"],
+                    estimate.probabilities["T"],
+                ], dtype=float)
+                db_draw_total += inv * np.asarray([
+                    estimate.draw_paths["none"],
+                    estimate.draw_paths["player_only"],
+                    estimate.draw_paths["banker_only"],
+                    estimate.draw_paths["both"],
+                ], dtype=float)
+                db_rel += inv * float(estimate.reliability)
+                db_samples += inv * float(estimate.samples)
+            db_probs = normalize_array(db_total, BASELINE)
+            db_draw = normalize_array(db_draw_total, DRAW_BASELINE)
+        else:
+            db_probs = BASELINE.copy()
+            db_draw = DRAW_BASELINE.copy()
+
+        # Re-rank 00-99 candidates with the database outcome and legal draw-path
+        # priors. Ratio clipping prevents a coarse state bucket from dominating
+        # the particle evidence.
+        db_candidate = raw_matrix.copy()
+        outcome_clip = float(settings["db_outcome_ratio_clip"])
+        path_clip = float(settings["db_path_ratio_clip"])
+        for idx in range(100):
+            outcome_idx = _point_outcome_index(idx)
+            outcome_ratio = float(db_probs[outcome_idx]) / max(1e-12, float(BASELINE[outcome_idx]))
+            base_path_mass = _point_feasible_path_mass(idx, DRAW_BASELINE)
+            db_path_mass = _point_feasible_path_mass(idx, db_draw)
+            path_ratio = db_path_mass / max(1e-12, base_path_mass)
+            outcome_ratio = min(outcome_clip, max(1.0 / outcome_clip, outcome_ratio))
+            path_ratio = min(path_clip, max(1.0 / path_clip, path_ratio))
+            db_candidate[idx] *= outcome_ratio * path_ratio
+        db_candidate = normalize_array(db_candidate, raw_matrix)
+
+        # Second independent simulation stream. Only the database-ranked top-K
+        # candidates receive validation mass; all others retain their particle
+        # prior through shrinkage.
+        top_k = min(100, int(settings["db_candidate_top_k"]))
+        # Select candidates by outcome strata so the second-stage validator cannot
+        # become biased simply because ties or one side occupy more of the global
+        # top-K point list. Quotas follow the 5M database B/P/T prior.
+        outcome_quotas = np.maximum(1, np.floor(db_probs * top_k).astype(int))
+        while int(outcome_quotas.sum()) > top_k:
+            outcome_quotas[int(np.argmax(outcome_quotas))] -= 1
+        while int(outcome_quotas.sum()) < top_k:
+            outcome_quotas[int(np.argmax(db_probs - outcome_quotas / max(1, top_k)))] += 1
+        chosen: List[int] = []
+        for outcome_idx in range(3):
+            candidates = [i for i in range(100) if _point_outcome_index(i) == outcome_idx]
+            candidates.sort(key=lambda i: float(db_candidate[i]), reverse=True)
+            chosen.extend(candidates[: int(outcome_quotas[outcome_idx])])
+        candidate_idx = np.asarray(chosen[:top_k], dtype=int)
+        candidate_mask = np.zeros(100, dtype=bool)
+        candidate_mask[candidate_idx] = True
+        validation_counts = np.zeros(100, dtype=float)
+        validation_sims = int(settings["point_revalidation_sims"])
+        validation_rng = np.random.default_rng(mix_seed(self.seed, 0x560056))
+        order2 = validation_rng.permutation(len(population.particles))
+        for sim_index in range(validation_sims):
+            particle_index = int(order2[sim_index % len(order2)])
+            hand = simulate_hand_np(population.particles[particle_index], validation_rng)
+            idx = hand.player_total * 10 + hand.banker_total
+            if candidate_mask[idx]:
+                validation_counts[idx] += 1.0
+        prior_strength = float(settings["point_revalidation_prior"])
+        revalidated = validation_counts + prior_strength * db_candidate
+        revalidated = normalize_array(revalidated, db_candidate)
+
+        pw, dw, rw = _normalize_weight_triplet(
+            float(settings["particle_point_weight"]),
+            float(settings["db_candidate_weight"]),
+            float(settings["point_revalidation_weight"]),
+        )
+        matrix = normalize_array(
+            pw * raw_matrix + dw * db_candidate + rw * revalidated,
+            raw_matrix,
+        )
+
+        # Convert the final point distribution into B/P/T probabilities. This is
+        # the V5.6 decision distribution; it is no longer just a diagnostic list.
+        candidate_outcomes = np.zeros(3, dtype=float)
+        for idx, probability in enumerate(matrix):
+            candidate_outcomes[_point_outcome_index(idx)] += float(probability)
+        pf = normalize_array(candidate_outcomes, BASELINE)
+        control_probs = normalize_array(control, BASELINE)
+        fused = pf.copy()
+        paired_center = _center(fused, control_probs)
+
+        top_idx = np.argsort(matrix)[::-1][:10]
+        top_points = []
+        for idx in top_idx:
+            p, b = int(idx // 10), int(idx % 10)
+            top_points.append({
+                "point": f"{p}{b}",
+                "probability": float(matrix[idx]),
+                "particle_probability": float(raw_matrix[idx]),
+                "database_candidate_probability": float(db_candidate[idx]),
+                "revalidated_probability": float(revalidated[idx]),
+                "outcome": "B" if b > p else "P" if p > b else "T",
+            })
+
         entropy = -float(sum(x * math.log(x) for x in matrix if x > 0))
         entropy_norm = min(1.0, entropy / math.log(100))
         top10_mass = float(matrix[top_idx].sum())
@@ -893,52 +1036,8 @@ class V5ReplicaEngine:
             0.0,
             min(1.0, 0.55 * (1.0 - entropy_norm) + 0.45 * max(0.0, min(1.0, (top10_mass - 0.10) / 0.22))),
         )
-        database = get_shoe_state_database()
-        db_allowed = settings["database_validation_mode"] == "force" or (
-            settings["database_validation_mode"] == "validated_only" and DB_HOLDOUT["passed"]
-        )
-        if settings["database_validation_mode"] == "diagnostic":
-            db_allowed = False
 
-        # With zero/disabled database weight, the per-particle SQLite lookup
-        # cannot change fused probabilities. Skipping it removes hundreds or
-        # thousands of unnecessary state-bucket queries per request.
-        skip_db_scan = bool(settings["fast_mode"]) and bool(
-            settings["skip_unused_db_diagnostics"]
-        ) and (not db_allowed or float(settings["database_weight"]) <= 0.0)
-        if skip_db_scan:
-            db_probs = BASELINE.copy()
-            db_rel = 0.0
-            db_samples = 0.0
-        else:
-            db_total = np.zeros(3, dtype=float)
-            db_rel = db_samples = 0.0
-            inv = 1.0 / max(1, len(population.particles))
-            for particle in population.particles:
-                estimate = database.estimate(particle, self.decks)
-                db_total += inv * np.asarray(
-                    [
-                        estimate.probabilities["B"],
-                        estimate.probabilities["P"],
-                        estimate.probabilities["T"],
-                    ],
-                    dtype=float,
-                )
-                db_rel += inv * estimate.reliability
-                db_samples += inv * estimate.samples
-            db_probs = normalize_array(db_total, BASELINE)
-        sample_scale = min(1.0, population.ess / max(1.0, float(settings["target_ess"])))
-        effective_db = (
-            float(settings["database_weight"]) * db_rel * (0.65 + 0.35 * sample_scale)
-            if db_allowed
-            else 0.0
-        )
-        delta = np.clip(
-            db_probs - BASELINE,
-            -float(settings["database_max_adjustment"]),
-            float(settings["database_max_adjustment"]),
-        )
-        fused = normalize_array(pf + effective_db * delta, BASELINE)
+        effective_db = float(settings["db_candidate_weight"]) * db_rel
         path_quality = 0.55 * population.path_coverage + 0.45 * population.path_ess_quality
         base_weight = (
             max(
@@ -962,6 +1061,9 @@ class V5ReplicaEngine:
             next_draw_paths=next_draw,
             next_path_centers=next_path_centers,
             point_matrix=matrix,
+            database_candidate_matrix=db_candidate,
+            revalidated_point_matrix=revalidated,
+            database_draw_paths=db_draw,
             top_points=top_points,
             paired_center=paired_center,
             split_centers=split_centers,
@@ -1409,6 +1511,36 @@ class V5IndependentBaccaratEngine:
             "path_min_samples_for_signal": int(
                 supplied.get("path_min_samples_for_signal", PATH_MIN_SAMPLES_FOR_SIGNAL)
             ),
+            "db_candidate_enabled": bool(
+                supplied.get("db_candidate_enabled", DB_CANDIDATE_ENABLED)
+            ),
+            "db_candidate_scan_particles": int(
+                supplied.get("db_candidate_scan_particles", DB_CANDIDATE_SCAN_PARTICLES)
+            ),
+            "db_candidate_top_k": int(
+                supplied.get("db_candidate_top_k", DB_CANDIDATE_TOP_K)
+            ),
+            "db_candidate_weight": float(
+                supplied.get("db_candidate_weight", DB_CANDIDATE_WEIGHT)
+            ),
+            "particle_point_weight": float(
+                supplied.get("particle_point_weight", PARTICLE_POINT_WEIGHT)
+            ),
+            "point_revalidation_weight": float(
+                supplied.get("point_revalidation_weight", POINT_REVALIDATION_WEIGHT)
+            ),
+            "point_revalidation_sims": int(
+                supplied.get("point_revalidation_sims", POINT_REVALIDATION_SIMS)
+            ),
+            "point_revalidation_prior": float(
+                supplied.get("point_revalidation_prior", POINT_REVALIDATION_PRIOR)
+            ),
+            "db_outcome_ratio_clip": float(
+                supplied.get("db_outcome_ratio_clip", DB_OUTCOME_RATIO_CLIP)
+            ),
+            "db_path_ratio_clip": float(
+                supplied.get("db_path_ratio_clip", DB_PATH_RATIO_CLIP)
+            ),
         }
 
         if bool(self.settings["fast_mode"]):
@@ -1474,11 +1606,16 @@ class V5IndependentBaccaratEngine:
         draw = _weighted_average(rows, "draw_paths", 4)
         next_draw = _weighted_average(rows, "next_draw_paths", 4)
         point_matrix = _weighted_average(rows, "point_matrix", 100)
+        database_candidate_matrix = _weighted_average(rows, "database_candidate_matrix", 100)
+        revalidated_point_matrix = _weighted_average(rows, "revalidated_point_matrix", 100)
+        database_draw_paths = _weighted_average(rows, "database_draw_paths", 4)
         top_idx = np.argsort(point_matrix)[::-1][:10]
         top_points = [
             {
                 "point": f"{int(i // 10)}{int(i % 10)}",
                 "probability": float(point_matrix[i]),
+                "database_candidate_probability": float(database_candidate_matrix[i]),
+                "revalidated_probability": float(revalidated_point_matrix[i]),
                 "outcome": "B" if int(i % 10) > int(i // 10) else "P" if int(i // 10) > int(i % 10) else "T",
             }
             for i in top_idx
@@ -1540,9 +1677,9 @@ class V5IndependentBaccaratEngine:
         if any(row.low_sample for row in rows):
             weakness.append("至少一個副本的總候選或補牌路徑候選偏少")
         if not DB_HOLDOUT["passed"] and self.settings["database_validation_mode"] != "force":
-            weakness.append("500萬資料庫樣本外驗證未優於基準，方向校正已抑制")
+            weakness.append("500萬資料庫僅作候選點數與補牌先驗，不直接單獨決定方向")
         if not weakness:
-            weakness.append("500粒子、補牌路徑ESS、統一樣本池與穩健誤差均通過")
+            weakness.append("1000粒子、500萬資料庫候選重排與第二次補牌驗證均完成")
         combined = hashlib.sha1()
         for row in rows:
             combined.update(row.digest.encode("ascii"))
@@ -1554,6 +1691,9 @@ class V5IndependentBaccaratEngine:
             "draw_paths": draw,
             "next_draw_paths": next_draw,
             "point_matrix": point_matrix,
+            "database_candidate_matrix": database_candidate_matrix,
+            "revalidated_point_matrix": revalidated_point_matrix,
+            "database_draw_paths": database_draw_paths,
             "top_points": top_points,
             **decision,
             "seed": int(seed) & 0xFFFFFFFF,
