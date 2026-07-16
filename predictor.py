@@ -1,4 +1,4 @@
-"""LINE-compatible V5.4 draw-path-fusion point predictor."""
+"""LINE-compatible V5.5 1000-particle draw-path predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -348,9 +348,9 @@ def predict(
         seed,
         latest.get("path"),
     )
-    # V5.4 no longer launches extra consensus models. The 500-particle primary
-    # run already fuses current-hand and next-hand draw-path effects, which is
-    # faster and guarantees one direction per request.
+    # V5.5 uses one complete 1000-particle primary run. The 2,000-sample paired
+    # forecast pool lets all 1,000 particle indices participate once per replica
+    # while avoiding the latency of extra consensus engines.
     result = primary
     result["master_seed_count"] = 1
     result["master_seed_directions"] = [str(result.get("recommend", "B"))]
@@ -378,8 +378,8 @@ def predict(
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": "V5_4_DRAW_PATH_FUSION_500P_LINE",
-        "model_version": "V5.4-DRAW-PATH-FUSION-500P-20260717",
+        "engine": "V5_5_DRAW_PATH_FUSION_1000P_LINE",
+        "model_version": "V5.5-DRAW-PATH-FUSION-1000P-20260717",
         "user_id": user_id,
         "venue": venue,
         "room": room,
