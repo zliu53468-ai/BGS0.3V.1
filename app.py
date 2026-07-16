@@ -21,7 +21,6 @@ Older formats remain accepted:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -96,17 +95,6 @@ app = FastAPI(
     title="Baccarat V5 Independent Point Bot",
     version="5.0.0",
 )
-
-# Reuse HTTPS connections to LINE instead of opening a new TLS connection for
-# every reply. This changes transport only; all Flex panels and front-end text
-# remain exactly as originally defined below.
-_LINE_HTTP = requests.Session()
-_LINE_ADAPTER = requests.adapters.HTTPAdapter(
-    pool_connections=8,
-    pool_maxsize=8,
-    max_retries=0,
-)
-_LINE_HTTP.mount("https://", _LINE_ADAPTER)
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +288,7 @@ def reply(
         print(json.dumps(messages, ensure_ascii=False))
         return
 
-    response = _LINE_HTTP.post(
+    response = requests.post(
         "https://api.line.me/v2/bot/message/reply",
         headers={
             "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
@@ -783,8 +771,7 @@ async def webhook(
                         continue
 
                     try:
-                        updated = await asyncio.to_thread(
-                            add_points_and_predict,
+                        updated = add_points_and_predict(
                             user_id,
                             observation,
                         )
