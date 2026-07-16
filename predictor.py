@@ -1,4 +1,4 @@
-"""LINE-compatible V5.2 three-tier independent point predictor."""
+"""LINE-compatible V5.3 conservative multi-seed point predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -6,10 +6,13 @@ import os
 import re
 import secrets
 
+import numpy as np
+
 from particle_filter_points import (
     DB_HOLDOUT,
     V5IndependentBaccaratEngine,
     clear_runtime_caches,
+    mix_seed,
 )
 from shoe_state_db import get_shoe_state_database
 
@@ -29,14 +32,70 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    return max(low, min(high, value))
+
+
 RANDOMIZE_EACH_CALL = _env_bool("PF_RANDOMIZE_EACH_CALL", True)
 FIXED_RUN_SEED = _env_int("PF_FIXED_RUN_SEED", 0, 0)
 DEBUG_V5_RESULT = _env_bool("PF_DEBUG_V5_RESULT", False)
 
-# The engine is stateless. Reusing one configured instance avoids reconstructing
-# the settings dictionary for every LINE message; request-specific randomness is
-# still supplied to analyze() through the run seed.
+# V5.3 uses one full primary run and two lightweight independent master-seed
+# validators. The validators do not create a direction; they can only confirm or
+# reject the primary direction. This prevents one fixed seed from permanently
+# mapping a point to an unstable side while keeping LINE latency practical.
+CONSENSUS_RUNS = min(5, _env_int("PF_CONSENSUS_RUNS", 3, 1))
+CONSENSUS_MIN_AGREEMENT = _env_float("PF_CONSENSUS_MIN_AGREEMENT", 1.0, 0.50, 1.0)
+CONSENSUS_MIN_DECISIVE_RUNS = min(
+    CONSENSUS_RUNS,
+    _env_int("PF_CONSENSUS_MIN_DECISIVE_RUNS", CONSENSUS_RUNS, 1),
+)
+CONSENSUS_MIN_EDGE = _env_float("PF_CONSENSUS_MIN_EDGE", 0.0005, 0.0, 0.05)
+CONSENSUS_MIN_VALIDATOR_AGREEMENT = _env_float(
+    "PF_CONSENSUS_MIN_VALIDATOR_AGREEMENT", 0.60, 0.50, 1.0
+)
+CONSENSUS_MIN_VALIDATOR_SPLIT = _env_float(
+    "PF_CONSENSUS_MIN_VALIDATOR_SPLIT", 0.0, 0.0, 1.0
+)
+CONSENSUS_MIN_VALIDATOR_ESS = _env_float(
+    "PF_CONSENSUS_MIN_VALIDATOR_ESS", 40.0, 1.0, 4000.0
+)
+CONSENSUS_MIN_VALIDATOR_DIVERSITY = _env_float(
+    "PF_CONSENSUS_MIN_VALIDATOR_DIVERSITY", 0.20, 0.0, 1.0
+)
+CONSENSUS_MIN_VALIDATOR_PATH = _env_float(
+    "PF_CONSENSUS_MIN_VALIDATOR_PATH", 0.50, 0.0, 1.0
+)
+VALIDATOR_PARTICLES = min(500, _env_int("PF_CONSENSUS_VALIDATOR_PARTICLES", 128, 64))
+VALIDATOR_REPLICAS = min(5, _env_int("PF_CONSENSUS_VALIDATOR_REPLICAS", 3, 3))
+VALIDATOR_SAMPLE_CAP = _env_int("PF_CONSENSUS_VALIDATOR_SAMPLE_CAP", 300, 200)
+VALIDATOR_MAX_PROPOSALS = _env_int("PF_CONSENSUS_VALIDATOR_MAX_PROPOSALS", 4500, 500)
+
+# Engines are stateless and safe to reuse. Immutable prior caching is handled by
+# particle_filter_points.py.
 _ENGINE = V5IndependentBaccaratEngine()
+_VALIDATOR_ENGINE = V5IndependentBaccaratEngine(
+    {
+        "particles": VALIDATOR_PARTICLES,
+        "replicas": VALIDATOR_REPLICAS,
+        "target_matches": 80,
+        "target_ess": 50.0,
+        "max_update_proposals": VALIDATOR_MAX_PROPOSALS,
+        "path_target_matches": 8,
+        "predict_simulations_per_replica": VALIDATOR_SAMPLE_CAP // 2,
+        "point_joint_simulations_per_replica": VALIDATOR_SAMPLE_CAP // 2,
+        "forecast_sample_cap": VALIDATOR_SAMPLE_CAP,
+        "fast_particle_cap": VALIDATOR_PARTICLES,
+        "fast_target_matches_cap": 80,
+        "fast_target_ess_cap": 50.0,
+        "fast_max_update_proposals": VALIDATOR_MAX_PROPOSALS,
+        "fast_path_target_matches_cap": 8,
+    }
+)
 
 
 def parse_point_observation(value: Any) -> Optional[Dict[str, Any]]:
@@ -113,6 +172,162 @@ def _draw_path_dict(values: Any) -> Dict[str, float]:
     return {name: float(values[i]) for i, name in enumerate(PATH_NAMES)}
 
 
+def _validator_quality(result: Mapping[str, Any]) -> bool:
+    return (
+        bool(result.get("all_ancestry_paired", False))
+        and float(result.get("replica_agreement", 0.0))
+        >= CONSENSUS_MIN_VALIDATOR_AGREEMENT
+        and float(result.get("split_agreement", 0.0))
+        >= CONSENSUS_MIN_VALIDATOR_SPLIT
+        and float(result.get("average_ess", 0.0))
+        >= CONSENSUS_MIN_VALIDATOR_ESS
+        and float(result.get("average_diversity", 0.0))
+        >= CONSENSUS_MIN_VALIDATOR_DIVERSITY
+        and float(result.get("average_path_coverage", 0.0))
+        >= CONSENSUS_MIN_VALIDATOR_PATH
+        and abs(float(result.get("center", 0.0))) >= CONSENSUS_MIN_EDGE
+    )
+
+
+def _average_arrays(results: List[Mapping[str, Any]], key: str) -> Any:
+    return np.mean(np.stack([np.asarray(item[key], dtype=float) for item in results]), axis=0)
+
+
+def _combine_master_seed_results(
+    primary: Dict[str, Any],
+    validators: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = [primary, *validators]
+    combined = dict(primary)
+
+    for key in ("pf", "control", "database", "fused", "draw_paths", "next_draw_paths", "point_matrix"):
+        combined[key] = _average_arrays(results, key)
+
+    point_matrix = np.asarray(combined["point_matrix"], dtype=float)
+    top_idx = np.argsort(point_matrix)[::-1][:10]
+    combined["top_points"] = [
+        {
+            "point": f"{int(index // 10)}{int(index % 10)}",
+            "probability": float(point_matrix[index]),
+            "outcome": (
+                "B" if int(index % 10) > int(index // 10)
+                else "P" if int(index // 10) > int(index % 10)
+                else "T"
+            ),
+        }
+        for index in top_idx
+    ]
+
+    primary_side = str(primary.get("recommend", "NONE")).upper()
+    model_sides = [str(item.get("model_side", "NONE")).upper() for item in results]
+    validator_quality = [_validator_quality(item) for item in validators]
+    decisive = [side for side in model_sides if side in {"B", "P"}]
+    counts = {"B": decisive.count("B"), "P": decisive.count("P")}
+    dominant = "B" if counts["B"] >= counts["P"] else "P"
+    agreement = max(counts.values()) / max(1, len(results))
+    centers = [float(item.get("center", 0.0)) for item in results]
+    signed_center = float(np.mean(centers))
+    minimum_edge = min(abs(value) for value in centers)
+    direction_consistent = (signed_center >= 0 and dominant == "B") or (
+        signed_center < 0 and dominant == "P"
+    )
+
+    consensus_pass = (
+        primary_side in {"B", "P"}
+        and primary_side == dominant
+        and len(decisive) >= CONSENSUS_MIN_DECISIVE_RUNS
+        and agreement >= CONSENSUS_MIN_AGREEMENT
+        and all(validator_quality)
+        and minimum_edge >= CONSENSUS_MIN_EDGE
+        and direction_consistent
+    )
+
+    combined["master_seed_count"] = len(results)
+    combined["master_seed_directions"] = model_sides
+    combined["master_seed_agreement"] = agreement
+    combined["master_seed_validator_quality"] = validator_quality
+    combined["master_seed_consensus_pass"] = consensus_pass
+    combined["master_seed_minimum_edge"] = minimum_edge
+    combined["master_seed_centers"] = centers
+    combined["center"] = signed_center
+    combined["raw_center"] = signed_center
+    combined["edge"] = min(float(primary.get("edge", 0.0)), minimum_edge) if consensus_pass else 0.0
+    combined["lower_bound"] = min(float(item.get("lower_bound", 0.0)) for item in results)
+    combined["replicas"] = sum(int(item.get("replicas", 0)) for item in results)
+    combined["replica_directions"] = [
+        direction
+        for item in results
+        for direction in list(item.get("replica_directions", []))
+    ]
+    combined["replica_agreement"] = float(
+        np.mean([float(item.get("replica_agreement", 0.0)) for item in results])
+    )
+    combined["split_agreement"] = float(
+        np.mean([float(item.get("split_agreement", 0.0)) for item in results])
+    )
+    combined["effective_replicas"] = float(
+        np.mean([float(item.get("effective_replicas", 0.0)) for item in results])
+    )
+    for key in (
+        "average_matches", "average_ess", "average_acceptance", "average_attempts",
+        "average_diversity", "average_path_coverage", "average_legacy_path_coverage",
+        "average_path_ess_quality", "average_current_path_agreement",
+        "average_draw_agreement", "average_point_concentration", "database_samples",
+        "average_database_weight", "mean_depth", "cards_remaining", "shoe_depth",
+    ):
+        combined[key] = float(np.mean([float(item.get(key, 0.0)) for item in results]))
+    combined["min_depth"] = min(int(item.get("min_depth", 0)) for item in results)
+    combined["max_depth"] = max(int(item.get("max_depth", 0)) for item in results)
+    combined["total_forecast_simulations"] = sum(
+        int(item.get("total_forecast_simulations", 0)) for item in results
+    )
+    combined["total_condition_attempts"] = sum(
+        int(item.get("total_condition_attempts", 0)) for item in results
+    )
+    combined["all_ancestry_paired"] = all(
+        bool(item.get("all_ancestry_paired", False)) for item in results
+    )
+    combined["all_replicas_updated"] = all(
+        bool(item.get("all_replicas_updated", False)) for item in results
+    )
+    combined["fallback_to_unconditioned"] = any(
+        bool(item.get("fallback_to_unconditioned", False)) for item in results
+    )
+
+    if not consensus_pass:
+        combined.update(
+            {
+                "recommend": "NONE",
+                "decision_tier": "OBSERVE",
+                "decision_source": "OBSERVE",
+                "signal_level": "OBSERVE",
+                "validated_signal": False,
+                "quality_pass": False,
+                "general_quality_pass": False,
+                "is_observe": True,
+                "stability": "UNSTABLE",
+                "reason": "主模型未取得多主種子一致驗證，本局觀望且不建立方向戰績",
+            }
+        )
+        combined["weakness_reason"] = (
+            str(primary.get("weakness_reason", ""))
+            + "；多主種子方向或驗證品質未形成完整共識"
+        ).strip("；")
+    else:
+        combined["recommend"] = dominant
+        combined["is_observe"] = False
+        combined["weakness_reason"] = (
+            str(primary.get("weakness_reason", ""))
+            + "；已通過三組獨立主種子方向共識"
+        ).strip("；")
+        combined["reason"] = (
+            str(primary.get("reason", ""))
+            + "；並通過三組獨立主種子方向與最低品質驗證"
+        ).strip("；")
+
+    return combined
+
+
 def predict(
     history: Union[str, Iterable[Any]],
     venue: str = "",
@@ -127,12 +342,27 @@ def predict(
         return {"ok": False, "error": "missing_point_observation", "message": "請輸入兩位數點數，例如65代表閒6莊5。"}
 
     seed = _new_seed(run_seed)
-    result = _ENGINE.analyze(
+    primary = _ENGINE.analyze(
         latest["player"],
         latest["banker"],
         seed,
         latest.get("path"),
     )
+    validators: List[Dict[str, Any]] = []
+    # Do not spend two extra model runs on a point that already failed the main
+    # quality gate. Independent validators are only used to confirm an eligible
+    # primary signal, never to rescue an OBSERVE result.
+    if str(primary.get("recommend", "NONE")).upper() in {"B", "P"}:
+        for index in range(1, CONSENSUS_RUNS):
+            validators.append(
+                _VALIDATOR_ENGINE.analyze(
+                    latest["player"],
+                    latest["banker"],
+                    mix_seed(seed, 10_000 + index),
+                    latest.get("path"),
+                )
+            )
+    result = _combine_master_seed_results(primary, validators)
     probabilities = _probability_dict(result["fused"])
     pf_probabilities = _probability_dict(result["pf"])
     control_probabilities = _probability_dict(result["control"])
@@ -154,8 +384,8 @@ def predict(
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": "V5_2_THREE_TIER_POINT_PF_LINE",
-        "model_version": "V5.2-THREE-TIER-FAST-20260716",
+        "engine": "V5_3_CONSERVATIVE_MULTI_SEED_POINT_PF_LINE",
+        "model_version": "V5.3-CONSERVATIVE-MULTI-SEED-20260717",
         "user_id": user_id,
         "venue": venue,
         "room": room,
@@ -189,6 +419,11 @@ def predict(
         "quality_pass": bool(result.get("quality_pass", False)),
         "general_quality_pass": bool(result.get("general_quality_pass", False)),
         "decision_tier": str(result.get("decision_tier", "OBSERVE")),
+        "master_seed_consensus_pass": bool(result.get("master_seed_consensus_pass", False)),
+        "master_seed_count": int(result.get("master_seed_count", 1)),
+        "master_seed_directions": list(result.get("master_seed_directions", [])),
+        "master_seed_agreement": round(float(result.get("master_seed_agreement", 0.0)), 6),
+        "master_seed_minimum_edge": round(float(result.get("master_seed_minimum_edge", 0.0)), 8),
         "lower_bound": round(float(result["lower_bound"]), 8),
         "centered_edge": round(float(result["center"]), 8),
         "center_se": round(float(result["center_se"]), 8),
@@ -234,10 +469,10 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            "V5.2單局獨立粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
+            "V5.3單局獨立粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
             f"每副本實際模擬總數約"
             f"{int(result['total_forecast_simulations']) // max(1, int(result['replicas']))}；"
-            "不使用歷史、牌路或連勝連敗；採正式、一般、觀望三層品質判定。"
+            "不使用歷史或牌路；採正式、一般、觀望三層品質判定，並加入多主種子共識驗證。"
             f"決策來源={result['decision_source']}；{result['reason']}。"
         ),
         "debug": None,
@@ -248,6 +483,9 @@ def predict(
             "votes": result["votes"],
             "outlier_count": result["outlier_count"],
             "robust_mad": result["robust_mad"],
+            "master_seed_directions": result.get("master_seed_directions", []),
+            "master_seed_validator_quality": result.get("master_seed_validator_quality", []),
+            "master_seed_centers": result.get("master_seed_centers", []),
         }
     return response
 
