@@ -1,4 +1,4 @@
-"""V5.3 conservative multi-seed-ready point-conditioned baccarat particle engine.
+"""V5.4 draw-path-fusion point-conditioned baccarat particle engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
@@ -118,6 +118,15 @@ GENERAL_REQUIRE_DIRECTION_CONSISTENCY = _env_bool(
     "PF_GENERAL_REQUIRE_DIRECTION_CONSISTENCY", True
 )
 
+# V5.4 directly fuses the observed-hand draw-path posterior and the simulated
+# next-hand draw-path-specific outcome effect into the final direction. These
+# are predictive weights, not observe gates.
+CURRENT_PATH_SIGNAL_WEIGHT = _env_float("PF_CURRENT_PATH_SIGNAL_WEIGHT", 0.28, 0.0, 0.75)
+NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.34, 0.0, 0.75)
+BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.38, 0.0, 1.0)
+PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.72, 0.0, 1.0)
+PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 12, 4, 5000)
+
 _PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
 _PRIOR_CACHE_LOCK = threading.RLock()
 
@@ -195,6 +204,7 @@ class ReplicaResult:
     database: np.ndarray
     fused: np.ndarray
     next_draw_paths: np.ndarray
+    next_path_centers: np.ndarray
     point_matrix: np.ndarray
     top_points: List[Dict[str, Any]]
     paired_center: float
@@ -815,6 +825,14 @@ class V5ReplicaEngine:
         split_disagreement = abs(split_centers[0] - split_centers[1])
         internal_se = 0.5 * split_disagreement
         next_draw = normalize_array(conditioned_draw, DRAW_BASELINE)
+        next_path_centers = np.zeros(4, dtype=float)
+        for path in range(4):
+            path_n = float(path_outcome_c[path].sum())
+            if path_n >= float(settings["path_min_samples_for_signal"]):
+                next_path_centers[path] = _center(
+                    path_outcome_c[path],
+                    path_outcome_u[path],
+                )
         matrix = point_matrix / max(1.0, float(point_matrix.sum()))
         top_idx = np.argsort(matrix)[::-1][:10]
         top_points = []
@@ -942,6 +960,7 @@ class V5ReplicaEngine:
             database=db_probs,
             fused=fused,
             next_draw_paths=next_draw,
+            next_path_centers=next_path_centers,
             point_matrix=matrix,
             top_points=top_points,
             paired_center=paired_center,
@@ -1110,7 +1129,26 @@ def decide_ensemble(
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
 
-    centers = [row.paired_center for row in rows]
+    # Fuse three complementary signals per replica:
+    # 1) overall conditioned-vs-control effect,
+    # 2) posterior-weighted effect of how the observed hand was completed,
+    # 3) probability-weighted effect of the next hand's four draw paths.
+    # Sparse path effects are shrunk rather than used as a hard observe gate.
+    base_w = float(settings["base_signal_weight"])
+    current_w = float(settings["current_path_signal_weight"])
+    next_w = float(settings["next_path_signal_weight"])
+    total_w = max(1e-12, base_w + current_w + next_w)
+    shrink = float(settings["path_signal_shrink"])
+    centers = []
+    for row in rows:
+        current_signal = float(np.dot(row.draw_paths, row.current_path_centers)) * shrink
+        next_signal = float(np.dot(row.next_draw_paths, row.next_path_centers)) * shrink
+        fused_center = (
+            base_w * row.paired_center
+            + current_w * current_signal
+            + next_w * next_signal
+        ) / total_w
+        centers.append(fused_center)
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
     sw2 = sum(w * w for w in weights)
@@ -1197,12 +1235,14 @@ def decide_ensemble(
         edge = abs(robust)
         reason = "通過一般品質閘門；保留方向但未標示為正式驗證訊號"
     else:
-        recommend = "NONE"
-        decision_source = "OBSERVE"
-        decision_tier = "OBSERVE"
-        signal = "OBSERVE"
-        edge = 0.0
-        reason = "副本、分半樣本或補牌路徑品質不足，本局觀望且不建立下注方向"
+        # V5.4 always returns the path-fused direction. Quality remains visible
+        # as FALLBACK, but path disagreement no longer suppresses the result.
+        recommend = model_side
+        decision_source = "DRAW_PATH_FUSION"
+        decision_tier = "FALLBACK"
+        signal = "LOW"
+        edge = abs(robust)
+        reason = "未通過正式品質閘門；改用當局與下一局四種補牌路徑融合方向"
 
     return {
         "recommend": recommend,
@@ -1223,7 +1263,7 @@ def decide_ensemble(
         "quality_pass": strict_quality_pass,
         "general_quality_pass": general_quality_pass,
         "decision_tier": decision_tier,
-        "is_observe": recommend == "NONE",
+        "is_observe": False,
         "decision_source": decision_source,
         "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
         "player_ev": float(fused[1] - fused[0]),
@@ -1354,6 +1394,21 @@ class V5IndependentBaccaratEngine:
                     "general_require_direction_consistency",
                     GENERAL_REQUIRE_DIRECTION_CONSISTENCY,
                 )
+            ),
+            "current_path_signal_weight": float(
+                supplied.get("current_path_signal_weight", CURRENT_PATH_SIGNAL_WEIGHT)
+            ),
+            "next_path_signal_weight": float(
+                supplied.get("next_path_signal_weight", NEXT_PATH_SIGNAL_WEIGHT)
+            ),
+            "base_signal_weight": float(
+                supplied.get("base_signal_weight", BASE_SIGNAL_WEIGHT)
+            ),
+            "path_signal_shrink": float(
+                supplied.get("path_signal_shrink", PATH_SIGNAL_SHRINK)
+            ),
+            "path_min_samples_for_signal": int(
+                supplied.get("path_min_samples_for_signal", PATH_MIN_SAMPLES_FOR_SIGNAL)
             ),
         }
 
