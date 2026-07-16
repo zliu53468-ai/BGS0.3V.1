@@ -1,4 +1,4 @@
-"""LINE-compatible V5.6 1000-particle database-candidate revalidation predictor."""
+"""LINE-compatible V5.7 1000-particle EV-direction database-candidate revalidation predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -348,7 +348,7 @@ def predict(
         seed,
         latest.get("path"),
     )
-    # V5.5 uses one complete 1000-particle primary run. The 2,000-sample paired
+    # V5.7 uses one complete 1000-particle primary run. The 2,000-sample paired
     # forecast pool lets all 1,000 particle indices participate once per replica
     # while avoiding the latency of extra consensus engines.
     result = primary
@@ -367,7 +367,7 @@ def predict(
     elif recommend == "P":
         recommend_text = "閒"
     else:
-        recommend = "B" if float(result.get("center", 0.0)) >= 0 else "P"
+        recommend = "B" if float(result.get("decision_center", result.get("center", 0.0))) >= 0 else "P"
         recommend_text = "莊" if recommend == "B" else "閒"
 
     confidence = max(probabilities["B"], probabilities["P"]) / max(
@@ -378,8 +378,8 @@ def predict(
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": "V5_6_DB_CANDIDATE_REVALIDATION_1000P_LINE",
-        "model_version": "V5.6-DB-CANDIDATE-REVALIDATION-1000P-20260717",
+        "engine": "V5_7_EV_DIRECTION_DB_REVALIDATION_1000P_LINE",
+        "model_version": "V5.7-EV-DIRECTION-DB-REVALIDATION-1000P-20260717",
         "user_id": user_id,
         "venue": venue,
         "room": room,
@@ -420,6 +420,10 @@ def predict(
         "master_seed_minimum_edge": round(float(result.get("master_seed_minimum_edge", 0.0)), 8),
         "lower_bound": round(float(result["lower_bound"]), 8),
         "centered_edge": round(float(result["center"]), 8),
+        "decision_center": round(float(result.get("decision_center", result["center"])), 8),
+        "relative_control_center": round(float(result.get("relative_control_center", 0.0)), 8),
+        "banker_ev": round(float(result.get("banker_ev", 0.0)), 8),
+        "player_ev": round(float(result.get("player_ev", 0.0)), 8),
         "center_se": round(float(result["center_se"]), 8),
         "replica_count": int(result["replicas"]),
         "replica_directions": list(result["replica_directions"]),
@@ -480,7 +484,7 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            "V5.6單局獨立1000粒子模型；先由粒子產生00-99點數矩陣，再使用倉庫內500萬資料庫的莊閒和與四種補牌先驗重排候選，"
+            "V5.7單局獨立1000粒子EV方向模型；先由粒子產生00-99點數矩陣，再使用倉庫內500萬資料庫的莊閒和與四種補牌先驗重排候選，"
             "最後用獨立亂數流做第二次合法補牌模擬驗證後才轉換成莊閒方向；不新增資料庫檔案。"
             f"每副本主要模擬約{int(result['total_forecast_simulations']) // max(1, int(result['replicas']))}次；"
             f"決策來源={result['decision_source']}；{result['reason']}。"
