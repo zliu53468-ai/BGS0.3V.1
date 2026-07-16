@@ -1,4 +1,4 @@
-"""LINE-compatible V5.1.6 500-particle independent point predictor."""
+"""LINE-compatible V5.2 three-tier independent point predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -6,7 +6,11 @@ import os
 import re
 import secrets
 
-from particle_filter_points import DB_HOLDOUT, V5IndependentBaccaratEngine
+from particle_filter_points import (
+    DB_HOLDOUT,
+    V5IndependentBaccaratEngine,
+    clear_runtime_caches,
+)
 from shoe_state_db import get_shoe_state_database
 
 PATH_SUFFIX = {"N": 0, "P": 1, "B": 2, "D": 3}
@@ -28,6 +32,11 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 RANDOMIZE_EACH_CALL = _env_bool("PF_RANDOMIZE_EACH_CALL", True)
 FIXED_RUN_SEED = _env_int("PF_FIXED_RUN_SEED", 0, 0)
 DEBUG_V5_RESULT = _env_bool("PF_DEBUG_V5_RESULT", False)
+
+# The engine is stateless. Reusing one configured instance avoids reconstructing
+# the settings dictionary for every LINE message; request-specific randomness is
+# still supplied to analyze() through the run seed.
+_ENGINE = V5IndependentBaccaratEngine()
 
 
 def parse_point_observation(value: Any) -> Optional[Dict[str, Any]]:
@@ -118,20 +127,35 @@ def predict(
         return {"ok": False, "error": "missing_point_observation", "message": "請輸入兩位數點數，例如65代表閒6莊5。"}
 
     seed = _new_seed(run_seed)
-    engine = V5IndependentBaccaratEngine()
-    result = engine.analyze(latest["player"], latest["banker"], seed, latest.get("path"))
+    result = _ENGINE.analyze(
+        latest["player"],
+        latest["banker"],
+        seed,
+        latest.get("path"),
+    )
     probabilities = _probability_dict(result["fused"])
     pf_probabilities = _probability_dict(result["pf"])
     control_probabilities = _probability_dict(result["control"])
     db_probabilities = _probability_dict(result["database"])
-    recommend = str(result["recommend"])
-    confidence = max(probabilities["B"], probabilities["P"]) / max(1e-12, probabilities["B"] + probabilities["P"])
+    recommend = str(result["recommend"]).upper()
+    if recommend == "B":
+        recommend_text = "莊"
+    elif recommend == "P":
+        recommend_text = "閒"
+    else:
+        recommend = "NONE"
+        recommend_text = "觀望"
+
+    confidence = max(probabilities["B"], probabilities["P"]) / max(
+        1e-12,
+        probabilities["B"] + probabilities["P"],
+    )
     point_text = f"{latest['player']}{latest['banker']}{latest.get('suffix', '')}"
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": "V5_1_6_500_PARTICLE_LINE",
-        "model_version": "V5.1.6-500P-LINE-20260715",
+        "engine": "V5_2_THREE_TIER_POINT_PF_LINE",
+        "model_version": "V5.2-THREE-TIER-FAST-20260716",
         "user_id": user_id,
         "venue": venue,
         "room": room,
@@ -154,8 +178,8 @@ def predict(
         "control_probabilities": control_probabilities,
         "shoe_database_probabilities": db_probabilities,
         "recommend": recommend,
-        "recommend_text": "莊" if recommend == "B" else "閒",
-        "is_observe": False,
+        "recommend_text": recommend_text,
+        "is_observe": recommend == "NONE",
         "confidence": round(confidence, 6),
         "confidence_pct": round(confidence * 100.0, 1),
         "decision_edge": round(float(result["edge"]), 8),
@@ -163,6 +187,8 @@ def predict(
         "decision_source": str(result["decision_source"]),
         "validated_signal": bool(result["validated_signal"]),
         "quality_pass": bool(result.get("quality_pass", False)),
+        "general_quality_pass": bool(result.get("general_quality_pass", False)),
+        "decision_tier": str(result.get("decision_tier", "OBSERVE")),
         "lower_bound": round(float(result["lower_bound"]), 8),
         "centered_edge": round(float(result["center"]), 8),
         "center_se": round(float(result["center_se"]), 8),
@@ -208,8 +234,10 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            "V5.1.6單局獨立500粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
-            "顯著路徑候選與ESS門檻；每副本600+600次統一樣本池；不使用歷史、牌路、連勝連敗或固定莊回退。"
+            "V5.2單局獨立粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
+            f"每副本實際模擬總數約"
+            f"{int(result['total_forecast_simulations']) // max(1, int(result['replicas']))}；"
+            "不使用歷史、牌路或連勝連敗；採正式、一般、觀望三層品質判定。"
             f"決策來源={result['decision_source']}；{result['reason']}。"
         ),
         "debug": None,
@@ -234,4 +262,10 @@ def reset_uid_model(user_id: str, venue: str = "", room: str = "", shoe_id: str 
 
 
 def clear_model_cache(user_id: Optional[str] = None) -> Dict[str, Any]:
-    return {"ok": True, "removed": 0, "independent_mode": True}
+    removed = clear_runtime_caches()
+    return {
+        "ok": True,
+        "removed": removed,
+        "independent_mode": True,
+        "message": "已清除粒子先驗快取；不影響任何UID歷史資料。",
+    }
