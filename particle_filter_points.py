@@ -1,10 +1,9 @@
-"""V5.6 1000-particle database-candidate revalidation baccarat engine.
+"""V5.2.0 stateless point-conditioned baccarat particle engine.
 
 The official LINE predictor uses only the newest final-point observation.
-Every request creates fresh conditional candidates, replicas and forecast samples.
-A calibrated stratified prior may be reused as an immutable speed cache; no road,
-streak, Markov state, previous recommendation or per-UID particle state is carried
-into the next request.
+Every request creates fresh particles, fresh replicas and fresh forecast samples.
+No road, streak, Markov state, previous recommendation or per-UID particle state
+is carried into the next request.
 """
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import hashlib
 import math
 import os
-import threading
 
 import numpy as np
 
@@ -49,20 +47,27 @@ def _env_choice(name: str, default: str, allowed: Sequence[str]) -> str:
     return value if value in allowed else default
 
 
+MIN_PARTICLE_COUNT = 64
+MAX_PARTICLE_COUNT = 2000
 DECKS = _env_int("PF_DECKS", 8, 1, 16)
-PARTICLE_COUNT = _env_int("PF_PARTICLES", 1000, 64, 2000)
+PARTICLE_COUNT = _env_int("PF_PARTICLES", 1000, MIN_PARTICLE_COUNT, MAX_PARTICLE_COUNT)
 REPLICA_COUNT = _env_int("PF_REPLICAS", 5, 3, 11)
-TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 520, 32, 8000)
-TARGET_ESS = _env_float("PF_TARGET_ESS", 360.0, 8.0, 8000.0)
+# These defaults scale with the requested particle count again inside condition().
+# This prevents a 1000/2000-particle run from being filled mostly by duplicates
+# drawn from the old 320-candidate pool.
+TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 600, 32, 8000)
+TARGET_ESS = _env_float("PF_TARGET_ESS", 380.0, 8.0, 8000.0)
 MIN_MATCHES = _env_int("PF_MIN_MATCHES", 80, 1, 8000)
-MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 60_000, 500, 750_000)
-PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 32, 4, 512)
-PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 10, 1, 256)
-PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 6.0, 1.0, 256.0)
+MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 150_000, 500, 500_000)
+PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 24, 4, 512)
+PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 6, 1, 256)
+PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 4.0, 1.0, 256.0)
 MIN_PATH_COVERAGE = _env_float("PF_MIN_DRAW_PATH_COVERAGE", 0.80, 0.0, 1.0)
 PATH_UNCERTAINTY = _env_float("PF_DRAW_PATH_UNCERTAINTY", 0.40, 0.0, 2.0)
-PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 1000, 100, 200_000)
-POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 1000, 100, 200_000)
+PATH_PRIOR_STRENGTH = _env_float("PF_DRAW_PATH_PRIOR_STRENGTH", 2.0, 0.0, 50.0)
+MIN_PATH_PARTICLES = _env_int("PF_MIN_PARTICLES_PER_DRAW_PATH", 24, 1, 512)
+PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
+POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
 SPLIT_UNCERTAINTY = _env_float("PF_SPLIT_UNCERTAINTY", 0.50, 0.0, 2.0)
 MIN_EFFECTIVE_REPLICAS = _env_float("PF_MIN_EFFECTIVE_REPLICAS", 3.5, 1.0, 11.0)
 ADAPTIVE_REPLICA_WEIGHT = _env_bool("PF_ADAPTIVE_REPLICA_WEIGHT", True)
@@ -76,75 +81,6 @@ MIN_VALIDATED_EDGE = _env_float("PF_MIN_VALIDATED_EDGE", 0.0012, 0.0, 0.05)
 MIN_REPLICA_AGREEMENT = _env_float("PF_MIN_REPLICA_AGREEMENT", 0.71, 0.50, 1.0)
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 DECISION_MODE = _env_choice("PF_DECISION_MODE", "validated", ("validated", "centered", "raw", "ev"))
-
-# Runtime acceleration. The default fast path preserves the particle/filter
-# mathematics while avoiding work that cannot affect the recommendation.
-FAST_MODE = _env_bool("PF_FAST_MODE", True)
-CACHE_STRATIFIED_PRIORS = _env_bool("PF_CACHE_STRATIFIED_PRIORS", True)
-SKIP_UNUSED_DB_DIAGNOSTICS = _env_bool("PF_SKIP_UNUSED_DB_DIAGNOSTICS", True)
-FORECAST_SAMPLE_CAP = _env_int("PF_FORECAST_SAMPLE_CAP", 2000, 200, 400_000)
-FAST_PARTICLE_CAP = _env_int("PF_FAST_PARTICLE_CAP", 1000, 64, 2000)
-FAST_TARGET_MATCHES_CAP = _env_int("PF_FAST_TARGET_MATCHES_CAP", 420, 32, 8000)
-FAST_TARGET_ESS_CAP = _env_float("PF_FAST_TARGET_ESS_CAP", 300.0, 8.0, 8000.0)
-FAST_MAX_UPDATE_PROPOSALS = _env_int(
-    "PF_FAST_MAX_UPDATE_PROPOSALS", 40_000, 500, 750_000
-)
-FAST_PATH_TARGET_MATCHES_CAP = _env_int(
-    "PF_FAST_PATH_TARGET_MATCHES_CAP", 24, 4, 512
-)
-
-# Three-level decision gate. V5.3 deliberately restores meaningful general
-# thresholds: a GENERAL signal must be internally stable, uncertainty-adjusted,
-# path-consistent and materially separated from zero. This lowers entry
-# frequency instead of relabelling nearly-random output as a usable signal.
-GENERAL_REPLICA_AGREEMENT = _env_float("PF_GENERAL_REPLICA_AGREEMENT", 0.70, 0.50, 1.0)
-GENERAL_ESS_RATIO = _env_float("PF_GENERAL_ESS_RATIO", 0.65, 0.05, 1.0)
-GENERAL_DIVERSITY = _env_float("PF_GENERAL_DIVERSITY", 0.35, 0.05, 1.0)
-GENERAL_SPLIT_AGREEMENT = _env_float("PF_GENERAL_SPLIT_AGREEMENT", 0.60, 0.0, 1.0)
-GENERAL_PATH_COVERAGE = _env_float("PF_GENERAL_PATH_COVERAGE", 0.70, 0.0, 1.0)
-GENERAL_EFFECTIVE_REPLICA_RATIO = _env_float(
-    "PF_GENERAL_EFFECTIVE_REPLICA_RATIO", 0.85, 0.10, 1.0
-)
-GENERAL_UPDATED_RATIO = _env_float("PF_GENERAL_UPDATED_RATIO", 0.80, 0.0, 1.0)
-GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.0030, 0.0, 0.05)
-GENERAL_MIN_LOWER_EDGE = _env_float("PF_GENERAL_MIN_LOWER_EDGE", 0.0, 0.0, 0.05)
-GENERAL_MIN_CURRENT_PATH_AGREEMENT = _env_float(
-    "PF_GENERAL_MIN_CURRENT_PATH_AGREEMENT", 0.55, 0.0, 1.0
-)
-GENERAL_MIN_NEXT_DRAW_AGREEMENT = _env_float(
-    "PF_GENERAL_MIN_NEXT_DRAW_AGREEMENT", 0.55, 0.0, 1.0
-)
-GENERAL_REQUIRE_DIRECTION_CONSISTENCY = _env_bool(
-    "PF_GENERAL_REQUIRE_DIRECTION_CONSISTENCY", True
-)
-
-# V5.4 directly fuses the observed-hand draw-path posterior and the simulated
-# next-hand draw-path-specific outcome effect into the final direction. These
-# are predictive weights, not observe gates.
-CURRENT_PATH_SIGNAL_WEIGHT = _env_float("PF_CURRENT_PATH_SIGNAL_WEIGHT", 0.0, 0.0, 0.75)
-NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.28, 0.0, 0.75)
-BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.72, 0.0, 1.0)
-PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.50, 0.0, 1.0)
-PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 40, 4, 10000)
-
-# V5.6 database-assisted candidate point generation. The existing 5M database
-# stores outcome and legal draw-path aggregates by remaining-shoe state. It does
-# not contain a native 00-99 matrix, so V5.6 uses those aggregates as priors to
-# re-rank particle-generated point candidates, then validates them with a second
-# independent simulation stream.
-DB_CANDIDATE_ENABLED = _env_bool("PF_DB_CANDIDATE_ENABLED", True)
-DB_CANDIDATE_SCAN_PARTICLES = _env_int("PF_DB_CANDIDATE_SCAN_PARTICLES", 192, 32, 1000)
-DB_CANDIDATE_TOP_K = _env_int("PF_DB_CANDIDATE_TOP_K", 20, 5, 60)
-DB_CANDIDATE_WEIGHT = _env_float("PF_DB_CANDIDATE_WEIGHT", 0.35, 0.0, 0.80)
-PARTICLE_POINT_WEIGHT = _env_float("PF_PARTICLE_POINT_WEIGHT", 0.40, 0.0, 1.0)
-POINT_REVALIDATION_WEIGHT = _env_float("PF_POINT_REVALIDATION_WEIGHT", 0.25, 0.0, 0.80)
-POINT_REVALIDATION_SIMS = _env_int("PF_POINT_REVALIDATION_SIMS", 800, 100, 10000)
-POINT_REVALIDATION_PRIOR = _env_float("PF_POINT_REVALIDATION_PRIOR", 120.0, 1.0, 5000.0)
-DB_OUTCOME_RATIO_CLIP = _env_float("PF_DB_OUTCOME_RATIO_CLIP", 1.35, 1.0, 3.0)
-DB_PATH_RATIO_CLIP = _env_float("PF_DB_PATH_RATIO_CLIP", 1.35, 1.0, 3.0)
-
-_PRIOR_CACHE: Dict[Tuple[int, int, int], Tuple[Tuple[np.ndarray, ...], Tuple[int, ...]]] = {}
-_PRIOR_CACHE_LOCK = threading.RLock()
 
 BASELINE = np.asarray(DEFAULT_BASELINE, dtype=float)
 DRAW_BASELINE = np.asarray(DEFAULT_DRAW, dtype=float)
@@ -162,6 +98,24 @@ CALIBRATED_DEPTH_PROFILE: Tuple[Tuple[int, int, float], ...] = (
     (26, 40, 0.40),
     (41, 55, 0.20),
 )
+
+
+def _scaled_runtime_settings(settings: Mapping[str, Any], particle_count: int) -> Dict[str, Any]:
+    """Return effective settings after scaling sample-quality targets by particles."""
+    out = dict(settings)
+    particles = max(MIN_PARTICLE_COUNT, min(MAX_PARTICLE_COUNT, int(particle_count)))
+    out["particles"] = particles
+    out["target_matches"] = max(int(out["target_matches"]), int(math.ceil(particles * 0.60)))
+    out["target_ess"] = max(float(out["target_ess"]), particles * 0.38)
+    out["min_matches"] = max(int(out["min_matches"]), int(math.ceil(particles * 0.08)))
+    out["path_target_matches"] = max(
+        int(out["path_target_matches"]), int(math.ceil(particles * 0.024))
+    )
+    out["max_update_proposals"] = min(
+        500_000,
+        max(int(out["max_update_proposals"]), int(out["target_matches"]) * 240),
+    )
+    return out
 
 
 @dataclass
@@ -220,11 +174,7 @@ class ReplicaResult:
     database: np.ndarray
     fused: np.ndarray
     next_draw_paths: np.ndarray
-    next_path_centers: np.ndarray
     point_matrix: np.ndarray
-    database_candidate_matrix: np.ndarray
-    revalidated_point_matrix: np.ndarray
-    database_draw_paths: np.ndarray
     top_points: List[Dict[str, Any]]
     paired_center: float
     split_centers: Tuple[float, float]
@@ -379,6 +329,7 @@ def exact_conditional_complete(
     rng: np.random.Generator,
     observed_player: int,
     observed_banker: int,
+    known_path: Optional[int] = None,
 ) -> Optional[Tuple[np.ndarray, int, float, int]]:
     counts = np.asarray(source, dtype=np.int16).copy()
     try:
@@ -416,6 +367,8 @@ def exact_conditional_complete(
     if player_total != observed_player or banker_total != observed_banker:
         return None
     path = (1 if player_third is not None else 0) + (2 if banker_third is not None else 0)
+    if known_path is not None and path != int(known_path):
+        return None
     cards = 4 + (1 if player_third is not None else 0) + (1 if banker_third is not None else 0)
     return counts, path, max(1e-12, float(weight)), cards
 
@@ -485,28 +438,47 @@ def systematic_weighted_resample(
     return [items[int(i)] for i in idx]
 
 
-def allocate_path_particles(masses: np.ndarray, total: int, available: np.ndarray) -> np.ndarray:
-    masses = np.asarray(masses, dtype=float)
+def allocate_path_particles(
+    masses: np.ndarray,
+    total: int,
+    available: np.ndarray,
+    minimum_per_available: int = 1,
+) -> np.ndarray:
+    """Allocate particles by posterior path mass while protecting rare legal paths.
+
+    A small floor prevents a low-probability but legal draw path from receiving only
+    one particle, which made its next-hand estimate extremely noisy at high particle
+    counts. Remaining particles are distributed by largest remainder.
+    """
+    masses = np.maximum(0.0, np.asarray(masses, dtype=float))
     available = np.asarray(available, dtype=bool)
     alloc = np.zeros(4, dtype=int)
-    raw = np.maximum(0.0, masses) * total
-    for i in range(4):
-        if available[i]:
-            alloc[i] = int(math.floor(raw[i]))
-            if masses[i] > 0 and alloc[i] == 0:
-                alloc[i] = 1
+    eligible = [i for i in range(4) if available[i]]
+    if total <= 0 or not eligible:
+        return alloc
+
+    floor = min(max(1, int(minimum_per_available)), max(1, total // len(eligible)))
+    for i in eligible:
+        alloc[i] = floor
     while int(alloc.sum()) > total:
-        candidates = [i for i in range(4) if alloc[i] > 1]
-        if not candidates:
-            break
-        alloc[max(candidates, key=lambda i: alloc[i])] -= 1
-    fractions = sorted(range(4), key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
-    cursor = 0
-    while int(alloc.sum()) < total:
-        i = fractions[cursor % 4]
-        cursor += 1
-        if available[i]:
-            alloc[i] += 1
+        i = max(eligible, key=lambda j: alloc[j])
+        alloc[i] -= 1
+
+    remaining = total - int(alloc.sum())
+    if remaining <= 0:
+        return alloc
+
+    masked = np.where(available, masses, 0.0)
+    if float(masked.sum()) <= 0:
+        masked = available.astype(float)
+    masked /= float(masked.sum())
+    raw = masked * remaining
+    base = np.floor(raw).astype(int)
+    alloc += base
+    left = total - int(alloc.sum())
+    order = sorted(eligible, key=lambda i: raw[i] - base[i], reverse=True)
+    for cursor in range(left):
+        alloc[order[cursor % len(order)]] += 1
     return alloc
 
 
@@ -546,23 +518,6 @@ def _weighted_median(values: Sequence[float], weights: Sequence[float]) -> float
         if acc >= total / 2:
             return float(value)
     return float(pairs[-1][0])
-
-
-def _point_outcome_index(index: int) -> int:
-    player, banker = divmod(int(index), 10)
-    return 0 if banker > player else 1 if player > banker else 2
-
-
-def _point_feasible_path_mass(index: int, draw_probs: np.ndarray) -> float:
-    player, banker = divmod(int(index), 10)
-    feasible = feasible_current_paths(player, banker, None)
-    mass = float(np.asarray(draw_probs, dtype=float)[feasible].sum())
-    return max(1e-12, mass)
-
-
-def _normalize_weight_triplet(a: float, b: float, c: float) -> Tuple[float, float, float]:
-    total = max(1e-12, float(a) + float(b) + float(c))
-    return float(a) / total, float(b) / total, float(c) / total
 
 
 class V5ReplicaEngine:
@@ -614,14 +569,23 @@ class V5ReplicaEngine:
         accepted: List[ConditionalCandidate] = []
         attempts = 0
         ess = 0.0
-        accepted_weight_sum = 0.0
-        accepted_weight_sq_sum = 0.0
-        max_proposals = int(settings["max_update_proposals"])
+        # Scale the accepted conditional population with the particle population.
+        # Otherwise increasing PF_PARTICLES mostly duplicates the same old candidates.
+        effective = _scaled_runtime_settings(settings, self.particle_count)
+        target_matches = int(effective["target_matches"])
+        target_ess = float(effective["target_ess"])
+        min_matches = int(effective["min_matches"])
+        path_target_matches = int(effective["path_target_matches"])
+        max_proposals = int(effective["max_update_proposals"])
         while attempts < max_proposals:
             parent_index = int(self.rng.integers(0, len(prior_particles)))
             source = prior_particles[parent_index]
             completed = exact_conditional_complete(
-                source, self.rng, int(player_total) % 10, int(banker_total) % 10
+                source,
+                self.rng,
+                int(player_total) % 10,
+                int(banker_total) % 10,
+                known_path,
             )
             attempts += 1
             if completed is not None:
@@ -637,29 +601,19 @@ class V5ReplicaEngine:
                     )
                     accepted.append(item)
                     by_path[path].append(item)
-                    accepted_weight_sum += max(0.0, float(weight))
-                    accepted_weight_sq_sum += max(0.0, float(weight)) ** 2
-            if attempts % 64 == 0:
-                ess = (
-                    accepted_weight_sum * accepted_weight_sum / accepted_weight_sq_sum
-                    if accepted_weight_sq_sum > 0.0
-                    else 0.0
-                )
+            if attempts % 32 == 0:
+                ess = weighted_ess(accepted)
                 total_ready = (
-                    len(accepted) >= int(settings["target_matches"])
-                    and ess >= float(settings["target_ess"])
+                    len(accepted) >= target_matches
+                    and ess >= target_ess
                 )
                 strata_ready = all(
-                    (not feasible[p]) or len(by_path[p]) >= int(settings["path_target_matches"])
+                    (not feasible[p]) or len(by_path[p]) >= path_target_matches
                     for p in range(4)
                 )
                 if total_ready and strata_ready:
                     break
-        ess = (
-            accepted_weight_sum * accepted_weight_sum / accepted_weight_sq_sum
-            if accepted_weight_sq_sum > 0.0
-            else 0.0
-        )
+        ess = weighted_ess(accepted)
         path_counts = np.asarray([len(rows) for rows in by_path], dtype=float)
         path_ess = np.asarray([weighted_ess(rows) for rows in by_path], dtype=float)
         path_weight_sums = np.asarray(
@@ -668,7 +622,13 @@ class V5ReplicaEngine:
         fallback_draw = np.where(feasible, DRAW_BASELINE, 0.0)
         if float(fallback_draw.sum()) <= 0:
             fallback_draw = feasible.astype(float)
-        path_posterior = normalize_array(path_weight_sums, fallback_draw)
+        # Weak Dirichlet smoothing stabilizes rare legal draw paths without
+        # overriding the importance-weighted conditional evidence.
+        path_prior = normalize_array(fallback_draw, DRAW_BASELINE)
+        path_posterior = normalize_array(
+            path_weight_sums + float(settings["path_prior_strength"]) * path_prior,
+            fallback_draw,
+        )
         if not accepted:
             particles = [np.asarray(x, dtype=np.int16).copy() for x in prior_particles]
             unique = len({x.tobytes() for x in particles})
@@ -698,7 +658,12 @@ class V5ReplicaEngine:
                 ancestry_paired=False,
             )
         available = path_counts > 0
-        allocation = allocate_path_particles(path_posterior, self.particle_count, available)
+        allocation = allocate_path_particles(
+            path_posterior,
+            self.particle_count,
+            available,
+            int(settings["min_path_particles"]),
+        )
         particles: List[np.ndarray] = []
         depths: List[int] = []
         controls: List[np.ndarray] = []
@@ -765,7 +730,7 @@ class V5ReplicaEngine:
             control_depths=control_depths,
             current_paths=current_paths,
             updated=True,
-            low_sample=len(accepted) < int(settings["min_matches"]) or low_path_sample,
+            low_sample=len(accepted) < min_matches or ess < target_ess * 0.60 or low_path_sample,
             matches=len(accepted),
             attempts=attempts,
             ess=ess,
@@ -785,15 +750,12 @@ class V5ReplicaEngine:
         )
 
     def forecast(self, population: ConditionedPopulation, settings: Mapping[str, Any]) -> ReplicaResult:
-        requested_samples = max(
+        particle_count = len(population.particles)
+        samples = max(
             200,
             int(settings["predict_simulations_per_replica"])
             + int(settings["point_joint_simulations_per_replica"]),
-        )
-        samples = (
-            min(requested_samples, int(settings["forecast_sample_cap"]))
-            if bool(settings["fast_mode"])
-            else requested_samples
+            particle_count * 2,
         )
         pairs = int(math.ceil(samples / 2.0))
         conditioned = np.zeros(3, dtype=float)
@@ -808,7 +770,6 @@ class V5ReplicaEngine:
         point_matrix = np.zeros(100, dtype=float)
         split_c = np.zeros((2, 3), dtype=float)
         split_u = np.zeros((2, 3), dtype=float)
-        particle_count = len(population.particles)
         cycle = 0
         order = np.random.default_rng(mix_seed(self.seed, 880001)).permutation(particle_count)
         for n in range(pairs):
@@ -861,14 +822,18 @@ class V5ReplicaEngine:
         split_disagreement = abs(split_centers[0] - split_centers[1])
         internal_se = 0.5 * split_disagreement
         next_draw = normalize_array(conditioned_draw, DRAW_BASELINE)
-        next_path_centers = np.zeros(4, dtype=float)
-        for path in range(4):
-            path_n = float(path_outcome_c[path].sum())
-            if path_n >= float(settings["path_min_samples_for_signal"]):
-                next_path_centers[path] = _center(
-                    path_outcome_c[path],
-                    path_outcome_u[path],
-                )
+        matrix = point_matrix / max(1.0, float(point_matrix.sum()))
+        top_idx = np.argsort(matrix)[::-1][:10]
+        top_points = []
+        for idx in top_idx:
+            p, b = int(idx // 10), int(idx % 10)
+            top_points.append(
+                {
+                    "point": f"{p}{b}",
+                    "probability": float(matrix[idx]),
+                    "outcome": "B" if b > p else "P" if p > b else "T",
+                }
+            )
         positive_mass = negative_mass = decisive_mass = 0.0
         for path in range(4):
             c_mass = float(path_outcome_c[path].sum()) / max(1.0, samples)
@@ -886,7 +851,7 @@ class V5ReplicaEngine:
             else:
                 negative_mass += mass
         draw_agreement = max(positive_mass, negative_mass) / decisive_mass if decisive_mass else 0.5
-        base_paired_center = _center(conditioned, control)
+        paired_center = _center(conditioned, control)
         current_centers = np.zeros(4, dtype=float)
         current_directions = ["—"] * 4
         cp_positive = cp_negative = cp_decisive = 0.0
@@ -904,131 +869,12 @@ class V5ReplicaEngine:
                 cp_positive += mass
             else:
                 cp_negative += mass
-            disp_num += mass * (value - base_paired_center) ** 2
+            disp_num += mass * (value - paired_center) ** 2
             disp_mass += mass
         current_agreement = max(cp_positive, cp_negative) / cp_decisive if cp_decisive else 0.5
         current_dispersion = math.sqrt(disp_num / disp_mass) if disp_mass else 0.0
         effective_paths = max(1, int(np.count_nonzero(current_path_samples >= 8)))
         current_internal_se = current_dispersion / math.sqrt(effective_paths)
-
-        raw_matrix = normalize_array(point_matrix, np.full(100, 0.01))
-        database = get_shoe_state_database()
-
-        # Aggregate the existing 5M state database over a deterministic, evenly
-        # spaced subset of the conditioned particles. This keeps latency bounded
-        # while still using the repository database on every request.
-        db_total = np.zeros(3, dtype=float)
-        db_draw_total = np.zeros(4, dtype=float)
-        db_rel = db_samples = 0.0
-        scan_n = min(len(population.particles), int(settings["db_candidate_scan_particles"]))
-        if bool(settings["db_candidate_enabled"]) and scan_n > 0:
-            scan_idx = np.linspace(0, len(population.particles) - 1, scan_n, dtype=int)
-            inv = 1.0 / float(scan_n)
-            for particle_index in scan_idx:
-                estimate = database.estimate(population.particles[int(particle_index)], self.decks)
-                db_total += inv * np.asarray([
-                    estimate.probabilities["B"],
-                    estimate.probabilities["P"],
-                    estimate.probabilities["T"],
-                ], dtype=float)
-                db_draw_total += inv * np.asarray([
-                    estimate.draw_paths["none"],
-                    estimate.draw_paths["player_only"],
-                    estimate.draw_paths["banker_only"],
-                    estimate.draw_paths["both"],
-                ], dtype=float)
-                db_rel += inv * float(estimate.reliability)
-                db_samples += inv * float(estimate.samples)
-            db_probs = normalize_array(db_total, BASELINE)
-            db_draw = normalize_array(db_draw_total, DRAW_BASELINE)
-        else:
-            db_probs = BASELINE.copy()
-            db_draw = DRAW_BASELINE.copy()
-
-        # Re-rank 00-99 candidates with the database outcome and legal draw-path
-        # priors. Ratio clipping prevents a coarse state bucket from dominating
-        # the particle evidence.
-        db_candidate = raw_matrix.copy()
-        outcome_clip = float(settings["db_outcome_ratio_clip"])
-        path_clip = float(settings["db_path_ratio_clip"])
-        for idx in range(100):
-            outcome_idx = _point_outcome_index(idx)
-            outcome_ratio = float(db_probs[outcome_idx]) / max(1e-12, float(BASELINE[outcome_idx]))
-            base_path_mass = _point_feasible_path_mass(idx, DRAW_BASELINE)
-            db_path_mass = _point_feasible_path_mass(idx, db_draw)
-            path_ratio = db_path_mass / max(1e-12, base_path_mass)
-            outcome_ratio = min(outcome_clip, max(1.0 / outcome_clip, outcome_ratio))
-            path_ratio = min(path_clip, max(1.0 / path_clip, path_ratio))
-            db_candidate[idx] *= outcome_ratio * path_ratio
-        db_candidate = normalize_array(db_candidate, raw_matrix)
-
-        # Second independent simulation stream. Only the database-ranked top-K
-        # candidates receive validation mass; all others retain their particle
-        # prior through shrinkage.
-        top_k = min(100, int(settings["db_candidate_top_k"]))
-        # Select candidates by outcome strata so the second-stage validator cannot
-        # become biased simply because ties or one side occupy more of the global
-        # top-K point list. Quotas follow the 5M database B/P/T prior.
-        outcome_quotas = np.maximum(1, np.floor(db_probs * top_k).astype(int))
-        while int(outcome_quotas.sum()) > top_k:
-            outcome_quotas[int(np.argmax(outcome_quotas))] -= 1
-        while int(outcome_quotas.sum()) < top_k:
-            outcome_quotas[int(np.argmax(db_probs - outcome_quotas / max(1, top_k)))] += 1
-        chosen: List[int] = []
-        for outcome_idx in range(3):
-            candidates = [i for i in range(100) if _point_outcome_index(i) == outcome_idx]
-            candidates.sort(key=lambda i: float(db_candidate[i]), reverse=True)
-            chosen.extend(candidates[: int(outcome_quotas[outcome_idx])])
-        candidate_idx = np.asarray(chosen[:top_k], dtype=int)
-        candidate_mask = np.zeros(100, dtype=bool)
-        candidate_mask[candidate_idx] = True
-        validation_counts = np.zeros(100, dtype=float)
-        validation_sims = int(settings["point_revalidation_sims"])
-        validation_rng = np.random.default_rng(mix_seed(self.seed, 0x560056))
-        order2 = validation_rng.permutation(len(population.particles))
-        for sim_index in range(validation_sims):
-            particle_index = int(order2[sim_index % len(order2)])
-            hand = simulate_hand_np(population.particles[particle_index], validation_rng)
-            idx = hand.player_total * 10 + hand.banker_total
-            if candidate_mask[idx]:
-                validation_counts[idx] += 1.0
-        prior_strength = float(settings["point_revalidation_prior"])
-        revalidated = validation_counts + prior_strength * db_candidate
-        revalidated = normalize_array(revalidated, db_candidate)
-
-        pw, dw, rw = _normalize_weight_triplet(
-            float(settings["particle_point_weight"]),
-            float(settings["db_candidate_weight"]),
-            float(settings["point_revalidation_weight"]),
-        )
-        matrix = normalize_array(
-            pw * raw_matrix + dw * db_candidate + rw * revalidated,
-            raw_matrix,
-        )
-
-        # Convert the final point distribution into B/P/T probabilities. This is
-        # the V5.6 decision distribution; it is no longer just a diagnostic list.
-        candidate_outcomes = np.zeros(3, dtype=float)
-        for idx, probability in enumerate(matrix):
-            candidate_outcomes[_point_outcome_index(idx)] += float(probability)
-        pf = normalize_array(candidate_outcomes, BASELINE)
-        control_probs = normalize_array(control, BASELINE)
-        fused = pf.copy()
-        paired_center = _center(fused, control_probs)
-
-        top_idx = np.argsort(matrix)[::-1][:10]
-        top_points = []
-        for idx in top_idx:
-            p, b = int(idx // 10), int(idx % 10)
-            top_points.append({
-                "point": f"{p}{b}",
-                "probability": float(matrix[idx]),
-                "particle_probability": float(raw_matrix[idx]),
-                "database_candidate_probability": float(db_candidate[idx]),
-                "revalidated_probability": float(revalidated[idx]),
-                "outcome": "B" if b > p else "P" if p > b else "T",
-            })
-
         entropy = -float(sum(x * math.log(x) for x in matrix if x > 0))
         entropy_norm = min(1.0, entropy / math.log(100))
         top10_mass = float(matrix[top_idx].sum())
@@ -1036,8 +882,40 @@ class V5ReplicaEngine:
             0.0,
             min(1.0, 0.55 * (1.0 - entropy_norm) + 0.45 * max(0.0, min(1.0, (top10_mass - 0.10) / 0.22))),
         )
-
-        effective_db = float(settings["db_candidate_weight"]) * db_rel
+        database = get_shoe_state_database()
+        db_total = np.zeros(3, dtype=float)
+        db_rel = db_samples = 0.0
+        inv = 1.0 / max(1, len(population.particles))
+        for particle in population.particles:
+            estimate = database.estimate(particle, self.decks)
+            db_total += inv * np.asarray(
+                [
+                    estimate.probabilities["B"],
+                    estimate.probabilities["P"],
+                    estimate.probabilities["T"],
+                ],
+                dtype=float,
+            )
+            db_rel += inv * estimate.reliability
+            db_samples += inv * estimate.samples
+        db_probs = normalize_array(db_total, BASELINE)
+        db_allowed = settings["database_validation_mode"] == "force" or (
+            settings["database_validation_mode"] == "validated_only" and DB_HOLDOUT["passed"]
+        )
+        if settings["database_validation_mode"] == "diagnostic":
+            db_allowed = False
+        sample_scale = min(1.0, population.ess / max(1.0, float(settings["target_ess"])))
+        effective_db = (
+            float(settings["database_weight"]) * db_rel * (0.65 + 0.35 * sample_scale)
+            if db_allowed
+            else 0.0
+        )
+        delta = np.clip(
+            db_probs - BASELINE,
+            -float(settings["database_max_adjustment"]),
+            float(settings["database_max_adjustment"]),
+        )
+        fused = normalize_array(pf + effective_db * delta, BASELINE)
         path_quality = 0.55 * population.path_coverage + 0.45 * population.path_ess_quality
         base_weight = (
             max(
@@ -1059,11 +937,7 @@ class V5ReplicaEngine:
             database=db_probs,
             fused=fused,
             next_draw_paths=next_draw,
-            next_path_centers=next_path_centers,
             point_matrix=matrix,
-            database_candidate_matrix=db_candidate,
-            revalidated_point_matrix=revalidated,
-            database_draw_paths=db_draw,
             top_points=top_points,
             paired_center=paired_center,
             split_centers=split_centers,
@@ -1107,46 +981,6 @@ class V5ReplicaEngine:
             base_weight=base_weight,
             final_weight=base_weight,
         )
-
-
-def _get_stratified_prior(
-    particle_count: int,
-    decks: int,
-    replica_index: int,
-    request_seed: int,
-    use_cache: bool,
-) -> Tuple[Sequence[np.ndarray], Sequence[int]]:
-    """Return an immutable calibrated prior, optionally shared across requests.
-
-    Conditioning always copies/removes cards from candidate arrays, so cached
-    prior arrays are read-only inputs and are safe to reuse. Request-specific
-    randomness remains in conditional completion and forecast sampling.
-    """
-    if not use_cache:
-        builder = V5ReplicaEngine(request_seed, particle_count, decks)
-        return builder.build_stratified_prior()
-
-    key = (int(particle_count), int(decks), int(replica_index))
-    with _PRIOR_CACHE_LOCK:
-        cached = _PRIOR_CACHE.get(key)
-        if cached is None:
-            prior_seed = mix_seed(0x51A7E5D3 ^ (particle_count << 8) ^ decks, replica_index)
-            builder = V5ReplicaEngine(prior_seed, particle_count, decks)
-            particles, depths = builder.build_stratified_prior()
-            cached = (
-                tuple(np.asarray(item, dtype=np.int16) for item in particles),
-                tuple(int(value) for value in depths),
-            )
-            _PRIOR_CACHE[key] = cached
-        return cached
-
-
-def clear_runtime_caches() -> int:
-    """Clear reusable calibrated priors and return the number removed."""
-    with _PRIOR_CACHE_LOCK:
-        removed = len(_PRIOR_CACHE)
-        _PRIOR_CACHE.clear()
-    return removed
 
 
 def _weighted_average(rows: Sequence[ReplicaResult], attr: str, size: int) -> np.ndarray:
@@ -1203,19 +1037,14 @@ def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str
         "split_se": 0.0,
         "path_se": 0.0,
         "lower_bound": 0.0,
-        "model_side": side,
+        "model_side": None,
         "validated_signal": False,
         "quality_pass": False,
-        "general_quality_pass": True,
-        "decision_tier": "GENERAL",
-        "is_observe": False,
         "decision_source": "UNVALIDATED_COMPARISON",
         "banker_ev": banker_ev,
         "player_ev": player_ev,
         "fallback_score": centered,
-        "effective_replicas": 1.0,
-        "direction_consistency": True,
-        "updated_ratio": 1.0,
+        "effective_replicas": float(len(fused)),
     }
 
 
@@ -1230,26 +1059,7 @@ def decide_ensemble(
     commission = float(settings["banker_commission"])
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
-
-    # Fuse the full next-hand simulation with a reliability-shrunk next-draw-path signal:
-    # The observed-hand draw path already conditions/resamples the particle population,
-    # so it is not counted a second time as a direct directional vote. The next-hand
-    # path layer remains a modest auxiliary signal to avoid double-counting.
-    base_w = float(settings["base_signal_weight"])
-    current_w = float(settings["current_path_signal_weight"])
-    next_w = float(settings["next_path_signal_weight"])
-    total_w = max(1e-12, base_w + current_w + next_w)
-    shrink = float(settings["path_signal_shrink"])
-    centers = []
-    for row in rows:
-        current_signal = float(np.dot(row.draw_paths, row.current_path_centers)) * shrink
-        next_signal = float(np.dot(row.next_draw_paths, row.next_path_centers)) * shrink
-        fused_center = (
-            base_w * row.paired_center
-            + current_w * current_signal
-            + next_w * next_signal
-        ) / total_w
-        centers.append(fused_center)
+    centers = [row.paired_center for row in rows]
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
     sw2 = sum(w * w for w in weights)
@@ -1273,13 +1083,7 @@ def decide_ensemble(
     model_side = "B" if robust >= 0 else "P"
     global_center = _center(fused, control)
     direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
-    updated_ratio = sum(
-        1 for row in rows if row.updated and row.ancestry_paired
-    ) / max(1, len(rows))
-
-    # Strict validation keeps the original gate and therefore remains the only
-    # tier labelled VALIDATED_MODEL.
-    strict_quality_pass = (
+    quality_pass = (
         quality["agreement"] >= float(settings["min_replica_agreement"])
         and quality["average_ess"] >= float(settings["target_ess"]) * 0.8
         and quality["average_diversity"] >= 0.45
@@ -1287,69 +1091,28 @@ def decide_ensemble(
         and quality["path_coverage"] >= float(settings["min_path_coverage"])
         and effective_replicas >= float(settings["min_effective_replicas"])
         and direction_consistency
-        and updated_ratio >= 0.999
+        and all(row.updated and row.ancestry_paired for row in rows)
     )
-    validated = strict_quality_pass and lower >= float(settings["min_validated_edge"])
-
-    # General validation accepts ordinary-quality runs without pretending they
-    # passed the strict statistical gate. Thresholds are configurable and still
-    # reject failed conditioning, extremely low diversity and severe replica
-    # disagreement.
-    general_effective_min = max(
-        1.0,
-        float(settings["min_effective_replicas"])
-        * float(settings["general_effective_replica_ratio"]),
-    )
-    general_quality_pass = (
-        quality["agreement"] >= float(settings["general_replica_agreement"])
-        and quality["average_ess"]
-        >= float(settings["target_ess"]) * float(settings["general_ess_ratio"])
-        and quality["average_diversity"] >= float(settings["general_diversity"])
-        and quality["split_agreement"] >= float(settings["general_split_agreement"])
-        and quality["path_coverage"] >= float(settings["general_path_coverage"])
-        and effective_replicas >= general_effective_min
-        and updated_ratio >= float(settings["general_updated_ratio"])
-        and abs(robust) >= float(settings["general_min_raw_edge"])
-        and lower >= float(settings["general_min_lower_edge"])
-        and quality.get("current_path_agreement", 0.0)
-        >= float(settings["general_min_current_path_agreement"])
-        and quality.get("next_draw_agreement", 0.0)
-        >= float(settings["general_min_next_draw_agreement"])
-        and (
-            direction_consistency
-            or not bool(settings["general_require_direction_consistency"])
-        )
-    )
-
-    if validated:
-        recommend = model_side
-        decision_source = "VALIDATED_MODEL"
-        decision_tier = "STRICT"
-        signal = "HIGH" if lower >= 0.005 else "MEDIUM"
-        edge = lower
-        reason = "補牌路徑分層、統一配對樣本池與穩健誤差修正後通過正式品質閘門"
-    elif general_quality_pass:
-        recommend = model_side
-        decision_source = "LOW_CONFIDENCE_BALANCED"
-        decision_tier = "GENERAL"
-        signal = "LOW"
-        edge = abs(robust)
-        reason = "通過一般品質閘門；保留方向但未標示為正式驗證訊號"
+    validated = quality_pass and lower >= float(settings["min_validated_edge"])
+    fallback_score = robust
+    if fallback_score > 1e-12:
+        fallback_side = "B"
+    elif fallback_score < -1e-12:
+        fallback_side = "P"
     else:
-        # V5.5 always returns the 1000-particle path-conditioned direction. Quality remains visible
-        # as FALLBACK, but path disagreement no longer suppresses the result.
-        recommend = model_side
-        decision_source = "DRAW_PATH_FUSION"
-        decision_tier = "FALLBACK"
-        signal = "LOW"
-        edge = abs(robust)
-        reason = "未通過正式品質閘門；改用當局與下一局四種補牌路徑融合方向"
-
+        fallback_side = "B" if int(rows[0].seed) & 1 else "P"
+    recommend = model_side if validated else fallback_side
+    decision_source = "VALIDATED_MODEL" if validated else "LOW_CONFIDENCE_BALANCED"
+    signal = "HIGH" if validated and lower >= 0.005 else "MEDIUM" if validated and lower >= 0.002 else "LOW"
     return {
         "recommend": recommend,
-        "reason": reason,
+        "reason": (
+            f"{int(settings['particles'])}粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
+            if validated
+            else "訊號未通過完整驗證，仍沿用低信心對稱後驗方向，不固定回退莊家"
+        ),
         "signal_level": signal,
-        "edge": edge,
+        "edge": lower,
         "center": robust,
         "raw_center": mean,
         "median_center": med,
@@ -1361,27 +1124,25 @@ def decide_ensemble(
         "lower_bound": lower,
         "model_side": model_side,
         "validated_signal": validated,
-        "quality_pass": strict_quality_pass,
-        "general_quality_pass": general_quality_pass,
-        "decision_tier": decision_tier,
-        "is_observe": False,
+        "quality_pass": quality_pass,
         "decision_source": decision_source,
         "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
         "player_ev": float(fused[1] - fused[0]),
-        "fallback_score": robust,
+        "fallback_score": fallback_score,
         "effective_replicas": effective_replicas,
         "direction_consistency": direction_consistency,
-        "updated_ratio": updated_ratio,
     }
 
 
 class V5IndependentBaccaratEngine:
     def __init__(self, settings: Optional[Mapping[str, Any]] = None) -> None:
         supplied = dict(settings or {})
+        requested_particles = int(supplied.get("particles", PARTICLE_COUNT))
+        safe_particles = max(MIN_PARTICLE_COUNT, min(MAX_PARTICLE_COUNT, requested_particles))
         self.settings: Dict[str, Any] = {
-            "decks": int(supplied.get("decks", DECKS)),
-            "particles": int(supplied.get("particles", PARTICLE_COUNT)),
-            "replicas": int(supplied.get("replicas", REPLICA_COUNT)),
+            "decks": max(1, min(16, int(supplied.get("decks", DECKS)))),
+            "particles": safe_particles,
+            "replicas": max(3, min(11, int(supplied.get("replicas", REPLICA_COUNT)))),
             "target_matches": int(supplied.get("target_matches", TARGET_MATCHES)),
             "target_ess": float(supplied.get("target_ess", TARGET_ESS)),
             "min_matches": int(supplied.get("min_matches", MIN_MATCHES)),
@@ -1391,6 +1152,12 @@ class V5IndependentBaccaratEngine:
             "path_min_ess": float(supplied.get("path_min_ess", PATH_MIN_ESS)),
             "min_path_coverage": float(supplied.get("min_path_coverage", MIN_PATH_COVERAGE)),
             "path_uncertainty": float(supplied.get("path_uncertainty", PATH_UNCERTAINTY)),
+            "path_prior_strength": max(
+                0.0, min(50.0, float(supplied.get("path_prior_strength", PATH_PRIOR_STRENGTH)))
+            ),
+            "min_path_particles": max(
+                1, min(512, int(supplied.get("min_path_particles", MIN_PATH_PARTICLES)))
+            ),
             "predict_simulations_per_replica": int(
                 supplied.get("predict_simulations_per_replica", PREDICT_SIMS)
             ),
@@ -1422,148 +1189,7 @@ class V5IndependentBaccaratEngine:
                 supplied.get("min_replica_agreement", MIN_REPLICA_AGREEMENT)
             ),
             "banker_commission": float(supplied.get("banker_commission", BANKER_COMMISSION)),
-            "fast_mode": bool(supplied.get("fast_mode", FAST_MODE)),
-            "cache_stratified_priors": bool(
-                supplied.get("cache_stratified_priors", CACHE_STRATIFIED_PRIORS)
-            ),
-            "skip_unused_db_diagnostics": bool(
-                supplied.get("skip_unused_db_diagnostics", SKIP_UNUSED_DB_DIAGNOSTICS)
-            ),
-            "forecast_sample_cap": int(
-                supplied.get("forecast_sample_cap", FORECAST_SAMPLE_CAP)
-            ),
-            "fast_particle_cap": int(
-                supplied.get("fast_particle_cap", FAST_PARTICLE_CAP)
-            ),
-            "fast_target_matches_cap": int(
-                supplied.get("fast_target_matches_cap", FAST_TARGET_MATCHES_CAP)
-            ),
-            "fast_target_ess_cap": float(
-                supplied.get("fast_target_ess_cap", FAST_TARGET_ESS_CAP)
-            ),
-            "fast_max_update_proposals": int(
-                supplied.get("fast_max_update_proposals", FAST_MAX_UPDATE_PROPOSALS)
-            ),
-            "fast_path_target_matches_cap": int(
-                supplied.get(
-                    "fast_path_target_matches_cap",
-                    FAST_PATH_TARGET_MATCHES_CAP,
-                )
-            ),
-            "general_replica_agreement": float(
-                supplied.get("general_replica_agreement", GENERAL_REPLICA_AGREEMENT)
-            ),
-            "general_ess_ratio": float(supplied.get("general_ess_ratio", GENERAL_ESS_RATIO)),
-            "general_diversity": float(
-                supplied.get("general_diversity", GENERAL_DIVERSITY)
-            ),
-            "general_split_agreement": float(
-                supplied.get("general_split_agreement", GENERAL_SPLIT_AGREEMENT)
-            ),
-            "general_path_coverage": float(
-                supplied.get("general_path_coverage", GENERAL_PATH_COVERAGE)
-            ),
-            "general_effective_replica_ratio": float(
-                supplied.get(
-                    "general_effective_replica_ratio",
-                    GENERAL_EFFECTIVE_REPLICA_RATIO,
-                )
-            ),
-            "general_updated_ratio": float(
-                supplied.get("general_updated_ratio", GENERAL_UPDATED_RATIO)
-            ),
-            "general_min_raw_edge": float(
-                supplied.get("general_min_raw_edge", GENERAL_MIN_RAW_EDGE)
-            ),
-            "general_min_lower_edge": float(
-                supplied.get("general_min_lower_edge", GENERAL_MIN_LOWER_EDGE)
-            ),
-            "general_min_current_path_agreement": float(
-                supplied.get(
-                    "general_min_current_path_agreement",
-                    GENERAL_MIN_CURRENT_PATH_AGREEMENT,
-                )
-            ),
-            "general_min_next_draw_agreement": float(
-                supplied.get(
-                    "general_min_next_draw_agreement",
-                    GENERAL_MIN_NEXT_DRAW_AGREEMENT,
-                )
-            ),
-            "general_require_direction_consistency": bool(
-                supplied.get(
-                    "general_require_direction_consistency",
-                    GENERAL_REQUIRE_DIRECTION_CONSISTENCY,
-                )
-            ),
-            "current_path_signal_weight": float(
-                supplied.get("current_path_signal_weight", CURRENT_PATH_SIGNAL_WEIGHT)
-            ),
-            "next_path_signal_weight": float(
-                supplied.get("next_path_signal_weight", NEXT_PATH_SIGNAL_WEIGHT)
-            ),
-            "base_signal_weight": float(
-                supplied.get("base_signal_weight", BASE_SIGNAL_WEIGHT)
-            ),
-            "path_signal_shrink": float(
-                supplied.get("path_signal_shrink", PATH_SIGNAL_SHRINK)
-            ),
-            "path_min_samples_for_signal": int(
-                supplied.get("path_min_samples_for_signal", PATH_MIN_SAMPLES_FOR_SIGNAL)
-            ),
-            "db_candidate_enabled": bool(
-                supplied.get("db_candidate_enabled", DB_CANDIDATE_ENABLED)
-            ),
-            "db_candidate_scan_particles": int(
-                supplied.get("db_candidate_scan_particles", DB_CANDIDATE_SCAN_PARTICLES)
-            ),
-            "db_candidate_top_k": int(
-                supplied.get("db_candidate_top_k", DB_CANDIDATE_TOP_K)
-            ),
-            "db_candidate_weight": float(
-                supplied.get("db_candidate_weight", DB_CANDIDATE_WEIGHT)
-            ),
-            "particle_point_weight": float(
-                supplied.get("particle_point_weight", PARTICLE_POINT_WEIGHT)
-            ),
-            "point_revalidation_weight": float(
-                supplied.get("point_revalidation_weight", POINT_REVALIDATION_WEIGHT)
-            ),
-            "point_revalidation_sims": int(
-                supplied.get("point_revalidation_sims", POINT_REVALIDATION_SIMS)
-            ),
-            "point_revalidation_prior": float(
-                supplied.get("point_revalidation_prior", POINT_REVALIDATION_PRIOR)
-            ),
-            "db_outcome_ratio_clip": float(
-                supplied.get("db_outcome_ratio_clip", DB_OUTCOME_RATIO_CLIP)
-            ),
-            "db_path_ratio_clip": float(
-                supplied.get("db_path_ratio_clip", DB_PATH_RATIO_CLIP)
-            ),
         }
-
-        if bool(self.settings["fast_mode"]):
-            self.settings["particles"] = min(
-                int(self.settings["particles"]),
-                int(self.settings["fast_particle_cap"]),
-            )
-            self.settings["target_matches"] = min(
-                int(self.settings["target_matches"]),
-                int(self.settings["fast_target_matches_cap"]),
-            )
-            self.settings["target_ess"] = min(
-                float(self.settings["target_ess"]),
-                float(self.settings["fast_target_ess_cap"]),
-            )
-            self.settings["max_update_proposals"] = min(
-                int(self.settings["max_update_proposals"]),
-                int(self.settings["fast_max_update_proposals"]),
-            )
-            self.settings["path_target_matches"] = min(
-                int(self.settings["path_target_matches"]),
-                int(self.settings["fast_path_target_matches_cap"]),
-            )
 
     def analyze(
         self,
@@ -1572,32 +1198,27 @@ class V5IndependentBaccaratEngine:
         seed: int,
         known_path: Optional[int] = None,
     ) -> Dict[str, Any]:
+        runtime_settings = _scaled_runtime_settings(self.settings, int(self.settings["particles"]))
         rows: List[ReplicaResult] = []
-        for replica_index in range(max(3, int(self.settings["replicas"]))):
+        for replica_index in range(max(3, int(runtime_settings["replicas"]))):
             replica_seed = mix_seed(seed, replica_index)
             engine = V5ReplicaEngine(
                 replica_seed,
-                particle_count=max(64, int(self.settings["particles"])),
-                decks=int(self.settings["decks"]),
+                particle_count=int(runtime_settings["particles"]),
+                decks=int(runtime_settings["decks"]),
             )
-            prior_particles, prior_depths = _get_stratified_prior(
-                particle_count=max(64, int(self.settings["particles"])),
-                decks=int(self.settings["decks"]),
-                replica_index=replica_index,
-                request_seed=replica_seed,
-                use_cache=bool(self.settings["cache_stratified_priors"]),
-            )
+            prior_particles, prior_depths = engine.build_stratified_prior()
             population = engine.condition(
                 prior_particles,
                 prior_depths,
                 int(player_total) % 10,
                 int(banker_total) % 10,
                 known_path,
-                self.settings,
+                runtime_settings,
             )
-            rows.append(engine.forecast(population, self.settings))
+            rows.append(engine.forecast(population, runtime_settings))
         robust_mad, outlier_count = _apply_robust_weights(
-            rows, bool(self.settings["adaptive_replica_weight"])
+            rows, bool(runtime_settings["adaptive_replica_weight"])
         )
         pf = _weighted_average(rows, "pf", 3)
         control = _weighted_average(rows, "control", 3)
@@ -1606,16 +1227,11 @@ class V5IndependentBaccaratEngine:
         draw = _weighted_average(rows, "draw_paths", 4)
         next_draw = _weighted_average(rows, "next_draw_paths", 4)
         point_matrix = _weighted_average(rows, "point_matrix", 100)
-        database_candidate_matrix = _weighted_average(rows, "database_candidate_matrix", 100)
-        revalidated_point_matrix = _weighted_average(rows, "revalidated_point_matrix", 100)
-        database_draw_paths = _weighted_average(rows, "database_draw_paths", 4)
         top_idx = np.argsort(point_matrix)[::-1][:10]
         top_points = [
             {
                 "point": f"{int(i // 10)}{int(i % 10)}",
                 "probability": float(point_matrix[i]),
-                "database_candidate_probability": float(database_candidate_matrix[i]),
-                "revalidated_probability": float(revalidated_point_matrix[i]),
                 "outcome": "B" if int(i % 10) > int(i // 10) else "P" if int(i // 10) > int(i % 10) else "T",
             }
             for i in top_idx
@@ -1636,50 +1252,56 @@ class V5IndependentBaccaratEngine:
         average_ess = float(np.mean([row.ess for row in rows]))
         average_diversity = float(np.mean([row.diversity for row in rows]))
         average_path_coverage = float(np.mean([row.path_coverage for row in rows]))
-        average_current_path_agreement = float(
-            np.mean([row.current_path_agreement for row in rows])
-        )
-        average_draw_agreement = float(np.mean([row.draw_agreement for row in rows]))
         quality = {
             "agreement": agreement,
             "average_ess": average_ess,
             "average_diversity": average_diversity,
             "split_agreement": split_agreement,
             "path_coverage": average_path_coverage,
-            "current_path_agreement": average_current_path_agreement,
-            "next_draw_agreement": average_draw_agreement,
         }
-        decision = decide_ensemble(fused, control, rows, quality, self.settings)
-        if decision["decision_tier"] == "STRICT":
+        decision = decide_ensemble(fused, control, rows, quality, runtime_settings)
+        stability = "UNSTABLE"
+        if (
+            decision["validated_signal"]
+            and agreement >= 0.71
+            and split_agreement >= 0.80
+            and average_ess >= float(runtime_settings["target_ess"]) * 0.8
+            and average_diversity >= 0.45
+            and average_path_coverage >= float(runtime_settings["min_path_coverage"])
+            and decision["effective_replicas"] >= float(runtime_settings["min_effective_replicas"])
+        ):
             stability = "STABLE"
-        elif decision["decision_tier"] == "GENERAL":
+        elif (
+            agreement >= 0.57
+            and split_agreement >= 0.60
+            and average_ess >= float(runtime_settings["target_ess"]) * 0.45
+            and average_diversity >= 0.30
+            and average_path_coverage >= 0.60
+        ):
             stability = "WATCH"
-        else:
-            stability = "UNSTABLE"
-
         weakness: List[str] = []
-        if decision["decision_tier"] == "GENERAL":
-            weakness.append("已通過一般品質閘門，但未通過正式信賴下界")
-        elif decision["decision_tier"] == "OBSERVE":
-            weakness.append("模型品質不足，本局觀望且不計入方向戰績")
-        if agreement < float(self.settings["min_replica_agreement"]):
-            weakness.append("副本穩健方向共識未達正式門檻")
+        if not decision["validated_signal"]:
+            weakness.append("模型訊號未通過補牌路徑分層信賴下界或品質閘門")
+        if agreement < float(runtime_settings["min_replica_agreement"]):
+            weakness.append("副本穩健方向共識低於設定門檻")
         if split_agreement < 0.60:
-            weakness.append("統一樣本池分半方向一致率未達正式60%門檻")
-        if average_ess < float(self.settings["target_ess"]) * 0.8:
-            weakness.append("條件候選ESS未達正式目標80%")
+            weakness.append("統一樣本池分半方向一致率低於60%")
+        if average_ess < float(runtime_settings["target_ess"]) * 0.8:
+            weakness.append("條件候選ESS未達目標80%")
         if average_diversity < 0.45:
-            weakness.append("粒子多樣性未達正式45%門檻")
-        if average_path_coverage < float(self.settings["min_path_coverage"]):
-            weakness.append("補牌路徑有效覆蓋率未達正式門檻")
+            weakness.append("粒子多樣性不足45%")
+        if average_path_coverage < float(runtime_settings["min_path_coverage"]):
+            weakness.append("補牌路徑有效覆蓋率不足")
         if outlier_count:
             weakness.append(f"已抑制{outlier_count}個偏離中位數副本")
         if any(row.low_sample for row in rows):
             weakness.append("至少一個副本的總候選或補牌路徑候選偏少")
-        if not DB_HOLDOUT["passed"] and self.settings["database_validation_mode"] != "force":
-            weakness.append("500萬資料庫僅作候選點數與補牌先驗，不直接單獨決定方向")
+        if not DB_HOLDOUT["passed"] and runtime_settings["database_validation_mode"] != "force":
+            weakness.append("50萬資料庫樣本外驗證未優於基準，方向校正已抑制")
         if not weakness:
-            weakness.append("1000粒子、500萬資料庫候選重排與第二次補牌驗證均完成")
+            weakness.append(
+                f"{int(runtime_settings['particles'])}粒子、補牌路徑ESS、統一樣本池與穩健誤差均通過"
+            )
         combined = hashlib.sha1()
         for row in rows:
             combined.update(row.digest.encode("ascii"))
@@ -1691,9 +1313,6 @@ class V5IndependentBaccaratEngine:
             "draw_paths": draw,
             "next_draw_paths": next_draw,
             "point_matrix": point_matrix,
-            "database_candidate_matrix": database_candidate_matrix,
-            "revalidated_point_matrix": revalidated_point_matrix,
-            "database_draw_paths": database_draw_paths,
             "top_points": top_points,
             **decision,
             "seed": int(seed) & 0xFFFFFFFF,
@@ -1715,8 +1334,10 @@ class V5IndependentBaccaratEngine:
                 np.mean([row.legacy_path_coverage for row in rows])
             ),
             "average_path_ess_quality": float(np.mean([row.path_ess_quality for row in rows])),
-            "average_current_path_agreement": average_current_path_agreement,
-            "average_draw_agreement": average_draw_agreement,
+            "average_current_path_agreement": float(
+                np.mean([row.current_path_agreement for row in rows])
+            ),
+            "average_draw_agreement": float(np.mean([row.draw_agreement for row in rows])),
             "average_point_concentration": float(
                 np.mean([row.point_concentration for row in rows])
             ),
@@ -1746,24 +1367,20 @@ class V5IndependentBaccaratEngine:
             "outlier_count": outlier_count,
             "total_forecast_simulations": int(
                 len(rows)
-                * (
-                    min(
-                        int(self.settings["predict_simulations_per_replica"])
-                        + int(self.settings["point_joint_simulations_per_replica"]),
-                        int(self.settings["forecast_sample_cap"]),
-                    )
-                    if bool(self.settings["fast_mode"])
-                    else int(self.settings["predict_simulations_per_replica"])
-                    + int(self.settings["point_joint_simulations_per_replica"])
+                * max(
+                    int(runtime_settings["predict_simulations_per_replica"])
+                    + int(runtime_settings["point_joint_simulations_per_replica"]),
+                    int(runtime_settings["particles"]) * 2,
                 )
             ),
             "total_condition_attempts": int(sum(row.attempts for row in rows)),
             "all_ancestry_paired": all(row.ancestry_paired for row in rows),
             "all_replicas_updated": all(row.updated for row in rows),
             "fallback_to_unconditioned": any(not row.updated for row in rows),
-            "conditional_generator": "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED",
-            "variance_reduction": "UNIFIED_BALANCED_PARTICLE_COMMON_RANDOM_ANTITHETIC",
+            "conditional_generator": "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V2",
+            "variance_reduction": "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC",
             "depth_profile": "CALIBRATED_10_30_40_20",
-            "settings": dict(self.settings),
+            "settings": dict(runtime_settings),
+            "configured_settings": dict(self.settings),
             "replica_rows": rows,
         }
