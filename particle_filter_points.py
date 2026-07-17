@@ -1,12 +1,14 @@
-"""V5.8 1000-particle probability-direction database-candidate revalidation baccarat engine.
+"""V5.9 1000-particle baseline-calibrated commission-EV baccarat engine.
 
 The official LINE predictor uses only the newest final-point observation.
 Every request creates fresh conditional candidates, replicas and forecast samples.
 A calibrated stratified prior may be reused as an immutable speed cache; no road,
 streak, Markov state, previous recommendation or per-UID particle state is carried
-into the next request. Final Banker/Player direction is selected only by the fused
-Banker-versus-Player probability gap. Commission-adjusted EV remains diagnostic and
-never changes the predicted side.
+into the next request. Final Banker/Player direction uses a baseline-calibrated
+commission-aware EV score: the normal baccarat Banker/Player structural imbalance
+is removed before choosing a side, so the 5% Banker commission remains represented
+without mechanically forcing the output toward Player. This build never returns
+an observe result; every completed analysis returns Banker or Player.
 """
 from __future__ import annotations
 
@@ -73,8 +75,8 @@ DATABASE_MAX_ADJUSTMENT = _env_float("PF_DATABASE_MAX_ADJUSTMENT", 0.005, 0.0, 0
 DATABASE_VALIDATION_MODE = _env_choice(
     "PF_DATABASE_VALIDATION_MODE", "diagnostic", ("validated_only", "diagnostic", "force")
 )
-UNCERTAINTY_PENALTY = _env_float("PF_UNCERTAINTY_PENALTY", 1.28, 0.0, 5.0)
-MIN_VALIDATED_EDGE = _env_float("PF_MIN_VALIDATED_EDGE", 0.0012, 0.0, 0.05)
+UNCERTAINTY_PENALTY = _env_float("PF_UNCERTAINTY_PENALTY", 1.20, 0.0, 5.0)
+MIN_VALIDATED_EDGE = _env_float("PF_MIN_VALIDATED_EDGE", 0.0015, 0.0, 0.05)
 MIN_REPLICA_AGREEMENT = _env_float("PF_MIN_REPLICA_AGREEMENT", 0.71, 0.50, 1.0)
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 DECISION_MODE = _env_choice("PF_DECISION_MODE", "validated", ("validated", "centered", "raw", "ev"))
@@ -108,7 +110,7 @@ GENERAL_EFFECTIVE_REPLICA_RATIO = _env_float(
     "PF_GENERAL_EFFECTIVE_REPLICA_RATIO", 0.85, 0.10, 1.0
 )
 GENERAL_UPDATED_RATIO = _env_float("PF_GENERAL_UPDATED_RATIO", 0.80, 0.0, 1.0)
-GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.0030, 0.0, 0.05)
+GENERAL_MIN_RAW_EDGE = _env_float("PF_GENERAL_MIN_RAW_EDGE", 0.0015, 0.0, 0.05)
 GENERAL_MIN_LOWER_EDGE = _env_float("PF_GENERAL_MIN_LOWER_EDGE", 0.0, 0.0, 0.05)
 GENERAL_MIN_CURRENT_PATH_AGREEMENT = _env_float(
     "PF_GENERAL_MIN_CURRENT_PATH_AGREEMENT", 0.55, 0.0, 1.0
@@ -120,25 +122,25 @@ GENERAL_REQUIRE_DIRECTION_CONSISTENCY = _env_bool(
     "PF_GENERAL_REQUIRE_DIRECTION_CONSISTENCY", True
 )
 
-# Draw-path layers may contribute to replica reliability and uncertainty, but
-# V5.8 final side selection is always the fused pure B-versus-P probability gap.
+# Draw-path layers contribute only a small reliability-shrunk auxiliary vote.
+# V5.9 prevents the path layer from re-applying the same directional evidence too strongly.
 CURRENT_PATH_SIGNAL_WEIGHT = _env_float("PF_CURRENT_PATH_SIGNAL_WEIGHT", 0.0, 0.0, 0.75)
-NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.28, 0.0, 0.75)
-BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.72, 0.0, 1.0)
-PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.50, 0.0, 1.0)
+NEXT_PATH_SIGNAL_WEIGHT = _env_float("PF_NEXT_PATH_SIGNAL_WEIGHT", 0.12, 0.0, 0.75)
+BASE_SIGNAL_WEIGHT = _env_float("PF_BASE_SIGNAL_WEIGHT", 0.88, 0.0, 1.0)
+PATH_SIGNAL_SHRINK = _env_float("PF_PATH_SIGNAL_SHRINK", 0.25, 0.0, 1.0)
 PATH_MIN_SAMPLES_FOR_SIGNAL = _env_int("PF_PATH_MIN_SAMPLES_FOR_SIGNAL", 40, 4, 10000)
 
-# V5.8 database-assisted candidate point generation. The existing 5M database
+# V5.9 database-assisted candidate point generation. The existing 5M database
 # stores outcome and legal draw-path aggregates by remaining-shoe state. It does
-# not contain a native 00-99 matrix, so V5.8 uses those aggregates as priors to
+# not contain a native 00-99 matrix, so V5.9 uses those aggregates as priors to
 # re-rank particle-generated point candidates, then validates them with a second
 # independent simulation stream.
 DB_CANDIDATE_ENABLED = _env_bool("PF_DB_CANDIDATE_ENABLED", True)
 DB_CANDIDATE_SCAN_PARTICLES = _env_int("PF_DB_CANDIDATE_SCAN_PARTICLES", 192, 32, 1000)
 DB_CANDIDATE_TOP_K = _env_int("PF_DB_CANDIDATE_TOP_K", 20, 5, 60)
-DB_CANDIDATE_WEIGHT = _env_float("PF_DB_CANDIDATE_WEIGHT", 0.35, 0.0, 0.80)
-PARTICLE_POINT_WEIGHT = _env_float("PF_PARTICLE_POINT_WEIGHT", 0.40, 0.0, 1.0)
-POINT_REVALIDATION_WEIGHT = _env_float("PF_POINT_REVALIDATION_WEIGHT", 0.25, 0.0, 0.80)
+DB_CANDIDATE_WEIGHT = _env_float("PF_DB_CANDIDATE_WEIGHT", 0.20, 0.0, 0.80)
+PARTICLE_POINT_WEIGHT = _env_float("PF_PARTICLE_POINT_WEIGHT", 0.45, 0.0, 1.0)
+POINT_REVALIDATION_WEIGHT = _env_float("PF_POINT_REVALIDATION_WEIGHT", 0.35, 0.0, 0.80)
 POINT_REVALIDATION_SIMS = _env_int("PF_POINT_REVALIDATION_SIMS", 800, 100, 10000)
 POINT_REVALIDATION_PRIOR = _env_float("PF_POINT_REVALIDATION_PRIOR", 120.0, 1.0, 5000.0)
 DB_OUTCOME_RATIO_CLIP = _env_float("PF_DB_OUTCOME_RATIO_CLIP", 1.35, 1.0, 3.0)
@@ -524,32 +526,57 @@ def _center(conditioned: Sequence[float], control: Sequence[float]) -> float:
 
 
 def _probability_direction_score(probabilities: Sequence[float]) -> float:
-    """Pure Banker-minus-Player probability gap used for every final direction.
+    """Raw Banker-minus-Player probability gap for diagnostics.
 
-    Ties do not favor either side. A positive value selects Banker and a negative
-    value selects Player. No payout or commission adjustment is permitted here.
+    This value is not the V5.9 final selector because a standard baccarat shoe
+    naturally gives Banker a small structural probability advantage.
     """
     probs = normalize_array(probabilities, BASELINE)
     return float(probs[0] - probs[1])
 
 
 def _ev_metrics(probabilities: Sequence[float], commission: float) -> Tuple[float, float]:
-    """Return Banker and Player EV values for diagnostics only."""
+    """Return ordinary Banker and Player wager EV values for diagnostics."""
     probs = normalize_array(probabilities, BASELINE)
     banker_ev = float(probs[0] * (1.0 - commission) - probs[1])
     player_ev = float(probs[1] - probs[0])
     return banker_ev, player_ev
 
 
+def _conditional_bp(probabilities: Sequence[float]) -> Tuple[float, float]:
+    """Return Banker/Player probabilities conditioned on a non-tie result."""
+    probs = normalize_array(probabilities, BASELINE)
+    bp_total = max(1e-12, float(probs[0] + probs[1]))
+    return float(probs[0]) / bp_total, float(probs[1]) / bp_total
+
+
+def _baseline_ev_center(commission: float) -> float:
+    """Commission-aware EV difference of the normal baccarat baseline."""
+    base_b, base_p = _conditional_bp(BASELINE)
+    base_banker_ev = base_b * (1.0 - commission) - base_p
+    base_player_ev = base_p - base_b
+    return float(base_banker_ev - base_player_ev)
+
+
 def _decision_score(probabilities: Sequence[float], commission: float) -> float:
-    """Compatibility wrapper for V5.x call sites.
+    """Baseline-calibrated, commission-aware Banker-minus-Player EV score.
 
-    V5.8 deliberately ignores commission for direction selection. Commission is
-    still returned separately through ``banker_ev`` and ``player_ev`` diagnostics.
+    The ordinary 5% Banker commission is included, but the same EV difference
+    already present in the normal baccarat baseline is subtracted. Therefore:
+
+    * zero means the model is exactly at the normal baccarat B/P balance;
+    * positive means the conditioned shoe is more Banker-favorable than baseline;
+    * negative means it is more Player-favorable than baseline.
+
+    Ties are removed before the comparison because both Banker and Player wagers
+    push on a tie. This prevents changes in tie probability from manufacturing a
+    directional signal.
     """
-    _ = commission
-    return _probability_direction_score(probabilities)
-
+    model_b, model_p = _conditional_bp(probabilities)
+    banker_ev = model_b * (1.0 - commission) - model_p
+    player_ev = model_p - model_b
+    model_center = float(banker_ev - player_ev)
+    return model_center - _baseline_ev_center(commission)
 
 def _composition(particles: Sequence[np.ndarray], decks: int) -> Dict[str, Any]:
     matrix = np.stack([np.asarray(p, dtype=float) for p in particles])
@@ -1039,7 +1066,7 @@ class V5ReplicaEngine:
         )
 
         # Convert the final point distribution into B/P/T probabilities. This is
-        # the V5.8 decision distribution; it is no longer just a diagnostic list.
+        # the V5.9 decision distribution; it is no longer just a diagnostic list.
         candidate_outcomes = np.zeros(3, dtype=float)
         for idx, probability in enumerate(matrix):
             candidate_outcomes[_point_outcome_index(idx)] += float(probability)
@@ -1215,26 +1242,43 @@ def _apply_robust_weights(rows: Sequence[ReplicaResult], enabled: bool) -> Tuple
 def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str, Any]:
     probs = normalize_array(fused, BASELINE)
     probability_center = _probability_direction_score(probs)
+    calibrated_center = _decision_score(probs, commission)
     banker_ev, player_ev = _ev_metrics(probs, commission)
-    side = "B" if probability_center >= 0 else "P"
+    uncalibrated_ev_center = banker_ev - player_ev
+    baseline_center = _baseline_ev_center(commission)
+
     if mode == "raw":
-        reason = "原始莊閒最大機率"
-    elif mode == "ev":
-        # Preserve the legacy environment value without allowing commission to
-        # introduce a structural Player bias into the prediction direction.
-        reason = "舊EV模式相容；方向改依純莊閒機率，EV僅作診斷"
+        selected_center = probability_center
+        reason = "原始莊閒最大機率模式"
+        decision_source = "RAW_PROBABILITY_COMPARISON"
     else:
-        reason = "融合後純莊閒機率方向"
-    edge = abs(probability_center)
+        # centered / ev / validated-compatible basic modes all use the same
+        # baseline-calibrated commission EV so commission is represented without
+        # creating a permanent Player lean.
+        selected_center = calibrated_center
+        reason = "依基準校正後抽水EV決定莊閒方向"
+        decision_source = "BASELINE_CALIBRATED_COMMISSION_EV"
+
+    if selected_center > 1e-12:
+        side = "B"
+    elif selected_center < -1e-12:
+        side = "P"
+    else:
+        # No observe mode: only an exact numerical tie reaches this deterministic
+        # fallback. Using the probability vector digest avoids a hard-coded side.
+        digest = hashlib.sha1(np.asarray(probs, dtype=np.float64).tobytes()).digest()
+        side = "B" if (digest[0] & 1) else "P"
+
+    edge = abs(selected_center)
     return {
         "recommend": side,
         "reason": reason,
         "signal_level": "HIGH" if edge >= 0.010 else "MEDIUM" if edge >= 0.004 else "LOW",
         "edge": edge,
-        "center": probability_center,
-        "raw_center": probability_center,
-        "median_center": probability_center,
-        "robust_center": probability_center,
+        "center": selected_center,
+        "raw_center": selected_center,
+        "median_center": selected_center,
+        "robust_center": selected_center,
         "center_std": 0.0,
         "center_se": 0.0,
         "base_se": 0.0,
@@ -1247,17 +1291,19 @@ def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str
         "general_quality_pass": True,
         "decision_tier": "GENERAL",
         "is_observe": False,
-        "decision_source": "PURE_PROBABILITY_COMPARISON",
+        "decision_source": decision_source,
         "banker_ev": banker_ev,
         "player_ev": player_ev,
-        "decision_center": probability_center,
+        "uncalibrated_ev_center": uncalibrated_ev_center,
+        "baseline_ev_center": baseline_center,
+        "probability_center": probability_center,
+        "decision_center": selected_center,
         "relative_control_center": 0.0,
-        "fallback_score": probability_center,
+        "fallback_score": selected_center,
         "effective_replicas": 1.0,
         "direction_consistency": True,
         "updated_ratio": 1.0,
     }
-
 
 def decide_ensemble(
     fused: np.ndarray,
@@ -1309,16 +1355,29 @@ def decide_ensemble(
     path_se = float(settings["path_uncertainty"]) * path_rms / math.sqrt(effective_replicas)
     se = math.sqrt(base_se**2 + split_se**2 + path_se**2)
     robust = 0.50 * mean + 0.50 * med
-    # Final side is controlled only by the fused B-versus-P probability gap.
-    # Replica/path robust centers remain quality diagnostics, not side selectors.
-    decision_center = _probability_direction_score(fused)
+    # Final side uses the fused baseline-calibrated commission EV. Replica/path
+    # centers use the same score and remain a stability/consistency diagnostic.
+    decision_center = _decision_score(fused, commission)
+    probability_center = _probability_direction_score(fused)
     banker_ev, player_ev = _ev_metrics(fused, commission)
+    uncalibrated_ev_center = banker_ev - player_ev
+    baseline_center = _baseline_ev_center(commission)
     lower = max(
         0.0,
         abs(decision_center) - float(settings["uncertainty_penalty"]) * se,
     )
-    model_side = "B" if decision_center >= 0 else "P"
     relative_control_center = _center(fused, control)
+    if decision_center > 1e-12:
+        model_side = "B"
+    elif decision_center < -1e-12:
+        model_side = "P"
+    elif robust > 1e-12:
+        model_side = "B"
+    elif robust < -1e-12:
+        model_side = "P"
+    else:
+        seed_mix = sum(int(row.seed) for row in rows) & 1
+        model_side = "B" if seed_mix else "P"
     direction_consistency = (
         abs(decision_center) < 1e-12
         or abs(robust) < 1e-12
@@ -1378,23 +1437,23 @@ def decide_ensemble(
         decision_tier = "STRICT"
         signal = "HIGH" if lower >= 0.005 else "MEDIUM"
         edge = lower
-        reason = "資料庫候選、補牌二次驗證與純莊閒機率方向通過正式品質閘門"
+        reason = "資料庫候選、補牌二次驗證與基準校正抽水EV方向通過正式品質閘門"
     elif general_quality_pass:
         recommend = model_side
         decision_source = "LOW_CONFIDENCE_BALANCED"
         decision_tier = "GENERAL"
         signal = "LOW"
         edge = abs(decision_center)
-        reason = "通過一般品質閘門；依融合後純莊閒機率保留方向"
+        reason = "通過一般品質閘門；依融合後基準校正抽水EV保留方向"
     else:
-        # V5.8 always returns the fused pure-probability direction. Quality remains
-        # visible as FALLBACK, but path disagreement no longer changes the side.
+        # V5.9 always returns a baseline-calibrated commission-EV direction. Quality
+        # remains visible as FALLBACK, but disagreement never becomes OBSERVE.
         recommend = model_side
         decision_source = "DRAW_PATH_FUSION"
         decision_tier = "FALLBACK"
         signal = "LOW"
         edge = abs(decision_center)
-        reason = "未通過正式品質閘門；仍依資料庫候選與補牌再驗證後的純莊閒機率方向"
+        reason = "未通過正式品質閘門；仍依資料庫候選與補牌再驗證後的基準校正抽水EV方向"
 
     return {
         "recommend": recommend,
@@ -1420,6 +1479,9 @@ def decide_ensemble(
         "decision_source": decision_source,
         "banker_ev": banker_ev,
         "player_ev": player_ev,
+        "uncalibrated_ev_center": uncalibrated_ev_center,
+        "baseline_ev_center": baseline_center,
+        "probability_center": probability_center,
         "decision_center": decision_center,
         "relative_control_center": relative_control_center,
         "fallback_score": decision_center,
@@ -1714,8 +1776,6 @@ class V5IndependentBaccaratEngine:
         weakness: List[str] = []
         if decision["decision_tier"] == "GENERAL":
             weakness.append("已通過一般品質閘門，但未通過正式信賴下界")
-        elif decision["decision_tier"] == "OBSERVE":
-            weakness.append("模型品質不足，本局觀望且不計入方向戰績")
         if agreement < float(self.settings["min_replica_agreement"]):
             weakness.append("副本穩健方向共識未達正式門檻")
         if split_agreement < 0.60:
@@ -1733,7 +1793,7 @@ class V5IndependentBaccaratEngine:
         if not DB_HOLDOUT["passed"] and self.settings["database_validation_mode"] != "force":
             weakness.append("500萬資料庫僅作候選點數與補牌先驗，不直接單獨決定方向")
         if not weakness:
-            weakness.append("1000粒子、500萬資料庫候選重排與第二次補牌驗證均完成")
+            weakness.append("1000粒子、500萬資料庫候選重排、第二次補牌驗證與基準校正抽水EV均完成")
         combined = hashlib.sha1()
         for row in rows:
             combined.update(row.digest.encode("ascii"))
