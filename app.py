@@ -1,22 +1,19 @@
-"""LINE point-input baccarat bot for V5 independent point prediction.
+"""LINE point-input baccarat bot for V5.2.0 independent point prediction.
 
 Operation flow
 --------------
-1. Start analysis.
-2. Select venue.
-3. Enter room.
-4. Enter two digits directly in chat, e.g. 65:
-      first digit  = Player point
-      second digit = Banker point
-5. The bot stores the observation for display/statistics, but V5 prediction
-   uses only the newest point observation.
-6. The result panel only keeps the End Analysis button.
-7. Enter the next two-digit point result directly in chat to continue.
+1. Start analysis, select venue, and enter the room.
+2. Enter final points directly, e.g. 65 = Player 6 / Banker 5.
+3. Optional draw-path suffix improves conditioning precision:
+       N = neither side drew a third card
+       P = Player only drew
+       B = Banker only drew
+       D = both sides drew
+   Example: 65D.
+4. The result is stored for settlement/statistics, while every prediction uses
+   only the newest point observation and creates fresh 1000-2000 particles.
 
-Older formats remain accepted:
-    閒6莊5
-    P6B5
-    6,5
+Older formats remain accepted: 閒6莊5, P6B5, 6,5.
 """
 
 from __future__ import annotations
@@ -28,6 +25,7 @@ import hmac
 import json
 import os
 import re
+import threading
 import traceback
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -42,6 +40,62 @@ import store
 from predictor import predict, parse_point_observation
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int = 0,
+    maximum: Optional[int] = None,
+) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    value = max(minimum, value)
+    return min(maximum, value) if maximum is not None else value
+
+
+APP_SHOW_MODEL_DIAGNOSTICS = _env_bool(
+    "APP_SHOW_MODEL_DIAGNOSTICS",
+    True,
+)
+APP_REQUIRE_DRAW_PATH = _env_bool(
+    "APP_REQUIRE_DRAW_PATH",
+    False,
+)
+APP_MAX_CONCURRENT_PREDICTIONS = _env_int(
+    "APP_MAX_CONCURRENT_PREDICTIONS",
+    1,
+    1,
+    4,
+)
+APP_PREDICTION_QUEUE_TIMEOUT = _env_int(
+    "APP_PREDICTION_QUEUE_TIMEOUT",
+    45,
+    1,
+    55,
+)
+MODEL_PARTICLES = _env_int("PF_PARTICLES", 1000, 64, 2000)
+MODEL_REPLICAS = _env_int("PF_REPLICAS", 5, 3, 11)
+_PREDICTION_SLOTS = threading.BoundedSemaphore(
+    APP_MAX_CONCURRENT_PREDICTIONS
+)
+
+DRAW_PATH_SUFFIX_BY_INDEX = {0: "N", 1: "P", 2: "B", 3: "D"}
+DRAW_PATH_TEXT = {
+    "none": "雙方都沒補牌",
+    "player_only": "只有閒家補牌",
+    "banker_only": "只有莊家補牌",
+    "both": "雙方都有補牌",
+}
 
 CHANNEL_ACCESS_TOKEN = os.getenv(
     "LINE_CHANNEL_ACCESS_TOKEN",
@@ -93,8 +147,8 @@ TEMP_CODES = {
 ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 app = FastAPI(
-    title="Baccarat V5 Independent Point Bot",
-    version="5.0.0",
+    title="Baccarat V5.2 Independent Point Bot",
+    version="5.2.0",
 )
 
 # Reuse HTTPS connections to LINE instead of opening a new TLS connection for
@@ -405,24 +459,45 @@ def flex(
 
 def parse_chat_point_observation(
     text: str,
-) -> Optional[Dict[str, int]]:
-    """Parse chat point input.
-
-    Compact format:
-        65 -> Player 6, Banker 5
-        00 -> Player 0, Banker 0
-
-    Older formats remain supported through predictor.parse_point_observation.
-    """
-    value = str(text or "").strip()
-
-    if re.fullmatch(r"\d{2}", value):
+) -> Optional[Dict[str, Any]]:
+    """Parse final points and preserve the optional N/P/B/D draw path."""
+    value = str(text or "").strip().upper()
+    compact = re.fullmatch(r"([0-9])([0-9])([NPBD])?", value)
+    if compact:
+        suffix = compact.group(3) or ""
         return {
-            "player": int(value[0]),
-            "banker": int(value[1]),
+            "player": int(compact.group(1)),
+            "banker": int(compact.group(2)),
+            "suffix": suffix,
+            "path_suffix": suffix,
+            "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
         }
 
-    return parse_point_observation(value)
+    parsed = parse_point_observation(value)
+    if not parsed:
+        return None
+
+    suffix = str(
+        parsed.get("path_suffix")
+        or parsed.get("suffix")
+        or ""
+    ).strip().upper()
+    if suffix not in {"N", "P", "B", "D"}:
+        try:
+            suffix = DRAW_PATH_SUFFIX_BY_INDEX.get(
+                int(parsed.get("path")),
+                "",
+            )
+        except Exception:
+            suffix = ""
+
+    return {
+        "player": int(parsed["player"]) % 10,
+        "banker": int(parsed["banker"]) % 10,
+        "suffix": suffix,
+        "path_suffix": suffix,
+        "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +547,12 @@ def ready_panel(
             f"房間：{session.get('room') or '-'}\n"
             f"UID權限：{user_status['label']}"
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-            "請直接在聊天室輸入兩位數：\n"
-            "例如 65＝閒6點、莊5點。\n\n"
-            "V5 每次只使用本次最新點數，"
-            "不沿用上一筆點數或上一局粒子狀態。"
+            "請直接輸入最終點數：\n"
+            "65＝閒6點、莊5點。\n"
+            "知道補牌情況時可輸入 65N／65P／65B／65D。\n"
+            "N雙方不補｜P僅閒補｜B僅莊補｜D雙方補。\n\n"
+            f"目前模型：{MODEL_PARTICLES} 粒子 × {MODEL_REPLICAS} 副本。\n"
+            "每次只使用最新點數，並重新建立獨立粒子。"
         ),
         [
             action(
@@ -488,11 +565,33 @@ def ready_panel(
 
 def _decision_source_text(value: Any) -> str:
     source = str(value or "")
-    if source == "VALIDATED_MODEL":
-        return "驗證模型"
-    if source == "LOW_CONFIDENCE_BALANCED":
-        return "低信心平衡"
-    return source or "V5模型"
+    names = {
+        "VALIDATED_MODEL": "驗證模型",
+        "LOW_CONFIDENCE_BALANCED": "低信心比較",
+        "UNVALIDATED_COMPARISON": "未驗證比較",
+    }
+    return names.get(source, source or "V5.2模型")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _draw_path_text(prediction: Dict[str, Any]) -> str:
+    known_path = prediction.get("known_draw_path")
+    if known_path in DRAW_PATH_TEXT:
+        return DRAW_PATH_TEXT[str(known_path)]
+    return "未指定（模型分層估計）"
 
 
 def _stored_prediction(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -523,23 +622,55 @@ def result_panel(
     source_text = _decision_source_text(
         prediction.get("decision_source")
     )
+    particle_info = prediction.get("point_particle_filter") or {}
+    path_info = prediction.get("draw_path_diagnostics") or {}
+    particles = _safe_int(
+        particle_info.get("particles_per_replica"),
+        MODEL_PARTICLES,
+    )
+    replicas = _safe_int(
+        particle_info.get("replicas", prediction.get("replica_count")),
+        MODEL_REPLICAS,
+    )
+    validated = bool(prediction.get("validated_signal"))
+    stability_names = {
+        "STABLE": "穩定",
+        "WATCH": "注意",
+        "UNSTABLE": "不穩定",
+    }
+    stability = stability_names.get(
+        str(prediction.get("stability") or ""),
+        str(prediction.get("stability") or "-")
+    )
+
+    diagnostics = ""
+    if APP_SHOW_MODEL_DIAGNOSTICS:
+        diagnostics = (
+            f"\n模型：{particles}粒子 × {replicas}副本"
+            f"\n驗證：{'通過' if validated else '未通過'}｜穩定：{stability}"
+            f"\nESS：{_safe_float(particle_info.get('average_effective_sample_size')):.0f}"
+            f"｜路徑覆蓋：{_safe_float(path_info.get('coverage')) * 100.0:.0f}%"
+        )
 
     body = (
         f"本次第 {len(observations)} 次獨立分析\n"
-        f"莊 {prediction.get('banker_rate', 0):.1f}%\n"
-        f"閒 {prediction.get('player_rate', 0):.1f}%\n"
-        f"和 {prediction.get('tie_rate', 0):.1f}%\n\n"
+        f"輸入：{prediction.get('conditioning_point', '-')}\n"
+        f"補牌：{_draw_path_text(prediction)}\n\n"
+        f"莊 {_safe_float(prediction.get('banker_rate')):.1f}%\n"
+        f"閒 {_safe_float(prediction.get('player_rate')):.1f}%\n"
+        f"和 {_safe_float(prediction.get('tie_rate')):.1f}%\n\n"
         f"推薦：{prediction.get('recommend_text', '-')}\n"
         f"訊號：{prediction.get('signal_level', '-')}\n"
-        f"來源：{source_text}\n\n"
+        f"來源：{source_text}"
+        f"{diagnostics}\n\n"
         f"UID權限：{user_status['label']}"
         f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-        "請直接輸入下一組點數，例如：65\n"
-        "每次分析完全獨立，不沿用上一筆點數。"
+        "請輸入下一組點數，例如 65 或 65D。\n"
+        "每次分析完全獨立，不沿用上一局粒子。"
     )
 
     return flex(
-        "V5 下一局點數模擬",
+        "V5.2 下一局粒子模擬",
         body,
         [
             action(
@@ -619,39 +750,70 @@ def predict_session(
 
 def add_points_and_predict(
     user_id: str,
-    observation: Dict[str, int],
+    observation: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Store/settle through the new store.py, while V5 uses only this point."""
+    """Settle the prior result and run one fresh V5.2 particle analysis."""
     ensure(user_id)
 
-    point = (
-        f"{int(observation['player']) % 10}"
-        f"{int(observation['banker']) % 10}"
+    acquired = _PREDICTION_SLOTS.acquire(
+        timeout=APP_PREDICTION_QUEUE_TIMEOUT
     )
-    session = store.record_point_and_settle(
-        user_id,
-        point,
-    )
-
-    prediction = predict(
-        [observation],
-        venue=session.get("venue", ""),
-        room=session.get("room", ""),
-        shoe_id=session.get("shoe_id", ""),
-        user_id=user_id,
-    )
-
-    if not prediction.get("ok"):
-        raise ValueError(
-            prediction.get("message")
-            or prediction.get("error")
-            or "V5預測失敗"
+    if not acquired:
+        raise RuntimeError(
+            "目前高粒子模型正在分析其他請求，請稍後重新輸入點數。"
         )
 
-    return store.save_prediction(
-        user_id,
-        prediction,
-    )
+    try:
+        player = int(observation["player"]) % 10
+        banker = int(observation["banker"]) % 10
+        suffix = str(
+            observation.get("path_suffix")
+            or observation.get("suffix")
+            or ""
+        ).strip().upper()
+        if suffix not in {"N", "P", "B", "D"}:
+            try:
+                suffix = DRAW_PATH_SUFFIX_BY_INDEX.get(
+                    int(observation.get("path")),
+                    "",
+                )
+            except Exception:
+                suffix = ""
+
+        point = f"{player}{banker}"
+        session = store.record_point_and_settle(
+            user_id,
+            point,
+        )
+
+        # predictor.parse_point_observation expects path_suffix for mapping input.
+        # Passing it explicitly prevents 65N/65P/65B/65D from losing the path.
+        model_observation = {
+            "player": player,
+            "banker": banker,
+            "path_suffix": suffix,
+        }
+        prediction = predict(
+            [model_observation],
+            venue=session.get("venue", ""),
+            room=session.get("room", ""),
+            shoe_id=session.get("shoe_id", ""),
+            user_id=user_id,
+        )
+
+        if not prediction.get("ok"):
+            raise ValueError(
+                prediction.get("message")
+                or prediction.get("error")
+                or "V5.2預測失敗"
+            )
+
+        return store.save_prediction(
+            user_id,
+            prediction,
+        )
+    finally:
+        _PREDICTION_SLOTS.release()
 
 
 # ---------------------------------------------------------------------------
@@ -675,8 +837,14 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "v5-independent-point-line",
-            "engine": "V5_INDEPENDENT_POINT_PF_LINE",
+            "version": "v5.2.0-independent-point-line",
+            "engine": "V5_2_INDEPENDENT_POINT_PF_LINE",
+            "particles": MODEL_PARTICLES,
+            "particle_limit": 2000,
+            "replicas": MODEL_REPLICAS,
+            "draw_path_input": "N/P/B/D",
+            "require_draw_path": APP_REQUIRE_DRAW_PATH,
+            "max_concurrent_predictions": APP_MAX_CONCURRENT_PREDICTIONS,
         }
     )
 
@@ -766,6 +934,20 @@ async def webhook(
 
                 observation = parse_chat_point_observation(text)
                 if observation:
+                    if (
+                        APP_REQUIRE_DRAW_PATH
+                        and not observation.get("path_suffix")
+                    ):
+                        reply(
+                            token,
+                            [
+                                text_message(
+                                    "目前設定必須輸入補牌路徑：例如 65N、65P、65B 或 65D。"
+                                )
+                            ],
+                        )
+                        continue
+
                     if not session.get("venue"):
                         reply(
                             token,
@@ -844,7 +1026,7 @@ async def webhook(
                     [
                         text_message(
                             "請輸入「開始分析」，"
-                            "或直接輸入兩位數，例如：65。"
+                            "或直接輸入點數，例如 65 或 65D。"
                         )
                     ],
                 )
