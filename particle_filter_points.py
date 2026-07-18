@@ -1,4 +1,4 @@
-"""V5.3.1 path-weighted factual-shoe-context HYBRID baccarat particle engine.
+"""V5.3.2 independent draw-path-head factual-shoe-context HYBRID baccarat particle engine.
 
 Every request still creates fresh particles, fresh replicas and fresh forecast
 samples. The engine may additionally use factual shoe context supplied by the
@@ -100,6 +100,25 @@ HYBRID_MAX_COMPONENT_ADJUSTMENT = _env_float(
 )
 HAND_NUMBER_UNCERTAINTY = _env_int("PF_HAND_NUMBER_UNCERTAINTY", 0, 0, 5)
 STATE_SIMULATIONS = _env_int("PF_STATE_SIMULATIONS", 1200, 200, 100_000)
+
+# Independent draw-path head. It reuses the existing forecast samples and adds
+# no extra particle, replica or Monte Carlo loops. The head is residualized
+# against the ordinary particle forecast before it can affect final probabilities.
+INDEPENDENT_PATH_MODEL_ENABLED = _env_bool(
+    "PF_INDEPENDENT_PATH_MODEL_ENABLED", True
+)
+INDEPENDENT_PATH_MODEL_MAX_WEIGHT = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_MAX_WEIGHT", 0.18, 0.0, 0.40
+)
+INDEPENDENT_PATH_MODEL_MIN_RELIABILITY = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_MIN_RELIABILITY", 0.55, 0.0, 1.0
+)
+INDEPENDENT_PATH_MODEL_MAX_ADJUSTMENT = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_MAX_ADJUSTMENT", 0.012, 0.0, 0.05
+)
+INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH", 6.0, 0.0, 100.0
+)
 
 BASELINE = np.asarray(DEFAULT_BASELINE, dtype=float)
 DRAW_BASELINE = np.asarray(DEFAULT_DRAW, dtype=float)
@@ -209,6 +228,15 @@ class ReplicaResult:
     draw_agreement: float
     path_quality: float
     path_fusion_gain: float
+    independent_path_probabilities: np.ndarray
+    independent_path_control_probabilities: np.ndarray
+    independent_path_next_draw: np.ndarray
+    independent_path_outcome_matrix: np.ndarray
+    independent_path_control_outcome_matrix: np.ndarray
+    independent_path_support: np.ndarray
+    independent_path_reliability: float
+    independent_path_effective_weight: float
+    independent_path_direction_agreement: float
     point_concentration: float
     effective_database_weight: float
     database_reliability: float
@@ -771,6 +799,174 @@ def _weighted_median(values: Sequence[float], weights: Sequence[float]) -> float
         if acc >= total / 2:
             return float(value)
     return float(pairs[-1][0])
+
+
+def build_independent_draw_path_model(
+    conditioned_draw: Sequence[float],
+    control_draw: Sequence[float],
+    path_outcome_conditioned: np.ndarray,
+    path_outcome_control: np.ndarray,
+    path_coverage: float,
+    path_ess_quality: float,
+    current_path_agreement: float,
+    draw_agreement: float,
+    settings: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build a four-path conditional outcome head from existing samples.
+
+    The head does not perform another simulation pass. It decomposes the samples
+    already produced by ``forecast`` into N/P/B/D path probabilities and the
+    B/P/T outcome distribution conditional on each path. Its final signal is
+    measured relative to the matched control population, which avoids treating
+    the same whole-particle probability as a second independent vote.
+    """
+
+    conditioned_path = normalize_array(conditioned_draw, DRAW_BASELINE)
+    control_path = normalize_array(control_draw, DRAW_BASELINE)
+    predicted_path = normalize_array(
+        0.70 * conditioned_path
+        + 0.20 * control_path
+        + 0.10 * DRAW_BASELINE,
+        DRAW_BASELINE,
+    )
+
+    conditioned_rows = np.asarray(path_outcome_conditioned, dtype=float)
+    control_rows = np.asarray(path_outcome_control, dtype=float)
+    if conditioned_rows.shape != (4, 3):
+        conditioned_rows = np.zeros((4, 3), dtype=float)
+    if control_rows.shape != (4, 3):
+        control_rows = np.zeros((4, 3), dtype=float)
+
+    prior_strength = max(
+        0.0,
+        float(settings.get("independent_path_model_prior_strength", 6.0)),
+    )
+    conditioned_matrix = np.zeros((4, 3), dtype=float)
+    control_matrix = np.zeros((4, 3), dtype=float)
+    support = np.zeros(4, dtype=float)
+    conditioned_total = float(conditioned_rows.sum())
+    control_total = float(control_rows.sum())
+    sample_target = max(
+        10.0,
+        0.035 * max(1.0, conditioned_total + control_total),
+    )
+
+    positive_mass = 0.0
+    negative_mass = 0.0
+    for path in range(4):
+        c_count = float(conditioned_rows[path].sum())
+        u_count = float(control_rows[path].sum())
+        conditioned_matrix[path] = normalize_array(
+            conditioned_rows[path] + prior_strength * BASELINE,
+            BASELINE,
+        )
+        control_matrix[path] = normalize_array(
+            control_rows[path] + prior_strength * BASELINE,
+            BASELINE,
+        )
+        paired_support = math.sqrt(max(0.0, c_count * u_count))
+        support[path] = min(1.0, paired_support / sample_target)
+        path_center = _center(
+            conditioned_matrix[path],
+            control_matrix[path],
+        )
+        direction_mass = predicted_path[path] * support[path]
+        if path_center > 1e-12:
+            positive_mass += direction_mass
+        elif path_center < -1e-12:
+            negative_mass += direction_mass
+
+    weighted_support = float(np.dot(predicted_path, support))
+    decisive = positive_mass + negative_mass
+    direction_agreement = (
+        max(positive_mass, negative_mass) / decisive
+        if decisive > 1e-12
+        else 0.5
+    )
+
+    conditioned_mix = normalize_array(
+        np.sum(predicted_path[:, None] * conditioned_matrix, axis=0),
+        BASELINE,
+    )
+    control_mix = normalize_array(
+        np.sum(predicted_path[:, None] * control_matrix, axis=0),
+        BASELINE,
+    )
+    control_probs = normalize_array(
+        np.sum(control_rows, axis=0),
+        BASELINE,
+    )
+    # The path head is the control forecast plus only the path-conditioned
+    # difference. This makes it a mechanism-specific estimate rather than a
+    # duplicated copy of the ordinary PF probability.
+    probabilities = normalize_array(
+        control_probs + (conditioned_mix - control_mix),
+        BASELINE,
+    )
+
+    def scale_quality(value: float, low: float = 0.50, high: float = 0.85) -> float:
+        if high <= low:
+            return 0.0
+        return max(0.0, min(1.0, (float(value) - low) / (high - low)))
+
+    path_quality = max(
+        0.0,
+        min(
+            1.0,
+            0.65 * float(path_coverage)
+            + 0.35 * float(path_ess_quality),
+        ),
+    )
+    current_q = scale_quality(current_path_agreement)
+    draw_q = scale_quality(draw_agreement)
+    direction_q = scale_quality(direction_agreement)
+    reliability = (
+        0.38 * path_quality
+        + 0.28 * weighted_support
+        + 0.17 * current_q
+        + 0.17 * draw_q
+    )
+    reliability *= 0.75 + 0.25 * direction_q
+    reliability = max(0.0, min(1.0, reliability))
+
+    enabled = bool(settings.get("independent_path_model_enabled", True))
+    minimum_reliability = max(
+        0.0,
+        min(
+            1.0,
+            float(settings.get("independent_path_model_min_reliability", 0.55)),
+        ),
+    )
+    maximum_weight = max(
+        0.0,
+        min(
+            0.40,
+            float(settings.get("independent_path_model_max_weight", 0.18)),
+        ),
+    )
+    effective_weight = 0.0
+    if enabled and reliability >= minimum_reliability:
+        effective_weight = maximum_weight * reliability
+        effective_weight *= 0.55 + 0.45 * path_quality
+        effective_weight *= 0.70 + 0.30 * direction_q
+        effective_weight = max(0.0, min(maximum_weight, effective_weight))
+
+    return {
+        "enabled": enabled,
+        "probabilities": probabilities,
+        "control_probabilities": control_probs,
+        "next_draw_paths": predicted_path,
+        "conditioned_path_outcomes": conditioned_matrix,
+        "control_path_outcomes": control_matrix,
+        "support": support,
+        "weighted_support": weighted_support,
+        "reliability": reliability,
+        "minimum_reliability": minimum_reliability,
+        "maximum_weight": maximum_weight,
+        "effective_weight": effective_weight,
+        "direction_agreement": direction_agreement,
+        "path_quality": path_quality,
+    }
 
 
 class V5ReplicaEngine:
@@ -1336,8 +1532,35 @@ class V5ReplicaEngine:
             -path_adjustment_limit,
             path_adjustment_limit,
         )
+        independent_path = build_independent_draw_path_model(
+            conditioned_draw,
+            control_draw,
+            path_outcome_c,
+            path_outcome_u,
+            population.path_coverage,
+            population.path_ess_quality,
+            current_agreement,
+            draw_agreement,
+            settings,
+        )
+        independent_residual = (
+            np.asarray(
+                independent_path["probabilities"],
+                dtype=float,
+            )
+            - pf
+        )
+        independent_adjustment = np.clip(
+            float(independent_path["effective_weight"])
+            * independent_residual,
+            -float(settings["independent_path_model_max_adjustment"]),
+            float(settings["independent_path_model_max_adjustment"]),
+        )
         fused = normalize_array(
-            pf + path_fusion_gain * path_delta + effective_db * delta,
+            pf
+            + path_fusion_gain * path_delta
+            + independent_adjustment
+            + effective_db * delta,
             BASELINE,
         )
         base_weight = (
@@ -1376,6 +1599,39 @@ class V5ReplicaEngine:
             draw_agreement=draw_agreement,
             path_quality=path_quality,
             path_fusion_gain=path_fusion_gain,
+            independent_path_probabilities=np.asarray(
+                independent_path["probabilities"],
+                dtype=float,
+            ),
+            independent_path_control_probabilities=np.asarray(
+                independent_path["control_probabilities"],
+                dtype=float,
+            ),
+            independent_path_next_draw=np.asarray(
+                independent_path["next_draw_paths"],
+                dtype=float,
+            ),
+            independent_path_outcome_matrix=np.asarray(
+                independent_path["conditioned_path_outcomes"],
+                dtype=float,
+            ),
+            independent_path_control_outcome_matrix=np.asarray(
+                independent_path["control_path_outcomes"],
+                dtype=float,
+            ),
+            independent_path_support=np.asarray(
+                independent_path["support"],
+                dtype=float,
+            ),
+            independent_path_reliability=float(
+                independent_path["reliability"]
+            ),
+            independent_path_effective_weight=float(
+                independent_path["effective_weight"]
+            ),
+            independent_path_direction_agreement=float(
+                independent_path["direction_agreement"]
+            ),
             point_concentration=point_concentration,
             effective_database_weight=float(effective_db),
             database_reliability=float(db_rel),
@@ -1452,6 +1708,9 @@ def build_hybrid_probabilities(
     settings: Mapping[str, Any],
     exact_state_reliability: float,
     effective_database_weight: float,
+    independent_path_probs: Optional[Sequence[float]] = None,
+    independent_path_reliability: float = 0.0,
+    independent_path_effective_weight: float = 0.0,
 ) -> Dict[str, Any]:
     """Quality-gated fusion of independent factual components.
 
@@ -1461,10 +1720,51 @@ def build_hybrid_probabilities(
     pf = normalize_array(particle_probs, BASELINE)
     db = normalize_array(database_probs, BASELINE)
     state = normalize_array(exact_state_probs, BASELINE)
+    independent_path = normalize_array(
+        independent_path_probs if independent_path_probs is not None else pf,
+        BASELINE,
+    )
+    independent_enabled = bool(
+        settings.get("independent_path_model_enabled", True)
+    )
+    independent_min_reliability = max(
+        0.0,
+        min(
+            1.0,
+            float(settings.get("independent_path_model_min_reliability", 0.55)),
+        ),
+    )
+    independent_max_weight = max(
+        0.0,
+        min(
+            0.40,
+            float(settings.get("independent_path_model_max_weight", 0.18)),
+        ),
+    )
+    independent_reliability = max(
+        0.0,
+        min(1.0, float(independent_path_reliability)),
+    )
+    independent_weight = 0.0
+    if independent_enabled and independent_reliability >= independent_min_reliability:
+        independent_weight = min(
+            independent_max_weight,
+            max(0.0, float(independent_path_effective_weight)),
+        )
 
     if str(settings.get("hybrid_mode", "hybrid")) != "hybrid":
+        independent_residual = independent_path - pf
+        independent_adjustment = np.clip(
+            independent_weight * independent_residual,
+            -float(settings["independent_path_model_max_adjustment"]),
+            float(settings["independent_path_model_max_adjustment"]),
+        )
+        particle_fused = normalize_array(
+            pf + independent_adjustment,
+            BASELINE,
+        )
         return {
-            "probabilities": pf,
+            "probabilities": particle_fused,
             "weights": {
                 "particle": 1.0,
                 "exact_shoe_state": 0.0,
@@ -1473,6 +1773,10 @@ def build_hybrid_probabilities(
             },
             "gate": 1.0,
             "state_reliability": 0.0,
+            "independent_path_enabled": independent_enabled,
+            "independent_path_reliability": independent_reliability,
+            "independent_path_effective_weight": independent_weight,
+            "independent_path_residual_adjustment": independent_adjustment,
             "mode": "particle",
         }
 
@@ -1560,7 +1864,18 @@ def build_hybrid_probabilities(
         -max_adjustment,
         max_adjustment,
     )
-    fused = normalize_array(BASELINE + delta, BASELINE)
+    # Only the path head residual relative to PF is added. If the two models say
+    # the same thing, this contribution is exactly zero, preventing double count.
+    independent_residual = independent_path - pf
+    independent_adjustment = np.clip(
+        independent_weight * independent_residual,
+        -float(settings["independent_path_model_max_adjustment"]),
+        float(settings["independent_path_model_max_adjustment"]),
+    )
+    fused = normalize_array(
+        BASELINE + delta + independent_adjustment,
+        BASELINE,
+    )
     return {
         "probabilities": fused,
         "weights": {
@@ -1574,6 +1889,10 @@ def build_hybrid_probabilities(
         "path_coverage_quality": float(path_coverage_q),
         "path_ess_quality": float(path_ess_q),
         "state_reliability": float(exact_state_reliability),
+        "independent_path_enabled": independent_enabled,
+        "independent_path_reliability": independent_reliability,
+        "independent_path_effective_weight": independent_weight,
+        "independent_path_residual_adjustment": independent_adjustment,
         "mode": "hybrid",
     }
 
@@ -1807,6 +2126,60 @@ class V5IndependentBaccaratEngine:
                     HYBRID_MAX_COMPONENT_ADJUSTMENT,
                 )
             ),
+            "independent_path_model_enabled": bool(
+                supplied.get(
+                    "independent_path_model_enabled",
+                    INDEPENDENT_PATH_MODEL_ENABLED,
+                )
+            ),
+            "independent_path_model_max_weight": max(
+                0.0,
+                min(
+                    0.40,
+                    float(
+                        supplied.get(
+                            "independent_path_model_max_weight",
+                            INDEPENDENT_PATH_MODEL_MAX_WEIGHT,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_min_reliability": max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_min_reliability",
+                            INDEPENDENT_PATH_MODEL_MIN_RELIABILITY,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_max_adjustment": max(
+                0.0,
+                min(
+                    0.05,
+                    float(
+                        supplied.get(
+                            "independent_path_model_max_adjustment",
+                            INDEPENDENT_PATH_MODEL_MAX_ADJUSTMENT,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_strength": max(
+                0.0,
+                min(
+                    100.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_strength",
+                            INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH,
+                        )
+                    ),
+                ),
+            ),
             "hand_number_uncertainty": int(
                 supplied.get(
                     "hand_number_uncertainty",
@@ -1898,6 +2271,21 @@ class V5IndependentBaccaratEngine:
         control = _weighted_average(rows, "control", 3)
         database = _weighted_average(rows, "database", 3)
         particle_database_fused = _weighted_average(rows, "fused", 3)
+        independent_path_probabilities = _weighted_average(
+            rows,
+            "independent_path_probabilities",
+            3,
+        )
+        independent_path_control_probabilities = _weighted_average(
+            rows,
+            "independent_path_control_probabilities",
+            3,
+        )
+        independent_path_next_draw = _weighted_average(
+            rows,
+            "independent_path_next_draw",
+            4,
+        )
         draw = _weighted_average(rows, "draw_paths", 4)
         next_draw = _weighted_average(rows, "next_draw_paths", 4)
         point_matrix = _weighted_average(rows, "point_matrix", 100)
@@ -1922,6 +2310,46 @@ class V5IndependentBaccaratEngine:
             max(1e-6, row.final_weight)
             for row in rows
         )
+        normalized_row_weights = np.asarray(
+            [max(1e-6, row.final_weight) for row in rows],
+            dtype=float,
+        )
+        normalized_row_weights /= max(
+            1e-12,
+            float(normalized_row_weights.sum()),
+        )
+        independent_path_outcome_matrix = np.zeros((4, 3), dtype=float)
+        independent_path_control_outcome_matrix = np.zeros((4, 3), dtype=float)
+        independent_path_support = np.zeros(4, dtype=float)
+        for row, row_weight in zip(rows, normalized_row_weights):
+            independent_path_outcome_matrix += (
+                row_weight * row.independent_path_outcome_matrix
+            )
+            independent_path_control_outcome_matrix += (
+                row_weight * row.independent_path_control_outcome_matrix
+            )
+            independent_path_support += (
+                row_weight * row.independent_path_support
+            )
+        independent_path_reliability = float(
+            sum(
+                row_weight * row.independent_path_reliability
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_effective_weight = float(
+            sum(
+                row_weight * row.independent_path_effective_weight
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_direction_agreement = float(
+            sum(
+                row_weight * row.independent_path_direction_agreement
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+
         weighted_votes = {"B": 0.0, "P": 0.0}
         votes = {"B": 0, "P": 0}
         directions: List[str] = []
@@ -1980,6 +2408,8 @@ class V5IndependentBaccaratEngine:
             "path_ess_quality": average_path_ess_quality,
             "current_path_agreement": average_current_path_agreement,
             "draw_agreement": average_draw_agreement,
+            "independent_path_reliability": independent_path_reliability,
+            "independent_path_effective_weight": independent_path_effective_weight,
             "hand_number_known": 1.0 if physical_hand_number > 0 else 0.0,
             "known_path": 1.0 if effective_known_path is not None else 0.0,
         }
@@ -2002,6 +2432,9 @@ class V5IndependentBaccaratEngine:
             runtime_settings,
             exact_state_reliability,
             average_database_weight,
+            independent_path_probabilities,
+            independent_path_reliability,
+            independent_path_effective_weight,
         )
         fused = normalize_array(
             hybrid["probabilities"],
@@ -2064,6 +2497,12 @@ class V5IndependentBaccaratEngine:
             weakness.append("補牌路徑有效覆蓋率不足")
         elif not decision.get("path_quality_pass", False):
             weakness.append("補牌路徑覆蓋率與路徑ESS綜合品質不足")
+        if (
+            runtime_settings["independent_path_model_enabled"]
+            and independent_path_reliability
+            < float(runtime_settings["independent_path_model_min_reliability"])
+        ):
+            weakness.append("獨立補牌模型可靠度不足，已自動停用其機率修正")
         if physical_hand_number <= 0:
             weakness.append(
                 "未提供牌靴局數，仍使用早中晚牌靴混合先驗"
@@ -2133,6 +2572,42 @@ class V5IndependentBaccaratEngine:
             },
             "draw_paths": draw,
             "next_draw_paths": next_draw,
+            "independent_draw_path_model": {
+                "enabled": bool(runtime_settings["independent_path_model_enabled"]),
+                "probabilities": independent_path_probabilities,
+                "control_probabilities": independent_path_control_probabilities,
+                "next_draw_paths": independent_path_next_draw,
+                "path_outcome_probabilities": independent_path_outcome_matrix,
+                "control_path_outcome_probabilities": (
+                    independent_path_control_outcome_matrix
+                ),
+                "path_support": independent_path_support,
+                "reliability": independent_path_reliability,
+                "minimum_reliability": float(
+                    runtime_settings["independent_path_model_min_reliability"]
+                ),
+                "configured_max_weight": float(
+                    runtime_settings["independent_path_model_max_weight"]
+                ),
+                "effective_weight": float(
+                    hybrid.get(
+                        "independent_path_effective_weight",
+                        independent_path_effective_weight,
+                    )
+                ),
+                "direction_agreement": independent_path_direction_agreement,
+                "residual_adjustment": np.asarray(
+                    hybrid.get(
+                        "independent_path_residual_adjustment",
+                        np.zeros(3, dtype=float),
+                    ),
+                    dtype=float,
+                ),
+                "max_adjustment": float(
+                    runtime_settings["independent_path_model_max_adjustment"]
+                ),
+                "uses_additional_simulations": False,
+            },
             "point_matrix": point_matrix,
             "top_points": top_points,
             **decision,
@@ -2242,7 +2717,7 @@ class V5IndependentBaccaratEngine:
             "conditional_generator": (
                 "EXACT_CURRENT_CARDS_IMPORTANCE_WEIGHTED"
                 if normalized_cards is not None
-                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V3"
+                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V4_WITH_INDEPENDENT_PATH_HEAD"
             ),
             "variance_reduction": (
                 "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC"
