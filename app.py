@@ -1,16 +1,14 @@
-"""LINE baccarat bot for V5.3 factual-shoe-context HYBRID prediction.
+"""LINE baccarat bot for independent point-and-draw-path prediction.
 
-Supported inputs
-----------------
-65          = Player 6 / Banker 5
-65D / 653   = both sides drew (letter / numeric draw code)
-65D@38      = both sides drew, physical shoe hand 38
-65D@38 P:2,1,3 B:4,0,1
-            = exact cards for this hand
+Recommended inputs
+------------------
+382 = Player 3 / Banker 8 / banker only drew
+571 = Player 5 / Banker 7 / player only drew
 
-Every request creates fresh particles. Only factual shoe context is persisted:
-hand number and exact cards explicitly entered by the user. Road, streak,
-previous recommendation and settlement results are never model features.
+The first two digits are the final Player/Banker points. The third digit is
+the current-hand draw code: 1=P, 2=B, 3=D, 4=N. Letter forms such as 38B and
+57P remain supported. Every request is predicted independently and does not
+use a hand number, prior shoe state, previous points or previous predictions.
 """
 
 from __future__ import annotations
@@ -68,10 +66,8 @@ APP_REQUIRE_DRAW_PATH = _env_bool(
     "APP_REQUIRE_DRAW_PATH",
     False,
 )
-APP_REQUIRE_HAND_NUMBER = _env_bool(
-    "APP_REQUIRE_HAND_NUMBER",
-    False,
-)
+# Independent mode never requires or consumes a shoe hand number.
+APP_REQUIRE_HAND_NUMBER = False
 APP_MAX_CONCURRENT_PREDICTIONS = _env_int(
     "APP_MAX_CONCURRENT_PREDICTIONS",
     1,
@@ -516,7 +512,7 @@ def _path_from_cards(cards: Mapping[str, Sequence[int]]) -> str:
 def parse_chat_point_observation(
     text: str,
 ) -> Optional[Dict[str, Any]]:
-    """Parse points, optional draw path, hand number and exact cards."""
+    """Parse current points and draw path; hand number is not required."""
     value = str(text or "").strip().upper()
     compact = re.fullmatch(
         r"([0-9])([0-9])([NPBD]|[1-4])?(?:@([0-9]{1,3}))?(?:\s+(.+))?",
@@ -542,14 +538,16 @@ def parse_chat_point_observation(
                 raise ValueError("N/P/B/D與實際牌張數不一致。")
             suffix = suffix or inferred_suffix
 
+        raw_suffix = compact.group(3) or ""
         return {
             "player": player,
             "banker": banker,
             "suffix": suffix,
             "path_suffix": suffix,
             "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
-            "hand_number": hand_number,
-            "known_cards": cards,
+            "hand_number": 0,
+            "known_cards": {},
+            "input_text": f"{player}{banker}{raw_suffix}",
         }
 
     parsed = parse_point_observation(value)
@@ -570,14 +568,17 @@ def parse_chat_point_observation(
         except Exception:
             suffix = ""
 
+    player = int(parsed["player"]) % 10
+    banker = int(parsed["banker"]) % 10
     return {
-        "player": int(parsed["player"]) % 10,
-        "banker": int(parsed["banker"]) % 10,
+        "player": player,
+        "banker": banker,
         "suffix": suffix,
         "path_suffix": suffix,
         "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
-        "hand_number": int(parsed.get("hand_number") or 0),
-        "known_cards": dict(parsed.get("known_cards") or {}),
+        "hand_number": 0,
+        "known_cards": {},
+        "input_text": f"{player}{banker}{suffix}",
     }
 
 
@@ -622,27 +623,26 @@ def ready_panel(
 ) -> Dict[str, Any]:
     user_status = status(user_id)
     return flex(
-        "V5.3 HYBRID 可開始分析",
+        "AI預測 可開始分析",
         (
             f"館別：{session.get('venue') or '-'}\n"
             f"房間：{session.get('room') or '-'}\n"
             f"UID權限：{user_status['label']}"
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-            "基本輸入：65\n"
-            "字母補牌：65B（只有莊家補牌）\n"
-            "數字補牌：652（只有莊家補牌）\n"
-            "補牌＋局數：65D@38 或 653@38\n"
-            "完整牌值：65D@38 P:2,1,3 B:4,0,1\n\n"
-            "字母：N雙方不補｜P僅閒補｜B僅莊補｜D雙方補\n"
-            "數字：1=P｜2=B｜3=D｜4=N\n"
-            "30分鐘試用會在首次成功輸入點數後開始計時。\n"
-            "若從牌靴中途開始，請務必加上 @目前局數。\n"
-            "只有每局都輸入完整牌值，才會啟用精確剩餘牌組。\n\n"
-            f"模型：HYBRID｜{MODEL_PARTICLES}粒子 × "
-            f"{MODEL_REPLICAS}副本。"
+            "直接輸入三位數即可開始預測：\n"
+            "382＝閒3、莊8、只有莊家補牌\n"
+            "571＝閒5、莊7、只有閒家補牌\n\n"
+            "第三碼補牌代號：\n"
+            "1＝只有閒家補牌\n"
+            "2＝只有莊家補牌\n"
+            "3＝雙方都補牌\n"
+            "4＝雙方都不補牌\n\n"
+            "字母格式也可使用：38B、57P、65D、65N。\n"
+            "每一組點數都會完全獨立預測，不需要輸入局數，"
+            "也不會沿用上一局資料。\n"
+            "30分鐘試用會在首次成功輸入點數後開始計時。"
         ),
         [
-            action("新牌靴", "new_shoe"),
             action("結束分析", "end"),
         ],
     )
@@ -702,103 +702,26 @@ def result_panel(
     session: Dict[str, Any],
 ) -> Dict[str, Any]:
     prediction = _stored_prediction(session)
-    observations = _stored_points(session)
     user_status = status(user_id)
-    source_text = _decision_source_text(
-        prediction.get("decision_source")
-    )
-
-    particle_info = prediction.get("point_particle_filter") or {}
-    path_info = prediction.get("draw_path_diagnostics") or {}
-    hybrid_info = prediction.get("hybrid") or {}
-    hybrid_weights = hybrid_info.get("weights") or {}
-    shoe_context = prediction.get("shoe_context") or {}
-
-    particles = _safe_int(
-        particle_info.get("particles_per_replica"),
-        MODEL_PARTICLES,
-    )
-    replicas = _safe_int(
-        particle_info.get(
-            "replicas",
-            prediction.get("replica_count"),
-        ),
-        MODEL_REPLICAS,
-    )
-    validated = bool(prediction.get("validated_signal"))
-    stability_names = {
-        "STABLE": "穩定",
-        "WATCH": "注意",
-        "UNSTABLE": "不穩定",
-    }
-    stability = stability_names.get(
-        str(prediction.get("stability") or ""),
-        str(prediction.get("stability") or "-"),
-    )
-
-    hand_number = _safe_int(
-        shoe_context.get("hand_number"),
-        _safe_int(session.get("hand_number")),
-    )
-    exact_state = bool(
-        shoe_context.get("exact_state_enabled")
-        or hybrid_info.get("exact_state_enabled")
-    )
-    known_cards = prediction.get("known_cards") or {}
-    if exact_state:
-        shoe_mode = "完整牌值追蹤"
-    elif known_cards:
-        shoe_mode = "本局牌值＋局數"
-    elif hand_number > 0:
-        shoe_mode = "牌靴局數先驗"
-    else:
-        shoe_mode = "早中晚混合先驗"
-
-    diagnostics = ""
-    if APP_SHOW_MODEL_DIAGNOSTICS:
-        diagnostics = (
-            f"\n模型：{particles}粒子 × {replicas}副本"
-            f"\nHYBRID閘門："
-            f"{_safe_float(hybrid_info.get('gate')) * 100.0:.0f}%"
-            f"｜PF權重："
-            f"{_safe_float(hybrid_weights.get('particle')) * 100.0:.0f}%"
-            f"\n精確牌組權重："
-            f"{_safe_float(hybrid_weights.get('exact_shoe_state')) * 100.0:.0f}%"
-            f"｜基準收縮："
-            f"{_safe_float(hybrid_weights.get('baseline')) * 100.0:.0f}%"
-            f"\n驗證：{'通過' if validated else '未通過'}"
-            f"｜穩定：{stability}"
-            f"\nESS："
-            f"{_safe_float(particle_info.get('average_effective_sample_size')):.0f}"
-            f"｜路徑覆蓋："
-            f"{_safe_float(path_info.get('coverage')) * 100.0:.0f}%"
-        )
 
     body = (
-        f"本牌靴第 {hand_number or '-'} 局"
-        f"｜第 {len(observations)} 次分析\n"
         f"輸入：{prediction.get('conditioning_point', '-')}\n"
-        f"補牌：{_draw_path_text(prediction)}\n"
-        f"牌靴資訊：{shoe_mode}\n\n"
+        f"補牌：{_draw_path_text(prediction)}\n\n"
         f"莊 {_safe_float(prediction.get('banker_rate')):.1f}%\n"
         f"閒 {_safe_float(prediction.get('player_rate')):.1f}%\n"
         f"和 {_safe_float(prediction.get('tie_rate')):.1f}%\n\n"
-        f"推薦：{prediction.get('recommend_text', '-')}\n"
-        f"訊號：{prediction.get('signal_level', '-')}\n"
-        f"來源：{source_text}"
-        f"{diagnostics}\n\n"
+        f"推薦：{prediction.get('recommend_text', '-')}\n\n"
         f"UID權限：{user_status['label']}"
         f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-        "下一局可輸入 65、65D@39、653@39，"
-        "或完整牌值格式。\n"
-        "換靴時請輸入「新牌靴」。"
+        "下一組直接輸入三位數，例如 382 或 571。\n"
+        "1=僅閒補｜2=僅莊補｜3=雙方補｜4=雙方不補。\n"
+        "每次分析完全獨立，不沿用上一局。"
     )
 
     return flex(
-        "V5.3 HYBRID 下一局分析",
+        "AI預測",
         body,
         [
-            action("新牌靴", "new_shoe"),
             action("結束分析", "end"),
         ],
     )
@@ -914,11 +837,11 @@ def add_points_and_predict(
                 "B": 2,
                 "D": 3,
             }.get(suffix),
-            "hand_number": int(
-                observation.get("hand_number") or 0
-            ),
-            "known_cards": dict(
-                observation.get("known_cards") or {}
+            "hand_number": 0,
+            "known_cards": {},
+            "input_text": str(
+                observation.get("input_text")
+                or f"{player}{banker}{suffix}"
             ),
         }
 
@@ -928,21 +851,19 @@ def add_points_and_predict(
             point,
             normalized_observation,
         )
-        context = store.shoe_context(session)
-        last_observation = dict(
-            session.get("last_observation")
-            or normalized_observation
-        )
-        last_observation.update(context)
-
+        # Do not load or merge shoe context.  Only the current point and
+        # current draw path are sent to the predictor for this request.
         prediction = predict(
-            [last_observation],
+            [normalized_observation],
             venue=session.get("venue", ""),
             room=session.get("room", ""),
             shoe_id=session.get("shoe_id", ""),
             user_id=user_id,
-            shoe_context=context,
+            shoe_context=None,
         )
+        prediction["conditioning_point"] = normalized_observation[
+            "input_text"
+        ]
 
         if not prediction.get("ok"):
             raise ValueError(
@@ -987,15 +908,13 @@ def health() -> JSONResponse:
             "particle_limit": 2000,
             "replicas": MODEL_REPLICAS,
             "input_formats": [
-                "65",
-                "65D",
-                "651",
-                "652",
-                "653",
-                "654",
-                "65D@38",
-                "652@38",
-                "65D@38 P:2,1,3 B:4,0,1",
+                "382",
+                "571",
+                "381",
+                "383",
+                "384",
+                "38B",
+                "57P",
             ],
             "require_draw_path": APP_REQUIRE_DRAW_PATH,
             "require_hand_number": APP_REQUIRE_HAND_NUMBER,
@@ -1080,7 +999,7 @@ async def webhook(
                     reply(
                         token,
                         [
-                            text_message("✅ 已建立新牌靴，局數與牌值追蹤已歸零。"),
+                            text_message("✅ 已清除本次分析紀錄。"),
                             ready_panel(user_id, session),
                         ],
                     )
@@ -1111,28 +1030,14 @@ async def webhook(
                             token,
                             [
                                 text_message(
-                                    "目前設定必須輸入補牌路徑：可用字母 "
-                                    "65N、65P、65B、65D，或數字 "
-                                    "654、651、652、653（1=P、2=B、3=D、4=N）。"
-                                    "例如 652 代表只有莊家補牌。"
+                                    "請輸入三位數，例如382或571。"
+                                    "前兩碼是閒、莊點數，第三碼為補牌代號："
+                                    "1=僅閒補、2=僅莊補、3=雙方補、4=雙方不補。"
                                 )
                             ],
                         )
                         continue
 
-                    if (
-                        APP_REQUIRE_HAND_NUMBER
-                        and not observation.get("hand_number")
-                    ):
-                        reply(
-                            token,
-                            [
-                                text_message(
-                                    "目前設定必須輸入牌靴局數，例如：65D@38 或 653@38。"
-                                )
-                            ],
-                        )
-                        continue
 
                     if not session.get("venue"):
                         reply(
@@ -1212,9 +1117,9 @@ async def webhook(
                     [
                         text_message(
                             "格式錯誤。請輸入「開始分析」，"
-                            "或輸入 65、65D、652、65D@38、652@38；"
-                            "數字代號為1=P、2=B、3=D、4=N。"
-                            "換靴請輸入「新牌靴」。"
+                            "或直接輸入三位數，例如382、571。"
+                            "前兩碼是閒、莊點數；第三碼："
+                            "1=僅閒補、2=僅莊補、3=雙方補、4=雙方不補。"
                         )
                     ],
                 )
@@ -1258,7 +1163,7 @@ async def webhook(
                     reply(
                         token,
                         [
-                            text_message("✅ 已建立新牌靴，局數與牌值追蹤已歸零。"),
+                            text_message("✅ 已清除本次分析紀錄。"),
                             ready_panel(user_id, session),
                         ],
                     )

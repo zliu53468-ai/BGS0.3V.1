@@ -1,4 +1,4 @@
-"""LINE-compatible V5.3 factual-shoe-context HYBRID predictor."""
+"""LINE-compatible V5.3 independent point-and-draw-path predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -87,7 +87,7 @@ def _normalize_counts(value: Any) -> Optional[List[int]]:
 def parse_point_observation(
     value: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Parse 65, 65D/653, 65@38, 65D@38/653@38, or a mapping."""
+    """Parse current-hand points and draw path, e.g. 382 or 38B."""
     if isinstance(value, Mapping):
         player = value.get(
             "player",
@@ -302,41 +302,21 @@ def predict(
             "ok": False,
             "error": "missing_point_observation",
             "message": (
-                "請輸入兩位數點數，例如65；"
-                "補牌可用字母65D或數字653，"
-                "加局數可輸入65D@38或653@38。"
+                "請輸入本局點數與補牌代號，例如382或571；"
+                "前兩碼是閒家、莊家點數，第三碼為補牌代號："
+                "1=僅閒補、2=僅莊補、3=雙方補、4=雙方不補。"
             ),
         }
 
-    context = dict(shoe_context or {})
-    hand_number = int(
-        latest.get("hand_number")
-        or context.get("hand_number")
-        or 0
-    )
-    known_cards = (
-        latest.get("known_cards")
-        or context.get("known_cards")
-        or {}
-    )
-    remaining_counts = (
-        latest.get("remaining_counts")
-        or context.get("remaining_counts")
-    )
-    state_complete = bool(
-        latest.get("state_complete")
-        or context.get("state_complete")
-    )
-    state_source = str(
-        latest.get("state_source")
-        or context.get("state_source")
-        or "UNKNOWN"
-    )
-    tracked_card_hands = int(
-        latest.get("tracked_card_hands")
-        or context.get("tracked_card_hands")
-        or 0
-    )
+    # Independent mode: every request is conditioned only on the current
+    # final points and current draw path.  Hand number, prior shoe state,
+    # exact-card history and previous observations are intentionally ignored.
+    hand_number = 0
+    known_cards: Dict[str, List[int]] = {}
+    remaining_counts = None
+    state_complete = False
+    state_source = "INDEPENDENT_CURRENT_HAND"
+    tracked_card_hands = 0
 
     seed = _new_seed(run_seed)
     engine = V5IndependentBaccaratEngine()
@@ -346,10 +326,10 @@ def predict(
             latest["banker"],
             seed,
             latest.get("path"),
-            hand_number=hand_number or None,
-            known_cards=known_cards or None,
-            remaining_counts=remaining_counts,
-            state_complete=state_complete,
+            hand_number=None,
+            known_cards=None,
+            remaining_counts=None,
+            state_complete=False,
         )
     except ValueError as exception:
         return {
@@ -387,8 +367,6 @@ def predict(
         f"{latest['player']}{latest['banker']}"
         f"{latest.get('suffix', '')}"
     )
-    if hand_number > 0:
-        point_text += f"@{hand_number}"
 
     particle_count = int(result["settings"]["particles"])
     hybrid = dict(result.get("hybrid") or {})
@@ -409,7 +387,7 @@ def predict(
         "run_seed": seed,
         "fresh_particle_mode": True,
         "persistent_particle_state": False,
-        "persistent_shoe_context": True,
+        "persistent_shoe_context": False,
         "road_history_used": False,
         "used_observation_count": 1,
         "ignored_prior_observations": max(
@@ -420,7 +398,7 @@ def predict(
         "conditioning_observation": {
             "player": latest["player"],
             "banker": latest["banker"],
-            "hand_number": hand_number,
+            "hand_number": 0,
         },
         "conditioning_outcome": _outcome(latest),
         "known_draw_path": (
@@ -428,7 +406,7 @@ def predict(
             if latest.get("path") is not None
             else None
         ),
-        "known_cards": _normalize_known_cards(known_cards),
+        "known_cards": {},
         "banker_rate": round(
             probabilities["B"] * 100.0,
             1,
@@ -473,13 +451,11 @@ def predict(
             ),
         },
         "shoe_context": {
-            "hand_number": hand_number,
-            "state_complete": state_complete,
+            "hand_number": 0,
+            "state_complete": False,
             "state_source": state_source,
-            "tracked_card_hands": tracked_card_hands,
-            "exact_state_enabled": bool(
-                hybrid.get("exact_state_enabled", False)
-            ),
+            "tracked_card_hands": 0,
+            "exact_state_enabled": False,
         },
         "recommend": recommend,
         "raw_recommend": raw_recommend,
@@ -685,8 +661,8 @@ def predict(
         "reason": (
             f"V5.3.0 HYBRID：{particle_count}粒子×"
             f"{int(result['replicas'])}副本；"
-            "使用最新最終點數、補牌路徑、實際牌靴局數及"
-            "使用者明確輸入的牌值；不使用牌路、長龍、"
+            "每次只使用本局最終點數與本局補牌路徑獨立模擬；"
+            "不使用牌靴局數、歷史牌值、上一局資料、牌路、長龍、"
             "Markov、上一局推薦或勝敗紀錄。"
             f"決策來源={result['decision_source']}；"
             f"{result['reason']}。"
