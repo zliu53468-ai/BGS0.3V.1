@@ -2,11 +2,11 @@
 
 Recommended inputs
 ------------------
-382 = Player 3 / Banker 8 / banker only drew
+652 = Player 6 / Banker 5 / banker only drew
 571 = Player 5 / Banker 7 / player only drew
 
 The first two digits are the final Player/Banker points. The third digit is
-the current-hand draw code: 1=P, 2=B, 3=D, 4=N. Letter forms such as 38B and
+the current-hand draw code: 1=P, 2=B, 3=D, 4=N. Letter forms such as 65B and
 57P remain supported. Every request is predicted independently and does not
 use a hand number, prior shoe state, previous points or previous predictions.
 """
@@ -58,6 +58,24 @@ def _env_int(
     return min(maximum, value) if maximum is not None else value
 
 
+def _env_csv_ints(
+    name: str,
+    default: Sequence[int],
+) -> Tuple[int, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return tuple(int(item) for item in default)
+    values: List[int] = []
+    for part in raw.split(","):
+        try:
+            value = int(part.strip())
+        except Exception:
+            continue
+        if value > 0 and value not in values:
+            values.append(value)
+    return tuple(values) if values else tuple(int(item) for item in default)
+
+
 APP_SHOW_MODEL_DIAGNOSTICS = _env_bool(
     "APP_SHOW_MODEL_DIAGNOSTICS",
     True,
@@ -80,6 +98,22 @@ APP_PREDICTION_QUEUE_TIMEOUT = _env_int(
     1,
     55,
 )
+APP_BANKROLL_MIN = _env_int("APP_BANKROLL_MIN", 1000, 100, 100_000_000)
+APP_BANKROLL_MAX = _env_int(
+    "APP_BANKROLL_MAX",
+    10_000_000,
+    APP_BANKROLL_MIN,
+    100_000_000,
+)
+APP_BANKROLL_PRESETS = tuple(
+    value
+    for value in _env_csv_ints(
+        "APP_BANKROLL_PRESETS",
+        (1000, 3000, 5000, 10000),
+    )
+    if APP_BANKROLL_MIN <= value <= APP_BANKROLL_MAX
+)[:4]
+BET_ROUND_UNIT = _env_int("BET_ROUND_UNIT", 100, 100, 100_000)
 MODEL_PARTICLES = _env_int("PF_PARTICLES", 384, 64, 2000)
 MODEL_REPLICAS = _env_int("PF_REPLICAS", 5, 3, 11)
 MODEL_HYBRID_MODE = os.getenv(
@@ -582,6 +616,75 @@ def parse_chat_point_observation(
     }
 
 
+def _parse_bankroll(text: Any) -> int:
+    cleaned = str(text or "").strip().upper()
+    cleaned = re.sub(r"^(?:本金|金額|資金)\s*[:：=]?\s*", "", cleaned)
+    cleaned = cleaned.replace(",", "").replace("，", "")
+    cleaned = cleaned.replace("NT$", "").replace("$", "").replace("元", "")
+    cleaned = cleaned.strip()
+    if not re.fullmatch(r"[0-9]+", cleaned):
+        raise ValueError("請輸入純數字本金，例如 10000。")
+    bankroll = int(cleaned)
+    if bankroll < APP_BANKROLL_MIN or bankroll > APP_BANKROLL_MAX:
+        raise ValueError(
+            f"本金請輸入 {APP_BANKROLL_MIN:,}～{APP_BANKROLL_MAX:,} 元。"
+        )
+    return bankroll
+
+
+def _format_money(value: Any) -> str:
+    return f"{max(0, _safe_int(value)):,}"
+
+
+def _round_bet_amount(
+    bankroll: int,
+    fraction: float,
+    unit: int = BET_ROUND_UNIT,
+) -> int:
+    bankroll = max(0, int(bankroll))
+    unit = max(100, int(unit))
+    if bankroll <= 0 or fraction <= 0:
+        return 0
+    raw = bankroll * max(0.0, min(1.0, float(fraction)))
+    # Conventional half-up rounding; unlike Python round(), exact halves do not
+    # use bankers rounding.  The result therefore has no tens or ones digits.
+    rounded = int((raw + unit / 2.0) // unit) * unit
+    affordable = (bankroll // unit) * unit
+    if affordable <= 0:
+        return 0
+    return max(unit, min(rounded, affordable))
+
+
+def _save_bankroll(
+    user_id: str,
+    session: Dict[str, Any],
+    bankroll: int,
+) -> Dict[str, Any]:
+    session = dict(session or {})
+    session["bankroll"] = int(bankroll)
+    session["initial_bankroll"] = int(bankroll)
+    session["awaiting_bankroll"] = False
+    return store.upsert_session(user_id, session)
+
+
+def _restore_bankroll_after_reset(
+    user_id: str,
+    old_session: Mapping[str, Any],
+    reset_session: Dict[str, Any],
+) -> Dict[str, Any]:
+    bankroll = _safe_int(old_session.get("bankroll"), 0)
+    if bankroll <= 0:
+        return reset_session
+    reset_session = dict(reset_session or {})
+    reset_session["bankroll"] = bankroll
+    reset_session["initial_bankroll"] = _safe_int(
+        old_session.get("initial_bankroll"),
+        bankroll,
+    )
+    reset_session["awaiting_bankroll"] = False
+    return store.upsert_session(user_id, reset_session)
+
+
 # ---------------------------------------------------------------------------
 # Panels
 # ---------------------------------------------------------------------------
@@ -617,6 +720,31 @@ def room_panel(venue_code: str) -> Dict[str, Any]:
     )
 
 
+def bankroll_panel(
+    user_id: str,
+    session: Dict[str, Any],
+) -> Dict[str, Any]:
+    buttons = [
+        action(
+            f"{value:,} 元",
+            "bankroll",
+            amount=str(value),
+        )
+        for value in APP_BANKROLL_PRESETS
+    ]
+    return flex(
+        "請選擇本金",
+        (
+            f"館別：{session.get('venue') or '-'}\n"
+            f"房間：{session.get('room') or '-'}\n\n"
+            "請點選常用本金，或直接輸入自訂金額。\n"
+            f"可輸入範圍：{APP_BANKROLL_MIN:,}～{APP_BANKROLL_MAX:,} 元。\n"
+            "例如：10000 或 本金10000。"
+        ),
+        buttons or None,
+    )
+
+
 def ready_panel(
     user_id: str,
     session: Dict[str, Any],
@@ -627,17 +755,18 @@ def ready_panel(
         (
             f"館別：{session.get('venue') or '-'}\n"
             f"房間：{session.get('room') or '-'}\n"
+            f"本金：{_format_money(session.get('bankroll'))} 元\n"
             f"UID權限：{user_status['label']}"
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
             "直接輸入三位數即可開始預測：\n"
-            "382＝閒3、莊8、只有莊家補牌\n"
+            "652＝閒6、莊5、只有莊家補牌\n"
             "571＝閒5、莊7、只有閒家補牌\n\n"
             "第三碼補牌代號：\n"
             "1＝只有閒家補牌\n"
             "2＝只有莊家補牌\n"
             "3＝雙方都補牌\n"
             "4＝雙方都不補牌\n\n"
-            "字母格式也可使用：38B、57P、65D、65N。\n"
+            "字母格式也可使用：65B、57P、65D、67N。\n"
             "每一組點數都會完全獨立預測，不需要輸入局數，"
             "也不會沿用上一局資料。\n"
             "30分鐘試用會在首次成功輸入點數後開始計時。"
@@ -703,6 +832,22 @@ def result_panel(
 ) -> Dict[str, Any]:
     prediction = _stored_prediction(session)
     user_status = status(user_id)
+    bankroll = _safe_int(
+        prediction.get("bankroll", session.get("bankroll", 0)),
+        0,
+    )
+    suggested_bet = _safe_int(
+        prediction.get("suggested_bet_amount", 0),
+        0,
+    )
+    bet_percentage = _safe_float(prediction.get("bet_percentage", 0.0))
+    bet_level_text = str(prediction.get("bet_level_text") or "保守")
+    bet_line = (
+        f"建議金額：{_format_money(suggested_bet)} 元"
+        f"（{bet_percentage:.1f}%｜{bet_level_text}）"
+        if suggested_bet > 0
+        else "建議金額：本局觀望"
+    )
 
     body = (
         f"輸入：{prediction.get('conditioning_point', '-')}\n"
@@ -710,10 +855,12 @@ def result_panel(
         f"莊 {_safe_float(prediction.get('banker_rate')):.1f}%\n"
         f"閒 {_safe_float(prediction.get('player_rate')):.1f}%\n"
         f"和 {_safe_float(prediction.get('tie_rate')):.1f}%\n\n"
-        f"推薦：{prediction.get('recommend_text', '-')}\n\n"
+        f"推薦：{prediction.get('recommend_text', '-')}\n"
+        f"本金：{_format_money(bankroll)} 元\n"
+        f"{bet_line}\n\n"
         f"UID權限：{user_status['label']}"
         f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-        "下一組直接輸入三位數，例如 382 或 571。\n"
+        "下一組直接輸入三位數，例如 652 或 571。\n"
         "1=僅閒補｜2=僅莊補｜3=雙方補｜4=雙方不補。\n"
         "每次分析完全獨立，不沿用上一局。"
     )
@@ -872,6 +1019,23 @@ def add_points_and_predict(
                 or "V5.3 HYBRID預測失敗"
             )
 
+        bankroll = _safe_int(session.get("bankroll"), 0)
+        if bankroll <= 0:
+            raise ValueError("尚未設定本金，請先輸入本金金額。")
+        bet_fraction = _safe_float(prediction.get("bet_fraction"), 0.0)
+        bet_allowed = bool(prediction.get("bet_allowed", False))
+        suggested_bet = (
+            _round_bet_amount(bankroll, bet_fraction)
+            if bet_allowed and prediction.get("recommend") != "O"
+            else 0
+        )
+        prediction["bankroll"] = bankroll
+        prediction["suggested_bet_amount"] = suggested_bet
+        prediction["suggested_bet_round_unit"] = BET_ROUND_UNIT
+        prediction["suggested_bet_display"] = (
+            f"{suggested_bet:,} 元" if suggested_bet > 0 else "本局觀望"
+        )
+
         return store.save_prediction(
             user_id,
             prediction,
@@ -908,17 +1072,22 @@ def health() -> JSONResponse:
             "particle_limit": 2000,
             "replicas": MODEL_REPLICAS,
             "input_formats": [
-                "382",
+                "652",
                 "571",
-                "381",
-                "383",
-                "384",
-                "38B",
+                "653",
+                "674",
+                "65B",
                 "57P",
+                "65D",
+                "67N",
             ],
             "require_draw_path": APP_REQUIRE_DRAW_PATH,
             "require_hand_number": APP_REQUIRE_HAND_NUMBER,
             "max_concurrent_predictions": APP_MAX_CONCURRENT_PREDICTIONS,
+            "bankroll_min": APP_BANKROLL_MIN,
+            "bankroll_max": APP_BANKROLL_MAX,
+            "bankroll_presets": list(APP_BANKROLL_PRESETS),
+            "bet_round_unit": BET_ROUND_UNIT,
         }
     )
 
@@ -995,7 +1164,13 @@ async def webhook(
                     text in {"新牌靴", "換靴", "重置牌靴"}
                     and session.get("room")
                 ):
+                    old_session = dict(session)
                     session = store.reset_shoe(user_id)
+                    session = _restore_bankroll_after_reset(
+                        user_id,
+                        old_session,
+                        session,
+                    )
                     reply(
                         token,
                         [
@@ -1010,14 +1185,71 @@ async def webhook(
                     and not session.get("room")
                 ):
                     session["room"] = text
+                    session["bankroll"] = 0
+                    session["initial_bankroll"] = 0
+                    session["awaiting_bankroll"] = True
                     session = store.upsert_session(
                         user_id,
                         session,
                     )
                     reply(
                         token,
-                        [ready_panel(user_id, session)],
+                        [bankroll_panel(user_id, session)],
                     )
+                    continue
+
+                if text in {"更改本金", "設定本金", "本金"} and session.get("room"):
+                    session["awaiting_bankroll"] = True
+                    session = store.upsert_session(user_id, session)
+                    reply(token, [bankroll_panel(user_id, session)])
+                    continue
+
+                if session.get("room") and (
+                    session.get("awaiting_bankroll")
+                    or _safe_int(session.get("bankroll"), 0) <= 0
+                ):
+                    try:
+                        bankroll = _parse_bankroll(text)
+                        session = _save_bankroll(user_id, session, bankroll)
+                        reply(
+                            token,
+                            [
+                                text_message(
+                                    f"✅ 本金已設定為 {bankroll:,} 元"
+                                ),
+                                ready_panel(user_id, session),
+                            ],
+                        )
+                    except ValueError as exception:
+                        reply(
+                            token,
+                            [
+                                text_message(str(exception)),
+                                bankroll_panel(user_id, session),
+                            ],
+                        )
+                    continue
+
+                bankroll_command = re.fullmatch(
+                    r"(?:本金|金額|資金)\s*[:：=]?\s*(.+)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                if bankroll_command and session.get("room"):
+                    try:
+                        bankroll = _parse_bankroll(bankroll_command.group(1))
+                        session = _save_bankroll(user_id, session, bankroll)
+                        reply(
+                            token,
+                            [
+                                text_message(
+                                    f"✅ 本金已更新為 {bankroll:,} 元"
+                                ),
+                                ready_panel(user_id, session),
+                            ],
+                        )
+                    except ValueError as exception:
+                        reply(token, [text_message(str(exception))])
                     continue
 
                 observation = parse_chat_point_observation(text)
@@ -1030,7 +1262,7 @@ async def webhook(
                             token,
                             [
                                 text_message(
-                                    "請輸入三位數，例如382或571。"
+                                    "請輸入三位數，例如652或571。"
                                     "前兩碼是閒、莊點數，第三碼為補牌代號："
                                     "1=僅閒補、2=僅莊補、3=雙方補、4=雙方不補。"
                                 )
@@ -1058,6 +1290,15 @@ async def webhook(
                                     "請先輸入房間名稱或桌號。"
                                 )
                             ],
+                        )
+                        continue
+
+                    if _safe_int(session.get("bankroll"), 0) <= 0:
+                        session["awaiting_bankroll"] = True
+                        session = store.upsert_session(user_id, session)
+                        reply(
+                            token,
+                            [bankroll_panel(user_id, session)],
                         )
                         continue
 
@@ -1117,7 +1358,8 @@ async def webhook(
                     [
                         text_message(
                             "格式錯誤。請輸入「開始分析」，"
-                            "或直接輸入三位數，例如382、571。"
+                            "或直接輸入三位數，例如652、571。"
+                            "需要調整金額可輸入「更改本金」。"
                             "前兩碼是閒、莊點數；第三碼："
                             "1=僅閒補、2=僅莊補、3=雙方補、4=雙方不補。"
                         )
@@ -1152,6 +1394,20 @@ async def webhook(
                         ],
                     )
 
+                elif action_name == "bankroll":
+                    session = store.get_session(user_id)
+                    bankroll = _parse_bankroll(query.get("amount", ""))
+                    session = _save_bankroll(user_id, session, bankroll)
+                    reply(
+                        token,
+                        [
+                            text_message(
+                                f"✅ 本金已設定為 {bankroll:,} 元"
+                            ),
+                            ready_panel(user_id, session),
+                        ],
+                    )
+
                 elif action_name == "start":
                     reply(
                         token,
@@ -1159,7 +1415,13 @@ async def webhook(
                     )
 
                 elif action_name == "new_shoe":
+                    old_session = store.get_session(user_id)
                     session = store.reset_shoe(user_id)
+                    session = _restore_bankroll_after_reset(
+                        user_id,
+                        old_session,
+                        session,
+                    )
                     reply(
                         token,
                         [
