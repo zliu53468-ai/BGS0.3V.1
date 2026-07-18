@@ -1,9 +1,12 @@
-"""V5.2.0 stateless point-conditioned baccarat particle engine.
+"""V5.3.0 factual-shoe-context HYBRID baccarat particle engine.
 
-The official LINE predictor uses only the newest final-point observation.
-Every request creates fresh particles, fresh replicas and fresh forecast samples.
-No road, streak, Markov state, previous recommendation or per-UID particle state
-is carried into the next request.
+Every request still creates fresh particles, fresh replicas and fresh forecast
+samples. The engine may additionally use factual shoe context supplied by the
+caller: current hand number, optional N/P/B/D path, and exact cards explicitly
+entered by the user.
+
+No road, streak, Markov state, previous recommendation, win/loss result, or
+per-UID particle direction is carried into the next request.
 """
 from __future__ import annotations
 
@@ -50,37 +53,53 @@ def _env_choice(name: str, default: str, allowed: Sequence[str]) -> str:
 MIN_PARTICLE_COUNT = 64
 MAX_PARTICLE_COUNT = 2000
 DECKS = _env_int("PF_DECKS", 8, 1, 16)
-PARTICLE_COUNT = _env_int("PF_PARTICLES", 1000, MIN_PARTICLE_COUNT, MAX_PARTICLE_COUNT)
+
+# 384 x 5 is the default real-time profile. Operators can still raise either
+# value through environment variables after measuring their Render CPU.
+PARTICLE_COUNT = _env_int("PF_PARTICLES", 384, MIN_PARTICLE_COUNT, MAX_PARTICLE_COUNT)
 REPLICA_COUNT = _env_int("PF_REPLICAS", 5, 3, 11)
-# These defaults scale with the requested particle count again inside condition().
-# This prevents a 1000/2000-particle run from being filled mostly by duplicates
-# drawn from the old 320-candidate pool.
-TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 600, 32, 8000)
-TARGET_ESS = _env_float("PF_TARGET_ESS", 380.0, 8.0, 8000.0)
-MIN_MATCHES = _env_int("PF_MIN_MATCHES", 80, 1, 8000)
-MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 150_000, 500, 500_000)
-PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 24, 4, 512)
-PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 6, 1, 256)
-PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 4.0, 1.0, 256.0)
-MIN_PATH_COVERAGE = _env_float("PF_MIN_DRAW_PATH_COVERAGE", 0.80, 0.0, 1.0)
-PATH_UNCERTAINTY = _env_float("PF_DRAW_PATH_UNCERTAINTY", 0.40, 0.0, 2.0)
-PATH_PRIOR_STRENGTH = _env_float("PF_DRAW_PATH_PRIOR_STRENGTH", 2.0, 0.0, 50.0)
-MIN_PATH_PARTICLES = _env_int("PF_MIN_PARTICLES_PER_DRAW_PATH", 24, 1, 512)
-PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
-POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 600, 100, 100_000)
-SPLIT_UNCERTAINTY = _env_float("PF_SPLIT_UNCERTAINTY", 0.50, 0.0, 2.0)
-MIN_EFFECTIVE_REPLICAS = _env_float("PF_MIN_EFFECTIVE_REPLICAS", 3.5, 1.0, 11.0)
+TARGET_MATCHES = _env_int("PF_TARGET_MATCHES", 230, 32, 8000)
+TARGET_ESS = _env_float("PF_TARGET_ESS", 146.0, 8.0, 8000.0)
+MIN_MATCHES = _env_int("PF_MIN_MATCHES", 31, 1, 8000)
+MAX_UPDATE_PROPOSALS = _env_int("PF_MAX_UPDATE_PROPOSALS", 56_000, 500, 500_000)
+PATH_TARGET_MATCHES = _env_int("PF_DRAW_PATH_TARGET_MATCHES", 10, 4, 512)
+PATH_MIN_MATCHES = _env_int("PF_DRAW_PATH_MIN_MATCHES", 4, 1, 256)
+PATH_MIN_ESS = _env_float("PF_DRAW_PATH_MIN_ESS", 2.5, 1.0, 256.0)
+MIN_PATH_COVERAGE = _env_float("PF_MIN_DRAW_PATH_COVERAGE", 0.70, 0.0, 1.0)
+PATH_UNCERTAINTY = _env_float("PF_DRAW_PATH_UNCERTAINTY", 0.35, 0.0, 2.0)
+PATH_PRIOR_STRENGTH = _env_float("PF_DRAW_PATH_PRIOR_STRENGTH", 1.5, 0.0, 50.0)
+MIN_PATH_PARTICLES = _env_int("PF_MIN_PARTICLES_PER_DRAW_PATH", 12, 1, 512)
+PREDICT_SIMS = _env_int("PF_PREDICT_SIMULATIONS_PER_REPLICA", 200, 100, 100_000)
+POINT_JOINT_SIMS = _env_int("PF_POINT_JOINT_SIMULATIONS_PER_REPLICA", 200, 100, 100_000)
+SPLIT_UNCERTAINTY = _env_float("PF_SPLIT_UNCERTAINTY", 0.45, 0.0, 2.0)
+MIN_EFFECTIVE_REPLICAS = _env_float("PF_MIN_EFFECTIVE_REPLICAS", 3.3, 1.0, 11.0)
 ADAPTIVE_REPLICA_WEIGHT = _env_bool("PF_ADAPTIVE_REPLICA_WEIGHT", True)
 DATABASE_WEIGHT = _env_float("PF_DATABASE_WEIGHT", 0.0, 0.0, 0.75)
 DATABASE_MAX_ADJUSTMENT = _env_float("PF_DATABASE_MAX_ADJUSTMENT", 0.005, 0.0, 0.05)
 DATABASE_VALIDATION_MODE = _env_choice(
     "PF_DATABASE_VALIDATION_MODE", "diagnostic", ("validated_only", "diagnostic", "force")
 )
-UNCERTAINTY_PENALTY = _env_float("PF_UNCERTAINTY_PENALTY", 1.28, 0.0, 5.0)
+UNCERTAINTY_PENALTY = _env_float("PF_UNCERTAINTY_PENALTY", 1.20, 0.0, 5.0)
 MIN_VALIDATED_EDGE = _env_float("PF_MIN_VALIDATED_EDGE", 0.0012, 0.0, 0.05)
-MIN_REPLICA_AGREEMENT = _env_float("PF_MIN_REPLICA_AGREEMENT", 0.71, 0.50, 1.0)
+MIN_REPLICA_AGREEMENT = _env_float("PF_MIN_REPLICA_AGREEMENT", 0.68, 0.50, 1.0)
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 DECISION_MODE = _env_choice("PF_DECISION_MODE", "validated", ("validated", "centered", "raw", "ev"))
+
+# HYBRID combines only independent factual sources. No road or streak features
+# are accepted by this engine.
+HYBRID_MODE = _env_choice("PF_HYBRID_MODE", "hybrid", ("hybrid", "particle"))
+HYBRID_PARTICLE_MAX_WEIGHT = _env_float("PF_HYBRID_PARTICLE_MAX_WEIGHT", 0.82, 0.0, 1.0)
+HYBRID_EXACT_STATE_MAX_WEIGHT = _env_float(
+    "PF_HYBRID_EXACT_STATE_MAX_WEIGHT", 0.24, 0.0, 0.60
+)
+HYBRID_BASELINE_MIN_WEIGHT = _env_float(
+    "PF_HYBRID_BASELINE_MIN_WEIGHT", 0.12, 0.0, 0.90
+)
+HYBRID_MAX_COMPONENT_ADJUSTMENT = _env_float(
+    "PF_HYBRID_MAX_COMPONENT_ADJUSTMENT", 0.020, 0.0, 0.10
+)
+HAND_NUMBER_UNCERTAINTY = _env_int("PF_HAND_NUMBER_UNCERTAINTY", 0, 0, 5)
+STATE_SIMULATIONS = _env_int("PF_STATE_SIMULATIONS", 1200, 200, 100_000)
 
 BASELINE = np.asarray(DEFAULT_BASELINE, dtype=float)
 DRAW_BASELINE = np.asarray(DEFAULT_DRAW, dtype=float)
@@ -373,6 +392,153 @@ def exact_conditional_complete(
     return counts, path, max(1e-12, float(weight)), cards
 
 
+
+def normalize_known_cards(value: Any) -> Optional[Dict[str, List[int]]]:
+    """Normalize an exact current hand entered as Player/Banker card values."""
+    if not isinstance(value, Mapping):
+        return None
+    out: Dict[str, List[int]] = {}
+    aliases = {
+        "player": ("player", "P", "閒", "闲"),
+        "banker": ("banker", "B", "莊", "庄"),
+    }
+    for side, names in aliases.items():
+        raw = None
+        for name in names:
+            if name in value:
+                raw = value.get(name)
+                break
+        if raw is None:
+            return None
+        try:
+            cards = [int(card) % 10 for card in list(raw)]
+        except Exception:
+            return None
+        if len(cards) not in {2, 3}:
+            return None
+        out[side] = cards
+    return out
+
+
+def validate_known_hand(
+    observed_player: int,
+    observed_banker: int,
+    known_path: Optional[int],
+    known_cards: Mapping[str, Sequence[int]],
+) -> Tuple[bool, int, str]:
+    """Validate exact cards against baccarat third-card rules and final totals."""
+    normalized = normalize_known_cards(known_cards)
+    if normalized is None:
+        return False, -1, "missing_or_invalid_cards"
+
+    player = normalized["player"]
+    banker = normalized["banker"]
+    p0 = (player[0] + player[1]) % 10
+    b0 = (banker[0] + banker[1]) % 10
+
+    natural = p0 >= 8 or b0 >= 8
+    if natural:
+        player_draw = False
+        banker_draw = False
+    else:
+        player_draw = p0 <= 5
+        player_third = player[2] if player_draw and len(player) == 3 else None
+        banker_draw = banker_draws(b0, player_third)
+
+    expected_player_len = 3 if player_draw else 2
+    expected_banker_len = 3 if banker_draw else 2
+    if len(player) != expected_player_len or len(banker) != expected_banker_len:
+        return False, -1, "cards_conflict_with_draw_rules"
+
+    final_player = sum(player) % 10
+    final_banker = sum(banker) % 10
+    if final_player != int(observed_player) % 10 or final_banker != int(observed_banker) % 10:
+        return False, -1, "cards_conflict_with_final_points"
+
+    path = (1 if player_draw else 0) + (2 if banker_draw else 0)
+    if known_path is not None and int(known_path) != path:
+        return False, path, "cards_conflict_with_path_suffix"
+    return True, path, "ok"
+
+
+def exact_known_hand_complete(
+    source: np.ndarray,
+    observed_player: int,
+    observed_banker: int,
+    known_path: Optional[int],
+    known_cards: Mapping[str, Sequence[int]],
+) -> Optional[Tuple[np.ndarray, int, float, int]]:
+    """Condition a prior particle on an exact entered hand.
+
+    The likelihood is computed in physical dealing order, then the known cards
+    are removed from the selected prior shoe. This supplies genuinely new card
+    composition information without using road or result history.
+    """
+    normalized = normalize_known_cards(known_cards)
+    if normalized is None:
+        return None
+    valid, path, _ = validate_known_hand(
+        observed_player,
+        observed_banker,
+        known_path,
+        normalized,
+    )
+    if not valid:
+        return None
+
+    player = normalized["player"]
+    banker = normalized["banker"]
+    sequence: List[int] = [player[0], banker[0], player[1], banker[1]]
+    if len(player) == 3:
+        sequence.append(player[2])
+    if len(banker) == 3:
+        sequence.append(banker[2])
+
+    counts = np.asarray(source, dtype=np.int16).copy()
+    weight = 1.0
+    for value in sequence:
+        probability = _required_card_probability(counts, int(value) % 10)
+        if probability <= 0:
+            return None
+        weight *= probability
+        counts[int(value) % 10] -= 1
+
+    return counts, path, max(1e-12, float(weight)), len(sequence)
+
+
+def _valid_remaining_counts(value: Any, decks: int) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(list(value), dtype=np.int16)
+    except Exception:
+        return None
+    if arr.shape != (10,) or np.any(arr < 0):
+        return None
+    maximum = fresh_shoe_counts(decks)
+    if np.any(arr > maximum) or int(arr.sum()) < 6:
+        return None
+    return arr.copy()
+
+
+def estimate_exact_state_probabilities(
+    remaining_counts: Sequence[int],
+    decks: int,
+    seed: int,
+    samples: int,
+) -> np.ndarray:
+    """Monte Carlo next-hand probabilities from an exactly tracked shoe."""
+    counts = _valid_remaining_counts(remaining_counts, decks)
+    if counts is None:
+        return BASELINE.copy()
+    total = np.zeros(3, dtype=float)
+    pair_count = int(math.ceil(max(200, int(samples)) / 2.0))
+    for pair_index in range(pair_count):
+        pair_seed = mix_seed(seed, 910000 + pair_index)
+        for antithetic in (False, True):
+            stream = UniformStream(pair_seed, antithetic)
+            hand = simulate_hand_uniform(counts, stream.random)
+            total[_outcome_index(hand.outcome)] += 1.0
+    return normalize_array(total, BASELINE)
+
 def feasible_current_paths(player_total: int, banker_total: int, known_path: Optional[int]) -> np.ndarray:
     possible = np.zeros(4, dtype=bool)
     for p0 in range(10):
@@ -527,21 +693,79 @@ class V5ReplicaEngine:
         self.decks = max(1, int(decks))
         self.rng = np.random.default_rng(self.seed)
 
-    def build_stratified_prior(self) -> Tuple[List[np.ndarray], List[int]]:
-        allocations = [int(math.floor(self.particle_count * w)) for _, _, w in CALIBRATED_DEPTH_PROFILE]
+    def build_stratified_prior(
+        self,
+        hand_number: Optional[int] = None,
+        hand_uncertainty: int = 0,
+    ) -> Tuple[List[np.ndarray], List[int]]:
+        """Build the shoe immediately before the observed current hand.
+
+        When a factual hand number is known, every particle is generated near
+        that physical depth instead of mixing early-, mid- and late-shoe states.
+        If the hand number is absent, the calibrated broad prior is retained for
+        backward compatibility.
+        """
+        particles: List[np.ndarray] = []
+        depths: List[int] = []
+
+        try:
+            current_hand = int(hand_number or 0)
+        except Exception:
+            current_hand = 0
+
+        if current_hand > 0:
+            base_prior_depth = max(0, min(90, current_hand - 1))
+            uncertainty = max(0, min(5, int(hand_uncertainty)))
+            offsets = list(range(-uncertainty, uncertainty + 1)) or [0]
+            for item_index in range(self.particle_count):
+                requested = max(
+                    0,
+                    min(
+                        90,
+                        base_prior_depth + offsets[item_index % len(offsets)],
+                    ),
+                )
+                counts = fresh_shoe_counts(self.decks)
+                completed = 0
+                for _ in range(requested):
+                    if int(counts.sum()) < 12:
+                        break
+                    try:
+                        counts = simulate_hand_np(counts, self.rng).counts_after
+                        completed += 1
+                    except RuntimeError:
+                        break
+                particles.append(counts)
+                depths.append(completed)
+            return particles, depths
+
+        allocations = [
+            int(math.floor(self.particle_count * w))
+            for _, _, w in CALIBRATED_DEPTH_PROFILE
+        ]
         index = 0
         while sum(allocations) < self.particle_count:
             allocations[index % len(allocations)] += 1
             index += 1
-        particles: List[np.ndarray] = []
-        depths: List[int] = []
-        for (low, high, _), count in zip(CALIBRATED_DEPTH_PROFILE, allocations):
+        for (low, high, _), count in zip(
+            CALIBRATED_DEPTH_PROFILE,
+            allocations,
+        ):
             span = high - low + 1
             for item_index in range(count):
                 counts = fresh_shoe_counts(self.decks)
                 q = (item_index + 0.5) / max(1, count)
-                base_depth = low + min(span - 1, int(math.floor(q * span)))
-                requested = max(low, min(high, base_depth + int(self.rng.integers(-1, 2))))
+                base_depth = low + min(
+                    span - 1,
+                    int(math.floor(q * span)),
+                )
+                requested = max(
+                    low,
+                    min(
+                        high,
+                        base_depth + int(self.rng.integers(-1, 2)),
+                    ),
+                )
                 completed = 0
                 for _ in range(requested):
                     if int(counts.sum()) < 12:
@@ -563,8 +787,23 @@ class V5ReplicaEngine:
         banker_total: int,
         known_path: Optional[int],
         settings: Mapping[str, Any],
+        known_cards: Optional[Mapping[str, Sequence[int]]] = None,
     ) -> ConditionedPopulation:
-        feasible = feasible_current_paths(player_total, banker_total, known_path)
+        effective_known_path = known_path
+        if known_cards:
+            valid_cards, inferred_path, _ = validate_known_hand(
+                player_total,
+                banker_total,
+                known_path,
+                known_cards,
+            )
+            if valid_cards:
+                effective_known_path = inferred_path
+        feasible = feasible_current_paths(
+            player_total,
+            banker_total,
+            effective_known_path,
+        )
         by_path: List[List[ConditionalCandidate]] = [[], [], [], []]
         accepted: List[ConditionalCandidate] = []
         attempts = 0
@@ -580,13 +819,22 @@ class V5ReplicaEngine:
         while attempts < max_proposals:
             parent_index = int(self.rng.integers(0, len(prior_particles)))
             source = prior_particles[parent_index]
-            completed = exact_conditional_complete(
-                source,
-                self.rng,
-                int(player_total) % 10,
-                int(banker_total) % 10,
-                known_path,
-            )
+            if known_cards:
+                completed = exact_known_hand_complete(
+                    source,
+                    int(player_total) % 10,
+                    int(banker_total) % 10,
+                    effective_known_path,
+                    known_cards,
+                )
+            else:
+                completed = exact_conditional_complete(
+                    source,
+                    self.rng,
+                    int(player_total) % 10,
+                    int(banker_total) % 10,
+                    effective_known_path,
+                )
             attempts += 1
             if completed is not None:
                 counts, path, weight, _ = completed
@@ -652,7 +900,7 @@ class V5ReplicaEngine:
                 legacy_path_coverage=0.0,
                 path_ess_quality=0.0,
                 feasible_paths=feasible,
-                known_path=known_path,
+                known_path=effective_known_path,
                 unique_particles=unique,
                 accepted_unique=0,
                 ancestry_paired=False,
@@ -743,7 +991,7 @@ class V5ReplicaEngine:
             legacy_path_coverage=legacy_path_coverage,
             path_ess_quality=path_ess_quality,
             feasible_paths=feasible,
-            known_path=known_path,
+            known_path=effective_known_path,
             unique_particles=unique,
             accepted_unique=accepted_unique,
             ancestry_paired=True,
@@ -1012,6 +1260,138 @@ def _apply_robust_weights(rows: Sequence[ReplicaResult], enabled: bool) -> Tuple
     return mad, outliers
 
 
+
+def _bounded_quality(value: float, low: float, high: float) -> float:
+    if high <= low:
+        return 0.0
+    return max(0.0, min(1.0, (float(value) - low) / (high - low)))
+
+
+def build_hybrid_probabilities(
+    particle_probs: Sequence[float],
+    database_probs: Sequence[float],
+    exact_state_probs: Sequence[float],
+    quality: Mapping[str, float],
+    settings: Mapping[str, Any],
+    exact_state_reliability: float,
+    effective_database_weight: float,
+) -> Dict[str, Any]:
+    """Quality-gated fusion of independent factual components.
+
+    The baseline share is deliberately retained. Adding more components must not
+    magnify a tiny Monte Carlo deviation into a strong recommendation.
+    """
+    pf = normalize_array(particle_probs, BASELINE)
+    db = normalize_array(database_probs, BASELINE)
+    state = normalize_array(exact_state_probs, BASELINE)
+
+    if str(settings.get("hybrid_mode", "hybrid")) != "hybrid":
+        return {
+            "probabilities": pf,
+            "weights": {
+                "particle": 1.0,
+                "exact_shoe_state": 0.0,
+                "database": 0.0,
+                "baseline": 0.0,
+            },
+            "gate": 1.0,
+            "state_reliability": 0.0,
+            "mode": "particle",
+        }
+
+    agreement_q = _bounded_quality(
+        float(quality.get("agreement", 0.5)),
+        0.50,
+        0.85,
+    )
+    ess_q = min(
+        1.0,
+        float(quality.get("average_ess", 0.0))
+        / max(1.0, float(settings["target_ess"])),
+    )
+    diversity_q = _bounded_quality(
+        float(quality.get("average_diversity", 0.0)),
+        0.25,
+        0.75,
+    )
+    split_q = _bounded_quality(
+        float(quality.get("split_agreement", 0.0)),
+        0.50,
+        1.00,
+    )
+    path_q = max(
+        0.0,
+        min(1.0, float(quality.get("path_coverage", 0.0))),
+    )
+    context_q = (
+        0.45 * max(0.0, min(1.0, float(quality.get("hand_number_known", 0.0))))
+        + 0.25 * max(0.0, min(1.0, float(quality.get("known_path", 0.0))))
+        + 0.30 * max(0.0, min(1.0, float(exact_state_reliability)))
+    )
+    gate = (
+        0.22 * agreement_q
+        + 0.22 * ess_q
+        + 0.16 * diversity_q
+        + 0.16 * split_q
+        + 0.14 * path_q
+        + 0.10 * context_q
+    )
+    gate = max(0.12, min(1.0, gate))
+
+    baseline_floor = float(settings["hybrid_baseline_min_weight"])
+    usable = max(0.0, 1.0 - baseline_floor)
+    particle_weight = min(
+        float(settings["hybrid_particle_max_weight"]),
+        usable * (0.35 + 0.65 * gate),
+    )
+    state_weight = min(
+        float(settings["hybrid_exact_state_max_weight"]),
+        usable
+        * max(0.0, min(1.0, float(exact_state_reliability)))
+        * (0.45 + 0.55 * gate),
+    )
+    database_weight = min(
+        max(0.0, float(effective_database_weight)),
+        max(0.0, usable - particle_weight - state_weight),
+    )
+
+    model_total = particle_weight + state_weight + database_weight
+    if model_total > usable and model_total > 0:
+        scale = usable / model_total
+        particle_weight *= scale
+        state_weight *= scale
+        database_weight *= scale
+    baseline_weight = max(
+        baseline_floor,
+        1.0 - particle_weight - state_weight - database_weight,
+    )
+
+    combined = (
+        baseline_weight * BASELINE
+        + particle_weight * pf
+        + state_weight * state
+        + database_weight * db
+    )
+    max_adjustment = float(settings["hybrid_max_component_adjustment"])
+    delta = np.clip(
+        combined - BASELINE,
+        -max_adjustment,
+        max_adjustment,
+    )
+    fused = normalize_array(BASELINE + delta, BASELINE)
+    return {
+        "probabilities": fused,
+        "weights": {
+            "particle": float(particle_weight),
+            "exact_shoe_state": float(state_weight),
+            "database": float(database_weight),
+            "baseline": float(baseline_weight),
+        },
+        "gate": float(gate),
+        "state_reliability": float(exact_state_reliability),
+        "mode": "hybrid",
+    }
+
 def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str, Any]:
     centered = float((fused[0] - BASELINE[0]) - (fused[1] - BASELINE[1]))
     banker_ev = float(fused[0] * (1.0 - commission) - fused[1])
@@ -1189,6 +1569,42 @@ class V5IndependentBaccaratEngine:
                 supplied.get("min_replica_agreement", MIN_REPLICA_AGREEMENT)
             ),
             "banker_commission": float(supplied.get("banker_commission", BANKER_COMMISSION)),
+            "hybrid_mode": str(
+                supplied.get("hybrid_mode", HYBRID_MODE)
+            ).lower(),
+            "hybrid_particle_max_weight": float(
+                supplied.get(
+                    "hybrid_particle_max_weight",
+                    HYBRID_PARTICLE_MAX_WEIGHT,
+                )
+            ),
+            "hybrid_exact_state_max_weight": float(
+                supplied.get(
+                    "hybrid_exact_state_max_weight",
+                    HYBRID_EXACT_STATE_MAX_WEIGHT,
+                )
+            ),
+            "hybrid_baseline_min_weight": float(
+                supplied.get(
+                    "hybrid_baseline_min_weight",
+                    HYBRID_BASELINE_MIN_WEIGHT,
+                )
+            ),
+            "hybrid_max_component_adjustment": float(
+                supplied.get(
+                    "hybrid_max_component_adjustment",
+                    HYBRID_MAX_COMPONENT_ADJUSTMENT,
+                )
+            ),
+            "hand_number_uncertainty": int(
+                supplied.get(
+                    "hand_number_uncertainty",
+                    HAND_NUMBER_UNCERTAINTY,
+                )
+            ),
+            "state_simulations": int(
+                supplied.get("state_simulations", STATE_SIMULATIONS)
+            ),
         }
 
     def analyze(
@@ -1197,46 +1613,104 @@ class V5IndependentBaccaratEngine:
         banker_total: int,
         seed: int,
         known_path: Optional[int] = None,
+        hand_number: Optional[int] = None,
+        known_cards: Optional[Mapping[str, Sequence[int]]] = None,
+        remaining_counts: Optional[Sequence[int]] = None,
+        state_complete: bool = False,
     ) -> Dict[str, Any]:
-        runtime_settings = _scaled_runtime_settings(self.settings, int(self.settings["particles"]))
+        runtime_settings = _scaled_runtime_settings(
+            self.settings,
+            int(self.settings["particles"]),
+        )
+
+        normalized_cards = normalize_known_cards(known_cards)
+        card_validation = "not_supplied"
+        effective_known_path = known_path
+        if normalized_cards is not None:
+            valid_cards, inferred_path, card_validation = validate_known_hand(
+                int(player_total) % 10,
+                int(banker_total) % 10,
+                known_path,
+                normalized_cards,
+            )
+            if not valid_cards:
+                raise ValueError(f"invalid_known_cards:{card_validation}")
+            effective_known_path = inferred_path
+
+        try:
+            physical_hand_number = max(0, min(120, int(hand_number or 0)))
+        except Exception:
+            physical_hand_number = 0
+
+        exact_remaining = (
+            _valid_remaining_counts(
+                remaining_counts,
+                int(runtime_settings["decks"]),
+            )
+            if state_complete
+            else None
+        )
+        exact_state_reliability = 1.0 if exact_remaining is not None else 0.0
+
         rows: List[ReplicaResult] = []
-        for replica_index in range(max(3, int(runtime_settings["replicas"]))):
+        for replica_index in range(
+            max(3, int(runtime_settings["replicas"]))
+        ):
             replica_seed = mix_seed(seed, replica_index)
             engine = V5ReplicaEngine(
                 replica_seed,
                 particle_count=int(runtime_settings["particles"]),
                 decks=int(runtime_settings["decks"]),
             )
-            prior_particles, prior_depths = engine.build_stratified_prior()
+            prior_particles, prior_depths = engine.build_stratified_prior(
+                hand_number=physical_hand_number or None,
+                hand_uncertainty=int(
+                    runtime_settings["hand_number_uncertainty"]
+                ),
+            )
             population = engine.condition(
                 prior_particles,
                 prior_depths,
                 int(player_total) % 10,
                 int(banker_total) % 10,
-                known_path,
+                effective_known_path,
                 runtime_settings,
+                known_cards=normalized_cards,
             )
             rows.append(engine.forecast(population, runtime_settings))
+
         robust_mad, outlier_count = _apply_robust_weights(
-            rows, bool(runtime_settings["adaptive_replica_weight"])
+            rows,
+            bool(runtime_settings["adaptive_replica_weight"]),
         )
         pf = _weighted_average(rows, "pf", 3)
         control = _weighted_average(rows, "control", 3)
         database = _weighted_average(rows, "database", 3)
-        fused = _weighted_average(rows, "fused", 3)
+        particle_database_fused = _weighted_average(rows, "fused", 3)
         draw = _weighted_average(rows, "draw_paths", 4)
         next_draw = _weighted_average(rows, "next_draw_paths", 4)
         point_matrix = _weighted_average(rows, "point_matrix", 100)
+
         top_idx = np.argsort(point_matrix)[::-1][:10]
         top_points = [
             {
                 "point": f"{int(i // 10)}{int(i % 10)}",
                 "probability": float(point_matrix[i]),
-                "outcome": "B" if int(i % 10) > int(i // 10) else "P" if int(i // 10) > int(i % 10) else "T",
+                "outcome": (
+                    "B"
+                    if int(i % 10) > int(i // 10)
+                    else "P"
+                    if int(i // 10) > int(i % 10)
+                    else "T"
+                ),
             }
             for i in top_idx
         ]
-        weight_sum = sum(max(1e-6, row.final_weight) for row in rows)
+
+        weight_sum = sum(
+            max(1e-6, row.final_weight)
+            for row in rows
+        )
         weighted_votes = {"B": 0.0, "P": 0.0}
         votes = {"B": 0, "P": 0}
         directions: List[str] = []
@@ -1245,71 +1719,181 @@ class V5IndependentBaccaratEngine:
             weighted_votes[side] += max(1e-6, row.final_weight)
             votes[side] += 1
             directions.append(side)
-        agreement = max(weighted_votes.values()) / max(1e-12, weight_sum)
+
+        agreement = max(weighted_votes.values()) / max(
+            1e-12,
+            weight_sum,
+        )
         split_agreement = sum(
-            max(1e-6, row.final_weight) * row.split_agreement for row in rows
+            max(1e-6, row.final_weight) * row.split_agreement
+            for row in rows
         ) / max(1e-12, weight_sum)
         average_ess = float(np.mean([row.ess for row in rows]))
-        average_diversity = float(np.mean([row.diversity for row in rows]))
-        average_path_coverage = float(np.mean([row.path_coverage for row in rows]))
+        average_diversity = float(
+            np.mean([row.diversity for row in rows])
+        )
+        average_path_coverage = float(
+            np.mean([row.path_coverage for row in rows])
+        )
+        average_database_weight = float(
+            np.mean([row.effective_database_weight for row in rows])
+        )
+
         quality = {
             "agreement": agreement,
             "average_ess": average_ess,
             "average_diversity": average_diversity,
             "split_agreement": split_agreement,
             "path_coverage": average_path_coverage,
+            "hand_number_known": 1.0 if physical_hand_number > 0 else 0.0,
+            "known_path": 1.0 if effective_known_path is not None else 0.0,
         }
-        decision = decide_ensemble(fused, control, rows, quality, runtime_settings)
+
+        state_probs = (
+            estimate_exact_state_probabilities(
+                exact_remaining,
+                int(runtime_settings["decks"]),
+                mix_seed(seed, 991001),
+                int(runtime_settings["state_simulations"]),
+            )
+            if exact_remaining is not None
+            else BASELINE.copy()
+        )
+        hybrid = build_hybrid_probabilities(
+            pf,
+            database,
+            state_probs,
+            quality,
+            runtime_settings,
+            exact_state_reliability,
+            average_database_weight,
+        )
+        fused = normalize_array(
+            hybrid["probabilities"],
+            BASELINE,
+        )
+
+        decision = decide_ensemble(
+            fused,
+            control,
+            rows,
+            quality,
+            runtime_settings,
+        )
+
         stability = "UNSTABLE"
         if (
             decision["validated_signal"]
-            and agreement >= 0.71
+            and agreement
+            >= float(runtime_settings["min_replica_agreement"])
             and split_agreement >= 0.80
-            and average_ess >= float(runtime_settings["target_ess"]) * 0.8
+            and average_ess
+            >= float(runtime_settings["target_ess"]) * 0.8
             and average_diversity >= 0.45
-            and average_path_coverage >= float(runtime_settings["min_path_coverage"])
-            and decision["effective_replicas"] >= float(runtime_settings["min_effective_replicas"])
+            and average_path_coverage
+            >= float(runtime_settings["min_path_coverage"])
+            and decision["effective_replicas"]
+            >= float(runtime_settings["min_effective_replicas"])
         ):
             stability = "STABLE"
         elif (
             agreement >= 0.57
             and split_agreement >= 0.60
-            and average_ess >= float(runtime_settings["target_ess"]) * 0.45
+            and average_ess
+            >= float(runtime_settings["target_ess"]) * 0.45
             and average_diversity >= 0.30
-            and average_path_coverage >= 0.60
+            and average_path_coverage >= 0.55
         ):
             stability = "WATCH"
+
         weakness: List[str] = []
         if not decision["validated_signal"]:
-            weakness.append("模型訊號未通過補牌路徑分層信賴下界或品質閘門")
-        if agreement < float(runtime_settings["min_replica_agreement"]):
+            weakness.append(
+                "HYBRID訊號未通過補牌路徑信賴下界或品質閘門"
+            )
+        if agreement < float(
+            runtime_settings["min_replica_agreement"]
+        ):
             weakness.append("副本穩健方向共識低於設定門檻")
         if split_agreement < 0.60:
             weakness.append("統一樣本池分半方向一致率低於60%")
-        if average_ess < float(runtime_settings["target_ess"]) * 0.8:
+        if average_ess < float(
+            runtime_settings["target_ess"]
+        ) * 0.8:
             weakness.append("條件候選ESS未達目標80%")
         if average_diversity < 0.45:
             weakness.append("粒子多樣性不足45%")
-        if average_path_coverage < float(runtime_settings["min_path_coverage"]):
+        if average_path_coverage < float(
+            runtime_settings["min_path_coverage"]
+        ):
             weakness.append("補牌路徑有效覆蓋率不足")
+        if physical_hand_number <= 0:
+            weakness.append(
+                "未提供牌靴局數，仍使用早中晚牌靴混合先驗"
+            )
+        if normalized_cards is None:
+            weakness.append(
+                "未提供本局實際牌值，僅依最終點數反推可能牌組"
+            )
+        if not state_complete:
+            weakness.append(
+                "牌靴卡牌追蹤不完整，精確剩餘牌組分量未啟用"
+            )
         if outlier_count:
-            weakness.append(f"已抑制{outlier_count}個偏離中位數副本")
+            weakness.append(
+                f"已抑制{outlier_count}個偏離中位數副本"
+            )
         if any(row.low_sample for row in rows):
-            weakness.append("至少一個副本的總候選或補牌路徑候選偏少")
-        if not DB_HOLDOUT["passed"] and runtime_settings["database_validation_mode"] != "force":
-            weakness.append("50萬資料庫樣本外驗證未優於基準，方向校正已抑制")
+            weakness.append(
+                "至少一個副本的總候選或補牌路徑候選偏少"
+            )
+        if (
+            not DB_HOLDOUT["passed"]
+            and runtime_settings["database_validation_mode"] != "force"
+        ):
+            weakness.append(
+                "資料庫樣本外驗證未優於基準，方向校正已抑制"
+            )
         if not weakness:
             weakness.append(
-                f"{int(runtime_settings['particles'])}粒子、補牌路徑ESS、統一樣本池與穩健誤差均通過"
+                f"{int(runtime_settings['particles'])}粒子、"
+                "牌靴深度、補牌路徑及精確牌組品質均通過"
             )
+
         combined = hashlib.sha1()
         for row in rows:
             combined.update(row.digest.encode("ascii"))
+
+        base_forecast_samples = max(
+            int(runtime_settings["predict_simulations_per_replica"])
+            + int(
+                runtime_settings[
+                    "point_joint_simulations_per_replica"
+                ]
+            ),
+            int(runtime_settings["particles"]) * 2,
+        )
+        state_samples = (
+            int(runtime_settings["state_simulations"])
+            if exact_remaining is not None
+            else 0
+        )
+
         return {
             "pf": pf,
             "control": control,
             "database": database,
+            "particle_database_fused": particle_database_fused,
+            "shoe_state": state_probs,
             "fused": fused,
+            "hybrid": {
+                **hybrid,
+                "probabilities": fused,
+                "card_validation": card_validation,
+                "hand_number_used": physical_hand_number,
+                "known_path_used": effective_known_path,
+                "exact_state_enabled": exact_remaining is not None,
+            },
             "draw_paths": draw,
             "next_draw_paths": next_draw,
             "point_matrix": point_matrix,
@@ -1324,62 +1908,119 @@ class V5IndependentBaccaratEngine:
             "split_agreement": split_agreement,
             "stability": stability,
             "weakness_reason": "；".join(weakness),
-            "average_matches": float(np.mean([row.matches for row in rows])),
+            "average_matches": float(
+                np.mean([row.matches for row in rows])
+            ),
             "average_ess": average_ess,
-            "average_acceptance": float(np.mean([row.acceptance for row in rows])),
-            "average_attempts": float(np.mean([row.attempts for row in rows])),
+            "average_acceptance": float(
+                np.mean([row.acceptance for row in rows])
+            ),
+            "average_attempts": float(
+                np.mean([row.attempts for row in rows])
+            ),
             "average_diversity": average_diversity,
             "average_path_coverage": average_path_coverage,
             "average_legacy_path_coverage": float(
-                np.mean([row.legacy_path_coverage for row in rows])
+                np.mean(
+                    [row.legacy_path_coverage for row in rows]
+                )
             ),
-            "average_path_ess_quality": float(np.mean([row.path_ess_quality for row in rows])),
+            "average_path_ess_quality": float(
+                np.mean([row.path_ess_quality for row in rows])
+            ),
             "average_current_path_agreement": float(
-                np.mean([row.current_path_agreement for row in rows])
+                np.mean(
+                    [row.current_path_agreement for row in rows]
+                )
             ),
-            "average_draw_agreement": float(np.mean([row.draw_agreement for row in rows])),
+            "average_draw_agreement": float(
+                np.mean([row.draw_agreement for row in rows])
+            ),
             "average_point_concentration": float(
-                np.mean([row.point_concentration for row in rows])
+                np.mean(
+                    [row.point_concentration for row in rows]
+                )
             ),
             "average_path_candidates": np.mean(
-                np.stack([row.path_candidate_counts for row in rows]), axis=0, dtype=float
+                np.stack(
+                    [row.path_candidate_counts for row in rows]
+                ),
+                axis=0,
+                dtype=float,
             ),
-            "average_path_ess": np.mean(np.stack([row.path_ess for row in rows]), axis=0),
+            "average_path_ess": np.mean(
+                np.stack([row.path_ess for row in rows]),
+                axis=0,
+            ),
             "average_path_allocated": np.mean(
-                np.stack([row.path_allocated for row in rows]), axis=0
+                np.stack([row.path_allocated for row in rows]),
+                axis=0,
             ),
             "average_current_path_centers": np.mean(
-                np.stack([row.current_path_centers for row in rows]), axis=0
+                np.stack(
+                    [row.current_path_centers for row in rows]
+                ),
+                axis=0,
             ),
-            "average_database_weight": float(
-                np.mean([row.effective_database_weight for row in rows])
+            "average_database_weight": average_database_weight,
+            "database_samples": float(
+                np.mean([row.database_samples for row in rows])
             ),
-            "database_samples": float(np.mean([row.database_samples for row in rows])),
-            "mean_depth": float(np.mean([row.mean_depth for row in rows])),
-            "min_depth": int(min(row.min_depth for row in rows)),
-            "max_depth": int(max(row.max_depth for row in rows)),
+            "mean_depth": float(
+                np.mean([row.mean_depth for row in rows])
+            ),
+            "min_depth": int(
+                min(row.min_depth for row in rows)
+            ),
+            "max_depth": int(
+                max(row.max_depth for row in rows)
+            ),
             "cards_remaining": float(
-                np.mean([row.composition["cards_remaining"] for row in rows])
+                np.mean(
+                    [
+                        row.composition["cards_remaining"]
+                        for row in rows
+                    ]
+                )
             ),
-            "shoe_depth": float(np.mean([row.composition["shoe_depth"] for row in rows])),
+            "shoe_depth": float(
+                np.mean(
+                    [row.composition["shoe_depth"] for row in rows]
+                )
+            ),
+            "physical_hand_number": physical_hand_number,
+            "exact_state_reliability": exact_state_reliability,
             "state_digest": combined.hexdigest()[:16],
             "robust_mad": robust_mad,
             "outlier_count": outlier_count,
             "total_forecast_simulations": int(
-                len(rows)
-                * max(
-                    int(runtime_settings["predict_simulations_per_replica"])
-                    + int(runtime_settings["point_joint_simulations_per_replica"]),
-                    int(runtime_settings["particles"]) * 2,
-                )
+                len(rows) * base_forecast_samples + state_samples
             ),
-            "total_condition_attempts": int(sum(row.attempts for row in rows)),
-            "all_ancestry_paired": all(row.ancestry_paired for row in rows),
-            "all_replicas_updated": all(row.updated for row in rows),
-            "fallback_to_unconditioned": any(not row.updated for row in rows),
-            "conditional_generator": "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V2",
-            "variance_reduction": "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC",
-            "depth_profile": "CALIBRATED_10_30_40_20",
+            "total_condition_attempts": int(
+                sum(row.attempts for row in rows)
+            ),
+            "all_ancestry_paired": all(
+                row.ancestry_paired for row in rows
+            ),
+            "all_replicas_updated": all(
+                row.updated for row in rows
+            ),
+            "fallback_to_unconditioned": any(
+                not row.updated for row in rows
+            ),
+            "conditional_generator": (
+                "EXACT_CURRENT_CARDS_IMPORTANCE_WEIGHTED"
+                if normalized_cards is not None
+                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V3"
+            ),
+            "variance_reduction": (
+                "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC"
+            ),
+            "depth_profile": (
+                f"PHYSICAL_HAND_{physical_hand_number}"
+                if physical_hand_number > 0
+                else "CALIBRATED_10_30_40_20"
+            ),
             "settings": dict(runtime_settings),
             "configured_settings": dict(self.settings),
             "replica_rows": rows,
