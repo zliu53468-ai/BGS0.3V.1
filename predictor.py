@@ -1,4 +1,4 @@
-"""LINE-compatible V5.2.0 1000-particle independent point predictor."""
+"""LINE-compatible V5.3 factual-shoe-context HYBRID predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -6,21 +6,36 @@ import os
 import re
 import secrets
 
-from particle_filter_points import DB_HOLDOUT, V5IndependentBaccaratEngine
+from particle_filter_points import (
+    DB_HOLDOUT,
+    V5IndependentBaccaratEngine,
+)
 from shoe_state_db import get_shoe_state_database
 
 PATH_SUFFIX = {"N": 0, "P": 1, "B": 2, "D": 3}
+DRAW_CODE_TO_SUFFIX = {"1": "P", "2": "B", "3": "D", "4": "N"}
 PATH_NAMES = ("none", "player_only", "banker_only", "both")
 
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
-    return default if raw is None else raw.strip().lower() in {"1", "true", "yes", "on"}
+    return (
+        default
+        if raw is None
+        else raw.strip().lower() in {"1", "true", "yes", "on"}
+    )
 
 
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int = 0,
+) -> int:
     try:
-        return max(minimum, int(os.getenv(name, str(default)).strip()))
+        return max(
+            minimum,
+            int(os.getenv(name, str(default)).strip()),
+        )
     except Exception:
         return default
 
@@ -28,56 +43,202 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 RANDOMIZE_EACH_CALL = _env_bool("PF_RANDOMIZE_EACH_CALL", True)
 FIXED_RUN_SEED = _env_int("PF_FIXED_RUN_SEED", 0, 0)
 DEBUG_V5_RESULT = _env_bool("PF_DEBUG_V5_RESULT", False)
-# Disabled by default to preserve the existing always-predict B/P workflow.
-# Enable it to skip low-confidence entries instead of forcing a side.
-OBSERVE_ON_UNVALIDATED = _env_bool("PF_OBSERVE_ON_UNVALIDATED", False)
+OBSERVE_ON_UNVALIDATED = _env_bool(
+    "PF_OBSERVE_ON_UNVALIDATED",
+    False,
+)
 
 
-def parse_point_observation(value: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(value, Mapping):
-        player = value.get("player", value.get("P", value.get("閒")))
-        banker = value.get("banker", value.get("B", value.get("莊")))
-        suffix = str(value.get("path_suffix", "") or "").strip().upper()
+def _normalize_known_cards(value: Any) -> Dict[str, List[int]]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: Dict[str, List[int]] = {}
+    aliases = {
+        "player": ("player", "P", "閒", "闲"),
+        "banker": ("banker", "B", "莊", "庄"),
+    }
+    for side, names in aliases.items():
+        raw = None
+        for name in names:
+            if name in value:
+                raw = value.get(name)
+                break
+        if raw is None:
+            continue
         try:
+            cards = [int(card) % 10 for card in list(raw)]
+        except Exception:
+            continue
+        if len(cards) in {2, 3}:
+            out[side] = cards
+    return out
+
+
+def _normalize_counts(value: Any) -> Optional[List[int]]:
+    try:
+        result = [int(item) for item in list(value)]
+    except Exception:
+        return None
+    if len(result) != 10 or any(item < 0 for item in result):
+        return None
+    return result
+
+
+def parse_point_observation(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    """Parse 65, 65D/653, 65@38, 65D@38/653@38, or a mapping."""
+    if isinstance(value, Mapping):
+        player = value.get(
+            "player",
+            value.get("P", value.get("閒")),
+        )
+        banker = value.get(
+            "banker",
+            value.get("B", value.get("莊")),
+        )
+        suffix = str(
+            value.get("path_suffix")
+            or value.get("suffix")
+            or ""
+        ).strip().upper()
+        suffix = DRAW_CODE_TO_SUFFIX.get(suffix, suffix)
+        try:
+            explicit_path = value.get("path")
+            path = (
+                PATH_SUFFIX.get(suffix)
+                if suffix in PATH_SUFFIX
+                else int(explicit_path)
+                if explicit_path is not None
+                else None
+            )
+            if path not in {0, 1, 2, 3}:
+                path = None
+            hand_number = int(value.get("hand_number") or 0)
             return {
                 "player": int(player) % 10,
                 "banker": int(banker) % 10,
-                "path": PATH_SUFFIX.get(suffix),
-                "suffix": suffix if suffix in PATH_SUFFIX else "",
+                "path": path,
+                "suffix": (
+                    suffix
+                    if suffix in PATH_SUFFIX
+                    else next(
+                        (
+                            key
+                            for key, index in PATH_SUFFIX.items()
+                            if index == path
+                        ),
+                        "",
+                    )
+                ),
+                "hand_number": max(0, min(120, hand_number)),
+                "known_cards": _normalize_known_cards(
+                    value.get("known_cards")
+                    or value.get("cards")
+                    or {}
+                ),
+                "remaining_counts": _normalize_counts(
+                    value.get("remaining_counts")
+                ),
+                "known_card_counts": _normalize_counts(
+                    value.get("known_card_counts")
+                ),
+                "state_complete": bool(
+                    value.get("state_complete", False)
+                ),
+                "state_source": str(
+                    value.get("state_source") or ""
+                ),
+                "tracked_card_hands": int(
+                    value.get("tracked_card_hands") or 0
+                ),
             }
         except Exception:
             return None
+
     text = str(value or "").strip().upper()
-    compact = re.fullmatch(r"([0-9])([0-9])([NPBD])?", text)
+    compact = re.fullmatch(
+        r"([0-9])([0-9])([NPBD]|[1-4])?(?:@([0-9]{1,3}))?",
+        text,
+    )
     if compact:
         suffix = compact.group(3) or ""
+        suffix = DRAW_CODE_TO_SUFFIX.get(suffix, suffix)
         return {
             "player": int(compact.group(1)),
             "banker": int(compact.group(2)),
             "path": PATH_SUFFIX.get(suffix),
             "suffix": suffix,
+            "hand_number": max(
+                0,
+                min(120, int(compact.group(4) or 0)),
+            ),
+            "known_cards": {},
+            "remaining_counts": None,
+            "known_card_counts": None,
+            "state_complete": False,
+            "state_source": "",
+            "tracked_card_hands": 0,
         }
+
     patterns = [
-        r"(?:P|PLAYER|閒|闲)\s*([0-9])\D*(?:B|BANKER|莊|庄)\s*([0-9])",
-        r"(?:B|BANKER|莊|庄)\s*([0-9])\D*(?:P|PLAYER|閒|闲)\s*([0-9])",
+        (
+            r"(?:P|PLAYER|閒|闲)\s*([0-9])"
+            r"\D*(?:B|BANKER|莊|庄)\s*([0-9])"
+        ),
+        (
+            r"(?:B|BANKER|莊|庄)\s*([0-9])"
+            r"\D*(?:P|PLAYER|閒|闲)\s*([0-9])"
+        ),
         r"^\s*([0-9])\s*[,/\- ]\s*([0-9])\s*$",
     ]
     match = re.search(patterns[0], text)
     if match:
-        return {"player": int(match.group(1)), "banker": int(match.group(2)), "path": None, "suffix": ""}
+        return {
+            "player": int(match.group(1)),
+            "banker": int(match.group(2)),
+            "path": None,
+            "suffix": "",
+            "hand_number": 0,
+            "known_cards": {},
+        }
     match = re.search(patterns[1], text)
     if match:
-        return {"player": int(match.group(2)), "banker": int(match.group(1)), "path": None, "suffix": ""}
+        return {
+            "player": int(match.group(2)),
+            "banker": int(match.group(1)),
+            "path": None,
+            "suffix": "",
+            "hand_number": 0,
+            "known_cards": {},
+        }
     match = re.search(patterns[2], text)
     if match:
-        return {"player": int(match.group(1)), "banker": int(match.group(2)), "path": None, "suffix": ""}
+        return {
+            "player": int(match.group(1)),
+            "banker": int(match.group(2)),
+            "path": None,
+            "suffix": "",
+            "hand_number": 0,
+            "known_cards": {},
+        }
     return None
 
 
-def _clean_observations(values: Union[str, Iterable[Any], None]) -> List[Dict[str, Any]]:
+def _clean_observations(
+    values: Union[str, Iterable[Any], None],
+) -> List[Dict[str, Any]]:
     if values is None:
         return []
-    chunks = [x for x in re.split(r"[;|\n]+", values) if x.strip()] if isinstance(values, str) else list(values)
+    chunks = (
+        [
+            item
+            for item in re.split(r"[;|\n]+", values)
+            if item.strip()
+        ]
+        if isinstance(values, str)
+        else list(values)
+    )
     out: List[Dict[str, Any]] = []
     for item in chunks:
         parsed = parse_point_observation(item)
@@ -87,8 +248,15 @@ def _clean_observations(values: Union[str, Iterable[Any], None]) -> List[Dict[st
 
 
 def _outcome(observation: Mapping[str, Any]) -> str:
-    player, banker = int(observation["player"]), int(observation["banker"])
-    return "B" if banker > player else "P" if player > banker else "T"
+    player = int(observation["player"])
+    banker = int(observation["banker"])
+    return (
+        "B"
+        if banker > player
+        else "P"
+        if player > banker
+        else "T"
+    )
 
 
 def _new_seed(explicit: Optional[int] = None) -> int:
@@ -96,15 +264,26 @@ def _new_seed(explicit: Optional[int] = None) -> int:
         return int(explicit) & 0xFFFFFFFF
     if FIXED_RUN_SEED > 0:
         return FIXED_RUN_SEED & 0xFFFFFFFF
-    return secrets.randbits(32) if RANDOMIZE_EACH_CALL else 20260714
+    return (
+        secrets.randbits(32)
+        if RANDOMIZE_EACH_CALL
+        else 20260717
+    )
 
 
 def _probability_dict(values: Any) -> Dict[str, float]:
-    return {"B": float(values[0]), "P": float(values[1]), "T": float(values[2])}
+    return {
+        "B": float(values[0]),
+        "P": float(values[1]),
+        "T": float(values[2]),
+    }
 
 
 def _draw_path_dict(values: Any) -> Dict[str, float]:
-    return {name: float(values[i]) for i, name in enumerate(PATH_NAMES)}
+    return {
+        name: float(values[index])
+        for index, name in enumerate(PATH_NAMES)
+    }
 
 
 def predict(
@@ -114,141 +293,470 @@ def predict(
     shoe_id: str = "",
     user_id: str = "",
     run_seed: Optional[int] = None,
+    shoe_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     observations = _clean_observations(history)
     latest = observations[-1] if observations else None
     if latest is None:
-        return {"ok": False, "error": "missing_point_observation", "message": "請輸入兩位數點數，例如65代表閒6莊5。"}
+        return {
+            "ok": False,
+            "error": "missing_point_observation",
+            "message": (
+                "請輸入兩位數點數，例如65；"
+                "補牌可用字母65D或數字653，"
+                "加局數可輸入65D@38或653@38。"
+            ),
+        }
+
+    context = dict(shoe_context or {})
+    hand_number = int(
+        latest.get("hand_number")
+        or context.get("hand_number")
+        or 0
+    )
+    known_cards = (
+        latest.get("known_cards")
+        or context.get("known_cards")
+        or {}
+    )
+    remaining_counts = (
+        latest.get("remaining_counts")
+        or context.get("remaining_counts")
+    )
+    state_complete = bool(
+        latest.get("state_complete")
+        or context.get("state_complete")
+    )
+    state_source = str(
+        latest.get("state_source")
+        or context.get("state_source")
+        or "UNKNOWN"
+    )
+    tracked_card_hands = int(
+        latest.get("tracked_card_hands")
+        or context.get("tracked_card_hands")
+        or 0
+    )
 
     seed = _new_seed(run_seed)
     engine = V5IndependentBaccaratEngine()
-    result = engine.analyze(latest["player"], latest["banker"], seed, latest.get("path"))
+    try:
+        result = engine.analyze(
+            latest["player"],
+            latest["banker"],
+            seed,
+            latest.get("path"),
+            hand_number=hand_number or None,
+            known_cards=known_cards or None,
+            remaining_counts=remaining_counts,
+            state_complete=state_complete,
+        )
+    except ValueError as exception:
+        return {
+            "ok": False,
+            "error": "invalid_shoe_context",
+            "message": str(exception),
+        }
+
     probabilities = _probability_dict(result["fused"])
     pf_probabilities = _probability_dict(result["pf"])
     control_probabilities = _probability_dict(result["control"])
     db_probabilities = _probability_dict(result["database"])
+    shoe_state_probabilities = _probability_dict(
+        result["shoe_state"]
+    )
+    particle_db_probabilities = _probability_dict(
+        result["particle_database_fused"]
+    )
+
     raw_recommend = str(result["recommend"])
-    is_observe = bool(OBSERVE_ON_UNVALIDATED and not result.get("validated_signal", False))
+    is_observe = bool(
+        OBSERVE_ON_UNVALIDATED
+        and not result.get("validated_signal", False)
+    )
     recommend = "O" if is_observe else raw_recommend
-    confidence = max(probabilities["B"], probabilities["P"]) / max(1e-12, probabilities["B"] + probabilities["P"])
-    point_text = f"{latest['player']}{latest['banker']}{latest.get('suffix', '')}"
+    confidence = max(
+        probabilities["B"],
+        probabilities["P"],
+    ) / max(
+        1e-12,
+        probabilities["B"] + probabilities["P"],
+    )
+
+    point_text = (
+        f"{latest['player']}{latest['banker']}"
+        f"{latest.get('suffix', '')}"
+    )
+    if hand_number > 0:
+        point_text += f"@{hand_number}"
+
     particle_count = int(result["settings"]["particles"])
+    hybrid = dict(result.get("hybrid") or {})
+    hybrid_weights = dict(hybrid.get("weights") or {})
 
     response: Dict[str, Any] = {
         "ok": True,
-        "engine": f"V5_2_0_{particle_count}_PARTICLE_LINE",
-        "model_version": f"V5.2.0-{particle_count}P-LINE-20260717",
+        "engine": (
+            f"V5_3_0_HYBRID_{particle_count}_PARTICLE_LINE"
+        ),
+        "model_version": (
+            f"V5.3.0-HYBRID-{particle_count}P-LINE-20260717"
+        ),
         "user_id": user_id,
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
         "run_seed": seed,
-        "independent_mode": True,
-        "history_continuation": False,
+        "fresh_particle_mode": True,
         "persistent_particle_state": False,
+        "persistent_shoe_context": True,
+        "road_history_used": False,
         "used_observation_count": 1,
-        "ignored_prior_observations": max(0, len(observations) - 1),
+        "ignored_prior_observations": max(
+            0,
+            len(observations) - 1,
+        ),
         "conditioning_point": point_text,
-        "conditioning_observation": {"player": latest["player"], "banker": latest["banker"]},
+        "conditioning_observation": {
+            "player": latest["player"],
+            "banker": latest["banker"],
+            "hand_number": hand_number,
+        },
         "conditioning_outcome": _outcome(latest),
-        "known_draw_path": PATH_NAMES[latest["path"]] if latest.get("path") is not None else None,
-        "banker_rate": round(probabilities["B"] * 100.0, 1),
-        "player_rate": round(probabilities["P"] * 100.0, 1),
-        "tie_rate": round(probabilities["T"] * 100.0, 1),
+        "known_draw_path": (
+            PATH_NAMES[latest["path"]]
+            if latest.get("path") is not None
+            else None
+        ),
+        "known_cards": _normalize_known_cards(known_cards),
+        "banker_rate": round(
+            probabilities["B"] * 100.0,
+            1,
+        ),
+        "player_rate": round(
+            probabilities["P"] * 100.0,
+            1,
+        ),
+        "tie_rate": round(
+            probabilities["T"] * 100.0,
+            1,
+        ),
         "probabilities": probabilities,
+        "hybrid_probabilities": probabilities,
         "particle_probabilities": pf_probabilities,
+        "particle_database_probabilities": (
+            particle_db_probabilities
+        ),
         "control_probabilities": control_probabilities,
         "shoe_database_probabilities": db_probabilities,
+        "exact_shoe_state_probabilities": (
+            shoe_state_probabilities
+        ),
+        "hybrid": {
+            "mode": hybrid.get("mode", "hybrid"),
+            "gate": round(float(hybrid.get("gate", 0.0)), 6),
+            "weights": {
+                key: round(float(value), 6)
+                for key, value in hybrid_weights.items()
+            },
+            "exact_state_enabled": bool(
+                hybrid.get("exact_state_enabled", False)
+            ),
+            "state_reliability": round(
+                float(
+                    hybrid.get("state_reliability", 0.0)
+                ),
+                6,
+            ),
+            "card_validation": str(
+                hybrid.get("card_validation") or ""
+            ),
+        },
+        "shoe_context": {
+            "hand_number": hand_number,
+            "state_complete": state_complete,
+            "state_source": state_source,
+            "tracked_card_hands": tracked_card_hands,
+            "exact_state_enabled": bool(
+                hybrid.get("exact_state_enabled", False)
+            ),
+        },
         "recommend": recommend,
         "raw_recommend": raw_recommend,
-        "recommend_text": "觀望" if recommend == "O" else "莊" if recommend == "B" else "閒",
+        "recommend_text": (
+            "觀望"
+            if recommend == "O"
+            else "莊"
+            if recommend == "B"
+            else "閒"
+        ),
         "is_observe": is_observe,
         "confidence": round(confidence, 6),
         "confidence_pct": round(confidence * 100.0, 1),
-        "decision_edge": round(float(result["edge"]), 8),
+        "decision_edge": round(
+            float(result["edge"]),
+            8,
+        ),
         "signal_level": str(result["signal_level"]),
-        "decision_source": str(result["decision_source"]),
-        "validated_signal": bool(result["validated_signal"]),
-        "quality_pass": bool(result.get("quality_pass", False)),
-        "lower_bound": round(float(result["lower_bound"]), 8),
-        "centered_edge": round(float(result["center"]), 8),
-        "center_se": round(float(result["center_se"]), 8),
+        "decision_source": str(
+            result["decision_source"]
+        ),
+        "validated_signal": bool(
+            result["validated_signal"]
+        ),
+        "quality_pass": bool(
+            result.get("quality_pass", False)
+        ),
+        "lower_bound": round(
+            float(result["lower_bound"]),
+            8,
+        ),
+        "centered_edge": round(
+            float(result["center"]),
+            8,
+        ),
+        "center_se": round(
+            float(result["center_se"]),
+            8,
+        ),
         "replica_count": int(result["replicas"]),
-        "replica_directions": list(result["replica_directions"]),
-        "replica_agreement": round(float(result["replica_agreement"]), 6),
-        "split_agreement": round(float(result["split_agreement"]), 6),
-        "effective_replicas": round(float(result["effective_replicas"]), 4),
+        "replica_directions": list(
+            result["replica_directions"]
+        ),
+        "replica_agreement": round(
+            float(result["replica_agreement"]),
+            6,
+        ),
+        "split_agreement": round(
+            float(result["split_agreement"]),
+            6,
+        ),
+        "effective_replicas": round(
+            float(result["effective_replicas"]),
+            4,
+        ),
         "stability": str(result["stability"]),
-        "weakness_reason": str(result["weakness_reason"]),
-        "current_point_draw_paths": _draw_path_dict(result["draw_paths"]),
-        "next_hand_draw_paths": _draw_path_dict(result["next_draw_paths"]),
+        "weakness_reason": str(
+            result["weakness_reason"]
+        ),
+        "current_point_draw_paths": _draw_path_dict(
+            result["draw_paths"]
+        ),
+        "next_hand_draw_paths": _draw_path_dict(
+            result["next_draw_paths"]
+        ),
         "top_points": list(result["top_points"]),
         "draw_path_diagnostics": {
-            "coverage": round(float(result["average_path_coverage"]), 6),
-            "legacy_coverage": round(float(result["average_legacy_path_coverage"]), 6),
-            "ess_quality": round(float(result["average_path_ess_quality"]), 6),
-            "candidates": [round(float(x), 2) for x in result["average_path_candidates"]],
-            "ess": [round(float(x), 2) for x in result["average_path_ess"]],
-            "allocated": [round(float(x), 2) for x in result["average_path_allocated"]],
-            "current_path_agreement": round(float(result["average_current_path_agreement"]), 6),
-            "next_draw_agreement": round(float(result["average_draw_agreement"]), 6),
+            "coverage": round(
+                float(result["average_path_coverage"]),
+                6,
+            ),
+            "legacy_coverage": round(
+                float(
+                    result[
+                        "average_legacy_path_coverage"
+                    ]
+                ),
+                6,
+            ),
+            "ess_quality": round(
+                float(
+                    result["average_path_ess_quality"]
+                ),
+                6,
+            ),
+            "candidates": [
+                round(float(item), 2)
+                for item in result[
+                    "average_path_candidates"
+                ]
+            ],
+            "ess": [
+                round(float(item), 2)
+                for item in result["average_path_ess"]
+            ],
+            "allocated": [
+                round(float(item), 2)
+                for item in result[
+                    "average_path_allocated"
+                ]
+            ],
+            "current_path_agreement": round(
+                float(
+                    result[
+                        "average_current_path_agreement"
+                    ]
+                ),
+                6,
+            ),
+            "next_draw_agreement": round(
+                float(
+                    result["average_draw_agreement"]
+                ),
+                6,
+            ),
         },
         "point_particle_filter": {
             "particles_per_replica": particle_count,
             "particle_limit": 2000,
             "replicas": int(result["replicas"]),
-            "target_matches": int(result["settings"]["target_matches"]),
-            "target_ess": round(float(result["settings"]["target_ess"]), 3),
-            "path_target_matches": int(result["settings"]["path_target_matches"]),
-            "minimum_particles_per_draw_path": int(result["settings"]["min_path_particles"]),
+            "target_matches": int(
+                result["settings"]["target_matches"]
+            ),
+            "target_ess": round(
+                float(result["settings"]["target_ess"]),
+                3,
+            ),
+            "path_target_matches": int(
+                result["settings"][
+                    "path_target_matches"
+                ]
+            ),
+            "minimum_particles_per_draw_path": int(
+                result["settings"]["min_path_particles"]
+            ),
             "forecast_simulations_per_replica": max(
-                int(result["settings"]["predict_simulations_per_replica"])
-                + int(result["settings"]["point_joint_simulations_per_replica"]),
+                int(
+                    result["settings"][
+                        "predict_simulations_per_replica"
+                    ]
+                )
+                + int(
+                    result["settings"][
+                        "point_joint_simulations_per_replica"
+                    ]
+                ),
                 particle_count * 2,
             ),
-            "average_matches": round(float(result["average_matches"]), 3),
-            "average_effective_sample_size": round(float(result["average_ess"]), 3),
-            "average_acceptance": round(float(result["average_acceptance"]), 8),
-            "average_attempts": round(float(result["average_attempts"]), 3),
-            "average_diversity": round(float(result["average_diversity"]), 6),
-            "total_forecast_simulations": int(result["total_forecast_simulations"]),
-            "total_condition_attempts": int(result["total_condition_attempts"]),
-            "state_digest": str(result["state_digest"]),
-            "conditional_generator": str(result["conditional_generator"]),
-            "variance_reduction": str(result["variance_reduction"]),
+            "average_matches": round(
+                float(result["average_matches"]),
+                3,
+            ),
+            "average_effective_sample_size": round(
+                float(result["average_ess"]),
+                3,
+            ),
+            "average_acceptance": round(
+                float(result["average_acceptance"]),
+                8,
+            ),
+            "average_attempts": round(
+                float(result["average_attempts"]),
+                3,
+            ),
+            "average_diversity": round(
+                float(result["average_diversity"]),
+                6,
+            ),
+            "total_forecast_simulations": int(
+                result["total_forecast_simulations"]
+            ),
+            "total_condition_attempts": int(
+                result["total_condition_attempts"]
+            ),
+            "state_digest": str(
+                result["state_digest"]
+            ),
+            "conditional_generator": str(
+                result["conditional_generator"]
+            ),
+            "variance_reduction": str(
+                result["variance_reduction"]
+            ),
+            "depth_profile": str(
+                result["depth_profile"]
+            ),
         },
         "shoe_state_database": {
             **get_shoe_state_database().database_info(),
             "probabilities": db_probabilities,
-            "average_samples": round(float(result["database_samples"]), 3),
-            "effective_weight": round(float(result["average_database_weight"]), 8),
+            "average_samples": round(
+                float(result["database_samples"]),
+                3,
+            ),
+            "effective_weight": round(
+                float(
+                    result["average_database_weight"]
+                ),
+                8,
+            ),
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            f"V5.2.0單局獨立{int(result['settings']['particles'])}粒子模型；只使用本次最新點數；四種合法補牌路徑分層；"
-            "條件候選、ESS、稀有補牌路徑保底粒子與預測樣本池會隨粒子數擴張；不使用歷史、牌路、連勝連敗或固定莊回退。"
-            f"決策來源={result['decision_source']}；{result['reason']}。"
+            f"V5.3.0 HYBRID：{particle_count}粒子×"
+            f"{int(result['replicas'])}副本；"
+            "使用最新最終點數、補牌路徑、實際牌靴局數及"
+            "使用者明確輸入的牌值；不使用牌路、長龍、"
+            "Markov、上一局推薦或勝敗紀錄。"
+            f"決策來源={result['decision_source']}；"
+            f"{result['reason']}。"
         ),
         "debug": None,
     }
+
     if DEBUG_V5_RESULT:
         response["debug"] = {
             "settings": result["settings"],
+            "configured_settings": result[
+                "configured_settings"
+            ],
             "votes": result["votes"],
+            "weighted_votes": result[
+                "weighted_votes"
+            ],
             "outlier_count": result["outlier_count"],
             "robust_mad": result["robust_mad"],
+            "hybrid": hybrid,
         }
     return response
 
 
-def fit_history(history: Union[str, Iterable[Any]], venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "", force: bool = True) -> Dict[str, Any]:
-    result = predict(history, venue, room, shoe_id, user_id)
-    return {"ok": bool(result.get("ok")), "model": result.get("engine"), "independent_samples": int(result.get("used_observation_count", 0))}
+def fit_history(
+    history: Union[str, Iterable[Any]],
+    venue: str = "",
+    room: str = "",
+    shoe_id: str = "",
+    user_id: str = "",
+    force: bool = True,
+) -> Dict[str, Any]:
+    result = predict(
+        history,
+        venue,
+        room,
+        shoe_id,
+        user_id,
+    )
+    return {
+        "ok": bool(result.get("ok")),
+        "model": result.get("engine"),
+        "independent_samples": int(
+            result.get("used_observation_count", 0)
+        ),
+    }
 
 
-def reset_uid_model(user_id: str, venue: str = "", room: str = "", shoe_id: str = "") -> Dict[str, Any]:
-    return {"ok": True, "removed": 0, "independent_mode": True, "message": "V5.2.0為無狀態模式，沒有UID粒子可清除。"}
+def reset_uid_model(
+    user_id: str,
+    venue: str = "",
+    room: str = "",
+    shoe_id: str = "",
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "removed": 0,
+        "fresh_particle_mode": True,
+        "message": (
+            "V5.3每次重建粒子；請由store.reset_shoe清除"
+            "實體牌靴資訊。"
+        ),
+    }
 
 
-def clear_model_cache(user_id: Optional[str] = None) -> Dict[str, Any]:
-    return {"ok": True, "removed": 0, "independent_mode": True}
+def clear_model_cache(
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "removed": 0,
+        "fresh_particle_mode": True,
+    }
