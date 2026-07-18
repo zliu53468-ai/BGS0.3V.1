@@ -1,4 +1,4 @@
-"""LINE-compatible V5.3.1 path-weighted independent point-and-draw-path predictor."""
+"""LINE-compatible V5.3.2 independent draw-path-head point predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -348,6 +348,15 @@ def predict(
     particle_db_probabilities = _probability_dict(
         result["particle_database_fused"]
     )
+    independent_path_model = dict(
+        result.get("independent_draw_path_model") or {}
+    )
+    independent_path_probabilities = _probability_dict(
+        independent_path_model.get("probabilities", result["pf"])
+    )
+    independent_path_control_probabilities = _probability_dict(
+        independent_path_model.get("control_probabilities", result["control"])
+    )
 
     raw_recommend = str(result["recommend"])
     is_observe = bool(
@@ -375,10 +384,10 @@ def predict(
     response: Dict[str, Any] = {
         "ok": True,
         "engine": (
-            f"V5_3_1_PATH_WEIGHTED_{particle_count}_PARTICLE_LINE"
+            f"V5_3_2_INDEPENDENT_PATH_HEAD_{particle_count}_PARTICLE_LINE"
         ),
         "model_version": (
-            f"V5.3.1-PATH-WEIGHTED-{particle_count}P-LINE-20260718"
+            f"V5.3.2-INDEPENDENT-PATH-HEAD-{particle_count}P-LINE-20260719"
         ),
         "user_id": user_id,
         "venue": venue,
@@ -448,6 +457,96 @@ def predict(
             ),
             "card_validation": str(
                 hybrid.get("card_validation") or ""
+            ),
+            "independent_path_reliability": round(
+                float(hybrid.get("independent_path_reliability", 0.0)),
+                6,
+            ),
+            "independent_path_effective_weight": round(
+                float(hybrid.get("independent_path_effective_weight", 0.0)),
+                6,
+            ),
+        },
+        "independent_draw_path_model": {
+            "enabled": bool(independent_path_model.get("enabled", False)),
+            "probabilities": independent_path_probabilities,
+            "control_probabilities": independent_path_control_probabilities,
+            "next_draw_paths": _draw_path_dict(
+                independent_path_model.get(
+                    "next_draw_paths",
+                    result["next_draw_paths"],
+                )
+            ),
+            "path_outcome_probabilities": {
+                path_name: _probability_dict(row)
+                for path_name, row in zip(
+                    PATH_NAMES,
+                    independent_path_model.get(
+                        "path_outcome_probabilities",
+                        [[0.0, 0.0, 0.0]] * 4,
+                    ),
+                )
+            },
+            "control_path_outcome_probabilities": {
+                path_name: _probability_dict(row)
+                for path_name, row in zip(
+                    PATH_NAMES,
+                    independent_path_model.get(
+                        "control_path_outcome_probabilities",
+                        [[0.0, 0.0, 0.0]] * 4,
+                    ),
+                )
+            },
+            "path_support": {
+                path_name: round(float(value), 6)
+                for path_name, value in zip(
+                    PATH_NAMES,
+                    independent_path_model.get(
+                        "path_support",
+                        [0.0, 0.0, 0.0, 0.0],
+                    ),
+                )
+            },
+            "reliability": round(
+                float(independent_path_model.get("reliability", 0.0)),
+                6,
+            ),
+            "minimum_reliability": round(
+                float(
+                    independent_path_model.get(
+                        "minimum_reliability",
+                        result["settings"].get(
+                            "independent_path_model_min_reliability",
+                            0.55,
+                        ),
+                    )
+                ),
+                6,
+            ),
+            "configured_max_weight": round(
+                float(independent_path_model.get("configured_max_weight", 0.0)),
+                6,
+            ),
+            "effective_weight": round(
+                float(independent_path_model.get("effective_weight", 0.0)),
+                6,
+            ),
+            "direction_agreement": round(
+                float(independent_path_model.get("direction_agreement", 0.5)),
+                6,
+            ),
+            "residual_adjustment": _probability_dict(
+                independent_path_model.get(
+                    "residual_adjustment",
+                    [0.0, 0.0, 0.0],
+                )
+            ),
+            "max_adjustment": round(
+                float(independent_path_model.get("max_adjustment", 0.0)),
+                6,
+            ),
+            "uses_additional_simulations": bool(
+                independent_path_model.get("uses_additional_simulations", False)
             ),
         },
         "shoe_context": {
@@ -610,6 +709,29 @@ def predict(
             "minimum_particles_per_draw_path": int(
                 result["settings"]["min_path_particles"]
             ),
+            "independent_path_model_enabled": bool(
+                result["settings"]["independent_path_model_enabled"]
+            ),
+            "independent_path_model_max_weight": round(
+                float(result["settings"]["independent_path_model_max_weight"]),
+                6,
+            ),
+            "independent_path_model_min_reliability": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_min_reliability"
+                    ]
+                ),
+                6,
+            ),
+            "independent_path_model_max_adjustment": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_max_adjustment"
+                    ]
+                ),
+                6,
+            ),
             "forecast_simulations_per_replica": max(
                 int(
                     result["settings"][
@@ -678,9 +800,10 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            f"V5.3.0 HYBRID：{particle_count}粒子×"
+            f"V5.3.2 HYBRID：{particle_count}粒子×"
             f"{int(result['replicas'])}副本；"
             "每次只使用本局最終點數與本局補牌路徑獨立模擬；"
+            "並以現有樣本建立N/P/B/D四路徑條件結果模型，不增加模擬輪數；"
             "不使用牌靴局數、歷史牌值、上一局資料、牌路、長龍、"
             "Markov、上一局推薦或勝敗紀錄。"
             f"決策來源={result['decision_source']}；"
@@ -741,7 +864,7 @@ def reset_uid_model(
         "removed": 0,
         "fresh_particle_mode": True,
         "message": (
-            "V5.3每次重建粒子；請由store.reset_shoe清除"
+            "V5.3.2每次重建粒子；請由store.reset_shoe清除"
             "實體牌靴資訊。"
         ),
     }
