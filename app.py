@@ -1,19 +1,16 @@
-"""LINE point-input baccarat bot for V5.2.0 independent point prediction.
+"""LINE baccarat bot for V5.3 factual-shoe-context HYBRID prediction.
 
-Operation flow
---------------
-1. Start analysis, select venue, and enter the room.
-2. Enter final points directly, e.g. 65 = Player 6 / Banker 5.
-3. Optional draw-path suffix improves conditioning precision:
-       N = neither side drew a third card
-       P = Player only drew
-       B = Banker only drew
-       D = both sides drew
-   Example: 65D.
-4. The result is stored for settlement/statistics, while every prediction uses
-   only the newest point observation and creates fresh 1000-2000 particles.
+Supported inputs
+----------------
+65          = Player 6 / Banker 5
+65D / 653   = both sides drew (letter / numeric draw code)
+65D@38      = both sides drew, physical shoe hand 38
+65D@38 P:2,1,3 B:4,0,1
+            = exact cards for this hand
 
-Older formats remain accepted: 閒6莊5, P6B5, 6,5.
+Every request creates fresh particles. Only factual shoe context is persisted:
+hand number and exact cards explicitly entered by the user. Road, streak,
+previous recommendation and settlement results are never model features.
 """
 
 from __future__ import annotations
@@ -30,7 +27,7 @@ import traceback
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 from fastapi import FastAPI, Request
@@ -71,6 +68,10 @@ APP_REQUIRE_DRAW_PATH = _env_bool(
     "APP_REQUIRE_DRAW_PATH",
     False,
 )
+APP_REQUIRE_HAND_NUMBER = _env_bool(
+    "APP_REQUIRE_HAND_NUMBER",
+    False,
+)
 APP_MAX_CONCURRENT_PREDICTIONS = _env_int(
     "APP_MAX_CONCURRENT_PREDICTIONS",
     1,
@@ -83,13 +84,18 @@ APP_PREDICTION_QUEUE_TIMEOUT = _env_int(
     1,
     55,
 )
-MODEL_PARTICLES = _env_int("PF_PARTICLES", 1000, 64, 2000)
+MODEL_PARTICLES = _env_int("PF_PARTICLES", 384, 64, 2000)
 MODEL_REPLICAS = _env_int("PF_REPLICAS", 5, 3, 11)
+MODEL_HYBRID_MODE = os.getenv(
+    "PF_HYBRID_MODE",
+    "hybrid",
+).strip().lower()
 _PREDICTION_SLOTS = threading.BoundedSemaphore(
     APP_MAX_CONCURRENT_PREDICTIONS
 )
 
 DRAW_PATH_SUFFIX_BY_INDEX = {0: "N", 1: "P", 2: "B", 3: "D"}
+DRAW_CODE_TO_SUFFIX = {"1": "P", "2": "B", "3": "D", "4": "N"}
 DRAW_PATH_TEXT = {
     "none": "雙方都沒補牌",
     "player_only": "只有閒家補牌",
@@ -147,8 +153,8 @@ TEMP_CODES = {
 ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 app = FastAPI(
-    title="Baccarat V5.2 Independent Point Bot",
-    version="5.2.0",
+    title="Baccarat V5.3 Factual Shoe HYBRID Bot",
+    version="5.3.0",
 )
 
 # Reuse HTTPS connections to LINE instead of opening a new TLS connection for
@@ -457,20 +463,93 @@ def flex(
 # ---------------------------------------------------------------------------
 
 
+def _parse_card_values(text: str) -> List[int]:
+    values = [
+        item
+        for item in re.split(r"\s*[,/]\s*", str(text or "").strip())
+        if item != ""
+    ]
+    if len(values) not in {2, 3} or any(
+        not re.fullmatch(r"[0-9]", item)
+        for item in values
+    ):
+        raise ValueError("牌值必須是2或3張，例如 P:2,1,3。")
+    return [int(item) for item in values]
+
+
+def _extract_known_cards(text: str) -> Dict[str, List[int]]:
+    tail = str(text or "").strip().upper()
+    if not tail:
+        return {}
+
+    patterns = {
+        "player": r"(?:P|PLAYER|閒|闲)\s*[:=]\s*([0-9](?:\s*[,/]\s*[0-9]){1,2})",
+        "banker": r"(?:B|BANKER|莊|庄)\s*[:=]\s*([0-9](?:\s*[,/]\s*[0-9]){1,2})",
+    }
+    cards: Dict[str, List[int]] = {}
+    for side, pattern in patterns.items():
+        match = re.search(pattern, tail, flags=re.IGNORECASE)
+        if match:
+            cards[side] = _parse_card_values(match.group(1))
+
+    if cards and set(cards) != {"player", "banker"}:
+        raise ValueError("輸入實際牌值時，閒家與莊家牌值都必須提供。")
+    if not cards:
+        raise ValueError(
+            "牌值格式錯誤，請使用：65D@38 P:2,1,3 B:4,0,1，"
+            "或 653@38 P:2,1,3 B:4,0,1"
+        )
+    return cards
+
+
+def _path_from_cards(cards: Mapping[str, Sequence[int]]) -> str:
+    player_len = len(cards.get("player", []))
+    banker_len = len(cards.get("banker", []))
+    return {
+        (2, 2): "N",
+        (3, 2): "P",
+        (2, 3): "B",
+        (3, 3): "D",
+    }.get((player_len, banker_len), "")
+
+
 def parse_chat_point_observation(
     text: str,
 ) -> Optional[Dict[str, Any]]:
-    """Parse final points and preserve the optional N/P/B/D draw path."""
+    """Parse points, optional draw path, hand number and exact cards."""
     value = str(text or "").strip().upper()
-    compact = re.fullmatch(r"([0-9])([0-9])([NPBD])?", value)
+    compact = re.fullmatch(
+        r"([0-9])([0-9])([NPBD]|[1-4])?(?:@([0-9]{1,3}))?(?:\s+(.+))?",
+        value,
+    )
     if compact:
+        player = int(compact.group(1))
+        banker = int(compact.group(2))
         suffix = compact.group(3) or ""
+        suffix = DRAW_CODE_TO_SUFFIX.get(suffix, suffix)
+        hand_number = int(compact.group(4) or 0)
+        if hand_number > 120:
+            raise ValueError("牌靴局數請輸入1到120。")
+
+        cards = _extract_known_cards(compact.group(5) or "")
+        if cards:
+            if sum(cards["player"]) % 10 != player:
+                raise ValueError("閒家實際牌值加總與最終點數不一致。")
+            if sum(cards["banker"]) % 10 != banker:
+                raise ValueError("莊家實際牌值加總與最終點數不一致。")
+            inferred_suffix = _path_from_cards(cards)
+            if suffix and inferred_suffix and suffix != inferred_suffix:
+                raise ValueError("N/P/B/D與實際牌張數不一致。")
+            suffix = suffix or inferred_suffix
+
         return {
-            "player": int(compact.group(1)),
-            "banker": int(compact.group(2)),
+            "player": player,
+            "banker": banker,
             "suffix": suffix,
             "path_suffix": suffix,
             "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
+            "hand_number": hand_number,
+            "known_cards": cards,
         }
 
     parsed = parse_point_observation(value)
@@ -497,6 +576,8 @@ def parse_chat_point_observation(
         "suffix": suffix,
         "path_suffix": suffix,
         "path": {"N": 0, "P": 1, "B": 2, "D": 3}.get(suffix),
+        "hand_number": int(parsed.get("hand_number") or 0),
+        "known_cards": dict(parsed.get("known_cards") or {}),
     }
 
 
@@ -541,24 +622,28 @@ def ready_panel(
 ) -> Dict[str, Any]:
     user_status = status(user_id)
     return flex(
-        "可直接輸入點數",
+        "V5.3 HYBRID 可開始分析",
         (
             f"館別：{session.get('venue') or '-'}\n"
             f"房間：{session.get('room') or '-'}\n"
             f"UID權限：{user_status['label']}"
             f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-            "請直接輸入最終點數：\n"
-            "65＝閒6點、莊5點。\n"
-            "知道補牌情況時可輸入 65N／65P／65B／65D。\n"
-            "N雙方不補｜P僅閒補｜B僅莊補｜D雙方補。\n\n"
-            f"目前模型：{MODEL_PARTICLES} 粒子 × {MODEL_REPLICAS} 副本。\n"
-            "每次只使用最新點數，並重新建立獨立粒子。"
+            "基本輸入：65\n"
+            "字母補牌：65B（只有莊家補牌）\n"
+            "數字補牌：652（只有莊家補牌）\n"
+            "補牌＋局數：65D@38 或 653@38\n"
+            "完整牌值：65D@38 P:2,1,3 B:4,0,1\n\n"
+            "字母：N雙方不補｜P僅閒補｜B僅莊補｜D雙方補\n"
+            "數字：1=P｜2=B｜3=D｜4=N\n"
+            "30分鐘試用會在首次成功輸入點數後開始計時。\n"
+            "若從牌靴中途開始，請務必加上 @目前局數。\n"
+            "只有每局都輸入完整牌值，才會啟用精確剩餘牌組。\n\n"
+            f"模型：HYBRID｜{MODEL_PARTICLES}粒子 × "
+            f"{MODEL_REPLICAS}副本。"
         ),
         [
-            action(
-                "結束分析",
-                "end",
-            )
+            action("新牌靴", "new_shoe"),
+            action("結束分析", "end"),
         ],
     )
 
@@ -570,7 +655,7 @@ def _decision_source_text(value: Any) -> str:
         "LOW_CONFIDENCE_BALANCED": "低信心比較",
         "UNVALIDATED_COMPARISON": "未驗證比較",
     }
-    return names.get(source, source or "V5.2模型")
+    return names.get(source, source or "V5.3 HYBRID模型")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -622,14 +707,22 @@ def result_panel(
     source_text = _decision_source_text(
         prediction.get("decision_source")
     )
+
     particle_info = prediction.get("point_particle_filter") or {}
     path_info = prediction.get("draw_path_diagnostics") or {}
+    hybrid_info = prediction.get("hybrid") or {}
+    hybrid_weights = hybrid_info.get("weights") or {}
+    shoe_context = prediction.get("shoe_context") or {}
+
     particles = _safe_int(
         particle_info.get("particles_per_replica"),
         MODEL_PARTICLES,
     )
     replicas = _safe_int(
-        particle_info.get("replicas", prediction.get("replica_count")),
+        particle_info.get(
+            "replicas",
+            prediction.get("replica_count"),
+        ),
         MODEL_REPLICAS,
     )
     validated = bool(prediction.get("validated_signal"))
@@ -640,22 +733,53 @@ def result_panel(
     }
     stability = stability_names.get(
         str(prediction.get("stability") or ""),
-        str(prediction.get("stability") or "-")
+        str(prediction.get("stability") or "-"),
     )
+
+    hand_number = _safe_int(
+        shoe_context.get("hand_number"),
+        _safe_int(session.get("hand_number")),
+    )
+    exact_state = bool(
+        shoe_context.get("exact_state_enabled")
+        or hybrid_info.get("exact_state_enabled")
+    )
+    known_cards = prediction.get("known_cards") or {}
+    if exact_state:
+        shoe_mode = "完整牌值追蹤"
+    elif known_cards:
+        shoe_mode = "本局牌值＋局數"
+    elif hand_number > 0:
+        shoe_mode = "牌靴局數先驗"
+    else:
+        shoe_mode = "早中晚混合先驗"
 
     diagnostics = ""
     if APP_SHOW_MODEL_DIAGNOSTICS:
         diagnostics = (
             f"\n模型：{particles}粒子 × {replicas}副本"
-            f"\n驗證：{'通過' if validated else '未通過'}｜穩定：{stability}"
-            f"\nESS：{_safe_float(particle_info.get('average_effective_sample_size')):.0f}"
-            f"｜路徑覆蓋：{_safe_float(path_info.get('coverage')) * 100.0:.0f}%"
+            f"\nHYBRID閘門："
+            f"{_safe_float(hybrid_info.get('gate')) * 100.0:.0f}%"
+            f"｜PF權重："
+            f"{_safe_float(hybrid_weights.get('particle')) * 100.0:.0f}%"
+            f"\n精確牌組權重："
+            f"{_safe_float(hybrid_weights.get('exact_shoe_state')) * 100.0:.0f}%"
+            f"｜基準收縮："
+            f"{_safe_float(hybrid_weights.get('baseline')) * 100.0:.0f}%"
+            f"\n驗證：{'通過' if validated else '未通過'}"
+            f"｜穩定：{stability}"
+            f"\nESS："
+            f"{_safe_float(particle_info.get('average_effective_sample_size')):.0f}"
+            f"｜路徑覆蓋："
+            f"{_safe_float(path_info.get('coverage')) * 100.0:.0f}%"
         )
 
     body = (
-        f"本次第 {len(observations)} 次獨立分析\n"
+        f"本牌靴第 {hand_number or '-'} 局"
+        f"｜第 {len(observations)} 次分析\n"
         f"輸入：{prediction.get('conditioning_point', '-')}\n"
-        f"補牌：{_draw_path_text(prediction)}\n\n"
+        f"補牌：{_draw_path_text(prediction)}\n"
+        f"牌靴資訊：{shoe_mode}\n\n"
         f"莊 {_safe_float(prediction.get('banker_rate')):.1f}%\n"
         f"閒 {_safe_float(prediction.get('player_rate')):.1f}%\n"
         f"和 {_safe_float(prediction.get('tie_rate')):.1f}%\n\n"
@@ -665,18 +789,17 @@ def result_panel(
         f"{diagnostics}\n\n"
         f"UID權限：{user_status['label']}"
         f"｜剩餘：{remaining_text(user_status.get('remaining'))}\n\n"
-        "請輸入下一組點數，例如 65 或 65D。\n"
-        "每次分析完全獨立，不沿用上一局粒子。"
+        "下一局可輸入 65、65D@39、653@39，"
+        "或完整牌值格式。\n"
+        "換靴時請輸入「新牌靴」。"
     )
 
     return flex(
-        "V5.2 下一局粒子模擬",
+        "V5.3 HYBRID 下一局分析",
         body,
         [
-            action(
-                "結束分析",
-                "end",
-            )
+            action("新牌靴", "new_shoe"),
+            action("結束分析", "end"),
         ],
     )
 
@@ -740,10 +863,11 @@ def predict_session(
 ) -> Dict[str, Any]:
     """Return the last stored V5 prediction without running the model again."""
     session = store.get_session(user_id)
-    ensure(user_id)
 
     if not _stored_prediction(session):
         raise ValueError("尚未輸入點數，請先輸入例如：65")
+
+    ensure(user_id)
 
     return session
 
@@ -752,7 +876,7 @@ def add_points_and_predict(
     user_id: str,
     observation: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Settle the prior result and run one fresh V5.2 particle analysis."""
+    """Settle the prior result and run one fresh V5.3 HYBRID analysis."""
     ensure(user_id)
 
     acquired = _PREDICTION_SLOTS.acquire(
@@ -760,7 +884,7 @@ def add_points_and_predict(
     )
     if not acquired:
         raise RuntimeError(
-            "目前高粒子模型正在分析其他請求，請稍後重新輸入點數。"
+            "目前HYBRID模型正在分析其他請求，請稍後重新輸入點數。"
         )
 
     try:
@@ -780,32 +904,51 @@ def add_points_and_predict(
             except Exception:
                 suffix = ""
 
+        normalized_observation = {
+            "player": player,
+            "banker": banker,
+            "path_suffix": suffix,
+            "path": {
+                "N": 0,
+                "P": 1,
+                "B": 2,
+                "D": 3,
+            }.get(suffix),
+            "hand_number": int(
+                observation.get("hand_number") or 0
+            ),
+            "known_cards": dict(
+                observation.get("known_cards") or {}
+            ),
+        }
+
         point = f"{player}{banker}"
         session = store.record_point_and_settle(
             user_id,
             point,
+            normalized_observation,
         )
+        context = store.shoe_context(session)
+        last_observation = dict(
+            session.get("last_observation")
+            or normalized_observation
+        )
+        last_observation.update(context)
 
-        # predictor.parse_point_observation expects path_suffix for mapping input.
-        # Passing it explicitly prevents 65N/65P/65B/65D from losing the path.
-        model_observation = {
-            "player": player,
-            "banker": banker,
-            "path_suffix": suffix,
-        }
         prediction = predict(
-            [model_observation],
+            [last_observation],
             venue=session.get("venue", ""),
             room=session.get("room", ""),
             shoe_id=session.get("shoe_id", ""),
             user_id=user_id,
+            shoe_context=context,
         )
 
         if not prediction.get("ok"):
             raise ValueError(
                 prediction.get("message")
                 or prediction.get("error")
-                or "V5.2預測失敗"
+                or "V5.3 HYBRID預測失敗"
             )
 
         return store.save_prediction(
@@ -837,13 +980,25 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "v5.2.0-independent-point-line",
-            "engine": "V5_2_INDEPENDENT_POINT_PF_LINE",
+            "version": "v5.3.0-factual-shoe-hybrid-line",
+            "engine": "V5_3_FACTUAL_SHOE_HYBRID_LINE",
+            "hybrid_mode": MODEL_HYBRID_MODE,
             "particles": MODEL_PARTICLES,
             "particle_limit": 2000,
             "replicas": MODEL_REPLICAS,
-            "draw_path_input": "N/P/B/D",
+            "input_formats": [
+                "65",
+                "65D",
+                "651",
+                "652",
+                "653",
+                "654",
+                "65D@38",
+                "652@38",
+                "65D@38 P:2,1,3 B:4,0,1",
+            ],
             "require_draw_path": APP_REQUIRE_DRAW_PATH,
+            "require_hand_number": APP_REQUIRE_HAND_NUMBER,
             "max_concurrent_predictions": APP_MAX_CONCURRENT_PREDICTIONS,
         }
     )
@@ -918,6 +1073,20 @@ async def webhook(
                 session = store.get_session(user_id)
 
                 if (
+                    text in {"新牌靴", "換靴", "重置牌靴"}
+                    and session.get("room")
+                ):
+                    session = store.reset_shoe(user_id)
+                    reply(
+                        token,
+                        [
+                            text_message("✅ 已建立新牌靴，局數與牌值追蹤已歸零。"),
+                            ready_panel(user_id, session),
+                        ],
+                    )
+                    continue
+
+                if (
                     session.get("venue")
                     and not session.get("room")
                 ):
@@ -942,7 +1111,24 @@ async def webhook(
                             token,
                             [
                                 text_message(
-                                    "目前設定必須輸入補牌路徑：例如 65N、65P、65B 或 65D。"
+                                    "目前設定必須輸入補牌路徑：可用字母 "
+                                    "65N、65P、65B、65D，或數字 "
+                                    "654、651、652、653（1=P、2=B、3=D、4=N）。"
+                                    "例如 652 代表只有莊家補牌。"
+                                )
+                            ],
+                        )
+                        continue
+
+                    if (
+                        APP_REQUIRE_HAND_NUMBER
+                        and not observation.get("hand_number")
+                    ):
+                        reply(
+                            token,
+                            [
+                                text_message(
+                                    "目前設定必須輸入牌靴局數，例如：65D@38 或 653@38。"
                                 )
                             ],
                         )
@@ -1025,8 +1211,10 @@ async def webhook(
                     token,
                     [
                         text_message(
-                            "請輸入「開始分析」，"
-                            "或直接輸入點數，例如 65 或 65D。"
+                            "格式錯誤。請輸入「開始分析」，"
+                            "或輸入 65、65D、652、65D@38、652@38；"
+                            "數字代號為1=P、2=B、3=D、4=N。"
+                            "換靴請輸入「新牌靴」。"
                         )
                     ],
                 )
@@ -1045,20 +1233,10 @@ async def webhook(
                 action_name = query.get("action")
 
                 if action_name == "venue":
-                    session = store.start_session(user_id)
-                    session.update(
-                        {
-                            "venue": query.get("venue", ""),
-                            "room": "",
-                            "shoe_id": "",
-                            "point_history": [],
-                            "pending_prediction": {},
-                            "last_settlement": {},
-                        }
-                    )
-                    store.upsert_session(
+                    session = store.reset_shoe(
                         user_id,
-                        session,
+                        venue=query.get("venue", ""),
+                        room="",
                     )
                     reply(
                         token,
@@ -1073,6 +1251,16 @@ async def webhook(
                     reply(
                         token,
                         [venue_panel(user_id)],
+                    )
+
+                elif action_name == "new_shoe":
+                    session = store.reset_shoe(user_id)
+                    reply(
+                        token,
+                        [
+                            text_message("✅ 已建立新牌靴，局數與牌值追蹤已歸零。"),
+                            ready_panel(user_id, session),
+                        ],
                     )
 
                 elif action_name == "end":
