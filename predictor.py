@@ -1,4 +1,4 @@
-"""LINE-compatible V5.3 independent point-and-draw-path predictor."""
+"""LINE-compatible V5.3.1 path-weighted independent point-and-draw-path predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -375,10 +375,10 @@ def predict(
     response: Dict[str, Any] = {
         "ok": True,
         "engine": (
-            f"V5_3_0_HYBRID_{particle_count}_PARTICLE_LINE"
+            f"V5_3_1_PATH_WEIGHTED_{particle_count}_PARTICLE_LINE"
         ),
         "model_version": (
-            f"V5.3.0-HYBRID-{particle_count}P-LINE-20260717"
+            f"V5.3.1-PATH-WEIGHTED-{particle_count}P-LINE-20260718"
         ),
         "user_id": user_id,
         "venue": venue,
@@ -539,6 +539,25 @@ def predict(
                 float(
                     result["average_path_ess_quality"]
                 ),
+                6,
+            ),
+            "quality_score": round(
+                float(result.get("average_path_quality", 0.0)),
+                6,
+            ),
+            "fusion_gain": round(
+                float(result.get("average_path_fusion_gain", 0.0)),
+                6,
+            ),
+            "hybrid_path_gate": round(
+                float(hybrid.get("path_gate", 0.0)),
+                6,
+            ),
+            "quality_pass": bool(
+                result.get("path_quality_pass", False)
+            ),
+            "quality_threshold": round(
+                float(result.get("path_quality_threshold", 0.0)),
                 6,
             ),
             "candidates": [
