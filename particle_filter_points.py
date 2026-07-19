@@ -119,6 +119,42 @@ INDEPENDENT_PATH_MODEL_MAX_ADJUSTMENT = _env_float(
 INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH = _env_float(
     "PF_INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH", 6.0, 0.0, 100.0
 )
+INDEPENDENT_PATH_MODEL_PRIOR_MIN = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_MIN", 2.0, 0.0, 100.0
+)
+INDEPENDENT_PATH_MODEL_PRIOR_MAX = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_MAX", 18.0, 0.0, 100.0
+)
+INDEPENDENT_PATH_MODEL_PRIOR_DEPTH_RELIEF = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_DEPTH_RELIEF", 0.35, 0.0, 0.90
+)
+INDEPENDENT_PATH_MODEL_PRIOR_LOW_SUPPORT_GAIN = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_LOW_SUPPORT_GAIN", 1.10, 0.0, 5.0
+)
+INDEPENDENT_PATH_MODEL_PRIOR_IMBALANCE_GAIN = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_PRIOR_IMBALANCE_GAIN", 0.65, 0.0, 5.0
+)
+INDEPENDENT_PATH_MODEL_SUPPORT_TARGET_FRACTION = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_SUPPORT_TARGET_FRACTION", 0.35, 0.05, 2.0
+)
+INDEPENDENT_PATH_MODEL_SUPPORT_MIN_COUNT = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_SUPPORT_MIN_COUNT", 6.0, 1.0, 200.0
+)
+INDEPENDENT_PATH_MODEL_RESIDUAL_SHRINK_POWER = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_RESIDUAL_SHRINK_POWER", 0.85, 0.10, 3.0
+)
+INDEPENDENT_PATH_MODEL_RESIDUAL_Z_SCORE = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_RESIDUAL_Z_SCORE", 1.0, 0.0, 5.0
+)
+INDEPENDENT_PATH_MODEL_DEPTH_START = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_DEPTH_START", 0.28, 0.0, 0.95
+)
+INDEPENDENT_PATH_MODEL_DEPTH_FULL = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_DEPTH_FULL", 0.68, 0.05, 1.0
+)
+INDEPENDENT_PATH_MODEL_LATE_MAX_WEIGHT = _env_float(
+    "PF_INDEPENDENT_PATH_MODEL_LATE_MAX_WEIGHT", 0.24, 0.0, 0.40
+)
 
 BASELINE = np.asarray(DEFAULT_BASELINE, dtype=float)
 DRAW_BASELINE = np.asarray(DEFAULT_DRAW, dtype=float)
@@ -237,6 +273,12 @@ class ReplicaResult:
     independent_path_reliability: float
     independent_path_effective_weight: float
     independent_path_direction_agreement: float
+    independent_path_weighted_support: float
+    independent_path_residual_shrinkage: float
+    independent_path_depth_factor: float
+    independent_path_depth_consistency: float
+    independent_path_dynamic_max_weight: float
+    independent_path_dynamic_prior_strength: np.ndarray
     point_concentration: float
     effective_database_weight: float
     database_reliability: float
@@ -421,265 +463,6 @@ def exact_conditional_complete(
     cards = 4 + (1 if player_third is not None else 0) + (1 if banker_third is not None else 0)
     return counts, path, max(1e-12, float(weight)), cards
 
-
-
-def _completion_from_initial_totals(
-    player_initial: int,
-    banker_initial: int,
-    observed_player: int,
-    observed_banker: int,
-    known_path: Optional[int] = None,
-) -> Optional[Tuple[int, Optional[int], Optional[int], int]]:
-    """Return the legal completion for one pair of initial two-card totals.
-
-    The result is ``(path, player_third, banker_third, cards_used)``.  This is
-    the same baccarat-rule check used by ``exact_conditional_complete``, split
-    out so the proposal generator can sample only legal initial-total branches.
-    """
-    player_initial = int(player_initial) % 10
-    banker_initial = int(banker_initial) % 10
-    observed_player = int(observed_player) % 10
-    observed_banker = int(observed_banker) % 10
-
-    player_third: Optional[int] = None
-    banker_third: Optional[int] = None
-
-    if player_initial >= 8 or banker_initial >= 8:
-        if (
-            player_initial != observed_player
-            or banker_initial != observed_banker
-        ):
-            return None
-    else:
-        if player_initial <= 5:
-            player_third = (observed_player - player_initial) % 10
-        elif player_initial != observed_player:
-            return None
-
-        if banker_draws(banker_initial, player_third):
-            banker_third = (observed_banker - banker_initial) % 10
-        elif banker_initial != observed_banker:
-            return None
-
-    path = (
-        (1 if player_third is not None else 0)
-        + (2 if banker_third is not None else 0)
-    )
-    if known_path is not None and path != int(known_path):
-        return None
-
-    cards = (
-        4
-        + (1 if player_third is not None else 0)
-        + (1 if banker_third is not None else 0)
-    )
-    return path, player_third, banker_third, cards
-
-
-def _ordered_pair_options(
-    counts: np.ndarray,
-    total_value: int,
-) -> Tuple[List[Tuple[int, int, float]], float]:
-    """Return exact ordered two-card options and their unconditional mass."""
-    source = np.asarray(counts, dtype=np.int16)
-    card_total = int(source.sum())
-    if card_total < 2:
-        return [], 0.0
-
-    options: List[Tuple[int, int, float]] = []
-    raw_total = 0.0
-    target = int(total_value) % 10
-    for first in range(10):
-        first_count = int(source[first])
-        if first_count <= 0:
-            continue
-        for second in range(10):
-            if (first + second) % 10 != target:
-                continue
-            second_count = int(source[second]) - (
-                1 if second == first else 0
-            )
-            if second_count <= 0:
-                continue
-            raw_weight = float(first_count * second_count)
-            options.append((first, second, raw_weight))
-            raw_total += raw_weight
-
-    denominator = float(card_total * (card_total - 1))
-    probability = raw_total / denominator if denominator > 0 else 0.0
-    return options, probability
-
-
-def _weighted_choice(
-    items: Sequence[Any],
-    weights: Sequence[float],
-    rng: np.random.Generator,
-) -> Optional[Any]:
-    """Sample one item from non-negative unnormalized weights."""
-    if not items or len(items) != len(weights):
-        return None
-    cleaned = np.asarray(
-        [max(0.0, float(value)) for value in weights],
-        dtype=float,
-    )
-    total = float(cleaned.sum())
-    if total <= 0:
-        return None
-    ticket = float(rng.random()) * total
-    index = int(np.searchsorted(np.cumsum(cleaned), ticket, side="right"))
-    index = min(len(items) - 1, max(0, index))
-    return items[index]
-
-
-def direct_conditional_complete(
-    source: np.ndarray,
-    rng: np.random.Generator,
-    observed_player: int,
-    observed_banker: int,
-    known_path: Optional[int] = None,
-) -> Optional[Tuple[np.ndarray, int, float, int]]:
-    """Direct importance proposal for a legal current-hand completion.
-
-    Instead of repeatedly dealing four random opening cards and rejecting most
-    hands, this proposal first samples only initial Player/Banker totals that can
-    legally complete to the observed final points and N/P/B/D path.  The
-    returned importance weight corrects for that proposal restriction, so the
-    posterior target remains the same while acceptance and ESS improve.
-    """
-    original = np.asarray(source, dtype=np.int16)
-    if int(original.sum()) < 4:
-        return None
-
-    observed_player = int(observed_player) % 10
-    observed_banker = int(observed_banker) % 10
-
-    legal_by_player: Dict[int, List[int]] = {}
-    completions: Dict[Tuple[int, int], Tuple[int, Optional[int], Optional[int], int]] = {}
-    for player_initial in range(10):
-        for banker_initial in range(10):
-            completion = _completion_from_initial_totals(
-                player_initial,
-                banker_initial,
-                observed_player,
-                observed_banker,
-                known_path,
-            )
-            if completion is None:
-                continue
-            legal_by_player.setdefault(player_initial, []).append(
-                banker_initial
-            )
-            completions[(player_initial, banker_initial)] = completion
-
-    if not legal_by_player:
-        return None
-
-    player_total_items: List[int] = []
-    player_total_weights: List[float] = []
-    player_pair_options: Dict[int, List[Tuple[int, int, float]]] = {}
-    for player_initial in sorted(legal_by_player):
-        options, probability = _ordered_pair_options(
-            original,
-            player_initial,
-        )
-        if options and probability > 0:
-            player_total_items.append(player_initial)
-            player_total_weights.append(probability)
-            player_pair_options[player_initial] = options
-
-    player_mass = float(sum(player_total_weights))
-    player_initial = _weighted_choice(
-        player_total_items,
-        player_total_weights,
-        rng,
-    )
-    if player_initial is None or player_mass <= 0:
-        return None
-
-    player_options = player_pair_options[int(player_initial)]
-    player_pair = _weighted_choice(
-        player_options,
-        [item[2] for item in player_options],
-        rng,
-    )
-    if player_pair is None:
-        return None
-
-    counts = original.copy()
-    player_first, player_second, _ = player_pair
-    if int(counts[player_first]) <= 0:
-        return None
-    counts[player_first] -= 1
-    if int(counts[player_second]) <= 0:
-        return None
-    counts[player_second] -= 1
-
-    banker_total_items: List[int] = []
-    banker_total_weights: List[float] = []
-    banker_pair_options: Dict[int, List[Tuple[int, int, float]]] = {}
-    for banker_initial in legal_by_player[int(player_initial)]:
-        options, probability = _ordered_pair_options(
-            counts,
-            banker_initial,
-        )
-        if options and probability > 0:
-            banker_total_items.append(banker_initial)
-            banker_total_weights.append(probability)
-            banker_pair_options[banker_initial] = options
-
-    banker_mass = float(sum(banker_total_weights))
-    banker_initial = _weighted_choice(
-        banker_total_items,
-        banker_total_weights,
-        rng,
-    )
-    if banker_initial is None or banker_mass <= 0:
-        return None
-
-    banker_options = banker_pair_options[int(banker_initial)]
-    banker_pair = _weighted_choice(
-        banker_options,
-        [item[2] for item in banker_options],
-        rng,
-    )
-    if banker_pair is None:
-        return None
-
-    banker_first, banker_second, _ = banker_pair
-    if int(counts[banker_first]) <= 0:
-        return None
-    counts[banker_first] -= 1
-    if int(counts[banker_second]) <= 0:
-        return None
-    counts[banker_second] -= 1
-
-    completion = completions.get(
-        (int(player_initial), int(banker_initial))
-    )
-    if completion is None:
-        return None
-    path, player_third, banker_third, cards = completion
-
-    # The proposal samples legal opening-total branches with probabilities
-    # proportional to their exact two-card masses.  Multiplying by these two
-    # normalizing masses corrects the proposal back to the physical deal.
-    weight = player_mass * banker_mass
-
-    if player_third is not None:
-        probability = _required_card_probability(counts, player_third)
-        if probability <= 0:
-            return None
-        weight *= probability
-        counts[player_third] -= 1
-
-    if banker_third is not None:
-        probability = _required_card_probability(counts, banker_third)
-        if probability <= 0:
-            return None
-        weight *= probability
-        counts[banker_third] -= 1
-
-    return counts, path, max(1e-12, float(weight)), cards
 
 
 def normalize_known_cards(value: Any) -> Optional[Dict[str, List[int]]]:
@@ -1070,24 +853,49 @@ def build_independent_draw_path_model(
     current_path_agreement: float,
     draw_agreement: float,
     settings: Mapping[str, Any],
+    *,
+    particle_probabilities: Optional[Sequence[float]] = None,
+    path_candidate_counts: Optional[Sequence[float]] = None,
+    path_ess: Optional[Sequence[float]] = None,
+    path_allocated: Optional[Sequence[float]] = None,
+    population_ess: float = 0.0,
+    target_ess: float = 1.0,
+    mean_depth: float = 0.0,
+    min_depth: int = 0,
+    max_depth: int = 0,
+    shoe_depth: Optional[float] = None,
+    decks: int = DECKS,
 ) -> Dict[str, Any]:
-    """Build a four-path conditional outcome head from existing samples.
+    """Build a depth-adaptive four-path conditional outcome head.
 
-    The head does not perform another simulation pass. It decomposes the samples
-    already produced by ``forecast`` into N/P/B/D path probabilities and the
-    B/P/T outcome distribution conditional on each path. Its final signal is
-    measured relative to the matched control population, which avoids treating
-    the same whole-particle probability as a second independent vote.
+    The head still reuses only samples already produced by ``forecast``.  It
+    adds no particle, replica or Monte Carlo pass.  Compared with the original
+    implementation, path priors, support, residual shrinkage and maximum weight
+    are adapted to paired sample quality and factual shoe depth.
     """
 
-    conditioned_path = normalize_array(conditioned_draw, DRAW_BASELINE)
-    control_path = normalize_array(control_draw, DRAW_BASELINE)
-    predicted_path = normalize_array(
-        0.70 * conditioned_path
-        + 0.20 * control_path
-        + 0.10 * DRAW_BASELINE,
-        DRAW_BASELINE,
-    )
+    def clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def scale_quality(
+        value: float,
+        low: float = 0.50,
+        high: float = 0.85,
+    ) -> float:
+        if high <= low:
+            return 0.0
+        return clamp01((float(value) - low) / (high - low))
+
+    def path_vector(value: Optional[Sequence[float]]) -> np.ndarray:
+        if value is None:
+            return np.zeros(4, dtype=float)
+        try:
+            arr = np.asarray(value, dtype=float)
+        except Exception:
+            return np.zeros(4, dtype=float)
+        if arr.shape != (4,):
+            return np.zeros(4, dtype=float)
+        return np.maximum(0.0, arr)
 
     conditioned_rows = np.asarray(path_outcome_conditioned, dtype=float)
     control_rows = np.asarray(path_outcome_control, dtype=float)
@@ -1095,53 +903,322 @@ def build_independent_draw_path_model(
         conditioned_rows = np.zeros((4, 3), dtype=float)
     if control_rows.shape != (4, 3):
         control_rows = np.zeros((4, 3), dtype=float)
+    conditioned_rows = np.maximum(0.0, conditioned_rows)
+    control_rows = np.maximum(0.0, control_rows)
 
-    prior_strength = max(
-        0.0,
-        float(settings.get("independent_path_model_prior_strength", 6.0)),
+    path_quality = clamp01(
+        0.65 * float(path_coverage)
+        + 0.35 * float(path_ess_quality)
     )
+    population_ess_quality = clamp01(
+        float(population_ess) / max(1.0, float(target_ess))
+    )
+
+    deck_count = max(1, int(decks))
+    maximum_hand_depth = 90.0
+    shoe_depth_ratio = clamp01(
+        float(shoe_depth)
+        if shoe_depth is not None
+        else float(mean_depth) / maximum_hand_depth
+    )
+    depth_start = clamp01(
+        float(settings.get("independent_path_model_depth_start", 0.28))
+    )
+    depth_full = clamp01(
+        float(settings.get("independent_path_model_depth_full", 0.68))
+    )
+    if depth_full <= depth_start:
+        depth_full = min(1.0, depth_start + 0.05)
+    depth_position = clamp01(
+        (shoe_depth_ratio - depth_start) / max(1e-12, depth_full - depth_start)
+    )
+    depth_factor = depth_position * depth_position * (3.0 - 2.0 * depth_position)
+    depth_span = max(0.0, float(max_depth) - float(min_depth))
+    depth_consistency = clamp01(
+        1.0 - depth_span / max(1.0, maximum_hand_depth * 0.35)
+    )
+    depth_effect = depth_factor * (0.55 + 0.45 * depth_consistency)
+
+    conditioned_path = normalize_array(conditioned_draw, DRAW_BASELINE)
+    control_path = normalize_array(control_draw, DRAW_BASELINE)
+    conditioned_blend = min(
+        0.84,
+        0.70 + 0.12 * depth_effect * path_quality,
+    )
+    control_blend = max(
+        0.10,
+        0.20 - 0.06 * depth_effect * path_quality,
+    )
+    baseline_blend = max(
+        0.05,
+        1.0 - conditioned_blend - control_blend,
+    )
+    blend = normalize_array(
+        [conditioned_blend, control_blend, baseline_blend],
+        [0.70, 0.20, 0.10],
+    )
+    predicted_path = normalize_array(
+        blend[0] * conditioned_path
+        + blend[1] * control_path
+        + blend[2] * DRAW_BASELINE,
+        DRAW_BASELINE,
+    )
+
+    candidate_counts = path_vector(path_candidate_counts)
+    path_ess_values = path_vector(path_ess)
+    allocated = path_vector(path_allocated)
+    metadata_available = bool(
+        np.any(candidate_counts > 0)
+        or np.any(path_ess_values > 0)
+        or np.any(allocated > 0)
+    )
+
     conditioned_matrix = np.zeros((4, 3), dtype=float)
     control_matrix = np.zeros((4, 3), dtype=float)
     support = np.zeros(4, dtype=float)
+    support_targets = np.zeros(4, dtype=float)
+    balance_quality = np.zeros(4, dtype=float)
+    signal_quality = np.zeros(4, dtype=float)
+    path_centers = np.zeros(4, dtype=float)
+    dynamic_prior = np.zeros(4, dtype=float)
+
     conditioned_total = float(conditioned_rows.sum())
     control_total = float(control_rows.sum())
-    sample_target = max(
-        10.0,
-        0.035 * max(1.0, conditioned_total + control_total),
+    average_total = 0.5 * (conditioned_total + control_total)
+    support_target_fraction = max(
+        0.01,
+        float(
+            settings.get(
+                "independent_path_model_support_target_fraction",
+                0.35,
+            )
+        ),
     )
+    support_min_count = max(
+        1.0,
+        float(
+            settings.get(
+                "independent_path_model_support_min_count",
+                6.0,
+            )
+        ),
+    )
+    path_target_matches = max(
+        1.0,
+        float(settings.get("path_target_matches", 10.0)),
+    )
+    path_min_ess = max(
+        1.0,
+        float(settings.get("path_min_ess", 2.5)),
+    )
+    min_path_particles = max(
+        1.0,
+        float(settings.get("min_path_particles", 12.0)),
+    )
+
+    base_prior = max(
+        0.0,
+        float(settings.get("independent_path_model_prior_strength", 6.0)),
+    )
+    prior_min = max(
+        0.0,
+        float(settings.get("independent_path_model_prior_min", 2.0)),
+    )
+    prior_max = max(
+        prior_min,
+        float(settings.get("independent_path_model_prior_max", 18.0)),
+    )
+    prior_depth_relief = clamp01(
+        float(
+            settings.get(
+                "independent_path_model_prior_depth_relief",
+                0.35,
+            )
+        )
+    )
+    prior_low_support_gain = max(
+        0.0,
+        float(
+            settings.get(
+                "independent_path_model_prior_low_support_gain",
+                1.10,
+            )
+        ),
+    )
+    prior_imbalance_gain = max(
+        0.0,
+        float(
+            settings.get(
+                "independent_path_model_prior_imbalance_gain",
+                0.65,
+            )
+        ),
+    )
+
+    for path in range(4):
+        c_count = float(conditioned_rows[path].sum())
+        u_count = float(control_rows[path].sum())
+        paired_total = c_count + u_count
+        paired_effective = (
+            2.0 * c_count * u_count / paired_total
+            if paired_total > 1e-12
+            else 0.0
+        )
+        balance = (
+            2.0 * min(c_count, u_count) / paired_total
+            if paired_total > 1e-12
+            else 0.0
+        )
+        balance_quality[path] = clamp01(balance)
+
+        expected_count = average_total * max(
+            0.02,
+            float(predicted_path[path]),
+        )
+        support_target = max(
+            support_min_count,
+            support_target_fraction * expected_count,
+        )
+        support_targets[path] = support_target
+        count_quality = 1.0 - math.exp(
+            -paired_effective / max(1e-12, support_target)
+        )
+
+        if metadata_available:
+            candidate_quality = 1.0 - math.exp(
+                -candidate_counts[path] / path_target_matches
+            )
+            ess_quality = clamp01(
+                path_ess_values[path] / path_min_ess
+            )
+            allocation_quality = clamp01(
+                allocated[path] / min_path_particles
+            )
+            structural_quality = clamp01(
+                0.35 * candidate_quality
+                + 0.40 * ess_quality
+                + 0.25 * allocation_quality
+            )
+        else:
+            structural_quality = clamp01(path_ess_quality)
+
+        support[path] = clamp01(
+            count_quality
+            * (
+                0.50
+                + 0.30 * balance_quality[path]
+                + 0.20 * structural_quality
+            )
+            * (
+                0.72
+                + 0.18 * clamp01(path_coverage)
+                + 0.10 * population_ess_quality
+            )
+        )
+
+        depth_prior_multiplier = max(
+            0.10,
+            1.0 - prior_depth_relief * depth_effect,
+        )
+        prior_value = base_prior * depth_prior_multiplier
+        prior_value *= (
+            1.0
+            + prior_low_support_gain * (1.0 - support[path])
+            + prior_imbalance_gain * (1.0 - balance_quality[path])
+        )
+        dynamic_prior[path] = max(
+            prior_min,
+            min(prior_max, prior_value),
+        )
+
+        conditioned_matrix[path] = normalize_array(
+            conditioned_rows[path] + dynamic_prior[path] * BASELINE,
+            BASELINE,
+        )
+        control_matrix[path] = normalize_array(
+            control_rows[path] + dynamic_prior[path] * BASELINE,
+            BASELINE,
+        )
+
+        path_centers[path] = _center(
+            conditioned_matrix[path],
+            control_matrix[path],
+        )
+        conditioned_mean = float(
+            conditioned_matrix[path, 0] - conditioned_matrix[path, 1]
+        )
+        control_mean = float(
+            control_matrix[path, 0] - control_matrix[path, 1]
+        )
+        conditioned_variance = max(
+            0.0,
+            float(
+                conditioned_matrix[path, 0]
+                + conditioned_matrix[path, 1]
+                - conditioned_mean * conditioned_mean
+            ),
+        )
+        control_variance = max(
+            0.0,
+            float(
+                control_matrix[path, 0]
+                + control_matrix[path, 1]
+                - control_mean * control_mean
+            ),
+        )
+        standard_error = math.sqrt(
+            conditioned_variance
+            / max(1.0, c_count + dynamic_prior[path])
+            + control_variance
+            / max(1.0, u_count + dynamic_prior[path])
+        )
+        residual_z_score = max(
+            0.0,
+            float(
+                settings.get(
+                    "independent_path_model_residual_z_score",
+                    1.0,
+                )
+            ),
+        )
+        absolute_center = abs(path_centers[path])
+        signal_quality[path] = clamp01(
+            absolute_center
+            / (
+                absolute_center
+                + residual_z_score * standard_error
+                + 1e-12
+            )
+        )
 
     positive_mass = 0.0
     negative_mass = 0.0
     for path in range(4):
-        c_count = float(conditioned_rows[path].sum())
-        u_count = float(control_rows[path].sum())
-        conditioned_matrix[path] = normalize_array(
-            conditioned_rows[path] + prior_strength * BASELINE,
-            BASELINE,
+        direction_mass = (
+            predicted_path[path]
+            * support[path]
+            * (0.35 + 0.65 * signal_quality[path])
         )
-        control_matrix[path] = normalize_array(
-            control_rows[path] + prior_strength * BASELINE,
-            BASELINE,
-        )
-        paired_support = math.sqrt(max(0.0, c_count * u_count))
-        support[path] = min(1.0, paired_support / sample_target)
-        path_center = _center(
-            conditioned_matrix[path],
-            control_matrix[path],
-        )
-        direction_mass = predicted_path[path] * support[path]
-        if path_center > 1e-12:
+        if path_centers[path] > 1e-12:
             positive_mass += direction_mass
-        elif path_center < -1e-12:
+        elif path_centers[path] < -1e-12:
             negative_mass += direction_mass
 
     weighted_support = float(np.dot(predicted_path, support))
+    supported_mass = float(np.dot(predicted_path, support))
+    weighted_signal_quality = (
+        float(np.dot(predicted_path * support, signal_quality))
+        / max(1e-12, supported_mass)
+        if supported_mass > 1e-12
+        else 0.0
+    )
     decisive = positive_mass + negative_mass
     direction_agreement = (
         max(positive_mass, negative_mass) / decisive
         if decisive > 1e-12
         else 0.5
     )
+    direction_q = scale_quality(direction_agreement)
 
     conditioned_mix = normalize_array(
         np.sum(predicted_path[:, None] * conditioned_matrix, axis=0),
@@ -1155,46 +1232,57 @@ def build_independent_draw_path_model(
         np.sum(control_rows, axis=0),
         BASELINE,
     )
-    # The path head is the control forecast plus only the path-conditioned
-    # difference. This makes it a mechanism-specific estimate rather than a
-    # duplicated copy of the ordinary PF probability.
-    probabilities = normalize_array(
+    mechanism_probabilities = normalize_array(
         control_probs + (conditioned_mix - control_mix),
         BASELINE,
     )
+    particle_probs = normalize_array(
+        particle_probabilities
+        if particle_probabilities is not None
+        else np.sum(conditioned_rows, axis=0),
+        BASELINE,
+    )
 
-    def scale_quality(value: float, low: float = 0.50, high: float = 0.85) -> float:
-        if high <= low:
-            return 0.0
-        return max(0.0, min(1.0, (float(value) - low) / (high - low)))
-
-    path_quality = max(
-        0.0,
-        min(
-            1.0,
-            0.65 * float(path_coverage)
-            + 0.35 * float(path_ess_quality),
+    residual_shrink_power = max(
+        0.10,
+        float(
+            settings.get(
+                "independent_path_model_residual_shrink_power",
+                0.85,
+            )
         ),
     )
+    residual_shrinkage = clamp01(
+        (weighted_support ** residual_shrink_power)
+        * (0.50 + 0.50 * weighted_signal_quality)
+        * (0.78 + 0.22 * population_ess_quality)
+        * (0.72 + 0.28 * depth_effect)
+        * (0.82 + 0.18 * direction_q)
+    )
+    raw_residual = mechanism_probabilities - particle_probs
+    probabilities = normalize_array(
+        particle_probs + residual_shrinkage * raw_residual,
+        BASELINE,
+    )
+
     current_q = scale_quality(current_path_agreement)
     draw_q = scale_quality(draw_agreement)
-    direction_q = scale_quality(direction_agreement)
     reliability = (
-        0.38 * path_quality
-        + 0.28 * weighted_support
-        + 0.17 * current_q
-        + 0.17 * draw_q
+        0.27 * path_quality
+        + 0.24 * weighted_support
+        + 0.14 * current_q
+        + 0.12 * draw_q
+        + 0.10 * direction_q
+        + 0.08 * weighted_signal_quality
+        + 0.05 * population_ess_quality
     )
-    reliability *= 0.75 + 0.25 * direction_q
-    reliability = max(0.0, min(1.0, reliability))
+    reliability *= 0.82 + 0.18 * depth_consistency
+    reliability *= 0.90 + 0.10 * depth_effect
+    reliability = clamp01(reliability)
 
     enabled = bool(settings.get("independent_path_model_enabled", True))
-    minimum_reliability = max(
-        0.0,
-        min(
-            1.0,
-            float(settings.get("independent_path_model_min_reliability", 0.55)),
-        ),
+    minimum_reliability = clamp01(
+        float(settings.get("independent_path_model_min_reliability", 0.55))
     )
     maximum_weight = max(
         0.0,
@@ -1203,285 +1291,69 @@ def build_independent_draw_path_model(
             float(settings.get("independent_path_model_max_weight", 0.18)),
         ),
     )
+    late_maximum_weight = max(
+        maximum_weight,
+        min(
+            0.40,
+            float(
+                settings.get(
+                    "independent_path_model_late_max_weight",
+                    0.24,
+                )
+            ),
+        ),
+    )
+    dynamic_maximum_weight = (
+        maximum_weight
+        + (late_maximum_weight - maximum_weight)
+        * depth_effect
+        * path_quality
+    )
     effective_weight = 0.0
     if enabled and reliability >= minimum_reliability:
-        effective_weight = maximum_weight * reliability
+        effective_weight = dynamic_maximum_weight * reliability
         effective_weight *= 0.55 + 0.45 * path_quality
-        effective_weight *= 0.70 + 0.30 * direction_q
-        effective_weight = max(0.0, min(maximum_weight, effective_weight))
+        effective_weight *= 0.68 + 0.32 * direction_q
+        effective_weight *= 0.72 + 0.28 * residual_shrinkage
+        effective_weight = max(
+            0.0,
+            min(dynamic_maximum_weight, effective_weight),
+        )
 
     return {
         "enabled": enabled,
         "probabilities": probabilities,
+        "raw_probabilities": mechanism_probabilities,
+        "particle_probabilities": particle_probs,
         "control_probabilities": control_probs,
         "next_draw_paths": predicted_path,
         "conditioned_path_outcomes": conditioned_matrix,
         "control_path_outcomes": control_matrix,
         "support": support,
+        "support_targets": support_targets,
+        "balance_quality": balance_quality,
+        "signal_quality": signal_quality,
+        "path_centers": path_centers,
+        "dynamic_prior_strength": dynamic_prior,
         "weighted_support": weighted_support,
+        "weighted_signal_quality": weighted_signal_quality,
+        "residual_shrinkage": residual_shrinkage,
         "reliability": reliability,
         "minimum_reliability": minimum_reliability,
         "maximum_weight": maximum_weight,
+        "late_maximum_weight": late_maximum_weight,
+        "dynamic_maximum_weight": dynamic_maximum_weight,
         "effective_weight": effective_weight,
         "direction_agreement": direction_agreement,
         "path_quality": path_quality,
+        "population_ess_quality": population_ess_quality,
+        "shoe_depth": shoe_depth_ratio,
+        "depth_factor": depth_factor,
+        "depth_consistency": depth_consistency,
+        "depth_effect": depth_effect,
+        "uses_additional_simulations": False,
     }
 
-
-
-def build_crossfit_independent_draw_path_model(
-    conditioned_draw_folds: np.ndarray,
-    control_draw_folds: np.ndarray,
-    path_outcome_conditioned_folds: np.ndarray,
-    path_outcome_control_folds: np.ndarray,
-    path_coverage: float,
-    path_ess_quality: float,
-    current_path_agreement: float,
-    draw_agreement: float,
-    settings: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """Two-fold cross-fit wrapper for the independent draw-path head.
-
-    Fold A estimates next-path probabilities while Fold B estimates the
-    path-conditional B/P/T outcomes, then the roles are reversed and averaged.
-    No additional simulations are performed.
-    """
-    conditioned_draw_folds = np.asarray(
-        conditioned_draw_folds,
-        dtype=float,
-    )
-    control_draw_folds = np.asarray(
-        control_draw_folds,
-        dtype=float,
-    )
-    path_outcome_conditioned_folds = np.asarray(
-        path_outcome_conditioned_folds,
-        dtype=float,
-    )
-    path_outcome_control_folds = np.asarray(
-        path_outcome_control_folds,
-        dtype=float,
-    )
-
-    valid_shapes = (
-        conditioned_draw_folds.shape == (2, 4)
-        and control_draw_folds.shape == (2, 4)
-        and path_outcome_conditioned_folds.shape == (2, 4, 3)
-        and path_outcome_control_folds.shape == (2, 4, 3)
-    )
-    if not valid_shapes:
-        return build_independent_draw_path_model(
-            np.sum(conditioned_draw_folds, axis=0),
-            np.sum(control_draw_folds, axis=0),
-            np.sum(path_outcome_conditioned_folds, axis=0),
-            np.sum(path_outcome_control_folds, axis=0),
-            path_coverage,
-            path_ess_quality,
-            current_path_agreement,
-            draw_agreement,
-            settings,
-        )
-
-    fold_models = [
-        build_independent_draw_path_model(
-            conditioned_draw_folds[0],
-            control_draw_folds[0],
-            path_outcome_conditioned_folds[1],
-            path_outcome_control_folds[1],
-            path_coverage,
-            path_ess_quality,
-            current_path_agreement,
-            draw_agreement,
-            settings,
-        ),
-        build_independent_draw_path_model(
-            conditioned_draw_folds[1],
-            control_draw_folds[1],
-            path_outcome_conditioned_folds[0],
-            path_outcome_control_folds[0],
-            path_coverage,
-            path_ess_quality,
-            current_path_agreement,
-            draw_agreement,
-            settings,
-        ),
-    ]
-
-    probabilities = normalize_array(
-        0.5
-        * (
-            np.asarray(fold_models[0]["probabilities"], dtype=float)
-            + np.asarray(fold_models[1]["probabilities"], dtype=float)
-        ),
-        BASELINE,
-    )
-    control_probabilities = normalize_array(
-        0.5
-        * (
-            np.asarray(
-                fold_models[0]["control_probabilities"],
-                dtype=float,
-            )
-            + np.asarray(
-                fold_models[1]["control_probabilities"],
-                dtype=float,
-            )
-        ),
-        BASELINE,
-    )
-    next_draw_paths = normalize_array(
-        0.5
-        * (
-            np.asarray(fold_models[0]["next_draw_paths"], dtype=float)
-            + np.asarray(fold_models[1]["next_draw_paths"], dtype=float)
-        ),
-        DRAW_BASELINE,
-    )
-    conditioned_path_outcomes = 0.5 * (
-        np.asarray(
-            fold_models[0]["conditioned_path_outcomes"],
-            dtype=float,
-        )
-        + np.asarray(
-            fold_models[1]["conditioned_path_outcomes"],
-            dtype=float,
-        )
-    )
-    control_path_outcomes = 0.5 * (
-        np.asarray(
-            fold_models[0]["control_path_outcomes"],
-            dtype=float,
-        )
-        + np.asarray(
-            fold_models[1]["control_path_outcomes"],
-            dtype=float,
-        )
-    )
-    support = np.clip(
-        0.5
-        * (
-            np.asarray(fold_models[0]["support"], dtype=float)
-            + np.asarray(fold_models[1]["support"], dtype=float)
-        ),
-        0.0,
-        1.0,
-    )
-
-    fold_centers = [
-        _center(
-            model["probabilities"],
-            model["control_probabilities"],
-        )
-        for model in fold_models
-    ]
-    if all(abs(value) <= 1e-12 for value in fold_centers):
-        fold_direction_agreement = 0.5
-    else:
-        fold_direction_agreement = (
-            1.0
-            if (fold_centers[0] >= 0) == (fold_centers[1] >= 0)
-            else 0.0
-        )
-
-    reliability_penalty = 0.70 + 0.30 * fold_direction_agreement
-    reliability = max(
-        0.0,
-        min(
-            1.0,
-            0.5
-            * (
-                float(fold_models[0]["reliability"])
-                + float(fold_models[1]["reliability"])
-            )
-            * reliability_penalty,
-        ),
-    )
-    minimum_reliability = max(
-        0.0,
-        min(
-            1.0,
-            float(
-                settings.get(
-                    "independent_path_model_min_reliability",
-                    0.55,
-                )
-            ),
-        ),
-    )
-    maximum_weight = max(
-        0.0,
-        min(
-            0.40,
-            float(
-                settings.get(
-                    "independent_path_model_max_weight",
-                    0.18,
-                )
-            ),
-        ),
-    )
-    enabled = bool(
-        settings.get("independent_path_model_enabled", True)
-    )
-    effective_weight = 0.0
-    if enabled and reliability >= minimum_reliability:
-        effective_weight = min(
-            maximum_weight,
-            0.5
-            * (
-                float(fold_models[0]["effective_weight"])
-                + float(fold_models[1]["effective_weight"])
-            )
-            * reliability_penalty,
-        )
-
-    weighted_support = float(np.dot(next_draw_paths, support))
-    direction_agreement = max(
-        0.0,
-        min(
-            1.0,
-            0.5
-            * (
-                float(fold_models[0]["direction_agreement"])
-                + float(fold_models[1]["direction_agreement"])
-            )
-            * reliability_penalty,
-        ),
-    )
-    path_quality = max(
-        0.0,
-        min(
-            1.0,
-            0.5
-            * (
-                float(fold_models[0]["path_quality"])
-                + float(fold_models[1]["path_quality"])
-            ),
-        ),
-    )
-
-    return {
-        "enabled": enabled,
-        "probabilities": probabilities,
-        "control_probabilities": control_probabilities,
-        "next_draw_paths": next_draw_paths,
-        "conditioned_path_outcomes": conditioned_path_outcomes,
-        "control_path_outcomes": control_path_outcomes,
-        "support": support,
-        "weighted_support": weighted_support,
-        "reliability": reliability,
-        "minimum_reliability": minimum_reliability,
-        "maximum_weight": maximum_weight,
-        "effective_weight": effective_weight,
-        "direction_agreement": direction_agreement,
-        "path_quality": path_quality,
-        "crossfit_enabled": True,
-        "crossfit_fold_reliabilities": [
-            float(fold_models[0]["reliability"]),
-            float(fold_models[1]["reliability"]),
-        ],
-        "crossfit_fold_direction_agreement": fold_direction_agreement,
-    }
 
 class V5ReplicaEngine:
     def __init__(self, seed: int, particle_count: int, decks: int) -> None:
@@ -1659,21 +1531,13 @@ class V5ReplicaEngine:
                     known_cards,
                 )
             else:
-                completed = direct_conditional_complete(
+                completed = exact_conditional_complete(
                     source,
                     self.rng,
                     int(player_total) % 10,
                     int(banker_total) % 10,
                     effective_known_path,
                 )
-                if completed is None:
-                    completed = exact_conditional_complete(
-                        source,
-                        self.rng,
-                        int(player_total) % 10,
-                        int(banker_total) % 10,
-                        effective_known_path,
-                    )
             attempts += 1
             if completed is not None:
                 counts, path, weight, _ = completed
@@ -1870,10 +1734,6 @@ class V5ReplicaEngine:
         control_draw = np.zeros(4, dtype=float)
         path_outcome_c = np.zeros((4, 3), dtype=float)
         path_outcome_u = np.zeros((4, 3), dtype=float)
-        crossfit_draw_c = np.zeros((2, 4), dtype=float)
-        crossfit_draw_u = np.zeros((2, 4), dtype=float)
-        crossfit_path_outcome_c = np.zeros((2, 4, 3), dtype=float)
-        crossfit_path_outcome_u = np.zeros((2, 4, 3), dtype=float)
         current_path_c = np.zeros((4, 3), dtype=float)
         current_path_u = np.zeros((4, 3), dtype=float)
         current_path_samples = np.zeros(4, dtype=float)
@@ -1907,10 +1767,6 @@ class V5ReplicaEngine:
                 control_draw[hu.draw_path] += 1
                 path_outcome_c[hc.draw_path, ci] += 1
                 path_outcome_u[hu.draw_path, ui] += 1
-                crossfit_draw_c[half, hc.draw_path] += 1
-                crossfit_draw_u[half, hu.draw_path] += 1
-                crossfit_path_outcome_c[half, hc.draw_path, ci] += 1
-                crossfit_path_outcome_u[half, hu.draw_path, ui] += 1
                 point_matrix[hc.player_total * 10 + hc.banker_total] += 1
                 split_c[half, ci] += 1
                 split_u[half, ui] += 1
@@ -2062,16 +1918,34 @@ class V5ReplicaEngine:
             -path_adjustment_limit,
             path_adjustment_limit,
         )
-        independent_path = build_crossfit_independent_draw_path_model(
-            crossfit_draw_c,
-            crossfit_draw_u,
-            crossfit_path_outcome_c,
-            crossfit_path_outcome_u,
+        population_mean_depth = float(np.mean(population.depths))
+        population_min_depth = int(min(population.depths))
+        population_max_depth = int(max(population.depths))
+        population_composition = _composition(
+            population.particles,
+            self.decks,
+        )
+        independent_path = build_independent_draw_path_model(
+            conditioned_draw,
+            control_draw,
+            path_outcome_c,
+            path_outcome_u,
             population.path_coverage,
             population.path_ess_quality,
             current_agreement,
             draw_agreement,
             settings,
+            particle_probabilities=pf,
+            path_candidate_counts=population.path_candidate_counts,
+            path_ess=population.path_ess,
+            path_allocated=population.path_allocated,
+            population_ess=population.ess,
+            target_ess=float(settings["target_ess"]),
+            mean_depth=population_mean_depth,
+            min_depth=population_min_depth,
+            max_depth=population_max_depth,
+            shoe_depth=float(population_composition["shoe_depth"]),
+            decks=self.decks,
         )
         independent_residual = (
             np.asarray(
@@ -2162,16 +2036,35 @@ class V5ReplicaEngine:
             independent_path_direction_agreement=float(
                 independent_path["direction_agreement"]
             ),
+            independent_path_weighted_support=float(
+                independent_path["weighted_support"]
+            ),
+            independent_path_residual_shrinkage=float(
+                independent_path["residual_shrinkage"]
+            ),
+            independent_path_depth_factor=float(
+                independent_path["depth_factor"]
+            ),
+            independent_path_depth_consistency=float(
+                independent_path["depth_consistency"]
+            ),
+            independent_path_dynamic_max_weight=float(
+                independent_path["dynamic_maximum_weight"]
+            ),
+            independent_path_dynamic_prior_strength=np.asarray(
+                independent_path["dynamic_prior_strength"],
+                dtype=float,
+            ),
             point_concentration=point_concentration,
             effective_database_weight=float(effective_db),
             database_reliability=float(db_rel),
             database_samples=float(db_samples),
-            composition=_composition(population.particles, self.decks),
+            composition=population_composition,
             digest=_digest(population.particles, self.seed),
             seed=self.seed,
-            mean_depth=float(np.mean(population.depths)),
-            min_depth=int(min(population.depths)),
-            max_depth=int(max(population.depths)),
+            mean_depth=population_mean_depth,
+            min_depth=population_min_depth,
+            max_depth=population_max_depth,
             matches=population.matches,
             attempts=population.attempts,
             ess=population.ess,
@@ -2268,7 +2161,10 @@ def build_hybrid_probabilities(
         0.0,
         min(
             0.40,
-            float(settings.get("independent_path_model_max_weight", 0.18)),
+            max(
+                float(settings.get("independent_path_model_max_weight", 0.18)),
+                float(settings.get("independent_path_model_late_max_weight", 0.24)),
+            ),
         ),
     )
     independent_reliability = max(
@@ -2473,87 +2369,37 @@ def decide_ensemble(
     commission = float(settings["banker_commission"])
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
-
     centers = [row.paired_center for row in rows]
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
     sw2 = sum(w * w for w in weights)
-    effective_replicas = max(
-        1.0,
-        sw * sw / max(1e-12, sw2),
-    )
+    effective_replicas = max(1.0, sw * sw / max(1e-12, sw2))
     mean = sum(c * w for c, w in zip(centers, weights)) / sw
     med = _weighted_median(centers, weights)
-    numerator = sum(
-        w * (c - mean) ** 2
-        for c, w in zip(centers, weights)
-    )
+    numerator = sum(w * (c - mean) ** 2 for c, w in zip(centers, weights))
     denominator = max(1e-12, sw - sw2 / sw)
     variance = numerator / denominator if len(rows) > 1 else 0.0
     std = math.sqrt(max(0.0, variance))
     base_se = std / math.sqrt(effective_replicas)
-    internal_rms = math.sqrt(
-        sum(
-            w * row.internal_se**2
-            for row, w in zip(rows, weights)
-        )
-        / sw
-    )
-    split_se = (
-        float(settings["split_uncertainty"])
-        * internal_rms
-        / math.sqrt(effective_replicas)
-    )
+    internal_rms = math.sqrt(sum(w * row.internal_se**2 for row, w in zip(rows, weights)) / sw)
+    split_se = float(settings["split_uncertainty"]) * internal_rms / math.sqrt(effective_replicas)
     path_rms = math.sqrt(
-        sum(
-            w * row.current_path_internal_se**2
-            for row, w in zip(rows, weights)
-        )
-        / sw
+        sum(w * row.current_path_internal_se**2 for row, w in zip(rows, weights)) / sw
     )
-    path_se = (
-        float(settings["path_uncertainty"])
-        * path_rms
-        / math.sqrt(effective_replicas)
-    )
+    path_se = float(settings["path_uncertainty"]) * path_rms / math.sqrt(effective_replicas)
     se = math.sqrt(base_se**2 + split_se**2 + path_se**2)
     robust = 0.50 * mean + 0.50 * med
-    lower = max(
-        0.0,
-        abs(robust) - float(settings["uncertainty_penalty"]) * se,
-    )
-
-    # Final side is selected from the fully fused B/P/T probabilities after
-    # accounting for banker commission.  The paired particle/control signal
-    # remains the validation layer rather than a second competing direction.
-    banker_ev = float(
-        fused[0] * (1.0 - commission) - fused[1]
-    )
-    player_ev = float(fused[1] - fused[0])
-    ev_margin = abs(banker_ev - player_ev)
-    ev_side = "B" if banker_ev >= player_ev else "P"
-
+    lower = max(0.0, abs(robust) - float(settings["uncertainty_penalty"]) * se)
     model_side = "B" if robust >= 0 else "P"
     global_center = _center(fused, control)
-    direction_consistency = (
-        abs(global_center) < 1e-12
-        or (global_center >= 0) == (robust >= 0)
-    )
-    ev_direction_consistency = (
-        ev_margin < 1e-12
-        or ev_side == model_side
-    )
-
+    direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
     path_coverage = max(
         0.0,
         min(1.0, float(quality.get("path_coverage", 0.0))),
     )
     path_ess_quality = max(
         0.0,
-        min(
-            1.0,
-            float(quality.get("path_ess_quality", 0.0)),
-        ),
+        min(1.0, float(quality.get("path_ess_quality", 0.0))),
     )
     path_quality_score = (
         0.68 * path_coverage
@@ -2570,56 +2416,36 @@ def decide_ensemble(
         path_coverage >= float(settings["min_path_coverage"])
         and path_quality_score >= path_quality_threshold
     )
-
     quality_pass = (
-        quality["agreement"]
-        >= float(settings["min_replica_agreement"])
-        and quality["average_ess"]
-        >= float(settings["target_ess"]) * 0.8
+        quality["agreement"] >= float(settings["min_replica_agreement"])
+        and quality["average_ess"] >= float(settings["target_ess"]) * 0.8
         and quality["average_diversity"] >= 0.45
         and quality["split_agreement"] >= 0.60
         and path_quality_pass
-        and effective_replicas
-        >= float(settings["min_effective_replicas"])
+        and effective_replicas >= float(settings["min_effective_replicas"])
         and direction_consistency
-        and ev_direction_consistency
-        and all(
-            row.updated and row.ancestry_paired
-            for row in rows
-        )
+        and all(row.updated and row.ancestry_paired for row in rows)
     )
-    minimum_edge = float(settings["min_validated_edge"])
-    validated = (
-        quality_pass
-        and lower >= minimum_edge
-        and ev_margin >= minimum_edge
-    )
-    decision_edge = min(lower, ev_margin)
-    decision_source = (
-        "VALIDATED_FUSED_EV"
-        if validated
-        else "LOW_CONFIDENCE_FUSED_EV"
-    )
-    signal = (
-        "HIGH"
-        if validated and decision_edge >= 0.005
-        else "MEDIUM"
-        if validated and decision_edge >= 0.002
-        else "LOW"
-    )
-
+    validated = quality_pass and lower >= float(settings["min_validated_edge"])
+    fallback_score = robust
+    if fallback_score > 1e-12:
+        fallback_side = "B"
+    elif fallback_score < -1e-12:
+        fallback_side = "P"
+    else:
+        fallback_side = "B" if int(rows[0].seed) & 1 else "P"
+    recommend = model_side if validated else fallback_side
+    decision_source = "VALIDATED_MODEL" if validated else "LOW_CONFIDENCE_BALANCED"
+    signal = "HIGH" if validated and lower >= 0.005 else "MEDIUM" if validated and lower >= 0.002 else "LOW"
     return {
-        "recommend": ev_side,
+        "recommend": recommend,
         "reason": (
-            f"{int(settings['particles'])}粒子補牌路徑分層、"
-            "二折交叉擬合、統一配對樣本池與穩健誤差修正後，"
-            "以融合機率的抽水後EV決定方向並通過品質閘門"
+            f"{int(settings['particles'])}粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
             if validated
-            else "最終方向依融合機率的抽水後EV決定；"
-            "訊號未通過完整品質驗證，因此標記為低信心"
+            else "訊號未通過完整驗證，仍沿用低信心對稱後驗方向，不固定回退莊家"
         ),
         "signal_level": signal,
-        "edge": decision_edge,
+        "edge": lower,
         "center": robust,
         "raw_center": mean,
         "median_center": med,
@@ -2630,22 +2456,18 @@ def decide_ensemble(
         "path_se": path_se,
         "lower_bound": lower,
         "model_side": model_side,
-        "ev_side": ev_side,
-        "ev_margin": ev_margin,
         "validated_signal": validated,
         "quality_pass": quality_pass,
         "path_quality_pass": path_quality_pass,
         "path_quality_score": path_quality_score,
         "path_quality_threshold": path_quality_threshold,
         "decision_source": decision_source,
-        "banker_ev": banker_ev,
-        "player_ev": player_ev,
-        "fallback_score": banker_ev - player_ev,
+        "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
+        "player_ev": float(fused[1] - fused[0]),
+        "fallback_score": fallback_score,
         "effective_replicas": effective_replicas,
         "direction_consistency": direction_consistency,
-        "ev_direction_consistency": ev_direction_consistency,
     }
-
 
 
 class V5IndependentBaccaratEngine:
@@ -2780,6 +2602,150 @@ class V5IndependentBaccaratEngine:
                         supplied.get(
                             "independent_path_model_prior_strength",
                             INDEPENDENT_PATH_MODEL_PRIOR_STRENGTH,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_min": max(
+                0.0,
+                min(
+                    100.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_min",
+                            INDEPENDENT_PATH_MODEL_PRIOR_MIN,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_max": max(
+                0.0,
+                min(
+                    100.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_max",
+                            INDEPENDENT_PATH_MODEL_PRIOR_MAX,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_depth_relief": max(
+                0.0,
+                min(
+                    0.90,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_depth_relief",
+                            INDEPENDENT_PATH_MODEL_PRIOR_DEPTH_RELIEF,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_low_support_gain": max(
+                0.0,
+                min(
+                    5.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_low_support_gain",
+                            INDEPENDENT_PATH_MODEL_PRIOR_LOW_SUPPORT_GAIN,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_prior_imbalance_gain": max(
+                0.0,
+                min(
+                    5.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_prior_imbalance_gain",
+                            INDEPENDENT_PATH_MODEL_PRIOR_IMBALANCE_GAIN,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_support_target_fraction": max(
+                0.05,
+                min(
+                    2.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_support_target_fraction",
+                            INDEPENDENT_PATH_MODEL_SUPPORT_TARGET_FRACTION,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_support_min_count": max(
+                1.0,
+                min(
+                    200.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_support_min_count",
+                            INDEPENDENT_PATH_MODEL_SUPPORT_MIN_COUNT,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_residual_shrink_power": max(
+                0.10,
+                min(
+                    3.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_residual_shrink_power",
+                            INDEPENDENT_PATH_MODEL_RESIDUAL_SHRINK_POWER,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_residual_z_score": max(
+                0.0,
+                min(
+                    5.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_residual_z_score",
+                            INDEPENDENT_PATH_MODEL_RESIDUAL_Z_SCORE,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_depth_start": max(
+                0.0,
+                min(
+                    0.95,
+                    float(
+                        supplied.get(
+                            "independent_path_model_depth_start",
+                            INDEPENDENT_PATH_MODEL_DEPTH_START,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_depth_full": max(
+                0.05,
+                min(
+                    1.0,
+                    float(
+                        supplied.get(
+                            "independent_path_model_depth_full",
+                            INDEPENDENT_PATH_MODEL_DEPTH_FULL,
+                        )
+                    ),
+                ),
+            ),
+            "independent_path_model_late_max_weight": max(
+                0.0,
+                min(
+                    0.40,
+                    float(
+                        supplied.get(
+                            "independent_path_model_late_max_weight",
+                            INDEPENDENT_PATH_MODEL_LATE_MAX_WEIGHT,
                         )
                     ),
                 ),
@@ -2953,6 +2919,41 @@ class V5IndependentBaccaratEngine:
                 for row, row_weight in zip(rows, normalized_row_weights)
             )
         )
+        independent_path_weighted_support = float(
+            sum(
+                row_weight * row.independent_path_weighted_support
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_residual_shrinkage = float(
+            sum(
+                row_weight * row.independent_path_residual_shrinkage
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_depth_factor = float(
+            sum(
+                row_weight * row.independent_path_depth_factor
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_depth_consistency = float(
+            sum(
+                row_weight * row.independent_path_depth_consistency
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_dynamic_max_weight = float(
+            sum(
+                row_weight * row.independent_path_dynamic_max_weight
+                for row, row_weight in zip(rows, normalized_row_weights)
+            )
+        )
+        independent_path_dynamic_prior_strength = np.zeros(4, dtype=float)
+        for row, row_weight in zip(rows, normalized_row_weights):
+            independent_path_dynamic_prior_strength += (
+                row_weight * row.independent_path_dynamic_prior_strength
+            )
 
         weighted_votes = {"B": 0.0, "P": 0.0}
         votes = {"B": 0, "P": 0}
@@ -3014,6 +3015,9 @@ class V5IndependentBaccaratEngine:
             "draw_agreement": average_draw_agreement,
             "independent_path_reliability": independent_path_reliability,
             "independent_path_effective_weight": independent_path_effective_weight,
+            "independent_path_weighted_support": independent_path_weighted_support,
+            "independent_path_residual_shrinkage": independent_path_residual_shrinkage,
+            "independent_path_depth_factor": independent_path_depth_factor,
             "hand_number_known": 1.0 if physical_hand_number > 0 else 0.0,
             "known_path": 1.0 if effective_known_path is not None else 0.0,
         }
@@ -3193,6 +3197,9 @@ class V5IndependentBaccaratEngine:
                 "configured_max_weight": float(
                     runtime_settings["independent_path_model_max_weight"]
                 ),
+                "configured_late_max_weight": float(
+                    runtime_settings["independent_path_model_late_max_weight"]
+                ),
                 "effective_weight": float(
                     hybrid.get(
                         "independent_path_effective_weight",
@@ -3200,6 +3207,15 @@ class V5IndependentBaccaratEngine:
                     )
                 ),
                 "direction_agreement": independent_path_direction_agreement,
+                "weighted_support": independent_path_weighted_support,
+                "residual_shrinkage": independent_path_residual_shrinkage,
+                "depth_factor": independent_path_depth_factor,
+                "depth_consistency": independent_path_depth_consistency,
+                "dynamic_max_weight": independent_path_dynamic_max_weight,
+                "dynamic_prior_strength": independent_path_dynamic_prior_strength,
+                "shoe_depth": float(
+                    np.mean([row.composition["shoe_depth"] for row in rows])
+                ),
                 "residual_adjustment": np.asarray(
                     hybrid.get(
                         "independent_path_residual_adjustment",
@@ -3211,8 +3227,6 @@ class V5IndependentBaccaratEngine:
                     runtime_settings["independent_path_model_max_adjustment"]
                 ),
                 "uses_additional_simulations": False,
-                "crossfit_enabled": True,
-                "crossfit_folds": 2,
             },
             "point_matrix": point_matrix,
             "top_points": top_points,
@@ -3323,10 +3337,10 @@ class V5IndependentBaccaratEngine:
             "conditional_generator": (
                 "EXACT_CURRENT_CARDS_IMPORTANCE_WEIGHTED"
                 if normalized_cards is not None
-                else "DIRECT_LEGAL_TOTAL_IMPORTANCE_WEIGHTED_V5_WITH_CROSSFIT_PATH_HEAD"
+                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V4_WITH_INDEPENDENT_PATH_HEAD"
             ),
             "variance_reduction": (
-                "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC_2FOLD_CROSSFIT"
+                "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC"
             ),
             "depth_profile": (
                 f"PHYSICAL_HAND_{physical_hand_number}"
