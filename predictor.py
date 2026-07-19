@@ -459,15 +459,61 @@ def predict(
             ),
         }
 
-    # Independent mode: every request is conditioned only on the current
-    # final points and current draw path.  Hand number, prior shoe state,
-    # exact-card history and previous observations are intentionally ignored.
-    hand_number = 0
-    known_cards: Dict[str, List[int]] = {}
-    remaining_counts = None
-    state_complete = False
-    state_source = "INDEPENDENT_CURRENT_HAND"
-    tracked_card_hands = 0
+    # Independent mode still rebuilds all particles on every request.  It may
+    # use factual shoe context explicitly supplied with this request, but never
+    # carries road history, previous recommendations or particle direction.
+    context = dict(shoe_context) if isinstance(shoe_context, Mapping) else {}
+    raw_hand_number = context.get(
+        "hand_number",
+        latest.get("hand_number", 0),
+    )
+    try:
+        hand_number = max(0, min(120, int(raw_hand_number or 0)))
+    except Exception:
+        hand_number = 0
+
+    known_cards = _normalize_known_cards(
+        context.get("known_cards")
+        or context.get("cards")
+        or latest.get("known_cards")
+        or {}
+    )
+    remaining_counts = _normalize_counts(
+        context.get("remaining_counts")
+        if context.get("remaining_counts") is not None
+        else latest.get("remaining_counts")
+    )
+    state_complete = bool(
+        context.get(
+            "state_complete",
+            latest.get("state_complete", False),
+        )
+        and remaining_counts is not None
+    )
+    state_source = str(
+        context.get("state_source")
+        or latest.get("state_source")
+        or (
+            "REQUEST_EXACT_SHOE_STATE"
+            if state_complete
+            else "REQUEST_FACTUAL_DEPTH"
+            if hand_number > 0
+            else "INDEPENDENT_CURRENT_HAND"
+        )
+    )
+    try:
+        tracked_card_hands = max(
+            0,
+            int(
+                context.get(
+                    "tracked_card_hands",
+                    latest.get("tracked_card_hands", 0),
+                )
+                or 0
+            ),
+        )
+    except Exception:
+        tracked_card_hands = 0
 
     seed = _new_seed(run_seed)
     engine = V5IndependentBaccaratEngine()
@@ -477,10 +523,10 @@ def predict(
             latest["banker"],
             seed,
             latest.get("path"),
-            hand_number=None,
-            known_cards=None,
-            remaining_counts=None,
-            state_complete=False,
+            hand_number=hand_number or None,
+            known_cards=known_cards or None,
+            remaining_counts=remaining_counts,
+            state_complete=state_complete,
         )
     except ValueError as exception:
         return {
@@ -548,7 +594,7 @@ def predict(
             f"V5_3_2_INDEPENDENT_PATH_HEAD_{particle_count}_PARTICLE_LINE"
         ),
         "model_version": (
-            f"V5.3.2-INDEPENDENT-PATH-HEAD-{particle_count}P-LINE-20260719"
+            f"V5.3.2-INDEPENDENT-PATH-HEAD-DEPTH-ADAPTIVE-{particle_count}P-LINE-20260719"
         ),
         "user_id": user_id,
         "venue": venue,
@@ -568,7 +614,7 @@ def predict(
         "conditioning_observation": {
             "player": latest["player"],
             "banker": latest["banker"],
-            "hand_number": 0,
+            "hand_number": hand_number,
         },
         "conditioning_outcome": _outcome(latest),
         "known_draw_path": (
@@ -576,7 +622,7 @@ def predict(
             if latest.get("path") is not None
             else None
         ),
-        "known_cards": {},
+        "known_cards": known_cards,
         "banker_rate": round(
             probabilities["B"] * 100.0,
             1,
@@ -688,6 +734,18 @@ def predict(
                 float(independent_path_model.get("configured_max_weight", 0.0)),
                 6,
             ),
+            "configured_late_max_weight": round(
+                float(
+                    independent_path_model.get(
+                        "configured_late_max_weight",
+                        result["settings"].get(
+                            "independent_path_model_late_max_weight",
+                            0.24,
+                        ),
+                    )
+                ),
+                6,
+            ),
             "effective_weight": round(
                 float(independent_path_model.get("effective_weight", 0.0)),
                 6,
@@ -696,6 +754,40 @@ def predict(
                 float(independent_path_model.get("direction_agreement", 0.5)),
                 6,
             ),
+            "weighted_support": round(
+                float(independent_path_model.get("weighted_support", 0.0)),
+                6,
+            ),
+            "residual_shrinkage": round(
+                float(independent_path_model.get("residual_shrinkage", 0.0)),
+                6,
+            ),
+            "shoe_depth": round(
+                float(independent_path_model.get("shoe_depth", 0.0)),
+                6,
+            ),
+            "depth_factor": round(
+                float(independent_path_model.get("depth_factor", 0.0)),
+                6,
+            ),
+            "depth_consistency": round(
+                float(independent_path_model.get("depth_consistency", 0.0)),
+                6,
+            ),
+            "dynamic_max_weight": round(
+                float(independent_path_model.get("dynamic_max_weight", 0.0)),
+                6,
+            ),
+            "dynamic_prior_strength": {
+                path_name: round(float(value), 6)
+                for path_name, value in zip(
+                    PATH_NAMES,
+                    independent_path_model.get(
+                        "dynamic_prior_strength",
+                        [0.0, 0.0, 0.0, 0.0],
+                    ),
+                )
+            },
             "residual_adjustment": _probability_dict(
                 independent_path_model.get(
                     "residual_adjustment",
@@ -709,19 +801,15 @@ def predict(
             "uses_additional_simulations": bool(
                 independent_path_model.get("uses_additional_simulations", False)
             ),
-            "crossfit_enabled": bool(
-                independent_path_model.get("crossfit_enabled", False)
-            ),
-            "crossfit_folds": int(
-                independent_path_model.get("crossfit_folds", 0)
-            ),
         },
         "shoe_context": {
-            "hand_number": 0,
-            "state_complete": False,
+            "hand_number": hand_number,
+            "state_complete": state_complete,
             "state_source": state_source,
-            "tracked_card_hands": 0,
-            "exact_state_enabled": False,
+            "tracked_card_hands": tracked_card_hands,
+            "exact_state_enabled": bool(
+                hybrid.get("exact_state_enabled", False)
+            ),
         },
         "recommend": recommend,
         "raw_recommend": raw_recommend,
@@ -738,24 +826,6 @@ def predict(
         "decision_edge": round(
             float(result["edge"]),
             8,
-        ),
-        "banker_ev": round(
-            float(result.get("banker_ev", 0.0)),
-            8,
-        ),
-        "player_ev": round(
-            float(result.get("player_ev", 0.0)),
-            8,
-        ),
-        "ev_margin": round(
-            float(result.get("ev_margin", 0.0)),
-            8,
-        ),
-        "ev_side": str(
-            result.get("ev_side") or raw_recommend
-        ),
-        "ev_direction_consistency": bool(
-            result.get("ev_direction_consistency", False)
         ),
         "signal_level": str(result["signal_level"]),
         "decision_source": str(
@@ -917,6 +987,38 @@ def predict(
                 ),
                 6,
             ),
+            "independent_path_model_late_max_weight": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_late_max_weight"
+                    ]
+                ),
+                6,
+            ),
+            "independent_path_model_depth_start": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_depth_start"
+                    ]
+                ),
+                6,
+            ),
+            "independent_path_model_depth_full": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_depth_full"
+                    ]
+                ),
+                6,
+            ),
+            "independent_path_model_residual_shrink_power": round(
+                float(
+                    result["settings"][
+                        "independent_path_model_residual_shrink_power"
+                    ]
+                ),
+                6,
+            ),
             "forecast_simulations_per_replica": max(
                 int(
                     result["settings"][
@@ -987,10 +1089,9 @@ def predict(
         "reason": (
             f"V5.3.2 HYBRID：{particle_count}粒子×"
             f"{int(result['replicas'])}副本；"
-            "每次只使用本局最終點數與本局補牌路徑獨立模擬；"
-            "並以二折交叉擬合建立N/P/B/D四路徑條件結果模型，不增加模擬輪數；"
-            "不使用牌靴局數、歷史牌值、上一局資料、牌路、長龍、"
-            "Markov、上一局推薦或勝敗紀錄。"
+            "每次只使用本局最終點數、本局補牌路徑與本次明確傳入的牌靴事實獨立模擬；"
+            "並以現有樣本建立鞋深自適應N/P/B/D四路徑條件結果模型，不增加模擬輪數；"
+            "不沿用上一局資料、牌路、長龍、Markov、上一局推薦、勝敗紀錄或持久粒子方向。"
             f"決策來源={result['decision_source']}；"
             f"{result['reason']}。"
         ),
