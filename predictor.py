@@ -62,12 +62,12 @@ OBSERVE_ON_UNVALIDATED = _env_bool(
 )
 
 BET_SIZING_ENABLED = _env_bool("BET_SIZING_ENABLED", True)
-BET_MIN_FRACTION = _env_float("BET_MIN_FRACTION", 0.15, 0.0, 1.0)
+BET_MIN_FRACTION = _env_float("BET_MIN_FRACTION", 0.10, 0.0, 1.0)
 BET_MAX_FRACTION = _env_float("BET_MAX_FRACTION", 0.40, 0.0, 1.0)
 BET_REQUIRE_VALIDATED = _env_bool("BET_REQUIRE_VALIDATED", False)
 BET_UNVALIDATED_MAX_FRACTION = _env_float(
     "BET_UNVALIDATED_MAX_FRACTION",
-    0.22,
+    0.40,
     0.0,
     1.0,
 )
@@ -356,29 +356,38 @@ def _calculate_bet_sizing(
         allowed = True
         cap = maximum if validated_signal else unvalidated_maximum
 
-        confidence_score = _clamp((float(confidence) - 0.50) / 0.10, 0.0, 1.0)
-        edge_score = _clamp(abs(float(decision_edge)) / 0.02, 0.0, 1.0)
+        confidence_score = _clamp(
+            (float(confidence) - 0.50) / 0.06,
+            0.0,
+            1.0,
+        )
+        edge_score = _clamp(
+            abs(float(decision_edge)) / 0.012,
+            0.0,
+            1.0,
+        )
         replica_score = _clamp(
-            (float(replica_agreement) - 0.50) / 0.50,
+            (float(replica_agreement) - 0.50) / 0.30,
             0.0,
             1.0,
         )
         split_score = _clamp(
-            (float(split_agreement) - 0.50) / 0.50,
+            (float(split_agreement) - 0.50) / 0.30,
             0.0,
             1.0,
         )
-        quality_bonus = 0.08 if quality_pass else 0.0
+        quality_bonus = 0.10 if quality_pass else 0.0
 
         strength = _clamp(
-            0.45 * confidence_score
+            0.40 * confidence_score
             + 0.25 * edge_score
-            + 0.15 * replica_score
+            + 0.20 * replica_score
             + 0.15 * split_score
             + quality_bonus,
             0.0,
             1.0,
         )
+        strength = strength ** 0.75
         fraction = minimum + (cap - minimum) * strength
         fraction = _clamp(fraction, minimum, cap)
 
