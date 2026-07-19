@@ -423,6 +423,265 @@ def exact_conditional_complete(
 
 
 
+def _completion_from_initial_totals(
+    player_initial: int,
+    banker_initial: int,
+    observed_player: int,
+    observed_banker: int,
+    known_path: Optional[int] = None,
+) -> Optional[Tuple[int, Optional[int], Optional[int], int]]:
+    """Return the legal completion for one pair of initial two-card totals.
+
+    The result is ``(path, player_third, banker_third, cards_used)``.  This is
+    the same baccarat-rule check used by ``exact_conditional_complete``, split
+    out so the proposal generator can sample only legal initial-total branches.
+    """
+    player_initial = int(player_initial) % 10
+    banker_initial = int(banker_initial) % 10
+    observed_player = int(observed_player) % 10
+    observed_banker = int(observed_banker) % 10
+
+    player_third: Optional[int] = None
+    banker_third: Optional[int] = None
+
+    if player_initial >= 8 or banker_initial >= 8:
+        if (
+            player_initial != observed_player
+            or banker_initial != observed_banker
+        ):
+            return None
+    else:
+        if player_initial <= 5:
+            player_third = (observed_player - player_initial) % 10
+        elif player_initial != observed_player:
+            return None
+
+        if banker_draws(banker_initial, player_third):
+            banker_third = (observed_banker - banker_initial) % 10
+        elif banker_initial != observed_banker:
+            return None
+
+    path = (
+        (1 if player_third is not None else 0)
+        + (2 if banker_third is not None else 0)
+    )
+    if known_path is not None and path != int(known_path):
+        return None
+
+    cards = (
+        4
+        + (1 if player_third is not None else 0)
+        + (1 if banker_third is not None else 0)
+    )
+    return path, player_third, banker_third, cards
+
+
+def _ordered_pair_options(
+    counts: np.ndarray,
+    total_value: int,
+) -> Tuple[List[Tuple[int, int, float]], float]:
+    """Return exact ordered two-card options and their unconditional mass."""
+    source = np.asarray(counts, dtype=np.int16)
+    card_total = int(source.sum())
+    if card_total < 2:
+        return [], 0.0
+
+    options: List[Tuple[int, int, float]] = []
+    raw_total = 0.0
+    target = int(total_value) % 10
+    for first in range(10):
+        first_count = int(source[first])
+        if first_count <= 0:
+            continue
+        for second in range(10):
+            if (first + second) % 10 != target:
+                continue
+            second_count = int(source[second]) - (
+                1 if second == first else 0
+            )
+            if second_count <= 0:
+                continue
+            raw_weight = float(first_count * second_count)
+            options.append((first, second, raw_weight))
+            raw_total += raw_weight
+
+    denominator = float(card_total * (card_total - 1))
+    probability = raw_total / denominator if denominator > 0 else 0.0
+    return options, probability
+
+
+def _weighted_choice(
+    items: Sequence[Any],
+    weights: Sequence[float],
+    rng: np.random.Generator,
+) -> Optional[Any]:
+    """Sample one item from non-negative unnormalized weights."""
+    if not items or len(items) != len(weights):
+        return None
+    cleaned = np.asarray(
+        [max(0.0, float(value)) for value in weights],
+        dtype=float,
+    )
+    total = float(cleaned.sum())
+    if total <= 0:
+        return None
+    ticket = float(rng.random()) * total
+    index = int(np.searchsorted(np.cumsum(cleaned), ticket, side="right"))
+    index = min(len(items) - 1, max(0, index))
+    return items[index]
+
+
+def direct_conditional_complete(
+    source: np.ndarray,
+    rng: np.random.Generator,
+    observed_player: int,
+    observed_banker: int,
+    known_path: Optional[int] = None,
+) -> Optional[Tuple[np.ndarray, int, float, int]]:
+    """Direct importance proposal for a legal current-hand completion.
+
+    Instead of repeatedly dealing four random opening cards and rejecting most
+    hands, this proposal first samples only initial Player/Banker totals that can
+    legally complete to the observed final points and N/P/B/D path.  The
+    returned importance weight corrects for that proposal restriction, so the
+    posterior target remains the same while acceptance and ESS improve.
+    """
+    original = np.asarray(source, dtype=np.int16)
+    if int(original.sum()) < 4:
+        return None
+
+    observed_player = int(observed_player) % 10
+    observed_banker = int(observed_banker) % 10
+
+    legal_by_player: Dict[int, List[int]] = {}
+    completions: Dict[Tuple[int, int], Tuple[int, Optional[int], Optional[int], int]] = {}
+    for player_initial in range(10):
+        for banker_initial in range(10):
+            completion = _completion_from_initial_totals(
+                player_initial,
+                banker_initial,
+                observed_player,
+                observed_banker,
+                known_path,
+            )
+            if completion is None:
+                continue
+            legal_by_player.setdefault(player_initial, []).append(
+                banker_initial
+            )
+            completions[(player_initial, banker_initial)] = completion
+
+    if not legal_by_player:
+        return None
+
+    player_total_items: List[int] = []
+    player_total_weights: List[float] = []
+    player_pair_options: Dict[int, List[Tuple[int, int, float]]] = {}
+    for player_initial in sorted(legal_by_player):
+        options, probability = _ordered_pair_options(
+            original,
+            player_initial,
+        )
+        if options and probability > 0:
+            player_total_items.append(player_initial)
+            player_total_weights.append(probability)
+            player_pair_options[player_initial] = options
+
+    player_mass = float(sum(player_total_weights))
+    player_initial = _weighted_choice(
+        player_total_items,
+        player_total_weights,
+        rng,
+    )
+    if player_initial is None or player_mass <= 0:
+        return None
+
+    player_options = player_pair_options[int(player_initial)]
+    player_pair = _weighted_choice(
+        player_options,
+        [item[2] for item in player_options],
+        rng,
+    )
+    if player_pair is None:
+        return None
+
+    counts = original.copy()
+    player_first, player_second, _ = player_pair
+    if int(counts[player_first]) <= 0:
+        return None
+    counts[player_first] -= 1
+    if int(counts[player_second]) <= 0:
+        return None
+    counts[player_second] -= 1
+
+    banker_total_items: List[int] = []
+    banker_total_weights: List[float] = []
+    banker_pair_options: Dict[int, List[Tuple[int, int, float]]] = {}
+    for banker_initial in legal_by_player[int(player_initial)]:
+        options, probability = _ordered_pair_options(
+            counts,
+            banker_initial,
+        )
+        if options and probability > 0:
+            banker_total_items.append(banker_initial)
+            banker_total_weights.append(probability)
+            banker_pair_options[banker_initial] = options
+
+    banker_mass = float(sum(banker_total_weights))
+    banker_initial = _weighted_choice(
+        banker_total_items,
+        banker_total_weights,
+        rng,
+    )
+    if banker_initial is None or banker_mass <= 0:
+        return None
+
+    banker_options = banker_pair_options[int(banker_initial)]
+    banker_pair = _weighted_choice(
+        banker_options,
+        [item[2] for item in banker_options],
+        rng,
+    )
+    if banker_pair is None:
+        return None
+
+    banker_first, banker_second, _ = banker_pair
+    if int(counts[banker_first]) <= 0:
+        return None
+    counts[banker_first] -= 1
+    if int(counts[banker_second]) <= 0:
+        return None
+    counts[banker_second] -= 1
+
+    completion = completions.get(
+        (int(player_initial), int(banker_initial))
+    )
+    if completion is None:
+        return None
+    path, player_third, banker_third, cards = completion
+
+    # The proposal samples legal opening-total branches with probabilities
+    # proportional to their exact two-card masses.  Multiplying by these two
+    # normalizing masses corrects the proposal back to the physical deal.
+    weight = player_mass * banker_mass
+
+    if player_third is not None:
+        probability = _required_card_probability(counts, player_third)
+        if probability <= 0:
+            return None
+        weight *= probability
+        counts[player_third] -= 1
+
+    if banker_third is not None:
+        probability = _required_card_probability(counts, banker_third)
+        if probability <= 0:
+            return None
+        weight *= probability
+        counts[banker_third] -= 1
+
+    return counts, path, max(1e-12, float(weight)), cards
+
+
 def normalize_known_cards(value: Any) -> Optional[Dict[str, List[int]]]:
     """Normalize an exact current hand entered as Player/Banker card values."""
     if not isinstance(value, Mapping):
@@ -969,6 +1228,261 @@ def build_independent_draw_path_model(
     }
 
 
+
+def build_crossfit_independent_draw_path_model(
+    conditioned_draw_folds: np.ndarray,
+    control_draw_folds: np.ndarray,
+    path_outcome_conditioned_folds: np.ndarray,
+    path_outcome_control_folds: np.ndarray,
+    path_coverage: float,
+    path_ess_quality: float,
+    current_path_agreement: float,
+    draw_agreement: float,
+    settings: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Two-fold cross-fit wrapper for the independent draw-path head.
+
+    Fold A estimates next-path probabilities while Fold B estimates the
+    path-conditional B/P/T outcomes, then the roles are reversed and averaged.
+    No additional simulations are performed.
+    """
+    conditioned_draw_folds = np.asarray(
+        conditioned_draw_folds,
+        dtype=float,
+    )
+    control_draw_folds = np.asarray(
+        control_draw_folds,
+        dtype=float,
+    )
+    path_outcome_conditioned_folds = np.asarray(
+        path_outcome_conditioned_folds,
+        dtype=float,
+    )
+    path_outcome_control_folds = np.asarray(
+        path_outcome_control_folds,
+        dtype=float,
+    )
+
+    valid_shapes = (
+        conditioned_draw_folds.shape == (2, 4)
+        and control_draw_folds.shape == (2, 4)
+        and path_outcome_conditioned_folds.shape == (2, 4, 3)
+        and path_outcome_control_folds.shape == (2, 4, 3)
+    )
+    if not valid_shapes:
+        return build_independent_draw_path_model(
+            np.sum(conditioned_draw_folds, axis=0),
+            np.sum(control_draw_folds, axis=0),
+            np.sum(path_outcome_conditioned_folds, axis=0),
+            np.sum(path_outcome_control_folds, axis=0),
+            path_coverage,
+            path_ess_quality,
+            current_path_agreement,
+            draw_agreement,
+            settings,
+        )
+
+    fold_models = [
+        build_independent_draw_path_model(
+            conditioned_draw_folds[0],
+            control_draw_folds[0],
+            path_outcome_conditioned_folds[1],
+            path_outcome_control_folds[1],
+            path_coverage,
+            path_ess_quality,
+            current_path_agreement,
+            draw_agreement,
+            settings,
+        ),
+        build_independent_draw_path_model(
+            conditioned_draw_folds[1],
+            control_draw_folds[1],
+            path_outcome_conditioned_folds[0],
+            path_outcome_control_folds[0],
+            path_coverage,
+            path_ess_quality,
+            current_path_agreement,
+            draw_agreement,
+            settings,
+        ),
+    ]
+
+    probabilities = normalize_array(
+        0.5
+        * (
+            np.asarray(fold_models[0]["probabilities"], dtype=float)
+            + np.asarray(fold_models[1]["probabilities"], dtype=float)
+        ),
+        BASELINE,
+    )
+    control_probabilities = normalize_array(
+        0.5
+        * (
+            np.asarray(
+                fold_models[0]["control_probabilities"],
+                dtype=float,
+            )
+            + np.asarray(
+                fold_models[1]["control_probabilities"],
+                dtype=float,
+            )
+        ),
+        BASELINE,
+    )
+    next_draw_paths = normalize_array(
+        0.5
+        * (
+            np.asarray(fold_models[0]["next_draw_paths"], dtype=float)
+            + np.asarray(fold_models[1]["next_draw_paths"], dtype=float)
+        ),
+        DRAW_BASELINE,
+    )
+    conditioned_path_outcomes = 0.5 * (
+        np.asarray(
+            fold_models[0]["conditioned_path_outcomes"],
+            dtype=float,
+        )
+        + np.asarray(
+            fold_models[1]["conditioned_path_outcomes"],
+            dtype=float,
+        )
+    )
+    control_path_outcomes = 0.5 * (
+        np.asarray(
+            fold_models[0]["control_path_outcomes"],
+            dtype=float,
+        )
+        + np.asarray(
+            fold_models[1]["control_path_outcomes"],
+            dtype=float,
+        )
+    )
+    support = np.clip(
+        0.5
+        * (
+            np.asarray(fold_models[0]["support"], dtype=float)
+            + np.asarray(fold_models[1]["support"], dtype=float)
+        ),
+        0.0,
+        1.0,
+    )
+
+    fold_centers = [
+        _center(
+            model["probabilities"],
+            model["control_probabilities"],
+        )
+        for model in fold_models
+    ]
+    if all(abs(value) <= 1e-12 for value in fold_centers):
+        fold_direction_agreement = 0.5
+    else:
+        fold_direction_agreement = (
+            1.0
+            if (fold_centers[0] >= 0) == (fold_centers[1] >= 0)
+            else 0.0
+        )
+
+    reliability_penalty = 0.70 + 0.30 * fold_direction_agreement
+    reliability = max(
+        0.0,
+        min(
+            1.0,
+            0.5
+            * (
+                float(fold_models[0]["reliability"])
+                + float(fold_models[1]["reliability"])
+            )
+            * reliability_penalty,
+        ),
+    )
+    minimum_reliability = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                settings.get(
+                    "independent_path_model_min_reliability",
+                    0.55,
+                )
+            ),
+        ),
+    )
+    maximum_weight = max(
+        0.0,
+        min(
+            0.40,
+            float(
+                settings.get(
+                    "independent_path_model_max_weight",
+                    0.18,
+                )
+            ),
+        ),
+    )
+    enabled = bool(
+        settings.get("independent_path_model_enabled", True)
+    )
+    effective_weight = 0.0
+    if enabled and reliability >= minimum_reliability:
+        effective_weight = min(
+            maximum_weight,
+            0.5
+            * (
+                float(fold_models[0]["effective_weight"])
+                + float(fold_models[1]["effective_weight"])
+            )
+            * reliability_penalty,
+        )
+
+    weighted_support = float(np.dot(next_draw_paths, support))
+    direction_agreement = max(
+        0.0,
+        min(
+            1.0,
+            0.5
+            * (
+                float(fold_models[0]["direction_agreement"])
+                + float(fold_models[1]["direction_agreement"])
+            )
+            * reliability_penalty,
+        ),
+    )
+    path_quality = max(
+        0.0,
+        min(
+            1.0,
+            0.5
+            * (
+                float(fold_models[0]["path_quality"])
+                + float(fold_models[1]["path_quality"])
+            ),
+        ),
+    )
+
+    return {
+        "enabled": enabled,
+        "probabilities": probabilities,
+        "control_probabilities": control_probabilities,
+        "next_draw_paths": next_draw_paths,
+        "conditioned_path_outcomes": conditioned_path_outcomes,
+        "control_path_outcomes": control_path_outcomes,
+        "support": support,
+        "weighted_support": weighted_support,
+        "reliability": reliability,
+        "minimum_reliability": minimum_reliability,
+        "maximum_weight": maximum_weight,
+        "effective_weight": effective_weight,
+        "direction_agreement": direction_agreement,
+        "path_quality": path_quality,
+        "crossfit_enabled": True,
+        "crossfit_fold_reliabilities": [
+            float(fold_models[0]["reliability"]),
+            float(fold_models[1]["reliability"]),
+        ],
+        "crossfit_fold_direction_agreement": fold_direction_agreement,
+    }
+
 class V5ReplicaEngine:
     def __init__(self, seed: int, particle_count: int, decks: int) -> None:
         self.seed = int(seed) & 0xFFFFFFFF
@@ -1145,13 +1659,21 @@ class V5ReplicaEngine:
                     known_cards,
                 )
             else:
-                completed = exact_conditional_complete(
+                completed = direct_conditional_complete(
                     source,
                     self.rng,
                     int(player_total) % 10,
                     int(banker_total) % 10,
                     effective_known_path,
                 )
+                if completed is None:
+                    completed = exact_conditional_complete(
+                        source,
+                        self.rng,
+                        int(player_total) % 10,
+                        int(banker_total) % 10,
+                        effective_known_path,
+                    )
             attempts += 1
             if completed is not None:
                 counts, path, weight, _ = completed
@@ -1348,6 +1870,10 @@ class V5ReplicaEngine:
         control_draw = np.zeros(4, dtype=float)
         path_outcome_c = np.zeros((4, 3), dtype=float)
         path_outcome_u = np.zeros((4, 3), dtype=float)
+        crossfit_draw_c = np.zeros((2, 4), dtype=float)
+        crossfit_draw_u = np.zeros((2, 4), dtype=float)
+        crossfit_path_outcome_c = np.zeros((2, 4, 3), dtype=float)
+        crossfit_path_outcome_u = np.zeros((2, 4, 3), dtype=float)
         current_path_c = np.zeros((4, 3), dtype=float)
         current_path_u = np.zeros((4, 3), dtype=float)
         current_path_samples = np.zeros(4, dtype=float)
@@ -1381,6 +1907,10 @@ class V5ReplicaEngine:
                 control_draw[hu.draw_path] += 1
                 path_outcome_c[hc.draw_path, ci] += 1
                 path_outcome_u[hu.draw_path, ui] += 1
+                crossfit_draw_c[half, hc.draw_path] += 1
+                crossfit_draw_u[half, hu.draw_path] += 1
+                crossfit_path_outcome_c[half, hc.draw_path, ci] += 1
+                crossfit_path_outcome_u[half, hu.draw_path, ui] += 1
                 point_matrix[hc.player_total * 10 + hc.banker_total] += 1
                 split_c[half, ci] += 1
                 split_u[half, ui] += 1
@@ -1532,11 +2062,11 @@ class V5ReplicaEngine:
             -path_adjustment_limit,
             path_adjustment_limit,
         )
-        independent_path = build_independent_draw_path_model(
-            conditioned_draw,
-            control_draw,
-            path_outcome_c,
-            path_outcome_u,
+        independent_path = build_crossfit_independent_draw_path_model(
+            crossfit_draw_c,
+            crossfit_draw_u,
+            crossfit_path_outcome_c,
+            crossfit_path_outcome_u,
             population.path_coverage,
             population.path_ess_quality,
             current_agreement,
@@ -1943,37 +2473,87 @@ def decide_ensemble(
     commission = float(settings["banker_commission"])
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
+
     centers = [row.paired_center for row in rows]
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
     sw2 = sum(w * w for w in weights)
-    effective_replicas = max(1.0, sw * sw / max(1e-12, sw2))
+    effective_replicas = max(
+        1.0,
+        sw * sw / max(1e-12, sw2),
+    )
     mean = sum(c * w for c, w in zip(centers, weights)) / sw
     med = _weighted_median(centers, weights)
-    numerator = sum(w * (c - mean) ** 2 for c, w in zip(centers, weights))
+    numerator = sum(
+        w * (c - mean) ** 2
+        for c, w in zip(centers, weights)
+    )
     denominator = max(1e-12, sw - sw2 / sw)
     variance = numerator / denominator if len(rows) > 1 else 0.0
     std = math.sqrt(max(0.0, variance))
     base_se = std / math.sqrt(effective_replicas)
-    internal_rms = math.sqrt(sum(w * row.internal_se**2 for row, w in zip(rows, weights)) / sw)
-    split_se = float(settings["split_uncertainty"]) * internal_rms / math.sqrt(effective_replicas)
-    path_rms = math.sqrt(
-        sum(w * row.current_path_internal_se**2 for row, w in zip(rows, weights)) / sw
+    internal_rms = math.sqrt(
+        sum(
+            w * row.internal_se**2
+            for row, w in zip(rows, weights)
+        )
+        / sw
     )
-    path_se = float(settings["path_uncertainty"]) * path_rms / math.sqrt(effective_replicas)
+    split_se = (
+        float(settings["split_uncertainty"])
+        * internal_rms
+        / math.sqrt(effective_replicas)
+    )
+    path_rms = math.sqrt(
+        sum(
+            w * row.current_path_internal_se**2
+            for row, w in zip(rows, weights)
+        )
+        / sw
+    )
+    path_se = (
+        float(settings["path_uncertainty"])
+        * path_rms
+        / math.sqrt(effective_replicas)
+    )
     se = math.sqrt(base_se**2 + split_se**2 + path_se**2)
     robust = 0.50 * mean + 0.50 * med
-    lower = max(0.0, abs(robust) - float(settings["uncertainty_penalty"]) * se)
+    lower = max(
+        0.0,
+        abs(robust) - float(settings["uncertainty_penalty"]) * se,
+    )
+
+    # Final side is selected from the fully fused B/P/T probabilities after
+    # accounting for banker commission.  The paired particle/control signal
+    # remains the validation layer rather than a second competing direction.
+    banker_ev = float(
+        fused[0] * (1.0 - commission) - fused[1]
+    )
+    player_ev = float(fused[1] - fused[0])
+    ev_margin = abs(banker_ev - player_ev)
+    ev_side = "B" if banker_ev >= player_ev else "P"
+
     model_side = "B" if robust >= 0 else "P"
     global_center = _center(fused, control)
-    direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
+    direction_consistency = (
+        abs(global_center) < 1e-12
+        or (global_center >= 0) == (robust >= 0)
+    )
+    ev_direction_consistency = (
+        ev_margin < 1e-12
+        or ev_side == model_side
+    )
+
     path_coverage = max(
         0.0,
         min(1.0, float(quality.get("path_coverage", 0.0))),
     )
     path_ess_quality = max(
         0.0,
-        min(1.0, float(quality.get("path_ess_quality", 0.0))),
+        min(
+            1.0,
+            float(quality.get("path_ess_quality", 0.0)),
+        ),
     )
     path_quality_score = (
         0.68 * path_coverage
@@ -1990,36 +2570,56 @@ def decide_ensemble(
         path_coverage >= float(settings["min_path_coverage"])
         and path_quality_score >= path_quality_threshold
     )
+
     quality_pass = (
-        quality["agreement"] >= float(settings["min_replica_agreement"])
-        and quality["average_ess"] >= float(settings["target_ess"]) * 0.8
+        quality["agreement"]
+        >= float(settings["min_replica_agreement"])
+        and quality["average_ess"]
+        >= float(settings["target_ess"]) * 0.8
         and quality["average_diversity"] >= 0.45
         and quality["split_agreement"] >= 0.60
         and path_quality_pass
-        and effective_replicas >= float(settings["min_effective_replicas"])
+        and effective_replicas
+        >= float(settings["min_effective_replicas"])
         and direction_consistency
-        and all(row.updated and row.ancestry_paired for row in rows)
+        and ev_direction_consistency
+        and all(
+            row.updated and row.ancestry_paired
+            for row in rows
+        )
     )
-    validated = quality_pass and lower >= float(settings["min_validated_edge"])
-    fallback_score = robust
-    if fallback_score > 1e-12:
-        fallback_side = "B"
-    elif fallback_score < -1e-12:
-        fallback_side = "P"
-    else:
-        fallback_side = "B" if int(rows[0].seed) & 1 else "P"
-    recommend = model_side if validated else fallback_side
-    decision_source = "VALIDATED_MODEL" if validated else "LOW_CONFIDENCE_BALANCED"
-    signal = "HIGH" if validated and lower >= 0.005 else "MEDIUM" if validated and lower >= 0.002 else "LOW"
+    minimum_edge = float(settings["min_validated_edge"])
+    validated = (
+        quality_pass
+        and lower >= minimum_edge
+        and ev_margin >= minimum_edge
+    )
+    decision_edge = min(lower, ev_margin)
+    decision_source = (
+        "VALIDATED_FUSED_EV"
+        if validated
+        else "LOW_CONFIDENCE_FUSED_EV"
+    )
+    signal = (
+        "HIGH"
+        if validated and decision_edge >= 0.005
+        else "MEDIUM"
+        if validated and decision_edge >= 0.002
+        else "LOW"
+    )
+
     return {
-        "recommend": recommend,
+        "recommend": ev_side,
         "reason": (
-            f"{int(settings['particles'])}粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
+            f"{int(settings['particles'])}粒子補牌路徑分層、"
+            "二折交叉擬合、統一配對樣本池與穩健誤差修正後，"
+            "以融合機率的抽水後EV決定方向並通過品質閘門"
             if validated
-            else "訊號未通過完整驗證，仍沿用低信心對稱後驗方向，不固定回退莊家"
+            else "最終方向依融合機率的抽水後EV決定；"
+            "訊號未通過完整品質驗證，因此標記為低信心"
         ),
         "signal_level": signal,
-        "edge": lower,
+        "edge": decision_edge,
         "center": robust,
         "raw_center": mean,
         "median_center": med,
@@ -2030,18 +2630,22 @@ def decide_ensemble(
         "path_se": path_se,
         "lower_bound": lower,
         "model_side": model_side,
+        "ev_side": ev_side,
+        "ev_margin": ev_margin,
         "validated_signal": validated,
         "quality_pass": quality_pass,
         "path_quality_pass": path_quality_pass,
         "path_quality_score": path_quality_score,
         "path_quality_threshold": path_quality_threshold,
         "decision_source": decision_source,
-        "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
-        "player_ev": float(fused[1] - fused[0]),
-        "fallback_score": fallback_score,
+        "banker_ev": banker_ev,
+        "player_ev": player_ev,
+        "fallback_score": banker_ev - player_ev,
         "effective_replicas": effective_replicas,
         "direction_consistency": direction_consistency,
+        "ev_direction_consistency": ev_direction_consistency,
     }
+
 
 
 class V5IndependentBaccaratEngine:
@@ -2607,6 +3211,8 @@ class V5IndependentBaccaratEngine:
                     runtime_settings["independent_path_model_max_adjustment"]
                 ),
                 "uses_additional_simulations": False,
+                "crossfit_enabled": True,
+                "crossfit_folds": 2,
             },
             "point_matrix": point_matrix,
             "top_points": top_points,
@@ -2717,10 +3323,10 @@ class V5IndependentBaccaratEngine:
             "conditional_generator": (
                 "EXACT_CURRENT_CARDS_IMPORTANCE_WEIGHTED"
                 if normalized_cards is not None
-                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V4_WITH_INDEPENDENT_PATH_HEAD"
+                else "DIRECT_LEGAL_TOTAL_IMPORTANCE_WEIGHTED_V5_WITH_CROSSFIT_PATH_HEAD"
             ),
             "variance_reduction": (
-                "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC"
+                "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC_2FOLD_CROSSFIT"
             ),
             "depth_profile": (
                 f"PHYSICAL_HAND_{physical_hand_number}"
