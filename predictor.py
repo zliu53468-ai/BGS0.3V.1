@@ -709,6 +709,12 @@ def predict(
             "uses_additional_simulations": bool(
                 independent_path_model.get("uses_additional_simulations", False)
             ),
+            "crossfit_enabled": bool(
+                independent_path_model.get("crossfit_enabled", False)
+            ),
+            "crossfit_folds": int(
+                independent_path_model.get("crossfit_folds", 0)
+            ),
         },
         "shoe_context": {
             "hand_number": 0,
@@ -732,6 +738,24 @@ def predict(
         "decision_edge": round(
             float(result["edge"]),
             8,
+        ),
+        "banker_ev": round(
+            float(result.get("banker_ev", 0.0)),
+            8,
+        ),
+        "player_ev": round(
+            float(result.get("player_ev", 0.0)),
+            8,
+        ),
+        "ev_margin": round(
+            float(result.get("ev_margin", 0.0)),
+            8,
+        ),
+        "ev_side": str(
+            result.get("ev_side") or raw_recommend
+        ),
+        "ev_direction_consistency": bool(
+            result.get("ev_direction_consistency", False)
         ),
         "signal_level": str(result["signal_level"]),
         "decision_source": str(
@@ -964,7 +988,7 @@ def predict(
             f"V5.3.2 HYBRID：{particle_count}粒子×"
             f"{int(result['replicas'])}副本；"
             "每次只使用本局最終點數與本局補牌路徑獨立模擬；"
-            "並以現有樣本建立N/P/B/D四路徑條件結果模型，不增加模擬輪數；"
+            "並以二折交叉擬合建立N/P/B/D四路徑條件結果模型，不增加模擬輪數；"
             "不使用牌靴局數、歷史牌值、上一局資料、牌路、長龍、"
             "Markov、上一局推薦或勝敗紀錄。"
             f"決策來源={result['decision_source']}；"
