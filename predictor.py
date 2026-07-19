@@ -40,12 +40,36 @@ def _env_int(
         return default
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 RANDOMIZE_EACH_CALL = _env_bool("PF_RANDOMIZE_EACH_CALL", True)
 FIXED_RUN_SEED = _env_int("PF_FIXED_RUN_SEED", 0, 0)
 DEBUG_V5_RESULT = _env_bool("PF_DEBUG_V5_RESULT", False)
 OBSERVE_ON_UNVALIDATED = _env_bool(
     "PF_OBSERVE_ON_UNVALIDATED",
     False,
+)
+
+BET_SIZING_ENABLED = _env_bool("BET_SIZING_ENABLED", True)
+BET_MIN_FRACTION = _env_float("BET_MIN_FRACTION", 0.15, 0.0, 1.0)
+BET_MAX_FRACTION = _env_float("BET_MAX_FRACTION", 0.40, 0.0, 1.0)
+BET_REQUIRE_VALIDATED = _env_bool("BET_REQUIRE_VALIDATED", False)
+BET_UNVALIDATED_MAX_FRACTION = _env_float(
+    "BET_UNVALIDATED_MAX_FRACTION",
+    0.22,
+    0.0,
+    1.0,
 )
 
 
@@ -286,6 +310,124 @@ def _draw_path_dict(values: Any) -> Dict[str, float]:
     }
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _calculate_bet_sizing(
+    *,
+    recommend: str,
+    confidence: float,
+    validated_signal: bool,
+    quality_pass: bool,
+    decision_edge: float,
+    replica_agreement: float,
+    split_agreement: float,
+) -> Dict[str, Any]:
+    """Return one normalized bet-sizing payload for app.py.
+
+    Predictor is the single source of truth for the fraction. app.py only
+    converts the fraction into a rounded currency amount.
+    """
+    side = str(recommend or "").upper()
+    minimum = _clamp(BET_MIN_FRACTION, 0.0, 1.0)
+    maximum = _clamp(BET_MAX_FRACTION, minimum, 1.0)
+    unvalidated_maximum = _clamp(
+        BET_UNVALIDATED_MAX_FRACTION,
+        minimum,
+        maximum,
+    )
+
+    allowed = False
+    fraction = 0.0
+    level = "observe"
+    level_text = "觀望"
+    reason = "recommend_observe"
+
+    if not BET_SIZING_ENABLED:
+        reason = "bet_sizing_disabled"
+        level_text = "未啟用"
+    elif side not in {"B", "P"}:
+        reason = "recommend_observe"
+    elif BET_REQUIRE_VALIDATED and not validated_signal:
+        reason = "validation_required"
+        level_text = "等待驗證"
+    else:
+        allowed = True
+        cap = maximum if validated_signal else unvalidated_maximum
+
+        confidence_score = _clamp((float(confidence) - 0.50) / 0.10, 0.0, 1.0)
+        edge_score = _clamp(abs(float(decision_edge)) / 0.02, 0.0, 1.0)
+        replica_score = _clamp(
+            (float(replica_agreement) - 0.50) / 0.50,
+            0.0,
+            1.0,
+        )
+        split_score = _clamp(
+            (float(split_agreement) - 0.50) / 0.50,
+            0.0,
+            1.0,
+        )
+        quality_bonus = 0.08 if quality_pass else 0.0
+
+        strength = _clamp(
+            0.45 * confidence_score
+            + 0.25 * edge_score
+            + 0.15 * replica_score
+            + 0.15 * split_score
+            + quality_bonus,
+            0.0,
+            1.0,
+        )
+        fraction = minimum + (cap - minimum) * strength
+        fraction = _clamp(fraction, minimum, cap)
+
+        relative = (
+            (fraction - minimum) / max(1e-12, maximum - minimum)
+            if maximum > minimum
+            else 0.0
+        )
+        if relative >= 0.66:
+            level = "aggressive"
+            level_text = "積極"
+        elif relative >= 0.33:
+            level = "balanced"
+            level_text = "穩健"
+        else:
+            level = "conservative"
+            level_text = "保守"
+
+        reason = (
+            "validated_signal"
+            if validated_signal
+            else "unvalidated_signal_allowed"
+        )
+
+    percentage = round(fraction * 100.0, 1)
+    payload = {
+        "enabled": bool(BET_SIZING_ENABLED),
+        "allowed": bool(allowed),
+        "fraction": round(float(fraction), 6),
+        "percentage": percentage,
+        "level": level,
+        "level_text": level_text,
+        "reason": reason,
+        "minimum_fraction": round(minimum, 6),
+        "maximum_fraction": round(maximum, 6),
+        "unvalidated_maximum_fraction": round(unvalidated_maximum, 6),
+        "requires_validated_signal": bool(BET_REQUIRE_VALIDATED),
+    }
+    return {
+        "bet_sizing": payload,
+        "bet_allowed": payload["allowed"],
+        "bet_fraction": payload["fraction"],
+        "bet_percentage": payload["percentage"],
+        "bet_level": payload["level"],
+        "bet_level_text": payload["level_text"],
+        "bet_reason": payload["reason"],
+    }
+
+
 def predict(
     history: Union[str, Iterable[Any]],
     venue: str = "",
@@ -380,6 +522,16 @@ def predict(
     particle_count = int(result["settings"]["particles"])
     hybrid = dict(result.get("hybrid") or {})
     hybrid_weights = dict(hybrid.get("weights") or {})
+
+    bet_sizing = _calculate_bet_sizing(
+        recommend=recommend,
+        confidence=confidence,
+        validated_signal=bool(result.get("validated_signal", False)),
+        quality_pass=bool(result.get("quality_pass", False)),
+        decision_edge=float(result.get("edge", 0.0)),
+        replica_agreement=float(result.get("replica_agreement", 0.5)),
+        split_agreement=float(result.get("split_agreement", 0.5)),
+    )
 
     response: Dict[str, Any] = {
         "ok": True,
@@ -811,6 +963,7 @@ def predict(
         ),
         "debug": None,
     }
+    response.update(bet_sizing)
 
     if DEBUG_V5_RESULT:
         response["debug"] = {
