@@ -58,6 +58,19 @@ def _env_int(
     return min(maximum, value) if maximum is not None else value
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 def _env_csv_ints(
     name: str,
     default: Sequence[int],
@@ -114,6 +127,8 @@ APP_BANKROLL_PRESETS = tuple(
     if APP_BANKROLL_MIN <= value <= APP_BANKROLL_MAX
 )[:4]
 BET_ROUND_UNIT = _env_int("BET_ROUND_UNIT", 100, 100, 100_000)
+BET_SIZING_ENABLED = _env_bool("BET_SIZING_ENABLED", True)
+BET_MIN_FRACTION = _env_float("BET_MIN_FRACTION", 0.15, 0.0, 1.0)
 MODEL_PARTICLES = _env_int("PF_PARTICLES", 384, 64, 2000)
 MODEL_REPLICAS = _env_int("PF_REPLICAS", 5, 3, 11)
 MODEL_HYBRID_MODE = os.getenv(
@@ -801,6 +816,112 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _resolve_bet_sizing(prediction: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize predictor bet fields exactly once.
+
+    New predictor.py is authoritative. The minimum-fraction fallback is used
+    only when an older predictor returned no bet fields at all.
+    """
+    source = dict(prediction or {})
+    nested = dict(source.get("bet_sizing") or {})
+    recommend = str(source.get("recommend") or "").upper()
+
+    has_new_fields = any(
+        key in source
+        for key in (
+            "bet_allowed",
+            "bet_fraction",
+            "bet_percentage",
+            "bet_reason",
+        )
+    )
+    enabled = bool(
+        nested.get(
+            "enabled",
+            source.get("bet_sizing_enabled", BET_SIZING_ENABLED),
+        )
+    )
+    allowed = bool(
+        source.get(
+            "bet_allowed",
+            nested.get("allowed", False),
+        )
+    )
+    fraction = _safe_float(
+        source.get(
+            "bet_fraction",
+            nested.get("fraction", 0.0),
+        ),
+        0.0,
+    )
+    percentage = _safe_float(
+        source.get(
+            "bet_percentage",
+            nested.get("percentage", fraction * 100.0),
+        ),
+        fraction * 100.0,
+    )
+    level = str(
+        source.get("bet_level")
+        or nested.get("level")
+        or "conservative"
+    )
+    level_text = str(
+        source.get("bet_level_text")
+        or nested.get("level_text")
+        or "保守"
+    )
+    reason = str(
+        source.get("bet_reason")
+        or nested.get("reason")
+        or ""
+    )
+
+    if recommend == "O":
+        allowed = False
+        fraction = 0.0
+        percentage = 0.0
+        level = "observe"
+        level_text = "觀望"
+        reason = reason or "recommend_observe"
+    elif recommend not in {"B", "P"}:
+        allowed = False
+        fraction = 0.0
+        percentage = 0.0
+        reason = reason or "invalid_recommendation"
+    elif not has_new_fields:
+        # Compatibility only: old predictor did not return any sizing fields.
+        enabled = True
+        allowed = True
+        fraction = max(0.0, min(1.0, BET_MIN_FRACTION))
+        percentage = fraction * 100.0
+        level = "conservative"
+        level_text = "保守"
+        reason = "legacy_predictor_fallback"
+    elif not enabled:
+        allowed = False
+        fraction = 0.0
+        percentage = 0.0
+        reason = reason or "bet_sizing_disabled"
+    elif not allowed or fraction <= 0.0:
+        allowed = False
+        fraction = 0.0
+        percentage = 0.0
+        reason = reason or "bet_not_allowed"
+    else:
+        fraction = max(0.0, min(1.0, fraction))
+        percentage = fraction * 100.0
+
+    return {
+        "bet_allowed": bool(allowed),
+        "bet_fraction": round(float(fraction), 6),
+        "bet_percentage": round(float(percentage), 1),
+        "bet_level": level,
+        "bet_level_text": level_text,
+        "bet_reason": reason,
+    }
+
+
 def _draw_path_text(prediction: Dict[str, Any]) -> str:
     known_path = prediction.get("known_draw_path")
     if known_path in DRAW_PATH_TEXT:
@@ -836,18 +957,24 @@ def result_panel(
         prediction.get("bankroll", session.get("bankroll", 0)),
         0,
     )
+    bet_sizing = _resolve_bet_sizing(prediction)
     suggested_bet = _safe_int(
         prediction.get("suggested_bet_amount", 0),
         0,
     )
-    bet_percentage = _safe_float(prediction.get("bet_percentage", 0.0))
-    bet_level_text = str(prediction.get("bet_level_text") or "保守")
-    bet_line = (
-        f"建議金額：{_format_money(suggested_bet)} 元"
-        f"（{bet_percentage:.1f}%｜{bet_level_text}）"
-        if suggested_bet > 0
-        else "建議金額：本局觀望"
-    )
+    bet_percentage = _safe_float(bet_sizing.get("bet_percentage"), 0.0)
+    bet_level_text = str(bet_sizing.get("bet_level_text") or "保守")
+    recommend = str(prediction.get("recommend") or "").upper()
+    if suggested_bet > 0:
+        bet_line = (
+            f"建議金額：{_format_money(suggested_bet)} 元"
+            f"（{bet_percentage:.1f}%｜{bet_level_text}）"
+        )
+    elif recommend == "O":
+        bet_line = "建議金額：本局觀望"
+    else:
+        reason = str(bet_sizing.get("bet_reason") or "配注資料不足")
+        bet_line = f"建議金額：未配置（{reason}）"
 
     body = (
         f"輸入：{prediction.get('conditioning_point', '-')}\n"
@@ -1022,19 +1149,28 @@ def add_points_and_predict(
         bankroll = _safe_int(session.get("bankroll"), 0)
         if bankroll <= 0:
             raise ValueError("尚未設定本金，請先輸入本金金額。")
-        bet_fraction = _safe_float(prediction.get("bet_fraction"), 0.0)
-        bet_allowed = bool(prediction.get("bet_allowed", False))
+        bet_sizing = _resolve_bet_sizing(prediction)
+        prediction.update(bet_sizing)
         suggested_bet = (
-            _round_bet_amount(bankroll, bet_fraction)
-            if bet_allowed and prediction.get("recommend") != "O"
+            _round_bet_amount(
+                bankroll,
+                _safe_float(bet_sizing.get("bet_fraction"), 0.0),
+            )
+            if bool(bet_sizing.get("bet_allowed"))
+            and prediction.get("recommend") != "O"
             else 0
         )
         prediction["bankroll"] = bankroll
         prediction["suggested_bet_amount"] = suggested_bet
         prediction["suggested_bet_round_unit"] = BET_ROUND_UNIT
-        prediction["suggested_bet_display"] = (
-            f"{suggested_bet:,} 元" if suggested_bet > 0 else "本局觀望"
-        )
+        if suggested_bet > 0:
+            prediction["suggested_bet_display"] = f"{suggested_bet:,} 元"
+        elif prediction.get("recommend") == "O":
+            prediction["suggested_bet_display"] = "本局觀望"
+        else:
+            prediction["suggested_bet_display"] = (
+                f"未配置（{bet_sizing.get('bet_reason') or '配注資料不足'}）"
+            )
 
         return store.save_prediction(
             user_id,
@@ -1087,6 +1223,8 @@ def health() -> JSONResponse:
             "bankroll_min": APP_BANKROLL_MIN,
             "bankroll_max": APP_BANKROLL_MAX,
             "bankroll_presets": list(APP_BANKROLL_PRESETS),
+            "bet_sizing_enabled": BET_SIZING_ENABLED,
+            "bet_min_fraction": BET_MIN_FRACTION,
             "bet_round_unit": BET_ROUND_UNIT,
         }
     )
