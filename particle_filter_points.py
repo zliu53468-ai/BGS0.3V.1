@@ -1,4 +1,4 @@
-"""V5.4.0 draw-path-quality factual-shoe-context HYBRID baccarat particle engine.
+"""V5.4.1 aggressive-quality-gated draw-path HYBRID baccarat particle engine.
 
 Every request creates fresh particles, fresh replicas and fresh forecast samples.
 Only the latest factual hand is used: current points, optional N/P/B/D draw path,
@@ -7,7 +7,8 @@ hand number and exact cards explicitly supplied by the caller.
 No road, streak, learned Markov state, previous recommendation, win/loss result,
 or per-UID particle direction is carried into the next request.  A small fixed
 single-step draw-path prior may use the current hand path only; it is quality
-gated and adds no simulation loop.
+gated and adds no simulation loop. High-quality path agreement may lower the
+validated-edge threshold and raise the dynamic particle fusion cap.
 """
 from __future__ import annotations
 
@@ -111,10 +112,22 @@ NO_DRAW_ALLOCATION_PROTECTION = _env_float(
     "PF_NO_DRAW_ALLOCATION_PROTECTION", 1.20, 1.0, 2.0
 )
 PATH_TRANSITION_PRIOR_WEIGHT = _env_float(
-    "PF_PATH_TRANSITION_PRIOR_WEIGHT", 0.10, 0.0, 0.30
+    "PF_PATH_TRANSITION_PRIOR_WEIGHT", 0.16, 0.0, 0.40
 )
 PATH_TRANSITION_SELF_BIAS = _env_float(
-    "PF_PATH_TRANSITION_SELF_BIAS", 0.06, 0.0, 0.20
+    "PF_PATH_TRANSITION_SELF_BIAS", 0.10, 0.0, 0.30
+)
+HYBRID_HIGH_PATH_THRESHOLD = _env_float(
+    "PF_HYBRID_HIGH_PATH_THRESHOLD", 0.75, 0.55, 0.95
+)
+HYBRID_HIGH_PATH_WEIGHT_BOOST = _env_float(
+    "PF_HYBRID_HIGH_PATH_WEIGHT_BOOST", 0.07, 0.0, 0.18
+)
+HIGH_QUALITY_EDGE_RELIEF = _env_float(
+    "PF_HIGH_QUALITY_EDGE_RELIEF", 0.40, 0.0, 0.60
+)
+ADVANTAGE_CONTINUITY_BONUS = _env_float(
+    "PF_ADVANTAGE_CONTINUITY_BONUS", 0.22, 0.0, 0.50
 )
 
 # Independent draw-path head. It reuses the existing forecast samples and adds
@@ -899,11 +912,12 @@ def apply_current_path_transition_prior(
     path_ess_quality: float,
     settings: Mapping[str, Any],
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    """Apply a weak current-hand-only path carry prior.
+    """Apply a stronger but still bounded current-hand-only path carry prior.
 
-    This is not a learned transition model and does not read any road/history.
-    It blends a fixed, near-baseline one-step prior using only the current hand's
-    known/inferred path and existing path-quality diagnostics.
+    This is not a learned transition model and does not read road/history. It
+    blends one fixed one-step prior using only the current hand path plus the
+    existing path coverage/ESS diagnostics, so the extra influence adds no
+    particle, proposal, replica or forecast loop.
     """
     raw = normalize_array(raw_next_draw, DRAW_BASELINE)
     if known_path is not None and int(known_path) in {0, 1, 2, 3}:
@@ -916,19 +930,24 @@ def apply_current_path_transition_prior(
 
     self_bias = max(
         0.0,
-        min(0.20, float(settings.get("path_transition_self_bias", 0.06))),
+        min(0.30, float(settings.get("path_transition_self_bias", 0.10))),
     )
     transition = np.zeros((4, 4), dtype=float)
     for path in range(4):
         row = DRAW_BASELINE.astype(float).copy()
-        row[path] += self_bias
+        row[path] += self_bias * 1.20
         if path == 0:
-            row[0] += self_bias * 0.50
-        elif path in {1, 2}:
-            row[1] += self_bias * 0.18
-            row[2] += self_bias * 0.18
+            row[0] += self_bias * 0.70
+        elif path == 1:
+            row[2] += self_bias * 0.24
+            row[3] += self_bias * 0.08
+        elif path == 2:
+            row[1] += self_bias * 0.24
+            row[3] += self_bias * 0.08
         else:
-            row[3] += self_bias * 0.35
+            row[3] += self_bias * 0.50
+            row[1] += self_bias * 0.10
+            row[2] += self_bias * 0.10
         transition[path] = normalize_array(row, DRAW_BASELINE)
 
     prior = normalize_array(current @ transition, DRAW_BASELINE)
@@ -936,18 +955,24 @@ def apply_current_path_transition_prior(
         0.0,
         min(
             1.0,
-            0.55 * float(path_coverage) + 0.45 * float(path_ess_quality),
+            0.45 * float(path_coverage)
+            + 0.35 * float(path_ess_quality)
+            + 0.20 * current_certainty,
         ),
     )
     transition_quality = max(
         0.0,
-        min(1.0, path_quality * (0.65 + 0.35 * current_certainty)),
+        min(1.0, path_quality * (0.75 + 0.25 * current_certainty)),
     )
     configured_weight = max(
         0.0,
-        min(0.30, float(settings.get("path_transition_prior_weight", 0.10))),
+        min(0.40, float(settings.get("path_transition_prior_weight", 0.16))),
     )
-    effective_weight = configured_weight * transition_quality
+    certainty_multiplier = 0.92 + 0.08 * current_certainty
+    effective_weight = min(
+        configured_weight,
+        configured_weight * transition_quality * certainty_multiplier,
+    )
     adjusted = normalize_array(
         (1.0 - effective_weight) * raw + effective_weight * prior,
         DRAW_BASELINE,
@@ -2436,8 +2461,37 @@ def build_hybrid_probabilities(
 
     baseline_floor = float(settings["hybrid_baseline_min_weight"])
     usable = max(0.0, 1.0 - baseline_floor)
+
+    configured_particle_max = max(
+        0.0,
+        min(1.0, float(settings["hybrid_particle_max_weight"])),
+    )
+    high_path_threshold = max(
+        0.55,
+        min(
+            0.95,
+            float(settings.get("hybrid_high_path_threshold", 0.75)),
+        ),
+    )
+    high_path_boost_cap = max(
+        0.0,
+        min(
+            0.18,
+            float(settings.get("hybrid_high_path_weight_boost", 0.07)),
+        ),
+    )
+    high_path_excess = _bounded_quality(path_q, high_path_threshold, 1.0)
+    high_path_boost = (
+        high_path_boost_cap
+        * high_path_excess
+        * (0.70 + 0.30 * current_path_q)
+    )
+    dynamic_particle_max = min(
+        1.0,
+        configured_particle_max + high_path_boost,
+    )
     particle_weight = min(
-        float(settings["hybrid_particle_max_weight"]),
+        dynamic_particle_max,
         usable * (0.35 + 0.65 * gate),
     )
     state_weight = min(
@@ -2496,6 +2550,10 @@ def build_hybrid_probabilities(
         },
         "gate": float(gate),
         "path_gate": float(path_q),
+        "configured_particle_max_weight": float(configured_particle_max),
+        "dynamic_particle_max_weight": float(dynamic_particle_max),
+        "high_path_threshold": float(high_path_threshold),
+        "high_path_particle_boost": float(high_path_boost),
         "path_coverage_quality": float(path_coverage_q),
         "path_ess_quality": float(path_ess_q),
         "current_path_agreement_quality": float(current_path_q),
@@ -2532,6 +2590,18 @@ def _basic_decision(fused: np.ndarray, mode: str, commission: float) -> Dict[str
         "split_se": 0.0,
         "path_se": 0.0,
         "lower_bound": 0.0,
+        "validated_edge_after_bonus": edge,
+        "base_min_validated_edge": 0.0,
+        "effective_min_validated_edge": 0.0,
+        "validated_edge_relief": 0.0,
+        "advantage_continuity_score": 0.0,
+        "advantage_continuity_bonus": 0.0,
+        "replica_advantage_continuity": 0.0,
+        "split_advantage_continuity": 0.0,
+        "path_advantage_continuity": 0.0,
+        "decision_confidence": max(fused[0], fused[1]) / max(1e-12, fused[0] + fused[1]),
+        "decision_confidence_quality": 0.0,
+        "decision_aggression_score": 0.0,
         "model_side": None,
         "validated_signal": False,
         "quality_pass": False,
@@ -2554,6 +2624,7 @@ def decide_ensemble(
     commission = float(settings["banker_commission"])
     if mode != "validated":
         return _basic_decision(fused, mode, commission)
+
     centers = [row.paired_center for row in rows]
     weights = [max(1e-6, row.final_weight) for row in rows]
     sw = sum(weights)
@@ -2566,11 +2637,22 @@ def decide_ensemble(
     variance = numerator / denominator if len(rows) > 1 else 0.0
     std = math.sqrt(max(0.0, variance))
     base_se = std / math.sqrt(effective_replicas)
-    internal_rms = math.sqrt(sum(w * row.internal_se**2 for row, w in zip(rows, weights)) / sw)
-    split_se = float(settings["split_uncertainty"]) * internal_rms / math.sqrt(effective_replicas)
-    path_rms = math.sqrt(
-        sum(w * row.current_path_internal_se**2 for row, w in zip(rows, weights)) / sw
+    internal_rms = math.sqrt(
+        sum(w * row.internal_se**2 for row, w in zip(rows, weights)) / sw
     )
+    split_se = (
+        float(settings["split_uncertainty"])
+        * internal_rms
+        / math.sqrt(effective_replicas)
+    )
+    path_rms = math.sqrt(
+        sum(
+            w * row.current_path_internal_se**2
+            for row, w in zip(rows, weights)
+        )
+        / sw
+    )
+
     current_path_agreement = max(
         0.0,
         min(1.0, float(quality.get("current_path_agreement", 0.5))),
@@ -2585,10 +2667,19 @@ def decide_ensemble(
     )
     se = math.sqrt(base_se**2 + split_se**2 + path_se**2)
     robust = 0.50 * mean + 0.50 * med
-    lower = max(0.0, abs(robust) - float(settings["uncertainty_penalty"]) * se)
+    raw_lower = max(
+        0.0,
+        abs(robust) - float(settings["uncertainty_penalty"]) * se,
+    )
     model_side = "B" if robust >= 0 else "P"
+    target_sign = 1.0 if robust >= 0 else -1.0
+
     global_center = _center(fused, control)
-    direction_consistency = abs(global_center) < 1e-12 or (global_center >= 0) == (robust >= 0)
+    direction_consistency = (
+        abs(global_center) < 1e-12
+        or (global_center >= 0) == (robust >= 0)
+    )
+
     path_coverage = max(
         0.0,
         min(1.0, float(quality.get("path_coverage", 0.0))),
@@ -2604,10 +2695,7 @@ def decide_ensemble(
     )
     path_quality_threshold = max(
         0.60,
-        min(
-            0.95,
-            float(settings["min_path_coverage"]) * 0.92,
-        ),
+        min(0.95, float(settings["min_path_coverage"]) * 0.92),
     )
     path_ess_floor = 0.42
     current_path_agreement_floor = 0.56
@@ -2617,6 +2705,80 @@ def decide_ensemble(
         and current_path_agreement >= current_path_agreement_floor
         and path_quality_score >= path_quality_threshold
     )
+
+    # Current-request-only continuity: repeated same-side evidence across
+    # replicas, split estimates and draw-path branches. No road history,
+    # recommendation history or win/loss state is consumed.
+    replica_advantage_continuity = (
+        sum(
+            w
+            for center, w in zip(centers, weights)
+            if center * target_sign > 0.0
+        )
+        / max(1e-12, sw)
+    )
+
+    split_same = 0.0
+    split_total = 0.0
+    for row, weight in zip(rows, weights):
+        for split_center in row.split_centers:
+            split_total += weight
+            if float(split_center) * target_sign > 0.0:
+                split_same += weight
+    split_advantage_continuity = (
+        split_same / split_total
+        if split_total > 0.0
+        else float(quality.get("split_agreement", 0.5))
+    )
+
+    path_same = 0.0
+    path_total = 0.0
+    for row, weight in zip(rows, weights):
+        centers_row = np.asarray(row.current_path_centers, dtype=float)
+        samples_row = np.maximum(
+            0.0,
+            np.asarray(row.current_path_samples, dtype=float),
+        )
+        if centers_row.shape != (4,) or samples_row.shape != (4,):
+            continue
+        for path_center, sample_count in zip(centers_row, samples_row):
+            evidence_weight = weight * float(sample_count)
+            if evidence_weight <= 0.0:
+                continue
+            path_total += evidence_weight
+            if float(path_center) * target_sign > 0.0:
+                path_same += evidence_weight
+    path_advantage_continuity = (
+        path_same / path_total
+        if path_total > 0.0
+        else current_path_agreement
+    )
+
+    advantage_continuity_score = max(
+        0.0,
+        min(
+            1.0,
+            0.45 * replica_advantage_continuity
+            + 0.30 * split_advantage_continuity
+            + 0.25 * path_advantage_continuity,
+        ),
+    )
+    advantage_continuity_q = _bounded_quality(
+        advantage_continuity_score,
+        0.62,
+        0.92,
+    )
+
+    non_tie_total = max(1e-12, float(fused[0] + fused[1]))
+    confidence = max(float(fused[0]), float(fused[1])) / non_tie_total
+    confidence_q = _bounded_quality(confidence, 0.515, 0.555)
+    high_path_q = _bounded_quality(path_quality_score, 0.75, 0.90)
+    high_current_path_q = _bounded_quality(
+        current_path_agreement,
+        0.68,
+        0.88,
+    )
+
     quality_pass = (
         quality["agreement"] >= float(settings["min_replica_agreement"])
         and quality["average_ess"] >= float(settings["target_ess"]) * 0.8
@@ -2627,7 +2789,70 @@ def decide_ensemble(
         and direction_consistency
         and all(row.updated and row.ancestry_paired for row in rows)
     )
-    validated = quality_pass and lower >= float(settings["min_validated_edge"])
+
+    base_min_validated_edge = max(
+        0.0,
+        float(settings["min_validated_edge"]),
+    )
+    high_quality_triplet = min(
+        high_path_q,
+        high_current_path_q,
+        confidence_q,
+    )
+    max_edge_relief = max(
+        0.0,
+        min(
+            0.60,
+            float(settings.get("high_quality_edge_relief", 0.40)),
+        ),
+    )
+    validated_edge_relief = (
+        max_edge_relief
+        * high_quality_triplet
+        * (0.80 + 0.20 * advantage_continuity_q)
+    )
+    effective_min_validated_edge = max(
+        base_min_validated_edge * 0.50,
+        base_min_validated_edge * (1.0 - validated_edge_relief),
+    )
+
+    edge_strength_q = _bounded_quality(
+        abs(robust),
+        max(1e-6, base_min_validated_edge * 0.75),
+        max(0.008, base_min_validated_edge * 4.0),
+    )
+    continuity_bonus_factor = max(
+        0.0,
+        min(
+            0.50,
+            float(settings.get("advantage_continuity_bonus", 0.22)),
+        ),
+    )
+    advantage_continuity_bonus = (
+        base_min_validated_edge
+        * continuity_bonus_factor
+        * advantage_continuity_q
+        * edge_strength_q
+        * (0.55 + 0.45 * min(high_path_q, high_current_path_q))
+    )
+    validated_edge_after_bonus = raw_lower + advantage_continuity_bonus
+
+    decision_aggression_score = max(
+        0.0,
+        min(
+            1.0,
+            0.34 * high_path_q
+            + 0.28 * high_current_path_q
+            + 0.24 * confidence_q
+            + 0.14 * advantage_continuity_q,
+        ),
+    )
+
+    validated = (
+        quality_pass
+        and validated_edge_after_bonus >= effective_min_validated_edge
+    )
+
     fallback_score = robust
     if fallback_score > 1e-12:
         fallback_side = "B"
@@ -2635,18 +2860,39 @@ def decide_ensemble(
         fallback_side = "P"
     else:
         fallback_side = "B" if int(rows[0].seed) & 1 else "P"
+
     recommend = model_side if validated else fallback_side
-    decision_source = "VALIDATED_MODEL" if validated else "LOW_CONFIDENCE_BALANCED"
-    signal = "HIGH" if validated and lower >= 0.005 else "MEDIUM" if validated and lower >= 0.002 else "LOW"
+    decision_source = (
+        "VALIDATED_AGGRESSIVE_PATH_MODEL"
+        if validated and decision_aggression_score >= 0.65
+        else "VALIDATED_MODEL"
+        if validated
+        else "LOW_CONFIDENCE_BALANCED"
+    )
+    signal = (
+        "HIGH"
+        if (
+            validated
+            and decision_aggression_score >= 0.72
+            and validated_edge_after_bonus
+            >= max(0.0035, effective_min_validated_edge * 2.0)
+        )
+        else "MEDIUM"
+        if validated
+        else "LOW"
+    )
+
     return {
         "recommend": recommend,
         "reason": (
-            f"{int(settings['particles'])}粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
+            f"{int(settings['particles'])}粒子補牌路徑品質、方向連續性與高信心動態門檻均通過"
+            if validated and decision_aggression_score >= 0.65
+            else f"{int(settings['particles'])}粒子補牌路徑分層、統一配對樣本池與穩健誤差修正後通過品質閘門"
             if validated
             else "訊號未通過完整驗證，仍沿用低信心對稱後驗方向，不固定回退莊家"
         ),
         "signal_level": signal,
-        "edge": lower,
+        "edge": validated_edge_after_bonus,
         "center": robust,
         "raw_center": mean,
         "median_center": med,
@@ -2655,7 +2901,19 @@ def decide_ensemble(
         "base_se": base_se,
         "split_se": split_se,
         "path_se": path_se,
-        "lower_bound": lower,
+        "lower_bound": raw_lower,
+        "validated_edge_after_bonus": validated_edge_after_bonus,
+        "base_min_validated_edge": base_min_validated_edge,
+        "effective_min_validated_edge": effective_min_validated_edge,
+        "validated_edge_relief": validated_edge_relief,
+        "advantage_continuity_score": advantage_continuity_score,
+        "advantage_continuity_bonus": advantage_continuity_bonus,
+        "replica_advantage_continuity": replica_advantage_continuity,
+        "split_advantage_continuity": split_advantage_continuity,
+        "path_advantage_continuity": path_advantage_continuity,
+        "decision_confidence": confidence,
+        "decision_confidence_quality": confidence_q,
+        "decision_aggression_score": decision_aggression_score,
         "model_side": model_side,
         "validated_signal": validated,
         "quality_pass": quality_pass,
@@ -2756,6 +3014,54 @@ class V5IndependentBaccaratEngine:
                     "hybrid_max_component_adjustment",
                     HYBRID_MAX_COMPONENT_ADJUSTMENT,
                 )
+            ),
+            "hybrid_high_path_threshold": max(
+                0.55,
+                min(
+                    0.95,
+                    float(
+                        supplied.get(
+                            "hybrid_high_path_threshold",
+                            HYBRID_HIGH_PATH_THRESHOLD,
+                        )
+                    ),
+                ),
+            ),
+            "hybrid_high_path_weight_boost": max(
+                0.0,
+                min(
+                    0.18,
+                    float(
+                        supplied.get(
+                            "hybrid_high_path_weight_boost",
+                            HYBRID_HIGH_PATH_WEIGHT_BOOST,
+                        )
+                    ),
+                ),
+            ),
+            "high_quality_edge_relief": max(
+                0.0,
+                min(
+                    0.60,
+                    float(
+                        supplied.get(
+                            "high_quality_edge_relief",
+                            HIGH_QUALITY_EDGE_RELIEF,
+                        )
+                    ),
+                ),
+            ),
+            "advantage_continuity_bonus": max(
+                0.0,
+                min(
+                    0.50,
+                    float(
+                        supplied.get(
+                            "advantage_continuity_bonus",
+                            ADVANTAGE_CONTINUITY_BONUS,
+                        )
+                    ),
+                ),
             ),
             "independent_path_model_enabled": bool(
                 supplied.get(
@@ -2991,7 +3297,7 @@ class V5IndependentBaccaratEngine:
             "path_transition_prior_weight": max(
                 0.0,
                 min(
-                    0.30,
+                    0.40,
                     float(
                         supplied.get(
                             "path_transition_prior_weight",
@@ -3003,7 +3309,7 @@ class V5IndependentBaccaratEngine:
             "path_transition_self_bias": max(
                 0.0,
                 min(
-                    0.20,
+                    0.30,
                     float(
                         supplied.get(
                             "path_transition_self_bias",
