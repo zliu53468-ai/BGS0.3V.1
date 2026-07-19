@@ -1,4 +1,4 @@
-"""LINE-compatible V5.4.1 aggressive quality-gated draw-path predictor."""
+"""LINE-compatible V5.4.0 draw-path-quality point predictor."""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
@@ -325,8 +325,6 @@ def _calculate_bet_sizing(
     split_agreement: float,
     path_quality_score: float,
     current_path_agreement: float,
-    advantage_continuity_score: float,
-    decision_aggression_score: float,
 ) -> Dict[str, Any]:
     """Return one normalized bet-sizing payload for app.py.
 
@@ -386,49 +384,20 @@ def _calculate_bet_sizing(
             0.0,
             1.0,
         )
-        continuity_score = _clamp(
-            float(advantage_continuity_score),
-            0.0,
-            1.0,
-        )
-        aggression_score = _clamp(
-            float(decision_aggression_score),
-            0.0,
-            1.0,
-        )
-        quality_bonus = 0.08 if quality_pass else 0.0
+        quality_bonus = 0.06 if quality_pass else 0.0
 
         strength = _clamp(
-            0.28 * confidence_score
-            + 0.17 * edge_score
-            + 0.13 * replica_score
-            + 0.10 * split_score
-            + 0.13 * path_score
-            + 0.07 * current_path_score
-            + 0.07 * continuity_score
-            + 0.05 * aggression_score
+            0.34 * confidence_score
+            + 0.20 * edge_score
+            + 0.16 * replica_score
+            + 0.12 * split_score
+            + 0.12 * path_score
+            + 0.06 * current_path_score
             + quality_bonus,
             0.0,
             1.0,
         )
-
-        if (
-            validated_signal
-            and path_score >= 0.75
-            and current_path_score >= 0.55
-            and aggression_score >= 0.60
-        ):
-            strength = max(
-                strength,
-                min(
-                    0.92,
-                    0.54
-                    + 0.22 * aggression_score
-                    + 0.12 * continuity_score,
-                ),
-            )
-
-        strength = strength ** 0.72
+        strength = strength ** 0.75
         fraction = minimum + (cap - minimum) * strength
         fraction = _clamp(fraction, minimum, cap)
 
@@ -466,14 +435,6 @@ def _calculate_bet_sizing(
         "maximum_fraction": round(maximum, 6),
         "unvalidated_maximum_fraction": round(unvalidated_maximum, 6),
         "requires_validated_signal": bool(BET_REQUIRE_VALIDATED),
-        "advantage_continuity_score": round(
-            _clamp(float(advantage_continuity_score), 0.0, 1.0),
-            6,
-        ),
-        "decision_aggression_score": round(
-            _clamp(float(decision_aggression_score), 0.0, 1.0),
-            6,
-        ),
     }
     return {
         "bet_sizing": payload,
@@ -639,21 +600,15 @@ def predict(
         current_path_agreement=float(
             result.get("average_current_path_agreement", 0.5)
         ),
-        advantage_continuity_score=float(
-            result.get("advantage_continuity_score", 0.0)
-        ),
-        decision_aggression_score=float(
-            result.get("decision_aggression_score", 0.0)
-        ),
     )
 
     response: Dict[str, Any] = {
         "ok": True,
         "engine": (
-            f"V5_4_1_AGGRESSIVE_DRAW_PATH_{particle_count}_PARTICLE_LINE"
+            f"V5_4_0_DRAW_PATH_QUALITY_{particle_count}_PARTICLE_LINE"
         ),
         "model_version": (
-            f"V5.4.1-AGGRESSIVE-PATH-QUALITY-DYNAMIC-GATE-{particle_count}P-LINE-20260719"
+            f"V5.4.0-DRAW-PATH-QUALITY-TRANSITION-PRIOR-{particle_count}P-LINE-20260719"
         ),
         "user_id": user_id,
         "venue": venue,
@@ -746,22 +701,6 @@ def predict(
             ),
             "current_path_agreement_quality": round(
                 float(hybrid.get("current_path_agreement_quality", 0.0)),
-                6,
-            ),
-            "configured_particle_max_weight": round(
-                float(hybrid.get("configured_particle_max_weight", 0.0)),
-                6,
-            ),
-            "dynamic_particle_max_weight": round(
-                float(hybrid.get("dynamic_particle_max_weight", 0.0)),
-                6,
-            ),
-            "high_path_threshold": round(
-                float(hybrid.get("high_path_threshold", 0.75)),
-                6,
-            ),
-            "high_path_particle_boost": round(
-                float(hybrid.get("high_path_particle_boost", 0.0)),
                 6,
             ),
         },
@@ -1035,34 +974,6 @@ def predict(
                 float(result.get("average_path_transition_quality", 0.0)),
                 6,
             ),
-            "base_min_validated_edge": round(
-                float(result.get("base_min_validated_edge", 0.0)),
-                8,
-            ),
-            "effective_min_validated_edge": round(
-                float(result.get("effective_min_validated_edge", 0.0)),
-                8,
-            ),
-            "validated_edge_relief": round(
-                float(result.get("validated_edge_relief", 0.0)),
-                6,
-            ),
-            "advantage_continuity_score": round(
-                float(result.get("advantage_continuity_score", 0.0)),
-                6,
-            ),
-            "advantage_continuity_bonus": round(
-                float(result.get("advantage_continuity_bonus", 0.0)),
-                8,
-            ),
-            "decision_confidence": round(
-                float(result.get("decision_confidence", 0.5)),
-                6,
-            ),
-            "decision_aggression_score": round(
-                float(result.get("decision_aggression_score", 0.0)),
-                6,
-            ),
             "candidates": [
                 round(float(item), 2)
                 for item in result[
@@ -1252,13 +1163,11 @@ def predict(
             "holdout": dict(DB_HOLDOUT),
         },
         "reason": (
-            f"V5.4.1 HYBRID：{particle_count}粒子×"
+            f"V5.4.0 HYBRID：{particle_count}粒子×"
             f"{int(result['replicas'])}副本；"
             "每次只使用最新一局最終點數、該局補牌路徑與本次明確傳入的牌靴事實獨立模擬；"
             "第三張牌條件似然、雙方不補粒子保護、路徑覆蓋/ESS/當前路徑共識已提高決策權重；"
-            "高補牌品質時會動態提高粒子融合上限並降低驗證門檻，方向連續性則以同一次分析內的"
-            "副本/分割/補牌分支一致性加分；另以當前補牌路徑加入較強但受品質限制的單步先驗，"
-            "不讀取更早牌路、不使用學習式Markov、長龍、"
+            "另以當前補牌路徑加入弱單步先驗，但不讀取更早牌路、不使用學習式Markov、長龍、"
             "上一局推薦、勝敗紀錄或持久粒子方向，且不增加模擬輪數。"
             f"決策來源={result['decision_source']}；"
             f"{result['reason']}。"
@@ -1319,7 +1228,7 @@ def reset_uid_model(
         "removed": 0,
         "fresh_particle_mode": True,
         "message": (
-            "V5.4.1每次重建粒子；請由store.reset_shoe清除"
+            "V5.3.2每次重建粒子；請由store.reset_shoe清除"
             "實體牌靴資訊。"
         ),
     }
