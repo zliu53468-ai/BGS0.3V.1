@@ -1,12 +1,13 @@
-"""V5.3.2 independent draw-path-head factual-shoe-context HYBRID baccarat particle engine.
+"""V5.4.0 draw-path-quality factual-shoe-context HYBRID baccarat particle engine.
 
-Every request still creates fresh particles, fresh replicas and fresh forecast
-samples. The engine may additionally use factual shoe context supplied by the
-caller: current hand number, optional N/P/B/D path, and exact cards explicitly
-entered by the user.
+Every request creates fresh particles, fresh replicas and fresh forecast samples.
+Only the latest factual hand is used: current points, optional N/P/B/D draw path,
+hand number and exact cards explicitly supplied by the caller.
 
-No road, streak, Markov state, previous recommendation, win/loss result, or
-per-UID particle direction is carried into the next request.
+No road, streak, learned Markov state, previous recommendation, win/loss result,
+or per-UID particle direction is carried into the next request.  A small fixed
+single-step draw-path prior may use the current hand path only; it is quality
+gated and adds no simulation loop.
 """
 from __future__ import annotations
 
@@ -100,6 +101,21 @@ HYBRID_MAX_COMPONENT_ADJUSTMENT = _env_float(
 )
 HAND_NUMBER_UNCERTAINTY = _env_int("PF_HAND_NUMBER_UNCERTAINTY", 0, 0, 5)
 STATE_SIMULATIONS = _env_int("PF_STATE_SIMULATIONS", 1200, 200, 100_000)
+
+# Draw-path quality controls.  These defaults are intentionally conservative and
+# do not change particle count, proposal count, replica count or forecast loops.
+THIRD_CARD_LIKELIHOOD_POWER = _env_float(
+    "PF_THIRD_CARD_LIKELIHOOD_POWER", 0.92, 0.70, 1.0
+)
+NO_DRAW_ALLOCATION_PROTECTION = _env_float(
+    "PF_NO_DRAW_ALLOCATION_PROTECTION", 1.20, 1.0, 2.0
+)
+PATH_TRANSITION_PRIOR_WEIGHT = _env_float(
+    "PF_PATH_TRANSITION_PRIOR_WEIGHT", 0.10, 0.0, 0.30
+)
+PATH_TRANSITION_SELF_BIAS = _env_float(
+    "PF_PATH_TRANSITION_SELF_BIAS", 0.06, 0.0, 0.20
+)
 
 # Independent draw-path head. It reuses the existing forecast samples and adds
 # no extra particle, replica or Monte Carlo loops. The head is residualized
@@ -248,6 +264,10 @@ class ReplicaResult:
     database: np.ndarray
     fused: np.ndarray
     next_draw_paths: np.ndarray
+    next_draw_paths_raw: np.ndarray
+    path_transition_prior: np.ndarray
+    path_transition_weight: float
+    path_transition_quality: float
     point_matrix: np.ndarray
     top_points: List[Dict[str, Any]]
     paired_center: float
@@ -415,52 +435,106 @@ def _required_card_probability(counts: np.ndarray, value: int) -> float:
     return float(counts[value]) / float(total)
 
 
+def _resolve_observed_completion(
+    player_initial: int,
+    banker_initial: int,
+    observed_player: int,
+    observed_banker: int,
+) -> Optional[Tuple[int, Optional[int], Optional[int], int]]:
+    """Resolve the unique legal completion from two-card totals to final totals.
+
+    This helper is shared by feasibility checks and conditional completion so the
+    path rules cannot drift apart.  Path 0 is accepted only for a natural or for
+    the explicit 6/7 versus 6/7 stand branch.
+    """
+    p0 = int(player_initial) % 10
+    b0 = int(banker_initial) % 10
+    final_p = int(observed_player) % 10
+    final_b = int(observed_banker) % 10
+
+    natural = p0 >= 8 or b0 >= 8
+    if natural:
+        if p0 == final_p and b0 == final_b:
+            return 0, None, None, 4
+        return None
+
+    player_third: Optional[int] = None
+    banker_third: Optional[int] = None
+    if p0 <= 5:
+        player_third = (final_p - p0) % 10
+    elif p0 != final_p:
+        return None
+
+    if banker_draws(b0, player_third):
+        banker_third = (final_b - b0) % 10
+    elif b0 != final_b:
+        return None
+
+    path = (1 if player_third is not None else 0) + (
+        2 if banker_third is not None else 0
+    )
+    if path == 0 and not (p0 in {6, 7} and b0 in {6, 7}):
+        return None
+    cards = 4 + int(player_third is not None) + int(banker_third is not None)
+    return path, player_third, banker_third, cards
+
+
 def exact_conditional_complete(
     source: np.ndarray,
     rng: np.random.Generator,
     observed_player: int,
     observed_banker: int,
     known_path: Optional[int] = None,
+    likelihood_power: Optional[float] = None,
 ) -> Optional[Tuple[np.ndarray, int, float, int]]:
+    """Complete one proposal under exact baccarat draw rules.
+
+    Initial four cards are sampled physically.  Any required third card is then
+    solved from the observed final total and scored by its sequential shoe
+    probability.  A mild likelihood tempering raises the effective contribution
+    of valid one-card/two-card completions without creating extra proposals.
+    """
     counts = np.asarray(source, dtype=np.int16).copy()
     try:
         p1, b1, p2, b2 = (_draw_np(counts, rng) for _ in range(4))
     except RuntimeError:
         return None
-    player_total, banker_total = (p1 + p2) % 10, (b1 + b2) % 10
-    player_third: Optional[int] = None
-    banker_third: Optional[int] = None
-    weight = 1.0
-    if player_total >= 8 or banker_total >= 8:
-        if player_total != observed_player or banker_total != observed_banker:
-            return None
-    else:
-        if player_total <= 5:
-            player_third = (observed_player - player_total) % 10
-            probability = _required_card_probability(counts, player_third)
-            if probability <= 0:
-                return None
-            weight *= probability
-            counts[player_third] -= 1
-            player_total = observed_player
-        elif player_total != observed_player:
-            return None
-        if banker_draws(banker_total, player_third):
-            banker_third = (observed_banker - banker_total) % 10
-            probability = _required_card_probability(counts, banker_third)
-            if probability <= 0:
-                return None
-            weight *= probability
-            counts[banker_third] -= 1
-            banker_total = observed_banker
-        elif banker_total != observed_banker:
-            return None
-    if player_total != observed_player or banker_total != observed_banker:
+
+    completion = _resolve_observed_completion(
+        (p1 + p2) % 10,
+        (b1 + b2) % 10,
+        int(observed_player) % 10,
+        int(observed_banker) % 10,
+    )
+    if completion is None:
         return None
-    path = (1 if player_third is not None else 0) + (2 if banker_third is not None else 0)
+    path, player_third, banker_third, cards = completion
     if known_path is not None and path != int(known_path):
         return None
-    cards = 4 + (1 if player_third is not None else 0) + (1 if banker_third is not None else 0)
+
+    raw_likelihood = 1.0
+    for required_card in (player_third, banker_third):
+        if required_card is None:
+            continue
+        probability = _required_card_probability(counts, int(required_card))
+        if probability <= 0.0:
+            return None
+        raw_likelihood *= probability
+        counts[int(required_card)] -= 1
+
+    draw_count = int(player_third is not None) + int(banker_third is not None)
+    power = max(
+        0.70,
+        min(
+            1.0,
+            float(
+                THIRD_CARD_LIKELIHOOD_POWER
+                if likelihood_power is None
+                else likelihood_power
+            ),
+        ),
+    )
+    weight = raw_likelihood if draw_count == 0 else raw_likelihood ** power
     return counts, path, max(1e-12, float(weight)), cards
 
 
@@ -616,11 +690,11 @@ def feasible_current_paths(
     banker_total: int,
     known_path: Optional[int],
 ) -> np.ndarray:
-    """Return draw paths that can exactly produce the observed final totals.
+    """Return paths that can exactly produce the observed final totals.
 
-    The check follows baccarat natural/stand/draw rules directly.  Third-card
-    values are solved from the observed totals instead of being repeatedly
-    enumerated, which removes ambiguous branches without adding simulation work.
+    The same completion resolver used by ``exact_conditional_complete`` checks
+    every legal two-card total pair.  This makes natural/stand path 0 explicit
+    and prevents feasibility and importance sampling from disagreeing.
     """
     possible = np.zeros(4, dtype=bool)
     try:
@@ -642,41 +716,19 @@ def feasible_current_paths(
 
     for player_initial in range(10):
         for banker_initial in range(10):
-            natural = player_initial >= 8 or banker_initial >= 8
-            if natural:
-                if (
-                    player_initial == final_player
-                    and banker_initial == final_banker
-                ):
-                    possible[0] = True
-                continue
-
-            if player_initial <= 5:
-                player_third = (final_player - player_initial) % 10
-                if banker_draws(banker_initial, player_third):
-                    # The required banker third-card value is uniquely determined
-                    # modulo ten and every value 0..9 is a legal baccarat card value.
-                    banker_third = (final_banker - banker_initial) % 10
-                    if 0 <= banker_third <= 9:
-                        possible[3] = True
-                elif banker_initial == final_banker:
-                    possible[1] = True
-                continue
-
-            # Player stands on 6 or 7.  The banker either draws on 0..5 or
-            # stands on 6 or 7; natural totals were handled above.
-            if player_initial != final_player:
-                continue
-            if banker_draws(banker_initial, None):
-                banker_third = (final_banker - banker_initial) % 10
-                if 0 <= banker_third <= 9:
-                    possible[2] = True
-            elif banker_initial == final_banker:
-                possible[0] = True
+            completion = _resolve_observed_completion(
+                player_initial,
+                banker_initial,
+                final_player,
+                final_banker,
+            )
+            if completion is not None:
+                possible[int(completion[0])] = True
 
     if path_filter is not None:
         possible &= np.arange(4) == path_filter
     return possible
+
 
 
 def normalize_array(values: Sequence[float], fallback: Sequence[float]) -> np.ndarray:
@@ -720,13 +772,14 @@ def allocate_path_particles(
     available: np.ndarray,
     minimum_per_available: int = 1,
     support_quality: Optional[np.ndarray] = None,
+    no_draw_protection: Optional[float] = None,
 ) -> np.ndarray:
-    """Allocate particles by posterior mass, legality and evidence quality.
+    """Allocate particles by posterior mass, legality and path protection.
 
-    Significant legal paths retain the configured floor, while very small paths
-    receive a smaller safety floor instead of consuming the same allocation as a
-    well-supported path.  The remaining budget uses a tempered posterior so rare
-    but legal paths stay represented without flattening the main posterior mass.
+    Path 0 receives an explicit floor/priority guard because exact no-draw
+    completions can be structurally narrow.  One-side and both-draw paths retain
+    smaller rarity guards so valid low-mass paths are not erased by resampling.
+    The total particle budget is unchanged.
     """
     masses = np.maximum(0.0, np.asarray(masses, dtype=float))
     available = np.asarray(available, dtype=bool)
@@ -744,11 +797,7 @@ def allocate_path_particles(
     if support_quality is None:
         support = available.astype(float)
     else:
-        support = np.clip(
-            np.asarray(support_quality, dtype=float),
-            0.0,
-            1.0,
-        )
+        support = np.clip(np.asarray(support_quality, dtype=float), 0.0, 1.0)
         support = np.where(available, support, 0.0)
 
     full_floor = min(
@@ -756,17 +805,46 @@ def allocate_path_particles(
         max(1, total // len(eligible)),
     )
     rare_floor = min(full_floor, max(1, full_floor // 3))
+    no_draw_floor = min(
+        full_floor,
+        max(rare_floor, int(math.ceil(full_floor * 0.75))),
+    )
+    one_side_floor = min(
+        full_floor,
+        max(rare_floor, int(math.ceil(full_floor * 0.50))),
+    )
+    both_floor = min(
+        full_floor,
+        max(rare_floor, int(math.ceil(full_floor * 0.60))),
+    )
+    protected_floors = np.asarray(
+        [no_draw_floor, one_side_floor, one_side_floor, both_floor],
+        dtype=int,
+    )
+
     significant_mass = max(0.015, 0.5 / max(1.0, float(total)))
     for index in eligible:
-        alloc[index] = (
-            full_floor
-            if posterior[index] >= significant_mass or support[index] >= 0.50
-            else rare_floor
-        )
+        if posterior[index] >= significant_mass or support[index] >= 0.50:
+            alloc[index] = full_floor
+        else:
+            alloc[index] = int(protected_floors[index])
 
-    # If floors exceed the budget, remove particles first from the least useful
-    # path while preserving at least one representative for each legal path.
-    priority = posterior * (0.70 + 0.30 * support)
+    configured_no_draw_protection = max(
+        1.0,
+        min(
+            2.0,
+            float(
+                NO_DRAW_ALLOCATION_PROTECTION
+                if no_draw_protection is None
+                else no_draw_protection
+            ),
+        ),
+    )
+    protection = np.asarray(
+        [configured_no_draw_protection, 1.08, 1.08, 1.14],
+        dtype=float,
+    )
+    priority = posterior * (0.62 + 0.38 * support) * protection
     while int(alloc.sum()) > total:
         reducible = [index for index in eligible if alloc[index] > 1]
         if not reducible:
@@ -778,12 +856,20 @@ def allocate_path_particles(
     if remaining <= 0:
         return alloc
 
-    tempered = np.sqrt(posterior)
-    tempered = normalize_array(tempered, available.astype(float))
-    supported = posterior * (0.50 + 0.50 * support)
-    supported = normalize_array(supported, posterior)
+    tempered = normalize_array(np.sqrt(posterior), available.astype(float))
+    supported = normalize_array(
+        posterior * (0.45 + 0.55 * support),
+        posterior,
+    )
+    protected = normalize_array(
+        posterior * protection * (0.55 + 0.45 * support),
+        posterior,
+    )
     target = normalize_array(
-        0.72 * posterior + 0.18 * tempered + 0.10 * supported,
+        0.58 * posterior
+        + 0.17 * tempered
+        + 0.10 * supported
+        + 0.15 * protected,
         posterior,
     )
 
@@ -796,13 +882,78 @@ def allocate_path_particles(
         key=lambda index: (
             raw[index] - base[index],
             target[index],
-            support[index],
+            priority[index],
         ),
         reverse=True,
     )
     for cursor in range(left):
         alloc[order[cursor % len(order)]] += 1
     return alloc
+
+
+def apply_current_path_transition_prior(
+    raw_next_draw: Sequence[float],
+    current_draw_paths: Sequence[float],
+    known_path: Optional[int],
+    path_coverage: float,
+    path_ess_quality: float,
+    settings: Mapping[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Apply a weak current-hand-only path carry prior.
+
+    This is not a learned transition model and does not read any road/history.
+    It blends a fixed, near-baseline one-step prior using only the current hand's
+    known/inferred path and existing path-quality diagnostics.
+    """
+    raw = normalize_array(raw_next_draw, DRAW_BASELINE)
+    if known_path is not None and int(known_path) in {0, 1, 2, 3}:
+        current = np.zeros(4, dtype=float)
+        current[int(known_path)] = 1.0
+        current_certainty = 1.0
+    else:
+        current = normalize_array(current_draw_paths, DRAW_BASELINE)
+        current_certainty = max(0.0, min(1.0, float(np.max(current))))
+
+    self_bias = max(
+        0.0,
+        min(0.20, float(settings.get("path_transition_self_bias", 0.06))),
+    )
+    transition = np.zeros((4, 4), dtype=float)
+    for path in range(4):
+        row = DRAW_BASELINE.astype(float).copy()
+        row[path] += self_bias
+        if path == 0:
+            row[0] += self_bias * 0.50
+        elif path in {1, 2}:
+            row[1] += self_bias * 0.18
+            row[2] += self_bias * 0.18
+        else:
+            row[3] += self_bias * 0.35
+        transition[path] = normalize_array(row, DRAW_BASELINE)
+
+    prior = normalize_array(current @ transition, DRAW_BASELINE)
+    path_quality = max(
+        0.0,
+        min(
+            1.0,
+            0.55 * float(path_coverage) + 0.45 * float(path_ess_quality),
+        ),
+    )
+    transition_quality = max(
+        0.0,
+        min(1.0, path_quality * (0.65 + 0.35 * current_certainty)),
+    )
+    configured_weight = max(
+        0.0,
+        min(0.30, float(settings.get("path_transition_prior_weight", 0.10))),
+    )
+    effective_weight = configured_weight * transition_quality
+    adjusted = normalize_array(
+        (1.0 - effective_weight) * raw + effective_weight * prior,
+        DRAW_BASELINE,
+    )
+    return adjusted, prior, float(effective_weight), float(transition_quality)
+
 
 
 def _outcome_index(outcome: str) -> int:
@@ -907,8 +1058,8 @@ def build_independent_draw_path_model(
     control_rows = np.maximum(0.0, control_rows)
 
     path_quality = clamp01(
-        0.65 * float(path_coverage)
-        + 0.35 * float(path_ess_quality)
+        0.55 * float(path_coverage)
+        + 0.45 * float(path_ess_quality)
     )
     population_ess_quality = clamp01(
         float(population_ess) / max(1.0, float(target_ess))
@@ -1268,12 +1419,12 @@ def build_independent_draw_path_model(
     current_q = scale_quality(current_path_agreement)
     draw_q = scale_quality(draw_agreement)
     reliability = (
-        0.27 * path_quality
-        + 0.24 * weighted_support
-        + 0.14 * current_q
-        + 0.12 * draw_q
-        + 0.10 * direction_q
-        + 0.08 * weighted_signal_quality
+        0.31 * path_quality
+        + 0.22 * weighted_support
+        + 0.18 * current_q
+        + 0.09 * draw_q
+        + 0.08 * direction_q
+        + 0.07 * weighted_signal_quality
         + 0.05 * population_ess_quality
     )
     reliability *= 0.82 + 0.18 * depth_consistency
@@ -1537,6 +1688,9 @@ class V5ReplicaEngine:
                     int(player_total) % 10,
                     int(banker_total) % 10,
                     effective_known_path,
+                    likelihood_power=float(
+                        settings["third_card_likelihood_power"]
+                    ),
                 )
             attempts += 1
             if completed is not None:
@@ -1630,6 +1784,9 @@ class V5ReplicaEngine:
             available,
             int(settings["min_path_particles"]),
             support_quality,
+            no_draw_protection=float(
+                settings["no_draw_allocation_protection"]
+            ),
         )
         particles: List[np.ndarray] = []
         depths: List[int] = []
@@ -1791,7 +1948,7 @@ class V5ReplicaEngine:
         split_agreement = 1.0 if (split_centers[0] >= 0) == (split_centers[1] >= 0) else 0.0
         split_disagreement = abs(split_centers[0] - split_centers[1])
         internal_se = 0.5 * split_disagreement
-        next_draw = normalize_array(conditioned_draw, DRAW_BASELINE)
+        next_draw_raw = normalize_array(conditioned_draw, DRAW_BASELINE)
         matrix = point_matrix / max(1.0, float(point_matrix.sum()))
         top_idx = np.argsort(matrix)[::-1][:10]
         top_points = []
@@ -1845,6 +2002,19 @@ class V5ReplicaEngine:
         current_dispersion = math.sqrt(disp_num / disp_mass) if disp_mass else 0.0
         effective_paths = max(1, int(np.count_nonzero(current_path_samples >= 8)))
         current_internal_se = current_dispersion / math.sqrt(effective_paths)
+        (
+            next_draw,
+            path_transition_prior,
+            path_transition_weight,
+            path_transition_quality,
+        ) = apply_current_path_transition_prior(
+            next_draw_raw,
+            population.draw_paths,
+            population.known_path,
+            population.path_coverage,
+            population.path_ess_quality,
+            settings,
+        )
         entropy = -float(sum(x * math.log(x) for x in matrix if x > 0))
         entropy_norm = min(1.0, entropy / math.log(100))
         top10_mass = float(matrix[top_idx].sum())
@@ -1885,14 +2055,15 @@ class V5ReplicaEngine:
             -float(settings["database_max_adjustment"]),
             float(settings["database_max_adjustment"]),
         )
-        path_quality = (
-            0.65 * population.path_coverage
-            + 0.35 * population.path_ess_quality
-        )
         current_agreement_q = _bounded_quality(
             current_agreement,
             0.50,
             0.85,
+        )
+        path_quality = (
+            0.50 * population.path_coverage
+            + 0.30 * population.path_ess_quality
+            + 0.20 * current_agreement_q
         )
         draw_agreement_q = _bounded_quality(
             draw_agreement,
@@ -1900,11 +2071,11 @@ class V5ReplicaEngine:
             0.85,
         )
         path_direction_quality = (
-            0.60 * current_agreement_q
-            + 0.40 * draw_agreement_q
+            0.70 * current_agreement_q
+            + 0.30 * draw_agreement_q
         )
         path_fusion_gain = (
-            0.18 * path_quality * path_direction_quality
+            0.24 * path_quality * path_direction_quality
         )
         path_adjustment_limit = min(
             0.020,
@@ -1987,6 +2158,10 @@ class V5ReplicaEngine:
             database=db_probs,
             fused=fused,
             next_draw_paths=next_draw,
+            next_draw_paths_raw=next_draw_raw,
+            path_transition_prior=path_transition_prior,
+            path_transition_weight=path_transition_weight,
+            path_transition_quality=path_transition_quality,
             point_matrix=matrix,
             top_points=top_points,
             paired_center=paired_center,
@@ -2234,18 +2409,27 @@ def build_hybrid_probabilities(
         0.0,
         min(1.0, float(quality.get("path_ess_quality", 0.0))),
     )
-    path_q = 0.65 * path_coverage_q + 0.35 * path_ess_q
+    current_path_q = _bounded_quality(
+        float(quality.get("current_path_agreement", 0.5)),
+        0.50,
+        0.85,
+    )
+    path_q = (
+        0.42 * path_coverage_q
+        + 0.28 * path_ess_q
+        + 0.30 * current_path_q
+    )
     context_q = (
         0.45 * max(0.0, min(1.0, float(quality.get("hand_number_known", 0.0))))
         + 0.25 * max(0.0, min(1.0, float(quality.get("known_path", 0.0))))
         + 0.30 * max(0.0, min(1.0, float(exact_state_reliability)))
     )
     gate = (
-        0.19 * agreement_q
-        + 0.18 * ess_q
-        + 0.13 * diversity_q
-        + 0.12 * split_q
-        + 0.28 * path_q
+        0.15 * agreement_q
+        + 0.14 * ess_q
+        + 0.09 * diversity_q
+        + 0.10 * split_q
+        + 0.42 * path_q
         + 0.10 * context_q
     )
     gate = max(0.12, min(1.0, gate))
@@ -2314,6 +2498,7 @@ def build_hybrid_probabilities(
         "path_gate": float(path_q),
         "path_coverage_quality": float(path_coverage_q),
         "path_ess_quality": float(path_ess_q),
+        "current_path_agreement_quality": float(current_path_q),
         "state_reliability": float(exact_state_reliability),
         "independent_path_enabled": independent_enabled,
         "independent_path_reliability": independent_reliability,
@@ -2386,7 +2571,18 @@ def decide_ensemble(
     path_rms = math.sqrt(
         sum(w * row.current_path_internal_se**2 for row, w in zip(rows, weights)) / sw
     )
-    path_se = float(settings["path_uncertainty"]) * path_rms / math.sqrt(effective_replicas)
+    current_path_agreement = max(
+        0.0,
+        min(1.0, float(quality.get("current_path_agreement", 0.5))),
+    )
+    current_path_q = _bounded_quality(current_path_agreement, 0.50, 0.85)
+    path_disagreement_multiplier = 1.0 + 0.30 * (1.0 - current_path_q)
+    path_se = (
+        float(settings["path_uncertainty"])
+        * path_rms
+        * path_disagreement_multiplier
+        / math.sqrt(effective_replicas)
+    )
     se = math.sqrt(base_se**2 + split_se**2 + path_se**2)
     robust = 0.50 * mean + 0.50 * med
     lower = max(0.0, abs(robust) - float(settings["uncertainty_penalty"]) * se)
@@ -2402,18 +2598,23 @@ def decide_ensemble(
         min(1.0, float(quality.get("path_ess_quality", 0.0))),
     )
     path_quality_score = (
-        0.68 * path_coverage
-        + 0.32 * path_ess_quality
+        0.42 * path_coverage
+        + 0.28 * path_ess_quality
+        + 0.30 * current_path_q
     )
     path_quality_threshold = max(
-        0.55,
+        0.60,
         min(
             0.95,
-            float(settings["min_path_coverage"]) * 0.90,
+            float(settings["min_path_coverage"]) * 0.92,
         ),
     )
+    path_ess_floor = 0.42
+    current_path_agreement_floor = 0.56
     path_quality_pass = (
         path_coverage >= float(settings["min_path_coverage"])
+        and path_ess_quality >= path_ess_floor
+        and current_path_agreement >= current_path_agreement_floor
         and path_quality_score >= path_quality_threshold
     )
     quality_pass = (
@@ -2461,6 +2662,10 @@ def decide_ensemble(
         "path_quality_pass": path_quality_pass,
         "path_quality_score": path_quality_score,
         "path_quality_threshold": path_quality_threshold,
+        "path_ess_floor": path_ess_floor,
+        "current_path_agreement": current_path_agreement,
+        "current_path_agreement_quality": current_path_q,
+        "current_path_agreement_floor": current_path_agreement_floor,
         "decision_source": decision_source,
         "banker_ev": float(fused[0] * (1.0 - commission) - fused[1]),
         "player_ev": float(fused[1] - fused[0]),
@@ -2759,6 +2964,54 @@ class V5IndependentBaccaratEngine:
             "state_simulations": int(
                 supplied.get("state_simulations", STATE_SIMULATIONS)
             ),
+            "third_card_likelihood_power": max(
+                0.70,
+                min(
+                    1.0,
+                    float(
+                        supplied.get(
+                            "third_card_likelihood_power",
+                            THIRD_CARD_LIKELIHOOD_POWER,
+                        )
+                    ),
+                ),
+            ),
+            "no_draw_allocation_protection": max(
+                1.0,
+                min(
+                    2.0,
+                    float(
+                        supplied.get(
+                            "no_draw_allocation_protection",
+                            NO_DRAW_ALLOCATION_PROTECTION,
+                        )
+                    ),
+                ),
+            ),
+            "path_transition_prior_weight": max(
+                0.0,
+                min(
+                    0.30,
+                    float(
+                        supplied.get(
+                            "path_transition_prior_weight",
+                            PATH_TRANSITION_PRIOR_WEIGHT,
+                        )
+                    ),
+                ),
+            ),
+            "path_transition_self_bias": max(
+                0.0,
+                min(
+                    0.20,
+                    float(
+                        supplied.get(
+                            "path_transition_self_bias",
+                            PATH_TRANSITION_SELF_BIAS,
+                        )
+                    ),
+                ),
+            ),
         }
 
     def analyze(
@@ -2858,6 +3111,12 @@ class V5IndependentBaccaratEngine:
         )
         draw = _weighted_average(rows, "draw_paths", 4)
         next_draw = _weighted_average(rows, "next_draw_paths", 4)
+        next_draw_raw = _weighted_average(rows, "next_draw_paths_raw", 4)
+        path_transition_prior = _weighted_average(
+            rows,
+            "path_transition_prior",
+            4,
+        )
         point_matrix = _weighted_average(rows, "point_matrix", 100)
 
         top_idx = np.argsort(point_matrix)[::-1][:10]
@@ -3000,6 +3259,14 @@ class V5IndependentBaccaratEngine:
             max(1e-6, row.final_weight) * row.path_fusion_gain
             for row in rows
         ) / max(1e-12, weight_sum)
+        average_path_transition_weight = sum(
+            max(1e-6, row.final_weight) * row.path_transition_weight
+            for row in rows
+        ) / max(1e-12, weight_sum)
+        average_path_transition_quality = sum(
+            max(1e-6, row.final_weight) * row.path_transition_quality
+            for row in rows
+        ) / max(1e-12, weight_sum)
         average_database_weight = float(
             np.mean([row.effective_database_weight for row in rows])
         )
@@ -3068,6 +3335,8 @@ class V5IndependentBaccaratEngine:
             and average_diversity >= 0.45
             and average_path_coverage
             >= float(runtime_settings["min_path_coverage"])
+            and decision.get("path_quality_pass", False)
+            and average_current_path_agreement >= 0.60
             and decision["effective_replicas"]
             >= float(runtime_settings["min_effective_replicas"])
         ):
@@ -3079,6 +3348,8 @@ class V5IndependentBaccaratEngine:
             >= float(runtime_settings["target_ess"]) * 0.45
             and average_diversity >= 0.30
             and average_path_coverage >= 0.55
+            and average_path_ess_quality >= 0.35
+            and average_current_path_agreement >= 0.54
         ):
             stability = "WATCH"
 
@@ -3180,6 +3451,10 @@ class V5IndependentBaccaratEngine:
             },
             "draw_paths": draw,
             "next_draw_paths": next_draw,
+            "next_draw_paths_raw": next_draw_raw,
+            "path_transition_prior": path_transition_prior,
+            "average_path_transition_weight": average_path_transition_weight,
+            "average_path_transition_quality": average_path_transition_quality,
             "independent_draw_path_model": {
                 "enabled": bool(runtime_settings["independent_path_model_enabled"]),
                 "probabilities": independent_path_probabilities,
@@ -3337,7 +3612,7 @@ class V5IndependentBaccaratEngine:
             "conditional_generator": (
                 "EXACT_CURRENT_CARDS_IMPORTANCE_WEIGHTED"
                 if normalized_cards is not None
-                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V4_WITH_INDEPENDENT_PATH_HEAD"
+                else "DRAW_PATH_STRATIFIED_EXACT_COMPLETION_IMPORTANCE_WEIGHTED_V5_PATH0_PROTECTED"
             ),
             "variance_reduction": (
                 "FULL_PARTICLE_TWO_PASS_COMMON_RANDOM_ANTITHETIC"
