@@ -355,6 +355,44 @@ class UniformStream:
         return value
 
 
+class SobolStream(UniformStream):
+    """One-dimensional base-2 low-discrepancy stream without SciPy.
+
+    In one dimension the Sobol construction is the base-2 Van der Corput
+    sequence.  A deterministic 32-bit digital XOR scramble keeps replicas
+    seed-specific while preserving the low-discrepancy structure.
+    """
+
+    _BITS = 32
+    _MASK = (1 << _BITS) - 1
+    _SCALE = 1.0 / float(1 << _BITS)
+
+    def __init__(self, seed: int, antithetic: bool = False) -> None:
+        self.antithetic = bool(antithetic)
+        self.index = 0
+        self.scramble = mix_seed(int(seed) & 0xFFFFFFFF, 0)
+
+    @staticmethod
+    def _reverse_bits32(value: int) -> int:
+        value &= 0xFFFFFFFF
+        value = ((value >> 1) & 0x55555555) | ((value & 0x55555555) << 1)
+        value = ((value >> 2) & 0x33333333) | ((value & 0x33333333) << 2)
+        value = ((value >> 4) & 0x0F0F0F0F) | ((value & 0x0F0F0F0F) << 4)
+        value = ((value >> 8) & 0x00FF00FF) | ((value & 0x00FF00FF) << 8)
+        value = ((value >> 16) | (value << 16)) & 0xFFFFFFFF
+        return value
+
+    def random(self) -> float:
+        reversed_bits = self._reverse_bits32(self.index)
+        self.index = (self.index + 1) & self._MASK
+        value = float((reversed_bits ^ self.scramble) * self._SCALE)
+        if self.antithetic:
+            value = 1.0 - value
+            if value >= 1.0:
+                value = float(np.nextafter(1.0, 0.0))
+        return value
+
+
 def fresh_shoe_counts(decks: int = DECKS) -> np.ndarray:
     return np.asarray([16 * decks] + [4 * decks] * 9, dtype=np.int16)
 
@@ -479,6 +517,139 @@ def _resolve_observed_completion(
     return path, player_third, banker_third, cards
 
 
+_LEGAL_INITIAL_PAIR_CACHE: Dict[
+    Tuple[int, int, int],
+    List[Tuple[int, int, int, int]],
+] = {}
+_LEGAL_INITIAL_PAIR_ARRAY_CACHE: Dict[Tuple[int, int, int], np.ndarray] = {}
+_LEGAL_INITIAL_PAIR_SAMPLING_CACHE: Dict[
+    Tuple[int, int, int],
+    Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ],
+] = {}
+
+
+def build_legal_initial_pairs(
+    final_p: int,
+    final_b: int,
+    path: int,
+) -> List[Tuple[int, int, int, int]]:
+    """Return legal initial P1/B1/P2/B2 values for one observed completion.
+
+    The table is cached by final points and draw path.  Legality is delegated to
+    ``_resolve_observed_completion`` so natural 8/9 and every banker third-card
+    branch stay identical to the engine's existing baccarat rules.
+    """
+    final_player = int(final_p) % 10
+    final_banker = int(final_b) % 10
+    target_path = int(path)
+    if target_path not in {0, 1, 2, 3}:
+        return []
+
+    key = (final_player, final_banker, target_path)
+    cached = _LEGAL_INITIAL_PAIR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    legal: List[Tuple[int, int, int, int]] = []
+    for p1 in range(10):
+        for p2 in range(10):
+            player_initial = (p1 + p2) % 10
+            for b1 in range(10):
+                for b2 in range(10):
+                    completion = _resolve_observed_completion(
+                        player_initial,
+                        (b1 + b2) % 10,
+                        final_player,
+                        final_banker,
+                    )
+                    if completion is not None and completion[0] == target_path:
+                        legal.append((p1, b1, p2, b2))
+
+    _LEGAL_INITIAL_PAIR_CACHE[key] = legal
+    return legal
+
+
+def _legal_initial_pair_array(
+    final_p: int,
+    final_b: int,
+    path: int,
+) -> np.ndarray:
+    key = (int(final_p) % 10, int(final_b) % 10, int(path))
+    cached = _LEGAL_INITIAL_PAIR_ARRAY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if key[2] == -1:
+        blocks = [
+            _legal_initial_pair_array(key[0], key[1], candidate_path)
+            for candidate_path in range(4)
+        ]
+        blocks = [block for block in blocks if block.shape[0] > 0]
+        array = (
+            np.concatenate(blocks, axis=0)
+            if blocks
+            else np.empty((0, 4), dtype=np.int8)
+        )
+    else:
+        pairs = build_legal_initial_pairs(*key)
+        array = np.asarray(pairs, dtype=np.int8)
+        if array.size == 0:
+            array = np.empty((0, 4), dtype=np.int8)
+        else:
+            array = array.reshape((-1, 4))
+
+    _LEGAL_INITIAL_PAIR_ARRAY_CACHE[key] = array
+    return array
+
+
+def _legal_initial_pair_sampling_arrays(
+    final_p: int,
+    final_b: int,
+    path: int,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    key = (int(final_p) % 10, int(final_b) % 10, int(path))
+    cached = _LEGAL_INITIAL_PAIR_SAMPLING_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    pairs = _legal_initial_pair_array(*key)
+    p1 = pairs[:, 0].astype(np.intp, copy=False)
+    b1 = pairs[:, 1].astype(np.intp, copy=False)
+    p2 = pairs[:, 2].astype(np.intp, copy=False)
+    b2 = pairs[:, 3].astype(np.intp, copy=False)
+    b1_seen = (b1 == p1).astype(np.int8)
+    p2_seen = (
+        (p2 == p1).astype(np.int8)
+        + (p2 == b1).astype(np.int8)
+    )
+    b2_seen = (
+        (b2 == p1).astype(np.int8)
+        + (b2 == b1).astype(np.int8)
+        + (b2 == p2).astype(np.int8)
+    )
+    cached = (pairs, p1, b1, p2, b2, b1_seen, p2_seen, b2_seen)
+    _LEGAL_INITIAL_PAIR_SAMPLING_CACHE[key] = cached
+    return cached
+
+
 def exact_conditional_complete(
     source: np.ndarray,
     rng: np.random.Generator,
@@ -489,22 +660,84 @@ def exact_conditional_complete(
 ) -> Optional[Tuple[np.ndarray, int, float, int]]:
     """Complete one proposal under exact baccarat draw rules.
 
-    Initial four cards are sampled physically.  Any required third card is then
-    solved from the observed final total and scored by its sequential shoe
-    probability.  A mild likelihood tempering raises the effective contribution
-    of valid one-card/two-card completions without creating extra proposals.
+    APF first samples only from legal initial four-card value combinations,
+    weighted by their exact without-replacement shoe probability.  Required
+    third cards are then solved and retain the existing tempered likelihood.
     """
     counts = np.asarray(source, dtype=np.int16).copy()
-    try:
-        p1, b1, p2, b2 = (_draw_np(counts, rng) for _ in range(4))
-    except RuntimeError:
+    total = int(counts.sum())
+    if total < 4:
         return None
 
+    final_player = int(observed_player) % 10
+    final_banker = int(observed_banker) % 10
+    if known_path is None:
+        sampling_path = -1
+    else:
+        sampling_path = int(known_path)
+        if sampling_path not in {0, 1, 2, 3}:
+            return None
+
+    (
+        pairs,
+        p1,
+        b1,
+        p2,
+        b2,
+        b1_seen,
+        p2_seen,
+        b2_seen,
+    ) = _legal_initial_pair_sampling_arrays(
+        final_player,
+        final_banker,
+        sampling_path,
+    )
+    if pairs.shape[0] == 0:
+        return None
+
+    available = counts.astype(np.int64, copy=False)
+    n1 = available[p1]
+    n2 = available[b1] - b1_seen
+    n3 = available[p2] - p2_seen
+    n4 = available[b2] - b2_seen
+    valid = (n1 > 0) & (n2 > 0) & (n3 > 0) & (n4 > 0)
+    if not bool(np.any(valid)):
+        return None
+
+    numerator_weights = n1 * n2 * n3 * n4
+    numerator_weights[~valid] = 0
+    total_numerator = int(numerator_weights.sum())
+    if total_numerator <= 0:
+        return None
+
+    denominator = float(total * (total - 1) * (total - 2) * (total - 3))
+    initial_mass = float(total_numerator) / denominator
+    if initial_mass <= 0.0 or not math.isfinite(initial_mass):
+        return None
+
+    cumulative = np.cumsum(numerator_weights, dtype=np.int64)
+    ticket = int(float(rng.random()) * total_numerator)
+    selected_index = int(np.searchsorted(cumulative, ticket, side="right"))
+    if selected_index >= pairs.shape[0]:
+        selected_index = pairs.shape[0] - 1
+    selected = pairs[selected_index]
+    p1_value, b1_value, p2_value, b2_value = (
+        int(selected[0]),
+        int(selected[1]),
+        int(selected[2]),
+        int(selected[3]),
+    )
+
+    for value in (p1_value, b1_value, p2_value, b2_value):
+        if int(counts[value]) <= 0:
+            return None
+        counts[value] -= 1
+
     completion = _resolve_observed_completion(
-        (p1 + p2) % 10,
-        (b1 + b2) % 10,
-        int(observed_player) % 10,
-        int(observed_banker) % 10,
+        (p1_value + p2_value) % 10,
+        (b1_value + b2_value) % 10,
+        final_player,
+        final_banker,
     )
     if completion is None:
         return None
@@ -534,7 +767,12 @@ def exact_conditional_complete(
             ),
         ),
     )
-    weight = raw_likelihood if draw_count == 0 else raw_likelihood ** power
+    third_card_weight = (
+        raw_likelihood
+        if draw_count == 0
+        else raw_likelihood ** power
+    )
+    weight = initial_mass * third_card_weight
     return counts, path, max(1e-12, float(weight)), cards
 
 
@@ -1913,8 +2151,8 @@ class V5ReplicaEngine:
                 k = n * 2 + (1 if flip else 0)
                 if k >= samples:
                     continue
-                c_stream = UniformStream(pair_seed, flip)
-                u_stream = UniformStream(pair_seed, flip)
+                c_stream = SobolStream(pair_seed, flip)
+                u_stream = SobolStream(pair_seed, flip)
                 hc = simulate_hand_uniform(population.particles[idx], c_stream.random)
                 hu = simulate_hand_uniform(population.control_particles[idx], u_stream.random)
                 ci, ui = _outcome_index(hc.outcome), _outcome_index(hu.outcome)
