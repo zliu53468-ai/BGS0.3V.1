@@ -3905,4 +3905,4 @@ class V5IndependentBaccaratEngine:
             "settings": dict(runtime_settings),
             "configured_settings": dict(self.settings),
             "replica_rows": rows,
-        }
+                }
