@@ -1,12 +1,13 @@
 """Click-only virtual-shoe baccarat predictor.
 
-The public entry point is ``run_virtual_round(session)``. It predicts from
-remaining card counts without seeing the hidden virtual-shoe order, then deals
-one actual virtual hand from that hidden order for honest self-evaluation.
+The public entry point is ``run_virtual_round(session)``.  V7 uses an exact
+finite-population hypergeometric core from remaining card counts, with Monte
+Carlo and hidden-order particle validation.  The hidden ordered shoe is not
+revealed until after the prediction is complete.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 import os
 import secrets
 
@@ -34,10 +35,16 @@ _ENGINE = VirtualShoeParticleEngine(
         particles=_env_int("PF_PARTICLES", 500, 64, 4000),
         replicas=_env_int("PF_REPLICAS", 5, 3, 11),
         simulations_per_replica=_env_int(
-            "PF_PREDICT_SIMULATIONS_PER_REPLICA", 1200, 200, 20_000
+            "PF_PREDICT_SIMULATIONS_PER_REPLICA",
+            1200,
+            200,
+            20_000,
         ),
         particle_draws_per_particle=_env_int(
-            "PF_DRAWS_PER_PARTICLE", 2, 1, 12
+            "PF_DRAWS_PER_PARTICLE",
+            2,
+            1,
+            12,
         ),
     )
 )
@@ -47,7 +54,11 @@ def _normalize_outcome_history(values: Iterable[Any]) -> List[str]:
     history: List[str] = []
     for item in values:
         if isinstance(item, Mapping):
-            raw = item.get("outcome") or item.get("actual") or item.get("virtual_outcome")
+            raw = (
+                item.get("outcome")
+                or item.get("actual")
+                or item.get("virtual_outcome")
+            )
         else:
             raw = item
         value = str(raw or "").upper().strip()
@@ -71,9 +82,9 @@ def _normalize_path_history(values: Iterable[Any]) -> List[str]:
 
 def _prediction_label(prediction: Mapping[str, Any]) -> str:
     quality = float(prediction.get("quality_score", 0.0) or 0.0)
-    if quality >= 0.72:
+    if quality >= 0.78:
         return "較高"
-    if quality >= 0.50:
+    if quality >= 0.58:
         return "中等"
     return "偏低"
 
@@ -82,12 +93,11 @@ def run_virtual_round(
     session: Mapping[str, Any],
     run_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Predict, then deal, one virtual round.
-
-    The predictor only receives card counts and virtual history. The hidden
-    ordered shoe is used only after the probability calculation is finished.
-    """
-    hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
+    """Predict first, then deal one hidden virtual round."""
+    hidden_shoe = [
+        int(card)
+        for card in list(session.get("virtual_shoe") or [])
+    ]
     if len(hidden_shoe) < 6:
         raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
 
@@ -99,7 +109,9 @@ def run_virtual_round(
     outcome_history = _normalize_outcome_history(round_history)
     path_history = _normalize_path_history(round_history)
 
-    seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
+    seed = int(
+        run_seed if run_seed is not None else secrets.randbits(32)
+    ) & 0xFFFFFFFF
     prediction = _ENGINE.analyze(
         remaining_counts=remaining_counts,
         history=outcome_history,
@@ -107,23 +119,25 @@ def run_virtual_round(
         seed=seed,
     )
 
-    # Only after the analysis is complete do we reveal and consume the next
-    # cards from the hidden virtual-shoe order.
+    # The hidden order is consumed only after the probability calculation.
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
     predicted_side = str(prediction.get("recommend") or "").upper()
+    action = str(prediction.get("action") or "O").upper()
     actual = hand.outcome
-    verdict = (
-        "TIE_SKIPPED"
-        if actual == "T" and predicted_side in {"B", "P"}
-        else "HIT"
-        if predicted_side == actual
-        else "MISS"
-    )
+
+    if action == "O":
+        verdict = "OBSERVE"
+    elif actual == "T" and predicted_side in {"B", "P"}:
+        verdict = "TIE_SKIPPED"
+    elif predicted_side == actual:
+        verdict = "HIT"
+    else:
+        verdict = "MISS"
 
     prediction.update(
         {
-            "model_version": "V6.0-VIRTUAL-SHOE-PARTICLE-SEQUENCE",
+            "model_version": "V7.0-HYPERGEOMETRIC-PARTICLE-MC",
             "mode": "virtual_shoe_click_only",
             "input_required": False,
             "confidence_label": _prediction_label(prediction),
@@ -135,6 +149,7 @@ def run_virtual_round(
                 "HIT": "命中",
                 "MISS": "未命中",
                 "TIE_SKIPPED": "和局不計",
+                "OBSERVE": "觀望不計",
             }[verdict],
             "cards_consumed": hand.cards_used,
             "remaining_cards_after": len(remaining_shoe),
@@ -143,7 +158,11 @@ def run_virtual_round(
             "venue": str(session.get("venue") or ""),
             "room": str(session.get("room") or ""),
             "round_number": int(session.get("hand_number", 0) or 0) + 1,
-            "disclaimer": "此結果只對程式內建虛擬牌靴有效，與外部真人桌無資料連線。",
+            "warmup_rounds": int(session.get("warmup_rounds", 0) or 0),
+            "disclaimer": (
+                "此結果只對程式內建虛擬牌靴有效，"
+                "與外部真人桌無資料連線。"
+            ),
         }
     )
 
@@ -163,11 +182,7 @@ def predict(
     run_seed: Optional[int] = None,
     shoe_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compatibility probability-only API.
-
-    New code should use ``run_virtual_round``. This function remains available
-    for old imports and accepts exact remaining counts through ``shoe_context``.
-    """
+    """Compatibility probability-only API."""
     context = dict(shoe_context or {})
     counts = context.get("remaining_counts")
     if not isinstance(counts, Sequence) or len(counts) != 10:
@@ -176,7 +191,11 @@ def predict(
     if history is None:
         history_values: List[Any] = []
     elif isinstance(history, str):
-        history_values = [part for part in history.replace("|", ",").split(",") if part.strip()]
+        history_values = [
+            part
+            for part in history.replace("|", ",").split(",")
+            if part.strip()
+        ]
     else:
         history_values = list(history)
 
@@ -194,17 +213,14 @@ def predict(
             "user_id": user_id,
             "input_required": False,
             "mode": "probability_only_compatibility",
+            "model_version": "V7.0-HYPERGEOMETRIC-PARTICLE-MC",
         }
     )
     return prediction
 
 
 def parse_point_observation(value: Any) -> Optional[Dict[str, Any]]:
-    """Deprecated compatibility shim.
-
-    Point input is intentionally disabled in V6. Returning ``None`` makes old
-    chat-point branches skip input processing instead of treating text as cards.
-    """
+    """Point input remains disabled in click-only V7."""
     return None
 
 
