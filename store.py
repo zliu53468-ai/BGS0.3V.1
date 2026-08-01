@@ -11,7 +11,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from particle_filter_points import counts_from_shoe, create_virtual_shoe
+from particle_filter_points import (
+    counts_from_shoe,
+    create_virtual_shoe,
+    deal_ordered_hand,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,7 +29,19 @@ ACTIVATION_CODES = {
     for item in os.getenv("ACTIVATION_CODES", "").split(",")
     if item.strip()
 }
-HISTORY_LIMIT = max(10, min(300, int(os.getenv("SESSION_HISTORY_LIMIT", "80") or "80")))
+HISTORY_LIMIT = max(
+    10,
+    min(300, int(os.getenv("SESSION_HISTORY_LIMIT", "80") or "80")),
+)
+VIRTUAL_WARMUP_ENABLED = os.getenv("VIRTUAL_WARMUP_ENABLED", "1").strip() == "1"
+VIRTUAL_WARMUP_MIN = max(
+    0,
+    min(80, int(os.getenv("VIRTUAL_WARMUP_MIN", "8") or "8")),
+)
+VIRTUAL_WARMUP_MAX = max(
+    VIRTUAL_WARMUP_MIN,
+    min(100, int(os.getenv("VIRTUAL_WARMUP_MAX", "25") or "25")),
+)
 _LOCK = threading.RLock()
 
 
@@ -38,6 +54,7 @@ def _fresh_stats() -> Dict[str, int]:
         "wins": 0,
         "losses": 0,
         "ties_skipped": 0,
+        "observes": 0,
         "total_rounds": 0,
         "current_win_streak": 0,
         "current_loss_streak": 0,
@@ -56,13 +73,47 @@ def _new_cut_card(decks: int = PF_DECKS) -> int:
 
 
 def _new_shoe_state(decks: int = PF_DECKS) -> Dict[str, Any]:
+    """Create a fresh hidden shoe and optionally simulate middle entry.
+
+    Warm-up hands are real internal virtual hands: cards are removed, the
+    remaining counts are updated, and their outcomes seed only the virtual
+    history model. They do not count toward the user's visible win/loss stats.
+    """
     shoe = create_virtual_shoe(decks=decks)
+    cut_card_remaining = _new_cut_card(decks)
+    warmup_target = 0
+    if VIRTUAL_WARMUP_ENABLED and VIRTUAL_WARMUP_MAX > 0:
+        span = VIRTUAL_WARMUP_MAX - VIRTUAL_WARMUP_MIN + 1
+        warmup_target = VIRTUAL_WARMUP_MIN + secrets.randbelow(max(1, span))
+
+    warmup_history: List[Dict[str, Any]] = []
+    for index in range(warmup_target):
+        if len(shoe) <= cut_card_remaining + 6:
+            break
+        hand, shoe = deal_ordered_hand(shoe)
+        hand_data = hand.as_dict()
+        warmup_history.append(
+            {
+                "round_number": index + 1,
+                "outcome": hand.outcome,
+                "draw_path": hand.draw_path,
+                "player_total": hand.player_total,
+                "banker_total": hand.banker_total,
+                "cards_used": hand.cards_used,
+                "warmup": True,
+                "created_at": _now(),
+            }
+        )
+
+    warmup_rounds = len(warmup_history)
     return {
         "shoe_id": uuid.uuid4().hex[:12],
         "virtual_shoe": shoe,
         "remaining_counts": counts_from_shoe(shoe),
-        "cut_card_remaining": _new_cut_card(decks),
-        "hand_number": 0,
+        "cut_card_remaining": cut_card_remaining,
+        "hand_number": warmup_rounds,
+        "warmup_rounds": warmup_rounds,
+        "round_history": warmup_history[-HISTORY_LIMIT:],
         "shoe_started_at": _now(),
         "shoe_reset_count": 0,
     }
@@ -198,7 +249,6 @@ def select_venue(user_id: str, venue: str, room: str = "1") -> Dict[str, Any]:
             preserved_reset_count = int(session.get("shoe_reset_count", 0) or 0)
             session.update(_new_shoe_state())
             session["shoe_reset_count"] = preserved_reset_count + 1
-            session["round_history"] = []
             session["analysis_history"] = []
             session["last_prediction"] = {}
             session["last_virtual_hand"] = {}
@@ -245,7 +295,6 @@ def reset_shoe(
             session["venue"] = str(venue or "")
         if room is not None:
             session["room"] = str(room or "1")
-        session["round_history"] = []
         session["analysis_history"] = []
         session["last_prediction"] = {}
         session["pending_prediction"] = {}
@@ -276,18 +325,32 @@ def reset_session(user_id: str) -> Dict[str, Any]:
 
 def _update_stats(stats: Dict[str, int], verdict: str) -> Dict[str, int]:
     result = dict(_fresh_stats())
-    result.update({key: int(value or 0) for key, value in stats.items() if key in result})
+    result.update(
+        {
+            key: int(value or 0)
+            for key, value in stats.items()
+            if key in result
+        }
+    )
     result["total_rounds"] += 1
     if verdict == "HIT":
         result["wins"] += 1
         result["current_win_streak"] += 1
         result["current_loss_streak"] = 0
-        result["max_win_streak"] = max(result["max_win_streak"], result["current_win_streak"])
+        result["max_win_streak"] = max(
+            result["max_win_streak"],
+            result["current_win_streak"],
+        )
     elif verdict == "MISS":
         result["losses"] += 1
         result["current_loss_streak"] += 1
         result["current_win_streak"] = 0
-        result["max_loss_streak"] = max(result["max_loss_streak"], result["current_loss_streak"])
+        result["max_loss_streak"] = max(
+            result["max_loss_streak"],
+            result["current_loss_streak"],
+        )
+    elif verdict == "OBSERVE":
+        result["observes"] += 1
     else:
         result["ties_skipped"] += 1
     return result
@@ -315,9 +378,8 @@ def run_virtual_round(
             preserved_reset_count = int(session.get("shoe_reset_count", 0) or 0)
             session.update(_new_shoe_state())
             session["shoe_reset_count"] = preserved_reset_count + 1
-            # A new shoe must clear sequence conditioning, but the visible
-            # analysis log and cumulative statistics remain available.
-            session["round_history"] = []
+            # The replacement shoe already contains its own hidden warm-up
+            # history. Visible analysis logs and cumulative statistics remain.
             session["last_prediction"] = {}
             session["last_virtual_hand"] = {}
             shoe_reset = True
@@ -370,6 +432,12 @@ def run_virtual_round(
             "confidence_label": prediction.get("confidence_label"),
             "quality_score": prediction.get("quality_score"),
             "uncertainty": prediction.get("uncertainty"),
+            "validation_gap": prediction.get("validation_gap"),
+            "model_core": prediction.get("model_core"),
+            "hypergeometric_probabilities": prediction.get(
+                "hypergeometric_probabilities"
+            ),
+            "weights": prediction.get("weights"),
             "virtual_outcome": prediction.get("virtual_outcome"),
             "virtual_outcome_text": prediction.get("virtual_outcome_text"),
             "verdict": prediction.get("verdict"),
