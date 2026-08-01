@@ -2,4 +2,6 @@ fastapi[standard]==0.139.0
 pydantic>=2.0,<3.0
 requests>=2.31,<3.0
 numpy>=1.26,<2.4
+opencv-python-headless==4.12.0.88
+easyocr==1.7.2
 tensorflow-cpu==2.21.0
