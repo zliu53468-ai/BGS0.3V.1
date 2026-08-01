@@ -1,13 +1,8 @@
-"""BGS V7 hypergeometric click-only virtual-shoe baccarat application.
+"""BGS V9 LINE Bot：全畫面 OCR＋大路偵測＋超幾何機率面板。
 
-Features:
-- Mobile web UI matching the supplied yellow card-style layout.
-- LINE Flex venue selection with uploaded venue artwork.
-- No point input: every click predicts and then deals one internal virtual hand.
-- Eight-deck depletion, Monte Carlo replicas, hidden-order particle ensemble,
-  calibrated sequence component, and honest virtual hit/miss statistics.
-
-The model is connected only to its own virtual shoe, not an external live table.
+同時保留原有虛擬牌靴點擊分析、館別流程、試用與開通機制。
+使用者傳送遊戲畫面後，後端會平行執行房間資訊 OCR 與大路偵測，
+再以剩餘總張數估計牌值組成，交給超幾何＋蒙地卡羅核心計算。
 """
 from __future__ import annotations
 
@@ -18,6 +13,7 @@ import hmac
 import json
 import os
 import threading
+import tempfile
 import traceback
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -32,6 +28,9 @@ from pydantic import BaseModel, Field
 
 import store
 from predictor import run_virtual_round
+from road_model import calculate_road_probabilities
+from screen_pipeline import analyze_game_screen
+from screenshot_predictor import predict_from_screenshot
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,6 +48,10 @@ MAX_CONCURRENT_PREDICTIONS = max(
 )
 PREDICTION_QUEUE_TIMEOUT = max(
     5, min(55, int(os.getenv("APP_PREDICTION_QUEUE_TIMEOUT", "45") or "45"))
+)
+LINE_IMAGE_MAX_BYTES = max(
+    1_000_000,
+    min(20_000_000, int(os.getenv("LINE_IMAGE_MAX_BYTES", "10000000") or "10000000")),
 )
 _PREDICTION_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_PREDICTIONS)
 
@@ -80,8 +83,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V7 Hypergeometric Virtual Shoe Bot",
-    version="7.0.0",
+    title="BGS V9 Screen OCR + Road Vision Bot",
+    version="9.0.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -153,6 +156,170 @@ def _reply(token: str, messages: List[Dict[str, Any]]) -> None:
 
 def _text(text: str) -> Dict[str, Any]:
     return {"type": "text", "text": str(text)[:5000]}
+
+
+def _road_quick_reply() -> Dict[str, Any]:
+    """建立路紙辨識後的三個手動校正按鈕。"""
+    return {
+        "items": [
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback",
+                    "label": "🔴 補輸：莊",
+                    "data": "action=road_append&result=B",
+                    "displayText": "🔴 補輸：莊",
+                },
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback",
+                    "label": "🔵 補輸：閒",
+                    "data": "action=road_append&result=P",
+                    "displayText": "🔵 補輸：閒",
+                },
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback",
+                    "label": "🔄 清除重來",
+                    "data": "action=road_clear",
+                    "displayText": "🔄 清除重來",
+                },
+            },
+        ]
+    }
+
+
+def _road_text_message(
+    session: Mapping[str, Any],
+    *,
+    notice: str = "",
+) -> Dict[str, Any]:
+    """把路紙序列與模擬結果包成附 Quick Reply 的文字訊息。"""
+    sequence = [
+        str(item).upper()
+        for item in list(session.get("road_sequence") or [])
+        if str(item).upper() in {"B", "P"}
+    ]
+    analysis = dict(session.get("road_last_analysis") or {})
+    vision = dict(session.get("road_last_vision") or {})
+
+    compact = "".join("莊" if item == "B" else "閒" for item in sequence[-30:])
+    if len(sequence) > 30:
+        compact = "…" + compact
+    if not compact:
+        compact = "尚無資料"
+
+    lines = []
+    if notice:
+        lines.append(str(notice))
+    lines.extend(
+        [
+            f"路紙資料：{len(sequence)} 局",
+            f"最近序列：{compact}",
+        ]
+    )
+
+    if analysis:
+        lines.extend(
+            [
+                f"莊：{float(analysis.get('banker_rate', 50.0)):.2f}%",
+                f"閒：{float(analysis.get('player_rate', 50.0)):.2f}%",
+                f"機率領先：{analysis.get('direction_text') or '-'}",
+                f"操作訊號：{analysis.get('action_text') or '觀望'}｜品質：{analysis.get('confidence_label') or '偏低'}",
+            ]
+        )
+    else:
+        lines.append("操作訊號：觀望")
+
+    if vision:
+        lines.append(
+            "影像辨識："
+            f"成功 {int(vision.get('recognized_count', 0) or 0)} 個｜"
+            f"顏色不明 {int(vision.get('unknown_candidates', 0) or 0)} 個"
+        )
+
+    lines.append("可用下方按鈕補輸最新一局，或清除後重新傳圖。")
+    lines.append("路紙模型只反映已輸入結果的統計傾向，不代表可預知外部牌局。")
+    return {
+        "type": "text",
+        "text": "\n".join(lines)[:5000],
+        "quickReply": _road_quick_reply(),
+    }
+
+
+def _road_error_message(message: str) -> Dict[str, Any]:
+    return {
+        "type": "text",
+        "text": (
+            f"⚠️ {message}\n"
+            "請裁切到大路區域後重新傳送；也可以先用下方按鈕手動補輸。"
+        )[:5000],
+        "quickReply": _road_quick_reply(),
+    }
+
+
+def _download_line_image(message_id: str) -> Path:
+    """從 LINE Content API 下載圖片到短期暫存檔。"""
+    if not CHANNEL_ACCESS_TOKEN:
+        raise RuntimeError("尚未設定 LINE_CHANNEL_ACCESS_TOKEN。")
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        raise ValueError("LINE 圖片 messageId 不存在。")
+
+    response = _LINE_HTTP.get(
+        f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+        headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+        stream=True,
+        timeout=(5, 25),
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(
+            f"LINE 圖片下載失敗（HTTP {response.status_code}）。"
+        )
+
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    suffix = (
+        ".png"
+        if "png" in content_type
+        else ".webp"
+        if "webp" in content_type
+        else ".jpg"
+    )
+    expected_length = int(response.headers.get("Content-Length") or 0)
+    if expected_length > LINE_IMAGE_MAX_BYTES:
+        raise ValueError("圖片檔案過大，請裁切路紙區域後再傳送。")
+
+    temporary = tempfile.NamedTemporaryFile(
+        prefix="line_road_",
+        suffix=suffix,
+        delete=False,
+    )
+    total = 0
+    try:
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > LINE_IMAGE_MAX_BYTES:
+                raise ValueError("圖片檔案過大，請裁切路紙區域後再傳送。")
+            temporary.write(chunk)
+        temporary.flush()
+    except Exception:
+        temporary.close()
+        Path(temporary.name).unlink(missing_ok=True)
+        raise
+    finally:
+        response.close()
+    temporary.close()
+
+    if total <= 0:
+        Path(temporary.name).unlink(missing_ok=True)
+        raise ValueError("LINE 回傳了空白圖片。")
+    return Path(temporary.name)
 
 
 def _postback_button(
@@ -402,6 +569,131 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     )
 
 
+def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
+    """遊戲畫面 OCR＋大路偵測完成後的 LINE Flex 面板。"""
+    prediction = dict(session.get("screen_last_prediction") or {})
+    ocr = dict(session.get("screen_last_ocr") or {})
+    detection = dict(session.get("screen_last_detection") or {})
+    sequence = [
+        str(item).upper()
+        for item in list(session.get("road_sequence") or [])
+        if str(item).upper() in {"B", "P"}
+    ]
+
+    venue_code = str(ocr.get("venue_code") or session.get("venue") or "")
+    venue_name = str(ocr.get("venue_name") or _venue_name(venue_code))
+    room = str(ocr.get("room") or session.get("room") or "1")
+    remaining = int(
+        ocr.get("remaining_cards")
+        or session.get("screen_remaining_cards")
+        or len(session.get("virtual_shoe") or [])
+        or 0
+    )
+    direction = str(prediction.get("recommend_text") or "-")
+    action = str(prediction.get("action_text") or "觀望")
+    analysis_number = int(session.get("screen_analysis_count", 0) or 0)
+    processing_ms = float(session.get("screen_processing_ms", 0.0) or 0.0)
+
+    flex = {
+        "type": "flex",
+        "altText": f"遊戲畫面分析結果：{action}",
+        "quickReply": _road_quick_reply(),
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#FFF4B8",
+                "paddingAll": "18px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"分析結果 #{analysis_number}",
+                        "weight": "bold",
+                        "size": "xl",
+                        "color": "#7B5600",
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"館別：{venue_name or '-'}｜桌號：{room}\n"
+                            f"剩餘：{remaining} 張｜路紙：{len(sequence)} 局"
+                        ),
+                        "wrap": True,
+                        "size": "sm",
+                        "margin": "sm",
+                        "color": "#665000",
+                    },
+                    {"type": "separator", "margin": "md", "color": "#E1BD43"},
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "spacing": "sm",
+                        "margin": "md",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%",
+                                "color": "#D52B2B",
+                                "weight": "bold",
+                            },
+                            {
+                                "type": "text",
+                                "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%",
+                                "color": "#2667D8",
+                                "weight": "bold",
+                            },
+                            {
+                                "type": "text",
+                                "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%",
+                                "color": "#259B55",
+                                "weight": "bold",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"機率領先方向：{direction}\n"
+                            f"操作建議：{action}｜品質：{prediction.get('confidence_label') or '偏低'}\n"
+                            f"辨識：OCR {ocr.get('backend') or '未取得'}｜"
+                            f"大路 {int(detection.get('recognized_count', 0) or 0)} 個\n"
+                            f"處理時間：{processing_ms:.0f} ms"
+                        ),
+                        "wrap": True,
+                        "margin": "md",
+                        "color": "#3E3100",
+                    },
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "spacing": "sm",
+                        "margin": "lg",
+                        "contents": [
+                            _postback_button("繼續分析", "predict"),
+                            _postback_button("重新建立牌靴", "reset", color="#E29B19"),
+                            _postback_button("結束分析", "end", style="secondary"),
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "截圖只提供剩餘總張數，牌值組成為估計；"
+                            "請用下方快速按鈕校正最新莊閒結果。"
+                        ),
+                        "wrap": True,
+                        "size": "xs",
+                        "margin": "md",
+                        "color": "#806A2A",
+                    },
+                ],
+            },
+        },
+    }
+    return _clean_flex(flex)
+
+
 def ended_panel() -> Dict[str, Any]:
     return _clean_flex(
         {
@@ -481,6 +773,45 @@ def _run_prediction(user_id: str) -> Dict[str, Any]:
         _PREDICTION_SLOTS.release()
 
 
+def _refresh_screen_prediction(
+    user_id: str,
+    sequence: List[str],
+) -> Dict[str, Any]:
+    """手動補輸後，用最近一次 OCR 的剩餘張數重新刷新面板。"""
+    session = store.get_session(user_id)
+    ocr = dict(session.get("screen_last_ocr") or {})
+    detection = dict(session.get("screen_last_detection") or {})
+    remaining = int(
+        ocr.get("remaining_cards")
+        or session.get("screen_remaining_cards")
+        or len(session.get("virtual_shoe") or [])
+        or 416
+    )
+    prediction = predict_from_screenshot(
+        sequence,
+        remaining_cards=remaining,
+        prior_counts=session.get("remaining_counts"),
+        venue=str(ocr.get("venue_code") or session.get("venue") or ""),
+        room=str(ocr.get("room") or session.get("room") or "1"),
+        user_id=user_id,
+    )
+    resolved = {
+        "venue_code": str(ocr.get("venue_code") or session.get("venue") or ""),
+        "venue_name": str(ocr.get("venue_name") or ""),
+        "room": str(ocr.get("room") or session.get("room") or "1"),
+        "remaining_cards": remaining,
+    }
+    return store.update_screen_analysis(
+        user_id,
+        ocr=ocr,
+        detection=detection,
+        sequence=sequence,
+        prediction=prediction,
+        resolved=resolved,
+        processing_ms=0.0,
+    )
+
+
 def _public_session(session: Mapping[str, Any]) -> Dict[str, Any]:
     data = copy_session = dict(session)
     copy_session.pop("virtual_shoe", None)
@@ -508,13 +839,17 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "7.0.0",
-            "engine": "V7_HYPERGEOMETRIC_PARTICLE_MONTE_CARLO",
+            "version": "9.0.0",
+            "engine": "V9_SCREEN_OCR_ROAD_HYPERGEOMETRIC_MC",
             "input_required": False,
-            "virtual_only": True,
+            "virtual_only": False,
             "public_base_url_configured": bool(PUBLIC_BASE_URL),
             "venues": [venue["code"] for venue in VENUES],
             "max_concurrent_predictions": MAX_CONCURRENT_PREDICTIONS,
+            "road_image_recognition": True,
+            "room_info_ocr": True,
+            "parallel_screen_pipeline": True,
+            "road_manual_quick_reply": True,
         }
     )
 
@@ -585,19 +920,110 @@ async def webhook(request: Request) -> JSONResponse:
         token = str(event.get("replyToken") or "")
         source = event.get("source") or {}
         user_id = str(
-            source.get("userId") or source.get("groupId") or source.get("roomId") or "anonymous"
+            source.get("userId")
+            or source.get("groupId")
+            or source.get("roomId")
+            or "anonymous"
         )
+        temporary_image: Optional[Path] = None
         try:
             event_type = event.get("type")
+            message = event.get("message") or {}
+            message_type = str(message.get("type") or "")
+
             if event_type == "follow":
                 _reply(token, [venue_panel(user_id)])
                 continue
 
-            if event_type == "message" and (event.get("message") or {}).get("type") == "text":
-                text = str((event.get("message") or {}).get("text") or "").strip()
+            # ──────────────────────────────────────────────────────────────
+            # 圖片路紙辨識：下載 -> 幾何輪廓 -> 圓心 5x5 HSV -> 路紙模型
+            # ──────────────────────────────────────────────────────────────
+            if event_type == "message" and message_type == "image":
+                _ensure_access(user_id)
+                temporary_image = await asyncio.to_thread(
+                    _download_line_image,
+                    str(message.get("id") or ""),
+                )
+                current_session = store.get_session(user_id)
+                screen = await asyncio.to_thread(
+                    analyze_game_screen,
+                    temporary_image,
+                    current_session,
+                )
+                sequence = list(screen.get("sequence") or [])
+                if not sequence:
+                    road_errors = list((screen.get("road") or {}).get("errors") or [])
+                    detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
+                    _reply(token, [_road_error_message(f"{detail}。請確認 ROAD_ROI 設定或裁切畫面。")])
+                    continue
+
+                resolved = dict(screen.get("resolved") or {})
+                prediction = await asyncio.to_thread(
+                    predict_from_screenshot,
+                    sequence,
+                    remaining_cards=resolved.get("remaining_cards"),
+                    prior_counts=current_session.get("remaining_counts"),
+                    venue=str(resolved.get("venue_code") or current_session.get("venue") or ""),
+                    room=str(resolved.get("room") or current_session.get("room") or "1"),
+                    user_id=user_id,
+                )
+                session = store.update_screen_analysis(
+                    user_id,
+                    ocr=dict(screen.get("ocr") or {}),
+                    detection=dict(screen.get("road") or {}),
+                    sequence=sequence,
+                    prediction=prediction,
+                    resolved=resolved,
+                    processing_ms=float(screen.get("elapsed_ms", 0.0) or 0.0),
+                )
+                _reply(token, [screen_result_panel(user_id, session)])
+                continue
+
+            if event_type == "message" and message_type == "text":
+                text = str(message.get("text") or "").strip()
                 if text in ALL_CODES:
                     plan = _activate_code(user_id, text)
                     _reply(token, [_text(f"✅ 已開通：{plan}"), venue_panel(user_id)])
+                    continue
+
+                # Quick Reply 使用 postback，但仍保留文字相容入口。
+                if text in {"🔴 補輸：莊", "補輸莊", "補莊"}:
+                    current = store.get_session(user_id)
+                    sequence = list(current.get("road_sequence") or []) + ["B"]
+                    if current.get("screen_last_ocr") or current.get("screen_last_prediction"):
+                        session = await asyncio.to_thread(_refresh_screen_prediction, user_id, sequence)
+                        _reply(token, [screen_result_panel(user_id, session)])
+                    else:
+                        analysis = calculate_road_probabilities(sequence)
+                        session = store.append_road_result(user_id, "B", analysis=analysis)
+                        _reply(token, [_road_text_message(session, notice="🔴 已補輸：莊")])
+                    continue
+                if text in {"🔵 補輸：閒", "補輸閒", "補閒"}:
+                    current = store.get_session(user_id)
+                    sequence = list(current.get("road_sequence") or []) + ["P"]
+                    if current.get("screen_last_ocr") or current.get("screen_last_prediction"):
+                        session = await asyncio.to_thread(_refresh_screen_prediction, user_id, sequence)
+                        _reply(token, [screen_result_panel(user_id, session)])
+                    else:
+                        analysis = calculate_road_probabilities(sequence)
+                        session = store.append_road_result(user_id, "P", analysis=analysis)
+                        _reply(token, [_road_text_message(session, notice="🔵 已補輸：閒")])
+                    continue
+                if text in {"🔄 清除重來", "清除路紙", "重來"}:
+                    session = store.clear_road_sequence(user_id)
+                    _reply(token, [_road_text_message(session, notice="🔄 路紙資料已清除")])
+                    continue
+                if text in {"路紙", "路單", "圖片辨識"}:
+                    session = store.get_session(user_id)
+                    _reply(
+                        token,
+                        [
+                            _road_text_message(
+                                session,
+                                notice="請直接傳送裁切後的大路截圖。",
+                            )
+                        ],
+                    )
                     continue
 
                 if text in {"開始", "開始分析", "選館", "重新選館", "館別"}:
@@ -629,8 +1055,37 @@ async def webhook(request: Request) -> JSONResponse:
                         str((event.get("postback") or {}).get("data") or "")
                     ).items()
                 }
-                action_name = query.get("action")
-                if action_name == "venue":
+                action_name = str(query.get("action") or "")
+
+                if action_name == "road_append":
+                    value = str(query.get("result") or "").upper()
+                    if value not in {"B", "P"}:
+                        raise ValueError("手動路紙結果不正確。")
+                    current = store.get_session(user_id)
+                    sequence = list(current.get("road_sequence") or []) + [value]
+                    if current.get("screen_last_ocr") or current.get("screen_last_prediction"):
+                        session = await asyncio.to_thread(
+                            _refresh_screen_prediction,
+                            user_id,
+                            sequence,
+                        )
+                        _reply(token, [screen_result_panel(user_id, session)])
+                    else:
+                        analysis = await asyncio.to_thread(
+                            calculate_road_probabilities,
+                            sequence,
+                        )
+                        session = store.append_road_result(
+                            user_id,
+                            value,
+                            analysis=analysis,
+                        )
+                        notice = "🔴 已補輸：莊" if value == "B" else "🔵 已補輸：閒"
+                        _reply(token, [_road_text_message(session, notice=notice)])
+                elif action_name == "road_clear":
+                    session = store.clear_road_sequence(user_id)
+                    _reply(token, [_road_text_message(session, notice="🔄 路紙資料已清除")])
+                elif action_name == "venue":
                     venue = str(query.get("venue") or "").upper()
                     if venue not in VENUE_BY_CODE:
                         raise ValueError("無效館別")
@@ -649,6 +1104,8 @@ async def webhook(request: Request) -> JSONResponse:
                 elif action_name == "end":
                     store.end_session(user_id)
                     _reply(token, [ended_panel()])
+                elif action_name == "venues":
+                    _reply(token, [venue_panel(user_id)])
                 else:
                     _reply(token, [venue_panel(user_id)])
                 continue
@@ -664,7 +1121,11 @@ async def webhook(request: Request) -> JSONResponse:
                             "type": "buttons",
                             "text": "試用已到期",
                             "actions": [
-                                {"type": "uri", "label": "聯繫管理員", "uri": ADMIN_LINE_URL}
+                                {
+                                    "type": "uri",
+                                    "label": "聯繫管理員",
+                                    "uri": ADMIN_LINE_URL,
+                                }
                             ],
                         },
                     },
@@ -672,6 +1133,12 @@ async def webhook(request: Request) -> JSONResponse:
             )
         except Exception as exc:
             traceback.print_exc()
-            _reply(token, [_text(f"系統忙碌：{exc}")])
+            if event.get("type") == "message" and (event.get("message") or {}).get("type") == "image":
+                _reply(token, [_road_error_message(f"圖片處理失敗：{exc}")])
+            else:
+                _reply(token, [_text(f"系統忙碌：{exc}")])
+        finally:
+            if temporary_image is not None:
+                temporary_image.unlink(missing_ok=True)
 
     return JSONResponse({"ok": True})
