@@ -42,6 +42,9 @@ VIRTUAL_WARMUP_MAX = max(
     VIRTUAL_WARMUP_MIN,
     min(100, int(os.getenv("VIRTUAL_WARMUP_MAX", "25") or "25")),
 )
+DEFAULT_ANALYSIS_MODE = os.getenv("DEFAULT_ANALYSIS_MODE", "screen").strip().lower()
+if DEFAULT_ANALYSIS_MODE not in {"screen", "virtual"}:
+    DEFAULT_ANALYSIS_MODE = "screen"
 _LOCK = threading.RLock()
 
 
@@ -132,6 +135,28 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         "pending_prediction": {},
         "last_virtual_hand": {},
         "stats": _fresh_stats(),
+        # 分析模式分流。screen=真人畫面截圖；virtual=程式內建虛擬牌靴。
+        "analysis_mode": DEFAULT_ANALYSIS_MODE,
+        "awaiting_screenshot": False,
+        "screen_data_version": 0,
+        "screen_prediction_version": 0,
+        "screen_last_input_source": "",
+        "screen_last_data_updated_at": 0,
+        # 路紙影像辨識與手動校正狀態，與虛擬牌靴狀態分開保存。
+        "road_sequence": [],
+        "road_last_analysis": {},
+        "road_last_vision": {},
+        "road_source": "",
+        "road_last_image_at": 0,
+        "road_corrections": 0,
+        # 全畫面 OCR＋大路辨識狀態。
+        "screen_last_ocr": {},
+        "screen_last_detection": {},
+        "screen_last_prediction": {},
+        "screen_remaining_cards": 0,
+        "screen_analysis_count": 0,
+        "screen_last_analyzed_at": 0,
+        "screen_processing_ms": 0.0,
         "trial_started_at": 0,
         "access_until": 0,
         "permanent_access": False,
@@ -183,6 +208,68 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         session["round_history"] = []
     if not isinstance(session.get("analysis_history"), list):
         session["analysis_history"] = []
+
+    # 舊版 Session 自動補上路紙欄位，並清除不合法字元。
+    if not isinstance(session.get("road_sequence"), list):
+        session["road_sequence"] = []
+    session["road_sequence"] = [
+        str(item).upper().strip()
+        for item in session.get("road_sequence", [])
+        if str(item).upper().strip() in {"B", "P"}
+    ][-500:]
+    if not isinstance(session.get("road_last_analysis"), dict):
+        session["road_last_analysis"] = {}
+    if not isinstance(session.get("road_last_vision"), dict):
+        session["road_last_vision"] = {}
+    session["road_source"] = str(session.get("road_source") or "")
+    session["road_last_image_at"] = max(
+        0, int(session.get("road_last_image_at", 0) or 0)
+    )
+    session["road_corrections"] = max(
+        0, int(session.get("road_corrections", 0) or 0)
+    )
+
+    # 舊版 Session 自動補上模式與畫面資料版本欄位。
+    mode = str(session.get("analysis_mode") or DEFAULT_ANALYSIS_MODE).strip().lower()
+    session["analysis_mode"] = mode if mode in {"screen", "virtual"} else DEFAULT_ANALYSIS_MODE
+    session["awaiting_screenshot"] = bool(session.get("awaiting_screenshot", False))
+    session["screen_data_version"] = max(
+        0, int(session.get("screen_data_version", 0) or 0)
+    )
+    session["screen_prediction_version"] = max(
+        0, int(session.get("screen_prediction_version", 0) or 0)
+    )
+    session["screen_prediction_version"] = min(
+        session["screen_prediction_version"],
+        session["screen_data_version"],
+    )
+    session["screen_last_input_source"] = str(
+        session.get("screen_last_input_source") or ""
+    )
+    session["screen_last_data_updated_at"] = max(
+        0, int(session.get("screen_last_data_updated_at", 0) or 0)
+    )
+
+    # 舊版 Session 自動補上全畫面辨識欄位。
+    for key in ("screen_last_ocr", "screen_last_detection", "screen_last_prediction"):
+        if not isinstance(session.get(key), dict):
+            session[key] = {}
+    session["screen_remaining_cards"] = max(
+        0, min(416, int(session.get("screen_remaining_cards", 0) or 0))
+    )
+    session["screen_analysis_count"] = max(
+        0, int(session.get("screen_analysis_count", 0) or 0)
+    )
+    session["screen_last_analyzed_at"] = max(
+        0, int(session.get("screen_last_analyzed_at", 0) or 0)
+    )
+    try:
+        session["screen_processing_ms"] = max(
+            0.0, float(session.get("screen_processing_ms", 0.0) or 0.0)
+        )
+    except Exception:
+        session["screen_processing_ms"] = 0.0
+
     if not isinstance(session.get("stats"), dict):
         session["stats"] = _fresh_stats()
     else:
@@ -244,7 +331,9 @@ def select_venue(user_id: str, venue: str, room: str = "1") -> Dict[str, Any]:
         changed = str(session.get("venue") or "") != str(venue or "")
         session["venue"] = str(venue or "")
         session["room"] = str(room or "1")
-        session["status"] = "分析中"
+        session["analysis_mode"] = DEFAULT_ANALYSIS_MODE
+        session["awaiting_screenshot"] = False
+        session["status"] = "待開始分析"
         if changed:
             preserved_reset_count = int(session.get("shoe_reset_count", 0) or 0)
             session.update(_new_shoe_state())
@@ -270,7 +359,14 @@ def start_session(user_id: str, venue: str = "", room: str = "1") -> Dict[str, A
 
 
 def end_session(user_id: str) -> Dict[str, Any]:
-    return upsert_session(user_id, {"status": "已結束", "pending_prediction": {}})
+    return upsert_session(
+        user_id,
+        {
+            "status": "已結束",
+            "pending_prediction": {},
+            "awaiting_screenshot": False,
+        },
+    )
 
 
 def reset_shoe(
@@ -290,6 +386,8 @@ def reset_shoe(
         preserved_reset_count = int(session.get("shoe_reset_count", 0) or 0)
         session.update(_new_shoe_state())
         session["shoe_reset_count"] = preserved_reset_count + 1
+        session["analysis_mode"] = "virtual"
+        session["awaiting_screenshot"] = False
         session["status"] = "分析中"
         if venue is not None:
             session["venue"] = str(venue or "")
@@ -391,6 +489,8 @@ def run_virtual_round(
         if not prediction.get("ok") or not hand or not _valid_shoe(remaining_shoe):
             raise ValueError("虛擬牌靴分析回傳格式錯誤。")
 
+        session["analysis_mode"] = "virtual"
+        session["awaiting_screenshot"] = False
         session["virtual_shoe"] = remaining_shoe
         session["remaining_counts"] = counts_from_shoe(remaining_shoe)
         session["hand_number"] = int(session.get("hand_number", 0) or 0) + 1
@@ -460,6 +560,236 @@ def run_virtual_round(
         return copy.deepcopy(session)
 
 
+def begin_screen_analysis(
+    user_id: str,
+    *,
+    clear_existing: bool = False,
+) -> Dict[str, Any]:
+    """切換到截圖模式並標記為等待最新遊戲畫面。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    with _LOCK:
+        data = _load_all_unlocked()
+        raw = data.get(uid)
+        session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
+        session["analysis_mode"] = "screen"
+        session["awaiting_screenshot"] = True
+        session["status"] = "等待遊戲截圖"
+        if clear_existing:
+            session["road_sequence"] = []
+            session["road_last_analysis"] = {}
+            session["road_last_vision"] = {}
+            session["screen_last_ocr"] = {}
+            session["screen_last_detection"] = {}
+            session["screen_last_prediction"] = {}
+            session["screen_remaining_cards"] = 0
+            session["screen_processing_ms"] = 0.0
+            session["screen_data_version"] = 0
+            session["screen_prediction_version"] = 0
+            session["screen_last_input_source"] = ""
+            session["screen_last_data_updated_at"] = 0
+        session["updated_at"] = _now()
+        data[uid] = session
+        _save_all_unlocked(data)
+        return copy.deepcopy(session)
+
+
+def begin_virtual_analysis(user_id: str) -> Dict[str, Any]:
+    """明確切換回內建虛擬牌靴模式。"""
+    return upsert_session(
+        user_id,
+        {
+            "analysis_mode": "virtual",
+            "awaiting_screenshot": False,
+            "status": "分析中",
+        },
+    )
+
+
+def clear_screen_analysis(
+    user_id: str,
+    *,
+    keep_mode: bool = True,
+) -> Dict[str, Any]:
+    """清除 OCR、路紙與截圖預測，不破壞試用、開通與虛擬牌靴資料。"""
+    updates: Dict[str, Any] = {
+        "road_sequence": [],
+        "road_last_analysis": {},
+        "road_last_vision": {},
+        "road_source": "",
+        "road_last_image_at": 0,
+        "road_corrections": 0,
+        "screen_last_ocr": {},
+        "screen_last_detection": {},
+        "screen_last_prediction": {},
+        "screen_remaining_cards": 0,
+        "screen_processing_ms": 0.0,
+        "screen_data_version": 0,
+        "screen_prediction_version": 0,
+        "screen_last_input_source": "",
+        "screen_last_data_updated_at": 0,
+        "awaiting_screenshot": bool(keep_mode),
+        "status": "等待遊戲截圖" if keep_mode else "待開始分析",
+    }
+    if keep_mode:
+        updates["analysis_mode"] = "screen"
+    return upsert_session(user_id, updates)
+
+
+def screen_has_fresh_data(session: Mapping[str, Any]) -> bool:
+    """判斷截圖/手動結果是否比最後一次預測更新。"""
+    return int(session.get("screen_data_version", 0) or 0) > int(
+        session.get("screen_prediction_version", 0) or 0
+    )
+
+
+def set_road_sequence(
+    user_id: str,
+    sequence: List[str],
+    *,
+    analysis: Optional[Mapping[str, Any]] = None,
+    vision: Optional[Mapping[str, Any]] = None,
+    source: str = "image",
+) -> Dict[str, Any]:
+    """覆蓋使用者的路紙序列，通常由影像辨識成功後呼叫。"""
+    cleaned = [
+        str(item).upper().strip()
+        for item in list(sequence or [])
+        if str(item).upper().strip() in {"B", "P"}
+    ][-500:]
+    return upsert_session(
+        user_id,
+        {
+            "road_sequence": cleaned,
+            "road_last_analysis": dict(analysis or {}),
+            "road_last_vision": dict(vision or {}),
+            "road_source": str(source or "image"),
+            "road_last_image_at": _now() if str(source or "") == "image" else 0,
+        },
+    )
+
+
+def append_road_result(
+    user_id: str,
+    outcome: str,
+    *,
+    analysis: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """在路紙尾端手動補上一局 B 或 P。"""
+    value = str(outcome or "").upper().strip()
+    if value not in {"B", "P"}:
+        raise ValueError("路紙結果只能是 B 或 P。")
+
+    with _LOCK:
+        data = _load_all_unlocked()
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+        raw = data.get(uid)
+        session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
+        sequence = list(session.get("road_sequence") or [])
+        sequence.append(value)
+        session["road_sequence"] = sequence[-500:]
+        session["road_source"] = "manual"
+        session["road_corrections"] = int(session.get("road_corrections", 0) or 0) + 1
+        if str(session.get("analysis_mode") or "") == "screen":
+            session["screen_data_version"] = int(
+                session.get("screen_data_version", 0) or 0
+            ) + 1
+            session["screen_last_input_source"] = "manual"
+            session["screen_last_data_updated_at"] = _now()
+            session["awaiting_screenshot"] = False
+        if analysis is not None:
+            session["road_last_analysis"] = dict(analysis)
+        session["updated_at"] = _now()
+        data[uid] = session
+        _save_all_unlocked(data)
+        return copy.deepcopy(session)
+
+
+def update_road_analysis(
+    user_id: str,
+    analysis: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """只更新路紙模型結果，不改動序列。"""
+    return upsert_session(user_id, {"road_last_analysis": dict(analysis or {})})
+
+
+def clear_road_sequence(user_id: str) -> Dict[str, Any]:
+    """清除路紙與截圖辨識結果；保留目前分析模式。"""
+    current = get_session(user_id)
+    return clear_screen_analysis(
+        user_id,
+        keep_mode=str(current.get("analysis_mode") or "") == "screen",
+    )
+
+
+def update_screen_analysis(
+    user_id: str,
+    *,
+    ocr: Mapping[str, Any],
+    detection: Mapping[str, Any],
+    sequence: List[str],
+    prediction: Mapping[str, Any],
+    resolved: Optional[Mapping[str, Any]] = None,
+    processing_ms: float = 0.0,
+    source: str = "screen_image",
+) -> Dict[str, Any]:
+    """原子更新一張遊戲截圖的 OCR、路紙序列與模型結果。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    cleaned = [
+        str(item).upper().strip()
+        for item in list(sequence or [])
+        if str(item).upper().strip() in {"B", "P"}
+    ][-500:]
+    resolved_data = dict(resolved or {})
+
+    with _LOCK:
+        data = _load_all_unlocked()
+        raw = data.get(uid)
+        session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
+
+        venue = str(resolved_data.get("venue_code") or "").upper().strip()
+        room = str(resolved_data.get("room") or "").strip()
+        remaining = resolved_data.get("remaining_cards")
+        if venue:
+            session["venue"] = venue
+        if room:
+            session["room"] = room
+        try:
+            remaining_value = max(0, min(416, int(remaining or 0)))
+        except Exception:
+            remaining_value = 0
+
+        next_data_version = int(session.get("screen_data_version", 0) or 0) + 1
+        session["analysis_mode"] = "screen"
+        session["awaiting_screenshot"] = False
+        session["screen_data_version"] = next_data_version
+        session["screen_prediction_version"] = next_data_version
+        session["screen_last_input_source"] = str(source or "screen_image")
+        session["screen_last_data_updated_at"] = _now()
+        session["road_sequence"] = cleaned
+        session["road_last_analysis"] = dict(prediction or {})
+        session["road_last_vision"] = dict(detection or {})
+        session["road_source"] = str(source or "screen_image")
+        session["road_last_image_at"] = _now()
+        session["screen_last_ocr"] = dict(ocr or {})
+        session["screen_last_detection"] = dict(detection or {})
+        session["screen_last_prediction"] = dict(prediction or {})
+        session["screen_remaining_cards"] = remaining_value
+        session["screen_analysis_count"] = int(session.get("screen_analysis_count", 0) or 0) + 1
+        session["screen_last_analyzed_at"] = _now()
+        session["screen_processing_ms"] = max(0.0, float(processing_ms or 0.0))
+        session["status"] = "分析中"
+        session["updated_at"] = _now()
+
+        data[uid] = session
+        _save_all_unlocked(data)
+        return copy.deepcopy(session)
+
 def save_prediction(user_id: str, prediction: Mapping[str, Any]) -> Dict[str, Any]:
     return upsert_session(
         user_id,
@@ -508,13 +838,22 @@ def activate(user_id: str, code: str) -> bool:
 __all__ = [
     "access_status",
     "activate",
+    "append_road_result",
+    "begin_screen_analysis",
+    "begin_virtual_analysis",
+    "clear_screen_analysis",
+    "clear_road_sequence",
     "end_session",
     "get_session",
     "reset_session",
     "reset_shoe",
     "run_virtual_round",
     "save_prediction",
+    "screen_has_fresh_data",
     "select_venue",
+    "set_road_sequence",
+    "update_road_analysis",
+    "update_screen_analysis",
     "set_room",
     "start_session",
     "upsert_session",
