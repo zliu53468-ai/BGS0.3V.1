@@ -117,6 +117,11 @@ PATH_TRANSITION_SELF_BIAS = _env_float(
     "PF_PATH_TRANSITION_SELF_BIAS", 0.06, 0.0, 0.20
 )
 
+# 新增：正則化重採樣雜訊強度（0=關閉）
+REGULARIZATION_NOISE = _env_float("PF_REGULARIZATION_NOISE", 0.0, 0.0, 2.0)
+# 新增：動態先驗深度強度倍率（1.0=全開，0=關閉）
+DYNAMIC_PRIOR_DEPTH = _env_float("PF_DYNAMIC_PRIOR_DEPTH", 1.0, 0.0, 1.0)
+
 # Independent draw-path head. It reuses the existing forecast samples and adds
 # no extra particle, replica or Monte Carlo loops. The head is residualized
 # against the ordinary particle forecast before it can affect final probabilities.
@@ -1784,6 +1789,14 @@ class V5ReplicaEngine:
                     ),
                 )
                 counts = fresh_shoe_counts(self.decks)
+                # ====== 新增：初始牌組微擾動（模擬洗牌誤差） ======
+                if self.rng.random() < 0.2:  # 20% 機率擾動
+                    i, j = self.rng.choice(10, size=2, replace=False)
+                    max_swap = min(8, counts[i], counts[j])
+                    if max_swap > 0:
+                        swap = self.rng.integers(1, max_swap+1)
+                        counts[i] -= swap
+                        counts[j] += swap
                 completed = 0
                 for _ in range(requested):
                     if int(counts.sum()) < 12:
@@ -1824,6 +1837,14 @@ class V5ReplicaEngine:
                         base_depth + int(self.rng.integers(-1, 2)),
                     ),
                 )
+                # ====== 新增：初始牌組微擾動（模擬洗牌誤差） ======
+                if self.rng.random() < 0.2:  # 20% 機率擾動
+                    i, j = self.rng.choice(10, size=2, replace=False)
+                    max_swap = min(8, counts[i], counts[j])
+                    if max_swap > 0:
+                        swap = self.rng.integers(1, max_swap+1)
+                        counts[i] -= swap
+                        counts[j] += swap
                 completed = 0
                 for _ in range(requested):
                     if int(counts.sum()) < 12:
@@ -1968,8 +1989,13 @@ class V5ReplicaEngine:
         # Weak Dirichlet smoothing stabilizes rare legal draw paths without
         # overriding the importance-weighted conditional evidence.
         path_prior = normalize_array(fallback_draw, DRAW_BASELINE)
+        # ====== 新增：動態先驗強度根據深度調整 ======
+        avg_depth = float(np.mean(prior_depths))
+        depth_factor = max(0.2, min(1.0, 1.0 - avg_depth / 90.0))
+        depth_factor = depth_factor * float(os.getenv("PF_DYNAMIC_PRIOR_DEPTH", "1.0"))
+        dynamic_prior_strength = float(settings["path_prior_strength"]) * depth_factor
         path_posterior = normalize_array(
-            path_weight_sums + float(settings["path_prior_strength"]) * path_prior,
+            path_weight_sums + dynamic_prior_strength * path_prior,
             fallback_draw,
         )
         if not accepted:
@@ -2051,6 +2077,22 @@ class V5ReplicaEngine:
         controls = controls[: self.particle_count]
         control_depths = control_depths[: self.particle_count]
         current_paths = current_paths[: self.particle_count]
+
+        # ====== 新增：正則化重採樣（提升粒子多樣性） ======
+        reg_noise = float(os.getenv("PF_REGULARIZATION_NOISE", "0.0"))
+        if reg_noise > 0.0:
+            rng_reg = np.random.default_rng(mix_seed(self.seed, 999))
+            for i in range(len(particles)):
+                noise = rng_reg.normal(0, reg_noise, size=10)
+                # 將雜訊加到剩餘牌數，確保不低於 0，且不超過初始牌數
+                new_counts = np.clip(particles[i].astype(float) + noise, 0, None).astype(np.int16)
+                # 確保總數與原粒子一致（微調）
+                total_diff = int(new_counts.sum()) - int(particles[i].sum())
+                if total_diff != 0:
+                    # 隨機調整一個牌值來補償總數差異
+                    idx = rng_reg.integers(0, 10)
+                    new_counts[idx] = max(0, new_counts[idx] - total_diff)
+                particles[i] = new_counts
         path_coverage = float(
             sum(
                 path_posterior[p]
