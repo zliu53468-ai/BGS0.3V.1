@@ -1,4 +1,4 @@
-"""BGS V6 click-only virtual-shoe baccarat application.
+"""BGS V7 hypergeometric click-only virtual-shoe baccarat application.
 
 Features:
 - Mobile web UI matching the supplied yellow card-style layout.
@@ -80,8 +80,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V6 Virtual Shoe Particle Bot",
-    version="6.0.0",
+    title="BGS V7 Hypergeometric Virtual Shoe Bot",
+    version="7.0.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -257,7 +257,8 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                     f"館別：{venue}\n"
                     f"桌號：{session.get('room') or '1'}\n"
                     f"牌靴：{session.get('shoe_id') or '-'}\n"
-                    f"剩餘牌數：{len(session.get('virtual_shoe') or [])}\n\n"
+                    f"剩餘牌數：{len(session.get('virtual_shoe') or [])}\n"
+                    f"中途預跑：{int(session.get('warmup_rounds', 0) or 0)} 局\n\n"
                     "不需輸入點數，直接點擊開始分析。"
                 ),
                 "wrap": True,
@@ -353,8 +354,10 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
             "text": (
                 f"分析方向：{recommend}\n"
                 f"訊號：{action}｜品質：{prediction.get('confidence_label') or '偏低'}\n"
+                f"核心：超幾何分布＋粒子/蒙地卡羅驗證\n"
                 f"虛擬開獎：{result_text}｜{verdict}\n"
-                f"累計：{stats.get('wins', 0)} 勝 / {stats.get('losses', 0)} 負 / {stats.get('ties_skipped', 0)} 和不計"
+                f"累計：{stats.get('wins', 0)} 勝 / {stats.get('losses', 0)} 負 / "
+                f"{stats.get('ties_skipped', 0)} 和不計 / {stats.get('observes', 0)} 觀望"
             ),
             "wrap": True,
             "margin": "md",
@@ -505,8 +508,8 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "6.0.0",
-            "engine": "V6_VIRTUAL_SHOE_PARTICLE_MONTE_CARLO",
+            "version": "7.0.0",
+            "engine": "V7_HYPERGEOMETRIC_PARTICLE_MONTE_CARLO",
             "input_required": False,
             "virtual_only": True,
             "public_base_url_configured": bool(PUBLIC_BASE_URL),
