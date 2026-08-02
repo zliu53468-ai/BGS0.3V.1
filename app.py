@@ -58,6 +58,15 @@ LINE_IMAGE_ANALYSIS_TIMEOUT = max(
 PREDICTION_QUEUE_TIMEOUT = max(
     5, min(55, int(os.getenv("APP_PREDICTION_QUEUE_TIMEOUT", "45") or "45"))
 )
+MANUAL_OUTCOME_TIMEOUT = max(
+    10.0,
+    min(90.0, float(os.getenv("MANUAL_OUTCOME_TIMEOUT", "55") or "55")),
+)
+PUSH_MAX_RETRIES = max(0, min(5, int(os.getenv("PUSH_MAX_RETRIES", "2") or "2")))
+PUSH_RETRY_DELAY_SECONDS = max(
+    0.2,
+    min(3.0, float(os.getenv("PUSH_RETRY_DELAY_SECONDS", "0.8") or "0.8")),
+)
 LINE_IMAGE_MAX_BYTES = max(
     1_000_000,
     min(20_000_000, int(os.getenv("LINE_IMAGE_MAX_BYTES", "10000000") or "10000000")),
@@ -206,27 +215,100 @@ def _reply(token: str, messages: List[Dict[str, Any]]) -> bool:
     return True
 
 
-def _push(to: str, messages: List[Dict[str, Any]]) -> bool:
-    """背景分析完成後，以 Push Message 主動傳送面板。"""
+def _push(
+    to: str,
+    messages: List[Dict[str, Any]],
+    *,
+    max_retries: Optional[int] = None,
+    retry_delay_seconds: Optional[float] = None,
+) -> bool:
+    """背景分析完成後以 Push 傳送；失敗會重試，全部失敗回傳 False。"""
     target = str(to or "").strip()
     if not target:
         return False
     if not CHANNEL_ACCESS_TOKEN:
         print("LINE push preview", target, json.dumps(messages, ensure_ascii=False))
         return False
-    response = _LINE_HTTP.post(
-        "https://api.line.me/v2/bot/message/push",
-        headers={
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={"to": target, "messages": messages[:5]},
-        timeout=10,
+
+    retries = PUSH_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    delay = (
+        PUSH_RETRY_DELAY_SECONDS
+        if retry_delay_seconds is None
+        else max(0.0, float(retry_delay_seconds))
     )
-    if response.status_code >= 300:
-        print("LINE push failed", response.status_code, response.text)
-        return False
-    return True
+    payload = {"to": target, "messages": messages[:5]}
+    headers = {
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    last_status = 0
+    last_body = ""
+    for attempt in range(retries + 1):
+        try:
+            response = _LINE_HTTP.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers=headers,
+                json=payload,
+                timeout=10,
+            )
+            last_status = int(response.status_code)
+            last_body = (response.text or "")[:500]
+            if response.status_code < 300:
+                if attempt > 0:
+                    print(
+                        "LINE push recovered",
+                        json.dumps(
+                            {
+                                "uid": target[-8:],
+                                "attempt": attempt,
+                                "status": last_status,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                return True
+            print(
+                "LINE push failed",
+                json.dumps(
+                    {
+                        "uid": target[-8:],
+                        "attempt": attempt,
+                        "status": last_status,
+                        "body": last_body,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as exc:
+            last_status = -1
+            last_body = str(exc)[:500]
+            print(
+                "LINE push exception",
+                json.dumps(
+                    {
+                        "uid": target[-8:],
+                        "attempt": attempt,
+                        "error": last_body,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        if attempt < retries and delay > 0:
+            time.sleep(delay)
+
+    print(
+        "LINE push exhausted",
+        json.dumps(
+            {
+                "uid": target[-8:],
+                "status": last_status,
+                "body": last_body,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return False
 
 
 def _schedule_background(coro: Any) -> None:
@@ -1220,10 +1302,13 @@ def _refresh_screen_prediction(
         "manual_update": True,
     }
 
-    acquired = _PREDICTION_SLOTS.acquire(timeout=PREDICTION_QUEUE_TIMEOUT)
-    if not acquired:
-        raise RuntimeError("目前分析人數較多，請稍後再按一次。")
+    prediction_slot_acquired = False
     try:
+        prediction_slot_acquired = _PREDICTION_SLOTS.acquire(
+            timeout=PREDICTION_QUEUE_TIMEOUT
+        )
+        if not prediction_slot_acquired:
+            raise RuntimeError("目前分析人數較多，請稍後再按一次。")
         prediction = predict_from_screenshot(
             sequence,
             raw_outcomes=raw_history,
@@ -1239,7 +1324,11 @@ def _refresh_screen_prediction(
             manual_outcome_history=manual_history,
         )
     finally:
-        _PREDICTION_SLOTS.release()
+        if prediction_slot_acquired:
+            try:
+                _PREDICTION_SLOTS.release()
+            except Exception:
+                pass
 
     prediction["latest_actual_outcome"] = value
     prediction["latest_actual_outcome_text"] = {"B": "莊", "P": "閒", "T": "和"}[value]
@@ -1500,21 +1589,150 @@ async def _process_manual_outcome(
     outcome: str,
     expected_run_id: str,
 ) -> None:
-    """同一 UID 依序處理莊／閒／和按鈕，完成後 Push 新分析面板。"""
+    """同一 UID 依序處理莊／閒／和；一定要 Push 下一局面板或明確錯誤。"""
+    uid_tail = str(user_id or "")[-8:]
+    started = time.perf_counter()
+    print(
+        "manual_start",
+        json.dumps(
+            {
+                "event": "manual_start",
+                "uid": uid_tail,
+                "outcome": outcome,
+                "run_id": str(expected_run_id or "")[:12],
+            },
+            ensure_ascii=False,
+        ),
+    )
+
     async with _user_lock(user_id):
         try:
             _ensure_access(user_id)
-            session = await asyncio.to_thread(
-                _refresh_screen_prediction,
-                user_id,
-                outcome,
-                expected_run_id,
+            session = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _refresh_screen_prediction,
+                    user_id,
+                    outcome,
+                    expected_run_id,
+                ),
+                timeout=MANUAL_OUTCOME_TIMEOUT,
             )
-            await asyncio.to_thread(_push, user_id, [screen_result_panel(user_id, session)])
+            predict_ms = (time.perf_counter() - started) * 1000.0
+            print(
+                "manual_predict_ok",
+                json.dumps(
+                    {
+                        "event": "manual_predict_ok",
+                        "uid": uid_tail,
+                        "outcome": outcome,
+                        "ms": round(predict_ms, 2),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+            panel = screen_result_panel(user_id, session)
+            pushed = await asyncio.to_thread(_push, user_id, [panel])
+            if not pushed:
+                pushed = await asyncio.to_thread(
+                    _push,
+                    user_id,
+                    [panel],
+                    max_retries=1,
+                    retry_delay_seconds=1.0,
+                )
+            if not pushed:
+                await asyncio.to_thread(
+                    _push,
+                    user_id,
+                    [
+                        _text(
+                            "⚠️ 下一局面板推送失敗。\n"
+                            "請再按一次「本局結果：莊／閒／和」，或重新上傳一張圖片繼續分析。"
+                        )
+                    ],
+                    max_retries=1,
+                )
+                print(
+                    "manual_push_fail",
+                    json.dumps(
+                        {
+                            "event": "manual_push_fail",
+                            "uid": uid_tail,
+                            "outcome": outcome,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            else:
+                print(
+                    "manual_push_ok",
+                    json.dumps(
+                        {
+                            "event": "manual_push_ok",
+                            "uid": uid_tail,
+                            "outcome": outcome,
+                            "total_ms": round(
+                                (time.perf_counter() - started) * 1000.0, 2
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+        except asyncio.TimeoutError:
+            traceback.print_exc()
+            print(
+                "manual_timeout",
+                json.dumps(
+                    {
+                        "event": "manual_timeout",
+                        "uid": uid_tail,
+                        "outcome": outcome,
+                        "timeout_s": MANUAL_OUTCOME_TIMEOUT,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            await asyncio.to_thread(
+                _push,
+                user_id,
+                [
+                    _text(
+                        "⚠️ 本局結果更新超時。\n"
+                        "請再按一次莊／閒／和，或重新上傳圖片繼續。"
+                    )
+                ],
+            )
         except Exception as exc:
             traceback.print_exc()
             message = str(exc)
-            if "舊操作已忽略" in message or "舊結果已忽略" in message:
+            print(
+                "manual_error",
+                json.dumps(
+                    {
+                        "event": "manual_error",
+                        "uid": uid_tail,
+                        "outcome": outcome,
+                        "error": message[:300],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            if any(
+                key in message
+                for key in ("舊操作已忽略", "舊結果已忽略", "已重新開始", "已結束")
+            ):
+                await asyncio.to_thread(
+                    _push,
+                    user_id,
+                    [
+                        _text(
+                            "本次操作已過期（分析已重新開始或結束），請重新開始分析。"
+                        )
+                    ],
+                    max_retries=1,
+                )
                 return
             await asyncio.to_thread(
                 _push,
@@ -1550,7 +1768,7 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "10.3",
+            "version": "10.3.1-manual-push-fix",
             "engine": "V10_3_FULL_HISTORY_GRID_QUALITY",
             "activation_code_fix": True,
             "activation_persistence_check": True,
@@ -1581,6 +1799,8 @@ def health() -> JSONResponse:
             "background_push_result": False,
             "image_result_via_reply": True,
             "image_reply_timeout_seconds": LINE_IMAGE_ANALYSIS_TIMEOUT,
+            "manual_outcome_timeout_seconds": MANUAL_OUTCOME_TIMEOUT,
+            "push_max_retries": PUSH_MAX_RETRIES,
             "line_default_mode": "screen",
         }
     )
