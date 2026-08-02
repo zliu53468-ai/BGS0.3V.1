@@ -49,7 +49,7 @@ ADMIN_LINE_URL = os.getenv(
 ).strip()
 ALLOW_UNSIGNED_WEBHOOK = os.getenv("ALLOW_UNSIGNED_WEBHOOK", "0").strip() == "1"
 MAX_CONCURRENT_PREDICTIONS = max(
-    1, min(4, int(os.getenv("APP_MAX_CONCURRENT_PREDICTIONS", "2") or "2"))
+    1, min(4, int(os.getenv("APP_MAX_CONCURRENT_PREDICTIONS", "1") or "1"))
 )
 PREDICTION_QUEUE_TIMEOUT = max(
     5, min(55, int(os.getenv("APP_PREDICTION_QUEUE_TIMEOUT", "45") or "45"))
@@ -122,7 +122,7 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.7.2 BPT Calibrated Screen Bot",
+    title="BGS V10.4 1CPU Fast Screen Bot",
     version="9.7.2",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

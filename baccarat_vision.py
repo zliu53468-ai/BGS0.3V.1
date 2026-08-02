@@ -1,4 +1,4 @@
-"""百家樂大路圖片辨識模組 V10.1（格位重建修正版）。
+"""百家樂大路圖片辨識模組 V10.4（1 CPU 加速版） V10.1（格位重建修正版）。
 
 改良重點：
 1. 先以幾何輪廓定位圓圈，再以「外框環形區域」判定紅莊／藍閒。
@@ -34,7 +34,7 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, value))
 
 
-MAX_IMAGE_SIDE = _env_int("VISION_MAX_IMAGE_SIDE", 1200, 480, 3000)
+MAX_IMAGE_SIDE = _env_int("VISION_MAX_IMAGE_SIDE", 900, 480, 3000)
 ADAPTIVE_BLOCK_SIZE = _env_int("VISION_ADAPTIVE_BLOCK_SIZE", 31, 11, 101)
 if ADAPTIVE_BLOCK_SIZE % 2 == 0:
     ADAPTIVE_BLOCK_SIZE += 1

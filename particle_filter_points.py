@@ -49,10 +49,10 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 
 
 DECKS = _env_int("PF_DECKS", 8, 1, 16)
-PARTICLE_COUNT = _env_int("PF_PARTICLES", 500, 64, 4000)
-REPLICA_COUNT = _env_int("PF_REPLICAS", 5, 3, 11)
+PARTICLE_COUNT = _env_int("PF_PARTICLES", 250, 64, 4000)
+REPLICA_COUNT = _env_int("PF_REPLICAS", 3, 3, 11)
 SIMULATIONS_PER_REPLICA = _env_int(
-    "PF_PREDICT_SIMULATIONS_PER_REPLICA", 1200, 200, 20_000
+    "PF_PREDICT_SIMULATIONS_PER_REPLICA", 600, 200, 20_000
 )
 PARTICLE_DRAWS_PER_PARTICLE = _env_int(
     "PF_DRAWS_PER_PARTICLE", 2, 1, 12
