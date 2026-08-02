@@ -1,8 +1,7 @@
-"""遊戲畫面大路偵測模組。
+"""遊戲畫面大路偵測模組（完整畫面／牌路裁切圖自動判斷）。
 
-預設使用 OpenCV 幾何輪廓＋圓心 HSV 判色；若設定 YOLO_MODEL_PATH 且
-環境已安裝 ultralytics，則優先使用自訂 YOLO 權重。沒有自訂訓練權重時，
-一般物件偵測模型不會認得百家樂莊閒圓圈，因此程式會自動回退 OpenCV。
+會依使用者已選館別嘗試平台專用 ROI、通用 ROI 與整張圖片，並以辨識數量、
+未知候選與幾何雜訊評分選出最佳結果。牌路裁切圖會直接分析整張圖片。
 """
 from __future__ import annotations
 
@@ -10,12 +9,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import os
-import tempfile
+import time
 
 import cv2
 import numpy as np
 
-from baccarat_vision import analyze_baccarat_image_detailed
+from baccarat_vision import analyze_baccarat_array_detailed
 
 
 _YOLO_MODEL: Any = None
@@ -37,7 +36,21 @@ def _parse_roi(raw: str, default: Tuple[float, float, float, float]) -> Tuple[fl
         return default
 
 
-ROAD_ROI = _parse_roi(os.getenv("ROAD_ROI", "0,0.24,1,0.62"), (0.0, 0.24, 1.0, 0.62))
+def _env_roi(name: str, default: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    return _parse_roi(os.getenv(name, ",".join(str(v) for v in default)), default)
+
+
+ROAD_ROI = _env_roi("ROAD_ROI", (0.0, 0.58, 1.0, 0.42))
+VENUE_ROIS: Dict[str, Tuple[float, float, float, float]] = {
+    "DG": _env_roi("DG_ROAD_ROI", (0.00, 0.80, 0.66, 0.20)),
+    "MT": _env_roi("MT_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+    "DB": _env_roi("DB_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+    "SA": _env_roi("SA_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+    "OB": _env_roi("OB_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+    "T9": _env_roi("T9_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+}
+ROAD_AUTO_FULL_FALLBACK = os.getenv("ROAD_AUTO_FULL_FALLBACK", "1").strip() == "1"
+ROAD_USE_YOLO = os.getenv("ROAD_USE_YOLO", "0").strip() == "1"
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "").strip()
 YOLO_CONFIDENCE = max(0.05, min(0.95, float(os.getenv("YOLO_CONFIDENCE", "0.35") or "0.35")))
 YOLO_IMAGE_SIZE = max(320, min(1536, int(os.getenv("YOLO_IMAGE_SIZE", "960") or "960")))
@@ -58,7 +71,9 @@ def _crop(image: np.ndarray, roi: Sequence[float]) -> Tuple[np.ndarray, Dict[str
     y1 = max(0, min(height - 1, int(round(y * height))))
     x2 = max(x1 + 1, min(width, int(round((x + roi_width) * width))))
     y2 = max(y1 + 1, min(height, int(round((y + roi_height) * height))))
-    return image[y1:y2, x1:x2].copy(), {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+    return image[y1:y2, x1:x2].copy(), {
+        "x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1,
+    }
 
 
 def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -74,8 +89,7 @@ def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             center_x = float(np.mean([member["cx"] for member in column]))
             distance = abs(float(item["cx"]) - center_x)
             if distance <= tolerance and distance < selected_distance:
-                selected = column
-                selected_distance = distance
+                selected, selected_distance = column, distance
         if selected is None:
             columns.append([item])
         else:
@@ -91,7 +105,7 @@ def _get_yolo_model() -> Any:
     global _YOLO_MODEL
     if _YOLO_MODEL is not None:
         return _YOLO_MODEL
-    if not YOLO_MODEL_PATH or not Path(YOLO_MODEL_PATH).is_file():
+    if not ROAD_USE_YOLO or not YOLO_MODEL_PATH or not Path(YOLO_MODEL_PATH).is_file():
         return None
     with _YOLO_LOCK:
         if _YOLO_MODEL is None:
@@ -102,11 +116,9 @@ def _get_yolo_model() -> Any:
 
 def _normalize_yolo_label(label: str) -> str:
     value = str(label or "").strip().lower()
-    banker_aliases = {"b", "banker", "red", "莊", "庄", "banker_circle"}
-    player_aliases = {"p", "player", "blue", "閒", "闲", "player_circle"}
-    if value in banker_aliases:
+    if value in {"b", "banker", "red", "莊", "庄", "banker_circle"}:
         return "B"
-    if value in player_aliases:
+    if value in {"p", "player", "blue", "閒", "闲", "player_circle"}:
         return "P"
     return ""
 
@@ -115,113 +127,149 @@ def _detect_yolo(crop: np.ndarray) -> Dict[str, Any]:
     model = _get_yolo_model()
     if model is None:
         return {"ok": False, "sequence": [], "method": "yolo_unavailable"}
-    results = model.predict(
-        source=crop,
-        conf=YOLO_CONFIDENCE,
-        imgsz=YOLO_IMAGE_SIZE,
-        verbose=False,
-    )
+    results = model.predict(source=crop, conf=YOLO_CONFIDENCE, imgsz=YOLO_IMAGE_SIZE, verbose=False)
     detections: List[Dict[str, Any]] = []
     for result in results:
         names = getattr(result, "names", {}) or {}
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             continue
-        xyxy = boxes.xyxy.cpu().numpy()
-        classes = boxes.cls.cpu().numpy()
-        confidences = boxes.conf.cpu().numpy()
-        for coordinates, class_id, confidence in zip(xyxy, classes, confidences):
+        for coordinates, class_id, confidence in zip(
+            boxes.xyxy.cpu().numpy(), boxes.cls.cpu().numpy(), boxes.conf.cpu().numpy()
+        ):
             label = names.get(int(class_id), str(int(class_id))) if isinstance(names, Mapping) else str(int(class_id))
             outcome = _normalize_yolo_label(label)
             if not outcome:
                 continue
             x1, y1, x2, y2 = [float(value) for value in coordinates]
-            detections.append(
-                {
-                    "outcome": outcome,
-                    "label": str(label),
-                    "confidence": round(float(confidence), 6),
-                    "x": round(x1, 2),
-                    "y": round(y1, 2),
-                    "width": round(max(1.0, x2 - x1), 2),
-                    "height": round(max(1.0, y2 - y1), 2),
-                    "cx": round((x1 + x2) / 2.0, 2),
-                    "cy": round((y1 + y2) / 2.0, 2),
-                }
-            )
+            detections.append({
+                "outcome": outcome, "label": str(label), "confidence": round(float(confidence), 6),
+                "x": round(x1, 2), "y": round(y1, 2),
+                "width": round(max(1.0, x2 - x1), 2), "height": round(max(1.0, y2 - y1), 2),
+                "cx": round((x1 + x2) / 2.0, 2), "cy": round((y1 + y2) / 2.0, 2),
+            })
     ordered = _sort_big_road(detections)
     return {
-        "ok": bool(ordered),
-        "sequence": [item["outcome"] for item in ordered],
-        "recognized_count": len(ordered),
-        "candidates": ordered,
-        "method": "custom_yolo",
+        "ok": bool(ordered), "sequence": [item["outcome"] for item in ordered],
+        "recognized_count": len(ordered), "candidates": ordered, "method": "custom_yolo",
+        "unknown_candidates": 0, "raw_contours": 0,
     }
 
 
-def _write_temp_crop(crop: np.ndarray) -> Path:
-    handle = tempfile.NamedTemporaryFile(prefix="road_roi_", suffix=".png", delete=False)
-    handle.close()
-    path = Path(handle.name)
-    if not cv2.imwrite(str(path), crop):
-        path.unlink(missing_ok=True)
-        raise RuntimeError("無法建立路紙暫存裁圖。")
-    return path
+def _score_result(result: Mapping[str, Any], *, preference: float = 0.0) -> float:
+    recognized = int(result.get("recognized_count", 0) or 0)
+    unknown = int(result.get("unknown_candidates", 0) or 0)
+    raw = int(result.get("raw_contours", 0) or 0)
+    if recognized <= 0:
+        return -9999.0
+    noise = max(0, raw - recognized * 8)
+    return recognized * 5.0 - unknown * 0.8 - noise * 0.015 + preference
 
 
-def _detect_opencv(crop: np.ndarray) -> Dict[str, Any]:
-    path = _write_temp_crop(crop)
-    try:
-        return analyze_baccarat_image_detailed(path)
-    finally:
-        path.unlink(missing_ok=True)
+def _run_region(image: np.ndarray, roi: Tuple[float, float, float, float], name: str, preference: float) -> Dict[str, Any]:
+    crop, pixels = _crop(image, roi)
+    started = time.perf_counter()
+    if ROAD_USE_YOLO and _get_yolo_model() is not None:
+        result = _detect_yolo(crop)
+    else:
+        result = analyze_baccarat_array_detailed(crop)
+    result = dict(result or {})
+    result.update({
+        "region_name": name,
+        "roi": pixels,
+        "normalized_roi": list(roi),
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
+    })
+    result["selection_score"] = round(_score_result(result, preference=preference), 4)
+    return result
 
 
-def detect_road_sequence_detailed(image_path: str | Path) -> Dict[str, Any]:
+def detect_road_sequence_detailed(
+    image_path: str | Path,
+    *,
+    venue: str = "",
+    input_type: str = "auto",
+) -> Dict[str, Any]:
     image = _read_image(image_path)
-    crop, roi_pixels = _crop(image, ROAD_ROI)
+    venue_code = str(venue or "").upper().strip()
+    requested_type = str(input_type or "auto").lower().strip()
     errors: List[str] = []
+    candidates: List[Dict[str, Any]] = []
 
-    if YOLO_MODEL_PATH:
+    regions: List[Tuple[str, Tuple[float, float, float, float], float]] = []
+    if requested_type == "road_crop":
+        regions.append(("full_image", (0.0, 0.0, 1.0, 1.0), 4.0))
+    else:
+        if venue_code in VENUE_ROIS:
+            regions.append((f"{venue_code.lower()}_venue_roi", VENUE_ROIS[venue_code], 3.0))
+        regions.append(("generic_road_roi", ROAD_ROI, 1.5))
+        if ROAD_AUTO_FULL_FALLBACK or requested_type == "auto":
+            regions.append(("full_image", (0.0, 0.0, 1.0, 1.0), 0.0))
+
+    seen = set()
+    for name, roi, preference in regions:
+        key = tuple(round(value, 4) for value in roi)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            yolo_result = _detect_yolo(crop)
-            if yolo_result.get("sequence"):
-                yolo_result.update({"roi": roi_pixels, "normalized_roi": list(ROAD_ROI)})
-                return yolo_result
+            candidates.append(_run_region(image, roi, name, preference))
         except Exception as exc:
-            errors.append(f"yolo: {exc}")
+            errors.append(f"{name}: {exc}")
 
-    try:
-        result = _detect_opencv(crop)
-        if not result.get("sequence"):
-            # ROI 設定不符某些平台時，以整張圖片再跑一次作為備援。
-            full_result = analyze_baccarat_image_detailed(image_path)
-            if full_result.get("sequence"):
-                result = full_result
-                roi_pixels = {"x": 0, "y": 0, "width": int(image.shape[1]), "height": int(image.shape[0])}
-        result.update(
-            {
-                "roi": roi_pixels,
-                "normalized_roi": list(ROAD_ROI),
-                "errors": errors,
-            }
-        )
-        return result
-    except Exception as exc:
-        errors.append(f"opencv: {exc}")
+    if not candidates:
         return {
-            "ok": False,
-            "sequence": [],
-            "recognized_count": 0,
-            "method": "failed",
-            "roi": roi_pixels,
-            "normalized_roi": list(ROAD_ROI),
-            "errors": errors,
+            "ok": False, "sequence": [], "recognized_count": 0, "method": "failed",
+            "input_type": "unknown", "errors": errors,
         }
+
+    aspect = image.shape[1] / max(1.0, float(image.shape[0]))
+    likely_crop = requested_type == "road_crop" or (requested_type == "auto" and aspect >= 2.40)
+    venue_result = next(
+        (item for item in candidates if str(item.get("region_name") or "").endswith("_venue_roi")),
+        None,
+    )
+    full_result = next((item for item in candidates if item.get("region_name") == "full_image"), None)
+
+    if requested_type == "full_screen":
+        detected_type = "full_screen"
+    elif requested_type == "road_crop":
+        detected_type = "road_crop"
+    else:
+        detected_type = "road_crop" if likely_crop else "full_screen"
+
+    # 使用者已選館且上傳完整畫面時，優先採平台專用 ROI，避免荷官、籌碼與
+    # 下注按鈕被全圖輪廓誤判為牌路。只有專用 ROI 完全失敗才使用其他區域。
+    if detected_type == "full_screen" and venue_result is not None and int(venue_result.get("recognized_count", 0) or 0) >= 4:
+        best = venue_result
+    elif detected_type == "road_crop" and full_result is not None and int(full_result.get("recognized_count", 0) or 0) > 0:
+        best = full_result
+    else:
+        best = max(candidates, key=lambda item: float(item.get("selection_score", -9999.0)))
+    region_name = str(best.get("region_name") or "")
+
+    result = dict(best)
+    result.update({
+        "ok": bool(result.get("sequence")),
+        "input_type": detected_type,
+        "selected_region": region_name,
+        "venue_hint": venue_code,
+        "errors": errors,
+        "candidate_regions": [
+            {
+                "name": item.get("region_name"),
+                "recognized_count": int(item.get("recognized_count", 0) or 0),
+                "unknown_candidates": int(item.get("unknown_candidates", 0) or 0),
+                "score": float(item.get("selection_score", -9999.0)),
+                "elapsed_ms": float(item.get("elapsed_ms", 0.0) or 0.0),
+            }
+            for item in candidates
+        ],
+    })
+    return result
 
 
 def detect_road_sequence(image_path: str | Path) -> List[str]:
-    """題目指定入口：回傳依大路座標排序的 B/P List。"""
     return list(detect_road_sequence_detailed(image_path).get("sequence") or [])
 
 
