@@ -1,4 +1,4 @@
-"""百家樂大路圖片辨識模組 V10.4（1 CPU 加速版） V10.1（格位重建修正版）。
+"""百家樂大路圖片辨識模組 V10.5（右上大路專區極速版）。
 
 改良重點：
 1. 先以幾何輪廓定位圓圈，再以「外框環形區域」判定紅莊／藍閒。
@@ -386,7 +386,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
     colored: List[CircleCandidate] = []
-    unknown = 0
+    unknown_candidates_raw: List[Tuple[CircleCandidate, float, float, float]] = []
     for candidate in unique_candidates:
         outcome, red_ratio, blue_ratio, hue, saturation, value = _ring_color_stats(hsv, candidate)
         method = "ring_hsv"
@@ -395,7 +395,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             outcome = _classify_local_color(hue, saturation, value)
             method = "center_hsv_fallback" if outcome else "unknown"
         if not outcome:
-            unknown += 1
+            unknown_candidates_raw.append((candidate, float(red_ratio), float(blue_ratio), float(saturation)))
             continue
         colored.append(CircleCandidate(
             x=candidate.x, y=candidate.y, width=candidate.width, height=candidate.height,
@@ -406,6 +406,19 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
 
     ordered = _sort_big_road(colored)
     sequence = [item.outcome for item in ordered]
+
+    # 不把格線交叉點、文字與其他小圖示全部算成「未知局」。
+    # 只計算尺寸接近已辨識大路圓圈的候選，避免品質檢查被背景雜訊拖垮。
+    if colored:
+        median_diameter = float(np.median([item.diameter for item in colored]))
+        plausible_unknown = [
+            item for item, red_ratio, blue_ratio, saturation in unknown_candidates_raw
+            if 0.62 * median_diameter <= item.diameter <= 1.45 * median_diameter
+            and (red_ratio + blue_ratio >= RING_MIN_COLOR_RATIO * 0.55 or saturation >= MIN_SATURATION * 1.35)
+        ]
+    else:
+        plausible_unknown = []
+    unknown = len(plausible_unknown)
     # 依已確認的時間序列重建邏輯六列格位；圖片像素座標仍保留在 candidate。
     try:
         from full_road_pattern_model import build_big_road
@@ -449,7 +462,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             "resize_scale": round(float(resize_scale), 6),
         },
         "candidates": [asdict(item) for item in ordered],
-        "method": "adaptive_contour_ring_hsv_grid_quality_v10_3",
+        "method": "adaptive_contour_ring_hsv_grid_quality_v10_5",
     }
 
 
