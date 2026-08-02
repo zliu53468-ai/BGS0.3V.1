@@ -1,4 +1,4 @@
-"""BGS V9.7 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
+"""BGS V9.7.1 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
@@ -19,6 +19,7 @@ import time
 import tempfile
 import traceback
 import urllib.parse
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -77,13 +78,33 @@ VENUES: List[Dict[str, str]] = [
 VENUE_BY_CODE = {venue["code"]: venue for venue in VENUES}
 
 
+def _normalize_access_code(value: Any) -> str:
+    """Normalize copied LINE text so full-width/hidden characters cannot break activation."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    for hidden in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
+        text = text.replace(hidden, "")
+    return re.sub(r"\s+", "", text).lower()
+
+
 def _code_set(env_name: str, defaults: str) -> set[str]:
-    raw = os.getenv(env_name, defaults)
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    """Always keep built-in codes and merge any Render environment codes.
+
+    The previous implementation let an empty/stale Render variable replace all
+    built-in codes.  This union-based implementation prevents that failure.
+    """
+    default_codes = {
+        _normalize_access_code(item)
+        for item in str(defaults or "").split(",")
+        if _normalize_access_code(item)
+    }
+    environment_codes = {
+        _normalize_access_code(item)
+        for item in str(os.getenv(env_name, "") or "").split(",")
+        if _normalize_access_code(item)
+    }
+    return default_codes | environment_codes
 
 
-# Defaults preserve the user's existing deployment behavior. Move these to
-# Render environment variables when convenient.
 PERMANENT_CODES = _code_set(
     "PERMANENT_CODES", "aaa1688003,aaa1888007,aaa1000889"
 )
@@ -93,8 +114,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.7 BPT Calibrated Screen Bot",
-    version="9.7.0",
+    title="BGS V9.7.1 BPT Calibrated Screen Bot",
+    version="9.7.1",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -1041,6 +1062,7 @@ def ended_panel() -> Dict[str, Any]:
 
 
 def _activate_code(user_id: str, code: str) -> str:
+    code = _normalize_access_code(code)
     now = int(datetime.now().timestamp())
     if code in PERMANENT_CODES:
         store.upsert_session(
@@ -1369,8 +1391,15 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "9.7.0",
-            "engine": "V9_7_UID_SCREEN_BPT_CALIBRATED",
+            "version": "9.7.1",
+            "engine": "V9_7_1_UID_SCREEN_BPT_CALIBRATED",
+            "activation_code_fix": True,
+            "activation_code_counts": {
+                "permanent": len(PERMANENT_CODES),
+                "monthly": len(MONTHLY_CODES),
+                "temporary": len(TEMP_CODES),
+            },
+            "default_permanent_code_loaded": "aaa1888007" in PERMANENT_CODES,
             "input_required": True,
             "virtual_only": False,
             "public_base_url_configured": bool(PUBLIC_BASE_URL),
@@ -1502,10 +1531,26 @@ async def webhook(request: Request) -> JSONResponse:
                 continue
 
             if event_type == "message" and message_type == "text":
-                text = str(message.get("text") or "").strip()
-                if text in ALL_CODES:
-                    plan = _activate_code(user_id, text)
+                raw_text = str(message.get("text") or "")
+                text = unicodedata.normalize("NFKC", raw_text).strip()
+                access_code = _normalize_access_code(raw_text)
+
+                if access_code in ALL_CODES:
+                    plan = _activate_code(user_id, access_code)
                     _reply(token, [_text(f"✅ 已開通：{plan}"), venue_panel(user_id)])
+                    continue
+
+                if text in {"開通碼檢查", "檢查開通碼", "版本檢查"}:
+                    _reply(
+                        token,
+                        [
+                            _text(
+                                "BGS 版本：9.7.1\n"
+                                f"永久碼載入數：{len(PERMANENT_CODES)}\n"
+                                f"aaa1888007 已載入：{'是' if 'aaa1888007' in PERMANENT_CODES else '否'}"
+                            )
+                        ],
+                    )
                     continue
 
                 session = store.get_session(user_id)
