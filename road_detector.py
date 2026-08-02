@@ -1,7 +1,8 @@
-"""遊戲畫面大路偵測模組 V10.4（1 CPU 單路徑加速版）。
+"""遊戲畫面大路偵測模組 V10.5（右上第一區塊專注掃描版）。
 
-不再固定把館別 ROI、通用 ROI、完整圖片全部掃完。採逐級策略：
-館別 ROI 成功即回傳；不足才掃通用 ROI；仍失敗才掃全圖。
+針對橫向多路紙版型，直接鎖定「右側上方第一個區塊」作為大路。
+不再把整張橫幅誤判成牌路裁切圖，也不掃左側珠盤路、下方衍生路。
+一般完整畫面仍保留館別 ROI -> 通用 ROI 的逐級備援。
 """
 from __future__ import annotations
 
@@ -38,6 +39,9 @@ def _env_roi(name: str, default: Tuple[float, float, float, float]) -> Tuple[flo
 
 
 ROAD_ROI = _env_roi("ROAD_ROI", (0.0, 0.58, 1.0, 0.42))
+# 橫向多路紙：左側約 26.5% 是珠盤路；右側上方第一區塊才是大路。
+WIDE_TOP_ROAD_ROI = _env_roi("WIDE_TOP_ROAD_ROI", (0.265, 0.00, 0.735, 0.64))
+WIDE_LAYOUT_MIN_ASPECT = max(3.2, float(os.getenv("WIDE_LAYOUT_MIN_ASPECT", "4.0") or "4.0"))
 VENUE_ROIS: Dict[str, Tuple[float, float, float, float]] = {
     "DG": _env_roi("DG_ROAD_ROI", (0.00, 0.80, 0.66, 0.20)),
     "MT": _env_roi("MT_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
@@ -140,11 +144,19 @@ def _acceptable(result: Mapping[str, Any]) -> bool:
 
 def detect_road_sequence_detailed(image_path: str | Path, *, venue: str="", input_type: str="auto") -> Dict[str, Any]:
     image=_read_image(image_path); venue_code=str(venue or "").upper().strip(); requested=str(input_type or "auto").lower().strip()
-    aspect=image.shape[1]/max(1.0,float(image.shape[0])); likely_crop=requested=="road_crop" or (requested=="auto" and aspect>=2.40)
-    detected_type="road_crop" if likely_crop else "full_screen"
+    aspect=image.shape[1]/max(1.0,float(image.shape[0]))
+    # 超寬橫幅通常同時包含珠盤路、大路與下三路；不能把整張圖當成 road_crop。
+    wide_multi_road = requested == "auto" and aspect >= WIDE_LAYOUT_MIN_ASPECT
+    likely_crop = requested == "road_crop" or (requested == "auto" and 2.40 <= aspect < WIDE_LAYOUT_MIN_ASPECT)
+    detected_type = "wide_multi_road" if wide_multi_road else "road_crop" if likely_crop else "full_screen"
     errors: List[str]=[]; candidates: List[Dict[str,Any]]=[]; attempted=[]
 
-    if likely_crop:
+    if wide_multi_road:
+        # 使用者指定：只掃右側上方第一個區塊（大路），不掃其餘路紙。
+        plan=[("wide_top_first_road",WIDE_TOP_ROAD_ROI,6.0)]
+        if ROAD_AUTO_FULL_FALLBACK:
+            plan.append(("full_image",(0.0,0.0,1.0,1.0),0.0))
+    elif likely_crop:
         plan=[("full_image",(0.0,0.0,1.0,1.0),4.0)]
     else:
         plan=[]
@@ -173,6 +185,7 @@ def detect_road_sequence_detailed(image_path: str | Path, *, venue: str="", inpu
     result.update({
         "ok":bool(result.get("sequence")),"input_type":detected_type,"selected_region":str(best.get("region_name") or ""),"venue_hint":venue_code,"errors":errors,"attempted_regions":attempted,
         "fast_early_exit":len(candidates)<len(plan),
+        "wide_layout_detected": bool(wide_multi_road),
         "candidate_regions":[{"name":i.get("region_name"),"recognized_count":int(i.get("recognized_count",0) or 0),"unknown_candidates":int(i.get("unknown_candidates",0) or 0),"score":float(i.get("selection_score",-9999)),"elapsed_ms":float(i.get("elapsed_ms",0) or 0)} for i in candidates],
     })
     return result
