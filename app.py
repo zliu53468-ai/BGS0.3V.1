@@ -1,4 +1,4 @@
-"""BGS V9.7.2 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
+"""BGS V10.3 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
@@ -1005,8 +1005,9 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                     {"type": "text", "text": f"BGS 下一局分析 #{analysis_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
                     {"type": "text", "text": (
                         f"館別：{venue_name or '-'}｜桌號：{room}（{room_source_text}）\n"
-                        f"完整牌局：{len(raw_outcomes)} 局｜大路：{len(sequence)} 局｜和局：{tie_total} 局\n"
-                        f"估計剩餘：{remaining} 張｜後續更新：{manual_rounds} 局"
+                        f"圖片確認：{int(session.get('initial_recognized_count', 0) or 0)} 局｜後續輸入：{len(session.get('manual_outcome_history') or [])} 局\n"
+                        f"模型完整歷史：{len(raw_outcomes)} 局｜大路：{len(sequence)} 局｜和局：{tie_total} 局\n"
+                        f"估計剩餘：{remaining} 張｜不確定格：{int(session.get('initial_uncertain_count', 0) or 0)}"
                     ), "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
                     {"type": "separator", "margin": "md", "color": "#E1BD43"},
                     {"type": "text", "text": f"下一局方向評估：{direction}", "weight": "bold", "size": "xl", "margin": "md", "color": direction_color},
@@ -1153,11 +1154,16 @@ def _refresh_screen_prediction(
     # 先用本局真實結果結算上一筆預測；校準器下一局只會看到過去資料。
     resolve_latest_prediction(user_id, value, venue=venue, room=room)
 
-    raw_history = [
-        str(item).upper() for item in list(session.get("raw_outcomes") or session.get("road_sequence") or [])
+    initial_history = [
+        str(item).upper() for item in list(session.get("initial_image_history") or [])
         if str(item).upper() in {"B", "P", "T"}
     ]
-    raw_history.append(value)
+    manual_history = [
+        str(item).upper() for item in list(session.get("manual_outcome_history") or [])
+        if str(item).upper() in {"B", "P", "T"}
+    ]
+    manual_history.append(value)
+    raw_history = initial_history + manual_history
     road_state = _derive_road_state(raw_history)
     sequence = list(road_state["road_sequence"])
     tie_markers = dict(road_state["tie_markers"])
@@ -1186,6 +1192,9 @@ def _refresh_screen_prediction(
             room=room,
             user_id=user_id,
             screen_metadata=screen_metadata,
+            initial_grid_cells=list(session.get("initial_grid_cells") or []),
+            initial_image_history=initial_history,
+            manual_outcome_history=manual_history,
         )
     finally:
         _PREDICTION_SLOTS.release()
@@ -1205,6 +1214,13 @@ def _refresh_screen_prediction(
         sequence=sequence,
         raw_outcomes=raw_history,
         tie_markers=tie_markers,
+        initial_image_history=initial_history,
+        manual_outcome_history=manual_history,
+        initial_grid_cells=list(session.get("initial_grid_cells") or []),
+        recognition_quality={
+            "recognized_count": int(session.get("initial_recognized_count", len(initial_history)) or len(initial_history)),
+            "uncertain_count": int(session.get("initial_uncertain_count", 0) or 0),
+        },
         prediction=prediction,
         resolved=resolved,
         processing_ms=0.0,
@@ -1261,12 +1277,24 @@ async def _process_screen_image(
             sequence = list(screen.get("sequence") or [])
             raw_outcomes = list(screen.get("raw_outcomes") or sequence)
             tie_markers = dict(screen.get("tie_markers") or {})
+            grid_cells = [dict(item) for item in list(screen.get("grid_cells") or []) if isinstance(item, Mapping)]
+            recognized_count = int(screen.get("recognized_count", len(sequence)) or len(sequence))
+            uncertain_count = int(screen.get("uncertain_count", 0) or 0)
+            recognition_quality_ok = bool(screen.get("recognition_quality_ok", True))
             if not sequence:
                 road_errors = list((screen.get("road") or {}).get("errors") or [])
                 detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
                 await asyncio.to_thread(
                     _push, user_id,
                     [_road_error_message(f"{detail}。請傳送包含完整大路的畫面或牌路裁切圖。")],
+                )
+                return
+            if not recognition_quality_ok:
+                await asyncio.to_thread(
+                    _push, user_id,
+                    [_road_error_message(
+                        f"本次只確認 {recognized_count} 格，另有 {uncertain_count} 格無法可靠判定；為避免總局數錯誤，已停止送入模型。請裁切只保留完整大路後重新上傳。"
+                    )],
                 )
                 return
 
@@ -1302,6 +1330,9 @@ async def _process_screen_image(
                     room=str(resolved.get("room") or current_session.get("room") or current_session.get("last_confirmed_room") or "1"),
                     user_id=user_id,
                     screen_metadata=screen_metadata,
+                    initial_grid_cells=grid_cells,
+                    initial_image_history=raw_outcomes,
+                    manual_outcome_history=[],
                 )
             finally:
                 _PREDICTION_SLOTS.release()
@@ -1317,6 +1348,14 @@ async def _process_screen_image(
                 sequence=sequence,
                 raw_outcomes=raw_outcomes,
                 tie_markers=tie_markers,
+                initial_image_history=raw_outcomes,
+                manual_outcome_history=[],
+                initial_grid_cells=grid_cells,
+                recognition_quality={
+                    "recognized_count": recognized_count,
+                    "uncertain_count": uncertain_count,
+                    "quality_ok": recognition_quality_ok,
+                },
                 prediction=prediction,
                 resolved=resolved,
                 processing_ms=elapsed_ms,
@@ -1403,8 +1442,8 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "9.7.2",
-            "engine": "V9_7_2_UID_SCREEN_BPT_CALIBRATED",
+            "version": "10.3",
+            "engine": "V10_3_FULL_HISTORY_GRID_QUALITY",
             "activation_code_fix": True,
             "activation_persistence_check": True,
             "storage_path": str(getattr(store, "SESSION_DATA_FILE", "")),

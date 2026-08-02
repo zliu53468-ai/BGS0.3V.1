@@ -101,7 +101,7 @@ def _binary_pattern_score(values: Sequence[str]) -> Dict[str, float]:
     return {"continuation": continuation, "stability": stability, "alternation": alternation}
 
 
-def analyze_full_road_pattern(values: Iterable[Any]) -> Dict[str, Any]:
+def analyze_full_road_pattern(values: Iterable[Any], *, grid_cells: Sequence[Mapping[str, Any]] | None = None, initial_image_count: int = 0, manual_count: int = 0) -> Dict[str, Any]:
     sequence = _clean(values)
     road = build_big_road(sequence)
     heights = road["column_heights"]
@@ -217,6 +217,12 @@ def analyze_full_road_pattern(values: Iterable[Any]) -> Dict[str, Any]:
             for name, sign, weight in votes
         ],
         "geometry": road,
+        "engine": "FULL_ROAD_PATTERN_V10_3",
+        "full_history_used_count": sample_count,
+        "initial_image_count": max(0, int(initial_image_count or 0)),
+        "manual_count": max(0, int(manual_count or 0)),
+        "grid_cell_count": len(list(grid_cells or [])),
+        "lookback_mode": "entire_available_history",
     }
 
 

@@ -48,6 +48,8 @@ RING_INNER_RATIO = _env_float("VISION_RING_INNER_RATIO", 0.22, 0.08, 0.42)
 RING_OUTER_RATIO = _env_float("VISION_RING_OUTER_RATIO", 0.52, 0.30, 0.78)
 RING_MIN_COLOR_RATIO = _env_float("VISION_RING_MIN_COLOR_RATIO", 0.10, 0.02, 0.60)
 COLUMN_TOLERANCE_RATIO = _env_float("VISION_COLUMN_TOLERANCE_RATIO", 0.62, 0.25, 1.50)
+MAX_UNKNOWN_RATIO = _env_float("VISION_MAX_UNKNOWN_RATIO", 0.18, 0.0, 0.80)
+MIN_RECOGNIZED_FOR_PREDICTION = _env_int("VISION_MIN_RECOGNIZED", 8, 1, 200)
 
 
 @dataclass(frozen=True)
@@ -404,10 +406,41 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
 
     ordered = _sort_big_road(colored)
     sequence = [item.outcome for item in ordered]
+    # 依已確認的時間序列重建邏輯六列格位；圖片像素座標仍保留在 candidate。
+    try:
+        from full_road_pattern_model import build_big_road
+        logical = build_big_road(sequence)
+        logical_cells = list(logical.get("cells") or [])
+    except Exception:
+        logical_cells = []
+    grid_cells = []
+    for index, item in enumerate(ordered):
+        logical_cell = logical_cells[index] if index < len(logical_cells) else {}
+        color_strength = max(float(item.red_ratio), float(item.blue_ratio), min(1.0, float(item.saturation) / 255.0))
+        confidence = max(0.0, min(1.0, 0.45 * color_strength + 0.35 * float(item.circularity) + 0.20 * min(1.0, float(item.fill_ratio))))
+        grid_cells.append({
+            "index": index, "outcome": item.outcome,
+            "column": int(logical_cell.get("column", 0) or 0),
+            "row": int(logical_cell.get("row", 0) or 0),
+            "x": int(item.x), "y": int(item.y),
+            "confidence": round(confidence, 6),
+        })
+    uncertain_count = int(unknown)
+    candidate_total = len(sequence) + uncertain_count
+    unknown_ratio = uncertain_count / max(1, candidate_total)
+    quality_ok = bool(len(sequence) >= MIN_RECOGNIZED_FOR_PREDICTION and unknown_ratio <= MAX_UNKNOWN_RATIO)
     return {
         "ok": bool(sequence),
+        "quality_ok": quality_ok,
         "sequence": sequence,
+        "raw_outcomes": list(sequence),
+        "grid_cells": grid_cells,
         "recognized_count": len(sequence),
+        "confirmed_round_count": len(sequence),
+        "uncertain_count": uncertain_count,
+        "unknown_ratio": round(unknown_ratio, 6),
+        "count_is_confirmed": uncertain_count == 0,
+        "estimated_candidate_total": candidate_total,
         "unknown_candidates": unknown,
         "raw_contours": len(raw_candidates),
         "unique_geometry_candidates": len(unique_candidates),
@@ -416,7 +449,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             "resize_scale": round(float(resize_scale), 6),
         },
         "candidates": [asdict(item) for item in ordered],
-        "method": "adaptive_contour_ring_hsv_with_center_fallback",
+        "method": "adaptive_contour_ring_hsv_grid_quality_v10_3",
     }
 
 

@@ -183,6 +183,12 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         # 路紙影像辨識與手動校正狀態，與虛擬牌靴狀態分開保存。
         "road_sequence": [],
         "raw_outcomes": [],
+        "initial_image_history": [],
+        "manual_outcome_history": [],
+        "initial_grid_cells": [],
+        "initial_recognized_count": 0,
+        "initial_uncertain_count": 0,
+        "combined_round_count": 0,
         "tie_markers": {},
         "tie_total": 0,
         "pending_opening_ties": 0,
@@ -339,6 +345,17 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         )
     road_state = _road_state_from_raw(raw_history)
     session.update(road_state)
+    if not isinstance(session.get("initial_image_history"), list):
+        session["initial_image_history"] = []
+    if not isinstance(session.get("manual_outcome_history"), list):
+        session["manual_outcome_history"] = []
+    if not session["initial_image_history"] and raw_history and int(session.get("screen_manual_rounds", 0) or 0) == 0:
+        session["initial_image_history"] = list(raw_history)
+    if not isinstance(session.get("initial_grid_cells"), list):
+        session["initial_grid_cells"] = []
+    session["initial_recognized_count"] = max(0, int(session.get("initial_recognized_count", len(session["initial_image_history"])) or 0))
+    session["initial_uncertain_count"] = max(0, int(session.get("initial_uncertain_count", 0) or 0))
+    session["combined_round_count"] = len(raw_history)
     if not isinstance(session.get("road_last_analysis"), dict):
         session["road_last_analysis"] = {}
     if not isinstance(session.get("road_last_vision"), dict):
@@ -540,6 +557,8 @@ def _clear_screen_fields(session: Dict[str, Any]) -> None:
     """清除本次畫面分析資料；保留權限、館別、本金與最近確認桌號供裁切圖沿用。"""
     session.update({
         "road_sequence": [], "raw_outcomes": [], "tie_markers": {},
+        "initial_image_history": [], "manual_outcome_history": [], "initial_grid_cells": [],
+        "initial_recognized_count": 0, "initial_uncertain_count": 0, "combined_round_count": 0,
         "tie_total": 0, "pending_opening_ties": 0, "last_actual_outcome": "",
         "road_last_analysis": {}, "road_last_vision": {},
         "road_source": "", "road_last_image_at": 0, "road_corrections": 0,
@@ -1045,6 +1064,10 @@ def update_screen_analysis(
     prediction: Mapping[str, Any],
     raw_outcomes: Optional[List[str]] = None,
     tie_markers: Optional[Mapping[str, Any]] = None,
+    initial_image_history: Optional[List[str]] = None,
+    manual_outcome_history: Optional[List[str]] = None,
+    initial_grid_cells: Optional[List[Mapping[str, Any]]] = None,
+    recognition_quality: Optional[Mapping[str, Any]] = None,
     resolved: Optional[Mapping[str, Any]] = None,
     processing_ms: float = 0.0,
     source: str = "screen_image",
@@ -1064,6 +1087,10 @@ def update_screen_analysis(
     prediction_data = dict(prediction or {})
     ocr_data = dict(ocr or {})
     detection_data = dict(detection or {})
+    initial_history_data = _clean_raw_outcomes(initial_image_history)
+    manual_history_data = _clean_raw_outcomes(manual_outcome_history)
+    grid_data = [dict(item) for item in list(initial_grid_cells or []) if isinstance(item, Mapping)]
+    quality_data = dict(recognition_quality or {})
 
     with _LOCK:
         data = _load_all_unlocked()
@@ -1124,9 +1151,18 @@ def update_screen_analysis(
         if str(source or "").startswith("screen_image"):
             session["road_last_image_at"] = _now()
             session["screen_manual_rounds"] = 0
+            session["initial_image_history"] = list(initial_history_data or raw_history)
+            session["manual_outcome_history"] = []
+            session["initial_grid_cells"] = list(grid_data or detection_data.get("grid_cells") or [])
+            session["initial_recognized_count"] = int(quality_data.get("recognized_count", detection_data.get("recognized_count", len(cleaned))) or len(cleaned))
+            session["initial_uncertain_count"] = int(quality_data.get("uncertain_count", detection_data.get("uncertain_count", detection_data.get("unknown_candidates", 0))) or 0)
         else:
             session["road_corrections"] = int(session.get("road_corrections", 0) or 0) + 1
-            session["screen_manual_rounds"] = int(session.get("screen_manual_rounds", 0) or 0) + 1
+            session["manual_outcome_history"] = list(manual_history_data or session.get("manual_outcome_history") or [])
+            session["screen_manual_rounds"] = len(session["manual_outcome_history"])
+            if grid_data:
+                session["initial_grid_cells"] = list(grid_data)
+        session["combined_round_count"] = len(raw_history)
         session["screen_last_ocr"] = ocr_data
         session["screen_last_detection"] = detection_data
         session["screen_last_prediction"] = prediction_data

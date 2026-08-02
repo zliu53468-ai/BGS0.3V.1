@@ -1,8 +1,7 @@
-"""遊戲截圖的 B/P/T 牌路先行預測轉接層。
+"""遊戲截圖 B/P/T 全歷史預測轉接層 V10.3。
 
-- raw_outcomes 保存每一局 B/P/T。
-- road_sequence 只保留 B/P，和局不新增大路格位。
-- 牌路 context、有限牌組核心、自適應集成與三方校準完成後，建立待結算預測。
+重點：圖片初始化歷史與後續人工輸入分開保存，再合併成模型完整歷史；
+全盤牌路模型可取得初始格位與辨識品質，不再只看最新一局。
 """
 from __future__ import annotations
 
@@ -15,148 +14,111 @@ from performance_tracker import record_prediction
 from predictor import predict
 from road_model import build_road_context
 
-
 PERFORMANCE_TRACKING_ENABLED = os.getenv("PERFORMANCE_TRACKING_ENABLED", "1").strip() == "1"
 
 
-def _clean_raw_outcomes(values: Iterable[Any]) -> List[str]:
-    result: List[str] = []
+def _clean_raw(values: Iterable[Any]) -> List[str]:
+    out: List[str] = []
     for item in values:
-        if isinstance(item, Mapping):
-            raw = item.get("outcome") or item.get("actual")
-        else:
-            raw = item
+        raw = item.get("outcome") if isinstance(item, Mapping) else item
         value = str(raw or "").upper().strip()
         if value in {"B", "P", "T"}:
-            result.append(value)
-    return result[-1000:]
+            out.append(value)
+    return out[-2000:]
 
 
-def _clean_sequence(values: Iterable[Any]) -> List[str]:
-    return [value for value in _clean_raw_outcomes(values) if value in {"B", "P"}][-500:]
+def _clean_bp(values: Iterable[Any]) -> List[str]:
+    return [v for v in _clean_raw(values) if v in {"B", "P"}][-1000:]
 
 
 def _largest_remainder_allocation(weights: Sequence[float], total: int) -> List[int]:
+    positive = [max(0.0, float(v)) for v in weights]
     if total <= 0:
-        return [0] * len(weights)
-    positive = [max(0.0, float(value)) for value in weights]
-    weight_sum = sum(positive)
-    if weight_sum <= 0:
-        positive = [1.0] * len(weights)
-        weight_sum = float(len(weights))
-    exact = [value / weight_sum * total for value in positive]
-    floors = [int(value) for value in exact]
-    remainder = total - sum(floors)
-    order = sorted(
-        range(len(exact)),
-        key=lambda index: (exact[index] - floors[index], positive[index]),
-        reverse=True,
-    )
-    for index in order[:remainder]:
+        return [0] * len(positive)
+    weight_sum = sum(positive) or float(len(positive))
+    if sum(positive) <= 0:
+        positive = [1.0] * len(positive)
+    exact = [v / weight_sum * total for v in positive]
+    floors = [int(v) for v in exact]
+    for index in sorted(range(len(exact)), key=lambda i: exact[i] - floors[i], reverse=True)[: total - sum(floors)]:
         floors[index] += 1
     return floors
 
 
-def estimate_point_counts(
-    remaining_cards: int,
-    *,
-    prior_counts: Optional[Sequence[int]] = None,
-    decks: int = 8,
-) -> Tuple[List[int], str]:
-    maximum = 52 * max(1, min(16, int(decks)))
-    total = max(6, min(maximum, int(remaining_cards)))
-    if (
-        isinstance(prior_counts, Sequence)
-        and len(prior_counts) == 10
-        and sum(max(0, int(value)) for value in prior_counts) >= 6
-    ):
-        weights = [max(0, int(value)) for value in prior_counts]
-        source = "session_scaled"
-    else:
-        weights = fresh_counts(decks)
-        source = "fresh_shoe_scaled"
-    return _largest_remainder_allocation(weights, total), source
+def estimate_point_counts(remaining_cards: int, *, prior_counts: Optional[Sequence[int]] = None, decks: int = 8) -> Tuple[List[int], str]:
+    total = max(6, min(52 * max(1, min(16, int(decks))), int(remaining_cards)))
+    if isinstance(prior_counts, Sequence) and len(prior_counts) == 10 and sum(max(0, int(v)) for v in prior_counts) >= 6:
+        return _largest_remainder_allocation([max(0, int(v)) for v in prior_counts], total), "session_scaled"
+    return _largest_remainder_allocation(fresh_counts(decks), total), "fresh_shoe_scaled"
 
 
 def predict_from_screenshot(
-    sequence: Iterable[Any],
-    *,
-    remaining_cards: Optional[int],
+    sequence: Iterable[Any], *, remaining_cards: Optional[int],
     raw_outcomes: Optional[Iterable[Any]] = None,
     tie_markers: Optional[Mapping[str, Any]] = None,
     prior_counts: Optional[Sequence[int]] = None,
-    venue: str = "",
-    room: str = "",
-    user_id: str = "",
+    venue: str = "", room: str = "", user_id: str = "",
     run_seed: Optional[int] = None,
     road_context: Optional[Mapping[str, Any]] = None,
     screen_metadata: Optional[Mapping[str, Any]] = None,
+    initial_grid_cells: Optional[Sequence[Mapping[str, Any]]] = None,
+    initial_image_history: Optional[Iterable[Any]] = None,
+    manual_outcome_history: Optional[Iterable[Any]] = None,
     record_for_learning: bool = True,
 ) -> Dict[str, Any]:
-    cleaned = _clean_sequence(sequence)
-    raw_history = _clean_raw_outcomes(raw_outcomes if raw_outcomes is not None else cleaned)
-    if not raw_history:
-        raw_history = list(cleaned)
-    fallback_total = sum(int(value) for value in prior_counts or [] if int(value) >= 0)
+    initial_raw = _clean_raw(initial_image_history or [])
+    manual_raw = _clean_raw(manual_outcome_history or [])
+    supplied_raw = _clean_raw(raw_outcomes or [])
+    combined_raw = initial_raw + manual_raw if (initial_raw or manual_raw) else supplied_raw
+    if not combined_raw:
+        combined_raw = _clean_raw(sequence)
+    cleaned = _clean_bp(combined_raw)
+
+    fallback_total = sum(int(v) for v in prior_counts or [] if int(v) >= 0)
     total = int(remaining_cards or fallback_total or 416)
     counts, source = estimate_point_counts(total, prior_counts=prior_counts, decks=8)
-
     seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
-    road_seed = (seed ^ 0x9E3779B9) & 0xFFFFFFFF
-    context = dict(road_context or build_road_context(raw_history, seed=road_seed))
+    context = dict(road_context or build_road_context(
+        combined_raw,
+        seed=(seed ^ 0x9E3779B9) & 0xFFFFFFFF,
+        grid_cells=list(initial_grid_cells or []),
+        initial_image_count=len(initial_raw),
+        manual_count=len(manual_raw),
+    ))
     metadata = dict(screen_metadata or {})
-    markers = {str(key): max(0, int(value or 0)) for key, value in dict(tie_markers or {}).items()}
-
     result = predict(
-        history=raw_history,
-        venue=venue,
-        room=room,
-        user_id=user_id,
-        run_seed=seed,
-        shoe_context={"remaining_counts": counts},
-        road_context=context,
+        history=combined_raw, venue=venue, room=room, user_id=user_id, run_seed=seed,
+        shoe_context={"remaining_counts": counts}, road_context=context,
     )
     result.update({
-        "model_version": "V9.7-BPT-TIE-AWARE-CALIBRATED",
-        "mode": "screen_estimated_composition_bpt_road_first",
-        "model_core": "B/P/T完整歷史＋牌路先行＋有限牌組超幾何＋自適應校準",
+        "model_version": "V10.3-FULL-HISTORY-GRID-AWARE",
+        "mode": "screen_full_history_grid_aware",
         "screen_remaining_cards": total,
         "estimated_remaining_counts": counts,
         "composition_source": source,
         "composition_quality": "estimated",
         "road_sequence_length": len(cleaned),
-        "raw_outcome_length": len(raw_history),
-        "tie_count": sum(1 for value in raw_history if value == "T"),
-        "tie_markers": markers,
+        "raw_outcome_length": len(combined_raw),
+        "initial_image_count": len(initial_raw),
+        "manual_round_count": len(manual_raw),
+        "combined_round_count": len(combined_raw),
+        "full_history_used_count": len(combined_raw),
+        "initial_grid_cells": list(initial_grid_cells or []),
+        "tie_count": sum(1 for v in combined_raw if v == "T"),
+        "tie_markers": dict(tie_markers or {}),
         "road_support": context,
         "road_pipeline_completed": True,
         "screen_metadata": metadata,
         "screen_input_type": str(metadata.get("input_type") or "unknown"),
-        "room_source": str(metadata.get("room_source") or "unknown"),
-        "venue_source": str(metadata.get("venue_source") or "unknown"),
         "virtual_only": False,
         "external_screen_input": True,
-        "disclaimer": (
-            "截圖未包含每個點值的真實剩餘張數；系統保存 B/P/T 實際結果並做保守校準，"
-            "但無法取得真人桌尚未公開的隱藏牌序。"
-        ),
     })
     result["road_fusion"] = dict(result.get("road_integration") or {})
-
     if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id:
-        prediction_id = record_prediction(
-            user_id,
-            result,
-            venue=venue,
-            room=room,
-            metadata={
-                **metadata,
-                "road_sequence_length": len(cleaned),
-                "raw_outcome_length": len(raw_history),
-                "tie_count": result["tie_count"],
-            },
-        )
-        result["prediction_id"] = prediction_id
+        result["prediction_id"] = record_prediction(user_id, result, venue=venue, room=room, metadata={
+            **metadata, "initial_image_count": len(initial_raw), "manual_round_count": len(manual_raw),
+            "combined_round_count": len(combined_raw),
+        })
         result["performance_tracking"] = True
     else:
         result["performance_tracking"] = False

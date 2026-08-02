@@ -38,7 +38,7 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 
 
 ROAD_MIN_SAMPLES = _env_int("ROAD_MIN_SAMPLES", 12, 4, 100)
-ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 120, 18, 500)
+ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 500, 36, 2000)
 ROAD_SIMULATIONS = _env_int("ROAD_SIMULATIONS", 5000, 500, 100_000)
 ROAD_MIN_EDGE = _env_float("ROAD_MIN_EDGE", 0.075, 0.0, 0.30)
 ROAD_MAX_UNCERTAINTY = _env_float("ROAD_MAX_UNCERTAINTY", 0.095, 0.01, 0.40)
@@ -261,7 +261,7 @@ def _base_weights(regime_name: str) -> Dict[str, float]:
     return weights
 
 
-def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None) -> Dict[str, Any]:
+def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None, *, grid_cells: Sequence[Mapping[str, Any]] | None = None, initial_image_count: int = 0, manual_count: int = 0) -> Dict[str, Any]:
     raw_outcomes = normalize_raw_outcomes(values)
     sequence = [v for v in raw_outcomes if v in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
     length = len(sequence)
@@ -277,7 +277,7 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
         "mid": _window_model(sequence, ROAD_MID_WINDOW),
         "long": _window_model(sequence, ROAD_LONG_WINDOW),
         "pattern": _pattern_model(sequence, regime),
-        "full_road": analyze_full_road_pattern(sequence),
+        "full_road": analyze_full_road_pattern(sequence, grid_cells=grid_cells, initial_image_count=initial_image_count, manual_count=manual_count),
         "markov1": _markov_model(sequence, 1, ROAD_MARKOV1_MIN_SUPPORT),
         "markov2": _markov_model(sequence, 2, ROAD_MARKOV2_MIN_SUPPORT),
         "markov3": _markov_model(sequence, 3, ROAD_MARKOV3_MIN_SUPPORT),
@@ -396,7 +396,7 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_FULL_GEOMETRY_DERIVED_ROADS_ENSEMBLE_V10_2",
+        "engine": "ROAD_FULL_HISTORY_GLOBAL_RECENT_ENSEMBLE_V10_3",
         "pipeline_stage": "full_road_pattern_multi_model",
         "run_seed": run_seed,
         "sequence": sequence,
@@ -451,12 +451,16 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
             "analogue": int(models["analogue"].get("support", 0)),
         },
         "center_probability_before_simulation": round(center_b, 6),
-        "data_scope": "full_banker_player_history_with_big_road_geometry_and_derived_roads",
+        "data_scope": "entire_combined_history_with_global_and_recent_model_groups",
+        "full_history_used_count": length,
+        "initial_image_count": max(0, int(initial_image_count or 0)),
+        "manual_count": max(0, int(manual_count or 0)),
+        "grid_cell_count": len(list(grid_cells or [])),
     }
 
 
-def build_road_context(values: Iterable[Any], seed: int | None = None) -> Dict[str, Any]:
-    return calculate_road_probabilities(values, seed=seed)
+def build_road_context(values: Iterable[Any], seed: int | None = None, *, grid_cells: Sequence[Mapping[str, Any]] | None = None, initial_image_count: int = 0, manual_count: int = 0) -> Dict[str, Any]:
+    return calculate_road_probabilities(values, seed=seed, grid_cells=grid_cells, initial_image_count=initial_image_count, manual_count=manual_count)
 
 
 def _probability(value: Any, fallback: float = 0.0) -> float:
