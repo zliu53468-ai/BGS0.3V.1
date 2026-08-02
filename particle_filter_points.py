@@ -68,6 +68,9 @@ MIN_DIRECTION_EDGE = _env_float("HG_MIN_DIRECTION_EDGE", 0.016, 0.0, 0.10)
 MAX_SIGNAL_UNCERTAINTY = _env_float(
     "HG_MAX_UNCERTAINTY", 0.012, 0.001, 0.10
 )
+MAX_VALIDATION_GAP = _env_float(
+    "HG_MAX_VALIDATION_GAP", 0.025, 0.001, 0.15
+)
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 
 
@@ -650,37 +653,56 @@ class VirtualShoeParticleEngine:
         best_ev_side = max(expected_values, key=expected_values.get)
         best_ev = float(expected_values[best_ev_side])
 
-        signal_allowed = bool(
-            direction_edge >= MIN_DIRECTION_EDGE
-            and uncertainty <= MAX_SIGNAL_UNCERTAINTY
-        )
+        edge_ok = direction_edge >= MIN_DIRECTION_EDGE
+        uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
+        validation_ok = validation_gap <= MAX_VALIDATION_GAP
+        signal_allowed = bool(edge_ok and uncertainty_ok and validation_ok)
         action = direction if signal_allowed else "O"
 
+        uncertainty_score = 1.0 - min(
+            1.0, uncertainty / max(MAX_SIGNAL_UNCERTAINTY, 1e-9)
+        )
+        edge_score = min(
+            1.0, direction_edge / max(MIN_DIRECTION_EDGE, 1e-9)
+        )
+        validation_score = 1.0 - min(
+            1.0, validation_gap / max(MAX_VALIDATION_GAP, 1e-9)
+        )
+        particle_score = min(
+            1.0, particle_ess / max(1.0, self.settings.particles)
+        )
         quality_score = max(
             0.0,
             min(
                 1.0,
-                0.40
-                * (
-                    1.0
-                    - min(
-                        1.0,
-                        uncertainty / max(MAX_SIGNAL_UNCERTAINTY, 1e-9),
-                    )
-                )
-                + 0.25
-                * min(
-                    1.0,
-                    direction_edge / max(MIN_DIRECTION_EDGE, 1e-9),
-                )
-                + 0.20 * hyper_weight
-                + 0.15
-                * min(
-                    1.0,
-                    particle_ess / max(1.0, self.settings.particles),
-                ),
+                0.30 * uncertainty_score
+                + 0.25 * edge_score
+                + 0.20 * validation_score
+                + 0.15 * hyper_weight
+                + 0.10 * particle_score,
             ),
         )
+        confidence_label = (
+            "較高"
+            if quality_score >= 0.72
+            else "中等"
+            if quality_score >= 0.50
+            else "偏低"
+        )
+        model_consistency = max(0.0, min(1.0, validation_score))
+        if signal_allowed:
+            signal_reason = "方向差距、不確定性與模型一致度均通過正式訊號門檻"
+            signal_status_text = "方向訊號已開放"
+        else:
+            reasons: List[str] = []
+            if not edge_ok:
+                reasons.append("莊閒方向差距尚未達門檻")
+            if not uncertainty_ok:
+                reasons.append("模擬不確定性仍偏高")
+            if not validation_ok:
+                reasons.append("核心與驗證層的一致度不足")
+            signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
+            signal_status_text = "等待更明確訊號"
 
         return {
             "ok": True,
@@ -744,10 +766,16 @@ class VirtualShoeParticleEngine:
                 else "觀望"
             ),
             "direction_edge": float(direction_edge),
+            "direction_edge_percent": round(direction_edge * 100.0, 4),
             "uncertainty": uncertainty,
             "validation_gap": validation_gap,
+            "max_validation_gap": MAX_VALIDATION_GAP,
             "quality_score": round(quality_score, 6),
+            "confidence_label": confidence_label,
+            "model_consistency": round(model_consistency, 6),
             "signal_allowed": signal_allowed,
+            "signal_status_text": signal_status_text,
+            "signal_reason": signal_reason,
             "expected_values": expected_values,
             "best_ev_side": best_ev_side,
             "best_ev": best_ev,
@@ -788,6 +816,7 @@ class V5IndependentBaccaratEngine(VirtualShoeParticleEngine):
 
 __all__ = [
     "BANKER_COMMISSION",
+    "MAX_VALIDATION_GAP",
     "DB_HOLDOUT",
     "DEFAULT_BASELINE",
     "EngineSettings",
