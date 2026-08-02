@@ -1,4 +1,4 @@
-"""BGS V9.3 LINE Bot：UID 獨立畫面分析＋莊閒連續補輸。
+"""BGS V9.4 LINE Bot：UID 獨立畫面分析＋莊閒連續補輸。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 import store
 from predictor import run_virtual_round
-from road_model import calculate_road_probabilities
+from road_model import calculate_road_probabilities, fuse_road_with_main_prediction
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 
@@ -92,8 +92,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.3 UID Screen OCR + Continuous Road Bot",
-    version="9.3.0",
+    title="BGS V9.4 Professional Screen Fusion Bot",
+    version="9.4.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -264,40 +264,40 @@ def _parse_bankroll(text: str) -> int:
     return bankroll
 
 
+
 def _attach_bankroll_advice(
     prediction: Mapping[str, Any],
     session: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """依模型訊號加入保守型本金比例建議，不改寫核心機率。"""
+    """依正式訊號加入保守型資金配置；不改寫模型機率與方向。"""
     result = dict(prediction or {})
     bankroll = max(0, int(session.get("bankroll", 0) or 0))
-    action_code = str(result.get("action") or result.get("recommend") or "O").upper()
-    banker_rate = float(result.get("banker_rate", 0.0) or 0.0)
-    player_rate = float(result.get("player_rate", 0.0) or 0.0)
-    edge = abs(banker_rate - player_rate) / 100.0
+    action_code = str(result.get("action") or "O").upper()
+    edge = float(result.get("direction_edge", 0.0) or 0.0)
     quality = float(result.get("quality_score", result.get("confidence_score", 0.0)) or 0.0)
     confidence_label = str(result.get("confidence_label") or "偏低")
+    signal_reason = str(result.get("signal_reason") or "模型正在等待更明確的方向差距")
 
     if bankroll <= 0:
         percentage = 0.0
-        level = "未設定本金"
-        reason = "請先設定本金"
+        level = "尚未設定"
+        reason = "請先設定本次分析本金"
     elif action_code not in {"B", "P"}:
         percentage = 0.0
-        level = "觀望"
-        reason = "主模型未開放方向訊號"
+        level = "暫緩配置"
+        reason = signal_reason
     elif confidence_label == "較高" or (quality >= 0.72 and edge >= 0.04):
         percentage = 3.0
-        level = "較高訊號"
-        reason = "訊號品質與方向差距較明顯"
+        level = "積極區間"
+        reason = "方向差距、模型一致度與訊號品質均達較高區間"
     elif confidence_label == "中等" or quality >= 0.52:
         percentage = 2.0
-        level = "中等訊號"
-        reason = "訊號品質中等，採保守比例"
+        level = "標準區間"
+        reason = "方向訊號已開放，採標準風險比例"
     else:
         percentage = 1.0
-        level = "偏低訊號"
-        reason = "訊號偏弱，只採最低比例"
+        level = "保守區間"
+        reason = "方向訊號已開放，但品質仍屬保守區間"
 
     raw_amount = bankroll * percentage / 100.0
     suggested = int(raw_amount // 10 * 10) if percentage > 0 else 0
@@ -315,7 +315,6 @@ def _attach_bankroll_advice(
         }
     )
     return result
-
 
 
 def _road_quick_reply() -> Dict[str, Any]:
@@ -344,57 +343,39 @@ def _road_quick_reply() -> Dict[str, Any]:
     }
 
 
+
 def _road_text_message(
     session: Mapping[str, Any],
     *,
     notice: str = "",
 ) -> Dict[str, Any]:
-    """把路紙序列與模擬結果包成附 Quick Reply 的文字訊息。"""
+    """建立簡潔、正式的牌路狀態訊息。"""
     sequence = [
         str(item).upper()
         for item in list(session.get("road_sequence") or [])
         if str(item).upper() in {"B", "P"}
     ]
     analysis = dict(session.get("road_last_analysis") or {})
-    vision = dict(session.get("road_last_vision") or {})
-
-    compact = "".join("莊" if item == "B" else "閒" for item in sequence[-30:])
-    if len(sequence) > 30:
+    compact = "".join("莊" if item == "B" else "閒" for item in sequence[-24:])
+    if len(sequence) > 24:
         compact = "…" + compact
     if not compact:
-        compact = "尚無資料"
+        compact = "尚未建立"
 
-    lines = []
+    lines: List[str] = []
     if notice:
         lines.append(str(notice))
-    lines.extend(
-        [
-            f"路紙資料：{len(sequence)} 局",
-            f"最近序列：{compact}",
-        ]
-    )
-
+    lines.extend([
+        f"牌路樣本：{len(sequence)} 局",
+        f"近期序列：{compact}",
+    ])
     if analysis:
-        lines.extend(
-            [
-                f"莊：{float(analysis.get('banker_rate', 50.0)):.2f}%",
-                f"閒：{float(analysis.get('player_rate', 50.0)):.2f}%",
-                f"機率領先：{analysis.get('direction_text') or '-'}",
-                f"操作訊號：{analysis.get('action_text') or '觀望'}｜品質：{analysis.get('confidence_label') or '偏低'}",
-            ]
-        )
-    else:
-        lines.append("操作訊號：觀望")
-
-    if vision:
-        lines.append(
-            "影像辨識："
-            f"成功 {int(vision.get('recognized_count', 0) or 0)} 個｜"
-            f"顏色不明 {int(vision.get('unknown_candidates', 0) or 0)} 個"
-        )
-
-    lines.append("可用下方按鈕補輸最新一局，或清除後重新傳圖。")
-    lines.append("路紙模型只反映已輸入結果的統計傾向，不代表可預知外部牌局。")
+        lines.extend([
+            f"方向評估：{analysis.get('direction_text') or '-'}",
+            f"訊號狀態：{analysis.get('signal_status_text') or analysis.get('action_text') or '暫緩'}",
+            f"模型信心：{analysis.get('confidence_label') or '偏低'}",
+        ])
+    lines.append("請使用下方按鈕回報本局實際結果，系統將更新下一局分析。")
     return {
         "type": "text",
         "text": "\n".join(lines)[:5000],
@@ -402,14 +383,14 @@ def _road_text_message(
     }
 
 
+
 def _road_error_message(message: str) -> Dict[str, Any]:
     return {
         "type": "text",
         "text": (
-            f"⚠️ {message}\n"
-            "請裁切到大路區域後重新傳送；也可以先用下方按鈕手動補輸。"
+            f"⚠️ 畫面資料尚未完整建立\n{message}\n\n"
+            "請重新傳送包含完整大路區域的清晰截圖。"
         )[:5000],
-        "quickReply": _road_quick_reply(),
     }
 
 
@@ -555,6 +536,7 @@ def venue_panel(user_id: str) -> Dict[str, Any]:
 
 
 
+
 def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
     value = str(outcome or "").upper()
     label = "莊" if value == "B" else "閒"
@@ -562,7 +544,7 @@ def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": f"已記錄本局結果：{label}",
+            "altText": f"本局結果已更新：{label}",
             "contents": {
                 "type": "bubble",
                 "body": {
@@ -573,14 +555,14 @@ def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
                     "contents": [
                         {
                             "type": "text",
-                            "text": f"✅ 已記錄本局：{label}",
+                            "text": f"本局結果已更新：{label}",
                             "weight": "bold",
                             "size": "xl",
                             "color": color,
                         },
                         {
                             "type": "text",
-                            "text": "正在把最新結果加入此 UID 的牌路，完成後會自動推送下一局分析面板。",
+                            "text": "系統正在同步牌路、模型機率與下一局方向評估，完成後將自動推送新版分析面板。",
                             "wrap": True,
                             "margin": "md",
                             "color": "#4C3900",
@@ -590,6 +572,7 @@ def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
             },
         }
     )
+
 
 
 def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
@@ -604,7 +587,7 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
         "contents": [
             {
                 "type": "text",
-                "text": "BGS 畫面分析準備完成",
+                "text": "BGS 智慧牌局分析",
                 "weight": "bold",
                 "size": "xl",
                 "color": "#7B5600",
@@ -612,10 +595,10 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
             {
                 "type": "text",
                 "text": (
-                    f"館別：{venue}\n"
+                    f"分析館別：{venue}\n"
                     f"桌號：{session.get('room') or '1'}\n"
-                    f"目前本金：{bankroll_text}\n\n"
-                    "點擊開始分析會只清除目前這個 UID 的舊牌路；確認本金後，只需上傳一次最新遊戲畫面。"
+                    f"資金設定：{bankroll_text}\n\n"
+                    "開始後將建立此 UID 的獨立牌局工作階段，首次上傳畫面完成初始化，後續每局只需回報莊或閒。"
                 ),
                 "wrap": True,
                 "margin": "md",
@@ -627,9 +610,9 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                 "spacing": "sm",
                 "margin": "lg",
                 "contents": [
-                    _postback_button("開始分析", "start_screen"),
-                    _postback_button("設定／更改本金", "change_bankroll", color="#E29B19"),
-                    _postback_button("重新選館", "venues", style="secondary"),
+                    _postback_button("開始牌局分析", "start_screen"),
+                    _postback_button("設定／調整本金", "change_bankroll", color="#E29B19"),
+                    _postback_button("重新選擇館別", "venues", style="secondary"),
                 ],
             },
         ],
@@ -637,19 +620,20 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "BGS 畫面分析準備完成",
+            "altText": "BGS 智慧牌局分析",
             "contents": {"type": "bubble", "size": "mega", "body": body},
         }
     )
 
 
+
 def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     current = int(session.get("bankroll", 0) or 0)
-    current_text = f"目前本金：{_format_money(current)} 元\n" if current > 0 else ""
+    current_text = f"目前設定：{_format_money(current)} 元\n" if current > 0 else ""
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "請輸入本次分析本金",
+            "altText": "設定分析本金",
             "contents": {
                 "type": "bubble",
                 "size": "mega",
@@ -661,7 +645,7 @@ def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                     "contents": [
                         {
                             "type": "text",
-                            "text": "請設定本次分析本金",
+                            "text": "設定分析本金",
                             "weight": "bold",
                             "size": "xl",
                             "color": "#7B5600",
@@ -669,14 +653,14 @@ def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                         {
                             "type": "text",
                             "text": (
-                                f"{current_text}請直接輸入純數字，例如：10000\n\n"
-                                "模型完成分析後，面板會依訊號品質提供 0%～3% 的保守型金額建議。"
+                                f"{current_text}請直接輸入金額，例如：10000\n\n"
+                                "系統會依方向訊號、模型一致度與風險區間計算建議配置。"
                             ),
                             "wrap": True,
                             "margin": "md",
                             "color": "#4C3900",
                         },
-                        _postback_button("返回選館", "venues", style="secondary"),
+                        _postback_button("返回館別選單", "venues", style="secondary"),
                     ],
                 },
             },
@@ -684,11 +668,12 @@ def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     )
 
 
+
 def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "請上傳最新遊戲畫面",
+            "altText": "上傳牌局畫面",
             "contents": {
                 "type": "bubble",
                 "size": "mega",
@@ -700,7 +685,7 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
                     "contents": [
                         {
                             "type": "text",
-                            "text": "請上傳最新遊戲畫面",
+                            "text": "建立牌局資料",
                             "weight": "bold",
                             "size": "xl",
                             "color": "#7B5600",
@@ -711,8 +696,7 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
                                 f"館別：{_venue_name(str(session.get('venue') or ''))}\n"
                                 f"桌號：{session.get('room') or '1'}\n"
                                 f"本金：{_format_money(session.get('bankroll', 0))} 元\n\n"
-                                "本次分析只需先傳送一次最新完整截圖，畫面盡量包含：\n"
-                                "① 館別／桌號　② 剩餘張數　③ 大路紅藍圓圈"
+                                "請上傳目前最新完整遊戲畫面，建議包含館別／桌號、剩餘張數與完整大路區域。"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -720,7 +704,7 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
                         },
                         {
                             "type": "text",
-                            "text": "圖片完成後，後續每局只需按「莊」或「閒」，系統會持續更新此 UID 的預測。",
+                            "text": "首次畫面完成後，系統將建立初始牌路；後續每局只需回報實際開出莊或閒。",
                             "wrap": True,
                             "size": "sm",
                             "margin": "md",
@@ -732,9 +716,9 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
                             "spacing": "sm",
                             "margin": "lg",
                             "contents": [
-                                _postback_button("更改本金", "change_bankroll", color="#E29B19"),
-                                _postback_button("重新選館", "venues", style="secondary"),
-                                _postback_button("結束分析", "end", style="secondary"),
+                                _postback_button("調整本金", "change_bankroll", color="#E29B19"),
+                                _postback_button("重新選擇館別", "venues", style="secondary"),
+                                _postback_button("結束本次分析", "end", style="secondary"),
                             ],
                         },
                     ],
@@ -744,11 +728,12 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
     )
 
 
+
 def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "圖片已收到，正在分析",
+            "altText": "牌局畫面已接收",
             "contents": {
                 "type": "bubble",
                 "body": {
@@ -759,7 +744,7 @@ def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
                     "contents": [
                         {
                             "type": "text",
-                            "text": "✅ 圖片已收到",
+                            "text": "牌局畫面已接收",
                             "weight": "bold",
                             "size": "xl",
                             "color": "#7B5600",
@@ -767,11 +752,11 @@ def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
                         {
                             "type": "text",
                             "text": (
-                                "正在執行：\n"
-                                "• 館別／桌號／剩餘張數 OCR\n"
-                                "• 大路紅藍圓圈辨識\n"
-                                "• 超幾何＋粒子／蒙地卡羅主模型\n\n"
-                                "完成後會自動推送分析結果面板。"
+                                "系統正在建立本桌分析資料：\n"
+                                "• 解析館別、桌號與剩餘張數\n"
+                                "• 建立大路莊閒序列\n"
+                                "• 執行有限牌組、蒙地卡羅、粒子驗證與牌路融合\n\n"
+                                "完成後將自動推送下一局方向分析。"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -782,6 +767,7 @@ def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
             },
         }
     )
+
 
 def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     prediction = dict(session.get("last_prediction") or {})
@@ -896,11 +882,14 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 
+
 def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
-    """首次圖片或後續莊閒結果完成後的 UID 獨立分析面板。"""
+    """首次圖片或後續莊閒結果完成後的 UID 獨立專業分析面板。"""
     prediction = dict(session.get("screen_last_prediction") or {})
     ocr = dict(session.get("screen_last_ocr") or {})
     detection = dict(session.get("screen_last_detection") or {})
+    road_support = dict(prediction.get("road_support") or {})
+    fusion = dict(prediction.get("road_fusion") or {})
     sequence = [
         str(item).upper()
         for item in list(session.get("road_sequence") or [])
@@ -916,26 +905,45 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         or ocr.get("remaining_cards")
         or 416
     )
-    direction = str(prediction.get("recommend_text") or "-")
+    direction = str(prediction.get("recommend_text") or "尚未建立")
+    action_code = str(prediction.get("action") or "O").upper()
     action = str(prediction.get("action_text") or "觀望")
+    signal_status = str(
+        prediction.get("signal_status_text")
+        or ("方向訊號已開放" if action_code in {"B", "P"} else "等待更明確訊號")
+    )
+    signal_reason = str(prediction.get("signal_reason") or "模型正在等待更明確的方向差距")
+    quality_score = float(prediction.get("quality_score", 0.0) or 0.0)
+    confidence_label = str(prediction.get("confidence_label") or "偏低")
+    edge_percent = float(
+        prediction.get("direction_edge_percent")
+        or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0
+    )
+    consistency = float(prediction.get("model_consistency", 0.0) or 0.0) * 100.0
     analysis_number = int(session.get("screen_analysis_count", 0) or 0)
-    processing_ms = float(session.get("screen_processing_ms", 0.0) or 0.0)
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
-    bet_level = str(prediction.get("bet_level_text") or "觀望")
-    bet_reason = str(prediction.get("bet_reason") or "-")
+    bet_level = str(prediction.get("bet_level_text") or "暫緩配置")
+    bet_reason = str(prediction.get("bet_reason") or signal_reason)
     manual_rounds = int(session.get("screen_manual_rounds", 0) or 0)
+    recognized = int(detection.get("recognized_count", 0) or 0)
+    road_direction = str(road_support.get("direction_text") or "資料建立中")
+    road_samples = int(road_support.get("sample_count", len(sequence)) or len(sequence))
+    fusion_text = "已納入" if bool(fusion.get("applied")) else "主模型為主"
+    data_quality = "畫面資料已建立" if recognized > 0 else "沿用本桌牌路資料"
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
         if suggested > 0
-        else "本局觀望／0 元"
+        else "0 元（暫緩配置）"
     )
+
+    direction_color = "#D52B2B" if direction == "莊" else "#2667D8" if direction == "閒" else "#7B5600"
 
     return _clean_flex(
         {
             "type": "flex",
-            "altText": f"即時分析結果：{action}",
+            "altText": f"BGS 下一局方向：{direction}",
             "quickReply": _road_quick_reply(),
             "contents": {
                 "type": "bubble",
@@ -948,7 +956,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                     "contents": [
                         {
                             "type": "text",
-                            "text": f"即時分析結果 #{analysis_number}",
+                            "text": f"BGS 下一局分析 #{analysis_number}",
                             "weight": "bold",
                             "size": "xl",
                             "color": "#7B5600",
@@ -956,9 +964,9 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                         {
                             "type": "text",
                             "text": (
-                                f"館別：{venue_name or '-'}｜桌號：{room}\\n"
-                                f"估計剩餘：{remaining} 張｜牌路：{len(sequence)} 局\\n"
-                                f"圖片後補輸：{manual_rounds} 局"
+                                f"館別：{venue_name or '-'}｜桌號：{room}\n"
+                                f"估計剩餘：{remaining} 張｜牌路樣本：{len(sequence)} 局\n"
+                                f"本次後續更新：{manual_rounds} 局"
                             ),
                             "wrap": True,
                             "size": "sm",
@@ -967,39 +975,53 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                         },
                         {"type": "separator", "margin": "md", "color": "#E1BD43"},
                         {
+                            "type": "text",
+                            "text": f"下一局方向評估：{direction}",
+                            "weight": "bold",
+                            "size": "xl",
+                            "margin": "md",
+                            "color": direction_color,
+                        },
+                        {
                             "type": "box",
                             "layout": "vertical",
                             "spacing": "sm",
                             "margin": "md",
                             "contents": [
-                                {
-                                    "type": "text",
-                                    "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%",
-                                    "color": "#D52B2B",
-                                    "weight": "bold",
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%",
-                                    "color": "#2667D8",
-                                    "weight": "bold",
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%",
-                                    "color": "#259B55",
-                                    "weight": "bold",
-                                },
+                                {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
+                                {"type": "text", "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%", "color": "#2667D8", "weight": "bold"},
+                                {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
                             ],
                         },
                         {
                             "type": "text",
                             "text": (
-                                f"機率領先：{direction}\\n"
-                                f"操作訊號：{action}｜品質：{prediction.get('confidence_label') or '偏低'}\\n"
-                                f"本金：{_format_money(bankroll)} 元\\n"
-                                f"建議金額：{bet_text}\\n"
-                                f"配置理由：{bet_reason}"
+                                f"正式訊號：{action}\n"
+                                f"訊號狀態：{signal_status}\n"
+                                f"方向優勢：{edge_percent:.2f}%\n"
+                                f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
+                                f"模型一致度：{consistency:.1f}%\n"
+                                f"牌路輔助：{road_direction}｜融合：{fusion_text}"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "text",
+                            "text": f"訊號說明：{signal_reason}",
+                            "wrap": True,
+                            "size": "sm",
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                        {"type": "separator", "margin": "md", "color": "#E1BD43"},
+                        {
+                            "type": "text",
+                            "text": (
+                                f"分析本金：{_format_money(bankroll)} 元\n"
+                                f"建議配置：{bet_text}\n"
+                                f"配置依據：{bet_reason}"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -1008,10 +1030,8 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                         {
                             "type": "text",
                             "text": (
-                                f"辨識：OCR {ocr.get('backend') or '未取得'}｜"
-                                f"初始圓圈 {int(detection.get('recognized_count', 0) or 0)} 個｜"
-                                f"處理 {processing_ms:.0f} ms\\n"
-                                "後續請直接按本局實際結果，系統會更新同一 UID 的牌路。"
+                                f"資料狀態：{data_quality}\n"
+                                f"牌路統計樣本：{road_samples} 局"
                             ),
                             "wrap": True,
                             "size": "sm",
@@ -1024,27 +1044,14 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                             "spacing": "sm",
                             "margin": "lg",
                             "contents": [
-                                _postback_button(
-                                    "🔴 本局結果：莊",
-                                    "road_append",
-                                    color="#D52B2B",
-                                    result="B",
-                                ),
-                                _postback_button(
-                                    "🔵 本局結果：閒",
-                                    "road_append",
-                                    color="#2667D8",
-                                    result="P",
-                                ),
-                                _postback_button("結束分析", "end", style="secondary"),
+                                _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
+                                _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
+                                _postback_button("結束本次分析", "end", style="secondary"),
                             ],
                         },
                         {
                             "type": "text",
-                            "text": (
-                                "剩餘張數在後續補輸階段採每局平均耗牌估計；"
-                                "建議金額僅供風險控管，不保證結果。"
-                            ),
+                            "text": "本面板提供下一局機率方向、訊號品質與資金風險區間；實際結果仍具有隨機性。",
                             "wrap": True,
                             "size": "xs",
                             "margin": "md",
@@ -1055,7 +1062,6 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
             },
         }
     )
-
 
 
 def ended_panel() -> Dict[str, Any]:
@@ -1193,7 +1199,8 @@ def _refresh_screen_prediction(
     finally:
         _PREDICTION_SLOTS.release()
 
-    prediction["road_support"] = calculate_road_probabilities(sequence)
+    road_support = calculate_road_probabilities(sequence)
+    prediction = fuse_road_with_main_prediction(prediction, road_support)
     prediction["latest_actual_outcome"] = value
     prediction["latest_actual_outcome_text"] = "莊" if value == "B" else "閒"
     prediction["remaining_cards_estimated_after_manual"] = True
@@ -1301,10 +1308,11 @@ async def _process_screen_image(
             finally:
                 _PREDICTION_SLOTS.release()
 
-            prediction["road_support"] = await asyncio.to_thread(
+            road_support = await asyncio.to_thread(
                 calculate_road_probabilities,
                 sequence,
             )
+            prediction = fuse_road_with_main_prediction(prediction, road_support)
             prediction = _attach_bankroll_advice(prediction, current_session)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             session = store.update_screen_analysis(
