@@ -1,4 +1,4 @@
-"""遊戲畫面大路偵測模組（完整畫面／牌路裁切圖自動判斷）。
+"""遊戲畫面大路偵測模組 V10.1（ROI 與格位品質修正版）。
 
 會依使用者已選館別嘗試平台專用 ROI、通用 ROI 與整張圖片，並以辨識數量、
 未知候選與幾何雜訊評分選出最佳結果。牌路裁切圖會直接分析整張圖片。
@@ -79,26 +79,22 @@ def _crop(image: np.ndarray, roi: Sequence[float]) -> Tuple[np.ndarray, Dict[str
 def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not items:
         return []
-    heights = [max(1.0, float(item["height"])) for item in items]
-    tolerance = max(4.0, float(np.median(heights)) * 0.65)
-    columns: List[List[Dict[str, Any]]] = []
-    for item in sorted(items, key=lambda value: (value["cx"], value["cy"])):
-        selected = None
-        selected_distance = float("inf")
-        for column in columns:
-            center_x = float(np.mean([member["cx"] for member in column]))
-            distance = abs(float(item["cx"]) - center_x)
-            if distance <= tolerance and distance < selected_distance:
-                selected, selected_distance = column, distance
-        if selected is None:
-            columns.append([item])
-        else:
-            selected.append(item)
-    columns.sort(key=lambda column: float(np.mean([item["cx"] for item in column])))
-    ordered: List[Dict[str, Any]] = []
-    for column in columns:
-        ordered.extend(sorted(column, key=lambda item: (item["cy"], item["cx"])))
-    return ordered
+    diameter = float(np.median([max(1.0, (float(i['width'])+float(i['height']))/2.0) for i in items]))
+    def cluster(values: List[float]) -> List[float]:
+        groups: List[List[float]] = []
+        for value in sorted(values):
+            target = next((g for g in groups if abs(value-float(np.mean(g))) <= diameter*0.48), None)
+            (target if target is not None else groups.append([value]) or groups[-1]).append(value) if target is not None else None
+        return [float(np.mean(g)) for g in groups]
+    xs=cluster([float(i['cx']) for i in items]); ys=cluster([float(i['cy']) for i in items])
+    xs.sort(); ys.sort()
+    if len(ys)>6: ys=ys[:6]
+    grid={}
+    for item in items:
+        c=min(range(len(xs)),key=lambda k:abs(float(item['cx'])-xs[k]))
+        r=min(range(len(ys)),key=lambda k:abs(float(item['cy'])-ys[k]))
+        if r<=5: grid[(c,r)]=item
+    return [grid[key] for key in sorted(grid,key=lambda p:(p[0],p[1]))]
 
 
 def _get_yolo_model() -> Any:
@@ -151,8 +147,6 @@ def _detect_yolo(crop: np.ndarray) -> Dict[str, Any]:
     ordered = _sort_big_road(detections)
     return {
         "ok": bool(ordered), "sequence": [item["outcome"] for item in ordered],
-        "raw_outcomes": [item["outcome"] for item in ordered],
-        "tie_markers": {}, "tie_count": 0,
         "recognized_count": len(ordered), "candidates": ordered, "method": "custom_yolo",
         "unknown_candidates": 0, "raw_contours": 0,
     }
@@ -165,7 +159,7 @@ def _score_result(result: Mapping[str, Any], *, preference: float = 0.0) -> floa
     if recognized <= 0:
         return -9999.0
     noise = max(0, raw - recognized * 8)
-    return recognized * 5.0 - unknown * 0.8 - noise * 0.015 + preference
+    return recognized * 5.0 - unknown * 1.5 - noise * 0.04 + preference
 
 
 def _run_region(image: np.ndarray, roi: Tuple[float, float, float, float], name: str, preference: float) -> Dict[str, Any]:
@@ -251,9 +245,6 @@ def detect_road_sequence_detailed(
     region_name = str(best.get("region_name") or "")
 
     result = dict(best)
-    result.setdefault("tie_markers", {})
-    result.setdefault("tie_count", sum(int(value or 0) for value in dict(result.get("tie_markers") or {}).values()))
-    result.setdefault("raw_outcomes", list(result.get("sequence") or []))
     result.update({
         "ok": bool(result.get("sequence")),
         "input_type": detected_type,
