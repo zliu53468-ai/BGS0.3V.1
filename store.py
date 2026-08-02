@@ -1,4 +1,4 @@
-"""Atomic JSON storage for BGS V9.6 UID-isolated mobile dual-mode sessions."""
+"""Atomic JSON storage for BGS V9.7.2 UID-isolated sessions with writable-path fallback."""
 from __future__ import annotations
 
 import copy
@@ -19,9 +19,34 @@ from particle_filter_points import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SESSION_DATA_FILE = Path(
-    os.getenv("SESSION_DATA_FILE", str(BASE_DIR / "data" / "sessions.json"))
-)
+
+
+def _resolve_session_data_file() -> Path:
+    """Choose a writable session path instead of masking OS errors as access expiry."""
+    configured = Path(
+        os.getenv("SESSION_DATA_FILE", str(BASE_DIR / "data" / "sessions.json"))
+    ).expanduser()
+    candidates = [configured, BASE_DIR / "data" / "sessions.json", Path("/tmp/bgs_sessions.json")]
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            probe = candidate.parent / f".bgs_write_test_{os.getpid()}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            if candidate != configured:
+                print(f"SESSION_DATA_FILE fallback: {configured} -> {candidate}")
+            return candidate
+        except OSError as exc:
+            print(f"SESSION_DATA_FILE unavailable: {candidate}: {exc}")
+    raise RuntimeError("No writable SESSION_DATA_FILE path is available")
+
+
+SESSION_DATA_FILE = _resolve_session_data_file()
 PF_DECKS = max(1, min(16, int(os.getenv("PF_DECKS", "8") or "8")))
 TRIAL_MINUTES = max(0, int(os.getenv("TRIAL_MINUTES", "30") or "30"))
 ACTIVATION_CODES = {
