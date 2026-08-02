@@ -1,8 +1,8 @@
 """BGS V10.3 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
-收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
-首次辨識後先建立牌路 context，再交給超幾何＋粒子／蒙地卡羅核心統一判斷；後續按莊／閒／和持續更新同一 UID。
+收到圖片後直接在 Webhook 內完成房間 OCR、大路偵測與模型分析，最長等待 3.5 秒，
+成功時使用同一個 replyToken 回覆分析面板；超時則立即回覆重新上傳提示。後續按莊／閒／和持續更新同一 UID。
 虛擬牌靴程式仍保留給既有 API 相容用途，但不再混入 LINE 截圖流程。
 """
 from __future__ import annotations
@@ -49,7 +49,11 @@ ADMIN_LINE_URL = os.getenv(
 ).strip()
 ALLOW_UNSIGNED_WEBHOOK = os.getenv("ALLOW_UNSIGNED_WEBHOOK", "0").strip() == "1"
 MAX_CONCURRENT_PREDICTIONS = max(
-    1, min(4, int(os.getenv("APP_MAX_CONCURRENT_PREDICTIONS", "1") or "1"))
+    1, min(4, int(os.getenv("APP_MAX_CONCURRENT_PREDICTIONS", "2") or "2"))
+)
+LINE_IMAGE_ANALYSIS_TIMEOUT = max(
+    1.0,
+    min(3.5, float(os.getenv("LINE_IMAGE_ANALYSIS_TIMEOUT", "3.5") or "3.5")),
 )
 PREDICTION_QUEUE_TIMEOUT = max(
     5, min(55, int(os.getenv("APP_PREDICTION_QUEUE_TIMEOUT", "45") or "45"))
@@ -61,6 +65,8 @@ LINE_IMAGE_MAX_BYTES = max(
 _PREDICTION_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_PREDICTIONS)
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 _USER_LOCKS: Dict[str, asyncio.Lock] = {}
+_USER_IMAGE_LOCKS: Dict[str, threading.Lock] = {}
+_USER_IMAGE_LOCKS_GUARD = threading.Lock()
 SCREEN_ESTIMATED_CARDS_PER_ROUND = max(
     0,
     min(6, int(os.getenv("SCREEN_ESTIMATED_CARDS_PER_ROUND", "5") or "5")),
@@ -245,6 +251,29 @@ def _user_lock(user_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _USER_LOCKS[uid] = lock
     return lock
+
+
+def _user_image_lock(user_id: str) -> threading.Lock:
+    """圖片同步分析專用鎖；超時後底層執行緒尚在收尾時，避免同 UID 重疊寫入。"""
+    uid = str(user_id or "").strip()
+    with _USER_IMAGE_LOCKS_GUARD:
+        lock = _USER_IMAGE_LOCKS.get(uid)
+        if lock is None:
+            lock = threading.Lock()
+            _USER_IMAGE_LOCKS[uid] = lock
+        return lock
+
+
+def _remaining_image_time(deadline: float) -> float:
+    return max(0.0, float(deadline) - time.perf_counter())
+
+
+def _raise_if_image_timed_out(
+    cancel_event: threading.Event,
+    deadline: float,
+) -> None:
+    if cancel_event.is_set() or _remaining_image_time(deadline) <= 0.0:
+        raise TimeoutError("LINE 圖片分析已超過 replyToken 時限。")
 
 
 def _request_bankroll(user_id: str) -> Dict[str, Any]:
@@ -467,7 +496,11 @@ def _road_error_message(message: str) -> Dict[str, Any]:
     }
 
 
-def _download_line_image(message_id: str) -> Path:
+def _download_line_image(
+    message_id: str,
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> Path:
     """從 LINE Content API 下載圖片到短期暫存檔。"""
     if not CHANNEL_ACCESS_TOKEN:
         raise RuntimeError("尚未設定 LINE_CHANNEL_ACCESS_TOKEN。")
@@ -475,11 +508,20 @@ def _download_line_image(message_id: str) -> Path:
     if not message_id:
         raise ValueError("LINE 圖片 messageId 不存在。")
 
+    if timeout_seconds is None:
+        request_timeout = (5.0, 25.0)
+    else:
+        available = max(0.25, float(timeout_seconds))
+        request_timeout = (
+            max(0.20, min(1.25, available)),
+            max(0.20, min(2.50, available)),
+        )
+
     response = _LINE_HTTP.get(
         f"https://api-data.line.me/v2/bot/message/{message_id}/content",
         headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
         stream=True,
-        timeout=(5, 25),
+        timeout=request_timeout,
     )
     if response.status_code >= 300:
         raise RuntimeError(
@@ -1253,138 +1295,204 @@ def _start_screen_flow(
 
 
 
-async def _process_screen_image(
+def _process_screen_image_sync(
     user_id: str,
     message_id: str,
     expected_run_id: str,
-) -> None:
-    """背景完成雙模式辨識、牌路先行分析與統一主模型；只寫回同一 UID、同一代次。"""
+    cancel_event: threading.Event,
+    deadline: float,
+) -> List[Dict[str, Any]]:
+    """在工作執行緒內完整處理圖片，最後把 Reply API 所需訊息直接回傳給 Webhook。"""
     temporary_image: Optional[Path] = None
     started = time.perf_counter()
-    async with _user_lock(user_id):
+    image_lock = _user_image_lock(user_id)
+    image_lock_acquired = False
+    prediction_slot_acquired = False
+
+    try:
+        _raise_if_image_timed_out(cancel_event, deadline)
+        lock_wait = _remaining_image_time(deadline)
+        if lock_wait <= 0.0 or not image_lock.acquire(timeout=lock_wait):
+            raise TimeoutError("同一使用者的上一張圖片仍在分析中。")
+        image_lock_acquired = True
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        _ensure_access(user_id)
+        current_session = store.get_session(user_id)
+        if str(current_session.get("analysis_run_id") or "") != str(expected_run_id):
+            return [_text("本次分析已重新開始，請重新上傳最新圖片。")]
+        if not bool(current_session.get("analysis_active")):
+            return [_text("本次分析已結束，請重新點擊「開始分析」。")]
+
+        download_started = time.perf_counter()
+        temporary_image = _download_line_image(
+            message_id,
+            timeout_seconds=_remaining_image_time(deadline),
+        )
+        download_ms = (time.perf_counter() - download_started) * 1000.0
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        screen = analyze_game_screen(temporary_image, current_session)
+        _raise_if_image_timed_out(cancel_event, deadline)
+
+        sequence = list(screen.get("sequence") or [])
+        raw_outcomes = list(screen.get("raw_outcomes") or sequence)
+        tie_markers = dict(screen.get("tie_markers") or {})
+        grid_cells = [
+            dict(item)
+            for item in list(screen.get("grid_cells") or [])
+            if isinstance(item, Mapping)
+        ]
+        recognized_count = int(screen.get("recognized_count", len(sequence)) or len(sequence))
+        uncertain_count = int(screen.get("uncertain_count", 0) or 0)
+        recognition_quality_ok = bool(screen.get("recognition_quality_ok", True))
+
+        if not sequence:
+            road_errors = list((screen.get("road") or {}).get("errors") or [])
+            detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
+            return [
+                _road_error_message(
+                    f"{detail}。請傳送包含完整大路的畫面或牌路裁切圖。"
+                )
+            ]
+
+        if not recognition_quality_ok:
+            return [
+                _road_error_message(
+                    f"本次只確認 {recognized_count} 格，另有 {uncertain_count} 格無法可靠判定；"
+                    "為避免總局數錯誤，已停止送入模型。請裁切只保留完整大路後重新上傳。"
+                )
+            ]
+
+        resolved = dict(screen.get("resolved") or {})
+        remaining = int(resolved.get("remaining_cards") or 416)
+        resolved["remaining_cards"] = remaining
+        expected_version = int(current_session.get("screen_data_version", 0) or 0)
+        screen_metadata = {
+            "input_type": str(
+                screen.get("input_type") or resolved.get("input_type") or "full_screen"
+            ),
+            "venue_source": str(resolved.get("venue_source") or "session_selected"),
+            "room_source": str(resolved.get("room_source") or "session_selected"),
+            "room_confidence": float(resolved.get("room_confidence", 0.0) or 0.0),
+            "ocr_timed_out": bool(resolved.get("ocr_timed_out")),
+            "vision_timings": dict(screen.get("timings") or {}),
+        }
+        resolved.update(screen_metadata)
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        semaphore_wait = min(
+            float(PREDICTION_QUEUE_TIMEOUT),
+            _remaining_image_time(deadline),
+        )
+        if semaphore_wait <= 0.0:
+            raise TimeoutError("等待模型分析名額時已超時。")
+
+        prediction_slot_acquired = _PREDICTION_SLOTS.acquire(
+            timeout=semaphore_wait
+        )
+        if not prediction_slot_acquired:
+            raise TimeoutError("目前分析人數較多，等待模型分析名額已超時。")
+
+        model_started = time.perf_counter()
         try:
-            current_session = store.get_session(user_id)
-            if str(current_session.get("analysis_run_id") or "") != str(expected_run_id):
-                return
-            if not bool(current_session.get("analysis_active")):
-                return
-
-            download_started = time.perf_counter()
-            temporary_image = await asyncio.to_thread(_download_line_image, message_id)
-            download_ms = (time.perf_counter() - download_started) * 1000.0
-
-            screen = await asyncio.to_thread(analyze_game_screen, temporary_image, current_session)
-            sequence = list(screen.get("sequence") or [])
-            raw_outcomes = list(screen.get("raw_outcomes") or sequence)
-            tie_markers = dict(screen.get("tie_markers") or {})
-            grid_cells = [dict(item) for item in list(screen.get("grid_cells") or []) if isinstance(item, Mapping)]
-            recognized_count = int(screen.get("recognized_count", len(sequence)) or len(sequence))
-            uncertain_count = int(screen.get("uncertain_count", 0) or 0)
-            recognition_quality_ok = bool(screen.get("recognition_quality_ok", True))
-            if not sequence:
-                road_errors = list((screen.get("road") or {}).get("errors") or [])
-                detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
-                await asyncio.to_thread(
-                    _push, user_id,
-                    [_road_error_message(f"{detail}。請傳送包含完整大路的畫面或牌路裁切圖。")],
-                )
-                return
-            if not recognition_quality_ok:
-                await asyncio.to_thread(
-                    _push, user_id,
-                    [_road_error_message(
-                        f"本次只確認 {recognized_count} 格，另有 {uncertain_count} 格無法可靠判定；為避免總局數錯誤，已停止送入模型。請裁切只保留完整大路後重新上傳。"
-                    )],
-                )
-                return
-
-            resolved = dict(screen.get("resolved") or {})
-            remaining = int(resolved.get("remaining_cards") or 416)
-            resolved["remaining_cards"] = remaining
-            expected_version = int(current_session.get("screen_data_version", 0) or 0)
-            screen_metadata = {
-                "input_type": str(screen.get("input_type") or resolved.get("input_type") or "full_screen"),
-                "venue_source": str(resolved.get("venue_source") or "session_selected"),
-                "room_source": str(resolved.get("room_source") or "session_selected"),
-                "room_confidence": float(resolved.get("room_confidence", 0.0) or 0.0),
-                "ocr_timed_out": bool(resolved.get("ocr_timed_out")),
-                "vision_timings": dict(screen.get("timings") or {}),
-            }
-            resolved.update(screen_metadata)
-
-            acquired = await asyncio.to_thread(
-                _PREDICTION_SLOTS.acquire, True, PREDICTION_QUEUE_TIMEOUT
-            )
-            if not acquired:
-                raise RuntimeError("目前分析人數較多，請稍後重新上傳圖片。")
-            model_started = time.perf_counter()
-            try:
-                prediction = await asyncio.to_thread(
-                    predict_from_screenshot,
-                    sequence,
-                    raw_outcomes=raw_outcomes,
-                    tie_markers=tie_markers,
-                    remaining_cards=remaining,
-                    prior_counts=None,
-                    venue=str(resolved.get("venue_code") or current_session.get("venue") or ""),
-                    room=str(resolved.get("room") or current_session.get("room") or current_session.get("last_confirmed_room") or "1"),
-                    user_id=user_id,
-                    screen_metadata=screen_metadata,
-                    initial_grid_cells=grid_cells,
-                    initial_image_history=raw_outcomes,
-                    manual_outcome_history=[],
-                )
-            finally:
-                _PREDICTION_SLOTS.release()
-            model_ms = (time.perf_counter() - model_started) * 1000.0
-
-            prediction = _attach_bankroll_advice(prediction, current_session)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            source = f"screen_image_{screen_metadata['input_type']}"
-            session = store.update_screen_analysis(
-                user_id,
-                ocr=dict(screen.get("ocr") or {}),
-                detection=dict(screen.get("road") or {}),
-                sequence=sequence,
+            prediction = predict_from_screenshot(
+                sequence,
                 raw_outcomes=raw_outcomes,
                 tie_markers=tie_markers,
+                remaining_cards=remaining,
+                prior_counts=None,
+                venue=str(
+                    resolved.get("venue_code")
+                    or current_session.get("venue")
+                    or ""
+                ),
+                room=str(
+                    resolved.get("room")
+                    or current_session.get("room")
+                    or current_session.get("last_confirmed_room")
+                    or "1"
+                ),
+                user_id=user_id,
+                screen_metadata=screen_metadata,
+                initial_grid_cells=grid_cells,
                 initial_image_history=raw_outcomes,
                 manual_outcome_history=[],
-                initial_grid_cells=grid_cells,
-                recognition_quality={
-                    "recognized_count": recognized_count,
-                    "uncertain_count": uncertain_count,
-                    "quality_ok": recognition_quality_ok,
-                },
-                prediction=prediction,
-                resolved=resolved,
-                processing_ms=elapsed_ms,
-                source=source,
-                expected_run_id=expected_run_id,
-                expected_data_version=expected_version,
             )
-            print("screen_timing", json.dumps({
-                "uid": user_id[-8:],
-                "download_ms": round(download_ms, 2),
-                **dict(screen.get("timings") or {}),
-                "model_ms": round(model_ms, 2),
-                "total_ms": round(elapsed_ms, 2),
-                "input_type": screen_metadata["input_type"],
-                "room_source": screen_metadata["room_source"],
-                "road_count": len(sequence),
-            }, ensure_ascii=False))
-            await asyncio.to_thread(_push, user_id, [screen_result_panel(user_id, session)])
-        except AccessExpiredError:
-            await asyncio.to_thread(_push, user_id, [_text("試用已到期，請聯繫管理員開通。")])
-        except Exception as exc:
-            traceback.print_exc()
-            message = str(exc)
-            if "舊結果已忽略" in message or "已重新開始" in message or "已結束" in message:
-                return
-            await asyncio.to_thread(_push, user_id, [_road_error_message(f"圖片處理失敗：{exc}")])
         finally:
-            if temporary_image is not None:
-                temporary_image.unlink(missing_ok=True)
+            if prediction_slot_acquired:
+                _PREDICTION_SLOTS.release()
+                prediction_slot_acquired = False
+
+        model_ms = (time.perf_counter() - model_started) * 1000.0
+        _raise_if_image_timed_out(cancel_event, deadline)
+
+        prediction = _attach_bankroll_advice(prediction, current_session)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        source = f"screen_image_{screen_metadata['input_type']}"
+        session = store.update_screen_analysis(
+            user_id,
+            ocr=dict(screen.get("ocr") or {}),
+            detection=dict(screen.get("road") or {}),
+            sequence=sequence,
+            raw_outcomes=raw_outcomes,
+            tie_markers=tie_markers,
+            initial_image_history=raw_outcomes,
+            manual_outcome_history=[],
+            initial_grid_cells=grid_cells,
+            recognition_quality={
+                "recognized_count": recognized_count,
+                "uncertain_count": uncertain_count,
+                "quality_ok": recognition_quality_ok,
+            },
+            prediction=prediction,
+            resolved=resolved,
+            processing_ms=elapsed_ms,
+            source=source,
+            expected_run_id=expected_run_id,
+            expected_data_version=expected_version,
+        )
+
+        print(
+            "screen_timing",
+            json.dumps(
+                {
+                    "uid": user_id[-8:],
+                    "download_ms": round(download_ms, 2),
+                    **dict(screen.get("timings") or {}),
+                    "model_ms": round(model_ms, 2),
+                    "total_ms": round(elapsed_ms, 2),
+                    "input_type": screen_metadata["input_type"],
+                    "room_source": screen_metadata["room_source"],
+                    "road_count": len(sequence),
+                    "reply_mode": True,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return [screen_result_panel(user_id, session)]
+
+    except AccessExpiredError:
+        return [_text("試用已到期，請聯繫管理員開通。")]
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        message = str(exc)
+        if "舊結果已忽略" in message or "已重新開始" in message or "已結束" in message:
+            return [_text("本次圖片已失效，請重新上傳最新圖片。")]
+        return [_road_error_message(f"圖片處理失敗：{message}")]
+    finally:
+        # 雙重安全：任何例外、超時或取消路徑都不能遺漏釋放 Semaphore。
+        if prediction_slot_acquired:
+            try:
+                _PREDICTION_SLOTS.release()
+            finally:
+                prediction_slot_acquired = False
+        if temporary_image is not None:
+            temporary_image.unlink(missing_ok=True)
+        if image_lock_acquired:
+            image_lock.release()
 
 
 async def _process_manual_outcome(
@@ -1469,8 +1577,10 @@ def health() -> JSONResponse:
             "adaptive_ensemble": True,
             "stale_background_guard": True,
             "bankroll_flow": True,
-            "immediate_image_ack": True,
-            "background_push_result": True,
+            "immediate_image_ack": False,
+            "background_push_result": False,
+            "image_result_via_reply": True,
+            "image_reply_timeout_seconds": LINE_IMAGE_ANALYSIS_TIMEOUT,
             "line_default_mode": "screen",
         }
     )
@@ -1571,7 +1681,7 @@ async def webhook(request: Request) -> JSONResponse:
                 _reply(token, [venue_panel(user_id)])
                 continue
 
-            # 圖片先立即回覆，再交由背景工作完成並 Push 結果。
+            # 圖片事件：直接在 Webhook 內等待分析完成，再用同一個 replyToken 回覆。
             if event_type == "message" and message_type == "image":
                 _ensure_access(user_id)
                 session = store.get_session(user_id)
@@ -1582,17 +1692,49 @@ async def webhook(request: Request) -> JSONResponse:
                     session = _request_bankroll(user_id)
                     _reply(token, [bankroll_panel(user_id, session)])
                     continue
-
                 if not bool(session.get("analysis_active")):
-                    _reply(token, [_text("請先點擊「開始分析」，再上傳圖片。"), ready_panel(user_id, session)])
+                    _reply(
+                        token,
+                        [
+                            _text("請先點擊「開始分析」，再上傳圖片。"),
+                            ready_panel(user_id, session),
+                        ],
+                    )
                     continue
+
                 session = store.begin_screen_analysis(user_id, clear_existing=False)
                 message_id = str(message.get("id") or "").strip()
                 if not message_id:
                     raise ValueError("LINE 圖片 messageId 不存在。")
+
                 run_id = str(session.get("analysis_run_id") or "")
-                _reply(token, [image_received_panel(session)])
-                _schedule_background(_process_screen_image(user_id, message_id, run_id))
+                cancel_event = threading.Event()
+                deadline = time.perf_counter() + LINE_IMAGE_ANALYSIS_TIMEOUT
+                try:
+                    messages = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _process_screen_image_sync,
+                            user_id,
+                            message_id,
+                            run_id,
+                            cancel_event,
+                            deadline,
+                        ),
+                        timeout=LINE_IMAGE_ANALYSIS_TIMEOUT,
+                    )
+                except TimeoutError:
+                    cancel_event.set()
+                    messages = [
+                        _text(
+                            "⚠️ 伺服器分析超時，請重新上傳一次圖片試試看！"
+                        )
+                    ]
+                except Exception as exc:
+                    cancel_event.set()
+                    traceback.print_exc()
+                    messages = [_road_error_message(f"圖片處理失敗：{exc}")]
+
+                _reply(token, messages or [_text("圖片分析未產生結果，請重新上傳一次。")])
                 continue
 
             if event_type == "message" and message_type == "text":
