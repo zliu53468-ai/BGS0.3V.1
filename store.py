@@ -1,4 +1,4 @@
-"""Atomic JSON storage for click-only virtual-shoe baccarat sessions."""
+"""Atomic JSON storage for BGS V9.2 screen-analysis and virtual compatibility sessions."""
 from __future__ import annotations
 
 import copy
@@ -157,6 +157,12 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         "screen_analysis_count": 0,
         "screen_last_analyzed_at": 0,
         "screen_processing_ms": 0.0,
+        # 本金與建議金額狀態。
+        "bankroll": 0,
+        "initial_bankroll": 0,
+        "awaiting_bankroll": False,
+        "last_suggested_bet": 0,
+        "last_bet_percentage": 0.0,
         "trial_started_at": 0,
         "access_until": 0,
         "permanent_access": False,
@@ -270,6 +276,26 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     except Exception:
         session["screen_processing_ms"] = 0.0
 
+    # 舊版 Session 自動補上本金欄位。
+    session["bankroll"] = max(
+        0, min(100_000_000, int(session.get("bankroll", 0) or 0))
+    )
+    session["initial_bankroll"] = max(
+        0, min(100_000_000, int(session.get("initial_bankroll", 0) or 0))
+    )
+    if session["initial_bankroll"] <= 0 and session["bankroll"] > 0:
+        session["initial_bankroll"] = session["bankroll"]
+    session["awaiting_bankroll"] = bool(session.get("awaiting_bankroll", False))
+    session["last_suggested_bet"] = max(
+        0, min(session["bankroll"], int(session.get("last_suggested_bet", 0) or 0))
+    )
+    try:
+        session["last_bet_percentage"] = max(
+            0.0, min(100.0, float(session.get("last_bet_percentage", 0.0) or 0.0))
+        )
+    except Exception:
+        session["last_bet_percentage"] = 0.0
+
     if not isinstance(session.get("stats"), dict):
         session["stats"] = _fresh_stats()
     else:
@@ -331,8 +357,9 @@ def select_venue(user_id: str, venue: str, room: str = "1") -> Dict[str, Any]:
         changed = str(session.get("venue") or "") != str(venue or "")
         session["venue"] = str(venue or "")
         session["room"] = str(room or "1")
-        session["analysis_mode"] = DEFAULT_ANALYSIS_MODE
+        session["analysis_mode"] = "screen"
         session["awaiting_screenshot"] = False
+        session["awaiting_bankroll"] = False
         session["status"] = "待開始分析"
         if changed:
             preserved_reset_count = int(session.get("shoe_reset_count", 0) or 0)
@@ -365,6 +392,7 @@ def end_session(user_id: str) -> Dict[str, Any]:
             "status": "已結束",
             "pending_prediction": {},
             "awaiting_screenshot": False,
+            "awaiting_bankroll": False,
         },
     )
 
@@ -560,6 +588,50 @@ def run_virtual_round(
         return copy.deepcopy(session)
 
 
+def request_bankroll(user_id: str) -> Dict[str, Any]:
+    """標記下一則文字輸入為本金。"""
+    session = get_session(user_id)
+    if not session.get("venue"):
+        raise ValueError("請先選擇館別。")
+    return upsert_session(
+        user_id,
+        {
+            "analysis_mode": "screen",
+            "awaiting_bankroll": True,
+            "awaiting_screenshot": False,
+            "status": "等待輸入本金",
+        },
+    )
+
+
+def set_bankroll(
+    user_id: str,
+    bankroll: int,
+    *,
+    begin_screen: bool = True,
+) -> Dict[str, Any]:
+    """儲存本金；預設完成後直接進入等待遊戲截圖。"""
+    value = int(bankroll)
+    if value < 100:
+        raise ValueError("本金至少需輸入 100 元。")
+    if value > 100_000_000:
+        raise ValueError("本金數字過大，請重新輸入。")
+    session = get_session(user_id)
+    if not session.get("venue"):
+        raise ValueError("請先選擇館別。")
+    return upsert_session(
+        user_id,
+        {
+            "bankroll": value,
+            "initial_bankroll": value,
+            "awaiting_bankroll": False,
+            "analysis_mode": "screen",
+            "awaiting_screenshot": bool(begin_screen),
+            "status": "等待遊戲截圖" if begin_screen else "待開始分析",
+        },
+    )
+
+
 def begin_screen_analysis(
     user_id: str,
     *,
@@ -573,9 +645,18 @@ def begin_screen_analysis(
         data = _load_all_unlocked()
         raw = data.get(uid)
         session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
-        session["analysis_mode"] = "screen"
-        session["awaiting_screenshot"] = True
-        session["status"] = "等待遊戲截圖"
+        if not session.get("venue"):
+            raise ValueError("請先選擇館別。")
+        if int(session.get("bankroll", 0) or 0) <= 0:
+            session["analysis_mode"] = "screen"
+            session["awaiting_bankroll"] = True
+            session["awaiting_screenshot"] = False
+            session["status"] = "等待輸入本金"
+        else:
+            session["analysis_mode"] = "screen"
+            session["awaiting_bankroll"] = False
+            session["awaiting_screenshot"] = True
+            session["status"] = "等待遊戲截圖"
         if clear_existing:
             session["road_sequence"] = []
             session["road_last_analysis"] = {}
@@ -589,11 +670,12 @@ def begin_screen_analysis(
             session["screen_prediction_version"] = 0
             session["screen_last_input_source"] = ""
             session["screen_last_data_updated_at"] = 0
+            session["last_suggested_bet"] = 0
+            session["last_bet_percentage"] = 0.0
         session["updated_at"] = _now()
         data[uid] = session
         _save_all_unlocked(data)
         return copy.deepcopy(session)
-
 
 def begin_virtual_analysis(user_id: str) -> Dict[str, Any]:
     """明確切換回內建虛擬牌靴模式。"""
@@ -630,6 +712,9 @@ def clear_screen_analysis(
         "screen_last_input_source": "",
         "screen_last_data_updated_at": 0,
         "awaiting_screenshot": bool(keep_mode),
+        "awaiting_bankroll": False,
+        "last_suggested_bet": 0,
+        "last_bet_percentage": 0.0,
         "status": "等待遊戲截圖" if keep_mode else "待開始分析",
     }
     if keep_mode:
@@ -783,7 +868,14 @@ def update_screen_analysis(
         session["screen_analysis_count"] = int(session.get("screen_analysis_count", 0) or 0) + 1
         session["screen_last_analyzed_at"] = _now()
         session["screen_processing_ms"] = max(0.0, float(processing_ms or 0.0))
-        session["status"] = "分析中"
+        session["last_suggested_bet"] = max(
+            0, int(dict(prediction or {}).get("suggested_bet_amount", 0) or 0)
+        )
+        session["last_bet_percentage"] = max(
+            0.0, float(dict(prediction or {}).get("bet_percentage", 0.0) or 0.0)
+        )
+        session["awaiting_bankroll"] = False
+        session["status"] = "分析完成"
         session["updated_at"] = _now()
 
         data[uid] = session
@@ -845,6 +937,7 @@ __all__ = [
     "clear_road_sequence",
     "end_session",
     "get_session",
+    "request_bankroll",
     "reset_session",
     "reset_shoe",
     "run_virtual_round",
@@ -854,6 +947,7 @@ __all__ = [
     "set_road_sequence",
     "update_road_analysis",
     "update_screen_analysis",
+    "set_bankroll",
     "set_room",
     "start_session",
     "upsert_session",
