@@ -5,7 +5,7 @@
 2. 先辨識牌路狀態（長龍、單跳、雙跳、轉折、混亂）。
 3. 讓短／中／長視窗、路型、Markov、歷史相似型態等模型各自提出方向。
 4. 依狀態選擇模型權重，採多模型共識建立牌路方向。
-5. 將方向交給有限牌組主引擎；後者僅做機率、穩定度與風險驗證。
+5. 將各牌路子模型機率與共識結果交給全模型主引擎，與有限牌組模型共同參與最終方向。
 
 本模組只分析已發生的 B/P/T 序列，不取得真人桌隱藏牌序，也不保證下一局結果。
 """
@@ -431,6 +431,14 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
         },
         "regime": regime,
         "models": model_outputs,
+        "component_probabilities": {
+            name: {
+                "B": round(component_probabilities[name], 8),
+                "P": round(1.0 - component_probabilities[name], 8),
+                "T": 0.0,
+            }
+            for name in models
+        },
         "weights": {name: round(weight, 6) for name, weight in effective.items()},
         "supports": {
             "first_order": int(models["markov1"].get("support", 0)),
