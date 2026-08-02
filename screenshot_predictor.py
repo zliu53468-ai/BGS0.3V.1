@@ -1,17 +1,21 @@
-"""遊戲截圖用的機率估計轉接層。
+"""遊戲截圖的牌路先行預測轉接層。
 
-重要限制：截圖只提供「剩餘總張數」與莊閒路紙，沒有每個點值實際剩餘
-張數，因此無法重建真人桌的精確牌組。本模組會依既有 Session 牌值比例，
-或全新八副牌的理論比例，建立一組可重現的估計 counts，再交給既有
-超幾何＋蒙地卡羅引擎。輸出會明確標示 estimated composition。
+流程固定為：
+1. 清理截圖辨識出的 B/P 序列。
+2. 先執行 road_model 建立牌路 context。
+3. 估計截圖未提供的 0~9 點剩餘張數。
+4. 將牌路 context 與估計牌組一起交給統一主引擎。
+
+截圖沒有每個點值的真實剩餘張數，因此牌組組成仍屬估計資料。
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import secrets
 
 from particle_filter_points import fresh_counts
 from predictor import predict
+from road_model import build_road_context
 
 
 def _clean_sequence(values: Iterable[Any]) -> List[str]:
@@ -78,12 +82,13 @@ def predict_from_screenshot(
     cleaned = _clean_sequence(sequence)
     fallback_total = sum(int(value) for value in prior_counts or [] if int(value) >= 0)
     total = int(remaining_cards or fallback_total or 416)
-    counts, source = estimate_point_counts(
-        total,
-        prior_counts=prior_counts,
-        decks=8,
-    )
+    counts, source = estimate_point_counts(total, prior_counts=prior_counts, decks=8)
+
     seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
+    road_seed = (seed ^ 0x9E3779B9) & 0xFFFFFFFF
+
+    # 關鍵順序：牌路先分析，再把 road context 交給主引擎。
+    road_context = build_road_context(cleaned, seed=road_seed)
     result = predict(
         history=cleaned,
         venue=venue,
@@ -91,23 +96,29 @@ def predict_from_screenshot(
         user_id=user_id,
         run_seed=seed,
         shoe_context={"remaining_counts": counts},
+        road_context=road_context,
     )
-    result.update(
-        {
-            "model_version": "V9.0-SCREEN-OCR-HYPERGEOMETRIC-MC",
-            "mode": "screen_estimated_composition",
-            "model_core": "超幾何分布＋粒子/蒙地卡羅驗證",
-            "screen_remaining_cards": total,
-            "estimated_remaining_counts": counts,
-            "composition_source": source,
-            "road_sequence_length": len(cleaned),
-            "virtual_only": False,
-            "external_screen_input": True,
-            "disclaimer": (
-                "截圖只有剩餘總張數，未包含每個點值的真實剩餘張數；"
-                "本結果使用估計牌值組成，不等同真人桌精確牌靴。"
-            ),
-        }
-    )
+    result.update({
+        "model_version": "V9.5-SCREEN-ROAD-FIRST-UNIFIED",
+        "mode": "screen_estimated_composition_road_first",
+        "model_core": "牌路先行＋有限牌組超幾何＋粒子／蒙地卡羅統一判斷",
+        "screen_remaining_cards": total,
+        "estimated_remaining_counts": counts,
+        "composition_source": source,
+        "composition_quality": "estimated",
+        "road_sequence_length": len(cleaned),
+        "road_support": road_context,
+        "road_pipeline_completed": True,
+        "virtual_only": False,
+        "external_screen_input": True,
+        "disclaimer": (
+            "截圖只有剩餘總張數，未包含每個點值的真實剩餘張數；"
+            "系統會先分析已辨識牌路，再以估計牌組執行機率模型。"
+        ),
+    })
+    # 相容舊面板欄位；內容實際來自主引擎內部整合，不是 app 後置融合。
+    result["road_fusion"] = dict(result.get("road_integration") or {})
     return result
 
+
+__all__ = ["estimate_point_counts", "predict_from_screenshot"]
