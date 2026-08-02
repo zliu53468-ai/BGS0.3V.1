@@ -1,4 +1,4 @@
-"""BGS V9.7.1 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
+"""BGS V9.7.2 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
@@ -79,11 +79,19 @@ VENUE_BY_CODE = {venue["code"]: venue for venue in VENUES}
 
 
 def _normalize_access_code(value: Any) -> str:
-    """Normalize copied LINE text so full-width/hidden characters cannot break activation."""
+    """Normalize LINE text, including common full-width/hidden/homoglyph input."""
     text = unicodedata.normalize("NFKC", str(value or ""))
     for hidden in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
         text = text.replace(hidden, "")
-    return re.sub(r"\s+", "", text).lower()
+    # Common visually identical characters accidentally produced by IMEs.
+    text = text.translate(str.maketrans({
+        "а": "a",  # Cyrillic small a
+        "ɑ": "a",  # Latin alpha
+        "Ａ": "A",
+        "ａ": "a",
+    }))
+    text = re.sub(r"[^0-9A-Za-z]", "", text)
+    return text.lower()
 
 
 def _code_set(env_name: str, defaults: str) -> set[str]:
@@ -114,8 +122,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.7.1 BPT Calibrated Screen Bot",
-    version="9.7.1",
+    title="BGS V9.7.2 BPT Calibrated Screen Bot",
+    version="9.7.2",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -137,6 +145,10 @@ class VenueRequest(UserRequest):
 
 class RoomRequest(UserRequest):
     room: str = Field(min_length=1, max_length=24)
+
+
+class AccessExpiredError(Exception):
+    """Raised only when the user's access is genuinely expired."""
 
 
 def _now() -> datetime:
@@ -1098,7 +1110,7 @@ def _activate_code(user_id: str, code: str) -> str:
 def _ensure_access(user_id: str) -> Dict[str, Any]:
     status = store.access_status(user_id, start_trial=True)
     if not status.get("allowed"):
-        raise PermissionError("試用已到期")
+        raise AccessExpiredError("試用已到期")
     return status
 
 
@@ -1323,7 +1335,7 @@ async def _process_screen_image(
                 "road_count": len(sequence),
             }, ensure_ascii=False))
             await asyncio.to_thread(_push, user_id, [screen_result_panel(user_id, session)])
-        except PermissionError:
+        except AccessExpiredError:
             await asyncio.to_thread(_push, user_id, [_text("試用已到期，請聯繫管理員開通。")])
         except Exception as exc:
             traceback.print_exc()
@@ -1391,9 +1403,11 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "9.7.1",
-            "engine": "V9_7_1_UID_SCREEN_BPT_CALIBRATED",
+            "version": "9.7.2",
+            "engine": "V9_7_2_UID_SCREEN_BPT_CALIBRATED",
             "activation_code_fix": True,
+            "activation_persistence_check": True,
+            "storage_path": str(getattr(store, "SESSION_DATA_FILE", "")),
             "activation_code_counts": {
                 "permanent": len(PERMANENT_CODES),
                 "monthly": len(MONTHLY_CODES),
@@ -1535,8 +1549,25 @@ async def webhook(request: Request) -> JSONResponse:
                 text = unicodedata.normalize("NFKC", raw_text).strip()
                 access_code = _normalize_access_code(raw_text)
 
-                if access_code in ALL_CODES:
+                activation_match = access_code in ALL_CODES
+                print(
+                    "activation_debug",
+                    json.dumps(
+                        {
+                            "uid": user_id[-8:],
+                            "normalized": access_code,
+                            "length": len(access_code),
+                            "matched": activation_match,
+                            "permanent": access_code in PERMANENT_CODES,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                if activation_match:
                     plan = _activate_code(user_id, access_code)
+                    saved = store.get_session(user_id)
+                    if plan == "永久版" and not bool(saved.get("permanent_access")):
+                        raise RuntimeError("開通資料未成功寫入，請檢查 SESSION_DATA_FILE 儲存路徑。")
                     _reply(token, [_text(f"✅ 已開通：{plan}"), venue_panel(user_id)])
                     continue
 
@@ -1545,7 +1576,7 @@ async def webhook(request: Request) -> JSONResponse:
                         token,
                         [
                             _text(
-                                "BGS 版本：9.7.1\n"
+                                "BGS 版本：9.7.2\n"
                                 f"永久碼載入數：{len(PERMANENT_CODES)}\n"
                                 f"aaa1888007 已載入：{'是' if 'aaa1888007' in PERMANENT_CODES else '否'}"
                             )
@@ -1698,7 +1729,7 @@ async def webhook(request: Request) -> JSONResponse:
                 else:
                     _reply(token, [venue_panel(user_id)])
                 continue
-        except PermissionError:
+        except AccessExpiredError:
             _reply(
                 token,
                 [
@@ -1720,6 +1751,10 @@ async def webhook(request: Request) -> JSONResponse:
                     },
                 ],
             )
+        except PermissionError as exc:
+            traceback.print_exc()
+            storage_path = str(getattr(store, "SESSION_DATA_FILE", "未設定"))
+            _reply(token, [_text(f"資料儲存權限錯誤：{storage_path}\n請確認 Render Persistent Disk 掛載或移除錯誤的 SESSION_DATA_FILE。")])
         except Exception as exc:
             traceback.print_exc()
             message = str(exc)
