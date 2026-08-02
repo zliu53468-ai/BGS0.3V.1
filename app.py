@@ -1,8 +1,8 @@
-"""BGS V9.6 LINE Bot：手機完整截圖／牌路裁切圖雙模式快速分析。
+"""BGS V9.7 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
 
-LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒。
+LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
-首次辨識後先建立牌路 context，再交給超幾何＋粒子／蒙地卡羅核心統一判斷；後續按莊／閒持續更新同一 UID。
+首次辨識後先建立牌路 context，再交給超幾何＋粒子／蒙地卡羅核心統一判斷；後續按莊／閒／和持續更新同一 UID。
 虛擬牌靴程式仍保留給既有 API 相容用途，但不再混入 LINE 截圖流程。
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ from predictor import run_virtual_round
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 from room_ocr import preload_ocr
+from performance_tracker import resolve_latest_prediction
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,8 +93,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.6 Mobile Dual-Mode Screen Bot",
-    version="9.6.0",
+    title="BGS V9.7 BPT Calibrated Screen Bot",
+    version="9.7.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -325,31 +326,58 @@ def _attach_bankroll_advice(
 
 
 def _road_quick_reply() -> Dict[str, Any]:
-    """首次圖片完成後，後續只保留莊／閒兩個結果按鈕。"""
+    """首次圖片完成後，後續只保留莊／閒／和三個實際結果按鈕。"""
     return {
         "items": [
             {
                 "type": "action",
                 "action": {
-                    "type": "postback",
-                    "label": "🔴 本局：莊",
-                    "data": "action=road_append&result=B",
-                    "displayText": "🔴 本局：莊",
+                    "type": "postback", "label": "🔴 本局：莊",
+                    "data": "action=road_append&result=B", "displayText": "🔴 本局：莊",
                 },
             },
             {
                 "type": "action",
                 "action": {
-                    "type": "postback",
-                    "label": "🔵 本局：閒",
-                    "data": "action=road_append&result=P",
-                    "displayText": "🔵 本局：閒",
+                    "type": "postback", "label": "🔵 本局：閒",
+                    "data": "action=road_append&result=P", "displayText": "🔵 本局：閒",
+                },
+            },
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback", "label": "🟢 本局：和",
+                    "data": "action=road_append&result=T", "displayText": "🟢 本局：和",
                 },
             },
         ]
     }
 
 
+def _derive_road_state(raw_values: List[str]) -> Dict[str, Any]:
+    raw = [str(item).upper().strip() for item in raw_values if str(item).upper().strip() in {"B", "P", "T"}][-1000:]
+    road: List[str] = []
+    markers: Dict[str, int] = {}
+    pending_opening = 0
+    for value in raw:
+        if value in {"B", "P"}:
+            road.append(value)
+            if pending_opening:
+                key = str(len(road) - 1)
+                markers[key] = markers.get(key, 0) + pending_opening
+                pending_opening = 0
+        elif road:
+            key = str(len(road) - 1)
+            markers[key] = markers.get(key, 0) + 1
+        else:
+            pending_opening += 1
+    return {
+        "raw_outcomes": raw,
+        "road_sequence": road[-500:],
+        "tie_markers": markers,
+        "tie_total": sum(1 for value in raw if value == "T"),
+        "pending_opening_ties": pending_opening,
+    }
 
 def _road_text_message(
     session: Mapping[str, Any],
@@ -362,8 +390,13 @@ def _road_text_message(
         for item in list(session.get("road_sequence") or [])
         if str(item).upper() in {"B", "P"}
     ]
+    raw_outcomes = [
+        str(item).upper()
+        for item in list(session.get("raw_outcomes") or sequence)
+        if str(item).upper() in {"B", "P", "T"}
+    ]
     analysis = dict(session.get("road_last_analysis") or {})
-    compact = "".join("莊" if item == "B" else "閒" for item in sequence[-24:])
+    compact = "".join({"B": "莊", "P": "閒", "T": "和"}[item] for item in raw_outcomes[-24:])
     if len(sequence) > 24:
         compact = "…" + compact
     if not compact:
@@ -373,7 +406,7 @@ def _road_text_message(
     if notice:
         lines.append(str(notice))
     lines.extend([
-        f"牌路樣本：{len(sequence)} 局",
+        f"完整牌局：{len(raw_outcomes)} 局｜大路樣本：{len(sequence)} 局｜和局：{sum(1 for item in raw_outcomes if item == 'T')} 局",
         f"近期序列：{compact}",
     ])
     if analysis:
@@ -382,7 +415,7 @@ def _road_text_message(
             f"訊號狀態：{analysis.get('signal_status_text') or analysis.get('action_text') or '暫緩'}",
             f"模型信心：{analysis.get('confidence_label') or '偏低'}",
         ])
-    lines.append("請使用下方按鈕回報本局實際結果，系統將更新下一局分析。")
+    lines.append("請使用下方按鈕回報本局莊／閒／和，系統將結算上一筆預測並更新下一局分析。")
     return {
         "type": "text",
         "text": "\n".join(lines)[:5000],
@@ -546,8 +579,11 @@ def venue_panel(user_id: str) -> Dict[str, Any]:
 
 def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
     value = str(outcome or "").upper()
-    label = "莊" if value == "B" else "閒"
-    color = "#D52B2B" if value == "B" else "#2667D8"
+    label, color = {
+        "B": ("莊", "#D52B2B"),
+        "P": ("閒", "#2667D8"),
+        "T": ("和", "#159447"),
+    }.get(value, ("未知", "#7B5600"))
     return _clean_flex(
         {
             "type": "flex",
@@ -555,32 +591,15 @@ def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
             "contents": {
                 "type": "bubble",
                 "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "backgroundColor": "#FFF4B8",
-                    "paddingAll": "18px",
+                    "type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px",
                     "contents": [
-                        {
-                            "type": "text",
-                            "text": f"本局結果已更新：{label}",
-                            "weight": "bold",
-                            "size": "xl",
-                            "color": color,
-                        },
-                        {
-                            "type": "text",
-                            "text": "系統正在同步牌路、模型機率與下一局方向評估，完成後將自動推送新版分析面板。",
-                            "wrap": True,
-                            "margin": "md",
-                            "color": "#4C3900",
-                        },
+                        {"type": "text", "text": f"本局結果已更新：{label}", "weight": "bold", "size": "xl", "color": color},
+                        {"type": "text", "text": "系統正在結算上一筆預測，並同步 B/P/T 完整歷史、牌路模型與下一局三方機率。", "wrap": True, "margin": "md", "color": "#4C3900"},
                     ],
                 },
             },
         }
     )
-
-
 
 def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     venue = _venue_name(str(session.get("venue") or ""))
@@ -891,40 +910,30 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
-    """首次圖片或後續莊閒結果完成後的 UID 獨立專業分析面板。"""
+    """首次圖片或後續 B/P/T 結果完成後的 UID 獨立專業分析面板。"""
     prediction = dict(session.get("screen_last_prediction") or {})
     ocr = dict(session.get("screen_last_ocr") or {})
     detection = dict(session.get("screen_last_detection") or {})
     road_support = dict(prediction.get("road_support") or {})
     fusion = dict(prediction.get("road_integration") or prediction.get("road_fusion") or {})
-    sequence = [
-        str(item).upper() for item in list(session.get("road_sequence") or [])
-        if str(item).upper() in {"B", "P"}
-    ]
+    calibration = dict(prediction.get("calibration") or {})
+    adaptive = dict(prediction.get("adaptive_ensemble") or {})
+    sequence = [str(item).upper() for item in list(session.get("road_sequence") or []) if str(item).upper() in {"B", "P"}]
+    raw_outcomes = [str(item).upper() for item in list(session.get("raw_outcomes") or sequence) if str(item).upper() in {"B", "P", "T"}]
+    tie_total = int(session.get("tie_total", 0) or sum(1 for item in raw_outcomes if item == "T"))
 
     venue_code = str(ocr.get("venue_code") or session.get("venue") or "")
     venue_name = str(ocr.get("venue_name") or _venue_name(venue_code))
     room = str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1")
-    remaining = int(
-        prediction.get("screen_remaining_cards")
-        or session.get("screen_remaining_cards")
-        or ocr.get("remaining_cards")
-        or 416
-    )
+    remaining = int(prediction.get("screen_remaining_cards") or session.get("screen_remaining_cards") or ocr.get("remaining_cards") or 416)
     direction = str(prediction.get("recommend_text") or "尚未建立")
     action_code = str(prediction.get("action") or "O").upper()
     action = str(prediction.get("action_text") or "觀望")
-    signal_status = str(
-        prediction.get("signal_status_text")
-        or ("方向訊號已開放" if action_code in {"B", "P"} else "等待更明確訊號")
-    )
+    signal_status = str(prediction.get("signal_status_text") or ("方向訊號已開放" if action_code in {"B", "P", "T"} else "等待更明確訊號"))
     signal_reason = str(prediction.get("signal_reason") or "模型正在等待更明確的方向差距")
     quality_score = float(prediction.get("quality_score", 0.0) or 0.0)
     confidence_label = str(prediction.get("confidence_label") or "偏低")
-    edge_percent = float(
-        prediction.get("direction_edge_percent")
-        or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0
-    )
+    edge_percent = float(prediction.get("direction_edge_percent") or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0)
     consistency = float(prediction.get("model_consistency", 0.0) or 0.0) * 100.0
     analysis_number = int(session.get("screen_analysis_count", 0) or 0)
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
@@ -942,16 +951,19 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     room_source = str(session.get("screen_room_source") or prediction.get("room_source") or ocr.get("room_source") or "")
     room_source_text = "畫面辨識" if room_source == "image_ocr" else "沿用目前分析桌"
     data_quality = f"{input_type_text}已完成辨識" if recognized > 0 else "沿用本桌牌路資料"
-    bet_text = (
-        f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
-        if suggested > 0 else "0 元（暫緩配置）"
+    bet_text = f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）" if suggested > 0 else "0 元（暫緩配置）"
+    direction_color = {"莊": "#D52B2B", "閒": "#2667D8", "和": "#159447"}.get(direction, "#7B5600")
+    calibration_text = (
+        f"已啟用｜{calibration.get('scope')}｜{int(calibration.get('sample_count', 0) or 0)} 筆"
+        if calibration.get("active") else f"累積中｜{int(calibration.get('sample_count', 0) or 0)} 筆"
     )
-    direction_color = "#D52B2B" if direction == "莊" else "#2667D8" if direction == "閒" else "#7B5600"
+    adaptive_text = (
+        f"已啟用｜{float(adaptive.get('effective_share', 0.0) or 0.0) * 100.0:.1f}%"
+        if adaptive.get("active") else "樣本累積中"
+    )
 
     return _clean_flex({
-        "type": "flex",
-        "altText": f"BGS 下一局方向：{direction}",
-        "quickReply": _road_quick_reply(),
+        "type": "flex", "altText": f"BGS 下一局方向：{direction}", "quickReply": _road_quick_reply(),
         "contents": {
             "type": "bubble", "size": "mega",
             "body": {
@@ -960,7 +972,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                     {"type": "text", "text": f"BGS 下一局分析 #{analysis_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
                     {"type": "text", "text": (
                         f"館別：{venue_name or '-'}｜桌號：{room}（{room_source_text}）\n"
-                        f"輸入畫面：{input_type_text}｜牌路樣本：{len(sequence)} 局\n"
+                        f"完整牌局：{len(raw_outcomes)} 局｜大路：{len(sequence)} 局｜和局：{tie_total} 局\n"
                         f"估計剩餘：{remaining} 張｜後續更新：{manual_rounds} 局"
                     ), "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
                     {"type": "separator", "margin": "md", "color": "#E1BD43"},
@@ -971,32 +983,26 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                         {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
                     ]},
                     {"type": "text", "text": (
-                        f"正式訊號：{action}\n"
-                        f"訊號狀態：{signal_status}\n"
-                        f"方向優勢：{edge_percent:.2f}%\n"
-                        f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
-                        f"模型一致度：{consistency:.1f}%\n"
+                        f"正式訊號：{action}\n訊號狀態：{signal_status}\n方向優勢：{edge_percent:.2f}%\n"
+                        f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n模型一致度：{consistency:.1f}%\n"
                         f"牌路先行：{road_direction}｜整合：{fusion_text}"
                     ), "wrap": True, "margin": "md", "color": "#3E3100"},
+                    {"type": "text", "text": f"校準狀態：{calibration_text}\n自適應集成：{adaptive_text}", "wrap": True, "size": "sm", "margin": "md", "color": "#665000"},
                     {"type": "text", "text": f"訊號說明：{signal_reason}", "wrap": True, "size": "sm", "margin": "md", "color": "#665000"},
                     {"type": "separator", "margin": "md", "color": "#E1BD43"},
-                    {"type": "text", "text": (
-                        f"分析本金：{_format_money(bankroll)} 元\n"
-                        f"建議配置：{bet_text}\n"
-                        f"配置依據：{bet_reason}"
-                    ), "wrap": True, "margin": "md", "color": "#3E3100"},
+                    {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}\n配置依據：{bet_reason}", "wrap": True, "margin": "md", "color": "#3E3100"},
                     {"type": "text", "text": f"資料狀態：{data_quality}\n牌路統計樣本：{road_samples} 局", "wrap": True, "size": "sm", "margin": "md", "color": "#806A2A"},
                     {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
                         _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
                         _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
+                        _postback_button("🟢 本局結果：和", "road_append", color="#159447", result="T"),
                         _postback_button("結束本次分析", "end", style="secondary"),
                     ]},
-                    {"type": "text", "text": "完成首次圖片分析後，每局只需回報莊或閒，系統會沿用目前桌號並更新下一局分析。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
+                    {"type": "text", "text": "首次圖片後，每局只需回報莊／閒／和。系統會用實際結果結算上一筆預測並更新校準資料。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
                 ],
             },
         },
     })
-
 
 def ended_panel() -> Dict[str, Any]:
     return _clean_flex(
@@ -1091,10 +1097,10 @@ def _refresh_screen_prediction(
     outcome: str,
     expected_run_id: str,
 ) -> Dict[str, Any]:
-    """加入本局結果；不再重跑 OCR，只沿用目前桌號與畫面 metadata。"""
+    """加入本局 B/P/T，結算上一筆預測；不重跑 OCR，只更新模型。"""
     value = str(outcome or "").upper().strip()
-    if value not in {"B", "P"}:
-        raise ValueError("本局結果只能是莊或閒。")
+    if value not in {"B", "P", "T"}:
+        raise ValueError("本局結果只能是莊、閒或和。")
 
     session = store.get_session(user_id)
     if str(session.get("analysis_run_id") or "") != str(expected_run_id):
@@ -1105,9 +1111,23 @@ def _refresh_screen_prediction(
         raise ValueError("請先上傳一次遊戲畫面，建立初始牌路。")
 
     expected_version = int(session.get("screen_data_version", 0) or 0)
-    sequence = list(session.get("road_sequence") or []) + [value]
     ocr = dict(session.get("screen_last_ocr") or {})
     detection = dict(session.get("screen_last_detection") or {})
+    venue = str(ocr.get("venue_code") or session.get("venue") or "")
+    room = str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1")
+
+    # 先用本局真實結果結算上一筆預測；校準器下一局只會看到過去資料。
+    resolve_latest_prediction(user_id, value, venue=venue, room=room)
+
+    raw_history = [
+        str(item).upper() for item in list(session.get("raw_outcomes") or session.get("road_sequence") or [])
+        if str(item).upper() in {"B", "P", "T"}
+    ]
+    raw_history.append(value)
+    road_state = _derive_road_state(raw_history)
+    sequence = list(road_state["road_sequence"])
+    tie_markers = dict(road_state["tie_markers"])
+
     current_remaining = int(session.get("screen_remaining_cards") or ocr.get("remaining_cards") or 416)
     remaining = max(6, current_remaining - SCREEN_ESTIMATED_CARDS_PER_ROUND)
     screen_metadata = {
@@ -1124,10 +1144,12 @@ def _refresh_screen_prediction(
     try:
         prediction = predict_from_screenshot(
             sequence,
+            raw_outcomes=raw_history,
+            tie_markers=tie_markers,
             remaining_cards=remaining,
             prior_counts=None,
-            venue=str(ocr.get("venue_code") or session.get("venue") or ""),
-            room=str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1"),
+            venue=venue,
+            room=room,
             user_id=user_id,
             screen_metadata=screen_metadata,
         )
@@ -1135,21 +1157,20 @@ def _refresh_screen_prediction(
         _PREDICTION_SLOTS.release()
 
     prediction["latest_actual_outcome"] = value
-    prediction["latest_actual_outcome_text"] = "莊" if value == "B" else "閒"
+    prediction["latest_actual_outcome_text"] = {"B": "莊", "P": "閒", "T": "和"}[value]
     prediction["remaining_cards_estimated_after_manual"] = True
     prediction = _attach_bankroll_advice(prediction, session)
     resolved = {
-        "venue_code": str(ocr.get("venue_code") or session.get("venue") or ""),
-        "venue_name": str(ocr.get("venue_name") or ""),
-        "room": str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1"),
-        "remaining_cards": remaining,
-        **screen_metadata,
+        "venue_code": venue, "venue_name": str(ocr.get("venue_name") or ""),
+        "room": room, "remaining_cards": remaining, **screen_metadata,
     }
     return store.update_screen_analysis(
         user_id,
         ocr=ocr,
         detection=detection,
         sequence=sequence,
+        raw_outcomes=raw_history,
+        tie_markers=tie_markers,
         prediction=prediction,
         resolved=resolved,
         processing_ms=0.0,
@@ -1157,7 +1178,6 @@ def _refresh_screen_prediction(
         expected_run_id=expected_run_id,
         expected_data_version=expected_version,
     )
-
 
 def _start_screen_flow(
     user_id: str,
@@ -1205,6 +1225,8 @@ async def _process_screen_image(
 
             screen = await asyncio.to_thread(analyze_game_screen, temporary_image, current_session)
             sequence = list(screen.get("sequence") or [])
+            raw_outcomes = list(screen.get("raw_outcomes") or sequence)
+            tie_markers = dict(screen.get("tie_markers") or {})
             if not sequence:
                 road_errors = list((screen.get("road") or {}).get("errors") or [])
                 detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
@@ -1238,6 +1260,8 @@ async def _process_screen_image(
                 prediction = await asyncio.to_thread(
                     predict_from_screenshot,
                     sequence,
+                    raw_outcomes=raw_outcomes,
+                    tie_markers=tie_markers,
                     remaining_cards=remaining,
                     prior_counts=None,
                     venue=str(resolved.get("venue_code") or current_session.get("venue") or ""),
@@ -1257,6 +1281,8 @@ async def _process_screen_image(
                 ocr=dict(screen.get("ocr") or {}),
                 detection=dict(screen.get("road") or {}),
                 sequence=sequence,
+                raw_outcomes=raw_outcomes,
+                tie_markers=tie_markers,
                 prediction=prediction,
                 resolved=resolved,
                 processing_ms=elapsed_ms,
@@ -1293,7 +1319,7 @@ async def _process_manual_outcome(
     outcome: str,
     expected_run_id: str,
 ) -> None:
-    """同一 UID 依序處理莊／閒按鈕，完成後 Push 新分析面板。"""
+    """同一 UID 依序處理莊／閒／和按鈕，完成後 Push 新分析面板。"""
     async with _user_lock(user_id):
         try:
             _ensure_access(user_id)
@@ -1343,8 +1369,8 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "9.3.0",
-            "engine": "V9_3_UID_SCREEN_ONCE_CONTINUOUS_BP",
+            "version": "9.7.0",
+            "engine": "V9_7_UID_SCREEN_BPT_CALIBRATED",
             "input_required": True,
             "virtual_only": False,
             "public_base_url_configured": bool(PUBLIC_BASE_URL),
@@ -1355,7 +1381,10 @@ def health() -> JSONResponse:
             "parallel_screen_pipeline": True,
             "road_manual_quick_reply": True,
             "uid_isolated_sessions": True,
-            "first_image_then_bp_only": True,
+            "first_image_then_bpt_only": True,
+            "tie_result_supported": True,
+            "online_calibration": True,
+            "adaptive_ensemble": True,
             "stale_background_guard": True,
             "bankroll_flow": True,
             "immediate_image_ack": True,
@@ -1504,7 +1533,7 @@ async def webhook(request: Request) -> JSONResponse:
                         _reply(token, [_text(str(exc)), bankroll_panel(user_id, session)])
                     continue
 
-                # 首次圖片完成後，文字入口同樣只接受莊／閒。
+                # 首次圖片完成後，文字入口同樣接受莊／閒／和。
                 if text in {"🔴 本局：莊", "🔴 本局結果：莊", "補輸莊", "補莊", "莊"}:
                     current = store.get_session(user_id)
                     if not current.get("screen_last_prediction"):
@@ -1522,6 +1551,15 @@ async def webhook(request: Request) -> JSONResponse:
                     run_id = str(current.get("analysis_run_id") or "")
                     _reply(token, [manual_result_received_panel("P")])
                     _schedule_background(_process_manual_outcome(user_id, "P", run_id))
+                    continue
+                if text in {"🟢 本局：和", "🟢 本局結果：和", "補輸和", "補和", "和"}:
+                    current = store.get_session(user_id)
+                    if not current.get("screen_last_prediction"):
+                        _reply(token, [_text("請先點擊開始分析並上傳一次遊戲畫面。")])
+                        continue
+                    run_id = str(current.get("analysis_run_id") or "")
+                    _reply(token, [manual_result_received_panel("T")])
+                    _schedule_background(_process_manual_outcome(user_id, "T", run_id))
                     continue
                 if text in {"🔄 清除重來", "清除路紙", "清除畫面", "重來"}:
                     result = _start_screen_flow(user_id, new_session=True)
@@ -1570,8 +1608,8 @@ async def webhook(request: Request) -> JSONResponse:
 
                 if action_name == "road_append":
                     value = str(query.get("result") or "").upper()
-                    if value not in {"B", "P"}:
-                        raise ValueError("手動牌路結果不正確。")
+                    if value not in {"B", "P", "T"}:
+                        raise ValueError("手動牌局結果不正確。")
                     current = store.get_session(user_id)
                     if not bool(current.get("analysis_active")):
                         _reply(token, [_text("本次分析已結束，請重新開始分析。")])
