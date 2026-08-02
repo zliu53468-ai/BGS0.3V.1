@@ -1,15 +1,18 @@
-"""BGS 百家樂牌路先行分析模組。
+"""BGS 百家樂牌路先行多模型分析模組 V9.9。
 
 處理順序：
-1. 先把已辨識或使用者回報的 B/P/T 結果正規化；T 另存、不新增大路格位。
-2. 使用近期衰減、一階轉移、二階轉移與 Beta 後驗蒙地卡羅建立牌路 context。
-3. 將牌路 context 傳入有限牌組主引擎，由主引擎統一決定下一局方向與正式訊號。
+1. 正規化圖片辨識或使用者回報的 B/P/T；和局保留統計但不新增大路格位。
+2. 先辨識牌路狀態（長龍、單跳、雙跳、轉折、混亂）。
+3. 讓短／中／長視窗、路型、Markov、歷史相似型態等模型各自提出方向。
+4. 依狀態選擇模型權重，採多模型共識建立牌路方向。
+5. 將方向交給有限牌組主引擎；後者僅做機率、穩定度與風險驗證。
 
-牌路資料只描述已發生結果，不取得外部真人桌的隱藏牌序，也不保證下一局結果。
+本模組只分析已發生的 B/P/T 序列，不取得真人桌隱藏牌序，也不保證下一局結果。
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+import math
 import os
 import secrets
 
@@ -32,23 +35,25 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, value))
 
 
-ROAD_MIN_SAMPLES = _env_int("ROAD_MIN_SAMPLES", 6, 2, 100)
-ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 120, 10, 500)
+ROAD_MIN_SAMPLES = _env_int("ROAD_MIN_SAMPLES", 12, 4, 100)
+ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 120, 18, 500)
 ROAD_SIMULATIONS = _env_int("ROAD_SIMULATIONS", 5000, 500, 100_000)
-ROAD_MIN_EDGE = _env_float("ROAD_MIN_EDGE", 0.055, 0.0, 0.30)
-ROAD_MAX_UNCERTAINTY = _env_float("ROAD_MAX_UNCERTAINTY", 0.10, 0.01, 0.40)
-ROAD_RECENCY_DECAY = _env_float("ROAD_RECENCY_DECAY", 0.93, 0.50, 0.999)
+ROAD_MIN_EDGE = _env_float("ROAD_MIN_EDGE", 0.075, 0.0, 0.30)
+ROAD_MAX_UNCERTAINTY = _env_float("ROAD_MAX_UNCERTAINTY", 0.095, 0.01, 0.40)
+ROAD_RECENCY_DECAY = _env_float("ROAD_RECENCY_DECAY", 0.90, 0.50, 0.999)
+ROAD_MIN_CONSENSUS = _env_float("ROAD_MIN_CONSENSUS", 0.62, 0.50, 1.0)
+ROAD_SHORT_WINDOW = _env_int("ROAD_SHORT_WINDOW", 8, 4, 30)
+ROAD_MID_WINDOW = _env_int("ROAD_MID_WINDOW", 18, 8, 60)
+ROAD_LONG_WINDOW = _env_int("ROAD_LONG_WINDOW", 36, 12, 120)
+ROAD_MARKOV1_MIN_SUPPORT = _env_int("ROAD_MARKOV1_MIN_SUPPORT", 5, 1, 100)
+ROAD_MARKOV2_MIN_SUPPORT = _env_int("ROAD_MARKOV2_MIN_SUPPORT", 4, 1, 100)
+ROAD_MARKOV3_MIN_SUPPORT = _env_int("ROAD_MARKOV3_MIN_SUPPORT", 3, 1, 100)
 
-# 牌路 context 是否可進入主引擎，以及最多可使用多少權重。
 ROAD_FUSION_ENABLED = os.getenv("ROAD_FUSION_ENABLED", "1").strip() == "1"
 ROAD_FUSION_WEIGHT = _env_float("ROAD_FUSION_WEIGHT", 0.08, 0.0, 0.20)
-ROAD_FUSION_MIN_SAMPLES = _env_int("ROAD_FUSION_MIN_SAMPLES", 10, 4, 100)
-ROAD_FUSION_MIN_CONFIDENCE = _env_float(
-    "ROAD_FUSION_MIN_CONFIDENCE", 0.45, 0.0, 1.0
-)
-ROAD_FUSION_MAX_UNCERTAINTY = _env_float(
-    "ROAD_FUSION_MAX_UNCERTAINTY", 0.16, 0.01, 0.50
-)
+ROAD_FUSION_MIN_SAMPLES = _env_int("ROAD_FUSION_MIN_SAMPLES", 16, 4, 100)
+ROAD_FUSION_MIN_CONFIDENCE = _env_float("ROAD_FUSION_MIN_CONFIDENCE", 0.58, 0.0, 1.0)
+ROAD_FUSION_MAX_UNCERTAINTY = _env_float("ROAD_FUSION_MAX_UNCERTAINTY", 0.14, 0.01, 0.50)
 
 
 def normalize_raw_outcomes(values: Iterable[Any]) -> List[str]:
@@ -64,37 +69,20 @@ def normalize_raw_outcomes(values: Iterable[Any]) -> List[str]:
 
 
 def normalize_road_sequence(values: Iterable[Any]) -> List[str]:
-    """大路結構只使用非和局 B/P；T 另保存於 raw history 與 tie 統計。"""
-    return [value for value in normalize_raw_outcomes(values) if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
+    return [v for v in normalize_raw_outcomes(values) if v in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
 
 
-def _beta_counts_for_context(
-    sequence: Sequence[str],
-    order: int,
-) -> Tuple[float, float, int]:
-    """回傳指定尾端 context 後，下一局 B/P 的平滑計數。"""
-    if len(sequence) <= order:
-        return 2.0, 2.0, 0
-    context = tuple(sequence[-order:])
-    banker = 2.0
-    player = 2.0
-    support = 0
-    for index in range(order, len(sequence)):
-        if tuple(sequence[index - order:index]) != context:
-            continue
-        support += 1
-        if sequence[index] == "B":
-            banker += 1.0
-        else:
-            player += 1.0
-    return banker, player, support
+def _clip_probability(value: float) -> float:
+    return max(0.02, min(0.98, float(value)))
 
 
-def _recent_probability(sequence: Sequence[str]) -> float:
+def _weighted_probability(sequence: Sequence[str], decay: float = ROAD_RECENCY_DECAY) -> float:
+    if not sequence:
+        return 0.5
     banker = 3.0
     player = 3.0
     for reverse_index, outcome in enumerate(reversed(sequence)):
-        weight = ROAD_RECENCY_DECAY ** reverse_index
+        weight = decay ** reverse_index
         if outcome == "B":
             banker += weight
         else:
@@ -102,125 +90,311 @@ def _recent_probability(sequence: Sequence[str]) -> float:
     return banker / max(1e-12, banker + player)
 
 
-def calculate_road_probabilities(
-    values: Iterable[Any],
-    seed: int | None = None,
-) -> Dict[str, Any]:
-    """先分析牌路，回傳可直接傳給主引擎的 road context。"""
+def _window_model(sequence: Sequence[str], size: int) -> Dict[str, Any]:
+    window = list(sequence[-size:])
+    probability = _weighted_probability(window)
+    effective = len(window)
+    reliability = min(1.0, effective / max(1.0, float(size)))
+    return {
+        "banker_probability": probability,
+        "direction": "B" if probability >= 0.5 else "P",
+        "edge": abs(probability - 0.5) * 2.0,
+        "support": effective,
+        "reliability": reliability,
+    }
+
+
+def _markov_model(sequence: Sequence[str], order: int, minimum_support: int) -> Dict[str, Any]:
+    if len(sequence) <= order:
+        return {"active": False, "support": 0, "banker_probability": 0.5, "direction": "B", "reliability": 0.0}
+    context = tuple(sequence[-order:])
+    banker = 2.5
+    player = 2.5
+    support = 0
+    for index in range(order, len(sequence)):
+        if tuple(sequence[index-order:index]) != context:
+            continue
+        support += 1
+        if sequence[index] == "B":
+            banker += 1.0
+        else:
+            player += 1.0
+    probability = banker / (banker + player)
+    active = support >= minimum_support
+    reliability = min(1.0, support / max(float(minimum_support * 3), 1.0)) if active else 0.0
+    return {
+        "active": active,
+        "support": support,
+        "banker_probability": probability,
+        "direction": "B" if probability >= 0.5 else "P",
+        "edge": abs(probability - 0.5) * 2.0,
+        "reliability": reliability,
+        "context": "".join(context),
+    }
+
+
+def _run_lengths(sequence: Sequence[str]) -> List[Tuple[str, int]]:
+    runs: List[Tuple[str, int]] = []
+    for value in sequence:
+        if runs and runs[-1][0] == value:
+            runs[-1] = (value, runs[-1][1] + 1)
+        else:
+            runs.append((value, 1))
+    return runs
+
+
+def _detect_regime(sequence: Sequence[str]) -> Dict[str, Any]:
+    recent = list(sequence[-18:])
+    if len(recent) < 4:
+        return {"name": "building", "confidence": 0.0, "alternation_rate": 0.0, "current_run": len(recent)}
+    changes = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+    alternation_rate = changes / max(1, len(recent) - 1)
+    runs = _run_lengths(recent)
+    current_run = runs[-1][1]
+    pair_runs = [length for _, length in runs[-8:]]
+    pair_score = sum(1 for length in pair_runs if length == 2) / max(1, len(pair_runs))
+    if current_run >= 4:
+        name = "streak"
+        confidence = min(1.0, 0.55 + 0.10 * (current_run - 4))
+    elif alternation_rate >= 0.78:
+        name = "alternating"
+        confidence = min(1.0, 0.55 + (alternation_rate - 0.78) * 1.5)
+    elif pair_score >= 0.60:
+        name = "double"
+        confidence = min(1.0, 0.50 + pair_score * 0.35)
+    elif alternation_rate <= 0.35 and max(pair_runs or [0]) >= 3:
+        name = "clustered"
+        confidence = 0.58
+    elif 0.42 <= alternation_rate <= 0.68:
+        name = "chaotic"
+        confidence = 0.48
+    else:
+        name = "transition"
+        confidence = 0.52
+    return {
+        "name": name,
+        "confidence": confidence,
+        "alternation_rate": alternation_rate,
+        "current_run": current_run,
+        "last_side": recent[-1],
+        "pair_score": pair_score,
+        "runs": runs[-8:],
+    }
+
+
+def _pattern_model(sequence: Sequence[str], regime: Mapping[str, Any]) -> Dict[str, Any]:
+    if not sequence:
+        return {"banker_probability": 0.5, "direction": "B", "reliability": 0.0, "rule": "none"}
+    last = sequence[-1]
+    name = str(regime.get("name") or "")
+    confidence = float(regime.get("confidence", 0.0) or 0.0)
+    predicted = last
+    rule = "continuation"
+    if name == "alternating":
+        predicted = "P" if last == "B" else "B"
+        rule = "alternation"
+    elif name == "double":
+        runs = _run_lengths(sequence)
+        current_len = runs[-1][1]
+        predicted = last if current_len == 1 else ("P" if last == "B" else "B")
+        rule = "double-pattern"
+    elif name == "transition":
+        predicted = "P" if last == "B" else "B"
+        rule = "transition-reversal"
+    elif name == "chaotic":
+        return {"banker_probability": 0.5, "direction": last, "reliability": 0.15, "rule": "chaotic-neutral"}
+    probability = 0.5 + (0.10 + 0.10 * confidence) * (1.0 if predicted == "B" else -1.0)
+    return {
+        "banker_probability": _clip_probability(probability),
+        "direction": predicted,
+        "reliability": max(0.15, confidence),
+        "rule": rule,
+    }
+
+
+def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
+    best = None
+    for order in (5, 4, 3):
+        if len(sequence) <= order:
+            continue
+        suffix = tuple(sequence[-order:])
+        b = 2.0
+        p = 2.0
+        support = 0
+        for i in range(order, len(sequence)):
+            if tuple(sequence[i-order:i]) == suffix:
+                support += 1
+                if sequence[i] == "B":
+                    b += 1
+                else:
+                    p += 1
+        if support >= 3:
+            probability = b / (b + p)
+            best = {
+                "active": True,
+                "order": order,
+                "support": support,
+                "banker_probability": probability,
+                "direction": "B" if probability >= 0.5 else "P",
+                "reliability": min(1.0, support / 12.0),
+            }
+            break
+    return best or {"active": False, "order": 0, "support": 0, "banker_probability": 0.5, "direction": "B", "reliability": 0.0}
+
+
+def _base_weights(regime_name: str) -> Dict[str, float]:
+    weights = {
+        "short": 0.20, "mid": 0.18, "long": 0.10,
+        "pattern": 0.20, "markov1": 0.10, "markov2": 0.10,
+        "markov3": 0.05, "analogue": 0.07,
+    }
+    if regime_name == "streak":
+        weights.update(short=0.16, mid=0.14, long=0.08, pattern=0.32, markov1=0.12, markov2=0.10)
+    elif regime_name == "alternating":
+        weights.update(short=0.14, mid=0.12, long=0.06, pattern=0.34, markov1=0.14, markov2=0.12)
+    elif regime_name == "double":
+        weights.update(short=0.14, mid=0.12, long=0.06, pattern=0.34, markov1=0.10, markov2=0.14)
+    elif regime_name == "chaotic":
+        weights.update(short=0.18, mid=0.16, long=0.12, pattern=0.10, markov1=0.12, markov2=0.12, analogue=0.10)
+    return weights
+
+
+def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None) -> Dict[str, Any]:
     raw_outcomes = normalize_raw_outcomes(values)
-    sequence = [value for value in raw_outcomes if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
+    sequence = [v for v in raw_outcomes if v in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
     length = len(sequence)
-    tie_count = sum(1 for value in raw_outcomes if value == "T")
+    tie_count = sum(1 for v in raw_outcomes if v == "T")
     raw_count = len(raw_outcomes)
     tie_rate = tie_count / raw_count if raw_count else 0.0
     run_seed = int(seed if seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     rng = np.random.default_rng(run_seed)
 
-    recent_b = _recent_probability(sequence)
-    first_b, first_p, first_support = _beta_counts_for_context(sequence, 1)
-    second_b, second_p, second_support = _beta_counts_for_context(sequence, 2)
+    regime = _detect_regime(sequence)
+    models: Dict[str, Dict[str, Any]] = {
+        "short": _window_model(sequence, ROAD_SHORT_WINDOW),
+        "mid": _window_model(sequence, ROAD_MID_WINDOW),
+        "long": _window_model(sequence, ROAD_LONG_WINDOW),
+        "pattern": _pattern_model(sequence, regime),
+        "markov1": _markov_model(sequence, 1, ROAD_MARKOV1_MIN_SUPPORT),
+        "markov2": _markov_model(sequence, 2, ROAD_MARKOV2_MIN_SUPPORT),
+        "markov3": _markov_model(sequence, 3, ROAD_MARKOV3_MIN_SUPPORT),
+        "analogue": _analogue_model(sequence),
+    }
+    weights = _base_weights(str(regime.get("name") or ""))
+    effective: Dict[str, float] = {}
+    for name, model in models.items():
+        active = bool(model.get("active", True))
+        reliability = max(0.0, min(1.0, float(model.get("reliability", 0.0) or 0.0)))
+        effective[name] = weights.get(name, 0.0) * reliability if active else 0.0
+    total_weight = sum(effective.values())
+    if total_weight <= 1e-12:
+        effective = {"short": 1.0}
+        total_weight = 1.0
+    effective = {k: v / total_weight for k, v in effective.items()}
 
-    first_probability = first_b / (first_b + first_p)
-    second_probability = second_b / (second_b + second_p)
+    component_probabilities = {
+        name: _clip_probability(float(model.get("banker_probability", 0.5) or 0.5))
+        for name, model in models.items()
+    }
+    center_b = sum(effective.get(name, 0.0) * probability for name, probability in component_probabilities.items())
 
-    # 支援度越高，轉移模型權重越大；資料不足時回到近期平滑頻率。
-    second_weight = min(0.42, second_support / 18.0)
-    first_weight = min(0.33, first_support / 24.0)
-    recent_weight = max(0.25, 1.0 - first_weight - second_weight)
-    total_weight = recent_weight + first_weight + second_weight
-    recent_weight /= total_weight
-    first_weight /= total_weight
-    second_weight /= total_weight
+    # 不是只用平均機率：另計算方向票數／共識，避免 50.1% 對 49.9% 的勉強選邊。
+    banker_vote = sum(effective.get(name, 0.0) for name, model in models.items() if model.get("direction") == "B")
+    player_vote = sum(effective.get(name, 0.0) for name, model in models.items() if model.get("direction") == "P")
+    vote_total = max(1e-12, banker_vote + player_vote)
+    banker_consensus = banker_vote / vote_total
+    player_consensus = player_vote / vote_total
+    direction = "B" if banker_consensus >= player_consensus else "P"
+    consensus = max(banker_consensus, player_consensus)
 
-    center_b = (
-        recent_b * recent_weight
-        + first_probability * first_weight
-        + second_probability * second_weight
-    )
-
-    first_samples = rng.beta(first_b, first_p, ROAD_SIMULATIONS)
-    second_samples = rng.beta(second_b, second_p, ROAD_SIMULATIONS)
-    recent_alpha = 3.0 + sum(
-        ROAD_RECENCY_DECAY ** index
-        for index, outcome in enumerate(reversed(sequence))
-        if outcome == "B"
-    )
-    recent_beta = 3.0 + sum(
-        ROAD_RECENCY_DECAY ** index
-        for index, outcome in enumerate(reversed(sequence))
-        if outcome == "P"
-    )
-    recent_samples = rng.beta(recent_alpha, recent_beta, ROAD_SIMULATIONS)
-    samples = (
-        recent_samples * recent_weight
-        + first_samples * first_weight
-        + second_samples * second_weight
-    )
+    # 依各子模型機率與可靠度建立 Beta 後驗抽樣，僅估計穩定度，不取代共識方向。
+    samples = np.zeros(ROAD_SIMULATIONS, dtype=np.float64)
+    for name, model in models.items():
+        weight = effective.get(name, 0.0)
+        if weight <= 0:
+            continue
+        probability = component_probabilities[name]
+        reliability = max(0.05, float(model.get("reliability", 0.0) or 0.0))
+        concentration = 8.0 + 28.0 * reliability
+        alpha = max(0.5, probability * concentration)
+        beta = max(0.5, (1.0 - probability) * concentration)
+        samples += weight * rng.beta(alpha, beta, ROAD_SIMULATIONS)
 
     banker = float(np.mean(samples)) if length else 0.5
     player = 1.0 - banker
     uncertainty = float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.5
-    direction = "B" if banker >= player else "P"
+    probability_direction = "B" if banker >= 0.5 else "P"
     edge = abs(banker - player)
+
+    window_directions = [models["short"]["direction"], models["mid"]["direction"], models["long"]["direction"]]
+    window_agreement = max(window_directions.count("B"), window_directions.count("P")) / 3.0
+    regime_name = str(regime.get("name") or "")
+    regime_quality_ok = regime_name != "chaotic" or consensus >= max(0.72, ROAD_MIN_CONSENSUS)
+    direction_probability_consistent = direction == probability_direction
 
     signal_allowed = bool(
         length >= ROAD_MIN_SAMPLES
+        and consensus >= ROAD_MIN_CONSENSUS
+        and window_agreement >= (2.0 / 3.0)
         and edge >= ROAD_MIN_EDGE
         and uncertainty <= ROAD_MAX_UNCERTAINTY
+        and regime_quality_ok
+        and direction_probability_consistent
     )
     action = direction if signal_allowed else "O"
 
-    confidence_score = max(
-        0.0,
-        min(
-            1.0,
-            0.45 * min(1.0, length / 30.0)
-            + 0.35 * min(1.0, edge / max(ROAD_MIN_EDGE, 1e-9))
-            + 0.20 * (1.0 - min(1.0, uncertainty / ROAD_MAX_UNCERTAINTY)),
-        ),
-    )
-    confidence_label = (
-        "較高" if confidence_score >= 0.72
-        else "中等" if confidence_score >= 0.50
-        else "偏低"
-    )
+    confidence_score = max(0.0, min(1.0,
+        0.30 * min(1.0, length / 36.0)
+        + 0.30 * consensus
+        + 0.20 * window_agreement
+        + 0.10 * min(1.0, edge / max(ROAD_MIN_EDGE, 1e-9))
+        + 0.10 * (1.0 - min(1.0, uncertainty / ROAD_MAX_UNCERTAINTY))
+    ))
+    confidence_label = "較高" if confidence_score >= 0.72 else "中等" if confidence_score >= 0.50 else "偏低"
 
     eligible_for_core = bool(
         ROAD_FUSION_ENABLED
         and length >= ROAD_FUSION_MIN_SAMPLES
         and confidence_score >= ROAD_FUSION_MIN_CONFIDENCE
         and uncertainty <= ROAD_FUSION_MAX_UNCERTAINTY
+        and consensus >= ROAD_MIN_CONSENSUS
+        and direction_probability_consistent
     )
-    support_factor = min(1.0, length / 30.0)
-    confidence_factor = min(1.0, confidence_score / 0.72) if confidence_score > 0 else 0.0
-    edge_factor = min(1.0, edge / max(ROAD_MIN_EDGE, 1e-9))
     suggested_core_weight = (
         ROAD_FUSION_WEIGHT
-        * support_factor
-        * confidence_factor
-        * (0.65 + 0.35 * edge_factor)
-        if eligible_for_core
-        else 0.0
+        * min(1.0, length / 36.0)
+        * min(1.0, confidence_score / 0.72)
+        * min(1.0, consensus / max(ROAD_MIN_CONSENSUS, 1e-9))
+        if eligible_for_core else 0.0
     )
 
     if signal_allowed:
-        signal_reason = "牌路樣本、方向差距與不確定性均達輔助訊號門檻"
-        signal_status_text = "牌路方向已建立"
+        signal_reason = f"多模型共識、三視窗與 {regime_name} 狀態驗證均通過"
+        signal_status_text = "牌路多模型方向已建立"
     else:
         reasons: List[str] = []
-        if length < ROAD_MIN_SAMPLES:
-            reasons.append("牌路樣本仍在累積")
-        if edge < ROAD_MIN_EDGE:
-            reasons.append("牌路方向差距不足")
-        if uncertainty > ROAD_MAX_UNCERTAINTY:
-            reasons.append("牌路不確定性偏高")
+        if length < ROAD_MIN_SAMPLES: reasons.append("牌路樣本仍在累積")
+        if consensus < ROAD_MIN_CONSENSUS: reasons.append("子模型方向共識不足")
+        if window_agreement < 2.0 / 3.0: reasons.append("短中長視窗未達兩票一致")
+        if edge < ROAD_MIN_EDGE: reasons.append("綜合方向差距不足")
+        if uncertainty > ROAD_MAX_UNCERTAINTY: reasons.append("模型不確定性偏高")
+        if not regime_quality_ok: reasons.append("目前牌路偏混亂")
+        if not direction_probability_consistent: reasons.append("共識方向與綜合機率方向不一致")
         signal_reason = "、".join(reasons) or "牌路資料尚未形成明確方向"
-        signal_status_text = "牌路資料建立中"
+        signal_status_text = "牌路多模型評估中"
+
+    model_outputs = {}
+    for name, model in models.items():
+        model_outputs[name] = {
+            **model,
+            "banker_probability": round(component_probabilities[name], 6),
+            "effective_weight": round(effective.get(name, 0.0), 6),
+        }
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_BAYES_MARKOV_MONTE_CARLO_V4_TIE_AWARE",
-        "pipeline_stage": "road_first",
+        "engine": "ROAD_REGIME_MULTI_MODEL_CONSENSUS_V9_9",
+        "pipeline_stage": "road_first_multi_model",
         "run_seed": run_seed,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
@@ -234,6 +408,7 @@ def calculate_road_probabilities(
         "player_rate": round(player * 100.0, 2),
         "direction": direction,
         "direction_text": "莊" if direction == "B" else "閒",
+        "probability_direction": probability_direction,
         "action": action,
         "action_text": "莊" if action == "B" else "閒" if action == "P" else "觀望",
         "signal_allowed": signal_allowed,
@@ -247,25 +422,28 @@ def calculate_road_probabilities(
         "eligible_for_core": eligible_for_core,
         "suggested_core_weight": round(suggested_core_weight, 8),
         "max_core_weight": ROAD_FUSION_WEIGHT,
-        "weights": {
-            "recent": round(recent_weight, 6),
-            "first_order": round(first_weight, 6),
-            "second_order": round(second_weight, 6),
+        "consensus": {
+            "banker_vote": round(banker_consensus, 6),
+            "player_vote": round(player_consensus, 6),
+            "winning_share": round(consensus, 6),
+            "minimum_required": ROAD_MIN_CONSENSUS,
+            "window_agreement": round(window_agreement, 6),
         },
+        "regime": regime,
+        "models": model_outputs,
+        "weights": {name: round(weight, 6) for name, weight in effective.items()},
         "supports": {
-            "first_order": first_support,
-            "second_order": second_support,
+            "first_order": int(models["markov1"].get("support", 0)),
+            "second_order": int(models["markov2"].get("support", 0)),
+            "third_order": int(models["markov3"].get("support", 0)),
+            "analogue": int(models["analogue"].get("support", 0)),
         },
         "center_probability_before_simulation": round(center_b, 6),
-        "data_scope": "recognized_banker_player_sequence_with_separate_tie_history",
+        "data_scope": "recognized_banker_player_sequence_with_regime_multi_model_consensus",
     }
 
 
-def build_road_context(
-    values: Iterable[Any],
-    seed: int | None = None,
-) -> Dict[str, Any]:
-    """語意化別名：明確表示這份結果會先送入主引擎。"""
+def build_road_context(values: Iterable[Any], seed: int | None = None) -> Dict[str, Any]:
     return calculate_road_probabilities(values, seed=seed)
 
 
