@@ -1,8 +1,8 @@
-"""BGS V9.4 LINE Bot：UID 獨立畫面分析＋莊閒連續補輸。
+"""BGS V9.5 LINE Bot：UID 獨立牌路先行＋統一主模型分析。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
-首次辨識後交給既有超幾何＋粒子／蒙地卡羅核心；後續按莊／閒持續更新同一 UID 的牌路。
+首次辨識後先建立牌路 context，再交給超幾何＋粒子／蒙地卡羅核心統一判斷；後續按莊／閒持續更新同一 UID。
 虛擬牌靴程式仍保留給既有 API 相容用途，但不再混入 LINE 截圖流程。
 """
 from __future__ import annotations
@@ -31,7 +31,6 @@ from pydantic import BaseModel, Field
 
 import store
 from predictor import run_virtual_round
-from road_model import calculate_road_probabilities, fuse_road_with_main_prediction
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 
@@ -92,8 +91,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.4 Professional Screen Fusion Bot",
-    version="9.4.0",
+    title="BGS V9.5 Road-First Unified Screen Bot",
+    version="9.5.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -756,7 +755,7 @@ def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
                                 "• 解析館別、桌號與剩餘張數\n"
                                 "• 建立大路莊閒序列\n"
                                 "• 執行有限牌組、蒙地卡羅、粒子驗證與牌路融合\n\n"
-                                "完成後將自動推送下一局方向分析。"
+                                "完成後將自動推送下一局方向、正式訊號與風險配置。"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -889,7 +888,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     ocr = dict(session.get("screen_last_ocr") or {})
     detection = dict(session.get("screen_last_detection") or {})
     road_support = dict(prediction.get("road_support") or {})
-    fusion = dict(prediction.get("road_fusion") or {})
+    fusion = dict(prediction.get("road_integration") or prediction.get("road_fusion") or {})
     sequence = [
         str(item).upper()
         for item in list(session.get("road_sequence") or [])
@@ -930,7 +929,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     recognized = int(detection.get("recognized_count", 0) or 0)
     road_direction = str(road_support.get("direction_text") or "資料建立中")
     road_samples = int(road_support.get("sample_count", len(sequence)) or len(sequence))
-    fusion_text = "已納入" if bool(fusion.get("applied")) else "主模型為主"
+    fusion_text = "已納入統一核心" if bool(fusion.get("applied")) else "已檢查／核心為主"
     data_quality = "畫面資料已建立" if recognized > 0 else "沿用本桌牌路資料"
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
@@ -1001,7 +1000,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                                 f"方向優勢：{edge_percent:.2f}%\n"
                                 f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
                                 f"模型一致度：{consistency:.1f}%\n"
-                                f"牌路輔助：{road_direction}｜融合：{fusion_text}"
+                                f"牌路先行：{road_direction}｜整合：{fusion_text}"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -1157,7 +1156,7 @@ def _refresh_screen_prediction(
     outcome: str,
     expected_run_id: str,
 ) -> Dict[str, Any]:
-    """把本局莊／閒加入該 UID 牌路，再用最近畫面資料執行主模型。"""
+    """加入本局結果；牌路模型先更新，再由統一主引擎產生下一局方向。"""
     value = str(outcome or "").upper().strip()
     if value not in {"B", "P"}:
         raise ValueError("本局結果只能是莊或閒。")
@@ -1199,8 +1198,6 @@ def _refresh_screen_prediction(
     finally:
         _PREDICTION_SLOTS.release()
 
-    road_support = calculate_road_probabilities(sequence)
-    prediction = fuse_road_with_main_prediction(prediction, road_support)
     prediction["latest_actual_outcome"] = value
     prediction["latest_actual_outcome_text"] = "莊" if value == "B" else "閒"
     prediction["remaining_cards_estimated_after_manual"] = True
@@ -1255,7 +1252,7 @@ async def _process_screen_image(
     message_id: str,
     expected_run_id: str,
 ) -> None:
-    """背景完成首次圖片辨識；只允許寫回同一 UID、同一分析代次。"""
+    """背景完成首次辨識、牌路先行分析與統一主模型；只寫回同一 UID、同一代次。"""
     temporary_image: Optional[Path] = None
     started = time.perf_counter()
     async with _user_lock(user_id):
@@ -1308,11 +1305,6 @@ async def _process_screen_image(
             finally:
                 _PREDICTION_SLOTS.release()
 
-            road_support = await asyncio.to_thread(
-                calculate_road_probabilities,
-                sequence,
-            )
-            prediction = fuse_road_with_main_prediction(prediction, road_support)
             prediction = _attach_bankroll_advice(prediction, current_session)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             session = store.update_screen_analysis(
