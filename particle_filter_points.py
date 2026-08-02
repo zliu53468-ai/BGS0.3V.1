@@ -71,6 +71,17 @@ MAX_SIGNAL_UNCERTAINTY = _env_float(
 MAX_VALIDATION_GAP = _env_float(
     "HG_MAX_VALIDATION_GAP", 0.025, 0.001, 0.15
 )
+
+# 牌路先行 context 由 road_model.py 建立，再交給本引擎統一判斷。
+ROAD_CONTEXT_MAX_WEIGHT = _env_float("ROAD_FUSION_WEIGHT", 0.08, 0.0, 0.20)
+ROAD_CONTEXT_MIN_SAMPLES = _env_int("ROAD_FUSION_MIN_SAMPLES", 10, 4, 100)
+ROAD_CONTEXT_MIN_CONFIDENCE = _env_float(
+    "ROAD_FUSION_MIN_CONFIDENCE", 0.45, 0.0, 1.0
+)
+ROAD_CONTEXT_MAX_UNCERTAINTY = _env_float(
+    "ROAD_FUSION_MAX_UNCERTAINTY", 0.16, 0.01, 0.50
+)
+
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 
 
@@ -526,10 +537,69 @@ def _confidence_interval(
 
 
 class VirtualShoeParticleEngine:
-    """Exact hypergeometric core with MC and particle validation layers."""
+    """Exact hypergeometric core with MC, particle and road-context validation."""
 
     def __init__(self, settings: Optional[EngineSettings] = None) -> None:
         self.settings = settings or EngineSettings()
+
+    @staticmethod
+    def _road_context_state(
+        road_context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        road = dict(road_context or {})
+        try:
+            sample_count = max(0, int(road.get("sample_count", 0) or 0))
+        except Exception:
+            sample_count = 0
+        try:
+            confidence = max(0.0, min(1.0, float(road.get("confidence_score", 0.0) or 0.0)))
+        except Exception:
+            confidence = 0.0
+        try:
+            uncertainty = max(0.0, float(road.get("uncertainty", 1.0) or 1.0))
+        except Exception:
+            uncertainty = 1.0
+        try:
+            banker_probability = max(
+                0.0,
+                min(1.0, float(road.get("banker_probability", 0.5) or 0.5)),
+            )
+        except Exception:
+            banker_probability = 0.5
+        direction = str(
+            road.get("direction") or ("B" if banker_probability >= 0.5 else "P")
+        ).upper()
+        if direction not in {"B", "P"}:
+            direction = "B" if banker_probability >= 0.5 else "P"
+        try:
+            suggested = max(0.0, float(road.get("suggested_core_weight", 0.0) or 0.0))
+        except Exception:
+            suggested = 0.0
+
+        eligible = bool(
+            road.get("ok")
+            and bool(road.get("eligible_for_core", True))
+            and sample_count >= ROAD_CONTEXT_MIN_SAMPLES
+            and confidence >= ROAD_CONTEXT_MIN_CONFIDENCE
+            and uncertainty <= ROAD_CONTEXT_MAX_UNCERTAINTY
+        )
+        effective_weight = min(ROAD_CONTEXT_MAX_WEIGHT, suggested) if eligible else 0.0
+        return {
+            "present": bool(road),
+            "ok": bool(road.get("ok")),
+            "eligible": eligible,
+            "sample_count": sample_count,
+            "confidence": confidence,
+            "uncertainty": uncertainty,
+            "banker_probability": banker_probability,
+            "player_probability": 1.0 - banker_probability,
+            "direction": direction,
+            "requested_weight": suggested,
+            "effective_weight": effective_weight,
+            "engine": str(road.get("engine") or ""),
+            "signal_allowed": bool(road.get("signal_allowed")),
+            "signal_reason": str(road.get("signal_reason") or ""),
+        }
 
     def analyze(
         self,
@@ -537,6 +607,7 @@ class VirtualShoeParticleEngine:
         history: Optional[Sequence[str]] = None,
         draw_path_history: Optional[Sequence[str]] = None,
         seed: Optional[int] = None,
+        road_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         counts = [int(value) for value in remaining_counts]
         if len(counts) != 10 or any(value < 0 for value in counts):
@@ -544,22 +615,16 @@ class VirtualShoeParticleEngine:
         if sum(counts) < 6:
             raise ValueError("virtual shoe does not contain enough cards")
 
-        run_seed = int(
-            seed if seed is not None else secrets.randbits(32)
-        ) & 0xFFFFFFFF
+        run_seed = int(seed if seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
         seed_sequence = np.random.SeedSequence(run_seed)
         child_seeds = seed_sequence.spawn(self.settings.replicas + 1)
 
-        hyper_probability, hyper_paths, hyper_meta = hypergeometric_probabilities(
-            counts
-        )
+        hyper_probability, hyper_paths, hyper_meta = hypergeometric_probabilities(counts)
 
         replica_probabilities: List[np.ndarray] = []
         replica_paths: List[np.ndarray] = []
         for index in range(self.settings.replicas):
-            replica_seed = int(
-                child_seeds[index].generate_state(1, dtype=np.uint32)[0]
-            )
+            replica_seed = int(child_seeds[index].generate_state(1, dtype=np.uint32)[0])
             probability, paths = _monte_carlo_replica(
                 counts,
                 self.settings.simulations_per_replica,
@@ -570,14 +635,10 @@ class VirtualShoeParticleEngine:
 
         replica_matrix = np.vstack(replica_probabilities)
         path_matrix = np.vstack(replica_paths)
-        mc_probability, ci_lower, ci_upper, replica_se = _confidence_interval(
-            replica_matrix
-        )
+        mc_probability, ci_lower, ci_upper, replica_se = _confidence_interval(replica_matrix)
         mc_path_probability = path_matrix.mean(axis=0)
 
-        particle_seed = int(
-            child_seeds[-1].generate_state(1, dtype=np.uint32)[0]
-        )
+        particle_seed = int(child_seeds[-1].generate_state(1, dtype=np.uint32)[0])
         particle_probability, particle_paths, particle_ess = _particle_ensemble(
             counts,
             self.settings.particles,
@@ -585,30 +646,20 @@ class VirtualShoeParticleEngine:
             particle_seed,
         )
 
-        sequence_probability, sequence_meta = _sequence_probabilities(
-            history or []
-        )
-        history_length = len(
-            [
-                item
-                for item in (history or [])
-                if str(item).upper() in OUTCOME_NAMES
-            ]
-        )
-        history_weight = min(
+        road_state = self._road_context_state(road_context)
+        sequence_probability, sequence_meta = _sequence_probabilities(history or [])
+        history_length = len([
+            item for item in (history or []) if str(item).upper() in OUTCOME_NAMES
+        ])
+
+        # 有 road context 時，避免同一份 B/P 歷史同時被內部序列層重複計權。
+        history_weight = 0.0 if road_state["present"] else min(
             HISTORY_MAX_WEIGHT,
-            HISTORY_MAX_WEIGHT
-            * history_length
-            / max(1.0, float(HISTORY_WINDOW)),
+            HISTORY_MAX_WEIGHT * history_length / max(1.0, float(HISTORY_WINDOW)),
         )
 
         requested_weights = np.asarray(
-            [
-                HYPERGEOMETRIC_WEIGHT,
-                MONTE_CARLO_WEIGHT,
-                PARTICLE_WEIGHT,
-                history_weight,
-            ],
+            [HYPERGEOMETRIC_WEIGHT, MONTE_CARLO_WEIGHT, PARTICLE_WEIGHT, history_weight],
             dtype=np.float64,
         )
         requested_weights = requested_weights / requested_weights.sum()
@@ -624,27 +675,40 @@ class VirtualShoeParticleEngine:
         )
 
         uncertainty = float(max(replica_se))
-        validation_gap = float(
-            max(
-                np.max(np.abs(mc_probability - hyper_probability)),
-                np.max(np.abs(particle_probability - hyper_probability)),
-            )
-        )
-        adaptive_shrink = min(
-            0.15,
-            BASELINE_SHRINK + uncertainty * 2.0,
-        )
-        fused = _normalize_probability(
-            raw * (1.0 - adaptive_shrink)
-            + DEFAULT_BASELINE * adaptive_shrink
+        validation_gap = float(max(
+            np.max(np.abs(mc_probability - hyper_probability)),
+            np.max(np.abs(particle_probability - hyper_probability)),
+        ))
+        adaptive_shrink = min(0.15, BASELINE_SHRINK + uncertainty * 2.0)
+        core_fused = _normalize_probability(
+            raw * (1.0 - adaptive_shrink) + DEFAULT_BASELINE * adaptive_shrink
         )
 
-        banker, player, tie = (float(value) for value in fused)
-        bp_total = max(1e-12, banker + player)
-        banker_no_tie = banker / bp_total
-        player_no_tie = player / bp_total
+        core_banker, core_player, core_tie = (float(value) for value in core_fused)
+        core_bp_total = max(1e-12, core_banker + core_player)
+        core_banker_no_tie = core_banker / core_bp_total
+        core_direction = "B" if core_banker >= core_player else "P"
+
+        road_weight = float(road_state["effective_weight"])
+        banker_no_tie = core_banker_no_tie
+        if road_weight > 0.0:
+            banker_no_tie = (
+                core_banker_no_tie * (1.0 - road_weight)
+                + float(road_state["banker_probability"]) * road_weight
+            )
+
+        tie = core_tie
+        banker = (1.0 - tie) * banker_no_tie
+        player = (1.0 - tie) * (1.0 - banker_no_tie)
+        player_no_tie = 1.0 - banker_no_tie
         direction = "B" if banker >= player else "P"
         direction_edge = abs(banker_no_tie - player_no_tie)
+        road_aligned_with_core = bool(
+            not road_state["ok"] or road_state["direction"] == core_direction
+        )
+        road_aligned_with_final = bool(
+            not road_state["ok"] or road_state["direction"] == direction
+        )
 
         banker_ev = banker * (1.0 - BANKER_COMMISSION) - player
         player_ev = player - banker
@@ -656,22 +720,26 @@ class VirtualShoeParticleEngine:
         edge_ok = direction_edge >= MIN_DIRECTION_EDGE
         uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
         validation_ok = validation_gap <= MAX_VALIDATION_GAP
-        signal_allowed = bool(edge_ok and uncertainty_ok and validation_ok)
+        # 當牌路已進入核心但與核心方向分歧時，不直接放大成正式訊號。
+        road_consensus_ok = bool(
+            road_weight <= 0.0
+            or road_aligned_with_core
+            or direction_edge >= MIN_DIRECTION_EDGE * 1.75
+        )
+        signal_allowed = bool(
+            edge_ok and uncertainty_ok and validation_ok and road_consensus_ok
+        )
         action = direction if signal_allowed else "O"
 
         uncertainty_score = 1.0 - min(
             1.0, uncertainty / max(MAX_SIGNAL_UNCERTAINTY, 1e-9)
         )
-        edge_score = min(
-            1.0, direction_edge / max(MIN_DIRECTION_EDGE, 1e-9)
-        )
+        edge_score = min(1.0, direction_edge / max(MIN_DIRECTION_EDGE, 1e-9))
         validation_score = 1.0 - min(
             1.0, validation_gap / max(MAX_VALIDATION_GAP, 1e-9)
         )
-        particle_score = min(
-            1.0, particle_ess / max(1.0, self.settings.particles)
-        )
-        quality_score = max(
+        particle_score = min(1.0, particle_ess / max(1.0, self.settings.particles))
+        base_quality = max(
             0.0,
             min(
                 1.0,
@@ -682,16 +750,36 @@ class VirtualShoeParticleEngine:
                 + 0.10 * particle_score,
             ),
         )
+        quality_score = base_quality
+        if road_weight > 0.0:
+            quality_score = (
+                base_quality * (1.0 - road_weight)
+                + float(road_state["confidence"]) * road_weight
+            )
+            if not road_aligned_with_core:
+                quality_score *= 0.92
+        quality_score = max(0.0, min(1.0, quality_score))
+
         confidence_label = (
-            "較高"
-            if quality_score >= 0.72
-            else "中等"
-            if quality_score >= 0.50
+            "較高" if quality_score >= 0.72
+            else "中等" if quality_score >= 0.50
             else "偏低"
         )
-        model_consistency = max(0.0, min(1.0, validation_score))
+        alignment_score = 1.0 if road_aligned_with_core else 0.0
+        model_consistency = validation_score
+        if road_weight > 0.0:
+            model_consistency = (
+                validation_score * (1.0 - road_weight) + alignment_score * road_weight
+            )
+        model_consistency = max(0.0, min(1.0, model_consistency))
+
         if signal_allowed:
-            signal_reason = "方向差距、不確定性與模型一致度均通過正式訊號門檻"
+            if road_weight > 0.0 and road_aligned_with_core:
+                signal_reason = "牌路先行分析與有限牌組核心方向一致，且模型驗證通過正式訊號門檻"
+            elif road_weight > 0.0:
+                signal_reason = "牌路先行分析已納入，融合後方向優勢通過正式訊號門檻"
+            else:
+                signal_reason = "有限牌組核心的方向差距、不確定性與模型一致度均通過門檻"
             signal_status_text = "方向訊號已開放"
         else:
             reasons: List[str] = []
@@ -701,13 +789,42 @@ class VirtualShoeParticleEngine:
                 reasons.append("模擬不確定性仍偏高")
             if not validation_ok:
                 reasons.append("核心與驗證層的一致度不足")
+            if not road_consensus_ok:
+                reasons.append("牌路先行分析與有限牌組核心方向分歧")
+            if road_state["present"] and road_weight <= 0.0:
+                reasons.append("牌路樣本或品質尚未達內部整合條件")
             signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
             signal_status_text = "等待更明確訊號"
 
+        road_integration = {
+            "processed_inside_core": True,
+            "present": road_state["present"],
+            "applied": road_weight > 0.0,
+            "eligible": road_state["eligible"],
+            "sample_count": road_state["sample_count"],
+            "road_direction": road_state["direction"],
+            "core_direction_before_road": core_direction,
+            "final_direction": direction,
+            "aligned_with_core": road_aligned_with_core,
+            "aligned_with_final": road_aligned_with_final,
+            "requested_weight": round(float(road_state["requested_weight"]), 8),
+            "effective_weight": round(road_weight, 8),
+            "road_confidence": round(float(road_state["confidence"]), 6),
+            "road_uncertainty": round(float(road_state["uncertainty"]), 6),
+            "road_engine": road_state["engine"],
+        }
+
         return {
             "ok": True,
-            "engine": "V7_HYPERGEOMETRIC_PARTICLE_MONTE_CARLO",
-            "model_core": "multivariate_hypergeometric_without_replacement",
+            "engine": "V9_5_ROAD_FIRST_HYPERGEOMETRIC_PARTICLE_MC",
+            "model_core": "road_context_then_multivariate_hypergeometric_validation",
+            "pipeline_order": [
+                "road_context",
+                "hypergeometric_core",
+                "monte_carlo_validation",
+                "particle_validation",
+                "unified_signal_decision",
+            ],
             "run_seed": run_seed,
             "virtual_only": True,
             "remaining_cards": int(sum(counts)),
@@ -716,9 +833,11 @@ class VirtualShoeParticleEngine:
             "banker_rate": round(banker * 100.0, 2),
             "player_rate": round(player * 100.0, 2),
             "tie_rate": round(tie * 100.0, 2),
-            "no_tie_probabilities": {
-                "B": banker_no_tie,
-                "P": player_no_tie,
+            "no_tie_probabilities": {"B": banker_no_tie, "P": player_no_tie},
+            "core_probabilities_before_road": {
+                "B": core_banker,
+                "P": core_player,
+                "T": core_tie,
             },
             "hypergeometric_probabilities": {
                 key: float(hyper_probability[index])
@@ -737,34 +856,22 @@ class VirtualShoeParticleEngine:
                 for index, key in enumerate(OUTCOME_NAMES)
             },
             "draw_path_probabilities": {
-                PATH_NAMES[index]: float(hyper_paths[index])
-                for index in range(4)
+                PATH_NAMES[index]: float(hyper_paths[index]) for index in range(4)
             },
             "monte_carlo_draw_path_probabilities": {
-                PATH_NAMES[index]: float(mc_path_probability[index])
-                for index in range(4)
+                PATH_NAMES[index]: float(mc_path_probability[index]) for index in range(4)
             },
             "particle_draw_path_probabilities": {
-                PATH_NAMES[index]: float(particle_paths[index])
-                for index in range(4)
+                PATH_NAMES[index]: float(particle_paths[index]) for index in range(4)
             },
             "confidence_interval_95": {
-                key: {
-                    "low": float(ci_lower[index]),
-                    "high": float(ci_upper[index]),
-                }
+                key: {"low": float(ci_lower[index]), "high": float(ci_upper[index])}
                 for index, key in enumerate(OUTCOME_NAMES)
             },
             "recommend": direction,
             "recommend_text": "莊" if direction == "B" else "閒",
             "action": action,
-            "action_text": (
-                "莊"
-                if action == "B"
-                else "閒"
-                if action == "P"
-                else "觀望"
-            ),
+            "action_text": "莊" if action == "B" else "閒" if action == "P" else "觀望",
             "direction_edge": float(direction_edge),
             "direction_edge_percent": round(direction_edge * 100.0, 4),
             "uncertainty": uncertainty,
@@ -776,6 +883,8 @@ class VirtualShoeParticleEngine:
             "signal_allowed": signal_allowed,
             "signal_status_text": signal_status_text,
             "signal_reason": signal_reason,
+            "direction_source": "road_context_inside_core" if road_weight > 0.0 else "main_core_after_road_check",
+            "road_integration": road_integration,
             "expected_values": expected_values,
             "best_ev_side": best_ev_side,
             "best_ev": best_ev,
@@ -785,6 +894,7 @@ class VirtualShoeParticleEngine:
                 "monte_carlo": round(mc_weight, 6),
                 "particle": round(particle_weight, 6),
                 "sequence": round(sequence_weight, 6),
+                "road_context": round(road_weight, 6),
                 "baseline_shrink": round(adaptive_shrink, 6),
             },
             "hypergeometric_meta": hyper_meta,
@@ -793,16 +903,10 @@ class VirtualShoeParticleEngine:
                 "particles": self.settings.particles,
                 "particle_ess": round(float(particle_ess), 3),
                 "replicas": self.settings.replicas,
-                "simulations_per_replica": (
-                    self.settings.simulations_per_replica
-                ),
-                "total_mc_simulations": (
-                    self.settings.replicas
-                    * self.settings.simulations_per_replica
-                ),
+                "simulations_per_replica": self.settings.simulations_per_replica,
+                "total_mc_simulations": self.settings.replicas * self.settings.simulations_per_replica,
                 "replica_standard_error": {
-                    key: float(replica_se[index])
-                    for index, key in enumerate(OUTCOME_NAMES)
+                    key: float(replica_se[index]) for index, key in enumerate(OUTCOME_NAMES)
                 },
                 "history_length": history_length,
                 "draw_path_history_length": len(draw_path_history or []),
@@ -817,6 +921,7 @@ class V5IndependentBaccaratEngine(VirtualShoeParticleEngine):
 __all__ = [
     "BANKER_COMMISSION",
     "MAX_VALIDATION_GAP",
+    "ROAD_CONTEXT_MAX_WEIGHT",
     "DB_HOLDOUT",
     "DEFAULT_BASELINE",
     "EngineSettings",
