@@ -1,4 +1,4 @@
-"""Atomic JSON storage for BGS V9.3 UID-isolated screen-analysis sessions."""
+"""Atomic JSON storage for BGS V9.6 UID-isolated mobile dual-mode sessions."""
 from __future__ import annotations
 
 import copy
@@ -148,6 +148,13 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         "screen_prediction_version": 0,
         "screen_last_input_source": "",
         "screen_last_data_updated_at": 0,
+        "screen_input_type": "",
+        "screen_venue_source": "",
+        "screen_room_source": "",
+        "screen_room_confidence": 0.0,
+        "screen_timings": {},
+        "last_confirmed_venue": "",
+        "last_confirmed_room": "",
         # 路紙影像辨識與手動校正狀態，與虛擬牌靴狀態分開保存。
         "road_sequence": [],
         "road_last_analysis": {},
@@ -273,6 +280,17 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     session["screen_last_data_updated_at"] = max(
         0, int(session.get("screen_last_data_updated_at", 0) or 0)
     )
+    session["screen_input_type"] = str(session.get("screen_input_type") or "")
+    session["screen_venue_source"] = str(session.get("screen_venue_source") or "")
+    session["screen_room_source"] = str(session.get("screen_room_source") or "")
+    try:
+        session["screen_room_confidence"] = max(0.0, min(1.0, float(session.get("screen_room_confidence", 0.0) or 0.0)))
+    except Exception:
+        session["screen_room_confidence"] = 0.0
+    if not isinstance(session.get("screen_timings"), dict):
+        session["screen_timings"] = {}
+    session["last_confirmed_venue"] = str(session.get("last_confirmed_venue") or session.get("venue") or "")
+    session["last_confirmed_room"] = str(session.get("last_confirmed_room") or "")
 
     # 舊版 Session 自動補上全畫面辨識欄位。
     for key in ("screen_last_ocr", "screen_last_detection", "screen_last_prediction"):
@@ -375,9 +393,16 @@ def select_venue(user_id: str, venue: str, room: str = "1") -> Dict[str, Any]:
         data = _load_all_unlocked()
         raw = data.get(uid)
         session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
-        changed = str(session.get("venue") or "") != str(venue or "")
-        session["venue"] = str(venue or "")
-        session["room"] = str(room or "1")
+        venue_value = str(venue or "").upper().strip()
+        room_value = str(room or "1").strip()
+        changed = str(session.get("venue") or "").upper() != venue_value
+        session["venue"] = venue_value
+        session["room"] = room_value
+        session["last_confirmed_venue"] = venue_value
+        if changed:
+            session["last_confirmed_room"] = "" if room_value == "1" else room_value
+        elif room_value and room_value != "1":
+            session["last_confirmed_room"] = room_value
         session["analysis_mode"] = "screen"
         session["analysis_active"] = False
         session["analysis_run_id"] = uuid.uuid4().hex[:16]
@@ -410,33 +435,21 @@ def start_session(user_id: str, venue: str = "", room: str = "1") -> Dict[str, A
 
 
 def _clear_screen_fields(session: Dict[str, Any]) -> None:
-    """原地清除本次畫面分析資料；不碰 UID 權限、館別與本金。"""
-    session.update(
-        {
-            "road_sequence": [],
-            "road_last_analysis": {},
-            "road_last_vision": {},
-            "road_source": "",
-            "road_last_image_at": 0,
-            "road_corrections": 0,
-            "screen_last_ocr": {},
-            "screen_last_detection": {},
-            "screen_last_prediction": {},
-            "screen_remaining_cards": 0,
-            "screen_analysis_count": 0,
-            "screen_last_analyzed_at": 0,
-            "screen_processing_ms": 0.0,
-            "screen_manual_rounds": 0,
-            "screen_data_version": 0,
-            "screen_prediction_version": 0,
-            "screen_last_input_source": "",
-            "screen_last_data_updated_at": 0,
-            "last_suggested_bet": 0,
-            "last_bet_percentage": 0.0,
-            "last_prediction": {},
-            "pending_prediction": {},
-        }
-    )
+    """清除本次畫面分析資料；保留權限、館別、本金與最近確認桌號供裁切圖沿用。"""
+    session.update({
+        "road_sequence": [], "road_last_analysis": {}, "road_last_vision": {},
+        "road_source": "", "road_last_image_at": 0, "road_corrections": 0,
+        "screen_last_ocr": {}, "screen_last_detection": {}, "screen_last_prediction": {},
+        "screen_remaining_cards": 0, "screen_analysis_count": 0,
+        "screen_last_analyzed_at": 0, "screen_processing_ms": 0.0,
+        "screen_manual_rounds": 0, "screen_data_version": 0,
+        "screen_prediction_version": 0, "screen_last_input_source": "",
+        "screen_last_data_updated_at": 0, "screen_input_type": "",
+        "screen_venue_source": "", "screen_room_source": "",
+        "screen_room_confidence": 0.0, "screen_timings": {},
+        "last_suggested_bet": 0, "last_bet_percentage": 0.0,
+        "last_prediction": {}, "pending_prediction": {},
+    })
 
 
 def start_new_analysis(user_id: str) -> Dict[str, Any]:
@@ -935,22 +948,23 @@ def update_screen_analysis(
     expected_run_id: Optional[str] = None,
     expected_data_version: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """原子更新指定 UID 的畫面分析，拒絕舊代次與重複按鈕覆蓋。"""
+    """原子更新指定 UID 的畫面分析，並保存輸入模式、桌號來源與最近確認桌號。"""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
     cleaned = [
-        str(item).upper().strip()
-        for item in list(sequence or [])
+        str(item).upper().strip() for item in list(sequence or [])
         if str(item).upper().strip() in {"B", "P"}
     ][-500:]
     resolved_data = dict(resolved or {})
+    prediction_data = dict(prediction or {})
+    ocr_data = dict(ocr or {})
+    detection_data = dict(detection or {})
 
     with _LOCK:
         data = _load_all_unlocked()
         raw = data.get(uid)
         session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
-
         current_run_id = str(session.get("analysis_run_id") or "")
         if expected_run_id is not None and current_run_id != str(expected_run_id):
             raise RuntimeError("本次分析已結束或已重新開始，舊結果已忽略。")
@@ -958,20 +972,31 @@ def update_screen_analysis(
             raise RuntimeError("本次分析已結束，請重新開始分析。")
         if (
             expected_data_version is not None
-            and int(session.get("screen_data_version", 0) or 0)
-            != int(expected_data_version)
+            and int(session.get("screen_data_version", 0) or 0) != int(expected_data_version)
         ):
             raise RuntimeError("牌路已由另一個操作更新，請以最新面板繼續。")
 
         venue = str(resolved_data.get("venue_code") or "").upper().strip()
         room = str(resolved_data.get("room") or "").strip()
-        remaining = resolved_data.get("remaining_cards")
+        venue_source = str(resolved_data.get("venue_source") or ocr_data.get("venue_source") or "")
+        room_source = str(resolved_data.get("room_source") or ocr_data.get("room_source") or "")
+        input_type = str(resolved_data.get("input_type") or detection_data.get("input_type") or prediction_data.get("screen_input_type") or "")
+        try:
+            room_confidence = max(0.0, min(1.0, float(resolved_data.get("room_confidence", ocr_data.get("confidence", 0.0)) or 0.0)))
+        except Exception:
+            room_confidence = 0.0
+
         if venue:
             session["venue"] = venue
+            if venue_source == "image_ocr" or not session.get("last_confirmed_venue"):
+                session["last_confirmed_venue"] = venue
         if room:
             session["room"] = room
+            if room_source == "image_ocr" or not session.get("last_confirmed_room"):
+                session["last_confirmed_room"] = room
+
         try:
-            remaining_value = max(0, min(416, int(remaining or 0)))
+            remaining_value = max(0, min(416, int(resolved_data.get("remaining_cards") or 0)))
         except Exception:
             remaining_value = 0
 
@@ -983,35 +1008,33 @@ def update_screen_analysis(
         session["screen_prediction_version"] = next_data_version
         session["screen_last_input_source"] = str(source or "screen_image")
         session["screen_last_data_updated_at"] = _now()
+        session["screen_input_type"] = input_type
+        session["screen_venue_source"] = venue_source
+        session["screen_room_source"] = room_source
+        session["screen_room_confidence"] = room_confidence
+        session["screen_timings"] = dict(resolved_data.get("vision_timings") or prediction_data.get("screen_metadata", {}).get("vision_timings") or {})
         session["road_sequence"] = cleaned
-        session["road_last_analysis"] = dict(prediction or {})
-        session["road_last_vision"] = dict(detection or {})
+        session["road_last_analysis"] = dict(prediction_data.get("road_support") or prediction_data)
+        session["road_last_vision"] = detection_data
         session["road_source"] = str(source or "screen_image")
-        if str(source or "") == "screen_image":
+        if str(source or "").startswith("screen_image"):
             session["road_last_image_at"] = _now()
             session["screen_manual_rounds"] = 0
         else:
             session["road_corrections"] = int(session.get("road_corrections", 0) or 0) + 1
-            session["screen_manual_rounds"] = int(
-                session.get("screen_manual_rounds", 0) or 0
-            ) + 1
-        session["screen_last_ocr"] = dict(ocr or {})
-        session["screen_last_detection"] = dict(detection or {})
-        session["screen_last_prediction"] = dict(prediction or {})
+            session["screen_manual_rounds"] = int(session.get("screen_manual_rounds", 0) or 0) + 1
+        session["screen_last_ocr"] = ocr_data
+        session["screen_last_detection"] = detection_data
+        session["screen_last_prediction"] = prediction_data
         session["screen_remaining_cards"] = remaining_value
         session["screen_analysis_count"] = int(session.get("screen_analysis_count", 0) or 0) + 1
         session["screen_last_analyzed_at"] = _now()
         session["screen_processing_ms"] = max(0.0, float(processing_ms or 0.0))
-        session["last_suggested_bet"] = max(
-            0, int(dict(prediction or {}).get("suggested_bet_amount", 0) or 0)
-        )
-        session["last_bet_percentage"] = max(
-            0.0, float(dict(prediction or {}).get("bet_percentage", 0.0) or 0.0)
-        )
+        session["last_suggested_bet"] = max(0, int(prediction_data.get("suggested_bet_amount", 0) or 0))
+        session["last_bet_percentage"] = max(0.0, float(prediction_data.get("bet_percentage", 0.0) or 0.0))
         session["awaiting_bankroll"] = False
         session["status"] = "分析完成"
         session["updated_at"] = _now()
-
         data[uid] = session
         _save_all_unlocked(data)
         return copy.deepcopy(session)
