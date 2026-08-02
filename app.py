@@ -1,4 +1,4 @@
-"""BGS V9.5 LINE Bot：UID 獨立牌路先行＋統一主模型分析。
+"""BGS V9.6 LINE Bot：手機完整截圖／牌路裁切圖雙模式快速分析。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒。
 收到圖片後先立即回覆「圖片已收到」，再於背景平行執行房間 OCR 與大路偵測，
@@ -33,6 +33,7 @@ import store
 from predictor import run_virtual_round
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
+from room_ocr import preload_ocr
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -91,8 +92,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V9.5 Road-First Unified Screen Bot",
-    version="9.5.0",
+    title="BGS V9.6 Mobile Dual-Mode Screen Bot",
+    version="9.6.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -193,6 +194,13 @@ def _schedule_background(coro: Any) -> None:
     task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _preload_ocr_on_startup() -> None:
+    """背景預載 OCR；不阻塞 Web Service 啟動。"""
+    if os.getenv("OCR_PRELOAD", "1").strip() == "1":
+        _schedule_background(asyncio.to_thread(preload_ocr))
 
 
 def _user_lock(user_id: str) -> asyncio.Lock:
@@ -751,11 +759,11 @@ def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
                         {
                             "type": "text",
                             "text": (
-                                "系統正在建立本桌分析資料：\n"
-                                "• 解析館別、桌號與剩餘張數\n"
-                                "• 建立大路莊閒序列\n"
-                                "• 執行有限牌組、蒙地卡羅、粒子驗證與牌路融合\n\n"
-                                "完成後將自動推送下一局方向、正式訊號與風險配置。"
+                                "系統將自動判斷完整遊戲畫面或牌路裁切圖，並同步處理：\n"
+                                "• 館別與桌號快速辨識\n"
+                                "• 大路莊閒序列建立\n"
+                                "• 牌路先行與統一機率模型\n\n"
+                                "分析完成後會自動推送下一局面板；後續每局只需點選莊或閒。"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -890,14 +898,13 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     road_support = dict(prediction.get("road_support") or {})
     fusion = dict(prediction.get("road_integration") or prediction.get("road_fusion") or {})
     sequence = [
-        str(item).upper()
-        for item in list(session.get("road_sequence") or [])
+        str(item).upper() for item in list(session.get("road_sequence") or [])
         if str(item).upper() in {"B", "P"}
     ]
 
     venue_code = str(ocr.get("venue_code") or session.get("venue") or "")
     venue_name = str(ocr.get("venue_name") or _venue_name(venue_code))
-    room = str(ocr.get("room") or session.get("room") or "1")
+    room = str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1")
     remaining = int(
         prediction.get("screen_remaining_cards")
         or session.get("screen_remaining_cards")
@@ -930,137 +937,65 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     road_direction = str(road_support.get("direction_text") or "資料建立中")
     road_samples = int(road_support.get("sample_count", len(sequence)) or len(sequence))
     fusion_text = "已納入統一核心" if bool(fusion.get("applied")) else "已檢查／核心為主"
-    data_quality = "畫面資料已建立" if recognized > 0 else "沿用本桌牌路資料"
+    input_type = str(session.get("screen_input_type") or prediction.get("screen_input_type") or detection.get("input_type") or "unknown")
+    input_type_text = "牌路裁切圖" if input_type == "road_crop" else "完整遊戲畫面" if input_type == "full_screen" else "遊戲畫面"
+    room_source = str(session.get("screen_room_source") or prediction.get("room_source") or ocr.get("room_source") or "")
+    room_source_text = "畫面辨識" if room_source == "image_ocr" else "沿用目前分析桌"
+    data_quality = f"{input_type_text}已完成辨識" if recognized > 0 else "沿用本桌牌路資料"
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
-        if suggested > 0
-        else "0 元（暫緩配置）"
+        if suggested > 0 else "0 元（暫緩配置）"
     )
-
     direction_color = "#D52B2B" if direction == "莊" else "#2667D8" if direction == "閒" else "#7B5600"
 
-    return _clean_flex(
-        {
-            "type": "flex",
-            "altText": f"BGS 下一局方向：{direction}",
-            "quickReply": _road_quick_reply(),
-            "contents": {
-                "type": "bubble",
-                "size": "mega",
-                "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "backgroundColor": "#FFF4B8",
-                    "paddingAll": "18px",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": f"BGS 下一局分析 #{analysis_number}",
-                            "weight": "bold",
-                            "size": "xl",
-                            "color": "#7B5600",
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"館別：{venue_name or '-'}｜桌號：{room}\n"
-                                f"估計剩餘：{remaining} 張｜牌路樣本：{len(sequence)} 局\n"
-                                f"本次後續更新：{manual_rounds} 局"
-                            ),
-                            "wrap": True,
-                            "size": "sm",
-                            "margin": "sm",
-                            "color": "#665000",
-                        },
-                        {"type": "separator", "margin": "md", "color": "#E1BD43"},
-                        {
-                            "type": "text",
-                            "text": f"下一局方向評估：{direction}",
-                            "weight": "bold",
-                            "size": "xl",
-                            "margin": "md",
-                            "color": direction_color,
-                        },
-                        {
-                            "type": "box",
-                            "layout": "vertical",
-                            "spacing": "sm",
-                            "margin": "md",
-                            "contents": [
-                                {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
-                                {"type": "text", "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%", "color": "#2667D8", "weight": "bold"},
-                                {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"正式訊號：{action}\n"
-                                f"訊號狀態：{signal_status}\n"
-                                f"方向優勢：{edge_percent:.2f}%\n"
-                                f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
-                                f"模型一致度：{consistency:.1f}%\n"
-                                f"牌路先行：{road_direction}｜整合：{fusion_text}"
-                            ),
-                            "wrap": True,
-                            "margin": "md",
-                            "color": "#3E3100",
-                        },
-                        {
-                            "type": "text",
-                            "text": f"訊號說明：{signal_reason}",
-                            "wrap": True,
-                            "size": "sm",
-                            "margin": "md",
-                            "color": "#665000",
-                        },
-                        {"type": "separator", "margin": "md", "color": "#E1BD43"},
-                        {
-                            "type": "text",
-                            "text": (
-                                f"分析本金：{_format_money(bankroll)} 元\n"
-                                f"建議配置：{bet_text}\n"
-                                f"配置依據：{bet_reason}"
-                            ),
-                            "wrap": True,
-                            "margin": "md",
-                            "color": "#3E3100",
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"資料狀態：{data_quality}\n"
-                                f"牌路統計樣本：{road_samples} 局"
-                            ),
-                            "wrap": True,
-                            "size": "sm",
-                            "margin": "md",
-                            "color": "#806A2A",
-                        },
-                        {
-                            "type": "box",
-                            "layout": "vertical",
-                            "spacing": "sm",
-                            "margin": "lg",
-                            "contents": [
-                                _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
-                                _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
-                                _postback_button("結束本次分析", "end", style="secondary"),
-                            ],
-                        },
-                        {
-                            "type": "text",
-                            "text": "本面板提供下一局機率方向、訊號品質與資金風險區間；實際結果仍具有隨機性。",
-                            "wrap": True,
-                            "size": "xs",
-                            "margin": "md",
-                            "color": "#806A2A",
-                        },
-                    ],
-                },
+    return _clean_flex({
+        "type": "flex",
+        "altText": f"BGS 下一局方向：{direction}",
+        "quickReply": _road_quick_reply(),
+        "contents": {
+            "type": "bubble", "size": "mega",
+            "body": {
+                "type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px",
+                "contents": [
+                    {"type": "text", "text": f"BGS 下一局分析 #{analysis_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
+                    {"type": "text", "text": (
+                        f"館別：{venue_name or '-'}｜桌號：{room}（{room_source_text}）\n"
+                        f"輸入畫面：{input_type_text}｜牌路樣本：{len(sequence)} 局\n"
+                        f"估計剩餘：{remaining} 張｜後續更新：{manual_rounds} 局"
+                    ), "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
+                    {"type": "separator", "margin": "md", "color": "#E1BD43"},
+                    {"type": "text", "text": f"下一局方向評估：{direction}", "weight": "bold", "size": "xl", "margin": "md", "color": direction_color},
+                    {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": [
+                        {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
+                        {"type": "text", "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%", "color": "#2667D8", "weight": "bold"},
+                        {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
+                    ]},
+                    {"type": "text", "text": (
+                        f"正式訊號：{action}\n"
+                        f"訊號狀態：{signal_status}\n"
+                        f"方向優勢：{edge_percent:.2f}%\n"
+                        f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
+                        f"模型一致度：{consistency:.1f}%\n"
+                        f"牌路先行：{road_direction}｜整合：{fusion_text}"
+                    ), "wrap": True, "margin": "md", "color": "#3E3100"},
+                    {"type": "text", "text": f"訊號說明：{signal_reason}", "wrap": True, "size": "sm", "margin": "md", "color": "#665000"},
+                    {"type": "separator", "margin": "md", "color": "#E1BD43"},
+                    {"type": "text", "text": (
+                        f"分析本金：{_format_money(bankroll)} 元\n"
+                        f"建議配置：{bet_text}\n"
+                        f"配置依據：{bet_reason}"
+                    ), "wrap": True, "margin": "md", "color": "#3E3100"},
+                    {"type": "text", "text": f"資料狀態：{data_quality}\n牌路統計樣本：{road_samples} 局", "wrap": True, "size": "sm", "margin": "md", "color": "#806A2A"},
+                    {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+                        _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
+                        _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
+                        _postback_button("結束本次分析", "end", style="secondary"),
+                    ]},
+                    {"type": "text", "text": "完成首次圖片分析後，每局只需回報莊或閒，系統會沿用目前桌號並更新下一局分析。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
+                ],
             },
-        }
-    )
+        },
+    })
 
 
 def ended_panel() -> Dict[str, Any]:
@@ -1156,7 +1091,7 @@ def _refresh_screen_prediction(
     outcome: str,
     expected_run_id: str,
 ) -> Dict[str, Any]:
-    """加入本局結果；牌路模型先更新，再由統一主引擎產生下一局方向。"""
+    """加入本局結果；不再重跑 OCR，只沿用目前桌號與畫面 metadata。"""
     value = str(outcome or "").upper().strip()
     if value not in {"B", "P"}:
         raise ValueError("本局結果只能是莊或閒。")
@@ -1173,15 +1108,15 @@ def _refresh_screen_prediction(
     sequence = list(session.get("road_sequence") or []) + [value]
     ocr = dict(session.get("screen_last_ocr") or {})
     detection = dict(session.get("screen_last_detection") or {})
-    current_remaining = int(
-        session.get("screen_remaining_cards")
-        or ocr.get("remaining_cards")
-        or 416
-    )
-    remaining = max(
-        6,
-        current_remaining - SCREEN_ESTIMATED_CARDS_PER_ROUND,
-    )
+    current_remaining = int(session.get("screen_remaining_cards") or ocr.get("remaining_cards") or 416)
+    remaining = max(6, current_remaining - SCREEN_ESTIMATED_CARDS_PER_ROUND)
+    screen_metadata = {
+        "input_type": str(session.get("screen_input_type") or detection.get("input_type") or "full_screen"),
+        "venue_source": str(session.get("screen_venue_source") or ocr.get("venue_source") or "session_selected"),
+        "room_source": str(session.get("screen_room_source") or ocr.get("room_source") or "session_previous"),
+        "room_confidence": float(session.get("screen_room_confidence", 0.0) or 0.0),
+        "manual_update": True,
+    }
 
     acquired = _PREDICTION_SLOTS.acquire(timeout=PREDICTION_QUEUE_TIMEOUT)
     if not acquired:
@@ -1192,8 +1127,9 @@ def _refresh_screen_prediction(
             remaining_cards=remaining,
             prior_counts=None,
             venue=str(ocr.get("venue_code") or session.get("venue") or ""),
-            room=str(ocr.get("room") or session.get("room") or "1"),
+            room=str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1"),
             user_id=user_id,
+            screen_metadata=screen_metadata,
         )
     finally:
         _PREDICTION_SLOTS.release()
@@ -1205,8 +1141,9 @@ def _refresh_screen_prediction(
     resolved = {
         "venue_code": str(ocr.get("venue_code") or session.get("venue") or ""),
         "venue_name": str(ocr.get("venue_name") or ""),
-        "room": str(ocr.get("room") or session.get("room") or "1"),
+        "room": str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1"),
         "remaining_cards": remaining,
+        **screen_metadata,
     }
     return store.update_screen_analysis(
         user_id,
@@ -1220,7 +1157,6 @@ def _refresh_screen_prediction(
         expected_run_id=expected_run_id,
         expected_data_version=expected_version,
     )
-
 
 
 def _start_screen_flow(
@@ -1252,7 +1188,7 @@ async def _process_screen_image(
     message_id: str,
     expected_run_id: str,
 ) -> None:
-    """背景完成首次辨識、牌路先行分析與統一主模型；只寫回同一 UID、同一代次。"""
+    """背景完成雙模式辨識、牌路先行分析與統一主模型；只寫回同一 UID、同一代次。"""
     temporary_image: Optional[Path] = None
     started = time.perf_counter()
     async with _user_lock(user_id):
@@ -1263,20 +1199,18 @@ async def _process_screen_image(
             if not bool(current_session.get("analysis_active")):
                 return
 
+            download_started = time.perf_counter()
             temporary_image = await asyncio.to_thread(_download_line_image, message_id)
-            screen = await asyncio.to_thread(
-                analyze_game_screen,
-                temporary_image,
-                current_session,
-            )
+            download_ms = (time.perf_counter() - download_started) * 1000.0
+
+            screen = await asyncio.to_thread(analyze_game_screen, temporary_image, current_session)
             sequence = list(screen.get("sequence") or [])
             if not sequence:
                 road_errors = list((screen.get("road") or {}).get("errors") or [])
                 detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
                 await asyncio.to_thread(
-                    _push,
-                    user_id,
-                    [_road_error_message(f"{detail}。請確認 ROAD_ROI 設定或裁切畫面。")],
+                    _push, user_id,
+                    [_road_error_message(f"{detail}。請傳送包含完整大路的畫面或牌路裁切圖。")],
                 )
                 return
 
@@ -1284,14 +1218,22 @@ async def _process_screen_image(
             remaining = int(resolved.get("remaining_cards") or 416)
             resolved["remaining_cards"] = remaining
             expected_version = int(current_session.get("screen_data_version", 0) or 0)
+            screen_metadata = {
+                "input_type": str(screen.get("input_type") or resolved.get("input_type") or "full_screen"),
+                "venue_source": str(resolved.get("venue_source") or "session_selected"),
+                "room_source": str(resolved.get("room_source") or "session_selected"),
+                "room_confidence": float(resolved.get("room_confidence", 0.0) or 0.0),
+                "ocr_timed_out": bool(resolved.get("ocr_timed_out")),
+                "vision_timings": dict(screen.get("timings") or {}),
+            }
+            resolved.update(screen_metadata)
 
             acquired = await asyncio.to_thread(
-                _PREDICTION_SLOTS.acquire,
-                True,
-                PREDICTION_QUEUE_TIMEOUT,
+                _PREDICTION_SLOTS.acquire, True, PREDICTION_QUEUE_TIMEOUT
             )
             if not acquired:
                 raise RuntimeError("目前分析人數較多，請稍後重新上傳圖片。")
+            model_started = time.perf_counter()
             try:
                 prediction = await asyncio.to_thread(
                     predict_from_screenshot,
@@ -1299,14 +1241,17 @@ async def _process_screen_image(
                     remaining_cards=remaining,
                     prior_counts=None,
                     venue=str(resolved.get("venue_code") or current_session.get("venue") or ""),
-                    room=str(resolved.get("room") or current_session.get("room") or "1"),
+                    room=str(resolved.get("room") or current_session.get("room") or current_session.get("last_confirmed_room") or "1"),
                     user_id=user_id,
+                    screen_metadata=screen_metadata,
                 )
             finally:
                 _PREDICTION_SLOTS.release()
+            model_ms = (time.perf_counter() - model_started) * 1000.0
 
             prediction = _attach_bankroll_advice(prediction, current_session)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            source = f"screen_image_{screen_metadata['input_type']}"
             session = store.update_screen_analysis(
                 user_id,
                 ocr=dict(screen.get("ocr") or {}),
@@ -1315,10 +1260,20 @@ async def _process_screen_image(
                 prediction=prediction,
                 resolved=resolved,
                 processing_ms=elapsed_ms,
-                source="screen_image",
+                source=source,
                 expected_run_id=expected_run_id,
                 expected_data_version=expected_version,
             )
+            print("screen_timing", json.dumps({
+                "uid": user_id[-8:],
+                "download_ms": round(download_ms, 2),
+                **dict(screen.get("timings") or {}),
+                "model_ms": round(model_ms, 2),
+                "total_ms": round(elapsed_ms, 2),
+                "input_type": screen_metadata["input_type"],
+                "room_source": screen_metadata["room_source"],
+                "road_count": len(sequence),
+            }, ensure_ascii=False))
             await asyncio.to_thread(_push, user_id, [screen_result_panel(user_id, session)])
         except PermissionError:
             await asyncio.to_thread(_push, user_id, [_text("試用已到期，請聯繫管理員開通。")])
@@ -1327,15 +1282,10 @@ async def _process_screen_image(
             message = str(exc)
             if "舊結果已忽略" in message or "已重新開始" in message or "已結束" in message:
                 return
-            await asyncio.to_thread(
-                _push,
-                user_id,
-                [_road_error_message(f"圖片處理失敗：{exc}")],
-            )
+            await asyncio.to_thread(_push, user_id, [_road_error_message(f"圖片處理失敗：{exc}")])
         finally:
             if temporary_image is not None:
                 temporary_image.unlink(missing_ok=True)
-
 
 
 async def _process_manual_outcome(
