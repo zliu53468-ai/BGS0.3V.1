@@ -1,16 +1,11 @@
 """遊戲截圖的牌路先行預測轉接層。
 
-流程固定為：
-1. 清理截圖辨識出的 B/P 序列。
-2. 先執行 road_model 建立牌路 context。
-3. 估計截圖未提供的 0~9 點剩餘張數。
-4. 將牌路 context 與估計牌組一起交給統一主引擎。
-
-截圖沒有每個點值的真實剩餘張數，因此牌組組成仍屬估計資料。
+流程：清理 B/P -> 建立牌路 context -> 估計剩餘點值牌組 -> 統一主引擎。
+畫面辨識 metadata 只做追蹤與面板顯示，不會重複執行 OCR 或牌路辨識。
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import secrets
 
 from particle_filter_points import fresh_counts
@@ -20,8 +15,7 @@ from road_model import build_road_context
 
 def _clean_sequence(values: Iterable[Any]) -> List[str]:
     return [
-        str(item).upper().strip()
-        for item in values
+        str(item).upper().strip() for item in values
         if str(item).upper().strip() in {"B", "P"}
     ][-500:]
 
@@ -53,7 +47,6 @@ def estimate_point_counts(
     prior_counts: Optional[Sequence[int]] = None,
     decks: int = 8,
 ) -> Tuple[List[int], str]:
-    """把剩餘總張數轉成 0~9 點值的估計張數。"""
     maximum = 52 * max(1, min(16, int(decks)))
     total = max(6, min(maximum, int(remaining_cards)))
     if (
@@ -78,6 +71,8 @@ def predict_from_screenshot(
     room: str = "",
     user_id: str = "",
     run_seed: Optional[int] = None,
+    road_context: Optional[Mapping[str, Any]] = None,
+    screen_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     cleaned = _clean_sequence(sequence)
     fallback_total = sum(int(value) for value in prior_counts or [] if int(value) >= 0)
@@ -86,9 +81,9 @@ def predict_from_screenshot(
 
     seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     road_seed = (seed ^ 0x9E3779B9) & 0xFFFFFFFF
+    context = dict(road_context or build_road_context(cleaned, seed=road_seed))
+    metadata = dict(screen_metadata or {})
 
-    # 關鍵順序：牌路先分析，再把 road context 交給主引擎。
-    road_context = build_road_context(cleaned, seed=road_seed)
     result = predict(
         history=cleaned,
         venue=venue,
@@ -96,10 +91,10 @@ def predict_from_screenshot(
         user_id=user_id,
         run_seed=seed,
         shoe_context={"remaining_counts": counts},
-        road_context=road_context,
+        road_context=context,
     )
     result.update({
-        "model_version": "V9.5-SCREEN-ROAD-FIRST-UNIFIED",
+        "model_version": "V9.6-MOBILE-DUAL-MODE-ROAD-FIRST",
         "mode": "screen_estimated_composition_road_first",
         "model_core": "牌路先行＋有限牌組超幾何＋粒子／蒙地卡羅統一判斷",
         "screen_remaining_cards": total,
@@ -107,16 +102,19 @@ def predict_from_screenshot(
         "composition_source": source,
         "composition_quality": "estimated",
         "road_sequence_length": len(cleaned),
-        "road_support": road_context,
+        "road_support": context,
         "road_pipeline_completed": True,
+        "screen_metadata": metadata,
+        "screen_input_type": str(metadata.get("input_type") or "unknown"),
+        "room_source": str(metadata.get("room_source") or "unknown"),
+        "venue_source": str(metadata.get("venue_source") or "unknown"),
         "virtual_only": False,
         "external_screen_input": True,
         "disclaimer": (
-            "截圖只有剩餘總張數，未包含每個點值的真實剩餘張數；"
-            "系統會先分析已辨識牌路，再以估計牌組執行機率模型。"
+            "截圖未包含每個點值的真實剩餘張數；系統會先分析已辨識牌路，"
+            "再以估計牌組執行機率模型。"
         ),
     })
-    # 相容舊面板欄位；內容實際來自主引擎內部整合，不是 app 後置融合。
     result["road_fusion"] = dict(result.get("road_integration") or {})
     return result
 
