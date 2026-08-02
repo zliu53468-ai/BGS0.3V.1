@@ -10,6 +10,8 @@ finite baccarat shoe.  Monte Carlo replicas and a low-weight hidden-order
 particle ensemble are retained as validation / uncertainty layers.
 
 This is a simulation engine.  It does not read or predict an external live table.
+V9.8 uses an eligible road-model direction as the displayed next-round direction;
+the finite-population layers validate risk and may downgrade the action to observe.
 """
 from __future__ import annotations
 
@@ -701,13 +703,27 @@ class VirtualShoeParticleEngine:
         banker = (1.0 - tie) * banker_no_tie
         player = (1.0 - tie) * (1.0 - banker_no_tie)
         player_no_tie = 1.0 - banker_no_tie
-        direction = "B" if banker >= player else "P"
-        direction_edge = abs(banker_no_tie - player_no_tie)
+        fused_direction = "B" if banker >= player else "P"
+
+        # V9.8：下一局方向以牌路先行模型為主；有限牌組核心只負責
+        # 機率、穩定度與風險驗證，不再把牌路方向改回理論基準方向。
+        road_direction = str(road_state.get("direction") or "").upper()
+        road_ready = bool(
+            road_state.get("ok")
+            and road_state.get("eligible")
+            and road_direction in {"B", "P"}
+        )
+        direction = road_direction if road_ready else fused_direction
+        direction_edge = (
+            abs(float(road_state["banker_probability"]) - float(road_state["player_probability"]))
+            if road_ready
+            else abs(banker_no_tie - player_no_tie)
+        )
         road_aligned_with_core = bool(
-            not road_state["ok"] or road_state["direction"] == core_direction
+            not road_state["ok"] or road_direction == core_direction
         )
         road_aligned_with_final = bool(
-            not road_state["ok"] or road_state["direction"] == direction
+            not road_state["ok"] or road_direction == direction
         )
 
         banker_ev = banker * (1.0 - BANKER_COMMISSION) - player
@@ -720,14 +736,12 @@ class VirtualShoeParticleEngine:
         edge_ok = direction_edge >= MIN_DIRECTION_EDGE
         uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
         validation_ok = validation_gap <= MAX_VALIDATION_GAP
-        # 當牌路已進入核心但與核心方向分歧時，不直接放大成正式訊號。
-        road_consensus_ok = bool(
-            road_weight <= 0.0
-            or road_aligned_with_core
-            or direction_edge >= MIN_DIRECTION_EDGE * 1.75
-        )
+        road_signal_ok = bool(road_state.get("signal_allowed")) if road_ready else True
+
+        # 牌路合格時：方向固定採牌路；核心不同意時只降低為觀望，
+        # 不會改成相反方向。牌路尚未合格時才沿用融合核心方向。
         signal_allowed = bool(
-            edge_ok and uncertainty_ok and validation_ok and road_consensus_ok
+            edge_ok and uncertainty_ok and validation_ok and road_signal_ok
         )
         action = direction if signal_allowed else "O"
 
@@ -774,25 +788,25 @@ class VirtualShoeParticleEngine:
         model_consistency = max(0.0, min(1.0, model_consistency))
 
         if signal_allowed:
-            if road_weight > 0.0 and road_aligned_with_core:
-                signal_reason = "牌路先行分析與有限牌組核心方向一致，且模型驗證通過正式訊號門檻"
-            elif road_weight > 0.0:
-                signal_reason = "牌路先行分析已納入，融合後方向優勢通過正式訊號門檻"
+            if road_ready and road_aligned_with_core:
+                signal_reason = "牌路先行方向已採用，且有限牌組核心與驗證層方向一致"
+            elif road_ready:
+                signal_reason = "牌路先行方向已採用；核心僅完成風險驗證，不改寫牌路方向"
             else:
-                signal_reason = "有限牌組核心的方向差距、不確定性與模型一致度均通過門檻"
+                signal_reason = "牌路尚未達正式條件，暫由融合核心方向通過驗證"
             signal_status_text = "方向訊號已開放"
         else:
             reasons: List[str] = []
             if not edge_ok:
-                reasons.append("莊閒方向差距尚未達門檻")
+                reasons.append("牌路或融合方向差距尚未達門檻")
             if not uncertainty_ok:
                 reasons.append("模擬不確定性仍偏高")
             if not validation_ok:
                 reasons.append("核心與驗證層的一致度不足")
-            if not road_consensus_ok:
-                reasons.append("牌路先行分析與有限牌組核心方向分歧")
-            if road_state["present"] and road_weight <= 0.0:
-                reasons.append("牌路樣本或品質尚未達內部整合條件")
+            if road_ready and not road_signal_ok:
+                reasons.append("牌路模型尚未開放正式訊號")
+            if road_state["present"] and not road_ready:
+                reasons.append("牌路樣本或品質尚未達方向主導條件")
             signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
             signal_status_text = "等待更明確訊號"
 
@@ -805,6 +819,8 @@ class VirtualShoeParticleEngine:
             "road_direction": road_state["direction"],
             "core_direction_before_road": core_direction,
             "final_direction": direction,
+            "fused_direction_before_override": fused_direction,
+            "road_direction_primary": road_ready,
             "aligned_with_core": road_aligned_with_core,
             "aligned_with_final": road_aligned_with_final,
             "requested_weight": round(float(road_state["requested_weight"]), 8),
@@ -816,14 +832,14 @@ class VirtualShoeParticleEngine:
 
         return {
             "ok": True,
-            "engine": "V9_7_BPT_ROAD_FIRST_HYPERGEOMETRIC_PARTICLE_MC",
-            "model_core": "road_context_then_multivariate_hypergeometric_validation",
+            "engine": "V9_8_ROAD_DIRECTION_FIRST_HYPERGEOMETRIC_VALIDATOR",
+            "model_core": "road_direction_primary_then_hypergeometric_validation",
             "pipeline_order": [
-                "road_context",
-                "hypergeometric_core",
+                "road_context_direction",
+                "hypergeometric_probability_reference",
                 "monte_carlo_validation",
                 "particle_validation",
-                "unified_signal_decision",
+                "road_direction_or_observe_decision",
             ],
             "run_seed": run_seed,
             "virtual_only": True,
@@ -871,7 +887,7 @@ class VirtualShoeParticleEngine:
                 for index, key in enumerate(OUTCOME_NAMES)
             },
             "recommend": direction,
-            "recommend_text": "莊" if direction == "B" else "閒",
+            "recommend_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
             "action": action,
             "action_text": "莊" if action == "B" else "閒" if action == "P" else "觀望",
             "direction_edge": float(direction_edge),
@@ -886,7 +902,9 @@ class VirtualShoeParticleEngine:
             "signal_allowed": signal_allowed,
             "signal_status_text": signal_status_text,
             "signal_reason": signal_reason,
-            "direction_source": "road_context_inside_core" if road_weight > 0.0 else "main_core_after_road_check",
+            "direction_source": "road_model_primary" if road_ready else "fallback_fused_core",
+            "road_direction_primary": road_ready,
+            "fused_direction_before_road_override": fused_direction,
             "road_integration": road_integration,
             "expected_values": expected_values,
             "best_ev_side": best_ev_side,
