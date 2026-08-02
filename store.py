@@ -157,6 +157,11 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         "last_confirmed_room": "",
         # 路紙影像辨識與手動校正狀態，與虛擬牌靴狀態分開保存。
         "road_sequence": [],
+        "raw_outcomes": [],
+        "tie_markers": {},
+        "tie_total": 0,
+        "pending_opening_ties": 0,
+        "last_actual_outcome": "",
         "road_last_analysis": {},
         "road_last_vision": {},
         "road_source": "",
@@ -212,6 +217,76 @@ def _valid_shoe(value: Any) -> bool:
     )
 
 
+def _clean_raw_outcomes(values: Any, limit: int = 1000) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    return [
+        str(item).upper().strip()
+        for item in values
+        if str(item).upper().strip() in {"B", "P", "T"}
+    ][-max(10, int(limit)):]
+
+
+def _normalize_tie_markers(values: Any) -> Dict[str, int]:
+    if not isinstance(values, Mapping):
+        return {}
+    result: Dict[str, int] = {}
+    for key, value in values.items():
+        try:
+            index = int(key)
+            count = max(0, int(value or 0))
+        except Exception:
+            continue
+        if index >= 0 and count > 0:
+            result[str(index)] = count
+    return result
+
+
+def _road_state_from_raw(values: Any) -> Dict[str, Any]:
+    raw = _clean_raw_outcomes(values)
+    road: List[str] = []
+    tie_markers: Dict[str, int] = {}
+    pending_opening = 0
+    for value in raw:
+        if value in {"B", "P"}:
+            road.append(value)
+            if pending_opening > 0:
+                key = str(len(road) - 1)
+                tie_markers[key] = tie_markers.get(key, 0) + pending_opening
+                pending_opening = 0
+        elif road:
+            key = str(len(road) - 1)
+            tie_markers[key] = tie_markers.get(key, 0) + 1
+        else:
+            pending_opening += 1
+    return {
+        "raw_outcomes": raw,
+        "road_sequence": road[-500:],
+        "tie_markers": tie_markers,
+        "tie_total": sum(1 for value in raw if value == "T"),
+        "pending_opening_ties": pending_opening,
+        "last_actual_outcome": raw[-1] if raw else "",
+    }
+
+
+def _raw_from_road_and_ties(
+    road_sequence: Any,
+    tie_markers: Any,
+    pending_opening_ties: int = 0,
+) -> List[str]:
+    road = [
+        str(item).upper().strip()
+        for item in list(road_sequence or [])
+        if str(item).upper().strip() in {"B", "P"}
+    ][-500:]
+    markers = _normalize_tie_markers(tie_markers)
+    raw: List[str] = ["T"] * max(0, int(pending_opening_ties or 0))
+    for index, value in enumerate(road):
+        raw.append(value)
+        raw.extend(["T"] * max(0, int(markers.get(str(index), 0) or 0)))
+    return raw[-1000:]
+
+
 def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     defaults = _default_session(user_id)
     for key, value in defaults.items():
@@ -229,14 +304,16 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     if not isinstance(session.get("analysis_history"), list):
         session["analysis_history"] = []
 
-    # 舊版 Session 自動補上路紙欄位，並清除不合法字元。
-    if not isinstance(session.get("road_sequence"), list):
-        session["road_sequence"] = []
-    session["road_sequence"] = [
-        str(item).upper().strip()
-        for item in session.get("road_sequence", [])
-        if str(item).upper().strip() in {"B", "P"}
-    ][-500:]
+    # 舊版 Session 自動遷移成 B/P/T 完整歷史；T 不新增大路格位。
+    raw_history = _clean_raw_outcomes(session.get("raw_outcomes"))
+    if not raw_history:
+        raw_history = _raw_from_road_and_ties(
+            session.get("road_sequence"),
+            session.get("tie_markers"),
+            int(session.get("pending_opening_ties", 0) or 0),
+        )
+    road_state = _road_state_from_raw(raw_history)
+    session.update(road_state)
     if not isinstance(session.get("road_last_analysis"), dict):
         session["road_last_analysis"] = {}
     if not isinstance(session.get("road_last_vision"), dict):
@@ -437,7 +514,9 @@ def start_session(user_id: str, venue: str = "", room: str = "1") -> Dict[str, A
 def _clear_screen_fields(session: Dict[str, Any]) -> None:
     """清除本次畫面分析資料；保留權限、館別、本金與最近確認桌號供裁切圖沿用。"""
     session.update({
-        "road_sequence": [], "road_last_analysis": {}, "road_last_vision": {},
+        "road_sequence": [], "raw_outcomes": [], "tie_markers": {},
+        "tie_total": 0, "pending_opening_ties": 0, "last_actual_outcome": "",
+        "road_last_analysis": {}, "road_last_vision": {},
         "road_source": "", "road_last_image_at": 0, "road_corrections": 0,
         "screen_last_ocr": {}, "screen_last_detection": {}, "screen_last_prediction": {},
         "screen_remaining_cards": 0, "screen_analysis_count": 0,
@@ -857,20 +936,21 @@ def set_road_sequence(
     user_id: str,
     sequence: List[str],
     *,
+    raw_outcomes: Optional[List[str]] = None,
+    tie_markers: Optional[Mapping[str, Any]] = None,
     analysis: Optional[Mapping[str, Any]] = None,
     vision: Optional[Mapping[str, Any]] = None,
     source: str = "image",
 ) -> Dict[str, Any]:
-    """覆蓋使用者的路紙序列，通常由影像辨識成功後呼叫。"""
-    cleaned = [
-        str(item).upper().strip()
-        for item in list(sequence or [])
-        if str(item).upper().strip() in {"B", "P"}
-    ][-500:]
+    """覆蓋使用者牌局；完整歷史保存 B/P/T，大路序列只保存 B/P。"""
+    raw = _clean_raw_outcomes(raw_outcomes)
+    if not raw:
+        raw = _raw_from_road_and_ties(sequence, tie_markers)
+    state = _road_state_from_raw(raw)
     return upsert_session(
         user_id,
         {
-            "road_sequence": cleaned,
+            **state,
             "road_last_analysis": dict(analysis or {}),
             "road_last_vision": dict(vision or {}),
             "road_source": str(source or "image"),
@@ -878,34 +958,31 @@ def set_road_sequence(
         },
     )
 
-
 def append_road_result(
     user_id: str,
     outcome: str,
     *,
     analysis: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """在路紙尾端手動補上一局 B 或 P。"""
+    """在完整歷史尾端補上一局 B/P/T；和局不新增大路格位。"""
     value = str(outcome or "").upper().strip()
-    if value not in {"B", "P"}:
-        raise ValueError("路紙結果只能是 B 或 P。")
+    if value not in {"B", "P", "T"}:
+        raise ValueError("牌局結果只能是 B、P 或 T。")
 
     with _LOCK:
         data = _load_all_unlocked()
         uid = str(user_id or "").strip()
         if not uid:
             raise ValueError("user_id is required")
-        raw = data.get(uid)
-        session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
-        sequence = list(session.get("road_sequence") or [])
-        sequence.append(value)
-        session["road_sequence"] = sequence[-500:]
+        raw_session = data.get(uid)
+        session = _migrate_session(raw_session, uid) if isinstance(raw_session, dict) else _default_session(uid)
+        raw_history = list(session.get("raw_outcomes") or [])
+        raw_history.append(value)
+        session.update(_road_state_from_raw(raw_history))
         session["road_source"] = "manual"
         session["road_corrections"] = int(session.get("road_corrections", 0) or 0) + 1
         if str(session.get("analysis_mode") or "") == "screen":
-            session["screen_data_version"] = int(
-                session.get("screen_data_version", 0) or 0
-            ) + 1
+            session["screen_data_version"] = int(session.get("screen_data_version", 0) or 0) + 1
             session["screen_last_input_source"] = "manual"
             session["screen_last_data_updated_at"] = _now()
             session["awaiting_screenshot"] = False
@@ -915,7 +992,6 @@ def append_road_result(
         data[uid] = session
         _save_all_unlocked(data)
         return copy.deepcopy(session)
-
 
 def update_road_analysis(
     user_id: str,
@@ -942,6 +1018,8 @@ def update_screen_analysis(
     detection: Mapping[str, Any],
     sequence: List[str],
     prediction: Mapping[str, Any],
+    raw_outcomes: Optional[List[str]] = None,
+    tie_markers: Optional[Mapping[str, Any]] = None,
     resolved: Optional[Mapping[str, Any]] = None,
     processing_ms: float = 0.0,
     source: str = "screen_image",
@@ -952,10 +1030,11 @@ def update_screen_analysis(
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
-    cleaned = [
-        str(item).upper().strip() for item in list(sequence or [])
-        if str(item).upper().strip() in {"B", "P"}
-    ][-500:]
+    raw_history = _clean_raw_outcomes(raw_outcomes)
+    if not raw_history:
+        raw_history = _raw_from_road_and_ties(sequence, tie_markers)
+    road_state = _road_state_from_raw(raw_history)
+    cleaned = list(road_state["road_sequence"])
     resolved_data = dict(resolved or {})
     prediction_data = dict(prediction or {})
     ocr_data = dict(ocr or {})
@@ -1013,7 +1092,7 @@ def update_screen_analysis(
         session["screen_room_source"] = room_source
         session["screen_room_confidence"] = room_confidence
         session["screen_timings"] = dict(resolved_data.get("vision_timings") or prediction_data.get("screen_metadata", {}).get("vision_timings") or {})
-        session["road_sequence"] = cleaned
+        session.update(road_state)
         session["road_last_analysis"] = dict(prediction_data.get("road_support") or prediction_data)
         session["road_last_vision"] = detection_data
         session["road_source"] = str(source or "screen_image")

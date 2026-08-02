@@ -1,7 +1,7 @@
 """BGS 統一機率預測入口。
 
 畫面模式會先由 ``road_model.py`` 建立牌路 context，再把 context 與估計剩餘
-牌值一起送入 ``VirtualShoeParticleEngine``。最終莊／閒／觀望由同一個主引擎
+牌值一起送入 ``VirtualShoeParticleEngine``。最終莊／閒／和／觀望由同一個主引擎
 統一決定，不再於 app.py 做第二次後置融合。
 """
 from __future__ import annotations
@@ -9,6 +9,9 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 import os
 import secrets
+
+from adaptive_ensemble import adapt_prediction
+from online_calibrator import calibrate_prediction
 
 from particle_filter_points import (
     DB_HOLDOUT,
@@ -118,7 +121,7 @@ def run_virtual_round(
         verdict = "MISS"
 
     prediction.update({
-        "model_version": "V9.5-UNIFIED-ENGINE",
+        "model_version": "V9.7-UNIFIED-ENGINE",
         "mode": "virtual_shoe_click_only",
         "input_required": False,
         "confidence_label": _prediction_label(prediction),
@@ -177,14 +180,17 @@ def predict(
         seed=run_seed,
         road_context=dict(road_context or {}),
     )
+    # 自適應權重與三方校準只使用過去已結算資料；樣本不足時維持主引擎原值。
+    prediction = adapt_prediction(prediction, venue=venue, room=room)
+    prediction = calibrate_prediction(prediction, venue=venue, room=room)
     prediction.update({
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
         "user_id": user_id,
         "input_required": False,
-        "mode": "probability_only_unified",
-        "model_version": "V9.5-ROAD-FIRST-UNIFIED",
+        "mode": "probability_only_unified_calibrated",
+        "model_version": "V9.7-BPT-ROAD-FIRST-CALIBRATED",
     })
     return prediction
 

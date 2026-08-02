@@ -1,4 +1,4 @@
-"""同一張遊戲畫面的快速 OCR 與路紙偵測協調器。"""
+"""同一張遊戲畫面的快速 OCR 與 B/P/T 路紙偵測協調器。"""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -78,6 +78,15 @@ def analyze_game_screen(
         str(item).upper() for item in list(road.get("sequence") or [])
         if str(item).upper() in {"B", "P"}
     ]
+    raw_outcomes = [
+        str(item).upper() for item in list(road.get("raw_outcomes") or sequence)
+        if str(item).upper() in {"B", "P", "T"}
+    ]
+    tie_markers = {
+        str(key): max(0, int(value or 0))
+        for key, value in dict(road.get("tie_markers") or {}).items()
+        if max(0, int(value or 0)) > 0
+    }
 
     fallback_venue = str(session.get("venue") or session.get("last_confirmed_venue") or "")
     fallback_room = str(session.get("last_confirmed_room") or session.get("room") or "1")
@@ -115,6 +124,9 @@ def analyze_game_screen(
         "ocr": ocr,
         "road": road,
         "sequence": sequence,
+        "raw_outcomes": raw_outcomes,
+        "tie_markers": tie_markers,
+        "tie_count": sum(1 for value in raw_outcomes if value == "T"),
         "resolved": resolved,
         "input_type": input_type,
         "timings": timings,

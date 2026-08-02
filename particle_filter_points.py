@@ -816,7 +816,7 @@ class VirtualShoeParticleEngine:
 
         return {
             "ok": True,
-            "engine": "V9_5_ROAD_FIRST_HYPERGEOMETRIC_PARTICLE_MC",
+            "engine": "V9_7_BPT_ROAD_FIRST_HYPERGEOMETRIC_PARTICLE_MC",
             "model_core": "road_context_then_multivariate_hypergeometric_validation",
             "pipeline_order": [
                 "road_context",
@@ -830,6 +830,8 @@ class VirtualShoeParticleEngine:
             "remaining_cards": int(sum(counts)),
             "remaining_counts": counts,
             "probabilities": {"B": banker, "P": player, "T": tie},
+            "raw_probabilities": {"B": banker, "P": player, "T": tie},
+            "tie_signal_allowed": False,
             "banker_rate": round(banker * 100.0, 2),
             "player_rate": round(player * 100.0, 2),
             "tie_rate": round(tie * 100.0, 2),
@@ -877,6 +879,7 @@ class VirtualShoeParticleEngine:
             "uncertainty": uncertainty,
             "validation_gap": validation_gap,
             "max_validation_gap": MAX_VALIDATION_GAP,
+            "max_signal_uncertainty": MAX_SIGNAL_UNCERTAINTY,
             "quality_score": round(quality_score, 6),
             "confidence_label": confidence_label,
             "model_consistency": round(model_consistency, 6),

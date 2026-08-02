@@ -151,6 +151,8 @@ def _detect_yolo(crop: np.ndarray) -> Dict[str, Any]:
     ordered = _sort_big_road(detections)
     return {
         "ok": bool(ordered), "sequence": [item["outcome"] for item in ordered],
+        "raw_outcomes": [item["outcome"] for item in ordered],
+        "tie_markers": {}, "tie_count": 0,
         "recognized_count": len(ordered), "candidates": ordered, "method": "custom_yolo",
         "unknown_candidates": 0, "raw_contours": 0,
     }
@@ -249,6 +251,9 @@ def detect_road_sequence_detailed(
     region_name = str(best.get("region_name") or "")
 
     result = dict(best)
+    result.setdefault("tie_markers", {})
+    result.setdefault("tie_count", sum(int(value or 0) for value in dict(result.get("tie_markers") or {}).values()))
+    result.setdefault("raw_outcomes", list(result.get("sequence") or []))
     result.update({
         "ok": bool(result.get("sequence")),
         "input_type": detected_type,

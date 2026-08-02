@@ -1,23 +1,39 @@
-"""遊戲截圖的牌路先行預測轉接層。
+"""遊戲截圖的 B/P/T 牌路先行預測轉接層。
 
-流程：清理 B/P -> 建立牌路 context -> 估計剩餘點值牌組 -> 統一主引擎。
-畫面辨識 metadata 只做追蹤與面板顯示，不會重複執行 OCR 或牌路辨識。
+- raw_outcomes 保存每一局 B/P/T。
+- road_sequence 只保留 B/P，和局不新增大路格位。
+- 牌路 context、有限牌組核心、自適應集成與三方校準完成後，建立待結算預測。
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import os
 import secrets
 
 from particle_filter_points import fresh_counts
+from performance_tracker import record_prediction
 from predictor import predict
 from road_model import build_road_context
 
 
+PERFORMANCE_TRACKING_ENABLED = os.getenv("PERFORMANCE_TRACKING_ENABLED", "1").strip() == "1"
+
+
+def _clean_raw_outcomes(values: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            raw = item.get("outcome") or item.get("actual")
+        else:
+            raw = item
+        value = str(raw or "").upper().strip()
+        if value in {"B", "P", "T"}:
+            result.append(value)
+    return result[-1000:]
+
+
 def _clean_sequence(values: Iterable[Any]) -> List[str]:
-    return [
-        str(item).upper().strip() for item in values
-        if str(item).upper().strip() in {"B", "P"}
-    ][-500:]
+    return [value for value in _clean_raw_outcomes(values) if value in {"B", "P"}][-500:]
 
 
 def _largest_remainder_allocation(weights: Sequence[float], total: int) -> List[int]:
@@ -66,6 +82,8 @@ def predict_from_screenshot(
     sequence: Iterable[Any],
     *,
     remaining_cards: Optional[int],
+    raw_outcomes: Optional[Iterable[Any]] = None,
+    tie_markers: Optional[Mapping[str, Any]] = None,
     prior_counts: Optional[Sequence[int]] = None,
     venue: str = "",
     room: str = "",
@@ -73,19 +91,24 @@ def predict_from_screenshot(
     run_seed: Optional[int] = None,
     road_context: Optional[Mapping[str, Any]] = None,
     screen_metadata: Optional[Mapping[str, Any]] = None,
+    record_for_learning: bool = True,
 ) -> Dict[str, Any]:
     cleaned = _clean_sequence(sequence)
+    raw_history = _clean_raw_outcomes(raw_outcomes if raw_outcomes is not None else cleaned)
+    if not raw_history:
+        raw_history = list(cleaned)
     fallback_total = sum(int(value) for value in prior_counts or [] if int(value) >= 0)
     total = int(remaining_cards or fallback_total or 416)
     counts, source = estimate_point_counts(total, prior_counts=prior_counts, decks=8)
 
     seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     road_seed = (seed ^ 0x9E3779B9) & 0xFFFFFFFF
-    context = dict(road_context or build_road_context(cleaned, seed=road_seed))
+    context = dict(road_context or build_road_context(raw_history, seed=road_seed))
     metadata = dict(screen_metadata or {})
+    markers = {str(key): max(0, int(value or 0)) for key, value in dict(tie_markers or {}).items()}
 
     result = predict(
-        history=cleaned,
+        history=raw_history,
         venue=venue,
         room=room,
         user_id=user_id,
@@ -94,14 +117,17 @@ def predict_from_screenshot(
         road_context=context,
     )
     result.update({
-        "model_version": "V9.6-MOBILE-DUAL-MODE-ROAD-FIRST",
-        "mode": "screen_estimated_composition_road_first",
-        "model_core": "牌路先行＋有限牌組超幾何＋粒子／蒙地卡羅統一判斷",
+        "model_version": "V9.7-BPT-TIE-AWARE-CALIBRATED",
+        "mode": "screen_estimated_composition_bpt_road_first",
+        "model_core": "B/P/T完整歷史＋牌路先行＋有限牌組超幾何＋自適應校準",
         "screen_remaining_cards": total,
         "estimated_remaining_counts": counts,
         "composition_source": source,
         "composition_quality": "estimated",
         "road_sequence_length": len(cleaned),
+        "raw_outcome_length": len(raw_history),
+        "tie_count": sum(1 for value in raw_history if value == "T"),
+        "tie_markers": markers,
         "road_support": context,
         "road_pipeline_completed": True,
         "screen_metadata": metadata,
@@ -111,11 +137,29 @@ def predict_from_screenshot(
         "virtual_only": False,
         "external_screen_input": True,
         "disclaimer": (
-            "截圖未包含每個點值的真實剩餘張數；系統會先分析已辨識牌路，"
-            "再以估計牌組執行機率模型。"
+            "截圖未包含每個點值的真實剩餘張數；系統保存 B/P/T 實際結果並做保守校準，"
+            "但無法取得真人桌尚未公開的隱藏牌序。"
         ),
     })
     result["road_fusion"] = dict(result.get("road_integration") or {})
+
+    if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id:
+        prediction_id = record_prediction(
+            user_id,
+            result,
+            venue=venue,
+            room=room,
+            metadata={
+                **metadata,
+                "road_sequence_length": len(cleaned),
+                "raw_outcome_length": len(raw_history),
+                "tie_count": result["tie_count"],
+            },
+        )
+        result["prediction_id"] = prediction_id
+        result["performance_tracking"] = True
+    else:
+        result["performance_tracking"] = False
     return result
 
 

@@ -1,4 +1,4 @@
-"""百家樂大路圖片辨識模組（完整畫面／牌路裁切圖共用）。
+"""百家樂大路圖片辨識模組（完整畫面／牌路裁切圖共用，支援綠色和局標記）。
 
 改良重點：
 1. 先以幾何輪廓定位圓圈，再以「外框環形區域」判定紅莊／藍閒。
@@ -47,6 +47,10 @@ CENTER_PATCH_RADIUS = _env_int("VISION_CENTER_PATCH_RADIUS", 2, 1, 8)
 RING_INNER_RATIO = _env_float("VISION_RING_INNER_RATIO", 0.22, 0.08, 0.42)
 RING_OUTER_RATIO = _env_float("VISION_RING_OUTER_RATIO", 0.52, 0.30, 0.78)
 RING_MIN_COLOR_RATIO = _env_float("VISION_RING_MIN_COLOR_RATIO", 0.10, 0.02, 0.60)
+TIE_GREEN_MIN_HUE = _env_float("VISION_TIE_GREEN_MIN_HUE", 32.0, 20.0, 80.0)
+TIE_GREEN_MAX_HUE = _env_float("VISION_TIE_GREEN_MAX_HUE", 92.0, 50.0, 120.0)
+TIE_GREEN_MIN_SATURATION = _env_float("VISION_TIE_GREEN_MIN_SATURATION", 55.0, 10.0, 255.0)
+TIE_GREEN_MIN_RATIO = _env_float("VISION_TIE_GREEN_MIN_RATIO", 0.025, 0.003, 0.30)
 COLUMN_TOLERANCE_RATIO = _env_float("VISION_COLUMN_TOLERANCE_RATIO", 0.62, 0.25, 1.50)
 
 
@@ -65,6 +69,8 @@ class CircleCandidate:
     value: float = 0.0
     red_ratio: float = 0.0
     blue_ratio: float = 0.0
+    green_ratio: float = 0.0
+    tie_count: int = 0
     color_method: str = ""
 
     @property
@@ -133,9 +139,10 @@ def _classify_local_color(hue: float, saturation: float, value: float) -> str:
 def _ring_color_stats(hsv: np.ndarray, candidate: CircleCandidate) -> Tuple[str, float, float, float, float, float]:
     """只讀取圓圈外框環形區域，適用紅／藍空心圓。"""
     height, width = hsv.shape[:2]
-    radius = max(4.0, candidate.diameter / 2.0)
-    outer = max(3, int(round(radius * RING_OUTER_RATIO)))
-    inner = max(1, int(round(radius * RING_INNER_RATIO)))
+    # RING_* 比例以候選框直徑為基準；0.52 約等於圓半徑。
+    diameter = max(8.0, candidate.diameter)
+    outer = max(3, int(round(diameter * RING_OUTER_RATIO)))
+    inner = max(1, int(round(diameter * RING_INNER_RATIO)))
     x1, x2 = max(0, candidate.x - outer), min(width, candidate.x + outer + 1)
     y1, y2 = max(0, candidate.y - outer), min(height, candidate.y + outer + 1)
     patch = hsv[y1:y2, x1:x2]
@@ -172,6 +179,37 @@ def _ring_color_stats(hsv: np.ndarray, candidate: CircleCandidate) -> Tuple[str,
         return "P", red_ratio, blue_ratio, hue, saturation, value
     return "", red_ratio, blue_ratio, hue, saturation, value
 
+
+
+def _tie_marker_stats(hsv: np.ndarray, candidate: CircleCandidate) -> Tuple[int, float]:
+    """偵測大路圓圈內外的綠色和局標記。
+
+    圖片只能可靠判定「此格曾出現和局」；若平台以綠色數字表示多次和局，
+    精確次數仍以使用者後續按下 T 為準。
+    """
+    height, width = hsv.shape[:2]
+    radius = max(4, int(round(candidate.diameter * 0.58)))
+    x1, x2 = max(0, candidate.x - radius), min(width, candidate.x + radius + 1)
+    y1, y2 = max(0, candidate.y - radius), min(height, candidate.y + radius + 1)
+    patch = hsv[y1:y2, x1:x2]
+    if patch.size == 0:
+        return 0, 0.0
+    yy, xx = np.ogrid[:patch.shape[0], :patch.shape[1]]
+    cx, cy = candidate.x - x1, candidate.y - y1
+    circle_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2
+    h = patch[:, :, 0].astype(np.float64)
+    sat = patch[:, :, 1].astype(np.float64)
+    val = patch[:, :, 2].astype(np.float64)
+    green = (
+        circle_mask
+        & (h >= TIE_GREEN_MIN_HUE)
+        & (h <= TIE_GREEN_MAX_HUE)
+        & (sat >= TIE_GREEN_MIN_SATURATION)
+        & (val >= 35.0)
+    )
+    denominator = max(1, int(np.count_nonzero(circle_mask)))
+    ratio = float(np.count_nonzero(green)) / denominator
+    return (1 if ratio >= TIE_GREEN_MIN_RATIO else 0), ratio
 
 def _preprocess_geometry(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -289,18 +327,33 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
         if not outcome:
             unknown += 1
             continue
+        tie_count, green_ratio = _tie_marker_stats(hsv, candidate)
         colored.append(CircleCandidate(
             x=candidate.x, y=candidate.y, width=candidate.width, height=candidate.height,
             area=candidate.area, circularity=candidate.circularity, fill_ratio=candidate.fill_ratio,
             outcome=outcome, hue=round(hue, 3), saturation=round(saturation, 3), value=round(value, 3),
-            red_ratio=round(red_ratio, 4), blue_ratio=round(blue_ratio, 4), color_method=method,
+            red_ratio=round(red_ratio, 4), blue_ratio=round(blue_ratio, 4),
+            green_ratio=round(green_ratio, 4), tie_count=tie_count, color_method=method,
         ))
 
     ordered = _sort_big_road(colored)
     sequence = [item.outcome for item in ordered]
+    tie_markers = {
+        str(index): int(item.tie_count)
+        for index, item in enumerate(ordered)
+        if int(item.tie_count) > 0
+    }
+    raw_outcomes: List[str] = []
+    for index, item in enumerate(ordered):
+        raw_outcomes.append(item.outcome)
+        raw_outcomes.extend(["T"] * int(tie_markers.get(str(index), 0)))
     return {
         "ok": bool(sequence),
         "sequence": sequence,
+        "raw_outcomes": raw_outcomes,
+        "tie_markers": tie_markers,
+        "tie_count": sum(tie_markers.values()),
+        "tie_count_estimated_from_image": bool(tie_markers),
         "recognized_count": len(sequence),
         "unknown_candidates": unknown,
         "raw_contours": len(raw_candidates),
@@ -310,7 +363,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             "resize_scale": round(float(resize_scale), 6),
         },
         "candidates": [asdict(item) for item in ordered],
-        "method": "adaptive_contour_ring_hsv_with_center_fallback",
+        "method": "adaptive_contour_ring_hsv_green_tie_marker",
     }
 
 

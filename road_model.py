@@ -1,7 +1,7 @@
 """BGS 百家樂牌路先行分析模組。
 
 處理順序：
-1. 先把已辨識或使用者回報的 B/P 結果正規化。
+1. 先把已辨識或使用者回報的 B/P/T 結果正規化；T 另存、不新增大路格位。
 2. 使用近期衰減、一階轉移、二階轉移與 Beta 後驗蒙地卡羅建立牌路 context。
 3. 將牌路 context 傳入有限牌組主引擎，由主引擎統一決定下一局方向與正式訊號。
 
@@ -51,13 +51,21 @@ ROAD_FUSION_MAX_UNCERTAINTY = _env_float(
 )
 
 
-def normalize_road_sequence(values: Iterable[Any]) -> List[str]:
-    sequence: List[str] = []
+def normalize_raw_outcomes(values: Iterable[Any]) -> List[str]:
+    raw: List[str] = []
     for item in values:
-        value = str(item or "").upper().strip()
-        if value in {"B", "P"}:
-            sequence.append(value)
-    return sequence[-ROAD_HISTORY_LIMIT:]
+        if isinstance(item, Mapping):
+            value = str(item.get("outcome") or item.get("actual") or "").upper().strip()
+        else:
+            value = str(item or "").upper().strip()
+        if value in {"B", "P", "T"}:
+            raw.append(value)
+    return raw[-max(ROAD_HISTORY_LIMIT * 2, 200):]
+
+
+def normalize_road_sequence(values: Iterable[Any]) -> List[str]:
+    """大路結構只使用非和局 B/P；T 另保存於 raw history 與 tie 統計。"""
+    return [value for value in normalize_raw_outcomes(values) if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
 
 
 def _beta_counts_for_context(
@@ -99,8 +107,12 @@ def calculate_road_probabilities(
     seed: int | None = None,
 ) -> Dict[str, Any]:
     """先分析牌路，回傳可直接傳給主引擎的 road context。"""
-    sequence = normalize_road_sequence(values)
+    raw_outcomes = normalize_raw_outcomes(values)
+    sequence = [value for value in raw_outcomes if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
     length = len(sequence)
+    tie_count = sum(1 for value in raw_outcomes if value == "T")
+    raw_count = len(raw_outcomes)
+    tie_rate = tie_count / raw_count if raw_count else 0.0
     run_seed = int(seed if seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     rng = np.random.default_rng(run_seed)
 
@@ -207,11 +219,15 @@ def calculate_road_probabilities(
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_BAYES_MARKOV_MONTE_CARLO_V3",
+        "engine": "ROAD_BAYES_MARKOV_MONTE_CARLO_V4_TIE_AWARE",
         "pipeline_stage": "road_first",
         "run_seed": run_seed,
         "sequence": sequence,
+        "raw_outcomes": raw_outcomes,
         "sample_count": length,
+        "raw_sample_count": raw_count,
+        "tie_count": tie_count,
+        "observed_tie_rate": round(tie_rate, 6),
         "banker_probability": banker,
         "player_probability": player,
         "banker_rate": round(banker * 100.0, 2),
@@ -241,7 +257,7 @@ def calculate_road_probabilities(
             "second_order": second_support,
         },
         "center_probability_before_simulation": round(center_b, 6),
-        "data_scope": "recognized_banker_player_sequence",
+        "data_scope": "recognized_banker_player_sequence_with_separate_tie_history",
     }
 
 
@@ -324,5 +340,6 @@ __all__ = [
     "build_road_context",
     "calculate_road_probabilities",
     "fuse_road_with_main_prediction",
+    "normalize_raw_outcomes",
     "normalize_road_sequence",
 ]
