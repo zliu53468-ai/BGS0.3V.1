@@ -10,8 +10,8 @@ finite baccarat shoe.  Monte Carlo replicas and a low-weight hidden-order
 particle ensemble are retained as validation / uncertainty layers.
 
 This is a simulation engine.  It does not read or predict an external live table.
-V9.8 uses an eligible road-model direction as the displayed next-round direction;
-the finite-population layers validate risk and may downgrade the action to observe.
+V10 combines the road group, finite-shoe group, and sequence group into one weighted ensemble;
+all active models participate in the displayed next-round direction.
 """
 from __future__ import annotations
 
@@ -83,6 +83,14 @@ ROAD_CONTEXT_MIN_CONFIDENCE = _env_float(
 ROAD_CONTEXT_MAX_UNCERTAINTY = _env_float(
     "ROAD_FUSION_MAX_UNCERTAINTY", 0.16, 0.01, 0.50
 )
+
+
+# V10 全模型群組集成。有限牌組三模型彼此高度相關，先在群組內融合，
+# 再與牌路群組、額外序列群組共同參與最終方向，避免重複計票。
+ENSEMBLE_ROAD_GROUP_WEIGHT = _env_float("ENSEMBLE_ROAD_GROUP_WEIGHT", 0.50, 0.0, 0.80)
+ENSEMBLE_FINITE_GROUP_WEIGHT = _env_float("ENSEMBLE_FINITE_GROUP_WEIGHT", 0.40, 0.10, 0.90)
+ENSEMBLE_SEQUENCE_GROUP_WEIGHT = _env_float("ENSEMBLE_SEQUENCE_GROUP_WEIGHT", 0.10, 0.0, 0.30)
+ENSEMBLE_MIN_MODEL_AGREEMENT = _env_float("ENSEMBLE_MIN_MODEL_AGREEMENT", 0.55, 0.50, 1.0)
 
 BANKER_COMMISSION = _env_float("PF_BANKER_COMMISSION", 0.05, 0.0, 0.20)
 
@@ -654,26 +662,20 @@ class VirtualShoeParticleEngine:
             item for item in (history or []) if str(item).upper() in OUTCOME_NAMES
         ])
 
-        # 有 road context 時，避免同一份 B/P 歷史同時被內部序列層重複計權。
-        history_weight = 0.0 if road_state["present"] else min(
-            HISTORY_MAX_WEIGHT,
-            HISTORY_MAX_WEIGHT * history_length / max(1.0, float(HISTORY_WINDOW)),
-        )
-
-        requested_weights = np.asarray(
-            [HYPERGEOMETRIC_WEIGHT, MONTE_CARLO_WEIGHT, PARTICLE_WEIGHT, history_weight],
+        # V10：所有模型共同參與方向。有限牌組三模型先在群組內融合，
+        # 避免超幾何、蒙地卡羅、粒子因使用同一估計牌組而被重複算成三票。
+        finite_requested = np.asarray(
+            [HYPERGEOMETRIC_WEIGHT, MONTE_CARLO_WEIGHT, PARTICLE_WEIGHT],
             dtype=np.float64,
         )
-        requested_weights = requested_weights / requested_weights.sum()
-        hyper_weight, mc_weight, particle_weight, sequence_weight = (
-            float(value) for value in requested_weights
+        finite_requested = finite_requested / finite_requested.sum()
+        hyper_weight, mc_weight, particle_weight = (
+            float(value) for value in finite_requested
         )
-
-        raw = _normalize_probability(
+        finite_group = _normalize_probability(
             hyper_probability * hyper_weight
             + mc_probability * mc_weight
             + particle_probability * particle_weight
-            + sequence_probability * sequence_weight
         )
 
         uncertainty = float(max(replica_se))
@@ -682,48 +684,70 @@ class VirtualShoeParticleEngine:
             np.max(np.abs(particle_probability - hyper_probability)),
         ))
         adaptive_shrink = min(0.15, BASELINE_SHRINK + uncertainty * 2.0)
-        core_fused = _normalize_probability(
-            raw * (1.0 - adaptive_shrink) + DEFAULT_BASELINE * adaptive_shrink
+        finite_group = _normalize_probability(
+            finite_group * (1.0 - adaptive_shrink)
+            + DEFAULT_BASELINE * adaptive_shrink
         )
 
-        core_banker, core_player, core_tie = (float(value) for value in core_fused)
-        core_bp_total = max(1e-12, core_banker + core_player)
-        core_banker_no_tie = core_banker / core_bp_total
-        core_direction = "B" if core_banker >= core_player else "P"
+        core_banker, core_player, core_tie = (float(value) for value in finite_group)
+        core_direction = "B" if core_banker > core_player else "P"
 
-        road_weight = float(road_state["effective_weight"])
-        banker_no_tie = core_banker_no_tie
-        if road_weight > 0.0:
-            banker_no_tie = (
-                core_banker_no_tie * (1.0 - road_weight)
-                + float(road_state["banker_probability"]) * road_weight
-            )
-
-        tie = core_tie
-        banker = (1.0 - tie) * banker_no_tie
-        player = (1.0 - tie) * (1.0 - banker_no_tie)
-        player_no_tie = 1.0 - banker_no_tie
-        fused_direction = "B" if banker >= player else "P"
-
-        # V9.8：下一局方向以牌路先行模型為主；有限牌組核心只負責
-        # 機率、穩定度與風險驗證，不再把牌路方向改回理論基準方向。
         road_direction = str(road_state.get("direction") or "").upper()
-        road_ready = bool(
+        road_available = bool(
             road_state.get("ok")
-            and road_state.get("eligible")
             and road_direction in {"B", "P"}
+            and history_length >= 4
         )
-        direction = road_direction if road_ready else fused_direction
-        direction_edge = (
-            abs(float(road_state["banker_probability"]) - float(road_state["player_probability"]))
-            if road_ready
-            else abs(banker_no_tie - player_no_tie)
+        sequence_available = history_length >= 4
+
+        # 牌路模型只提供 B/P，因此沿用有限牌組群組估計的和局比例，
+        # 再把剩餘 B/P 比例依牌路機率分配。
+        road_three = np.asarray(
+            [
+                (1.0 - core_tie) * float(road_state["banker_probability"]),
+                (1.0 - core_tie) * float(road_state["player_probability"]),
+                core_tie,
+            ],
+            dtype=np.float64,
+        )
+        road_three = _normalize_probability(road_three)
+
+        group_weights = {
+            "road": ENSEMBLE_ROAD_GROUP_WEIGHT if road_available else 0.0,
+            "finite": ENSEMBLE_FINITE_GROUP_WEIGHT,
+            "sequence": ENSEMBLE_SEQUENCE_GROUP_WEIGHT if sequence_available else 0.0,
+        }
+        group_total = sum(group_weights.values()) or 1.0
+        group_weights = {name: value / group_total for name, value in group_weights.items()}
+
+        ensemble_probability = _normalize_probability(
+            road_three * group_weights["road"]
+            + finite_group * group_weights["finite"]
+            + sequence_probability * group_weights["sequence"]
+        )
+        banker, player, tie = (float(value) for value in ensemble_probability)
+        bp_total = max(1e-12, banker + player)
+        banker_no_tie = banker / bp_total
+        player_no_tie = player / bp_total
+        direction = "B" if banker > player else "P"
+        direction_edge = abs(banker_no_tie - player_no_tie)
+
+        model_directions = {
+            "road": road_direction if road_available else "",
+            "hypergeometric": "B" if hyper_probability[0] > hyper_probability[1] else "P",
+            "monte_carlo": "B" if mc_probability[0] > mc_probability[1] else "P",
+            "particle": "B" if particle_probability[0] > particle_probability[1] else "P",
+            "sequence": "B" if sequence_probability[0] > sequence_probability[1] else "P",
+        }
+        active_directions = [value for value in model_directions.values() if value in {"B", "P"}]
+        agreement = (
+            active_directions.count(direction) / max(1, len(active_directions))
         )
         road_aligned_with_core = bool(
-            not road_state["ok"] or road_direction == core_direction
+            not road_available or road_direction == core_direction
         )
         road_aligned_with_final = bool(
-            not road_state["ok"] or road_direction == direction
+            not road_available or road_direction == direction
         )
 
         banker_ev = banker * (1.0 - BANKER_COMMISSION) - player
@@ -736,14 +760,15 @@ class VirtualShoeParticleEngine:
         edge_ok = direction_edge >= MIN_DIRECTION_EDGE
         uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
         validation_ok = validation_gap <= MAX_VALIDATION_GAP
-        road_signal_ok = bool(road_state.get("signal_allowed")) if road_ready else True
-
-        # 牌路合格時：方向固定採牌路；核心不同意時只降低為觀望，
-        # 不會改成相反方向。牌路尚未合格時才沿用融合核心方向。
+        agreement_ok = agreement >= ENSEMBLE_MIN_MODEL_AGREEMENT
         signal_allowed = bool(
-            edge_ok and uncertainty_ok and validation_ok and road_signal_ok
+            edge_ok and uncertainty_ok and validation_ok and agreement_ok
         )
         action = direction if signal_allowed else "O"
+        road_weight = group_weights["road"]
+        sequence_weight = group_weights["sequence"]
+        fused_direction = direction
+        road_ready = road_available
 
         uncertainty_score = 1.0 - min(
             1.0, uncertainty / max(MAX_SIGNAL_UNCERTAINTY, 1e-9)
@@ -788,27 +813,22 @@ class VirtualShoeParticleEngine:
         model_consistency = max(0.0, min(1.0, model_consistency))
 
         if signal_allowed:
-            if road_ready and road_aligned_with_core:
-                signal_reason = "牌路先行方向已採用，且有限牌組核心與驗證層方向一致"
-            elif road_ready:
-                signal_reason = "牌路先行方向已採用；核心僅完成風險驗證，不改寫牌路方向"
-            else:
-                signal_reason = "牌路尚未達正式條件，暫由融合核心方向通過驗證"
-            signal_status_text = "方向訊號已開放"
+            signal_reason = "牌路、有限牌組、蒙地卡羅、粒子與序列模型已完成全模型集成，方向與品質門檻通過"
+            signal_status_text = "全模型方向訊號已開放"
         else:
             reasons: List[str] = []
             if not edge_ok:
-                reasons.append("牌路或融合方向差距尚未達門檻")
+                reasons.append("全模型集成方向差距尚未達門檻")
             if not uncertainty_ok:
                 reasons.append("模擬不確定性仍偏高")
             if not validation_ok:
-                reasons.append("核心與驗證層的一致度不足")
-            if road_ready and not road_signal_ok:
-                reasons.append("牌路模型尚未開放正式訊號")
-            if road_state["present"] and not road_ready:
-                reasons.append("牌路樣本或品質尚未達方向主導條件")
+                reasons.append("有限牌組與驗證層的一致度不足")
+            if not agreement_ok:
+                reasons.append("各模型方向共識不足")
+            if not road_available:
+                reasons.append("牌路模型樣本不足，已由其餘模型重新分配權重")
             signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
-            signal_status_text = "等待更明確訊號"
+            signal_status_text = "等待更明確的全模型共識"
 
         road_integration = {
             "processed_inside_core": True,
@@ -820,7 +840,10 @@ class VirtualShoeParticleEngine:
             "core_direction_before_road": core_direction,
             "final_direction": direction,
             "fused_direction_before_override": fused_direction,
-            "road_direction_primary": road_ready,
+            "road_direction_primary": False,
+            "all_models_participate": True,
+            "model_directions": model_directions,
+            "model_agreement": round(agreement, 6),
             "aligned_with_core": road_aligned_with_core,
             "aligned_with_final": road_aligned_with_final,
             "requested_weight": round(float(road_state["requested_weight"]), 8),
@@ -832,14 +855,14 @@ class VirtualShoeParticleEngine:
 
         return {
             "ok": True,
-            "engine": "V9_8_ROAD_DIRECTION_FIRST_HYPERGEOMETRIC_VALIDATOR",
-            "model_core": "road_direction_primary_then_hypergeometric_validation",
+            "engine": "V10_ALL_MODEL_GROUP_ENSEMBLE",
+            "model_core": "road_finite_sequence_group_ensemble",
             "pipeline_order": [
-                "road_context_direction",
-                "hypergeometric_probability_reference",
-                "monte_carlo_validation",
-                "particle_validation",
-                "road_direction_or_observe_decision",
+                "road_multi_model_group",
+                "hypergeometric_monte_carlo_particle_group",
+                "sequence_group",
+                "all_model_weighted_ensemble",
+                "quality_and_observe_decision",
             ],
             "run_seed": run_seed,
             "virtual_only": True,
@@ -856,6 +879,11 @@ class VirtualShoeParticleEngine:
                 "B": core_banker,
                 "P": core_player,
                 "T": core_tie,
+            },
+            "group_probabilities": {
+                "road": {"B": float(road_three[0]), "P": float(road_three[1]), "T": float(road_three[2])},
+                "finite": {"B": float(finite_group[0]), "P": float(finite_group[1]), "T": float(finite_group[2])},
+                "sequence": {"B": float(sequence_probability[0]), "P": float(sequence_probability[1]), "T": float(sequence_probability[2])},
             },
             "hypergeometric_probabilities": {
                 key: float(hyper_probability[index])
@@ -902,8 +930,11 @@ class VirtualShoeParticleEngine:
             "signal_allowed": signal_allowed,
             "signal_status_text": signal_status_text,
             "signal_reason": signal_reason,
-            "direction_source": "road_model_primary" if road_ready else "fallback_fused_core",
-            "road_direction_primary": road_ready,
+            "direction_source": "all_model_group_ensemble",
+            "road_direction_primary": False,
+            "all_models_participate": True,
+            "model_directions": model_directions,
+            "model_agreement": round(agreement, 6),
             "fused_direction_before_road_override": fused_direction,
             "road_integration": road_integration,
             "expected_values": expected_values,
@@ -916,6 +947,9 @@ class VirtualShoeParticleEngine:
                 "particle": round(particle_weight, 6),
                 "sequence": round(sequence_weight, 6),
                 "road_context": round(road_weight, 6),
+                "finite_group": round(group_weights["finite"], 6),
+                "road_group": round(group_weights["road"], 6),
+                "sequence_group": round(group_weights["sequence"], 6),
                 "baseline_shrink": round(adaptive_shrink, 6),
             },
             "hypergeometric_meta": hyper_meta,
