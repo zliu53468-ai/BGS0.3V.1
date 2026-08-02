@@ -1,4 +1,4 @@
-"""BGS 百家樂牌路先行多模型分析模組 V9.9。
+"""BGS 百家樂全盤牌路規律多模型分析模組 V10.2。
 
 處理順序：
 1. 正規化圖片辨識或使用者回報的 B/P/T；和局保留統計但不新增大路格位。
@@ -17,6 +17,8 @@ import os
 import secrets
 
 import numpy as np
+
+from full_road_pattern_model import analyze_full_road_pattern
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -244,18 +246,18 @@ def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
 
 def _base_weights(regime_name: str) -> Dict[str, float]:
     weights = {
-        "short": 0.20, "mid": 0.18, "long": 0.10,
-        "pattern": 0.20, "markov1": 0.10, "markov2": 0.10,
+        "short": 0.14, "mid": 0.12, "long": 0.08,
+        "pattern": 0.14, "full_road": 0.22, "markov1": 0.09, "markov2": 0.09,
         "markov3": 0.05, "analogue": 0.07,
     }
     if regime_name == "streak":
-        weights.update(short=0.16, mid=0.14, long=0.08, pattern=0.32, markov1=0.12, markov2=0.10)
+        weights.update(short=0.11, mid=0.10, long=0.06, pattern=0.24, full_road=0.28, markov1=0.10, markov2=0.08)
     elif regime_name == "alternating":
-        weights.update(short=0.14, mid=0.12, long=0.06, pattern=0.34, markov1=0.14, markov2=0.12)
+        weights.update(short=0.10, mid=0.09, long=0.05, pattern=0.25, full_road=0.27, markov1=0.12, markov2=0.10)
     elif regime_name == "double":
-        weights.update(short=0.14, mid=0.12, long=0.06, pattern=0.34, markov1=0.10, markov2=0.14)
+        weights.update(short=0.10, mid=0.09, long=0.05, pattern=0.24, full_road=0.28, markov1=0.09, markov2=0.12)
     elif regime_name == "chaotic":
-        weights.update(short=0.18, mid=0.16, long=0.12, pattern=0.10, markov1=0.12, markov2=0.12, analogue=0.10)
+        weights.update(short=0.13, mid=0.12, long=0.10, pattern=0.08, full_road=0.18, markov1=0.11, markov2=0.11, analogue=0.09)
     return weights
 
 
@@ -275,6 +277,7 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
         "mid": _window_model(sequence, ROAD_MID_WINDOW),
         "long": _window_model(sequence, ROAD_LONG_WINDOW),
         "pattern": _pattern_model(sequence, regime),
+        "full_road": analyze_full_road_pattern(sequence),
         "markov1": _markov_model(sequence, 1, ROAD_MARKOV1_MIN_SUPPORT),
         "markov2": _markov_model(sequence, 2, ROAD_MARKOV2_MIN_SUPPORT),
         "markov3": _markov_model(sequence, 3, ROAD_MARKOV3_MIN_SUPPORT),
@@ -393,8 +396,8 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_REGIME_MULTI_MODEL_CONSENSUS_V9_9",
-        "pipeline_stage": "road_first_multi_model",
+        "engine": "ROAD_FULL_GEOMETRY_DERIVED_ROADS_ENSEMBLE_V10_2",
+        "pipeline_stage": "full_road_pattern_multi_model",
         "run_seed": run_seed,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
@@ -430,6 +433,7 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
             "window_agreement": round(window_agreement, 6),
         },
         "regime": regime,
+        "full_road_analysis": model_outputs.get("full_road", {}),
         "models": model_outputs,
         "component_probabilities": {
             name: {
@@ -447,7 +451,7 @@ def calculate_road_probabilities(values: Iterable[Any], seed: int | None = None)
             "analogue": int(models["analogue"].get("support", 0)),
         },
         "center_probability_before_simulation": round(center_b, 6),
-        "data_scope": "recognized_banker_player_sequence_with_regime_multi_model_consensus",
+        "data_scope": "full_banker_player_history_with_big_road_geometry_and_derived_roads",
     }
 
 
