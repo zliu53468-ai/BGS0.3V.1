@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1476,11 +1476,23 @@ def health() -> JSONResponse:
     )
 
 
+
+
+@app.head("/health")
+def health_head() -> Response:
+    """Render／外部監控使用 HEAD 健康檢查時回傳 200。"""
+    return Response(status_code=200)
+
 @app.get("/ping")
 def ping() -> PlainTextResponse:
     return PlainTextResponse("OK")
 
 
+
+@app.head("/ping")
+def ping_head() -> Response:
+    """允許監控以 HEAD /ping 檢查服務狀態。"""
+    return Response(status_code=200)
 @app.get("/api/session")
 def api_session(user_id: str) -> JSONResponse:
     try:
