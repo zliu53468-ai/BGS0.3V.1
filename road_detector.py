@@ -1,11 +1,11 @@
-"""遊戲畫面大路偵測模組 V10.6（MT 固定 6×15 大路掃描版）。
+"""遊戲畫面大路偵測模組 V10.9（自適應固定 6×15 大路掃描版）。
 
 重點：
 1. MT 完整畫面只裁切右下方的大路區塊，不再掃描珠盤路、下三路或整張圖片。
-2. 固定把目標區塊切成 6 列 × 15 欄，共 90 格。
-3. 每格分別統計紅、藍、綠 HSV 像素；紅=莊、藍=閒、綠=和局標記。
-4. 依標準大路落點規則反推時間序列，避免單純 x/y 排序在長龍黏邊時錯序。
-5. 其他館別仍保留原本 OpenCV/YOLO 區域辨識流程。
+2. 固定維持 6 列 × 15 欄，但先在 ROI 內微調有效格線範圍與內縮距離。
+3. 每格分別統計紅、藍、綠 HSV 像素；雙色接近標記 uncertain，不硬選。
+4. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不再把欄排序當正確答案。
+5. 可用 ROAD_GRID_DEBUG=1 輸出疊格線除錯圖；其他館別仍保留原流程。
 """
 from __future__ import annotations
 
@@ -50,6 +50,22 @@ def _env_roi(
         os.getenv(name, ",".join(str(value) for value in default)),
         default,
     )
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(str(os.getenv(name, default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.getenv(name, default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 # 一般館別備援區域。
@@ -103,6 +119,35 @@ ROAD_GRID_MAX_UNCERTAIN_RATIO = max(
     0.0,
     min(0.8, float(os.getenv("ROAD_GRID_MAX_UNCERTAIN_RATIO", "0.12") or "0.12")),
 )
+
+# 固定格內容自適應與顏色可信度。
+ROAD_GRID_ALIGN_MAX_TRIM = _env_float("ROAD_GRID_ALIGN_MAX_TRIM", 0.12, 0.0, 0.25)
+ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 17, 5, 41)
+ROAD_GRID_MIN_ALIGNMENT_SCORE = _env_float("ROAD_GRID_MIN_ALIGNMENT_SCORE", 0.46, 0.0, 1.0)
+ROAD_GRID_MIN_COLOR_RATIO = _env_float("ROAD_GRID_MIN_COLOR_RATIO", 0.018, 0.001, 0.20)
+ROAD_GRID_INNER_MARGIN_MAX = _env_float("ROAD_GRID_INNER_MARGIN_MAX", 0.18, 0.02, 0.35)
+ROAD_GRID_BOUNDARY_GUARD_PX = _env_float("ROAD_GRID_BOUNDARY_GUARD_PX", 1.4, 0.0, 6.0)
+ROAD_GRID_MIN_MEDIAN_CONFIDENCE = _env_float(
+    "ROAD_GRID_MIN_MEDIAN_CONFIDENCE", 0.42, 0.0, 1.0
+)
+ROAD_GRID_RED_MIN_S = _env_int("ROAD_GRID_RED_MIN_S", 58, 0, 255)
+ROAD_GRID_RED_MIN_V = _env_int("ROAD_GRID_RED_MIN_V", 48, 0, 255)
+ROAD_GRID_BLUE_MIN_S = _env_int("ROAD_GRID_BLUE_MIN_S", 52, 0, 255)
+ROAD_GRID_BLUE_MIN_V = _env_int("ROAD_GRID_BLUE_MIN_V", 45, 0, 255)
+ROAD_GRID_GREEN_MIN_S = _env_int("ROAD_GRID_GREEN_MIN_S", 62, 0, 255)
+ROAD_GRID_GREEN_MIN_V = _env_int("ROAD_GRID_GREEN_MIN_V", 48, 0, 255)
+ROAD_GRID_TIE_MIN_AREA_RATIO = _env_float(
+    "ROAD_GRID_TIE_MIN_AREA_RATIO", 0.006, 0.001, 0.15
+)
+ROAD_GRID_TIE_MIN_COMPONENT_RATIO = _env_float(
+    "ROAD_GRID_TIE_MIN_COMPONENT_RATIO", 0.45, 0.10, 1.0
+)
+ROAD_GRID_TIE_MAX_SPAN_RATIO = _env_float(
+    "ROAD_GRID_TIE_MAX_SPAN_RATIO", 0.78, 0.20, 1.0
+)
+ROAD_GRID_DEBUG = os.getenv("ROAD_GRID_DEBUG", "0").strip() == "1"
+ROAD_GRID_DEBUG_DIR = os.getenv("ROAD_GRID_DEBUG_DIR", "/tmp/bgs_road_debug").strip()
+ROAD_CROP_MIN_ASPECT = _env_float("ROAD_CROP_MIN_ASPECT", 2.05, 1.2, 4.0)
 
 WIDE_LAYOUT_MIN_ASPECT = max(
     3.2,
@@ -160,232 +205,539 @@ def _grid_bounds(length: int, index: int, count: int) -> Tuple[int, int]:
     return max(0, start), max(start + 1, min(length, end))
 
 
+def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    red = (
+        ((hue <= 15) | (hue >= 165))
+        & (saturation >= ROAD_GRID_RED_MIN_S)
+        & (value >= ROAD_GRID_RED_MIN_V)
+    ).astype(np.uint8)
+    blue = (
+        (hue >= 88)
+        & (hue <= 142)
+        & (saturation >= ROAD_GRID_BLUE_MIN_S)
+        & (value >= ROAD_GRID_BLUE_MIN_V)
+    ).astype(np.uint8)
+    green = (
+        (hue >= 34)
+        & (hue <= 87)
+        & (saturation >= ROAD_GRID_GREEN_MIN_S)
+        & (value >= ROAD_GRID_GREEN_MIN_V)
+    ).astype(np.uint8)
+    union = ((red | blue | green) > 0).astype(np.uint8)
+    return red, blue, green, union
+
+
+def _axis_alignment(
+    color_coordinates: np.ndarray,
+    edge_projection: np.ndarray,
+    length: int,
+    divisions: int,
+) -> Dict[str, float]:
+    """在不改變列欄數的前提下，搜尋 ROI 內最合理的格線起訖。"""
+    length = max(1, int(length))
+    max_trim = int(round(length * ROAD_GRID_ALIGN_MAX_TRIM))
+    steps = max(5, ROAD_GRID_ALIGN_SEARCH_STEPS)
+    starts = np.unique(np.rint(np.linspace(0, max_trim, steps)).astype(int))
+    ends = np.unique(np.rint(np.linspace(length - max_trim, length, steps)).astype(int))
+    projection = np.asarray(edge_projection, dtype=np.float64).reshape(-1)
+    if projection.size != length:
+        projection = np.resize(projection, length)
+    denominator = float(np.percentile(projection, 92)) if projection.size else 0.0
+    denominator = max(1e-9, denominator)
+    coordinates = np.asarray(color_coordinates, dtype=np.float64).reshape(-1)
+
+    def score_candidate(start: int, end: int) -> Tuple[float, float, float, float]:
+        width = float(end - start)
+        if width < max(6.0, divisions * 2.0):
+            return -1.0, 0.0, 0.0, 0.0
+        inside = coordinates[(coordinates >= start) & (coordinates < end)]
+        coverage = float(inside.size / max(1, coordinates.size)) if coordinates.size else 0.0
+        if inside.size:
+            pitch = width / divisions
+            phase = np.mod((inside - start) / pitch, 1.0)
+            center_score = float(np.mean(np.clip(1.0 - np.abs(phase - 0.5) / 0.5, 0.0, 1.0)))
+        else:
+            center_score = 0.0
+        boundaries = np.rint(np.linspace(start, end, divisions + 1)).astype(int)
+        edge_samples: List[float] = []
+        for boundary in boundaries:
+            left = max(0, boundary - 1)
+            right = min(length, boundary + 2)
+            if right > left:
+                edge_samples.append(float(np.max(projection[left:right])) / denominator)
+        edge_score = min(1.0, float(np.mean(edge_samples)) if edge_samples else 0.0)
+        trim_ratio = (start + (length - end)) / max(1.0, float(length))
+        score = (
+            0.58 * center_score
+            + 0.27 * edge_score
+            + 0.15 * coverage
+            - 0.08 * (trim_ratio / max(1e-9, ROAD_GRID_ALIGN_MAX_TRIM * 2.0))
+        )
+        return score, center_score, edge_score, coverage
+
+    nominal_score, nominal_center, nominal_edge, nominal_coverage = score_candidate(0, length)
+    best = {
+        "start": 0.0,
+        "end": float(length),
+        "score": float(max(0.0, nominal_score)),
+        "center_score": float(nominal_center),
+        "edge_score": float(nominal_edge),
+        "coverage": float(nominal_coverage),
+        "nominal_score": float(max(0.0, nominal_score)),
+    }
+    for start in starts:
+        for end in ends:
+            if end <= start:
+                continue
+            score, center_score, edge_score, coverage = score_candidate(int(start), int(end))
+            if score > best["score"] + 1e-12:
+                best.update(
+                    {
+                        "start": float(start),
+                        "end": float(end),
+                        "score": float(max(0.0, score)),
+                        "center_score": float(center_score),
+                        "edge_score": float(edge_score),
+                        "coverage": float(coverage),
+                    }
+                )
+    best["gain"] = float(best["score"] - best["nominal_score"])
+    best["scale"] = float((best["end"] - best["start"]) / max(1.0, float(length)))
+    best["offset"] = float(best["start"])
+    return best
+
+
+def _effective_grid_bounds(crop: np.ndarray, union_mask: np.ndarray) -> Dict[str, Any]:
+    height, width = crop.shape[:2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edge_x = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)), axis=0)
+    edge_y = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)), axis=1)
+    ys, xs = np.nonzero(union_mask)
+    x_alignment = _axis_alignment(xs, edge_x, width, ROAD_GRID_COLS)
+    y_alignment = _axis_alignment(ys, edge_y, height, ROAD_GRID_ROWS)
+    x1 = int(round(x_alignment["start"]))
+    x2 = int(round(x_alignment["end"]))
+    y1 = int(round(y_alignment["start"]))
+    y2 = int(round(y_alignment["end"]))
+    x1 = max(0, min(width - 1, x1))
+    x2 = max(x1 + 1, min(width, x2))
+    y1 = max(0, min(height - 1, y1))
+    y2 = max(y1 + 1, min(height, y2))
+    score = float((x_alignment["score"] + y_alignment["score"]) / 2.0)
+    coverage = float((x_alignment["coverage"] + y_alignment["coverage"]) / 2.0)
+    return {
+        "x": x1,
+        "y": y1,
+        "width": x2 - x1,
+        "height": y2 - y1,
+        "score": score,
+        "coverage": coverage,
+        "offset_x": x1,
+        "offset_y": y1,
+        "scale_x": (x2 - x1) / max(1.0, float(width)),
+        "scale_y": (y2 - y1) / max(1.0, float(height)),
+        "gain_x": float(x_alignment["gain"]),
+        "gain_y": float(y_alignment["gain"]),
+        "x_axis": x_alignment,
+        "y_axis": y_alignment,
+    }
+
+
+def _integral(mask: np.ndarray) -> np.ndarray:
+    return cv2.integral(mask.astype(np.uint8), sdepth=cv2.CV_32S)
+
+
+def _rect_sum(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> int:
+    return int(integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1])
+
+
+def _green_component_stats(mask: np.ndarray) -> Tuple[int, float, float, float]:
+    if mask.size == 0 or int(mask.sum()) <= 0:
+        return 0, 0.0, 0.0, 0.0
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    if count <= 1:
+        return 0, 0.0, 0.0, 0.0
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    index = int(np.argmax(areas)) + 1
+    largest = int(stats[index, cv2.CC_STAT_AREA])
+    width = int(stats[index, cv2.CC_STAT_WIDTH])
+    height = int(stats[index, cv2.CC_STAT_HEIGHT])
+    total = max(1, int(mask.sum()))
+    return largest, largest / total, width / max(1, mask.shape[1]), height / max(1, mask.shape[0])
+
+
+def _classify_grid(
+    crop: np.ndarray,
+    red_mask: np.ndarray,
+    blue_mask: np.ndarray,
+    green_mask: np.ndarray,
+    bounds: Mapping[str, Any],
+) -> Dict[str, Any]:
+    red_integral = _integral(red_mask)
+    blue_integral = _integral(blue_mask)
+    green_integral = _integral(green_mask)
+    grid_x = int(bounds["x"])
+    grid_y = int(bounds["y"])
+    grid_width = int(bounds["width"])
+    grid_height = int(bounds["height"])
+    recognized: List[Dict[str, Any]] = []
+    uncertain: List[Dict[str, Any]] = []
+    all_cells: List[Dict[str, Any]] = []
+
+    for row in range(ROAD_GRID_ROWS):
+        local_y1, local_y2 = _grid_bounds(grid_height, row, ROAD_GRID_ROWS)
+        y1, y2 = grid_y + local_y1, grid_y + local_y2
+        for column in range(ROAD_GRID_COLS):
+            local_x1, local_x2 = _grid_bounds(grid_width, column, ROAD_GRID_COLS)
+            x1, x2 = grid_x + local_x1, grid_x + local_x2
+            cell_width = max(1, x2 - x1)
+            cell_height = max(1, y2 - y1)
+            margin_ratio_x = min(
+                ROAD_GRID_INNER_MARGIN_MAX,
+                max(ROAD_GRID_INNER_MARGIN, ROAD_GRID_BOUNDARY_GUARD_PX / cell_width),
+            )
+            margin_ratio_y = min(
+                ROAD_GRID_INNER_MARGIN_MAX,
+                max(ROAD_GRID_INNER_MARGIN, ROAD_GRID_BOUNDARY_GUARD_PX / cell_height),
+            )
+            margin_x = max(1, int(round(cell_width * margin_ratio_x)))
+            margin_y = max(1, int(round(cell_height * margin_ratio_y)))
+            inner_x1 = min(x2 - 1, x1 + margin_x)
+            inner_x2 = max(inner_x1 + 1, x2 - margin_x)
+            inner_y1 = min(y2 - 1, y1 + margin_y)
+            inner_y2 = max(inner_y1 + 1, y2 - margin_y)
+            inner_area = max(1, (inner_x2 - inner_x1) * (inner_y2 - inner_y1))
+            red_pixels = _rect_sum(red_integral, inner_x1, inner_y1, inner_x2, inner_y2)
+            blue_pixels = _rect_sum(blue_integral, inner_x1, inner_y1, inner_x2, inner_y2)
+            green_pixels = _rect_sum(green_integral, inner_x1, inner_y1, inner_x2, inner_y2)
+            minimum_pixels = max(
+                ROAD_GRID_MIN_COLOR_PIXELS,
+                int(round(inner_area * ROAD_GRID_MIN_COLOR_RATIO)),
+            )
+            dominant_pixels = max(red_pixels, blue_pixels)
+            secondary_pixels = min(red_pixels, blue_pixels)
+            dominance = (dominant_pixels + 1.0) / (secondary_pixels + 1.0)
+            outcome = ""
+            is_uncertain = False
+            if dominant_pixels >= minimum_pixels:
+                if dominance >= ROAD_GRID_COLOR_DOMINANCE:
+                    outcome = "B" if red_pixels > blue_pixels else "P"
+                else:
+                    is_uncertain = True
+
+            largest_green, green_concentration, green_span_x, green_span_y = _green_component_stats(
+                green_mask[inner_y1:inner_y2, inner_x1:inner_x2]
+            )
+            tie_minimum = max(
+                ROAD_GRID_TIE_MIN_PIXELS,
+                int(round(inner_area * ROAD_GRID_TIE_MIN_AREA_RATIO)),
+            )
+            tie_confident = bool(
+                outcome
+                and largest_green >= tie_minimum
+                and green_concentration >= ROAD_GRID_TIE_MIN_COMPONENT_RATIO
+                and max(green_span_x, green_span_y) <= ROAD_GRID_TIE_MAX_SPAN_RATIO
+            )
+            separation = max(0.0, min(1.0, (dominant_pixels - secondary_pixels) / max(1.0, dominant_pixels + secondary_pixels)))
+            pixel_strength = max(0.0, min(1.0, dominant_pixels / max(1.0, minimum_pixels * 2.0)))
+            confidence = 0.55 * pixel_strength + 0.45 * separation if outcome else 0.0
+            cell = {
+                "index": -1,
+                "outcome": outcome,
+                "uncertain": bool(is_uncertain),
+                "empty": bool(not outcome and not is_uncertain),
+                "column": column,
+                "row": row,
+                "x": x1,
+                "y": y1,
+                "width": cell_width,
+                "height": cell_height,
+                "inner_x": inner_x1,
+                "inner_y": inner_y1,
+                "inner_width": inner_x2 - inner_x1,
+                "inner_height": inner_y2 - inner_y1,
+                "cx": round((x1 + x2) / 2.0, 2),
+                "cy": round((y1 + y2) / 2.0, 2),
+                "red_pixels": int(red_pixels),
+                "blue_pixels": int(blue_pixels),
+                "green_pixels": int(green_pixels),
+                "minimum_color_pixels": int(minimum_pixels),
+                "dominance": round(float(dominance), 6),
+                "green_largest_component": int(largest_green),
+                "green_component_ratio": round(float(green_concentration), 6),
+                "green_span_x_ratio": round(float(green_span_x), 6),
+                "green_span_y_ratio": round(float(green_span_y), 6),
+                "tie_count": 1 if tie_confident else 0,
+                "confidence": round(float(confidence), 6),
+            }
+            all_cells.append(cell)
+            if outcome:
+                recognized.append(dict(cell))
+            elif is_uncertain:
+                uncertain.append(dict(cell))
+
+    return {"cells": recognized, "uncertain_cells": uncertain, "all_grid_cells": all_cells}
+
+
 def _reconstruct_big_road_order(
     cells: Sequence[Mapping[str, Any]],
-) -> List[Tuple[int, int]]:
-    """依標準六列大路規則，從最終格位反推出非和局結果順序。"""
+    *,
+    return_details: bool = False,
+) -> Any:
+    """依六列大路規則反推時間序；長龍轉右後會保持右黏，不再錯誤往下。"""
     grid: Dict[Tuple[int, int], str] = {
-        (int(item.get("column", 0)), int(item.get("row", 0))): str(
-            item.get("outcome") or ""
-        ).upper()
+        (int(item.get("column", 0)), int(item.get("row", 0))): str(item.get("outcome") or "").upper()
         for item in cells
         if str(item.get("outcome") or "").upper() in {"B", "P"}
     }
-    if not grid or (0, 0) not in grid:
-        return sorted(grid, key=lambda position: (position[0], position[1]))
+    fallback_preview = sorted(grid, key=lambda position: (position[0], position[1]))
+    if not grid:
+        details = {
+            "positions": [],
+            "reconstructed_all": False,
+            "fallback_reason": "no_recognized_cells",
+            "partial_positions": [],
+            "fallback_preview": [],
+            "solution_count": 0,
+        }
+        return details if return_details else []
+    if (0, 0) not in grid:
+        details = {
+            "positions": [],
+            "reconstructed_all": False,
+            "fallback_reason": "missing_big_road_origin_0_0",
+            "partial_positions": [],
+            "fallback_preview": fallback_preview,
+            "solution_count": 0,
+        }
+        return details if return_details else []
 
     target_count = len(grid)
     first_outcome = grid[(0, 0)]
-    visited = {(0, 0)}
-    ordered = [(0, 0)]
+    best_partial: List[Tuple[int, int]] = [(0, 0)]
+    solutions: List[List[Tuple[int, int]]] = []
 
     def search(
-        column: int,
-        row: int,
-        start_column: int,
+        current: Tuple[int, int],
+        run_start_column: int,
         previous: str,
-    ) -> bool:
-        if len(visited) == target_count:
-            return True
+        tailing_right: bool,
+        visited: set[Tuple[int, int]],
+        ordered: List[Tuple[int, int]],
+    ) -> None:
+        nonlocal best_partial
+        if len(ordered) > len(best_partial):
+            best_partial = list(ordered)
+        if len(ordered) == target_count:
+            solutions.append(list(ordered))
+            return
+        if len(solutions) >= 2:
+            return
 
-        options: List[Tuple[Tuple[int, int], int, str]] = []
-
-        # 同色：能往下就往下；到底或下方已被占用才往右黏邊。
-        if row < ROAD_GRID_ROWS - 1 and (column, row + 1) not in visited:
+        column, row = current
+        options: List[Tuple[Tuple[int, int], int, str, bool]] = []
+        if not tailing_right and row < ROAD_GRID_ROWS - 1 and (column, row + 1) not in visited:
             same_position = (column, row + 1)
+            same_tailing = False
         else:
             next_column = column + 1
             while (next_column, row) in visited:
                 next_column += 1
             same_position = (next_column, row)
+            same_tailing = True
+        if grid.get(same_position) == previous and same_position not in visited:
+            options.append((same_position, run_start_column, previous, same_tailing))
 
-        if (
-            same_position in grid
-            and same_position not in visited
-            and grid[same_position] == previous
-        ):
-            options.append((same_position, start_column, previous))
-
-        # 變色：從下一個主欄最上方開始。
         opposite = "P" if previous == "B" else "B"
-        next_start_column = start_column + 1
+        next_start_column = run_start_column + 1
         while (next_start_column, 0) in visited:
             next_start_column += 1
         opposite_position = (next_start_column, 0)
-        if (
-            opposite_position in grid
-            and opposite_position not in visited
-            and grid[opposite_position] == opposite
-        ):
-            options.append((opposite_position, next_start_column, opposite))
+        if grid.get(opposite_position) == opposite and opposite_position not in visited:
+            options.append((opposite_position, next_start_column, opposite, False))
 
-        for position, candidate_start, candidate_outcome in options:
+        for position, candidate_start, candidate_outcome, candidate_tailing in options:
             visited.add(position)
             ordered.append(position)
-            if search(
-                position[0],
-                position[1],
+            search(
+                position,
                 candidate_start,
                 candidate_outcome,
-            ):
-                return True
+                candidate_tailing,
+                visited,
+                ordered,
+            )
             ordered.pop()
             visited.remove(position)
-        return False
+            if len(solutions) >= 2:
+                return
 
-    if search(0, 0, 0, first_outcome):
-        return list(ordered)
+    search((0, 0), 0, first_outcome, False, {(0, 0)}, [(0, 0)])
+    unique = len(solutions) == 1
+    positions = solutions[0] if unique else []
+    if unique:
+        fallback_reason = ""
+    elif len(solutions) > 1:
+        fallback_reason = "ambiguous_big_road_reconstruction"
+    else:
+        fallback_reason = f"incomplete_big_road_reconstruction_{len(best_partial)}_of_{target_count}"
+    details = {
+        "positions": positions,
+        "reconstructed_all": unique and len(positions) == target_count,
+        "fallback_reason": fallback_reason,
+        "partial_positions": best_partial,
+        "fallback_preview": fallback_preview,
+        "solution_count": len(solutions),
+    }
+    return details if return_details else positions
 
-    # 無法完整反推時，仍回傳穩定的欄優先順序，並讓 quality_ok 反映異常。
-    return sorted(grid, key=lambda position: (position[0], position[1]))
+
+def _debug_overlay(
+    crop: np.ndarray,
+    all_cells: Sequence[Mapping[str, Any]],
+    grid_bounds: Mapping[str, Any],
+    quality_ok: bool,
+    fallback_reason: str,
+) -> str:
+    if not ROAD_GRID_DEBUG:
+        return ""
+    overlay = crop.copy()
+    x, y = int(grid_bounds["x"]), int(grid_bounds["y"])
+    width, height = int(grid_bounds["width"]), int(grid_bounds["height"])
+    cv2.rectangle(overlay, (x, y), (x + width - 1, y + height - 1), (255, 255, 255), 1)
+    for column in range(ROAD_GRID_COLS + 1):
+        line_x = int(round(x + column * width / ROAD_GRID_COLS))
+        cv2.line(overlay, (line_x, y), (line_x, y + height), (160, 160, 160), 1)
+    for row in range(ROAD_GRID_ROWS + 1):
+        line_y = int(round(y + row * height / ROAD_GRID_ROWS))
+        cv2.line(overlay, (x, line_y), (x + width, line_y), (160, 160, 160), 1)
+    for cell in all_cells:
+        label = str(cell.get("outcome") or "")
+        if bool(cell.get("uncertain")):
+            label = "?"
+        if int(cell.get("tie_count", 0) or 0) > 0:
+            label += "T"
+        if not label:
+            continue
+        cx, cy = int(round(float(cell.get("cx", 0)))), int(round(float(cell.get("cy", 0))))
+        cv2.putText(overlay, label, (max(0, cx - 7), max(10, cy + 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+    status = "OK" if quality_ok else f"RETAKE:{fallback_reason or 'quality'}"
+    cv2.putText(overlay, status[:80], (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    directory = Path(ROAD_GRID_DEBUG_DIR or "/tmp/bgs_road_debug")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"road_grid_{time.time_ns()}.png"
+    cv2.imwrite(str(path), overlay)
+    return str(path)
 
 
 def _detect_fixed_grid(crop: np.ndarray) -> Dict[str, Any]:
-    """固定掃描 6×15 格，只辨識每格的紅、藍與綠色和局記號。"""
+    """固定 6×15，先微調有效區，再以像素量、dominance 與集中綠點分類。"""
     if crop is None or crop.size == 0:
         raise ValueError("固定大路裁圖為空。")
-
     image_height, image_width = crop.shape[:2]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hue, saturation, value = cv2.split(hsv)
-
-    red_mask = (
-        (((hue <= 12) | (hue >= 168)) & (saturation >= 95) & (value >= 90))
-    ).astype(np.uint8)
-    blue_mask = (
-        ((hue >= 90) & (hue <= 135) & (saturation >= 75) & (value >= 75))
-    ).astype(np.uint8)
-    green_mask = (
-        ((hue >= 35) & (hue <= 90) & (saturation >= 75) & (value >= 75))
-    ).astype(np.uint8)
-
-    cells: List[Dict[str, Any]] = []
-    uncertain_cells: List[Dict[str, Any]] = []
-
-    for row in range(ROAD_GRID_ROWS):
-        y1, y2 = _grid_bounds(image_height, row, ROAD_GRID_ROWS)
-        for column in range(ROAD_GRID_COLS):
-            x1, x2 = _grid_bounds(image_width, column, ROAD_GRID_COLS)
-
-            margin_x = max(1, int(round((x2 - x1) * ROAD_GRID_INNER_MARGIN)))
-            margin_y = max(1, int(round((y2 - y1) * ROAD_GRID_INNER_MARGIN)))
-            inner_x1 = min(x2 - 1, x1 + margin_x)
-            inner_x2 = max(inner_x1 + 1, x2 - margin_x)
-            inner_y1 = min(y2 - 1, y1 + margin_y)
-            inner_y2 = max(inner_y1 + 1, y2 - margin_y)
-
-            red_pixels = int(
-                red_mask[inner_y1:inner_y2, inner_x1:inner_x2].sum()
-            )
-            blue_pixels = int(
-                blue_mask[inner_y1:inner_y2, inner_x1:inner_x2].sum()
-            )
-            green_pixels = int(
-                green_mask[inner_y1:inner_y2, inner_x1:inner_x2].sum()
-            )
-
-            dominant_pixels = max(red_pixels, blue_pixels)
-            outcome = ""
-            if dominant_pixels >= ROAD_GRID_MIN_COLOR_PIXELS:
-                if red_pixels >= blue_pixels * ROAD_GRID_COLOR_DOMINANCE:
-                    outcome = "B"
-                elif blue_pixels >= red_pixels * ROAD_GRID_COLOR_DOMINANCE:
-                    outcome = "P"
-                else:
-                    uncertain_cells.append(
-                        {
-                            "row": row,
-                            "column": column,
-                            "red_pixels": red_pixels,
-                            "blue_pixels": blue_pixels,
-                        }
-                    )
-
-            if not outcome:
-                continue
-
-            inner_area = max(
-                1,
-                (inner_x2 - inner_x1) * (inner_y2 - inner_y1),
-            )
-            cells.append(
-                {
-                    "index": -1,
-                    "outcome": outcome,
-                    "column": column,
-                    "row": row,
-                    "x": x1,
-                    "y": y1,
-                    "width": x2 - x1,
-                    "height": y2 - y1,
-                    "cx": round((x1 + x2) / 2.0, 2),
-                    "cy": round((y1 + y2) / 2.0, 2),
-                    "red_pixels": red_pixels,
-                    "blue_pixels": blue_pixels,
-                    "green_pixels": green_pixels,
-                    "tie_count": 1
-                    if green_pixels >= ROAD_GRID_TIE_MIN_PIXELS
-                    else 0,
-                    "confidence": round(dominant_pixels / inner_area, 6),
-                }
-            )
-
-    cell_lookup = {
-        (int(item["column"]), int(item["row"])): item for item in cells
-    }
-    ordered_positions = _reconstruct_big_road_order(cells)
+    red_mask, blue_mask, green_mask, union_mask = _color_masks(crop)
+    grid_bounds = _effective_grid_bounds(crop, union_mask)
+    classified = _classify_grid(crop, red_mask, blue_mask, green_mask, grid_bounds)
+    cells = list(classified["cells"])
+    uncertain_cells = list(classified["uncertain_cells"])
+    all_grid_cells = list(classified["all_grid_cells"])
+    reconstruction = _reconstruct_big_road_order(cells, return_details=True)
+    ordered_positions = list(reconstruction["positions"])
+    cell_lookup = {(int(item["column"]), int(item["row"])): item for item in cells}
     ordered_cells: List[Dict[str, Any]] = []
     sequence: List[str] = []
     raw_outcomes: List[str] = []
     tie_markers: Dict[str, int] = {}
-
-    for index, position in enumerate(ordered_positions):
-        source = dict(cell_lookup[position])
-        source["index"] = index
-        ordered_cells.append(source)
-        outcome = str(source["outcome"])
-        sequence.append(outcome)
-        raw_outcomes.append(outcome)
-        tie_count = int(source.get("tie_count", 0) or 0)
-        if tie_count > 0:
-            tie_markers[str(index)] = tie_count
-            raw_outcomes.extend(["T"] * tie_count)
+    if reconstruction["reconstructed_all"]:
+        for index, position in enumerate(ordered_positions):
+            source = dict(cell_lookup[position])
+            source["index"] = index
+            source["chronology_confirmed"] = True
+            ordered_cells.append(source)
+            outcome = str(source["outcome"])
+            sequence.append(outcome)
+            raw_outcomes.append(outcome)
+            tie_count = int(source.get("tie_count", 0) or 0)
+            if tie_count > 0:
+                tie_markers[str(index)] = tie_count
+                raw_outcomes.extend(["T"] * tie_count)
+    else:
+        # 保留格位資料供 debug，但不產生可供預測使用的假時間序列。
+        for source in sorted(cells, key=lambda item: (int(item["column"]), int(item["row"]))):
+            item = dict(source)
+            item["chronology_confirmed"] = False
+            ordered_cells.append(item)
 
     uncertain_count = len(uncertain_cells)
-    candidate_total = len(sequence) + uncertain_count
+    recognized_count = len(cells)
+    candidate_total = recognized_count + uncertain_count
     uncertain_ratio = uncertain_count / max(1, candidate_total)
-    reconstructed_all = len(ordered_positions) == len(cells)
-    quality_ok = bool(
-        len(sequence) >= ROAD_GRID_MIN_RECOGNIZED
-        and uncertain_ratio <= ROAD_GRID_MAX_UNCERTAIN_RATIO
-        and reconstructed_all
+    confidences = [float(item.get("confidence", 0.0) or 0.0) for item in cells]
+    median_confidence = float(np.median(confidences)) if confidences else 0.0
+    alignment_ok = bool(
+        float(grid_bounds["score"]) >= ROAD_GRID_MIN_ALIGNMENT_SCORE
+        and float(grid_bounds["coverage"]) >= 0.80
     )
+    quality_ok = bool(
+        recognized_count >= ROAD_GRID_MIN_RECOGNIZED
+        and uncertain_ratio <= ROAD_GRID_MAX_UNCERTAIN_RATIO
+        and bool(reconstruction["reconstructed_all"])
+        and alignment_ok
+        and median_confidence >= ROAD_GRID_MIN_MEDIAN_CONFIDENCE
+    )
+    fallback_reason = str(reconstruction.get("fallback_reason") or "")
+    if not fallback_reason and not alignment_ok:
+        fallback_reason = "grid_alignment_not_confident"
+    if not fallback_reason and median_confidence < ROAD_GRID_MIN_MEDIAN_CONFIDENCE:
+        fallback_reason = "cell_color_confidence_too_low"
+    if not fallback_reason and recognized_count < ROAD_GRID_MIN_RECOGNIZED:
+        fallback_reason = "recognized_count_below_minimum"
+    if not fallback_reason and uncertain_ratio > ROAD_GRID_MAX_UNCERTAIN_RATIO:
+        fallback_reason = "too_many_uncertain_cells"
+    debug_overlay_path = _debug_overlay(crop, all_grid_cells, grid_bounds, quality_ok, fallback_reason)
 
     return {
-        "ok": bool(sequence),
+        "ok": bool(sequence) and quality_ok,
         "quality_ok": quality_ok,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
         "tie_markers": tie_markers,
         "grid_cells": ordered_cells,
-        "recognized_count": len(sequence),
+        "all_grid_cells": all_grid_cells,
+        "recognized_count": recognized_count,
+        "sequence_count": len(sequence),
         "confirmed_round_count": len(raw_outcomes),
         "uncertain_count": uncertain_count,
         "unknown_candidates": uncertain_count,
         "unknown_ratio": round(uncertain_ratio, 6),
         "raw_contours": 0,
         "candidates": ordered_cells,
-        "method": "fixed_hsv_grid_6x15_v10_6",
+        "method": "fixed_hsv_grid_6x15_adaptive_v10_9",
         "grid_rows": ROAD_GRID_ROWS,
         "grid_columns": ROAD_GRID_COLS,
-        "grid_size": {
-            "width": image_width,
-            "height": image_height,
+        "grid_size": {"width": image_width, "height": image_height},
+        "effective_grid": {
+            key: grid_bounds[key]
+            for key in (
+                "x", "y", "width", "height", "score", "coverage", "offset_x", "offset_y",
+                "scale_x", "scale_y", "gain_x", "gain_y"
+            )
         },
-        "reconstructed_all": reconstructed_all,
+        "grid_alignment": grid_bounds,
+        "alignment_ok": alignment_ok,
+        "median_cell_confidence": round(median_confidence, 6),
+        "reconstructed_all": bool(reconstruction["reconstructed_all"]),
+        "reconstruction_solution_count": int(reconstruction["solution_count"]),
+        "partial_reconstruction": list(reconstruction["partial_positions"]),
+        "fallback_preview_positions": list(reconstruction["fallback_preview"]),
+        "fallback_reason": fallback_reason,
         "uncertain_cells": uncertain_cells,
+        "count_is_confirmed": bool(quality_ok and uncertain_count == 0),
+        "debug_overlay_path": debug_overlay_path,
+        "debug_enabled": ROAD_GRID_DEBUG,
     }
-
 
 def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
@@ -485,16 +837,24 @@ def _detect_yolo(crop: np.ndarray) -> Dict[str, Any]:
 
 def _score_result(result: Mapping[str, Any], preference: float = 0.0) -> float:
     recognized = int(result.get("recognized_count", 0) or 0)
-    unknown = int(
-        result.get("unknown_candidates", result.get("uncertain_count", 0)) or 0
-    )
+    unknown = int(result.get("unknown_candidates", result.get("uncertain_count", 0)) or 0)
     raw = int(result.get("raw_contours", 0) or 0)
     if recognized <= 0:
         return -9999.0
     noise = max(0, raw - recognized * 8)
-    fixed_bonus = 30.0 if str(result.get("method") or "").startswith("fixed_") else 0.0
-    return recognized * 5.0 - unknown * 1.5 - noise * 0.04 + preference + fixed_bonus
-
+    fixed = str(result.get("method") or "").startswith("fixed_")
+    quality_bonus = 55.0 if bool(result.get("quality_ok")) else -35.0
+    reconstruction_bonus = 25.0 if bool(result.get("reconstructed_all", not fixed)) else -45.0
+    alignment = float(dict(result.get("effective_grid") or {}).get("score", 0.0) or 0.0)
+    return (
+        recognized * 3.0
+        - unknown * 4.0
+        - noise * 0.04
+        + preference
+        + quality_bonus
+        + reconstruction_bonus
+        + alignment * 20.0
+    )
 
 def _run_region(
     image: np.ndarray,
@@ -552,9 +912,13 @@ def detect_road_sequence_detailed(
     requested = str(input_type or "auto").lower().strip()
     aspect = image.shape[1] / max(1.0, float(image.shape[0]))
 
-    wide_multi_road = requested == "auto" and aspect >= WIDE_LAYOUT_MIN_ASPECT
+    if requested not in {"auto", "full_screen", "road_crop", "wide_multi_road"}:
+        requested = "auto"
+    wide_multi_road = requested == "wide_multi_road" or (
+        requested == "auto" and aspect >= WIDE_LAYOUT_MIN_ASPECT
+    )
     likely_crop = requested == "road_crop" or (
-        requested == "auto" and 2.40 <= aspect < WIDE_LAYOUT_MIN_ASPECT
+        requested == "auto" and ROAD_CROP_MIN_ASPECT <= aspect < WIDE_LAYOUT_MIN_ASPECT
     )
     detected_type = (
         "wide_multi_road"
@@ -640,7 +1004,7 @@ def detect_road_sequence_detailed(
     result = dict(best)
     result.update(
         {
-            "ok": bool(result.get("sequence")),
+            "ok": bool(result.get("sequence")) and bool(result.get("quality_ok", True)),
             "input_type": detected_type,
             "selected_region": str(best.get("region_name") or ""),
             "venue_hint": venue_code,
@@ -663,6 +1027,10 @@ def detect_road_sequence_detailed(
                     "elapsed_ms": float(item.get("elapsed_ms", 0) or 0),
                     "method": str(item.get("method") or ""),
                     "fixed_grid": bool(item.get("fixed_grid")),
+                    "quality_ok": bool(item.get("quality_ok", True)),
+                    "reconstructed_all": bool(item.get("reconstructed_all", True)),
+                    "fallback_reason": str(item.get("fallback_reason") or ""),
+                    "alignment_score": float(dict(item.get("effective_grid") or {}).get("score", 0.0) or 0.0),
                 }
                 for item in candidates
             ],

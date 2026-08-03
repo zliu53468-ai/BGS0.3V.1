@@ -1,4 +1,4 @@
-"""百家樂大路圖片辨識模組 V10.5（右上大路專區極速版）。
+"""百家樂大路圖片辨識模組 V10.9（保守完整反推版）。
 
 改良重點：
 1. 先以幾何輪廓定位圓圈，再以「外框環形區域」判定紅莊／藍閒。
@@ -265,70 +265,122 @@ def _nearest_index(value: float, centers: Sequence[float]) -> Tuple[int, float]:
     return index, abs(float(value) - centers[index])
 
 
-def _next_big_road_cell(
-    current: Tuple[int, int],
-    start_column: int,
-    same_side: bool,
-    occupied: set[Tuple[int, int]],
-) -> Tuple[Tuple[int, int], int]:
-    column, row = current
-    if same_side:
-        below = (column, row + 1)
-        if row < 5 and below not in occupied:
-            return below, start_column
-        right = (column + 1, row)
-        while right in occupied:
-            right = (right[0] + 1, row)
-        return right, start_column
-    new_column = start_column + 1
-    while (new_column, 0) in occupied:
-        new_column += 1
-    return (new_column, 0), new_column
-
-
-def _reconstruct_big_road(
+def _reconstruct_big_road_detailed(
     grid: Dict[Tuple[int, int], CircleCandidate],
-) -> List[CircleCandidate]:
-    if not grid or (0, 0) not in grid:
-        return []
+) -> Dict[str, Any]:
+    """依大路規則完整反推；長龍一旦右黏，就保持同列向右。"""
+    if not grid:
+        return {
+            "ordered": [],
+            "reconstructed_all": False,
+            "fallback_reason": "no_grid_cells",
+            "partial": [],
+            "solution_count": 0,
+        }
+    if (0, 0) not in grid:
+        return {
+            "ordered": [],
+            "reconstructed_all": False,
+            "fallback_reason": "missing_big_road_origin_0_0",
+            "partial": [],
+            "solution_count": 0,
+        }
+
     first = grid[(0, 0)]
-    best: List[CircleCandidate] = []
+    target_count = len(grid)
+    best: List[CircleCandidate] = [first]
+    solutions: List[List[CircleCandidate]] = []
 
     def walk(
         ordered: List[CircleCandidate],
         occupied: set[Tuple[int, int]],
         current: Tuple[int, int],
         start_column: int,
+        tailing_right: bool,
     ) -> None:
         nonlocal best
         if len(ordered) > len(best):
             best = list(ordered)
-        if len(ordered) == len(grid):
+        if len(ordered) == target_count:
+            solutions.append(list(ordered))
+            return
+        if len(solutions) >= 2:
             return
         last_side = ordered[-1].outcome
-        options = []
-        for next_side in (last_side, 'P' if last_side == 'B' else 'B'):
-            cell, next_start = _next_big_road_cell(
-                current, start_column, next_side == last_side, occupied
-            )
-            item = grid.get(cell)
-            if item is not None and cell not in occupied and item.outcome == next_side:
-                options.append((item, cell, next_start))
-        for item, cell, next_start in options:
+        column, row = current
+        options: List[Tuple[CircleCandidate, Tuple[int, int], int, bool]] = []
+
+        if not tailing_right and row < 5 and (column, row + 1) not in occupied:
+            same_cell = (column, row + 1)
+            next_tailing = False
+        else:
+            next_column = column + 1
+            while (next_column, row) in occupied:
+                next_column += 1
+            same_cell = (next_column, row)
+            next_tailing = True
+        same_item = grid.get(same_cell)
+        if same_item is not None and same_item.outcome == last_side:
+            options.append((same_item, same_cell, start_column, next_tailing))
+
+        opposite = "P" if last_side == "B" else "B"
+        new_column = start_column + 1
+        while (new_column, 0) in occupied:
+            new_column += 1
+        opposite_cell = (new_column, 0)
+        opposite_item = grid.get(opposite_cell)
+        if opposite_item is not None and opposite_item.outcome == opposite:
+            options.append((opposite_item, opposite_cell, new_column, False))
+
+        for item, cell, next_start, next_tail in options:
             occupied.add(cell)
             ordered.append(item)
-            walk(ordered, occupied, cell, next_start)
+            walk(ordered, occupied, cell, next_start, next_tail)
             ordered.pop()
             occupied.remove(cell)
+            if len(solutions) >= 2:
+                return
 
-    walk([first], {(0, 0)}, (0, 0), 0)
-    return best if len(best) == len(grid) else []
+    walk([first], {(0, 0)}, (0, 0), 0, False)
+    if len(solutions) == 1:
+        return {
+            "ordered": solutions[0],
+            "reconstructed_all": True,
+            "fallback_reason": "",
+            "partial": solutions[0],
+            "solution_count": 1,
+        }
+    reason = (
+        "ambiguous_big_road_reconstruction"
+        if len(solutions) > 1
+        else f"incomplete_big_road_reconstruction_{len(best)}_of_{target_count}"
+    )
+    return {
+        "ordered": [],
+        "reconstructed_all": False,
+        "fallback_reason": reason,
+        "partial": best,
+        "solution_count": len(solutions),
+    }
 
 
-def _sort_big_road(candidates: Sequence[CircleCandidate]) -> List[CircleCandidate]:
-    """依六列大路格位重建時間順序，而不是單純逐欄由上往下讀。"""
+def _reconstruct_big_road(
+    grid: Dict[Tuple[int, int], CircleCandidate],
+) -> List[CircleCandidate]:
+    return list(_reconstruct_big_road_detailed(grid).get("ordered") or [])
+
+
+def _sort_big_road_detailed(candidates: Sequence[CircleCandidate]) -> Dict[str, Any]:
+    """輪廓先映射六列格位，再要求完整、唯一的時間序反推。"""
     if not candidates:
-        return []
+        return {
+            "ordered": [],
+            "grid_items": [],
+            "grid_count": 0,
+            "reconstructed_all": False,
+            "fallback_reason": "no_colored_candidates",
+            "solution_count": 0,
+        }
     diameters = [item.diameter for item in candidates]
     median_diameter = float(np.median(diameters))
     size_filtered = [
@@ -336,45 +388,75 @@ def _sort_big_road(candidates: Sequence[CircleCandidate]) -> List[CircleCandidat
         if 0.58 * median_diameter <= item.diameter <= 1.55 * median_diameter
     ] or list(candidates)
 
-    x_centers = _cluster_axis([item.x for item in size_filtered], max(3.0, median_diameter * 0.48))
-    y_centers = _cluster_axis([item.y for item in size_filtered], max(3.0, median_diameter * 0.48))
-    x_centers.sort(); y_centers.sort()
-    # 大路固定最多六列；全圖誤抓到其他區域時，只採最密集的六個水平格位。
+    x_centers = _cluster_axis(
+        [item.x for item in size_filtered], max(3.0, median_diameter * 0.48)
+    )
+    y_centers = _cluster_axis(
+        [item.y for item in size_filtered], max(3.0, median_diameter * 0.48)
+    )
+    x_centers.sort()
+    y_centers.sort()
     if len(y_centers) > 6:
-        counts = []
-        for center in y_centers:
-            counts.append(sum(abs(item.y-center) <= median_diameter*0.48 for item in size_filtered))
-        keep = sorted(range(len(y_centers)), key=lambda i: counts[i], reverse=True)[:6]
-        y_centers = sorted(y_centers[i] for i in keep)
+        counts = [
+            sum(abs(item.y - center) <= median_diameter * 0.48 for item in size_filtered)
+            for center in y_centers
+        ]
+        keep = sorted(range(len(y_centers)), key=lambda index: counts[index], reverse=True)[:6]
+        y_centers = sorted(y_centers[index] for index in keep)
     if not x_centers or not y_centers:
-        return []
+        return {
+            "ordered": [],
+            "grid_items": [],
+            "grid_count": 0,
+            "reconstructed_all": False,
+            "fallback_reason": "grid_axis_clustering_failed",
+            "solution_count": 0,
+        }
 
     grid: Dict[Tuple[int, int], CircleCandidate] = {}
     max_residual = median_diameter * 0.46
-    min_x = min(x_centers)
     for item in size_filtered:
-        col, dx = _nearest_index(item.x, x_centers)
+        column, dx = _nearest_index(item.x, x_centers)
         row, dy = _nearest_index(item.y, y_centers)
         if dx > max_residual or dy > max_residual or row > 5:
             continue
-        cell = (col, row)
+        cell = (column, row)
         old = grid.get(cell)
         quality = max(item.red_ratio, item.blue_ratio, item.saturation / 255.0) + item.circularity
-        old_quality = -1.0 if old is None else max(old.red_ratio, old.blue_ratio, old.saturation / 255.0) + old.circularity
+        old_quality = (
+            -1.0
+            if old is None
+            else max(old.red_ratio, old.blue_ratio, old.saturation / 255.0) + old.circularity
+        )
         if old is None or quality > old_quality:
             grid[cell] = item
 
     if not grid:
-        return []
-    min_col = min(column for column, _ in grid)
-    normalized = {(column-min_col, row): item for (column,row), item in grid.items()}
-    reconstructed = _reconstruct_big_road(normalized)
-    if reconstructed:
-        return reconstructed
+        return {
+            "ordered": [],
+            "grid_items": [],
+            "grid_count": 0,
+            "reconstructed_all": False,
+            "fallback_reason": "no_candidates_mapped_to_grid",
+            "solution_count": 0,
+        }
+    minimum_column = min(column for column, _ in grid)
+    normalized = {(column - minimum_column, row): item for (column, row), item in grid.items()}
+    reconstruction = _reconstruct_big_road_detailed(normalized)
+    grid_items = [normalized[cell] for cell in sorted(normalized, key=lambda value: (value[0], value[1]))]
+    return {
+        "ordered": list(reconstruction.get("ordered") or []),
+        "grid_items": grid_items,
+        "grid_count": len(normalized),
+        "reconstructed_all": bool(reconstruction.get("reconstructed_all")),
+        "fallback_reason": str(reconstruction.get("fallback_reason") or ""),
+        "solution_count": int(reconstruction.get("solution_count", 0) or 0),
+        "partial": list(reconstruction.get("partial") or []),
+    }
 
-    # 無法唯一重建時保守回退；仍以格位而非原始輪廓座標排序。
-    return [normalized[cell] for cell in sorted(normalized, key=lambda p: (p[0], p[1]))]
 
+def _sort_big_road(candidates: Sequence[CircleCandidate]) -> List[CircleCandidate]:
+    return list(_sort_big_road_detailed(candidates).get("ordered") or [])
 
 def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
     if source is None or not isinstance(source, np.ndarray) or source.size == 0:
@@ -404,8 +486,12 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             red_ratio=round(red_ratio, 4), blue_ratio=round(blue_ratio, 4), color_method=method,
         ))
 
-    ordered = _sort_big_road(colored)
+    ordering = _sort_big_road_detailed(colored)
+    ordered = list(ordering.get("ordered") or [])
     sequence = [item.outcome for item in ordered]
+    reconstructed_all = bool(ordering.get("reconstructed_all"))
+    fallback_reason = str(ordering.get("fallback_reason") or "")
+    detected_grid_count = int(ordering.get("grid_count", len(ordered)) or 0)
 
     # 不把格線交叉點、文字與其他小圖示全部算成「未知局」。
     # 只計算尺寸接近已辨識大路圓圈的候選，避免品質檢查被背景雜訊拖垮。
@@ -441,18 +527,23 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
     uncertain_count = int(unknown)
     candidate_total = len(sequence) + uncertain_count
     unknown_ratio = uncertain_count / max(1, candidate_total)
-    quality_ok = bool(len(sequence) >= MIN_RECOGNIZED_FOR_PREDICTION and unknown_ratio <= MAX_UNKNOWN_RATIO)
+    quality_ok = bool(
+        len(sequence) >= MIN_RECOGNIZED_FOR_PREDICTION
+        and unknown_ratio <= MAX_UNKNOWN_RATIO
+        and reconstructed_all
+    )
     return {
-        "ok": bool(sequence),
+        "ok": bool(sequence) and quality_ok,
         "quality_ok": quality_ok,
         "sequence": sequence,
         "raw_outcomes": list(sequence),
         "grid_cells": grid_cells,
-        "recognized_count": len(sequence),
+        "recognized_count": detected_grid_count,
+        "sequence_count": len(sequence),
         "confirmed_round_count": len(sequence),
         "uncertain_count": uncertain_count,
         "unknown_ratio": round(unknown_ratio, 6),
-        "count_is_confirmed": uncertain_count == 0,
+        "count_is_confirmed": bool(quality_ok and uncertain_count == 0),
         "estimated_candidate_total": candidate_total,
         "unknown_candidates": unknown,
         "raw_contours": len(raw_candidates),
@@ -461,8 +552,11 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             "width": int(image.shape[1]), "height": int(image.shape[0]),
             "resize_scale": round(float(resize_scale), 6),
         },
-        "candidates": [asdict(item) for item in ordered],
-        "method": "adaptive_contour_ring_hsv_grid_quality_v10_5",
+        "candidates": [asdict(item) for item in colored],
+        "reconstructed_all": reconstructed_all,
+        "reconstruction_solution_count": int(ordering.get("solution_count", 0) or 0),
+        "fallback_reason": fallback_reason,
+        "method": "adaptive_contour_ring_hsv_grid_quality_v10_9",
     }
 
 
