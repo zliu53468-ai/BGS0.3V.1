@@ -1,4 +1,4 @@
-"""BGS V10.9 規則導向的受限制機率 Stacking。
+"""BGS V10.9 牌路先行但受限制的規則導向 Stacking。
 
 有限牌組是唯一可提供真實因果偏移的主要群組；全歷史、牌路規劃、近期牌路與
 額外序列只作弱輔助。截圖／真人桌沒有真實剩餘牌時，各群組偏移會先收縮回
@@ -15,6 +15,7 @@ import numpy as np
 OUTCOMES = ("B", "P", "T")
 GROUPS = ("global_history", "road_planning", "recent_road", "finite", "sequence")
 ROAD_GROUPS = ("global_history", "road_planning", "recent_road")
+ROAD_FIRST_GROUPS = ("road_planning", "recent_road")
 BASELINE_PRIOR = np.asarray([0.458597, 0.446247, 0.095156], dtype=np.float64)
 RELIABLE_COMPOSITION_LABELS = {"observed", "actual", "known", "session_actual", "virtual_shoe"}
 
@@ -41,10 +42,22 @@ STACKING_PROBABILITY_CONCENTRATION = _env_float(
     "STACKING_PROBABILITY_CONCENTRATION", 95.0, 12.0, 500.0
 )
 STACKING_ROAD_TOTAL_CAP_RELIABLE = _env_float(
-    "STACKING_ROAD_TOTAL_CAP_RELIABLE", 0.28, 0.05, 0.45
+    "STACKING_ROAD_TOTAL_CAP_RELIABLE", 0.22, 0.05, 0.40
 )
 STACKING_ROAD_TOTAL_CAP_ESTIMATED = _env_float(
-    "STACKING_ROAD_TOTAL_CAP_ESTIMATED", 0.15, 0.02, 0.30
+    "STACKING_ROAD_TOTAL_CAP_ESTIMATED", 0.28, 0.05, 0.40
+)
+STACKING_ROAD_FIRST_ENABLED = os.getenv(
+    "STACKING_ROAD_FIRST_ENABLED", "1"
+).strip() == "1"
+STACKING_ROAD_FIRST_MIN_QUALITY = _env_float(
+    "STACKING_ROAD_FIRST_MIN_QUALITY", 0.62, 0.40, 0.95
+)
+STACKING_ROAD_FIRST_PLANNING_BOOST = _env_float(
+    "STACKING_ROAD_FIRST_PLANNING_BOOST", 1.35, 1.0, 2.0
+)
+STACKING_ROAD_FIRST_RECENT_BOOST = _env_float(
+    "STACKING_ROAD_FIRST_RECENT_BOOST", 1.20, 1.0, 2.0
 )
 STACKING_SEQUENCE_MAX_RELIABLE = _env_float(
     "STACKING_SEQUENCE_MAX_RELIABLE", 0.10, 0.0, 0.25
@@ -53,10 +66,10 @@ STACKING_SEQUENCE_MAX_ESTIMATED = _env_float(
     "STACKING_SEQUENCE_MAX_ESTIMATED", 0.06, 0.0, 0.15
 )
 STACKING_FINITE_MIN_RELIABLE = _env_float(
-    "STACKING_FINITE_MIN_RELIABLE", 0.60, 0.30, 0.95
+    "STACKING_FINITE_MIN_RELIABLE", 0.68, 0.40, 0.95
 )
 STACKING_FINITE_MIN_ESTIMATED = _env_float(
-    "STACKING_FINITE_MIN_ESTIMATED", 0.79, 0.45, 0.98
+    "STACKING_FINITE_MIN_ESTIMATED", 0.66, 0.45, 0.95
 )
 STACKING_ESTIMATED_FINITE_INFORMATION_FACTOR = _env_float(
     "STACKING_ESTIMATED_FINITE_INFORMATION_FACTOR", 0.55, 0.05, 1.0
@@ -65,25 +78,25 @@ STACKING_ESTIMATED_FINITE_SIGNAL_SHARE = _env_float(
     "STACKING_ESTIMATED_FINITE_SIGNAL_SHARE", 0.25, 0.0, 1.0
 )
 STACKING_ESTIMATED_ROAD_SIGNAL_SHARE = _env_float(
-    "STACKING_ESTIMATED_ROAD_SIGNAL_SHARE", 0.20, 0.0, 1.0
+    "STACKING_ESTIMATED_ROAD_SIGNAL_SHARE", 0.30, 0.0, 1.0
 )
 STACKING_ESTIMATED_SEQUENCE_SIGNAL_SHARE = _env_float(
     "STACKING_ESTIMATED_SEQUENCE_SIGNAL_SHARE", 0.20, 0.0, 1.0
 )
 
 RELIABLE_BASE_PRIORS = {
-    "global_history": 0.12,
-    "road_planning": 0.08,
-    "recent_road": 0.05,
-    "finite": 0.65,
-    "sequence": 0.10,
+    "global_history": 0.10,
+    "road_planning": 0.12,
+    "recent_road": 0.07,
+    "finite": 0.63,
+    "sequence": 0.08,
 }
 ESTIMATED_BASE_PRIORS = {
-    "global_history": 0.08,
-    "road_planning": 0.05,
-    "recent_road": 0.03,
-    "finite": 0.76,
-    "sequence": 0.08,
+    "global_history": 0.10,
+    "road_planning": 0.14,
+    "recent_road": 0.08,
+    "finite": 0.62,
+    "sequence": 0.06,
 }
 
 # 相容舊匯入名稱；實際執行會依 composition_quality 選擇設定。
@@ -93,16 +106,16 @@ BASE_PRIORS = dict(RELIABLE_BASE_PRIORS)
 def _bounds_for_mode(reliable_composition: bool) -> Dict[str, Tuple[float, float]]:
     if reliable_composition:
         return {
-            "global_history": (0.0, 0.12),
-            "road_planning": (0.0, 0.10),
+            "global_history": (0.0, 0.10),
+            "road_planning": (0.0, 0.12),
             "recent_road": (0.0, 0.08),
             "finite": (STACKING_FINITE_MIN_RELIABLE, 0.96),
             "sequence": (0.0, STACKING_SEQUENCE_MAX_RELIABLE),
         }
     return {
-        "global_history": (0.0, 0.07),
-        "road_planning": (0.0, 0.05),
-        "recent_road": (0.0, 0.03),
+        "global_history": (0.0, 0.10),
+        "road_planning": (0.0, 0.18),
+        "recent_road": (0.0, 0.12),
         "finite": (STACKING_FINITE_MIN_ESTIMATED, 0.98),
         "sequence": (0.0, STACKING_SEQUENCE_MAX_ESTIMATED),
     }
@@ -281,6 +294,31 @@ def constrained_stacking(
             score *= finite_information_factor
         scores[name] = score if available.get(name, True) else 0.0
 
+    planning_direction = (
+        "B"
+        if raw_normalized["road_planning"][0] >= raw_normalized["road_planning"][1]
+        else "P"
+    )
+    recent_direction = (
+        "B"
+        if raw_normalized["recent_road"][0] >= raw_normalized["recent_road"][1]
+        else "P"
+    )
+    road_first_quality = min(
+        quality_scores["road_planning"],
+        quality_scores["recent_road"],
+    )
+    road_first_active = bool(
+        STACKING_ROAD_FIRST_ENABLED
+        and available.get("road_planning", False)
+        and available.get("recent_road", False)
+        and planning_direction == recent_direction
+        and road_first_quality >= STACKING_ROAD_FIRST_MIN_QUALITY
+    )
+    if road_first_active:
+        scores["road_planning"] *= STACKING_ROAD_FIRST_PLANNING_BOOST
+        scores["recent_road"] *= STACKING_ROAD_FIRST_RECENT_BOOST
+
     bounds = _bounds_for_mode(reliable_composition)
     road_total_cap = (
         STACKING_ROAD_TOTAL_CAP_RELIABLE
@@ -372,6 +410,28 @@ def constrained_stacking(
         "road_total_weight": road_total_weight,
         "road_total_cap": float(road_total_cap),
         "road_effective_signal_weight": road_effective_signal_weight,
+        "road_first": {
+            "enabled": bool(STACKING_ROAD_FIRST_ENABLED),
+            "active": bool(road_first_active),
+            "direction": planning_direction if road_first_active else "",
+            "planning_direction": planning_direction,
+            "recent_direction": recent_direction,
+            "direction_agrees": bool(planning_direction == recent_direction),
+            "quality": float(road_first_quality),
+            "minimum_quality": float(STACKING_ROAD_FIRST_MIN_QUALITY),
+            "planning_boost": (
+                float(STACKING_ROAD_FIRST_PLANNING_BOOST)
+                if road_first_active
+                else 1.0
+            ),
+            "recent_boost": (
+                float(STACKING_ROAD_FIRST_RECENT_BOOST)
+                if road_first_active
+                else 1.0
+            ),
+            "road_total_weight": road_total_weight,
+            "road_total_cap": float(road_total_cap),
+        },
         "finite_effective_signal_weight": float(effective_signal_weights["finite"]),
         "sequence_effective_signal_weight": float(effective_signal_weights["sequence"]),
         "baseline_anchor_weight": baseline_anchor_weight,
@@ -416,6 +476,7 @@ __all__ = [
     "constrained_stacking",
     "GROUPS",
     "ROAD_GROUPS",
+    "ROAD_FIRST_GROUPS",
     "STACKING_MIN_STABILITY",
     "BASELINE_PRIOR",
 ]
