@@ -10,7 +10,7 @@ finite baccarat shoe.  Monte Carlo replicas and a low-weight hidden-order
 particle ensemble are retained as validation / uncertainty layers.
 
 This is a simulation engine.  It does not read or predict an external live table.
-V10.7 runs finite-shoe, road and sequence groups in parallel, then uses dynamic quality-aware weights and posterior simulation.
+V10.8 fits full-history probabilities, plans the complete road, bounds recent-trend influence, and then performs constrained stacking with posterior simulation.
 """
 from __future__ import annotations
 
@@ -24,7 +24,8 @@ import secrets
 
 import numpy as np
 
-from dynamic_ensemble import dynamic_group_ensemble
+from global_probability_model import analyze_global_probability
+from stacking_model import constrained_stacking
 
 
 DEFAULT_BASELINE = np.asarray([0.458597, 0.446247, 0.095156], dtype=np.float64)
@@ -629,12 +630,18 @@ class VirtualShoeParticleEngine:
         if sum(counts) < 6:
             raise ValueError("virtual shoe does not contain enough cards")
 
+        clean_history = [
+            str(item).upper().strip()
+            for item in (history or [])
+            if str(item).upper().strip() in OUTCOME_NAMES
+        ]
+        history_length = len(clean_history)
         run_seed = int(seed if seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
         seed_sequence = np.random.SeedSequence(run_seed)
         child_seeds = seed_sequence.spawn(self.settings.replicas + 1)
 
+        # 有限牌組群組：精確超幾何為中心，蒙地卡羅與粒子只做驗證／不確定性。
         hyper_probability, hyper_paths, hyper_meta = hypergeometric_probabilities(counts)
-
         replica_probabilities: List[np.ndarray] = []
         replica_paths: List[np.ndarray] = []
         for index in range(self.settings.replicas):
@@ -660,19 +667,11 @@ class VirtualShoeParticleEngine:
             particle_seed,
         )
 
-        road_state = self._road_context_state(road_context)
-        sequence_probability, sequence_meta = _sequence_probabilities(history or [])
-        history_length = len([
-            item for item in (history or []) if str(item).upper() in OUTCOME_NAMES
-        ])
-
-        # V10：所有模型共同參與方向。有限牌組三模型先在群組內融合，
-        # 避免超幾何、蒙地卡羅、粒子因使用同一估計牌組而被重複算成三票。
         finite_requested = np.asarray(
             [HYPERGEOMETRIC_WEIGHT, MONTE_CARLO_WEIGHT, PARTICLE_WEIGHT],
             dtype=np.float64,
         )
-        finite_requested = finite_requested / finite_requested.sum()
+        finite_requested /= finite_requested.sum()
         hyper_weight, mc_weight, particle_weight = (
             float(value) for value in finite_requested
         )
@@ -681,7 +680,6 @@ class VirtualShoeParticleEngine:
             + mc_probability * mc_weight
             + particle_probability * particle_weight
         )
-
         uncertainty = float(max(replica_se))
         validation_gap = float(max(
             np.max(np.abs(mc_probability - hyper_probability)),
@@ -693,94 +691,148 @@ class VirtualShoeParticleEngine:
             + DEFAULT_BASELINE * adaptive_shrink
         )
 
-        core_banker, core_player, core_tie = (float(value) for value in finite_group)
-        core_direction = "B" if core_banker > core_player else "P"
+        # 全歷史機率擬合獨立運算，不從近期牌路結果推導。
+        global_result = analyze_global_probability(clean_history)
+        global_probability = _normalize_probability([
+            float(dict(global_result.get("probabilities") or {}).get("B", DEFAULT_BASELINE[0])),
+            float(dict(global_result.get("probabilities") or {}).get("P", DEFAULT_BASELINE[1])),
+            float(dict(global_result.get("probabilities") or {}).get("T", DEFAULT_BASELINE[2])),
+        ])
 
-        road_direction = str(road_state.get("direction") or "").upper()
-        road_available = bool(
-            road_state.get("ok")
-            and road_direction in {"B", "P"}
-            and history_length >= 4
+        # 畫面模式由 screenshot_predictor 先建好 road_context；虛擬模式則在這裡補建。
+        resolved_road_context = dict(road_context or {})
+        if not resolved_road_context and clean_history:
+            try:
+                from road_model import build_road_context
+                resolved_road_context = build_road_context(
+                    clean_history,
+                    seed=(run_seed ^ 0x9E3779B9) & 0xFFFFFFFF,
+                )
+            except Exception:
+                resolved_road_context = {}
+
+        road_state = self._road_context_state(resolved_road_context)
+        core_tie = float(finite_group[2])
+        planning_b = max(0.0, min(1.0, float(
+            resolved_road_context.get(
+                "planning_probability",
+                resolved_road_context.get("banker_probability", 0.5),
+            ) or 0.5
+        )))
+        recent_b = max(0.0, min(1.0, float(
+            resolved_road_context.get(
+                "recent_probability",
+                resolved_road_context.get("banker_probability", 0.5),
+            ) or 0.5
+        )))
+        planning_three = _normalize_probability([
+            (1.0 - core_tie) * planning_b,
+            (1.0 - core_tie) * (1.0 - planning_b),
+            core_tie,
+        ])
+        recent_three = _normalize_probability([
+            (1.0 - core_tie) * recent_b,
+            (1.0 - core_tie) * (1.0 - recent_b),
+            core_tie,
+        ])
+
+        sequence_probability, sequence_meta = _sequence_probabilities(clean_history)
+
+        particle_ess_ratio = min(
+            1.0,
+            particle_ess / max(1.0, float(self.settings.particles)),
         )
-        sequence_available = history_length >= 4
-
-        # 牌路模型只提供 B/P，因此沿用有限牌組群組估計的和局比例，
-        # 再把剩餘 B/P 比例依牌路機率分配。
-        road_three = np.asarray(
-            [
-                (1.0 - core_tie) * float(road_state["banker_probability"]),
-                (1.0 - core_tie) * float(road_state["player_probability"]),
-                core_tie,
-            ],
-            dtype=np.float64,
+        validation_quality = 1.0 - min(1.0, validation_gap / 0.06)
+        uncertainty_quality = 1.0 - min(1.0, uncertainty / 0.025)
+        finite_quality = max(
+            0.0,
+            min(1.0, 0.46 * validation_quality + 0.34 * uncertainty_quality + 0.20 * particle_ess_ratio),
         )
-        road_three = _normalize_probability(road_three)
+        sequence_support = max(0, int(sequence_meta.get("support", 0) or 0))
+        sequence_order = max(0, int(sequence_meta.get("order", 0) or 0))
+        sequence_quality = max(0.0, min(1.0,
+            0.38 * min(1.0, history_length / 42.0)
+            + 0.42 * min(1.0, sequence_support / 18.0)
+            + 0.20 * min(1.0, sequence_order / 3.0)
+        ))
 
-        # 三個群組平行完成後才整合。圖片／外部畫面模式沒有真實牌值，
-        # 因此有限牌組群組會被標記為 estimated composition，不會固定壓過牌路。
-        composition_quality = "estimated" if road_context else "observed"
-        dynamic_ensemble = dynamic_group_ensemble(
-            road_probability=road_three,
-            finite_probability=finite_group,
-            sequence_probability=sequence_probability,
-            road_context=dict(road_context or {}),
-            sequence_meta=sequence_meta,
-            history_length=history_length,
-            validation_gap=validation_gap,
-            simulation_uncertainty=uncertainty,
-            particle_ess_ratio=min(
-                1.0,
-                particle_ess / max(1.0, float(self.settings.particles)),
-            ),
+        planning_reliability = max(0.0, min(1.0, float(
+            resolved_road_context.get("planning_reliability", 0.0) or 0.0
+        )))
+        recent_reliability = max(0.0, min(1.0, float(
+            resolved_road_context.get("recent_reliability", 0.0) or 0.0
+        )))
+        global_reliability = max(0.0, min(1.0, float(
+            global_result.get("reliability", 0.0) or 0.0
+        )))
+
+        composition_quality = "estimated" if road_context is not None else "observed"
+        stacking = constrained_stacking(
+            probabilities={
+                "global_history": global_probability,
+                "road_planning": planning_three,
+                "recent_road": recent_three,
+                "finite": finite_group,
+                "sequence": sequence_probability,
+            },
+            qualities={
+                "global_history": global_reliability,
+                "road_planning": planning_reliability,
+                "recent_road": recent_reliability,
+                "finite": finite_quality,
+                "sequence": sequence_quality,
+            },
+            availability={
+                "global_history": bool(global_result.get("ok")),
+                "road_planning": bool(resolved_road_context.get("planning_available")) or history_length >= 10,
+                "recent_road": history_length >= 4,
+                "finite": True,
+                "sequence": history_length >= 4,
+            },
             composition_quality=composition_quality,
-            road_available=road_available,
-            sequence_available=sequence_available,
             seed=(run_seed ^ 0xA5A5A5A5) & 0xFFFFFFFF,
         )
-        group_weights = dict(dynamic_ensemble["weights"])
-        dynamic_probabilities = dict(dynamic_ensemble["probabilities"])
+
+        stacked_probabilities = dict(stacking["probabilities"])
         ensemble_probability = _normalize_probability([
-            dynamic_probabilities["B"],
-            dynamic_probabilities["P"],
-            dynamic_probabilities["T"],
+            stacked_probabilities["B"],
+            stacked_probabilities["P"],
+            stacked_probabilities["T"],
         ])
         banker, player, tie = (float(value) for value in ensemble_probability)
         bp_total = max(1e-12, banker + player)
         banker_no_tie = banker / bp_total
         player_no_tie = player / bp_total
-        direction = "B" if banker > player else "P"
+        direction = "B" if banker >= player else "P"
         direction_edge = abs(banker_no_tie - player_no_tie)
-        posterior = dict(dynamic_ensemble.get("posterior") or {})
-        posterior_direction_stability = float(
-            posterior.get("direction_stability", 0.0) or 0.0
-        )
-        posterior_minimum_stability = float(
-            posterior.get("minimum_direction_stability", 0.60) or 0.60
-        )
-        posterior_interval_crosses_zero = bool(
-            posterior.get("bp_difference_interval_crosses_zero", True)
-        )
-        ensemble_uncertainty = float(
-            posterior.get("bp_difference_std", 1.0) or 1.0
-        )
 
-        model_directions = {
-            "road": road_direction if road_available else "",
-            "hypergeometric": "B" if hyper_probability[0] > hyper_probability[1] else "P",
-            "monte_carlo": "B" if mc_probability[0] > mc_probability[1] else "P",
-            "particle": "B" if particle_probability[0] > particle_probability[1] else "P",
-            "sequence": "B" if sequence_probability[0] > sequence_probability[1] else "P",
+        weights = dict(stacking["weights"])
+        posterior = dict(stacking.get("posterior") or {})
+        direction_stability = float(posterior.get("direction_stability", 0.0) or 0.0)
+        minimum_stability = float(posterior.get("minimum_direction_stability", 0.58) or 0.58)
+        ensemble_uncertainty = float(posterior.get("bp_difference_std", 1.0) or 1.0)
+        weighted_agreement = float(stacking.get("weighted_agreement", 0.0) or 0.0)
+
+        group_directions = {
+            name: str(dict(stacking.get("contributions") or {}).get(name, {}).get("direction") or "")
+            for name in ("global_history", "road_planning", "recent_road", "finite", "sequence")
         }
-        active_directions = [value for value in model_directions.values() if value in {"B", "P"}]
-        agreement = (
-            active_directions.count(direction) / max(1, len(active_directions))
+        model_directions = {
+            **group_directions,
+            "hypergeometric": "B" if hyper_probability[0] >= hyper_probability[1] else "P",
+            "monte_carlo": "B" if mc_probability[0] >= mc_probability[1] else "P",
+            "particle": "B" if particle_probability[0] >= particle_probability[1] else "P",
+        }
+
+        edge_ok = direction_edge >= MIN_DIRECTION_EDGE
+        uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
+        validation_ok = validation_gap <= MAX_VALIDATION_GAP
+        agreement_ok = weighted_agreement >= ENSEMBLE_MIN_MODEL_AGREEMENT
+        stability_ok = direction_stability >= minimum_stability
+        signal_allowed = bool(
+            edge_ok and uncertainty_ok and validation_ok and agreement_ok and stability_ok
         )
-        road_aligned_with_core = bool(
-            not road_available or road_direction == core_direction
-        )
-        road_aligned_with_final = bool(
-            not road_available or road_direction == direction
-        )
+        action = direction if signal_allowed else "O"
 
         banker_ev = banker * (1.0 - BANKER_COMMISSION) - player
         player_ev = player - banker
@@ -789,127 +841,65 @@ class VirtualShoeParticleEngine:
         best_ev_side = max(expected_values, key=expected_values.get)
         best_ev = float(expected_values[best_ev_side])
 
-        edge_ok = direction_edge >= MIN_DIRECTION_EDGE
-        uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
-        validation_ok = validation_gap <= MAX_VALIDATION_GAP
-        agreement_ok = agreement >= ENSEMBLE_MIN_MODEL_AGREEMENT
-        posterior_stability_ok = (
-            posterior_direction_stability >= posterior_minimum_stability
-        )
-        posterior_interval_ok = not posterior_interval_crosses_zero
-        signal_allowed = bool(
-            edge_ok
-            and uncertainty_ok
-            and validation_ok
-            and agreement_ok
-            and posterior_stability_ok
-            and posterior_interval_ok
-        )
-        action = direction if signal_allowed else "O"
-        road_weight = group_weights["road"]
-        sequence_weight = group_weights["sequence"]
-        fused_direction = direction
-        road_ready = road_available
-
-        uncertainty_score = 1.0 - min(
-            1.0, uncertainty / max(MAX_SIGNAL_UNCERTAINTY, 1e-9)
-        )
-        edge_score = min(1.0, direction_edge / max(MIN_DIRECTION_EDGE, 1e-9))
-        validation_score = 1.0 - min(
-            1.0, validation_gap / max(MAX_VALIDATION_GAP, 1e-9)
-        )
-        particle_score = min(1.0, particle_ess / max(1.0, self.settings.particles))
-        base_quality = max(
-            0.0,
-            min(
-                1.0,
-                0.22 * uncertainty_score
-                + 0.22 * edge_score
-                + 0.18 * validation_score
-                + 0.16 * posterior_direction_stability
-                + 0.12 * hyper_weight
-                + 0.10 * particle_score,
-            ),
-        )
-        quality_score = base_quality
-        if road_weight > 0.0:
-            quality_score = (
-                base_quality * (1.0 - road_weight)
-                + float(road_state["confidence"]) * road_weight
-            )
-            if not road_aligned_with_core:
-                quality_score *= 0.92
-        quality_score = max(0.0, min(1.0, quality_score))
-
-        confidence_label = (
-            "較高" if quality_score >= 0.72
-            else "中等" if quality_score >= 0.50
-            else "偏低"
-        )
-        alignment_score = 1.0 if road_aligned_with_core else 0.0
-        model_consistency = validation_score
-        if road_weight > 0.0:
-            model_consistency = (
-                validation_score * (1.0 - road_weight) + alignment_score * road_weight
-            )
-        model_consistency = max(0.0, min(1.0, model_consistency))
+        quality_score = max(0.0, min(1.0,
+            0.22 * global_reliability
+            + 0.22 * planning_reliability
+            + 0.12 * recent_reliability
+            + 0.16 * finite_quality
+            + 0.08 * sequence_quality
+            + 0.12 * direction_stability
+            + 0.08 * weighted_agreement
+        ))
+        confidence_label = "較高" if quality_score >= 0.72 else "中等" if quality_score >= 0.50 else "偏低"
 
         if signal_allowed:
-            signal_reason = "牌路、有限牌組、蒙地卡羅、粒子與序列模型已完成全模型集成，方向與品質門檻通過"
-            signal_status_text = "全模型方向訊號已開放"
+            signal_reason = "全歷史機率、完整牌路規劃、受限近期專家、有限牌組與序列 Stacking 門檻均通過"
+            signal_status_text = "V10.8 全歷史統合方向已開放"
         else:
             reasons: List[str] = []
             if not edge_ok:
-                reasons.append("全模型集成方向差距尚未達門檻")
+                reasons.append("Stacking 莊閒差距不足")
             if not uncertainty_ok:
-                reasons.append("模擬不確定性仍偏高")
+                reasons.append("蒙地卡羅不確定性偏高")
             if not validation_ok:
-                reasons.append("有限牌組與驗證層的一致度不足")
+                reasons.append("有限牌組驗證層差距偏高")
             if not agreement_ok:
-                reasons.append("各模型方向共識不足")
-            if not posterior_stability_ok:
-                reasons.append("後驗模擬方向穩定度不足")
-            if not posterior_interval_ok:
-                reasons.append("後驗方向區間仍跨越五成")
-            if not road_available:
-                reasons.append("牌路模型樣本不足，已由其餘模型重新分配權重")
+                reasons.append("五群組加權共識不足")
+            if not stability_ok:
+                reasons.append("後驗方向穩定度不足")
             signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
-            signal_status_text = "等待更明確的全模型共識"
+            signal_status_text = "等待更明確的全歷史統合訊號"
 
+        road_weight = weights.get("road_planning", 0.0) + weights.get("recent_road", 0.0)
         road_integration = {
             "processed_inside_core": True,
-            "present": road_state["present"],
+            "present": bool(resolved_road_context),
             "applied": road_weight > 0.0,
-            "eligible": road_state["eligible"],
-            "sample_count": road_state["sample_count"],
-            "road_direction": road_state["direction"],
-            "core_direction_before_road": core_direction,
+            "eligible": bool(resolved_road_context.get("ok")),
+            "sample_count": history_length,
+            "road_direction": "B" if planning_b >= 0.5 else "P",
             "final_direction": direction,
-            "fused_direction_before_override": fused_direction,
             "road_direction_primary": False,
             "all_models_participate": True,
-            "model_directions": model_directions,
-            "model_agreement": round(agreement, 6),
-            "aligned_with_core": road_aligned_with_core,
-            "aligned_with_final": road_aligned_with_final,
-            "requested_weight": round(float(road_state["requested_weight"]), 8),
             "effective_weight": round(road_weight, 8),
-            "road_confidence": round(float(road_state["confidence"]), 6),
-            "road_uncertainty": round(float(road_state["uncertainty"]), 6),
-            "road_engine": road_state["engine"],
+            "planning_weight": round(weights.get("road_planning", 0.0), 8),
+            "recent_weight": round(weights.get("recent_road", 0.0), 8),
+            "global_history_weight": round(weights.get("global_history", 0.0), 8),
+            "road_engine": str(resolved_road_context.get("engine") or ""),
         }
 
         return {
             "ok": True,
-            "engine": "V10_7_DYNAMIC_PARALLEL_POSTERIOR_ENSEMBLE",
-            "model_core": "parallel_groups_dynamic_quality_posterior_simulation",
+            "engine": "V10_8_FULL_HISTORY_ROAD_PLANNING_STACKING",
+            "model_core": "global_probability_road_planning_bounded_recent_finite_sequence",
             "pipeline_order": [
-                "parallel_finite_group_hypergeometric_mc_particle",
-                "parallel_road_ten_expert_group",
-                "parallel_sequence_group",
-                "dynamic_quality_aware_group_weights",
-                "posterior_ensemble_simulation",
-                "quality_and_observe_decision",
+                "full_history_probability_fit",
+                "complete_road_planning",
+                "bounded_recent_road_experts",
+                "finite_hypergeometric_mc_particle",
+                "sequence_probability",
+                "constrained_five_group_stacking",
+                "posterior_stability_and_signal_gate",
             ],
             "run_seed": run_seed,
             "virtual_only": True,
@@ -917,77 +907,77 @@ class VirtualShoeParticleEngine:
             "remaining_counts": counts,
             "probabilities": {"B": banker, "P": player, "T": tie},
             "raw_probabilities": {"B": banker, "P": player, "T": tie},
+            "stacked_probabilities_before_adaptation": {"B": banker, "P": player, "T": tie},
             "tie_signal_allowed": False,
             "banker_rate": round(banker * 100.0, 2),
             "player_rate": round(player * 100.0, 2),
             "tie_rate": round(tie * 100.0, 2),
             "no_tie_probabilities": {"B": banker_no_tie, "P": player_no_tie},
             "core_probabilities_before_road": {
-                "B": core_banker,
-                "P": core_player,
-                "T": core_tie,
+                "B": float(finite_group[0]),
+                "P": float(finite_group[1]),
+                "T": float(finite_group[2]),
             },
             "group_probabilities": {
-                "road": {"B": float(road_three[0]), "P": float(road_three[1]), "T": float(road_three[2])},
-                "finite": {"B": float(finite_group[0]), "P": float(finite_group[1]), "T": float(finite_group[2])},
-                "sequence": {"B": float(sequence_probability[0]), "P": float(sequence_probability[1]), "T": float(sequence_probability[2])},
+                "global_history": {key: float(global_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+                "road_planning": {key: float(planning_three[index]) for index, key in enumerate(OUTCOME_NAMES)},
+                "recent_road": {key: float(recent_three[index]) for index, key in enumerate(OUTCOME_NAMES)},
+                "finite": {key: float(finite_group[index]) for index, key in enumerate(OUTCOME_NAMES)},
+                "sequence": {key: float(sequence_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+                "road": {
+                    "B": float((planning_three[0] * weights.get("road_planning", 0.0) + recent_three[0] * weights.get("recent_road", 0.0)) / max(1e-12, road_weight)),
+                    "P": float((planning_three[1] * weights.get("road_planning", 0.0) + recent_three[1] * weights.get("recent_road", 0.0)) / max(1e-12, road_weight)),
+                    "T": core_tie,
+                } if road_weight > 0 else {"B": 0.5 * (1.0 - core_tie), "P": 0.5 * (1.0 - core_tie), "T": core_tie},
             },
-            "hypergeometric_probabilities": {
-                key: float(hyper_probability[index])
-                for index, key in enumerate(OUTCOME_NAMES)
+            "global_probability_model": global_result,
+            "road_planning_model": dict(resolved_road_context.get("full_road_analysis") or {}),
+            "recent_road_model": {
+                "banker_probability": recent_b,
+                "reliability": recent_reliability,
+                "uncertainty": resolved_road_context.get("recent_uncertainty"),
+                "model_disagreement": resolved_road_context.get("recent_model_disagreement"),
+                "models": dict(resolved_road_context.get("models") or {}),
             },
-            "monte_carlo_probabilities": {
-                key: float(mc_probability[index])
-                for index, key in enumerate(OUTCOME_NAMES)
-            },
-            "particle_probabilities": {
-                key: float(particle_probability[index])
-                for index, key in enumerate(OUTCOME_NAMES)
-            },
-            "sequence_probabilities": {
-                key: float(sequence_probability[index])
-                for index, key in enumerate(OUTCOME_NAMES)
-            },
-            "draw_path_probabilities": {
-                PATH_NAMES[index]: float(hyper_paths[index]) for index in range(4)
-            },
-            "monte_carlo_draw_path_probabilities": {
-                PATH_NAMES[index]: float(mc_path_probability[index]) for index in range(4)
-            },
-            "particle_draw_path_probabilities": {
-                PATH_NAMES[index]: float(particle_paths[index]) for index in range(4)
-            },
+            "hypergeometric_probabilities": {key: float(hyper_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+            "monte_carlo_probabilities": {key: float(mc_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+            "particle_probabilities": {key: float(particle_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+            "sequence_probabilities": {key: float(sequence_probability[index]) for index, key in enumerate(OUTCOME_NAMES)},
+            "draw_path_probabilities": {PATH_NAMES[index]: float(hyper_paths[index]) for index in range(4)},
+            "monte_carlo_draw_path_probabilities": {PATH_NAMES[index]: float(mc_path_probability[index]) for index in range(4)},
+            "particle_draw_path_probabilities": {PATH_NAMES[index]: float(particle_paths[index]) for index in range(4)},
             "confidence_interval_95": {
                 key: {"low": float(ci_lower[index]), "high": float(ci_upper[index])}
                 for index, key in enumerate(OUTCOME_NAMES)
             },
             "recommend": direction,
-            "recommend_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+            "recommend_text": "莊" if direction == "B" else "閒",
             "action": action,
             "action_text": "莊" if action == "B" else "閒" if action == "P" else "觀望",
             "direction_edge": float(direction_edge),
             "direction_edge_percent": round(direction_edge * 100.0, 4),
             "uncertainty": uncertainty,
             "ensemble_uncertainty": ensemble_uncertainty,
-            "posterior_direction_stability": posterior_direction_stability,
-            "posterior_interval_crosses_zero": posterior_interval_crosses_zero,
+            "posterior_direction_stability": direction_stability,
+            "posterior_interval_crosses_zero": bool(posterior.get("bp_difference_interval_crosses_zero", True)),
             "validation_gap": validation_gap,
             "max_validation_gap": MAX_VALIDATION_GAP,
             "max_signal_uncertainty": MAX_SIGNAL_UNCERTAINTY,
             "quality_score": round(quality_score, 6),
             "confidence_label": confidence_label,
-            "model_consistency": round(model_consistency, 6),
+            "model_consistency": round(weighted_agreement, 6),
             "signal_allowed": signal_allowed,
             "signal_status_text": signal_status_text,
             "signal_reason": signal_reason,
-            "direction_source": "dynamic_parallel_posterior_ensemble",
+            "direction_source": "full_history_constrained_stacking",
             "road_direction_primary": False,
             "all_models_participate": True,
             "model_directions": model_directions,
-            "model_agreement": round(agreement, 6),
-            "fused_direction_before_road_override": fused_direction,
+            "model_agreement": round(weighted_agreement, 6),
+            "fused_direction_before_road_override": direction,
             "road_integration": road_integration,
-            "dynamic_ensemble": dynamic_ensemble,
+            "stacking": stacking,
+            "dynamic_ensemble": stacking,
             "posterior_simulation": posterior,
             "composition_quality": composition_quality,
             "expected_values": expected_values,
@@ -998,13 +988,17 @@ class VirtualShoeParticleEngine:
                 "hypergeometric": round(hyper_weight, 6),
                 "monte_carlo": round(mc_weight, 6),
                 "particle": round(particle_weight, 6),
-                "sequence": round(sequence_weight, 6),
+                "global_history_group": round(weights.get("global_history", 0.0), 6),
+                "road_planning_group": round(weights.get("road_planning", 0.0), 6),
+                "recent_road_group": round(weights.get("recent_road", 0.0), 6),
+                "finite_group": round(weights.get("finite", 0.0), 6),
+                "sequence_group": round(weights.get("sequence", 0.0), 6),
                 "road_context": round(road_weight, 6),
-                "finite_group": round(group_weights["finite"], 6),
-                "road_group": round(group_weights["road"], 6),
-                "sequence_group": round(group_weights["sequence"], 6),
+                "road_group": round(road_weight, 6),
+                "sequence": round(weights.get("sequence", 0.0), 6),
                 "baseline_shrink": round(adaptive_shrink, 6),
                 "dynamic_weighting": True,
+                "bounded_stacking": True,
             },
             "hypergeometric_meta": hyper_meta,
             "sequence_meta": sequence_meta,
@@ -1014,13 +1008,14 @@ class VirtualShoeParticleEngine:
                 "replicas": self.settings.replicas,
                 "simulations_per_replica": self.settings.simulations_per_replica,
                 "total_mc_simulations": self.settings.replicas * self.settings.simulations_per_replica,
-                "replica_standard_error": {
-                    key: float(replica_se[index]) for index, key in enumerate(OUTCOME_NAMES)
-                },
+                "replica_standard_error": {key: float(replica_se[index]) for index, key in enumerate(OUTCOME_NAMES)},
                 "history_length": history_length,
+                "full_history_used_count": history_length,
                 "draw_path_history_length": len(draw_path_history or []),
                 "posterior_simulations": int(posterior.get("simulations", 0) or 0),
                 "composition_quality": composition_quality,
+                "recent_weight_capped": weights.get("recent_road", 0.0) <= 0.25 + 1e-9,
+                "finite_weight_not_double_penalized": weights.get("finite", 0.0) >= 0.12 - 1e-9,
             },
         }
 

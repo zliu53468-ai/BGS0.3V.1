@@ -1,8 +1,8 @@
-"""BGS 統一機率預測入口。
+"""BGS V10.8 統一機率預測入口。
 
-畫面模式會先由 ``road_model.py`` 建立牌路 context，再把 context 與估計剩餘
-牌值一起送入 ``VirtualShoeParticleEngine``。最終莊／閒／和／觀望由同一個主引擎
-統一決定，不再於 app.py 做第二次後置融合。
+V10.8 的主引擎已在內部完成全歷史機率、完整牌路規劃、近期專家、
+有限牌組與序列五群組 Stacking。舊 adaptive_ensemble 預設不再於後面
+二次改寫中心機率；線上校準器仍保留，但只做歷史校準與觀望閘門。
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import secrets
 
 from adaptive_ensemble import adapt_prediction
 from online_calibrator import calibrate_prediction
-
 from particle_filter_points import (
     DB_HOLDOUT,
     EngineSettings,
@@ -30,6 +29,10 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
         value = default
     return max(minimum, min(maximum, value))
 
+
+LEGACY_ADAPTIVE_AFTER_STACKING = (
+    os.getenv("LEGACY_ADAPTIVE_AFTER_STACKING", "0").strip() == "1"
+)
 
 _ENGINE = VirtualShoeParticleEngine(
     EngineSettings(
@@ -79,6 +82,26 @@ def _prediction_label(prediction: Mapping[str, Any]) -> str:
     return "偏低"
 
 
+def _post_process(
+    prediction: Mapping[str, Any],
+    *,
+    venue: str = "",
+    room: str = "",
+) -> Dict[str, Any]:
+    result = dict(prediction or {})
+    if LEGACY_ADAPTIVE_AFTER_STACKING:
+        result = adapt_prediction(result, venue=venue, room=room)
+    else:
+        result["adaptive_ensemble"] = {
+            "active": False,
+            "reason": "V10.8 主引擎已完成受限制五群組 Stacking，避免舊自適應層二次改寫中心機率",
+            "effective_share": 0.0,
+            "legacy_override_available": True,
+        }
+    result = calibrate_prediction(result, venue=venue, room=room)
+    return result
+
+
 def run_virtual_round(
     session: Mapping[str, Any],
     run_seed: Optional[int] = None,
@@ -104,6 +127,11 @@ def run_virtual_round(
         seed=seed,
         road_context=None,
     )
+    prediction = _post_process(
+        prediction,
+        venue=str(session.get("venue") or ""),
+        room=str(session.get("room") or ""),
+    )
 
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
@@ -121,7 +149,7 @@ def run_virtual_round(
         verdict = "MISS"
 
     prediction.update({
-        "model_version": "V9.7-UNIFIED-ENGINE",
+        "model_version": "V10.8-FULL-HISTORY-ROAD-PLANNING-STACKING",
         "mode": "virtual_shoe_click_only",
         "input_required": False,
         "confidence_label": _prediction_label(prediction),
@@ -158,7 +186,7 @@ def predict(
     shoe_context: Optional[Mapping[str, Any]] = None,
     road_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """機率預測 API；road_context 會在正式訊號決策前進入主引擎。"""
+    """機率預測 API；完整歷史與 road_context 在主引擎內分組統整。"""
     context = dict(shoe_context or {})
     counts = context.get("remaining_counts")
     if not isinstance(counts, Sequence) or len(counts) != 10:
@@ -180,17 +208,15 @@ def predict(
         seed=run_seed,
         road_context=dict(road_context or {}),
     )
-    # 自適應權重與三方校準只使用過去已結算資料；樣本不足時維持主引擎原值。
-    prediction = adapt_prediction(prediction, venue=venue, room=room)
-    prediction = calibrate_prediction(prediction, venue=venue, room=room)
+    prediction = _post_process(prediction, venue=venue, room=room)
     prediction.update({
         "venue": venue,
         "room": room,
         "shoe_id": shoe_id,
         "user_id": user_id,
         "input_required": False,
-        "mode": "probability_only_unified_calibrated",
-        "model_version": "V9.7-BPT-ROAD-FIRST-CALIBRATED",
+        "mode": "probability_only_full_history_stacking",
+        "model_version": "V10.8-FULL-HISTORY-ROAD-PLANNING-STACKING",
     })
     return prediction
 
