@@ -10,8 +10,7 @@ finite baccarat shoe.  Monte Carlo replicas and a low-weight hidden-order
 particle ensemble are retained as validation / uncertainty layers.
 
 This is a simulation engine.  It does not read or predict an external live table.
-V10 combines the road group, finite-shoe group, and sequence group into one weighted ensemble;
-all active models participate in the displayed next-round direction.
+V10.7 runs finite-shoe, road and sequence groups in parallel, then uses dynamic quality-aware weights and posterior simulation.
 """
 from __future__ import annotations
 
@@ -24,6 +23,8 @@ import random
 import secrets
 
 import numpy as np
+
+from dynamic_ensemble import dynamic_group_ensemble
 
 
 DEFAULT_BASELINE = np.asarray([0.458597, 0.446247, 0.095156], dtype=np.float64)
@@ -609,6 +610,9 @@ class VirtualShoeParticleEngine:
             "engine": str(road.get("engine") or ""),
             "signal_allowed": bool(road.get("signal_allowed")),
             "signal_reason": str(road.get("signal_reason") or ""),
+            "model_disagreement": float(road.get("model_disagreement", 0.20) or 0.20),
+            "models": dict(road.get("models") or {}),
+            "regime": dict(road.get("regime") or {}),
         }
 
     def analyze(
@@ -712,25 +716,53 @@ class VirtualShoeParticleEngine:
         )
         road_three = _normalize_probability(road_three)
 
-        group_weights = {
-            "road": ENSEMBLE_ROAD_GROUP_WEIGHT if road_available else 0.0,
-            "finite": ENSEMBLE_FINITE_GROUP_WEIGHT,
-            "sequence": ENSEMBLE_SEQUENCE_GROUP_WEIGHT if sequence_available else 0.0,
-        }
-        group_total = sum(group_weights.values()) or 1.0
-        group_weights = {name: value / group_total for name, value in group_weights.items()}
-
-        ensemble_probability = _normalize_probability(
-            road_three * group_weights["road"]
-            + finite_group * group_weights["finite"]
-            + sequence_probability * group_weights["sequence"]
+        # 三個群組平行完成後才整合。圖片／外部畫面模式沒有真實牌值，
+        # 因此有限牌組群組會被標記為 estimated composition，不會固定壓過牌路。
+        composition_quality = "estimated" if road_context else "observed"
+        dynamic_ensemble = dynamic_group_ensemble(
+            road_probability=road_three,
+            finite_probability=finite_group,
+            sequence_probability=sequence_probability,
+            road_context=dict(road_context or {}),
+            sequence_meta=sequence_meta,
+            history_length=history_length,
+            validation_gap=validation_gap,
+            simulation_uncertainty=uncertainty,
+            particle_ess_ratio=min(
+                1.0,
+                particle_ess / max(1.0, float(self.settings.particles)),
+            ),
+            composition_quality=composition_quality,
+            road_available=road_available,
+            sequence_available=sequence_available,
+            seed=(run_seed ^ 0xA5A5A5A5) & 0xFFFFFFFF,
         )
+        group_weights = dict(dynamic_ensemble["weights"])
+        dynamic_probabilities = dict(dynamic_ensemble["probabilities"])
+        ensemble_probability = _normalize_probability([
+            dynamic_probabilities["B"],
+            dynamic_probabilities["P"],
+            dynamic_probabilities["T"],
+        ])
         banker, player, tie = (float(value) for value in ensemble_probability)
         bp_total = max(1e-12, banker + player)
         banker_no_tie = banker / bp_total
         player_no_tie = player / bp_total
         direction = "B" if banker > player else "P"
         direction_edge = abs(banker_no_tie - player_no_tie)
+        posterior = dict(dynamic_ensemble.get("posterior") or {})
+        posterior_direction_stability = float(
+            posterior.get("direction_stability", 0.0) or 0.0
+        )
+        posterior_minimum_stability = float(
+            posterior.get("minimum_direction_stability", 0.60) or 0.60
+        )
+        posterior_interval_crosses_zero = bool(
+            posterior.get("bp_difference_interval_crosses_zero", True)
+        )
+        ensemble_uncertainty = float(
+            posterior.get("bp_difference_std", 1.0) or 1.0
+        )
 
         model_directions = {
             "road": road_direction if road_available else "",
@@ -761,8 +793,17 @@ class VirtualShoeParticleEngine:
         uncertainty_ok = uncertainty <= MAX_SIGNAL_UNCERTAINTY
         validation_ok = validation_gap <= MAX_VALIDATION_GAP
         agreement_ok = agreement >= ENSEMBLE_MIN_MODEL_AGREEMENT
+        posterior_stability_ok = (
+            posterior_direction_stability >= posterior_minimum_stability
+        )
+        posterior_interval_ok = not posterior_interval_crosses_zero
         signal_allowed = bool(
-            edge_ok and uncertainty_ok and validation_ok and agreement_ok
+            edge_ok
+            and uncertainty_ok
+            and validation_ok
+            and agreement_ok
+            and posterior_stability_ok
+            and posterior_interval_ok
         )
         action = direction if signal_allowed else "O"
         road_weight = group_weights["road"]
@@ -782,10 +823,11 @@ class VirtualShoeParticleEngine:
             0.0,
             min(
                 1.0,
-                0.30 * uncertainty_score
-                + 0.25 * edge_score
-                + 0.20 * validation_score
-                + 0.15 * hyper_weight
+                0.22 * uncertainty_score
+                + 0.22 * edge_score
+                + 0.18 * validation_score
+                + 0.16 * posterior_direction_stability
+                + 0.12 * hyper_weight
                 + 0.10 * particle_score,
             ),
         )
@@ -825,6 +867,10 @@ class VirtualShoeParticleEngine:
                 reasons.append("有限牌組與驗證層的一致度不足")
             if not agreement_ok:
                 reasons.append("各模型方向共識不足")
+            if not posterior_stability_ok:
+                reasons.append("後驗模擬方向穩定度不足")
+            if not posterior_interval_ok:
+                reasons.append("後驗方向區間仍跨越五成")
             if not road_available:
                 reasons.append("牌路模型樣本不足，已由其餘模型重新分配權重")
             signal_reason = "、".join(reasons) or "目前資料尚未形成正式方向訊號"
@@ -855,13 +901,14 @@ class VirtualShoeParticleEngine:
 
         return {
             "ok": True,
-            "engine": "V10_ALL_MODEL_GROUP_ENSEMBLE",
-            "model_core": "road_finite_sequence_group_ensemble",
+            "engine": "V10_7_DYNAMIC_PARALLEL_POSTERIOR_ENSEMBLE",
+            "model_core": "parallel_groups_dynamic_quality_posterior_simulation",
             "pipeline_order": [
-                "road_multi_model_group",
-                "hypergeometric_monte_carlo_particle_group",
-                "sequence_group",
-                "all_model_weighted_ensemble",
+                "parallel_finite_group_hypergeometric_mc_particle",
+                "parallel_road_ten_expert_group",
+                "parallel_sequence_group",
+                "dynamic_quality_aware_group_weights",
+                "posterior_ensemble_simulation",
                 "quality_and_observe_decision",
             ],
             "run_seed": run_seed,
@@ -921,6 +968,9 @@ class VirtualShoeParticleEngine:
             "direction_edge": float(direction_edge),
             "direction_edge_percent": round(direction_edge * 100.0, 4),
             "uncertainty": uncertainty,
+            "ensemble_uncertainty": ensemble_uncertainty,
+            "posterior_direction_stability": posterior_direction_stability,
+            "posterior_interval_crosses_zero": posterior_interval_crosses_zero,
             "validation_gap": validation_gap,
             "max_validation_gap": MAX_VALIDATION_GAP,
             "max_signal_uncertainty": MAX_SIGNAL_UNCERTAINTY,
@@ -930,13 +980,16 @@ class VirtualShoeParticleEngine:
             "signal_allowed": signal_allowed,
             "signal_status_text": signal_status_text,
             "signal_reason": signal_reason,
-            "direction_source": "all_model_group_ensemble",
+            "direction_source": "dynamic_parallel_posterior_ensemble",
             "road_direction_primary": False,
             "all_models_participate": True,
             "model_directions": model_directions,
             "model_agreement": round(agreement, 6),
             "fused_direction_before_road_override": fused_direction,
             "road_integration": road_integration,
+            "dynamic_ensemble": dynamic_ensemble,
+            "posterior_simulation": posterior,
+            "composition_quality": composition_quality,
             "expected_values": expected_values,
             "best_ev_side": best_ev_side,
             "best_ev": best_ev,
@@ -951,6 +1004,7 @@ class VirtualShoeParticleEngine:
                 "road_group": round(group_weights["road"], 6),
                 "sequence_group": round(group_weights["sequence"], 6),
                 "baseline_shrink": round(adaptive_shrink, 6),
+                "dynamic_weighting": True,
             },
             "hypergeometric_meta": hyper_meta,
             "sequence_meta": sequence_meta,
@@ -965,6 +1019,8 @@ class VirtualShoeParticleEngine:
                 },
                 "history_length": history_length,
                 "draw_path_history_length": len(draw_path_history or []),
+                "posterior_simulations": int(posterior.get("simulations", 0) or 0),
+                "composition_quality": composition_quality,
             },
         }
 
