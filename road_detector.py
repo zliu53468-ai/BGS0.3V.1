@@ -1,13 +1,11 @@
-"""遊戲畫面大路偵測模組 V10.9.1（自適應固定 6×15；非 MT 完整畫面也優先固定格）。
+"""遊戲畫面大路偵測模組 V10.10（內容自適應對焦 6×15；手機／電腦通用）。
 
 重點：
-1. MT 完整畫面只裁切右下方的大路區塊。
-2. DG / DB / SA / OB / T9 完整畫面同樣優先固定 6×15（venue ROI → generic ROI），
-   找圓 / YOLO 僅作 quality 失敗後的備援，避免再出現「未偵測到大路圓圈」誤導。
-3. 固定維持 6 列 × 15 欄，但先在 ROI 內微調有效格線範圍與內縮距離。
-4. 每格分別統計紅、藍、綠 HSV 像素；雙色接近標記 uncertain，不硬選。
-5. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不再把欄排序當正確答案。
-6. ROAD_GRID_DEBUG=1 可輸出疊格線除錯圖。
+1. 自動對焦：依紅／藍離散格狀密度搜尋最像大路的矩形，不依賴單一固定比例。
+2. MT 完整畫面（左荷官＋右路紙）不因 aspect 誤判成 road_crop；固定右下 ROI + 自動對焦並行。
+3. DG 等館：館別 ROI + 自動對焦 + generic；找圓僅備援。
+4. 固定 6×15 格內再微調格線；紅藍綠 HSV；長龍右黏反推；失敗不假排序。
+5. ROAD_GRID_DEBUG=1 可輸出疊格線除錯圖。
 """
 from __future__ import annotations
 
@@ -251,6 +249,163 @@ def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
     ).astype(np.uint8)
     union = ((red | blue | green) > 0).astype(np.uint8)
     return red, blue, green, union
+
+
+def _auto_detect_big_road_rois(
+    image: np.ndarray,
+    *,
+    venue_code: str = "",
+    max_results: int = 3,
+) -> List[Tuple[str, Tuple[float, float, float, float], float]]:
+    """依紅／藍色塊密度自動對焦最像大路的矩形區域（手機／電腦通用）。
+
+    回傳 [(name, normalized_roi, preference), ...]，preference 愈高愈優先。
+    大路區塊典型為扁長矩形（約 2~4 倍寬高比），且色點呈離散格狀而非連續影像。
+    """
+    if image is None or image.size == 0:
+        return []
+    height, width = image.shape[:2]
+    if height < 24 or width < 24:
+        return []
+
+    long_side = max(height, width)
+    scale = 1.0
+    work = image
+    if long_side > 720:
+        scale = 720.0 / float(long_side)
+        work = cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    wh, ww = work.shape[:2]
+    red, blue, _, _ = _color_masks(work)
+    color = ((red > 0) | (blue > 0)).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    color = cv2.morphologyEx(color, cv2.MORPH_OPEN, kernel)
+    integral = cv2.integral(color, sdepth=cv2.CV_32S)
+    total_color = int(color.sum())
+    if total_color < 30:
+        return []
+
+    venue = str(venue_code or "").upper()
+    width_ratios = [0.18, 0.22, 0.28, 0.35, 0.42, 0.55, 0.70, 0.85, 1.0]
+    height_ratios = [0.10, 0.12, 0.15, 0.18, 0.22, 0.28, 0.35, 0.42]
+    step_x = max(4, ww // 16)
+    step_y = max(4, wh // 14)
+
+    candidates: List[Tuple[float, int, int, int, int]] = []
+    for hr in height_ratios:
+        win_h = max(12, int(round(wh * hr)))
+        if win_h >= wh:
+            win_h = wh
+        for wr in width_ratios:
+            win_w = max(16, int(round(ww * wr)))
+            if win_w >= ww:
+                win_w = ww
+            aspect = win_w / max(1.0, float(win_h))
+            if aspect < 1.55 or aspect > 5.5:
+                continue
+            area = win_w * win_h
+            for y0 in range(0, max(1, wh - win_h + 1), step_y):
+                y1 = y0 + win_h
+                for x0 in range(0, max(1, ww - win_w + 1), step_x):
+                    x1 = x0 + win_w
+                    s = int(
+                        integral[y1, x1]
+                        - integral[y0, x1]
+                        - integral[y1, x0]
+                        + integral[y0, x0]
+                    )
+                    if s < 25:
+                        continue
+                    density = s / float(area)
+                    if density < 0.008 or density > 0.55:
+                        continue
+                    cx = (x0 + x1) * 0.5 / ww
+                    cy = (y0 + y1) * 0.5 / wh
+                    if venue == "MT":
+                        pos = 0.55 * cx + 0.45 * cy
+                        if cx < 0.35:
+                            continue
+                    else:
+                        pos = 0.35 * cx + 0.65 * cy
+                    gy, gx = 6, 10
+                    cell_h = max(1, win_h // gy)
+                    cell_w = max(1, win_w // gx)
+                    occupied = 0
+                    for r in range(gy):
+                        cy0 = y0 + r * cell_h
+                        cy1 = min(y1, cy0 + cell_h)
+                        for c in range(gx):
+                            cx0 = x0 + c * cell_w
+                            cx1 = min(x1, cx0 + cell_w)
+                            cell_sum = int(
+                                integral[cy1, cx1]
+                                - integral[cy0, cx1]
+                                - integral[cy1, cx0]
+                                + integral[cy0, cx0]
+                            )
+                            if cell_sum >= max(3, (cx1 - cx0) * (cy1 - cy0) // 40):
+                                occupied += 1
+                    occupy_ratio = occupied / float(gy * gx)
+                    if occupy_ratio < 0.06 or occupy_ratio > 0.92:
+                        continue
+                    score = (
+                        0.42 * min(1.0, density / 0.08)
+                        + 0.28 * occupy_ratio
+                        + 0.20 * pos
+                        + 0.10 * min(1.0, aspect / 3.0)
+                    )
+                    candidates.append((score, x0, y0, x1, y1))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    picked: List[Tuple[float, int, int, int, int]] = []
+    for cand in candidates:
+        _, x0, y0, x1, y1 = cand
+        area = max(1, (x1 - x0) * (y1 - y0))
+        overlap_too_much = False
+        for _, px0, py0, px1, py1 in picked:
+            ix0, iy0 = max(x0, px0), max(y0, py0)
+            ix1, iy1 = min(x1, px1), min(y1, py1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            if inter / area >= 0.55:
+                overlap_too_much = True
+                break
+        if not overlap_too_much:
+            picked.append(cand)
+        if len(picked) >= max(1, max_results):
+            break
+
+    inv = 1.0 / max(1e-9, scale)
+    results: List[Tuple[str, Tuple[float, float, float, float], float]] = []
+    for rank, (score, x0, y0, x1, y1) in enumerate(picked):
+        ox0 = max(0, int(round(x0 * inv)) - 2)
+        oy0 = max(0, int(round(y0 * inv)) - 2)
+        ox1 = min(width, int(round(x1 * inv)) + 2)
+        oy1 = min(height, int(round(y1 * inv)) + 2)
+        nx = ox0 / float(width)
+        ny = oy0 / float(height)
+        nw = max(0.02, (ox1 - ox0) / float(width))
+        nh = max(0.02, (oy1 - oy0) / float(height))
+        if nx + nw > 1.0:
+            nw = 1.0 - nx
+        if ny + nh > 1.0:
+            nh = 1.0 - ny
+        preference = 16.0 - rank * 1.5 + float(score) * 4.0
+        results.append(
+            (
+                f"auto_focus_road_{rank + 1}",
+                (round(nx, 6), round(ny, 6), round(nw, 6), round(nh, 6)),
+                preference,
+            )
+        )
+    return results
 
 
 def _axis_alignment(
@@ -999,12 +1154,33 @@ def detect_road_sequence_detailed(
 
     if requested not in {"auto", "full_screen", "road_crop", "wide_multi_road"}:
         requested = "auto"
-    wide_multi_road = requested == "wide_multi_road" or (
-        requested == "auto" and aspect >= WIDE_LAYOUT_MIN_ASPECT
-    )
-    likely_crop = requested == "road_crop" or (
-        requested == "auto" and ROAD_CROP_MIN_ASPECT <= aspect < WIDE_LAYOUT_MIN_ASPECT
-    )
+
+    # ── 輸入類型判斷 ──────────────────────────────────────────────
+    # MT 已知館別：完整畫面常為「左荷官直播 + 右路紙」，寬高比常落在
+    # 2.05~4.0，若仍依 aspect 當 road_crop 會把整張圖當 6×15 而失敗。
+    # 規則：
+    #   - input_type 明確指定 road_crop / wide_multi_road / full_screen → 尊重指定
+    #   - venue=MT 且 auto → 預設 full_screen（MT_FIXED_ROAD_ROI），不因 aspect 變 crop
+    #   - 其他館別 auto 仍可用 aspect 推斷 crop / wide
+    if requested == "road_crop":
+        wide_multi_road = False
+        likely_crop = True
+    elif requested == "wide_multi_road":
+        wide_multi_road = True
+        likely_crop = False
+    elif requested == "full_screen":
+        wide_multi_road = False
+        likely_crop = False
+    elif venue_code == "MT":
+        # auto + MT：信任完整畫面右下大路；僅極端超寬才當多路橫圖
+        wide_multi_road = aspect >= WIDE_LAYOUT_MIN_ASPECT
+        likely_crop = False
+    else:
+        wide_multi_road = aspect >= WIDE_LAYOUT_MIN_ASPECT
+        likely_crop = (
+            ROAD_CROP_MIN_ASPECT <= aspect < WIDE_LAYOUT_MIN_ASPECT
+        )
+
     detected_type = (
         "wide_multi_road"
         if wide_multi_road
@@ -1025,15 +1201,43 @@ def detect_road_sequence_detailed(
         ]
     ] = []
 
+    # 內容自適應對焦：依紅藍格狀密度找出大路候選框（手機／電腦通用）
+    auto_rois: List[Tuple[str, Tuple[float, float, float, float], float]] = []
+    try:
+        auto_rois = _auto_detect_big_road_rois(
+            image, venue_code=venue_code, max_results=3
+        )
+    except Exception as exc:
+        errors.append(f"auto_focus: {exc}")
+
     if venue_code == "MT" and not likely_crop and not wide_multi_road:
-        # MT 完整畫面：只掃右下方固定 6×15。
+        # MT 完整畫面（含左荷官）：預設右下固定格 + 自動對焦 + 擴大備援
         plan = [("mt_fixed_6x15", MT_FIXED_ROAD_ROI, 20.0, True)]
+        for name, roi, pref in auto_rois:
+            plan.append((f"mt_{name}", roi, max(pref, 17.0), True))
+        plan.append(
+            (
+                "mt_fixed_6x15_expanded",
+                _env_roi(
+                    "MT_FIXED_ROAD_ROI_ALT",
+                    (0.55, 0.62, 0.45, 0.36),
+                ),
+                14.0,
+                True,
+            )
+        )
+        plan.append(("mt_right_half_fixed_6x15", (0.48, 0.45, 0.52, 0.55), 11.0, True))
     elif likely_crop:
-        plan = [("road_crop_fixed_6x15", (0.0, 0.0, 1.0, 1.0), 15.0, True)]
+        # 使用者裁切圖：整張為主，仍可讓 auto 當備援（防裁切含多餘邊）
+        plan = [("road_crop_fixed_6x15", (0.0, 0.0, 1.0, 1.0), 18.0, True)]
+        for name, roi, pref in auto_rois:
+            plan.append((name, roi, min(pref, 12.0), True))
     elif wide_multi_road:
-        plan = [("wide_top_fixed_6x15", WIDE_TOP_ROAD_ROI, 10.0, True)]
+        plan = [("wide_top_fixed_6x15", WIDE_TOP_ROAD_ROI, 14.0, True)]
+        for name, roi, pref in auto_rois:
+            plan.append((name, roi, max(pref, 12.0), True))
     else:
-        # 完整畫面（含 DG）：一律先走固定 6×15，找圓僅備援。
+        # 完整畫面（含 DG）：館別 ROI + 自動對焦 + generic，找圓最後備援
         if venue_code in VENUE_ROIS:
             plan.append(
                 (
@@ -1045,9 +1249,10 @@ def detect_road_sequence_detailed(
             )
             for alt_name, alt_roi in VENUE_FALLBACK_ROIS.get(venue_code, []):
                 plan.append((f"{alt_name}_fixed_6x15", alt_roi, 12.0, True))
+        for name, roi, pref in auto_rois:
+            plan.append((name, roi, max(pref, 15.0), True))
         plan.append(("generic_road_fixed_6x15", ROAD_ROI, 10.0, True))
         if ROAD_CONTOUR_FALLBACK:
-            # 備援：同一 ROI 走找圓（分數較低，不會蓋過成功固定格）。
             if venue_code in VENUE_ROIS:
                 plan.append(
                     (
