@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import requests
+import cv2
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -53,8 +55,8 @@ MAX_CONCURRENT_PREDICTIONS = max(
     1, min(4, int(os.getenv("APP_MAX_CONCURRENT_PREDICTIONS", "2") or "2"))
 )
 LINE_IMAGE_ANALYSIS_TIMEOUT = max(
-    1.0,
-    min(3.5, float(os.getenv("LINE_IMAGE_ANALYSIS_TIMEOUT", "3.5") or "3.5")),
+    4.0,
+    min(25.0, float(os.getenv("LINE_IMAGE_ANALYSIS_TIMEOUT", "12.0") or "12.0")),
 )
 PREDICTION_QUEUE_TIMEOUT = max(
     5, min(55, int(os.getenv("APP_PREDICTION_QUEUE_TIMEOUT", "45") or "45"))
@@ -139,8 +141,8 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 
 app = FastAPI(
-    title="BGS V10.4 ReplyToken Sync Screen Bot",
-    version="10.4.0",
+    title="BGS AI預測系統",
+    version="10.4.1",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -665,6 +667,53 @@ def _download_line_image(
     return Path(temporary.name)
 
 
+
+def _prepare_analysis_image(source_path: Path) -> Path:
+    """保留原圖比例，只在解析度偏低時放大並轉存 PNG。
+
+    不改變 HSV 色相、不做銳化或強烈增豔，避免破壞紅／藍／綠牌路辨識。
+    高解析度原圖直接沿用，避免多餘重編碼。
+    """
+    path = Path(source_path)
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None or image.size == 0:
+        return path
+
+    height, width = image.shape[:2]
+    long_side = max(height, width)
+    short_side = min(height, width)
+
+    # LINE 壓縮後若圖片偏小，等比例放大，讓自動聚焦與格線分析保留更多像素。
+    target_long_side = 1800
+    target_short_side = 900
+    scale = max(
+        1.0,
+        target_long_side / max(1.0, float(long_side)),
+        target_short_side / max(1.0, float(short_side)),
+    )
+    scale = min(scale, 2.5)
+
+    if scale <= 1.05:
+        return path
+
+    resized = cv2.resize(
+        image,
+        (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        ),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    prepared = path.with_name(f"{path.stem}_analysis.png")
+    ok, encoded = cv2.imencode(".png", resized)
+    if not ok:
+        return path
+    encoded.tofile(str(prepared))
+    return prepared
+
+
+
 def _postback_button(
     label: str,
     action_name: str,
@@ -698,6 +747,130 @@ def _clean_flex(value: Any) -> Any:
     if isinstance(value, list):
         return [_clean_flex(item) for item in value]
     return value
+
+
+
+def guide_panel() -> Dict[str, Any]:
+    """結束分析或首次加入時顯示的 BGS AI 使用指南。"""
+    return _clean_flex(
+        {
+            "type": "flex",
+            "altText": "BGS AI預測系統使用指南",
+            "contents": {
+                "type": "bubble",
+                "size": "mega",
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#FFFFFF",
+                    "paddingAll": "18px",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "BGS AI預測系統",
+                            "weight": "bold",
+                            "size": "xl",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "text",
+                            "text": "富百家使用指南",
+                            "weight": "bold",
+                            "size": "xl",
+                            "margin": "sm",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "📍 操作 3 步驟\n"
+                                "同桌號：請確保程式選擇與平台一致的桌號資訊。\n"
+                                "數據校正：先讓系統預測 3～5 顆，再開始下注。\n"
+                                "跟隨訊號：依程式顯示的下一局方向評估操作。"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "separator",
+                            "margin": "md",
+                            "color": "#F1B900",
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "⚠️ 贏家 4 守則\n"
+                                "專屬平台：僅限配合平台使用，非合作平台數據會產生誤差。\n"
+                                "資金規劃：請將本金分成 20～30 等份，穩定下注。\n"
+                                "紀律停利：每次獲利達標即離場，科學下注、不戀戰。\n"
+                                "裝置綁定：程式已與您的 LINE 帳號綁定，無法轉借他人或跨裝置使用。"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "margin": "lg",
+                            "contents": [
+                                _postback_button(
+                                    "開始分析",
+                                    "start_guide",
+                                    color="#FFD400",
+                                )
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+    )
+
+
+def selected_venue_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
+    venue_name = _venue_name(str(session.get("venue") or ""))
+    return _clean_flex(
+        {
+            "type": "flex",
+            "altText": f"已選擇：{venue_name}",
+            "contents": {
+                "type": "bubble",
+                "size": "mega",
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#FFF4B8",
+                    "paddingAll": "18px",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "館別選擇完成",
+                            "weight": "bold",
+                            "size": "xl",
+                            "color": "#7B5600",
+                        },
+                        {
+                            "type": "text",
+                            "text": f"目前選擇：{venue_name}\n桌號：{session.get('room') or '1'}",
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "text",
+                            "text": "下一步請輸入本次分析本金，系統會依正式訊號提供配置建議。",
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                    ],
+                },
+            },
+        }
+    )
+
 
 
 def venue_panel(user_id: str) -> Dict[str, Any]:
@@ -740,7 +913,7 @@ def venue_panel(user_id: str) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "請選擇遊戲館",
+            "altText": "BGS AI預測系統－請選擇遊戲館",
             "contents": {"type": "carousel", "contents": bubbles},
         }
     )
@@ -784,7 +957,7 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
         "contents": [
             {
                 "type": "text",
-                "text": "BGS 智慧牌局分析",
+                "text": "BGS AI預測系統",
                 "weight": "bold",
                 "size": "xl",
                 "color": "#7B5600",
@@ -795,7 +968,7 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                     f"分析館別：{venue}\n"
                     f"桌號：{session.get('room') or '1'}\n"
                     f"資金設定：{bankroll_text}\n\n"
-                    "開始後將建立此 UID 的獨立牌局工作階段，首次上傳畫面完成初始化，後續每局只需回報莊或閒。"
+                    "選擇館別後請設定本金，再上傳最新完整遊戲畫面。首次辨識完成後，每局只需回報莊／閒／和。"
                 ),
                 "wrap": True,
                 "margin": "md",
@@ -817,7 +990,7 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "BGS 智慧牌局分析",
+            "altText": "BGS AI預測系統",
             "contents": {"type": "bubble", "size": "mega", "body": body},
         }
     )
@@ -893,7 +1066,7 @@ def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, 
                                 f"館別：{_venue_name(str(session.get('venue') or ''))}\n"
                                 f"桌號：{session.get('room') or '1'}\n"
                                 f"本金：{_format_money(session.get('bankroll', 0))} 元\n\n"
-                                "請上傳目前最新完整遊戲畫面，建議包含館別／桌號、剩餘張數與完整大路區域。"
+                                "請開始上傳最新完整遊戲畫面進行分析。建議保留完整大路區域，避免裁掉左上起始格與六列格線。"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -1081,108 +1254,81 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
-    """首次圖片或後續 B/P/T 結果完成後的 UID 獨立專業分析面板。"""
+    """精簡預測面板：正式訊號就是下一局方向評估。"""
     prediction = dict(session.get("screen_last_prediction") or {})
-    ocr = dict(session.get("screen_last_ocr") or {})
-    detection = dict(session.get("screen_last_detection") or {})
-    road_support = dict(prediction.get("road_support") or {})
-    fusion = dict(prediction.get("road_integration") or prediction.get("road_fusion") or {})
     calibration = dict(prediction.get("calibration") or {})
     adaptive = dict(prediction.get("adaptive_ensemble") or {})
-    sequence = [str(item).upper() for item in list(session.get("road_sequence") or []) if str(item).upper() in {"B", "P"}]
-    raw_outcomes = [str(item).upper() for item in list(session.get("raw_outcomes") or sequence) if str(item).upper() in {"B", "P", "T"}]
-    tie_total = int(session.get("tie_total", 0) or sum(1 for item in raw_outcomes if item == "T"))
+    road_support = dict(prediction.get("road_support") or {})
 
-    venue_code = str(ocr.get("venue_code") or session.get("venue") or "")
-    venue_name = str(ocr.get("venue_name") or _venue_name(venue_code))
-    room = str(ocr.get("room") or session.get("room") or session.get("last_confirmed_room") or "1")
-    remaining = int(prediction.get("screen_remaining_cards") or session.get("screen_remaining_cards") or ocr.get("remaining_cards") or 416)
-    direction = str(prediction.get("recommend_text") or "尚未建立")
-    action_code = str(prediction.get("action") or "O").upper()
-    action = str(prediction.get("action_text") or "觀望")
-    signal_status = str(prediction.get("signal_status_text") or ("方向訊號已開放" if action_code in {"B", "P", "T"} else "等待更明確訊號"))
-    signal_reason = str(prediction.get("signal_reason") or "模型正在等待更明確的方向差距")
+    # 正式訊號優先採用模型在公開方向覆寫前保留的 internal_* 欄位。
+    formal_code = str(
+        prediction.get("internal_action")
+        or prediction.get("internal_recommend")
+        or prediction.get("action")
+        or prediction.get("recommend")
+        or ""
+    ).upper().strip()
+    if formal_code not in {"B", "P"}:
+        banker = float(prediction.get("banker_rate", 0.0) or 0.0)
+        player = float(prediction.get("player_rate", 0.0) or 0.0)
+        formal_code = "B" if banker >= player else "P"
+
+    formal_text = "莊" if formal_code == "B" else "閒"
+    direction_color = "#D52B2B" if formal_code == "B" else "#2667D8"
+    prediction["formal_direction"] = formal_code
+    prediction["formal_direction_text"] = formal_text
+    prediction["next_round_direction"] = formal_code
+    prediction["next_round_direction_text"] = formal_text
+
+    action_code = str(prediction.get("internal_action") or "").upper().strip()
+    internal_observe = action_code == "O"
+    signal_status = (
+        "正式訊號已確認"
+        if not internal_observe
+        else "正式模型原為低優勢，已依正式模型方向輸出"
+    )
+    signal_reason = str(
+        prediction.get("internal_signal_reason")
+        or prediction.get("signal_reason")
+        or "依正式模型、校準結果與方向機率產生"
+    )
+
     quality_score = float(prediction.get("quality_score", 0.0) or 0.0)
     confidence_label = str(prediction.get("confidence_label") or "偏低")
-    edge_percent = float(prediction.get("direction_edge_percent") or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0)
+    edge_percent = float(
+        prediction.get("direction_edge_percent")
+        or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0
+    )
     consistency = float(prediction.get("model_consistency", 0.0) or 0.0) * 100.0
     analysis_number = int(session.get("screen_analysis_count", 0) or 0)
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
-    bet_level = str(prediction.get("bet_level_text") or "暫緩配置")
-    bet_reason = str(prediction.get("bet_reason") or signal_reason)
-    manual_rounds = int(session.get("screen_manual_rounds", 0) or 0)
-    recognized = int(detection.get("recognized_count", 0) or 0)
+    bet_level = str(prediction.get("bet_level_text") or "標準區間")
+    bet_text = (
+        f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
+        if suggested > 0
+        else "0 元"
+    )
     road_direction = str(road_support.get("direction_text") or "資料建立中")
-    road_samples = int(road_support.get("sample_count", len(sequence)) or len(sequence))
-    fusion_text = "已納入統一核心" if bool(fusion.get("applied")) else "已檢查／核心為主"
-    input_type = str(session.get("screen_input_type") or prediction.get("screen_input_type") or detection.get("input_type") or "unknown")
-    input_type_text = "牌路裁切圖" if input_type == "road_crop" else "完整遊戲畫面" if input_type == "full_screen" else "遊戲畫面"
-    room_source = str(session.get("screen_room_source") or prediction.get("room_source") or ocr.get("room_source") or "")
-    room_source_text = "畫面辨識" if room_source == "image_ocr" else "沿用目前分析桌"
-    data_quality = f"{input_type_text}已完成辨識" if recognized > 0 else "沿用本桌牌路資料"
-    bet_text = f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）" if suggested > 0 else "0 元（暫緩配置）"
-    direction_color = {"莊": "#D52B2B", "閒": "#2667D8", "和": "#159447"}.get(direction, "#7B5600")
     calibration_text = (
         f"已啟用｜{calibration.get('scope')}｜{int(calibration.get('sample_count', 0) or 0)} 筆"
-        if calibration.get("active") else f"累積中｜{int(calibration.get('sample_count', 0) or 0)} 筆"
+        if calibration.get("active")
+        else f"累積中｜{int(calibration.get('sample_count', 0) or 0)} 筆"
     )
     adaptive_text = (
         f"已啟用｜{float(adaptive.get('effective_share', 0.0) or 0.0) * 100.0:.1f}%"
-        if adaptive.get("active") else "樣本累積中"
+        if adaptive.get("active")
+        else "樣本累積中"
     )
 
-    return _clean_flex({
-        "type": "flex", "altText": f"BGS 下一局方向：{direction}", "quickReply": _road_quick_reply(),
-        "contents": {
-            "type": "bubble", "size": "mega",
-            "body": {
-                "type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px",
-                "contents": [
-                    {"type": "text", "text": f"BGS 下一局分析 #{analysis_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
-                    {"type": "text", "text": (
-                        f"館別：{venue_name or '-'}｜桌號：{room}（{room_source_text}）\n"
-                        f"圖片確認：{int(session.get('initial_recognized_count', 0) or 0)} 局｜後續輸入：{len(session.get('manual_outcome_history') or [])} 局\n"
-                        f"模型完整歷史：{len(raw_outcomes)} 局｜大路：{len(sequence)} 局｜和局：{tie_total} 局\n"
-                        f"估計剩餘：{remaining} 張｜不確定格：{int(session.get('initial_uncertain_count', 0) or 0)}"
-                    ), "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
-                    {"type": "separator", "margin": "md", "color": "#E1BD43"},
-                    {"type": "text", "text": f"下一局方向評估：{direction}", "weight": "bold", "size": "xl", "margin": "md", "color": direction_color},
-                    {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": [
-                        {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
-                        {"type": "text", "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%", "color": "#2667D8", "weight": "bold"},
-                        {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
-                    ]},
-                    {"type": "text", "text": (
-                        f"正式訊號：{action}\n訊號狀態：{signal_status}\n方向優勢：{edge_percent:.2f}%\n"
-                        f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n模型一致度：{consistency:.1f}%\n"
-                        f"牌路先行：{road_direction}｜整合：{fusion_text}"
-                    ), "wrap": True, "margin": "md", "color": "#3E3100"},
-                    {"type": "text", "text": f"校準狀態：{calibration_text}\n自適應集成：{adaptive_text}", "wrap": True, "size": "sm", "margin": "md", "color": "#665000"},
-                    {"type": "text", "text": f"訊號說明：{signal_reason}", "wrap": True, "size": "sm", "margin": "md", "color": "#665000"},
-                    {"type": "separator", "margin": "md", "color": "#E1BD43"},
-                    {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}\n配置依據：{bet_reason}", "wrap": True, "margin": "md", "color": "#3E3100"},
-                    {"type": "text", "text": f"資料狀態：{data_quality}\n牌路統計樣本：{road_samples} 局", "wrap": True, "size": "sm", "margin": "md", "color": "#806A2A"},
-                    {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
-                        _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
-                        _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
-                        _postback_button("🟢 本局結果：和", "road_append", color="#159447", result="T"),
-                        _postback_button("結束本次分析", "end", style="secondary"),
-                    ]},
-                    {"type": "text", "text": "首次圖片後，每局只需回報莊／閒／和。系統會用實際結果結算上一筆預測並更新校準資料。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
-                ],
-            },
-        },
-    })
-
-def ended_panel() -> Dict[str, Any]:
     return _clean_flex(
         {
             "type": "flex",
-            "altText": "分析已結束",
+            "altText": f"BGS AI 下一局方向：{formal_text}",
             "contents": {
                 "type": "bubble",
+                "size": "mega",
                 "body": {
                     "type": "box",
                     "layout": "vertical",
@@ -1191,25 +1337,141 @@ def ended_panel() -> Dict[str, Any]:
                     "contents": [
                         {
                             "type": "text",
-                            "text": "本次分析已結束",
+                            "text": f"BGS AI 下一局分析 #{analysis_number}",
                             "weight": "bold",
                             "size": "xl",
                             "color": "#7B5600",
                         },
                         {
+                            "type": "separator",
+                            "margin": "md",
+                            "color": "#E1BD43",
+                        },
+                        {
                             "type": "text",
-                            "text": "此 UID 的本次牌路、OCR 與預測已獨立清除；開通權限、館別與本金仍保留。",
+                            "text": f"下一局方向評估：{formal_text}",
+                            "weight": "bold",
+                            "size": "xl",
+                            "margin": "md",
+                            "color": direction_color,
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "spacing": "sm",
+                            "margin": "md",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%",
+                                    "color": "#D52B2B",
+                                    "weight": "bold",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%",
+                                    "color": "#2667D8",
+                                    "weight": "bold",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%",
+                                    "color": "#259B55",
+                                    "weight": "bold",
+                                },
+                            ],
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"正式訊號：{formal_text}\n"
+                                f"訊號狀態：{signal_status}\n"
+                                f"方向優勢：{edge_percent:.2f}%\n"
+                                f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
+                                f"模型一致度：{consistency:.1f}%\n"
+                                f"牌路先行：{road_direction}"
+                            ),
                             "wrap": True,
                             "margin": "md",
-                            "color": "#4C3900",
+                            "color": "#3E3100",
                         },
-                        _postback_button("同館再次開始", "restart_screen"),
-                        _postback_button("重新選館", "venues", style="secondary"),
+                        {
+                            "type": "text",
+                            "text": (
+                                f"校準狀態：{calibration_text}\n"
+                                f"自適應集成：{adaptive_text}"
+                            ),
+                            "wrap": True,
+                            "size": "sm",
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                        {
+                            "type": "text",
+                            "text": f"訊號說明：{signal_reason}",
+                            "wrap": True,
+                            "size": "sm",
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                        {
+                            "type": "separator",
+                            "margin": "md",
+                            "color": "#E1BD43",
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"分析本金：{_format_money(bankroll)} 元\n"
+                                f"建議配置：{bet_text}"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "spacing": "sm",
+                            "margin": "lg",
+                            "contents": [
+                                _postback_button(
+                                    "🔴 本局結果：莊",
+                                    "road_append",
+                                    color="#D52B2B",
+                                    result="B",
+                                ),
+                                _postback_button(
+                                    "🔵 本局結果：閒",
+                                    "road_append",
+                                    color="#2667D8",
+                                    result="P",
+                                ),
+                                _postback_button(
+                                    "🟢 本局結果：和",
+                                    "road_append",
+                                    color="#159447",
+                                    result="T",
+                                ),
+                                _postback_button(
+                                    "結束本次分析",
+                                    "end",
+                                    style="secondary",
+                                ),
+                            ],
+                        },
                     ],
                 },
             },
         }
     )
+
+
+
+def ended_panel() -> Dict[str, Any]:
+    """結束後回到使用指南，不自動跳過館別與本金流程。"""
+    return guide_panel()
+
 
 
 def _activate_code(user_id: str, code: str) -> str:
@@ -1480,6 +1742,7 @@ def _process_screen_image_sync(
 ) -> List[Dict[str, Any]]:
     """在工作執行緒內完整處理圖片，最後把 Reply API 所需訊息直接回傳給 Webhook。"""
     temporary_image: Optional[Path] = None
+    analysis_image: Optional[Path] = None
     started = time.perf_counter()
     image_lock = _user_image_lock(user_id)
     image_lock_acquired = False
@@ -1508,7 +1771,8 @@ def _process_screen_image_sync(
         download_ms = (time.perf_counter() - download_started) * 1000.0
 
         _raise_if_image_timed_out(cancel_event, deadline)
-        screen = analyze_game_screen(temporary_image, current_session)
+        analysis_image = _prepare_analysis_image(temporary_image)
+        screen = analyze_game_screen(analysis_image, current_session)
         _raise_if_image_timed_out(cancel_event, deadline)
 
         sequence = list(screen.get("sequence") or [])
@@ -1665,6 +1929,8 @@ def _process_screen_image_sync(
                 _PREDICTION_SLOTS.release()
             finally:
                 prediction_slot_acquired = False
+        if analysis_image is not None and analysis_image != temporary_image:
+            analysis_image.unlink(missing_ok=True)
         if temporary_image is not None:
             temporary_image.unlink(missing_ok=True)
         if image_lock_acquired:
@@ -1970,7 +2236,7 @@ async def webhook(request: Request) -> JSONResponse:
             message_type = str(message.get("type") or "")
 
             if event_type == "follow":
-                _reply(token, [venue_panel(user_id)])
+                _reply(token, [guide_panel()])
                 continue
 
             # 圖片事件：直接在 Webhook 內等待分析完成，再用同一個 replyToken 回覆。
@@ -2053,7 +2319,7 @@ async def webhook(request: Request) -> JSONResponse:
                     saved = store.get_session(user_id)
                     if plan == "永久版" and not bool(saved.get("permanent_access")):
                         raise RuntimeError("開通資料未成功寫入，請檢查 SESSION_DATA_FILE 儲存路徑。")
-                    _reply(token, [_text(f"✅ 已開通：{plan}"), venue_panel(user_id)])
+                    _reply(token, [_text(f"✅ 已開通：{plan}"), guide_panel()])
                     continue
 
                 if text in {"開通碼檢查", "檢查開通碼", "版本檢查"}:
@@ -2061,7 +2327,7 @@ async def webhook(request: Request) -> JSONResponse:
                         token,
                         [
                             _text(
-                                "BGS 版本：10.4.0\n"
+                                "BGS AI預測系統版本：10.4.1\n"
                                 f"永久碼載入數：{len(PERMANENT_CODES)}\n"
                                 f"aaa1888007 已載入：{'是' if 'aaa1888007' in PERMANENT_CODES else '否'}"
                             )
@@ -2128,8 +2394,7 @@ async def webhook(request: Request) -> JSONResponse:
                     _reply(token, [venue_panel(user_id)])
                     continue
                 if text in {"開始分析"}:
-                    result = _start_screen_flow(user_id, new_session=True)
-                    _reply(token, [result["panel"]])
+                    _reply(token, [venue_panel(user_id)])
                     continue
                 if text in {"上傳圖片", "圖片辨識", "路紙", "路單"}:
                     result = _start_screen_flow(user_id, new_session=False)
@@ -2164,7 +2429,9 @@ async def webhook(request: Request) -> JSONResponse:
                 }
                 action_name = str(query.get("action") or "")
 
-                if action_name == "road_append":
+                if action_name == "start_guide":
+                    _reply(token, [venue_panel(user_id)])
+                elif action_name == "road_append":
                     value = str(query.get("result") or "").upper()
                     if value not in {"B", "P", "T"}:
                         raise ValueError("手動牌局結果不正確。")
@@ -2191,7 +2458,14 @@ async def webhook(request: Request) -> JSONResponse:
                         venue,
                         str(query.get("room") or "1"),
                     )
-                    _reply(token, [ready_panel(user_id, session)])
+                    session = _request_bankroll(user_id)
+                    _reply(
+                        token,
+                        [
+                            selected_venue_panel(session),
+                            bankroll_panel(user_id, session),
+                        ],
+                    )
                 elif action_name in {"start_screen", "restart_screen"}:
                     result = _start_screen_flow(user_id, new_session=True)
                     _reply(token, [result["panel"]])
