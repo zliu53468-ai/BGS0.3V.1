@@ -1,4 +1,4 @@
-"""BGS V10.9 統一機率預測入口。
+"""BGS V10.9 牌路先行、對外固定輸出莊閒方向的統一預測入口。
 
 虛擬牌靴有真實剩餘牌組時，有限牌組可作主要訊號；圖片／真人桌只有歷史
 B/P/T 與估計組成時，會把機率收縮回 8 副牌先驗、壓低路型品質並提高觀望門檻。
@@ -45,7 +45,7 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 LEGACY_ADAPTIVE_AFTER_STACKING = os.getenv("LEGACY_ADAPTIVE_AFTER_STACKING", "0").strip() == "1"
 PREDICT_SCREEN_MIN_RECOGNIZED = _env_int("PREDICT_SCREEN_MIN_RECOGNIZED", 8, 1, 90)
 PREDICT_ESTIMATED_PRIOR_SHRINK = _env_float(
-    "PREDICT_ESTIMATED_PRIOR_SHRINK", 0.55, 0.0, 0.98
+    "PREDICT_ESTIMATED_PRIOR_SHRINK", 0.42, 0.0, 0.98
 )
 PREDICT_BAD_SCAN_PRIOR_SHRINK = _env_float(
     "PREDICT_BAD_SCAN_PRIOR_SHRINK", 0.90, 0.0, 1.0
@@ -60,7 +60,13 @@ PREDICT_ESTIMATED_MIN_AGREEMENT = _env_float(
     "PREDICT_ESTIMATED_MIN_AGREEMENT", 0.62, 0.0, 1.0
 )
 PREDICT_SCREEN_ROAD_QUALITY_SCALE = _env_float(
-    "PREDICT_SCREEN_ROAD_QUALITY_SCALE", 0.35, 0.0, 1.0
+    "PREDICT_SCREEN_ROAD_QUALITY_SCALE", 0.72, 0.0, 1.0
+)
+PREDICT_ROAD_FIRST_DIRECTION = os.getenv(
+    "PREDICT_ROAD_FIRST_DIRECTION", "1"
+).strip() == "1"
+PREDICT_ROAD_FIRST_MIN_AGREEMENT = _env_float(
+    "PREDICT_ROAD_FIRST_MIN_AGREEMENT", 0.64, 0.50, 0.95
 )
 PREDICT_ESTIMATED_MAX_QUALITY = _env_float(
     "PREDICT_ESTIMATED_MAX_QUALITY", 0.58, 0.0, 1.0
@@ -303,6 +309,33 @@ def _apply_mode_action_guard(
     agreement = _nested_metric(result, "weighted_agreement")
     reasons: List[str] = []
 
+    road_first_meta = result.get("road_first")
+    if not isinstance(road_first_meta, Mapping):
+        for container_key in ("stacking", "ensemble", "group_ensemble"):
+            container = result.get(container_key)
+            if isinstance(container, Mapping) and isinstance(container.get("road_first"), Mapping):
+                road_first_meta = container.get("road_first")
+                break
+    road_first = dict(road_first_meta or {})
+    road_first_direction = str(road_first.get("direction") or "").upper().strip()
+    road_first_quality = float(road_first.get("quality", 0.0) or 0.0)
+    road_first_active = bool(
+        PREDICT_ROAD_FIRST_DIRECTION
+        and road_first.get("active")
+        and road_first_direction in {"B", "P"}
+        and road_first_quality >= PREDICT_ROAD_FIRST_MIN_AGREEMENT
+    )
+    model_direction = str(result.get("recommend") or "").upper().strip()
+    if model_direction not in {"B", "P"}:
+        model_direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
+    road_first_conflict = bool(
+        road_first_active and model_direction != road_first_direction
+    )
+    if road_first_conflict:
+        reasons.append(
+            f"牌路先行方向 {road_first_direction} 與完整模型方向 {model_direction} 衝突"
+        )
+
     if bool(road_quality.get("bad")):
         reasons.append("圖片牌路品質未通過對齊、顏色或完整反推檢查")
     if not reliable_composition:
@@ -343,9 +376,96 @@ def _apply_mode_action_guard(
         "minimum_stability": PREDICT_ESTIMATED_MIN_STABILITY if not reliable_composition else None,
         "weighted_agreement": agreement,
         "minimum_agreement": PREDICT_ESTIMATED_MIN_AGREEMENT if not reliable_composition else None,
+        "road_first": {
+            **road_first,
+            "guard_enabled": bool(PREDICT_ROAD_FIRST_DIRECTION),
+            "guard_active": bool(road_first_active),
+            "minimum_agreement": float(PREDICT_ROAD_FIRST_MIN_AGREEMENT),
+            "model_direction": model_direction,
+            "conflict": bool(road_first_conflict),
+        },
         "forced_observe": bool(reasons),
         "reasons": reasons,
     }
+    return result
+
+
+
+def _extract_road_first(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """從主結果或 Stacking 容器取出牌路先行資訊。"""
+    direct = result.get("road_first")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+    for container_key in ("stacking", "ensemble", "group_ensemble"):
+        container = result.get(container_key)
+        if isinstance(container, Mapping):
+            nested = container.get("road_first")
+            if isinstance(nested, Mapping):
+                return dict(nested)
+    mode_guard = result.get("mode_guard")
+    if isinstance(mode_guard, Mapping):
+        nested = mode_guard.get("road_first")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    return {}
+
+
+def _direction_from_probabilities(result: Mapping[str, Any]) -> str:
+    probabilities = _result_probabilities(result)
+    return "B" if probabilities["B"] >= probabilities["P"] else "P"
+
+
+def _apply_public_road_first_direction(
+    prediction: Mapping[str, Any],
+    *,
+    screenshot_mode: bool,
+) -> Dict[str, Any]:
+    """圖片／真人桌對外永遠顯示莊或閒，且牌路先行優先。
+
+    內部原始 action、signal_allowed 與觀望原因完整保存在 internal_* 欄位，
+    方便後續回測；對外 action/recommend/next_round_direction 保持一致。
+    """
+    result = dict(prediction or {})
+    internal_action = str(result.get("action") or "O").upper().strip()
+    internal_recommend = str(result.get("recommend") or "").upper().strip()
+    result["internal_action"] = internal_action
+    result["internal_recommend"] = internal_recommend
+    result["internal_signal_allowed"] = bool(result.get("signal_allowed", False))
+    result["internal_signal_reason"] = str(result.get("signal_reason") or "")
+
+    road_first = _extract_road_first(result)
+    road_direction = str(
+        road_first.get("direction")
+        or road_first.get("planning_direction")
+        or ""
+    ).upper().strip()
+
+    if screenshot_mode and road_direction in {"B", "P"}:
+        public_direction = road_direction
+        direction_source = "road_first"
+    elif internal_recommend in {"B", "P"}:
+        public_direction = internal_recommend
+        direction_source = "complete_model"
+    else:
+        public_direction = _direction_from_probabilities(result)
+        direction_source = "probability_fallback"
+
+    result["next_round_direction"] = public_direction
+    result["next_round_direction_text"] = "莊" if public_direction == "B" else "閒"
+    result["direction_source"] = direction_source
+    result["road_first_display"] = {
+        **road_first,
+        "selected_direction": public_direction,
+        "selected_direction_text": "莊" if public_direction == "B" else "閒",
+        "source": direction_source,
+    }
+
+    # 對外不再回傳 O；下一局方向評估與 recommend/action 完全一致。
+    result["recommend"] = public_direction
+    result["action"] = public_direction
+    result["action_text"] = "莊" if public_direction == "B" else "閒"
+    result["signal_allowed"] = True
+    result["signal_status_text"] = "下一局方向評估"
     return result
 
 
@@ -554,9 +674,9 @@ def predict(
                 else "estimated_composition_conservative"
             ),
             "model_version": (
-                "V10.9-RULE-AWARE-SCREENSHOT-CONSERVATIVE"
+                "V10.9-ROAD-FIRST-ALWAYS-DIRECTION-SCREENSHOT"
                 if screenshot_mode
-                else "V10.9-RULE-AWARE-ESTIMATED-CONSERVATIVE"
+                else "V10.9-ROAD-FIRST-ALWAYS-DIRECTION-ESTIMATED"
             ),
             "composition_quality": composition_quality,
             "remaining_counts_source": "provided_reliable" if reliable_composition else "fresh_prior_or_estimate",
@@ -568,6 +688,10 @@ def predict(
                 else "未提供可驗證的真實剩餘牌組，機率以標準先驗為中心並採保守觀望；歷史路型不具額外因果力。"
             ),
         }
+    )
+    prediction = _apply_public_road_first_direction(
+        prediction,
+        screenshot_mode=screenshot_mode,
     )
     return prediction
 
