@@ -1,11 +1,13 @@
-"""遊戲畫面大路偵測模組 V10.9（自適應固定 6×15 大路掃描版）。
+"""遊戲畫面大路偵測模組 V10.9.1（自適應固定 6×15；非 MT 完整畫面也優先固定格）。
 
 重點：
-1. MT 完整畫面只裁切右下方的大路區塊，不再掃描珠盤路、下三路或整張圖片。
-2. 固定維持 6 列 × 15 欄，但先在 ROI 內微調有效格線範圍與內縮距離。
-3. 每格分別統計紅、藍、綠 HSV 像素；雙色接近標記 uncertain，不硬選。
-4. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不再把欄排序當正確答案。
-5. 可用 ROAD_GRID_DEBUG=1 輸出疊格線除錯圖；其他館別仍保留原流程。
+1. MT 完整畫面只裁切右下方的大路區塊。
+2. DG / DB / SA / OB / T9 完整畫面同樣優先固定 6×15（venue ROI → generic ROI），
+   找圓 / YOLO 僅作 quality 失敗後的備援，避免再出現「未偵測到大路圓圈」誤導。
+3. 固定維持 6 列 × 15 欄，但先在 ROI 內微調有效格線範圍與內縮距離。
+4. 每格分別統計紅、藍、綠 HSV 像素；雙色接近標記 uncertain，不硬選。
+5. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不再把欄排序當正確答案。
+6. ROAD_GRID_DEBUG=1 可輸出疊格線除錯圖。
 """
 from __future__ import annotations
 
@@ -68,11 +70,10 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-# 一般館別備援區域。
-ROAD_ROI = _env_roi("ROAD_ROI", (0.0, 0.58, 1.0, 0.42))
+# 一般館別備援區域（下半大路常見區，較寬以利手機截圖）。
+ROAD_ROI = _env_roi("ROAD_ROI", (0.0, 0.55, 1.0, 0.45))
 
-# MT 1728×903 範例中的實際大路區塊：x=1071, y=647, w=348, h=134。
-# 使用比例座標後，畫面同比例縮放時仍可沿用。
+# MT 1728×903 範例中的實際大路區塊。
 MT_FIXED_ROAD_ROI = _env_roi(
     "MT_FIXED_ROAD_ROI",
     (0.619791667, 0.716500554, 0.201388889, 0.148394241),
@@ -84,13 +85,35 @@ WIDE_TOP_ROAD_ROI = _env_roi(
     (0.265, 0.00, 0.735, 0.64),
 )
 
+# DG 等館：預設改為較寬的下半／中下大路區，避免舊版 y=0.80 窄帶裁空。
+# 格式：x, y, w, h（正規化 0~1）。可用環境變數覆寫。
 VENUE_ROIS: Dict[str, Tuple[float, float, float, float]] = {
-    "DG": _env_roi("DG_ROAD_ROI", (0.00, 0.80, 0.66, 0.20)),
+    "DG": _env_roi("DG_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
     "MT": MT_FIXED_ROAD_ROI,
-    "DB": _env_roi("DB_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
-    "SA": _env_roi("SA_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
-    "OB": _env_roi("OB_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
-    "T9": _env_roi("T9_ROAD_ROI", (0.00, 0.58, 1.00, 0.42)),
+    "DB": _env_roi("DB_ROAD_ROI", (0.00, 0.55, 1.00, 0.45)),
+    "SA": _env_roi("SA_ROAD_ROI", (0.00, 0.55, 1.00, 0.45)),
+    "OB": _env_roi("OB_ROAD_ROI", (0.00, 0.55, 1.00, 0.45)),
+    "T9": _env_roi("T9_ROAD_ROI", (0.00, 0.55, 1.00, 0.45)),
+}
+
+# 同一館完整畫面可再試的備援 ROI（仍走固定格）。
+VENUE_FALLBACK_ROIS: Dict[str, List[Tuple[str, Tuple[float, float, float, float]]]] = {
+    "DG": [
+        ("dg_mid_road", _env_roi("DG_ROAD_ROI_ALT1", (0.00, 0.48, 1.00, 0.40))),
+        ("dg_lower_road", _env_roi("DG_ROAD_ROI_ALT2", (0.00, 0.62, 0.85, 0.35))),
+    ],
+    "DB": [
+        ("db_mid_road", _env_roi("DB_ROAD_ROI_ALT1", (0.00, 0.50, 1.00, 0.42))),
+    ],
+    "SA": [
+        ("sa_mid_road", _env_roi("SA_ROAD_ROI_ALT1", (0.00, 0.50, 1.00, 0.42))),
+    ],
+    "OB": [
+        ("ob_mid_road", _env_roi("OB_ROAD_ROI_ALT1", (0.00, 0.50, 1.00, 0.42))),
+    ],
+    "T9": [
+        ("t9_mid_road", _env_roi("T9_ROAD_ROI_ALT1", (0.00, 0.50, 1.00, 0.42))),
+    ],
 }
 
 ROAD_GRID_ROWS = max(3, min(12, int(os.getenv("ROAD_GRID_ROWS", "6") or "6")))
@@ -120,7 +143,6 @@ ROAD_GRID_MAX_UNCERTAIN_RATIO = max(
     min(0.8, float(os.getenv("ROAD_GRID_MAX_UNCERTAIN_RATIO", "0.12") or "0.12")),
 )
 
-# 固定格內容自適應與顏色可信度。
 ROAD_GRID_ALIGN_MAX_TRIM = _env_float("ROAD_GRID_ALIGN_MAX_TRIM", 0.12, 0.0, 0.25)
 ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 17, 5, 41)
 ROAD_GRID_MIN_ALIGNMENT_SCORE = _env_float("ROAD_GRID_MIN_ALIGNMENT_SCORE", 0.46, 0.0, 1.0)
@@ -155,6 +177,8 @@ WIDE_LAYOUT_MIN_ASPECT = max(
 )
 ROAD_AUTO_FULL_FALLBACK = os.getenv("ROAD_AUTO_FULL_FALLBACK", "0").strip() == "1"
 ROAD_USE_YOLO = os.getenv("ROAD_USE_YOLO", "0").strip() == "1"
+# 固定格失敗後是否嘗試找圓備援（預設開；僅 quality 全失敗時才會用到）。
+ROAD_CONTOUR_FALLBACK = os.getenv("ROAD_CONTOUR_FALLBACK", "1").strip() == "1"
 ROAD_FAST_EARLY_EXIT = os.getenv("ROAD_FAST_EARLY_EXIT", "1").strip() == "1"
 ROAD_FAST_MIN_RECOGNIZED = max(
     4,
@@ -440,8 +464,17 @@ def _classify_grid(
                 and green_concentration >= ROAD_GRID_TIE_MIN_COMPONENT_RATIO
                 and max(green_span_x, green_span_y) <= ROAD_GRID_TIE_MAX_SPAN_RATIO
             )
-            separation = max(0.0, min(1.0, (dominant_pixels - secondary_pixels) / max(1.0, dominant_pixels + secondary_pixels)))
-            pixel_strength = max(0.0, min(1.0, dominant_pixels / max(1.0, minimum_pixels * 2.0)))
+            separation = max(
+                0.0,
+                min(
+                    1.0,
+                    (dominant_pixels - secondary_pixels)
+                    / max(1.0, dominant_pixels + secondary_pixels),
+                ),
+            )
+            pixel_strength = max(
+                0.0, min(1.0, dominant_pixels / max(1.0, minimum_pixels * 2.0))
+            )
             confidence = 0.55 * pixel_strength + 0.45 * separation if outcome else 0.0
             cell = {
                 "index": -1,
@@ -488,7 +521,9 @@ def _reconstruct_big_road_order(
 ) -> Any:
     """依六列大路規則反推時間序；長龍轉右後會保持右黏，不再錯誤往下。"""
     grid: Dict[Tuple[int, int], str] = {
-        (int(item.get("column", 0)), int(item.get("row", 0))): str(item.get("outcome") or "").upper()
+        (int(item.get("column", 0)), int(item.get("row", 0))): str(
+            item.get("outcome") or ""
+        ).upper()
         for item in cells
         if str(item.get("outcome") or "").upper() in {"B", "P"}
     }
@@ -582,7 +617,9 @@ def _reconstruct_big_road_order(
     elif len(solutions) > 1:
         fallback_reason = "ambiguous_big_road_reconstruction"
     else:
-        fallback_reason = f"incomplete_big_road_reconstruction_{len(best_partial)}_of_{target_count}"
+        fallback_reason = (
+            f"incomplete_big_road_reconstruction_{len(best_partial)}_of_{target_count}"
+        )
     details = {
         "positions": positions,
         "reconstructed_all": unique and len(positions) == target_count,
@@ -621,10 +658,29 @@ def _debug_overlay(
             label += "T"
         if not label:
             continue
-        cx, cy = int(round(float(cell.get("cx", 0)))), int(round(float(cell.get("cy", 0))))
-        cv2.putText(overlay, label, (max(0, cx - 7), max(10, cy + 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+        cx = int(round(float(cell.get("cx", 0))))
+        cy = int(round(float(cell.get("cy", 0))))
+        cv2.putText(
+            overlay,
+            label,
+            (max(0, cx - 7), max(10, cy + 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
     status = "OK" if quality_ok else f"RETAKE:{fallback_reason or 'quality'}"
-    cv2.putText(overlay, status[:80], (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        overlay,
+        status[:80],
+        (4, 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
     directory = Path(ROAD_GRID_DEBUG_DIR or "/tmp/bgs_road_debug")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"road_grid_{time.time_ns()}.png"
@@ -664,7 +720,6 @@ def _detect_fixed_grid(crop: np.ndarray) -> Dict[str, Any]:
                 tie_markers[str(index)] = tie_count
                 raw_outcomes.extend(["T"] * tie_count)
     else:
-        # 保留格位資料供 debug，但不產生可供預測使用的假時間序列。
         for source in sorted(cells, key=lambda item: (int(item["column"]), int(item["row"]))):
             item = dict(source)
             item["chronology_confirmed"] = False
@@ -696,7 +751,9 @@ def _detect_fixed_grid(crop: np.ndarray) -> Dict[str, Any]:
         fallback_reason = "recognized_count_below_minimum"
     if not fallback_reason and uncertain_ratio > ROAD_GRID_MAX_UNCERTAIN_RATIO:
         fallback_reason = "too_many_uncertain_cells"
-    debug_overlay_path = _debug_overlay(crop, all_grid_cells, grid_bounds, quality_ok, fallback_reason)
+    debug_overlay_path = _debug_overlay(
+        crop, all_grid_cells, grid_bounds, quality_ok, fallback_reason
+    )
 
     return {
         "ok": bool(sequence) and quality_ok,
@@ -714,15 +771,25 @@ def _detect_fixed_grid(crop: np.ndarray) -> Dict[str, Any]:
         "unknown_ratio": round(uncertain_ratio, 6),
         "raw_contours": 0,
         "candidates": ordered_cells,
-        "method": "fixed_hsv_grid_6x15_adaptive_v10_9",
+        "method": "fixed_hsv_grid_6x15_adaptive_v10_9_1",
         "grid_rows": ROAD_GRID_ROWS,
         "grid_columns": ROAD_GRID_COLS,
         "grid_size": {"width": image_width, "height": image_height},
         "effective_grid": {
             key: grid_bounds[key]
             for key in (
-                "x", "y", "width", "height", "score", "coverage", "offset_x", "offset_y",
-                "scale_x", "scale_y", "gain_x", "gain_y"
+                "x",
+                "y",
+                "width",
+                "height",
+                "score",
+                "coverage",
+                "offset_x",
+                "offset_y",
+                "scale_x",
+                "scale_y",
+                "gain_x",
+                "gain_y",
             )
         },
         "grid_alignment": grid_bounds,
@@ -738,6 +805,7 @@ def _detect_fixed_grid(crop: np.ndarray) -> Dict[str, Any]:
         "debug_overlay_path": debug_overlay_path,
         "debug_enabled": ROAD_GRID_DEBUG,
     }
+
 
 def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
@@ -832,6 +900,8 @@ def _detect_yolo(crop: np.ndarray) -> Dict[str, Any]:
         "unknown_candidates": 0,
         "raw_contours": 0,
         "quality_ok": bool(ordered),
+        "reconstructed_all": bool(ordered),
+        "fallback_reason": "" if ordered else "yolo_no_detections",
     }
 
 
@@ -846,6 +916,8 @@ def _score_result(result: Mapping[str, Any], preference: float = 0.0) -> float:
     quality_bonus = 55.0 if bool(result.get("quality_ok")) else -35.0
     reconstruction_bonus = 25.0 if bool(result.get("reconstructed_all", not fixed)) else -45.0
     alignment = float(dict(result.get("effective_grid") or {}).get("score", 0.0) or 0.0)
+    # 固定格成功時額外加分，避免被找圓備援搶過。
+    fixed_success_bonus = 40.0 if fixed and bool(result.get("quality_ok")) else 0.0
     return (
         recognized * 3.0
         - unknown * 4.0
@@ -854,7 +926,9 @@ def _score_result(result: Mapping[str, Any], preference: float = 0.0) -> float:
         + quality_bonus
         + reconstruction_bonus
         + alignment * 20.0
+        + fixed_success_bonus
     )
+
 
 def _run_region(
     image: np.ndarray,
@@ -873,6 +947,14 @@ def _run_region(
         result = _detect_yolo(crop)
     else:
         result = analyze_baccarat_array_detailed(crop)
+        result = dict(result or {})
+        result.setdefault("reconstructed_all", bool(result.get("quality_ok")))
+        result.setdefault(
+            "fallback_reason",
+            ""
+            if result.get("quality_ok")
+            else "contour_circle_detection_failed",
+        )
 
     result = dict(result or {})
     result.update(
@@ -889,15 +971,18 @@ def _run_region(
 
 
 def _acceptable(result: Mapping[str, Any]) -> bool:
+    """只有固定格且 quality 通過才允許 early exit，避免找圓半成品提前結束。"""
     recognized = int(result.get("recognized_count", 0) or 0)
     unknown = int(
         result.get("unknown_candidates", result.get("uncertain_count", 0)) or 0
     )
     ratio = unknown / max(1, recognized + unknown)
     return bool(
-        recognized >= ROAD_FAST_MIN_RECOGNIZED
+        bool(result.get("fixed_grid"))
+        and bool(result.get("quality_ok"))
+        and bool(result.get("reconstructed_all", True))
+        and recognized >= ROAD_FAST_MIN_RECOGNIZED
         and ratio <= ROAD_FAST_MAX_UNKNOWN_RATIO
-        and result.get("quality_ok", True)
     )
 
 
@@ -941,26 +1026,40 @@ def detect_road_sequence_detailed(
     ] = []
 
     if venue_code == "MT" and not likely_crop and not wide_multi_road:
-        # MT 完整畫面：只掃右下方固定 6×15 大路，不做其他 ROI 備援。
+        # MT 完整畫面：只掃右下方固定 6×15。
         plan = [("mt_fixed_6x15", MT_FIXED_ROAD_ROI, 20.0, True)]
     elif likely_crop:
-        # 使用者直接上傳牌路裁切圖時，整張圖視為固定 6×15 大路。
         plan = [("road_crop_fixed_6x15", (0.0, 0.0, 1.0, 1.0), 15.0, True)]
     elif wide_multi_road:
         plan = [("wide_top_fixed_6x15", WIDE_TOP_ROAD_ROI, 10.0, True)]
     else:
+        # 完整畫面（含 DG）：一律先走固定 6×15，找圓僅備援。
         if venue_code in VENUE_ROIS:
             plan.append(
                 (
-                    f"{venue_code.lower()}_venue_roi",
+                    f"{venue_code.lower()}_venue_fixed_6x15",
                     VENUE_ROIS[venue_code],
-                    3.0,
-                    False,
+                    18.0,
+                    True,
                 )
             )
-        plan.append(("generic_road_roi", ROAD_ROI, 1.5, False))
+            for alt_name, alt_roi in VENUE_FALLBACK_ROIS.get(venue_code, []):
+                plan.append((f"{alt_name}_fixed_6x15", alt_roi, 12.0, True))
+        plan.append(("generic_road_fixed_6x15", ROAD_ROI, 10.0, True))
+        if ROAD_CONTOUR_FALLBACK:
+            # 備援：同一 ROI 走找圓（分數較低，不會蓋過成功固定格）。
+            if venue_code in VENUE_ROIS:
+                plan.append(
+                    (
+                        f"{venue_code.lower()}_venue_contour",
+                        VENUE_ROIS[venue_code],
+                        2.0,
+                        False,
+                    )
+                )
+            plan.append(("generic_road_contour", ROAD_ROI, 1.0, False))
         if ROAD_AUTO_FULL_FALLBACK:
-            plan.append(("full_image", (0.0, 0.0, 1.0, 1.0), 0.0, False))
+            plan.append(("full_image_fixed_6x15", (0.0, 0.0, 1.0, 1.0), 4.0, True))
 
     seen = set()
     best: Dict[str, Any] | None = None
@@ -993,12 +1092,15 @@ def detect_road_sequence_detailed(
     if best is None:
         return {
             "ok": False,
+            "quality_ok": False,
             "sequence": [],
             "recognized_count": 0,
             "method": "failed",
             "input_type": "unknown",
+            "fallback_reason": "all_regions_failed",
             "errors": errors,
             "attempted_regions": attempted,
+            "reconstructed_all": False,
         }
 
     result = dict(best)
@@ -1030,7 +1132,9 @@ def detect_road_sequence_detailed(
                     "quality_ok": bool(item.get("quality_ok", True)),
                     "reconstructed_all": bool(item.get("reconstructed_all", True)),
                     "fallback_reason": str(item.get("fallback_reason") or ""),
-                    "alignment_score": float(dict(item.get("effective_grid") or {}).get("score", 0.0) or 0.0),
+                    "alignment_score": float(
+                        dict(item.get("effective_grid") or {}).get("score", 0.0) or 0.0
+                    ),
                 }
                 for item in candidates
             ],
