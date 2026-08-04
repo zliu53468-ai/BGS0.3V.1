@@ -774,7 +774,7 @@ def guide_panel() -> Dict[str, Any]:
                         },
                         {
                             "type": "text",
-                            "text": "富百家使用指南",
+                            "text": "BGS AI 預測系統使用指南",
                             "weight": "bold",
                             "size": "xl",
                             "margin": "sm",
