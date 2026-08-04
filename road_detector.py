@@ -1,17 +1,19 @@
-"""遊戲畫面大路偵測模組 V11.2（DG 手機／電腦全畫面自適應大路版）。
+"""遊戲畫面大路偵測模組 V11.3（保留 DG V11.2，新增 MT／DB 手機全畫面自動追焦）。
 
 重點：
-1. MT 完整畫面只裁切右下方的大路區塊，不再掃描珠盤路、下三路或整張圖片。
-2. 固定維持 6 列，但欄數依實際格線自動判定；手機與電腦版使用獨立 DG 大路版型候選。
-3. 每格分別統計紅、藍、綠 HSV 像素；雙色接近標記 uncertain，不硬選。
-4. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不再把欄排序當正確答案。
-5. 可用 ROAD_GRID_DEBUG=1 輸出疊格線除錯圖；版型不吻合時仍以品質閘門阻擋錯序列。
+1. DG 手機／電腦 ROI、滑動搜尋與固定格辨識流程完整保留 V11.2，不改動原有邏輯。
+2. 新增 MT／DB 手機直式全畫面專用 ROI、附近滑動追焦與彩色圓環格位辨識。
+3. 固定維持 6 列，MT／DB 允許非正方形格位；欄距與列距由彩色圓環中心自動估計。
+4. 每個圓環分別統計紅、藍、綠 HSV 像素；雙色接近或偏離格位者標記 uncertain。
+5. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不把欄排序當正確答案。
+6. 可用 ROAD_GRID_DEBUG=1 輸出追焦疊圖；版型不吻合時仍以品質閘門阻擋錯序列。
 """
 from __future__ import annotations
 
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import math
 import os
 import time
 
@@ -76,6 +78,18 @@ ROAD_ROI = _env_roi("ROAD_ROI", (0.0, 0.58, 1.0, 0.42))
 MT_FIXED_ROAD_ROI = _env_roi(
     "MT_FIXED_ROAD_ROI",
     (0.619791667, 0.716500554, 0.201388889, 0.148394241),
+)
+
+# MT／DB iPhone Safari 直式完整桌廳：只截取右側大路本體，
+# 不包含左側珠盤路、上方統計列、下三路與右側問路按鈕。
+# 這兩組是新增候選，不取代 MT 電腦版與 DG 原有候選。
+MT_MOBILE_BIG_ROAD_ROI = _env_roi(
+    "MT_MOBILE_BIG_ROAD_ROI",
+    (0.315, 0.733, 0.630, 0.080),
+)
+DB_MOBILE_BIG_ROAD_ROI = _env_roi(
+    "DB_MOBILE_BIG_ROAD_ROI",
+    (0.350, 0.775, 0.650, 0.086),
 )
 
 # 橫向「珠盤路＋大路＋下三路」裁圖中的右上第一區塊。
@@ -186,6 +200,39 @@ ROAD_PROFILE_SEARCH_Y_DESKTOP = _env_float(
 ROAD_PROFILE_SEARCH_STEPS = _env_int("ROAD_PROFILE_SEARCH_STEPS", 5, 1, 9)
 ROAD_CROP_BRIGHT_FRACTION = _env_float(
     "ROAD_CROP_BRIGHT_FRACTION", 0.45, 0.10, 0.95
+)
+
+
+# MT／DB 手機大路的圓環追焦參數。DG 不會進入此分支。
+MT_PROFILE_SEARCH_Y_MOBILE = _env_float(
+    "MT_PROFILE_SEARCH_Y_MOBILE", 0.018, 0.0, 0.08
+)
+DB_PROFILE_SEARCH_Y_MOBILE = _env_float(
+    "DB_PROFILE_SEARCH_Y_MOBILE", 0.018, 0.0, 0.08
+)
+MOBILE_RING_HOUGH_PARAM1 = _env_float(
+    "MOBILE_RING_HOUGH_PARAM1", 80.0, 20.0, 240.0
+)
+MT_MOBILE_RING_HOUGH_PARAM2 = _env_float(
+    "MT_MOBILE_RING_HOUGH_PARAM2", 14.0, 4.0, 40.0
+)
+DB_MOBILE_RING_HOUGH_PARAM2 = _env_float(
+    "DB_MOBILE_RING_HOUGH_PARAM2", 12.0, 4.0, 40.0
+)
+MOBILE_RING_MIN_COLOR_PIXELS = _env_int(
+    "MOBILE_RING_MIN_COLOR_PIXELS", 18, 5, 300
+)
+MOBILE_RING_COLOR_DOMINANCE = _env_float(
+    "MOBILE_RING_COLOR_DOMINANCE", 1.35, 1.05, 5.0
+)
+MOBILE_RING_MAX_UNCERTAIN_RATIO = _env_float(
+    "MOBILE_RING_MAX_UNCERTAIN_RATIO", 0.20, 0.0, 0.80
+)
+MOBILE_RING_MAX_MEDIAN_FIT_ERROR = _env_float(
+    "MOBILE_RING_MAX_MEDIAN_FIT_ERROR", 0.18, 0.05, 0.45
+)
+MOBILE_RING_MAX_SINGLE_FIT_ERROR = _env_float(
+    "MOBILE_RING_MAX_SINGLE_FIT_ERROR", 0.30, 0.10, 0.60
 )
 
 WIDE_LAYOUT_MIN_ASPECT = max(
@@ -953,6 +1000,486 @@ def _detect_fixed_grid(
     return output
 
 
+
+def _median_float(values: Sequence[float], default: float) -> float:
+    if not values:
+        return float(default)
+    return float(np.median(np.asarray(list(values), dtype=np.float64)))
+
+
+def _nearest_ring_pitch(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    axis: str,
+    expected: float,
+) -> float:
+    """由每顆圓環的最近同列／同欄鄰居估計實際欄距或列距。
+
+    MT 手機版格位約為寬 30、高 22 像素，不能沿用 DG 的近正方形假設；
+    DB 手機版則約為寬 22、高 20 像素。因此 x/y pitch 必須分開估計。
+    """
+    nearest: List[float] = []
+    for index, first in enumerate(items):
+        best: Optional[float] = None
+        for other_index, second in enumerate(items):
+            if index == other_index:
+                continue
+            dx = abs(float(first.get("cx", 0.0)) - float(second.get("cx", 0.0)))
+            dy = abs(float(first.get("cy", 0.0)) - float(second.get("cy", 0.0)))
+            if axis == "x":
+                if dy > max(4.0, expected * 0.30):
+                    continue
+                distance = dx
+                minimum = max(6.0, expected * 0.55)
+                maximum = expected * 2.20
+            else:
+                if dx > max(5.0, expected * 0.35):
+                    continue
+                distance = dy
+                minimum = max(6.0, expected * 0.50)
+                maximum = expected * 1.65
+            if minimum <= distance <= maximum and (
+                best is None or distance < best
+            ):
+                best = distance
+        if best is not None:
+            nearest.append(float(best))
+
+    if not nearest:
+        return float(expected)
+    median = _median_float(nearest, expected)
+    trimmed = [
+        value
+        for value in nearest
+        if abs(value - median) <= max(2.5, median * 0.18)
+    ]
+    return _median_float(trimmed, median)
+
+
+def _debug_ring_overlay(
+    crop: np.ndarray,
+    cells: Sequence[Mapping[str, Any]],
+    uncertain_cells: Sequence[Mapping[str, Any]],
+    *,
+    quality_ok: bool,
+    fallback_reason: str,
+    pitch_x: float,
+    pitch_y: float,
+    origin_x: float,
+    origin_y: float,
+    profile: str,
+) -> str:
+    if not ROAD_GRID_DEBUG:
+        return ""
+    overlay = crop.copy()
+    for item in list(cells) + list(uncertain_cells):
+        cx = int(round(float(item.get("cx", 0.0))))
+        cy = int(round(float(item.get("cy", 0.0))))
+        radius = max(3, int(item.get("radius", 6) or 6))
+        uncertain = bool(item.get("uncertain"))
+        outcome = str(item.get("outcome") or "?")
+        color = (
+            (0, 255, 255)
+            if uncertain
+            else (0, 0, 255)
+            if outcome == "B"
+            else (255, 0, 0)
+        )
+        cv2.circle(overlay, (cx, cy), radius, color, 1, cv2.LINE_AA)
+        label = "?" if uncertain else outcome
+        tie_count = int(item.get("tie_count", 0) or 0)
+        if tie_count > 0:
+            label += f"T{tie_count}"
+        cv2.putText(
+            overlay,
+            label,
+            (max(0, cx - 7), min(overlay.shape[0] - 2, cy + 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.32,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    max_column = max(
+        [int(item.get("column", 0) or 0) for item in cells],
+        default=0,
+    )
+    for column in range(max_column + 2):
+        x = int(round(origin_x - pitch_x / 2.0 + column * pitch_x))
+        cv2.line(overlay, (x, 0), (x, overlay.shape[0] - 1), (120, 120, 120), 1)
+    for row in range(ROAD_GRID_ROWS + 1):
+        y = int(round(origin_y - pitch_y / 2.0 + row * pitch_y))
+        cv2.line(overlay, (0, y), (overlay.shape[1] - 1, y), (120, 120, 120), 1)
+
+    status = "OK" if quality_ok else f"RETAKE:{fallback_reason or 'quality'}"
+    cv2.putText(
+        overlay,
+        f"{status} px={pitch_x:.1f} py={pitch_y:.1f} {profile}"[:110],
+        (4, 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.36,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    directory = Path(ROAD_GRID_DEBUG_DIR or "/tmp/bgs_road_debug")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"road_ring_{time.time_ns()}.png"
+    cv2.imwrite(str(path), overlay)
+    return str(path)
+
+
+def _detect_mobile_ring_grid(
+    crop: np.ndarray,
+    *,
+    profile: str,
+) -> Dict[str, Any]:
+    """MT／DB 手機全畫面專用彩色圓環大路偵測。
+
+    只由新增的 MT／DB 手機候選呼叫。DG 仍完整使用原本的
+    ``_detect_fixed_grid``，不會進入本函式。
+    """
+    if crop is None or crop.size == 0:
+        raise ValueError("MT/DB 手機大路裁圖為空。")
+
+    image_height, image_width = crop.shape[:2]
+    expected_pitch_y = image_height / max(1.0, float(ROAD_GRID_ROWS))
+    minimum_radius = max(3, int(round(expected_pitch_y * 0.24)))
+    maximum_radius = max(minimum_radius + 2, int(round(expected_pitch_y * 0.68)))
+    profile_key = str(profile or "").lower()
+    hough_param2 = (
+        MT_MOBILE_RING_HOUGH_PARAM2
+        if profile_key.startswith("mt_")
+        else DB_MOBILE_RING_HOUGH_PARAM2
+    )
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=max(7.0, expected_pitch_y * 0.55),
+        param1=MOBILE_RING_HOUGH_PARAM1,
+        param2=hough_param2,
+        minRadius=minimum_radius,
+        maxRadius=maximum_radius,
+    )
+
+    red_mask, blue_mask, green_mask, _ = _color_masks(crop)
+    yy, xx = np.ogrid[:image_height, :image_width]
+    colored: List[Dict[str, Any]] = []
+    uncertain_cells: List[Dict[str, Any]] = []
+
+    raw_circles = [] if circles is None else np.round(circles[0]).astype(int)
+    for raw_circle in raw_circles:
+        cx, cy, radius = [int(value) for value in raw_circle]
+        if not (0 <= cx < image_width and 0 <= cy < image_height):
+            continue
+        squared_distance = (xx - cx) ** 2 + (yy - cy) ** 2
+        annulus = (
+            (squared_distance <= float(radius + 2) ** 2)
+            & (squared_distance >= float(max(1, radius - 3)) ** 2)
+        )
+        disk = squared_distance <= float(radius + 2) ** 2
+        red_pixels = int(red_mask[annulus].sum())
+        blue_pixels = int(blue_mask[annulus].sum())
+        green_pixels = int(green_mask[disk].sum())
+        dominant = max(red_pixels, blue_pixels)
+        secondary = min(red_pixels, blue_pixels)
+        dominance = dominant / max(1.0, float(secondary))
+        minimum_color = max(
+            MOBILE_RING_MIN_COLOR_PIXELS,
+            int(round(math.pi * radius * radius * 0.12)),
+        )
+        base = {
+            "cx": float(cx),
+            "cy": float(cy),
+            "radius": int(radius),
+            "red_pixels": red_pixels,
+            "blue_pixels": blue_pixels,
+            "green_pixels": green_pixels,
+            "color_dominance": round(dominance, 6),
+        }
+        if dominant < minimum_color or dominance < MOBILE_RING_COLOR_DOMINANCE:
+            uncertain_cells.append({**base, "uncertain": True})
+            continue
+
+        outcome = "B" if red_pixels > blue_pixels else "P"
+        colored_fraction = dominant / max(1.0, math.pi * float(radius + 2) ** 2)
+        confidence = min(
+            1.0,
+            0.55 * colored_fraction
+            + 0.45 * min(1.0, (dominance - 1.0) / 3.0),
+        )
+        tie_threshold = max(8, int(round(math.pi * radius * radius * 0.035)))
+        colored.append(
+            {
+                **base,
+                "outcome": outcome,
+                "tie_count": 1 if green_pixels >= tie_threshold else 0,
+                "confidence": round(confidence, 6),
+                "uncertain": False,
+            }
+        )
+
+    if not colored:
+        return {
+            "ok": False,
+            "quality_ok": False,
+            "sequence": [],
+            "raw_outcomes": [],
+            "recognized_count": 0,
+            "unknown_candidates": len(uncertain_cells),
+            "uncertain_count": len(uncertain_cells),
+            "raw_contours": len(raw_circles),
+            "method": "fixed_ring_grid_6xN_mobile_v11_3",
+            "reconstructed_all": False,
+            "fallback_reason": "no_colored_big_road_rings",
+            "layout_profile": profile,
+        }
+
+    pitch_y = _nearest_ring_pitch(
+        colored, axis="y", expected=expected_pitch_y
+    )
+    pitch_x = _nearest_ring_pitch(
+        colored, axis="x", expected=expected_pitch_y
+    )
+    origin_x = min(float(item["cx"]) for item in colored)
+    origin_y = min(float(item["cy"]) for item in colored)
+
+    mapped: List[Dict[str, Any]] = []
+    for source in colored:
+        column = int(round((float(source["cx"]) - origin_x) / max(1.0, pitch_x)))
+        row = int(round((float(source["cy"]) - origin_y) / max(1.0, pitch_y)))
+        expected_x = origin_x + column * pitch_x
+        expected_y = origin_y + row * pitch_y
+        fit_x = abs(float(source["cx"]) - expected_x) / max(1.0, pitch_x)
+        fit_y = abs(float(source["cy"]) - expected_y) / max(1.0, pitch_y)
+        item = {
+            **source,
+            "column": column,
+            "row": row,
+            "fit_error_x": round(fit_x, 6),
+            "fit_error_y": round(fit_y, 6),
+        }
+        if (
+            column < 0
+            or row < 0
+            or row >= ROAD_GRID_ROWS
+            or fit_x > MOBILE_RING_MAX_SINGLE_FIT_ERROR
+            or fit_y > MOBILE_RING_MAX_SINGLE_FIT_ERROR
+        ):
+            item["uncertain"] = True
+            uncertain_cells.append(item)
+        else:
+            mapped.append(item)
+
+    # Hough 偶爾會在同一圓環產生兩個候選；同格只保留顏色信心較高者。
+    by_cell: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for item in mapped:
+        key = (int(item["column"]), int(item["row"]))
+        score = float(item.get("confidence", 0.0)) + 0.01 * float(
+            item.get("radius", 0) or 0
+        )
+        previous = by_cell.get(key)
+        previous_score = float(previous.get("_dedup_score", -1.0)) if previous else -1.0
+        if previous is None or score > previous_score:
+            if previous is not None:
+                rejected = dict(previous)
+                rejected.pop("_dedup_score", None)
+                rejected["uncertain"] = True
+                uncertain_cells.append(rejected)
+            by_cell[key] = {**item, "_dedup_score": score}
+        else:
+            rejected = dict(item)
+            rejected["uncertain"] = True
+            uncertain_cells.append(rejected)
+
+    cells: List[Dict[str, Any]] = []
+    for value in by_cell.values():
+        item = dict(value)
+        item.pop("_dedup_score", None)
+        cells.append(item)
+
+    reconstruction = _reconstruct_big_road_order(
+        cells,
+        return_details=True,
+        grid_rows=ROAD_GRID_ROWS,
+    )
+    cell_lookup = {
+        (int(item["column"]), int(item["row"])): item
+        for item in cells
+    }
+    ordered_cells: List[Dict[str, Any]] = []
+    sequence: List[str] = []
+    raw_outcomes: List[str] = []
+    tie_markers: Dict[str, int] = {}
+    if bool(reconstruction.get("reconstructed_all")):
+        for index, position in enumerate(list(reconstruction.get("positions") or [])):
+            source = dict(cell_lookup[position])
+            source["index"] = index
+            source["chronology_confirmed"] = True
+            ordered_cells.append(source)
+            outcome = str(source.get("outcome") or "")
+            sequence.append(outcome)
+            raw_outcomes.append(outcome)
+            tie_count = int(source.get("tie_count", 0) or 0)
+            if tie_count > 0:
+                tie_markers[str(index)] = tie_count
+                raw_outcomes.extend(["T"] * tie_count)
+    else:
+        for source in sorted(
+            cells,
+            key=lambda item: (int(item["column"]), int(item["row"])),
+        ):
+            item = dict(source)
+            item["chronology_confirmed"] = False
+            ordered_cells.append(item)
+
+    fit_errors = [
+        max(
+            float(item.get("fit_error_x", 1.0) or 0.0),
+            float(item.get("fit_error_y", 1.0) or 0.0),
+        )
+        for item in cells
+    ]
+    median_fit_error = _median_float(fit_errors, 1.0)
+    maximum_fit_error = max(fit_errors or [1.0])
+    recognized_count = len(cells)
+    uncertain_count = len(uncertain_cells)
+    uncertain_ratio = uncertain_count / max(1, recognized_count + uncertain_count)
+    geometry_score = max(
+        0.0,
+        min(1.0, 1.0 - median_fit_error / max(1e-9, MOBILE_RING_MAX_SINGLE_FIT_ERROR)),
+    )
+    reconstruction_ok = bool(reconstruction.get("reconstructed_all"))
+    quality_ok = bool(
+        recognized_count >= ROAD_GRID_MIN_RECOGNIZED
+        and reconstruction_ok
+        and uncertain_ratio <= MOBILE_RING_MAX_UNCERTAIN_RATIO
+        and median_fit_error <= MOBILE_RING_MAX_MEDIAN_FIT_ERROR
+    )
+
+    fallback_reason = str(reconstruction.get("fallback_reason") or "")
+    if not fallback_reason and uncertain_ratio > MOBILE_RING_MAX_UNCERTAIN_RATIO:
+        fallback_reason = "too_many_uncertain_mobile_rings"
+    if not fallback_reason and median_fit_error > MOBILE_RING_MAX_MEDIAN_FIT_ERROR:
+        fallback_reason = "mobile_ring_grid_geometry_not_confident"
+    if not fallback_reason and recognized_count < ROAD_GRID_MIN_RECOGNIZED:
+        fallback_reason = "recognized_count_below_minimum"
+
+    maximum_column = max(
+        [int(item.get("column", 0) or 0) for item in cells],
+        default=-1,
+    )
+    grid_columns = maximum_column + 1
+    grid_x = max(0, int(round(origin_x - pitch_x / 2.0)))
+    grid_y = max(0, int(round(origin_y - pitch_y / 2.0)))
+    grid_width = min(
+        image_width - grid_x,
+        max(1, int(round(max(1, grid_columns) * pitch_x))),
+    )
+    grid_height = min(
+        image_height - grid_y,
+        max(1, int(round(ROAD_GRID_ROWS * pitch_y))),
+    )
+    effective_grid = {
+        "x": grid_x,
+        "y": grid_y,
+        "width": grid_width,
+        "height": grid_height,
+        "score": round(geometry_score, 6),
+        "coverage": round(
+            recognized_count / max(1, ROAD_GRID_ROWS * max(1, grid_columns)),
+            6,
+        ),
+        "square_cell_score": round(min(pitch_x, pitch_y) / max(pitch_x, pitch_y), 6),
+        "cell_pitch_x": round(pitch_x, 6),
+        "cell_pitch_y": round(pitch_y, 6),
+        "offset_x": round(origin_x, 6),
+        "offset_y": round(origin_y, 6),
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "gain_x": 0.0,
+        "gain_y": 0.0,
+    }
+    debug_overlay_path = _debug_ring_overlay(
+        crop,
+        cells,
+        uncertain_cells,
+        quality_ok=quality_ok,
+        fallback_reason=fallback_reason,
+        pitch_x=pitch_x,
+        pitch_y=pitch_y,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        profile=profile,
+    )
+
+    return {
+        "ok": bool(sequence) and quality_ok,
+        "quality_ok": quality_ok,
+        "sequence": sequence,
+        "raw_outcomes": raw_outcomes,
+        "tie_markers": tie_markers,
+        "grid_cells": ordered_cells,
+        "all_grid_cells": cells + uncertain_cells,
+        "recognized_count": recognized_count,
+        "sequence_count": len(sequence),
+        "confirmed_round_count": len(raw_outcomes),
+        "uncertain_count": uncertain_count,
+        "unknown_candidates": uncertain_count,
+        "unknown_ratio": round(uncertain_ratio, 6),
+        "raw_contours": len(raw_circles),
+        "candidates": ordered_cells,
+        "method": "fixed_ring_grid_6xN_mobile_v11_3",
+        "grid_rows": ROAD_GRID_ROWS,
+        "grid_columns": grid_columns,
+        "grid_size": {"width": image_width, "height": image_height},
+        "effective_grid": effective_grid,
+        "grid_alignment": effective_grid,
+        "alignment_ok": bool(quality_ok),
+        "median_cell_confidence": round(
+            _median_float(
+                [float(item.get("confidence", 0.0) or 0.0) for item in cells],
+                0.0,
+            ),
+            6,
+        ),
+        "reconstructed_all": reconstruction_ok,
+        "reconstruction_solution_count": int(
+            reconstruction.get("solution_count", 0) or 0
+        ),
+        "partial_reconstruction": list(
+            reconstruction.get("partial_positions") or []
+        ),
+        "fallback_preview_positions": list(
+            reconstruction.get("fallback_preview") or []
+        ),
+        "fallback_reason": fallback_reason,
+        "uncertain_cells": uncertain_cells,
+        "count_is_confirmed": bool(quality_ok and uncertain_count == 0),
+        "debug_overlay_path": debug_overlay_path,
+        "debug_enabled": ROAD_GRID_DEBUG,
+        "layout_profile": profile,
+        "ring_pitch_x": round(pitch_x, 6),
+        "ring_pitch_y": round(pitch_y, 6),
+        "ring_origin": {"x": round(origin_x, 6), "y": round(origin_y, 6)},
+        "ring_fit_median_error": round(median_fit_error, 6),
+        "ring_fit_max_error": round(maximum_fit_error, 6),
+        "column_candidate_score": round(
+            (1000.0 if quality_ok else 0.0)
+            + (300.0 if reconstruction_ok else 0.0)
+            + geometry_score * 120.0
+            + recognized_count * 2.0
+            - uncertain_count * 8.0,
+            6,
+        ),
+    }
+
+
 def _sort_big_road(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         items,
@@ -1077,13 +1604,18 @@ def _run_region(
     preference: float,
     *,
     fixed_grid: bool = False,
+    ring_grid: bool = False,
     grid_columns: Optional[int] = None,
     layout_profile: str = "",
 ) -> Dict[str, Any]:
     crop, pixels = _crop(image, roi)
     started = time.perf_counter()
 
-    if fixed_grid:
+    if ring_grid:
+        result = _detect_mobile_ring_grid(
+            crop, profile=layout_profile or name
+        )
+    elif fixed_grid:
         result = _detect_fixed_grid(
             crop, grid_columns=grid_columns, profile=layout_profile or name
         )
@@ -1099,7 +1631,8 @@ def _run_region(
             "roi": pixels,
             "normalized_roi": list(roi),
             "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
-            "fixed_grid": fixed_grid,
+            "fixed_grid": bool(fixed_grid or ring_grid),
+            "ring_grid": bool(ring_grid),
             "layout_profile": str(result.get("layout_profile") or layout_profile or ""),
         }
     )
@@ -1232,6 +1765,38 @@ def detect_road_sequence_detailed(
                     "grid_columns": None,
                     "profile": "dg_mobile_full_screen",
                 })
+        if portrait and venue_code == "MT":
+            for index, roi in enumerate(
+                _shifted_profile_rois(
+                    MT_MOBILE_BIG_ROAD_ROI,
+                    y_radius=MT_PROFILE_SEARCH_Y_MOBILE,
+                )
+            ):
+                plan.append({
+                    "name": f"mt_mobile_big_road_{index}",
+                    "roi": roi,
+                    "preference": 52.0 - index * 0.4,
+                    "fixed_grid": False,
+                    "ring_grid": True,
+                    "grid_columns": None,
+                    "profile": "mt_mobile_full_screen",
+                })
+        if portrait and venue_code == "DB":
+            for index, roi in enumerate(
+                _shifted_profile_rois(
+                    DB_MOBILE_BIG_ROAD_ROI,
+                    y_radius=DB_PROFILE_SEARCH_Y_MOBILE,
+                )
+            ):
+                plan.append({
+                    "name": f"db_mobile_big_road_{index}",
+                    "roi": roi,
+                    "preference": 52.0 - index * 0.4,
+                    "fixed_grid": False,
+                    "ring_grid": True,
+                    "grid_columns": None,
+                    "profile": "db_mobile_full_screen",
+                })
         if landscape and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
@@ -1287,7 +1852,13 @@ def detect_road_sequence_detailed(
     for item in plan:
         roi = tuple(float(value) for value in item["roi"])
         fixed_grid = bool(item["fixed_grid"])
-        key = (tuple(round(value, 6) for value in roi), fixed_grid, item.get("grid_columns"))
+        ring_grid = bool(item.get("ring_grid", False))
+        key = (
+            tuple(round(value, 6) for value in roi),
+            fixed_grid,
+            ring_grid,
+            item.get("grid_columns"),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -1300,6 +1871,7 @@ def detect_road_sequence_detailed(
                 name,
                 float(item["preference"]),
                 fixed_grid=fixed_grid,
+                ring_grid=ring_grid,
                 grid_columns=item.get("grid_columns"),
                 layout_profile=str(item.get("profile") or ""),
             )
@@ -1347,6 +1919,7 @@ def detect_road_sequence_detailed(
                 "elapsed_ms": float(item.get("elapsed_ms", 0) or 0),
                 "method": str(item.get("method") or ""),
                 "fixed_grid": bool(item.get("fixed_grid")),
+                "ring_grid": bool(item.get("ring_grid")),
                 "quality_ok": bool(item.get("quality_ok", True)),
                 "reconstructed_all": bool(item.get("reconstructed_all", True)),
                 "fallback_reason": str(item.get("fallback_reason") or ""),
