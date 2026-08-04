@@ -132,6 +132,10 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "context_feature_names": list(prediction.get("context_feature_names") or []),
         "bandit_scores": dict(prediction.get("bandit_scores") or {}),
         "quality_score": float(prediction.get("quality_score", 0.0) or 0.0),
+        "unknown_region_active": bool(prediction.get("unknown_region_active", False)),
+        "uncertainty_braking": dict(prediction.get("uncertainty_braking") or {}),
+        "short_term_trend_buffer": dict(prediction.get("short_term_trend_buffer") or {}),
+        "few_shot_update_weight": float(prediction.get("few_shot_update_weight", 1.0) or 1.0),
         "metadata": dict(metadata or {}),
         "actual_outcome": "",
         "reward": None,
@@ -186,6 +190,12 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         else:
             reward = None
 
+        update_weight = (
+            max(1.0, min(12.0, float(target.get("few_shot_update_weight", 1.0) or 1.0)))
+            if bool(target.get("unknown_region_active"))
+            else 1.0
+        )
+
         if reward is not None and context:
             bandit_update = update_bandit(
                 context=context,
@@ -193,6 +203,7 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
                 reward=reward,
                 event_id=str(target.get("prediction_id") or ""),
                 actual_outcome=actual,
+                update_weight=update_weight,
             )
         elif actual == "T":
             bandit_update = {"updated": False, "reason": "tie_not_used_for_bp_arms", "actual_outcome": actual}
@@ -203,6 +214,15 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         target["resolved_at"] = _now()
         target["reward"] = reward
         target["bandit_update"] = bandit_update
+        target["applied_update_weight"] = (
+            float(bandit_update.get("update_weight", 0.0) or 0.0)
+            if isinstance(bandit_update, Mapping)
+            else 0.0
+        )
+        target["few_shot_boost_applied"] = bool(
+            isinstance(bandit_update, Mapping)
+            and bandit_update.get("few_shot_boost_applied")
+        )
         if venue:
             target["venue"] = str(venue).upper().strip()
         if room:
@@ -248,6 +268,8 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     log_losses: List[float] = []
     decided = correct = 0
     rewards: List[float] = []
+    unknown_region_count = 0
+    boosted_update_count = 0
     for record in valid:
         actual = str(record.get("actual_outcome") or "").upper()
         counts[actual] += 1
@@ -264,6 +286,8 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             correct += int(bool(record.get("action_correct")))
         if record.get("reward") is not None:
             rewards.append(float(record.get("reward") or 0.0))
+        unknown_region_count += int(bool(record.get("unknown_region_active")))
+        boosted_update_count += int(bool(record.get("few_shot_boost_applied")))
     total = max(1, len(valid))
     return {
         "sample_count": len(valid),
@@ -273,6 +297,8 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "correct_count": correct,
         "accuracy": correct / max(1, decided),
         "mean_reward": sum(rewards) / max(1, len(rewards)),
+        "unknown_region_count": unknown_region_count,
+        "few_shot_boosted_update_count": boosted_update_count,
         "mean_brier_score": sum(brier_values) / len(brier_values) if brier_values else None,
         "mean_log_loss": sum(log_losses) / len(log_losses) if log_losses else None,
         "component_brier_scores": {},

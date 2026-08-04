@@ -5,6 +5,11 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
+V1.1 新增：
+- 以兩個 Arm 的 LinUCB 置信區間標準差偵測未知特徵區間。
+- 未知區間由最近 2-3 局短週期順勢／逆勢 Buffer 臨時接管。
+- 未知區間的下一次 B/P reward 以 4 倍觀測權重更新。
+
 banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
 """
 from __future__ import annotations
@@ -20,7 +25,7 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1"
+MODEL_VERSION = "CMAB-LINUCB-V1.1-UNKNOWN-DEFENSE"
 FEATURE_NAMES = (
     "bias", "history_maturity", "global_banker_balance",
     "recent5_banker_balance", "recent10_banker_balance",
@@ -50,6 +55,14 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 CMAB_ALPHA = _env_float("CMAB_ALPHA", 0.80, 0.0, 5.0)
 CMAB_L2 = _env_float("CMAB_L2", 1.0, 0.05, 100.0)
 CMAB_SCORE_TEMPERATURE = _env_float("CMAB_SCORE_TEMPERATURE", 1.35, 0.10, 10.0)
+# 兩個 Arm 標準差的幾何平均。冷啟動／新特徵通常明顯高於此值。
+CMAB_UNKNOWN_STD_THRESHOLD = _env_float(
+    "CMAB_UNKNOWN_STD_THRESHOLD", 1.35, 0.10, 10.0
+)
+# 未知區間每一筆真實 B/P reward 的觀測權重。
+CMAB_UNKNOWN_UPDATE_MULTIPLIER = _env_float(
+    "CMAB_UNKNOWN_UPDATE_MULTIPLIER", 4.0, 1.0, 12.0
+)
 CMAB_MAX_EVENT_IDS = max(100, min(20000, int(os.getenv("CMAB_MAX_EVENT_IDS", "5000") or "5000")))
 
 
@@ -190,9 +203,20 @@ def _new_state() -> Dict[str, Any]:
         "feature_names": list(FEATURE_NAMES),
         "alpha": CMAB_ALPHA,
         "l2": CMAB_L2,
-        "arms": {arm: {"A": identity, "b": zeros, "updates": 0, "reward_sum": 0.0} for arm in ARMS},
+        "arms": {
+            arm: {
+                "A": identity,
+                "b": zeros,
+                "updates": 0,
+                "weighted_updates": 0.0,
+                "reward_sum": 0.0,
+                "weighted_reward_sum": 0.0,
+            }
+            for arm in ARMS
+        },
         "applied_event_ids": [],
         "total_updates": 0,
+        "total_weighted_updates": 0.0,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
     }
@@ -211,6 +235,21 @@ def _read_state_unlocked() -> Dict[str, Any]:
             b = np.asarray(arms[arm].get("b"), dtype=np.float64)
             if A.shape != (CONTEXT_DIM, CONTEXT_DIM) or b.shape != (CONTEXT_DIM,):
                 raise ValueError("invalid matrix shape")
+        # 舊 V1 狀態可直接延續，不重置已學習的 A／b。
+        data["version"] = MODEL_VERSION
+        data["total_weighted_updates"] = float(
+            data.get("total_weighted_updates", data.get("total_updates", 0)) or 0.0
+        )
+        for arm in ARMS:
+            arm_state = arms[arm]
+            arm_state["weighted_updates"] = float(
+                arm_state.get("weighted_updates", arm_state.get("updates", 0)) or 0.0
+            )
+            arm_state["weighted_reward_sum"] = float(
+                arm_state.get(
+                    "weighted_reward_sum", arm_state.get("reward_sum", 0.0)
+                ) or 0.0
+            )
         data["applied_event_ids"] = list(data.get("applied_event_ids") or [])[-CMAB_MAX_EVENT_IDS:]
         return data
     except Exception:
@@ -244,7 +283,15 @@ def _arm_metrics(state: Mapping[str, Any], arm: str, context: np.ndarray) -> Dic
         "exploration": exploration,
         "score": estimate + exploration,
         "updates": int(arm_state.get("updates", 0) or 0),
+        "weighted_updates": float(
+            arm_state.get("weighted_updates", arm_state.get("updates", 0)) or 0.0
+        ),
         "reward_sum": float(arm_state.get("reward_sum", 0.0) or 0.0),
+        "weighted_reward_sum": float(
+            arm_state.get(
+                "weighted_reward_sum", arm_state.get("reward_sum", 0.0)
+            ) or 0.0
+        ),
     }
 
 
@@ -271,6 +318,88 @@ def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any])
     return bp[-1] if bp else "B"
 
 
+
+def _short_term_trend_buffer(
+    history: Sequence[str],
+    fallback_direction: str,
+) -> Dict[str, Any]:
+    """未知區間只看最近 2-3 個 B/P，動態選擇順勢或逆勢。
+
+    規則優先序：
+    1. 最近兩局同向：順勢延續。
+    2. 最近三局完全交替：逆最近一局，延續單跳節奏。
+    3. 其他三局：採三局多數方向。
+    4. 樣本不足：沿用 cMAB／牌路 fallback。
+    """
+    bp = [value for value in history if value in ARMS]
+    fallback = fallback_direction if fallback_direction in ARMS else "B"
+
+    if len(bp) >= 2 and bp[-1] == bp[-2]:
+        direction = bp[-1]
+        strategy = "follow_last_two_streak"
+        strength = 0.58
+        evidence = bp[-2:]
+    elif len(bp) >= 3 and bp[-3] == bp[-1] and bp[-2] != bp[-1]:
+        direction = "P" if bp[-1] == "B" else "B"
+        strategy = "continue_three_step_alternation"
+        strength = 0.56
+        evidence = bp[-3:]
+    elif len(bp) >= 3:
+        recent = bp[-3:]
+        banker = sum(value == "B" for value in recent)
+        direction = "B" if banker >= 2 else "P"
+        strategy = "recent_three_majority"
+        strength = 0.54
+        evidence = recent
+    else:
+        direction = fallback
+        strategy = "insufficient_micro_history_fallback"
+        strength = 0.52
+        evidence = bp[-3:]
+
+    probabilities = {
+        direction: strength,
+        ("P" if direction == "B" else "B"): 1.0 - strength,
+        "T": 0.0,
+    }
+    return {
+        "direction": direction,
+        "direction_text": "莊" if direction == "B" else "閒",
+        "strategy": strategy,
+        "strength": strength,
+        "evidence": list(evidence),
+        "probabilities": probabilities,
+    }
+
+
+def _uncertainty_braking_metrics(
+    metrics: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """以兩個 Arm CI 標準差的幾何平均衡量上下文新穎度。
+
+    幾何平均可避免單一 Arm 尚未探索就永久鎖住 Buffer；
+    任一 Arm 在新區間取得 4 倍 few-shot 更新後，統計量會迅速下降。
+    """
+    std_b = max(0.0, float(metrics["B"].get("uncertainty", 0.0) or 0.0))
+    std_p = max(0.0, float(metrics["P"].get("uncertainty", 0.0) or 0.0))
+    variance_b = std_b * std_b
+    variance_p = std_p * std_p
+    action_space_std = math.sqrt(max(0.0, std_b * std_p))
+    action_space_variance = action_space_std * action_space_std
+    active = action_space_std >= CMAB_UNKNOWN_STD_THRESHOLD
+    return {
+        "active": active,
+        "threshold_std": float(CMAB_UNKNOWN_STD_THRESHOLD),
+        "action_space_std": float(action_space_std),
+        "action_space_variance": float(action_space_variance),
+        "per_arm_std": {"B": float(std_b), "P": float(std_p)},
+        "per_arm_variance": {"B": float(variance_b), "P": float(variance_p)},
+        "few_shot_update_weight": (
+            float(CMAB_UNKNOWN_UPDATE_MULTIPLIER) if active else 1.0
+        ),
+    }
+
+
 def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None,
                     venue: str = "", room: str = "", user_id: str = "",
                     run_seed: Optional[int] = None) -> Dict[str, Any]:
@@ -281,21 +410,48 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
     with _LOCK:
         state = _read_state_unlocked()
         metrics = {arm: _arm_metrics(state, arm, context) for arm in ARMS}
+
     score_b, score_p = metrics["B"]["score"], metrics["P"]["score"]
     if abs(score_b - score_p) <= 1e-12:
-        direction, tie_break = _fallback_direction(raw_history, road), True
+        base_direction, tie_break = _fallback_direction(raw_history, road), True
     else:
-        direction, tie_break = ("B" if score_b > score_p else "P"), False
-    probabilities = _softmax_two(score_b, score_p)
+        base_direction, tie_break = ("B" if score_b > score_p else "P"), False
+
+    base_probabilities = _softmax_two(score_b, score_p)
+    braking = _uncertainty_braking_metrics(metrics)
+    short_term = _short_term_trend_buffer(raw_history, base_direction)
+
+    if bool(braking["active"]):
+        direction = str(short_term["direction"])
+        probabilities = dict(short_term["probabilities"])
+        direction_source = "unknown_region_short_term_buffer"
+        signal_reason = (
+            f"未知區間接管：action-space std "
+            f"{float(braking['action_space_std']):.4f} >= "
+            f"{float(braking['threshold_std']):.4f}；"
+            f"採最近 2-3 局策略 {short_term['strategy']}"
+        )
+    else:
+        direction = base_direction
+        probabilities = dict(base_probabilities)
+        direction_source = "contextual_bandit_linu_cb"
+        signal_reason = "LinUCB 依目前牌路上下文、歷史回饋與探索上界選擇莊／閒 Arm"
+
     margin = abs(score_b - score_p)
     total_updates = int(state.get("total_updates", 0) or 0)
     maturity = 1.0 - math.exp(-total_updates / 80.0)
     quality = min(0.95, 0.34 + 0.36 * maturity + 0.25 * math.tanh(margin))
     if sum(value in ARMS for value in raw_history) < 8:
         quality = min(quality, 0.45)
+    if bool(braking["active"]):
+        # 未知區間仍強制輸出，但不可把短週期接管顯示成高信心。
+        quality = min(quality, 0.46)
+
     direction_edge = abs(probabilities["B"] - probabilities["P"])
     consistency = min(1.0, 0.50 + 0.50 * math.tanh(margin * 1.5))
     selected = metrics[direction]
+    few_shot_weight = float(braking["few_shot_update_weight"])
+
     return {
         "ok": True,
         "engine": "CONTEXTUAL_MULTI_ARMED_BANDIT_LINUCB",
@@ -303,6 +459,7 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
         "model_core": "contextual_multi_armed_bandit_linu_cb",
         "mode": "screen_contextual_bandit",
         "probabilities": dict(probabilities),
+        "pre_braking_probabilities": dict(base_probabilities),
         "banker_rate": round(probabilities["B"] * 100.0, 2),
         "player_rate": round(probabilities["P"] * 100.0, 2),
         "tie_rate": 0.0,
@@ -313,28 +470,56 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
         "internal_recommend": direction,
         "internal_action": direction,
         "signal_allowed": True,
-        "signal_status_text": "cMAB 下一局方向評估",
-        "signal_reason": "LinUCB 依目前牌路上下文、歷史回饋與探索上界選擇莊／閒 Arm",
+        "signal_status_text": (
+            "未知區間短週期策略接管"
+            if braking["active"]
+            else "cMAB 下一局方向評估"
+        ),
+        "signal_reason": signal_reason,
         "selected_arm": direction,
+        "base_bandit_direction": base_direction,
+        "base_bandit_direction_text": "莊" if base_direction == "B" else "閒",
         "next_round_direction": direction,
         "next_round_direction_text": "莊" if direction == "B" else "閒",
-        "direction_source": "contextual_bandit_linu_cb",
+        "direction_source": direction_source,
         "direction_edge": float(direction_edge),
         "direction_edge_percent": round(direction_edge * 100.0, 4),
         "quality_score": float(quality),
         "confidence_label": "較高" if quality >= 0.72 else "中等" if quality >= 0.50 else "偏低",
         "model_consistency": float(consistency),
         "uncertainty": float(selected["uncertainty"]),
+        "unknown_region_active": bool(braking["active"]),
+        "few_shot_update_weight": few_shot_weight,
+        "uncertainty_braking": {
+            **braking,
+            "base_direction": base_direction,
+            "selected_direction": direction,
+            "short_term_buffer": dict(short_term),
+        },
+        "short_term_trend_buffer": dict(short_term),
         "bandit_context": list(vector),
         "context_vector": list(vector),
         "context_feature_names": list(FEATURE_NAMES),
-        "bandit_scores": {arm: {key: int(value) if key == "updates" else round(float(value), 10)
-                                  for key, value in metrics[arm].items()} for arm in ARMS},
+        "bandit_scores": {
+            arm: {
+                key: int(value) if key == "updates" else round(float(value), 10)
+                for key, value in metrics[arm].items()
+            }
+            for arm in ARMS
+        },
         "bandit_state": {
             "total_updates": total_updates,
+            "total_weighted_updates": float(
+                state.get("total_weighted_updates", total_updates) or 0.0
+            ),
             "arm_updates": {arm: int(metrics[arm]["updates"]) for arm in ARMS},
+            "arm_weighted_updates": {
+                arm: float(metrics[arm]["weighted_updates"]) for arm in ARMS
+            },
             "alpha": CMAB_ALPHA,
             "l2": CMAB_L2,
+            "unknown_std_threshold": CMAB_UNKNOWN_STD_THRESHOLD,
+            "unknown_update_multiplier": CMAB_UNKNOWN_UPDATE_MULTIPLIER,
             "state_file": str(CMAB_STATE_FILE),
             "cold_start_tie_break": tie_break,
         },
@@ -357,7 +542,8 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
 
 
 def update_bandit(*, context: Sequence[float], selected_arm: str, reward: Optional[float],
-                   event_id: str = "", actual_outcome: str = "") -> Dict[str, Any]:
+                   event_id: str = "", actual_outcome: str = "",
+                   update_weight: float = 1.0) -> Dict[str, Any]:
     arm = str(selected_arm or "").upper().strip()
     if arm not in ARMS:
         raise ValueError("selected_arm must be B or P")
@@ -369,6 +555,7 @@ def update_bandit(*, context: Sequence[float], selected_arm: str, reward: Option
         raise ValueError(f"context must contain {CONTEXT_DIM} values, got {x.shape}")
     x = np.clip(x, -1.0, 1.0)
     reward_value = max(0.0, min(1.0, float(reward)))
+    observation_weight = max(0.25, min(12.0, float(update_weight)))
     event_key = str(event_id or "").strip()
     with _LOCK:
         state = _read_state_unlocked()
@@ -379,20 +566,36 @@ def update_bandit(*, context: Sequence[float], selected_arm: str, reward: Option
         arm_state = dict(state["arms"][arm])
         A = np.asarray(arm_state["A"], dtype=np.float64)
         b = np.asarray(arm_state["b"], dtype=np.float64)
-        A += np.outer(x, x)
-        b += reward_value * x
+
+        # Weighted LinUCB update：未知區間預設把這一筆視為 4 筆同等觀測。
+        A += observation_weight * np.outer(x, x)
+        b += observation_weight * reward_value * x
         arm_state["A"], arm_state["b"] = A.tolist(), b.tolist()
         arm_state["updates"] = int(arm_state.get("updates", 0) or 0) + 1
+        arm_state["weighted_updates"] = float(
+            arm_state.get("weighted_updates", arm_state["updates"] - 1) or 0.0
+        ) + observation_weight
         arm_state["reward_sum"] = float(arm_state.get("reward_sum", 0.0) or 0.0) + reward_value
+        arm_state["weighted_reward_sum"] = float(
+            arm_state.get("weighted_reward_sum", arm_state["reward_sum"] - reward_value) or 0.0
+        ) + observation_weight * reward_value
         state["arms"][arm] = arm_state
         state["total_updates"] = int(state.get("total_updates", 0) or 0) + 1
+        state["total_weighted_updates"] = float(
+            state.get("total_weighted_updates", state["total_updates"] - 1) or 0.0
+        ) + observation_weight
         if event_key:
             applied.append(event_key)
             state["applied_event_ids"] = applied[-CMAB_MAX_EVENT_IDS:]
         _write_state_unlocked(state)
     return {"updated": True, "event_id": event_key, "selected_arm": arm,
             "actual_outcome": str(actual_outcome or "").upper(), "reward": reward_value,
-            "arm_updates": int(arm_state["updates"]), "total_updates": int(state["total_updates"])}
+            "update_weight": observation_weight,
+            "few_shot_boost_applied": observation_weight > 1.0,
+            "arm_updates": int(arm_state["updates"]),
+            "arm_weighted_updates": float(arm_state["weighted_updates"]),
+            "total_updates": int(state["total_updates"]),
+            "total_weighted_updates": float(state["total_weighted_updates"])}
 
 
 def get_bandit_summary() -> Dict[str, Any]:
@@ -403,9 +606,28 @@ def get_bandit_summary() -> Dict[str, Any]:
         "context_dim": CONTEXT_DIM,
         "feature_names": list(FEATURE_NAMES),
         "total_updates": int(state.get("total_updates", 0) or 0),
-        "arms": {arm: {"updates": int(state["arms"][arm].get("updates", 0) or 0),
-                       "reward_sum": float(state["arms"][arm].get("reward_sum", 0.0) or 0.0)}
-                 for arm in ARMS},
+        "total_weighted_updates": float(
+            state.get("total_weighted_updates", state.get("total_updates", 0)) or 0.0
+        ),
+        "unknown_std_threshold": float(CMAB_UNKNOWN_STD_THRESHOLD),
+        "unknown_update_multiplier": float(CMAB_UNKNOWN_UPDATE_MULTIPLIER),
+        "arms": {
+            arm: {
+                "updates": int(state["arms"][arm].get("updates", 0) or 0),
+                "weighted_updates": float(
+                    state["arms"][arm].get(
+                        "weighted_updates", state["arms"][arm].get("updates", 0)
+                    ) or 0.0
+                ),
+                "reward_sum": float(state["arms"][arm].get("reward_sum", 0.0) or 0.0),
+                "weighted_reward_sum": float(
+                    state["arms"][arm].get(
+                        "weighted_reward_sum", state["arms"][arm].get("reward_sum", 0.0)
+                    ) or 0.0
+                ),
+            }
+            for arm in ARMS
+        },
         "state_file": str(CMAB_STATE_FILE),
     }
 
