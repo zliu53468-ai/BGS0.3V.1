@@ -107,6 +107,18 @@ DG_MOBILE_BIG_ROAD_ROI = _env_roi(
     # x 向左保留第一格，避免首顆莊被裁掉；執行時仍會在附近滑動搜尋。
     (0.302, 0.660, 0.653, 0.104),
 )
+
+# DG 942×2048 手機版新增兩種較低路紙位置。
+# 這兩組只作為額外候選，原本 DG 手機／電腦 ROI 與辨識邏輯完全保留。
+DG_MOBILE_LOWER_FULL_VIEW_ROI = _env_roi(
+    "DG_MOBILE_LOWER_FULL_VIEW_ROI",
+    (0.302, 0.700, 0.653, 0.104),
+)
+DG_MOBILE_LOWER_BROWSER_VIEW_ROI = _env_roi(
+    "DG_MOBILE_LOWER_BROWSER_VIEW_ROI",
+    (0.302, 0.720, 0.653, 0.104),
+)
+
 DG_DESKTOP_BIG_ROAD_ROI = _env_roi(
     "DG_DESKTOP_BIG_ROAD_ROI",
     (0.240, 0.803, 0.145, 0.135),
@@ -1751,6 +1763,26 @@ def detect_road_sequence_detailed(
     else:
         portrait = image_height > image_width * 1.15
         landscape = image_width > image_height * 1.25
+        if portrait and venue_code == "DG":
+            # 新增兩種 DG 942×2048 手機畫面；先嘗試精準 ROI，
+            # 未通過品質閘門時才繼續執行原本 dg_mobile_big_road_* 流程。
+            plan.append({
+                "name": "dg_mobile_lower_full_view",
+                "roi": DG_MOBILE_LOWER_FULL_VIEW_ROI,
+                "preference": 56.0,
+                "fixed_grid": True,
+                "grid_columns": None,
+                "profile": "dg_mobile_full_screen",
+            })
+            plan.append({
+                "name": "dg_mobile_lower_browser_view",
+                "roi": DG_MOBILE_LOWER_BROWSER_VIEW_ROI,
+                "preference": 55.5,
+                "fixed_grid": True,
+                "grid_columns": None,
+                "profile": "dg_mobile_full_screen",
+            })
+
         if portrait and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
