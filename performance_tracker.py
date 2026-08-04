@@ -198,6 +198,7 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
 
         if reward is not None and context:
             bandit_update = update_bandit(
+                user_id=user_id,
                 context=context,
                 selected_arm=selected_arm,
                 reward=reward,
