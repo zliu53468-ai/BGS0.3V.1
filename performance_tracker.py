@@ -1,7 +1,9 @@
-"""BGS 預測績效紀錄器。
+"""BGS cMAB 預測績效紀錄器。
 
-每次模型輸出後先建立 pending prediction；使用者回報下一個實際結果 B/P/T
-時，再把該筆預測結算。校準與自適應權重只讀取已結算資料，避免使用未來資訊。
+每次 cMAB 輸出後建立 pending prediction；使用者回報實際結果時：
+- B/P：以 1 或 0 reward 更新被選擇的 Arm。
+- T：和局不更新 B/P Arm。
+- prediction_id 去重，避免同一局重複學習。
 """
 from __future__ import annotations
 
@@ -15,20 +17,38 @@ import os
 import secrets
 import time
 
+from contextual_bandit import update_bandit
 
 BASE_DIR = Path(__file__).resolve().parent
-PERFORMANCE_DATA_FILE = Path(
-    os.getenv(
-        "PERFORMANCE_DATA_FILE",
-        str(BASE_DIR / "data" / "prediction_performance.json"),
-    )
-)
-PERFORMANCE_MAX_RECORDS = max(
-    1000,
-    min(200_000, int(os.getenv("PERFORMANCE_MAX_RECORDS", "30000") or "30000")),
-)
 _LOCK = RLock()
 _OUTCOMES = ("B", "P", "T")
+_GUARD_SECONDS = max(5, min(300, int(os.getenv("CMAB_DUPLICATE_GUARD_SECONDS", "90") or "90")))
+PERFORMANCE_MAX_RECORDS = max(1000, min(200000, int(os.getenv("PERFORMANCE_MAX_RECORDS", "30000") or "30000")))
+
+
+def _resolve_performance_file() -> Path:
+    configured = Path(os.getenv("PERFORMANCE_DATA_FILE", str(BASE_DIR / "data" / "prediction_performance.json"))).expanduser()
+    candidates = [configured, BASE_DIR / "data" / "prediction_performance.json", Path("/tmp/bgs_prediction_performance.json")]
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            probe = candidate.parent / f".performance_write_test_{os.getpid()}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            if candidate != configured:
+                print(f"PERFORMANCE_DATA_FILE fallback: {configured} -> {candidate}")
+            return candidate
+        except OSError as exc:
+            print(f"PERFORMANCE_DATA_FILE unavailable: {candidate}: {exc}")
+    raise RuntimeError("No writable PERFORMANCE_DATA_FILE path is available")
+
+
+PERFORMANCE_DATA_FILE = _resolve_performance_file()
 
 
 def _now() -> int:
@@ -41,81 +61,61 @@ def _uid_key(user_id: str) -> str:
 
 def _normalize_probabilities(values: Mapping[str, Any]) -> Dict[str, float]:
     raw = {key: max(1e-12, float(values.get(key, 0.0) or 0.0)) for key in _OUTCOMES}
-    total = sum(raw.values())
-    if total <= 0:
-        return {"B": 0.458597, "P": 0.446247, "T": 0.095156}
+    total = sum(raw.values()) or 1.0
     return {key: raw[key] / total for key in _OUTCOMES}
+
+
+def _prune_guards_unlocked(data: Dict[str, Any]) -> None:
+    now = _now()
+    guards = dict(data.get("duplicate_guards") or {})
+    data["duplicate_guards"] = {
+        uid: guard for uid, guard in guards.items()
+        if isinstance(guard, Mapping) and now - int(guard.get("created_at", 0) or 0) <= _GUARD_SECONDS
+    }
 
 
 def _read_unlocked() -> Dict[str, Any]:
     try:
-        with PERFORMANCE_DATA_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = json.loads(PERFORMANCE_DATA_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError
     except Exception:
         data = {}
-    records = data.get("records")
-    pending = data.get("pending")
-    return {
-        "records": records if isinstance(records, list) else [],
-        "pending": pending if isinstance(pending, dict) else {},
+    result = {
+        "records": data.get("records") if isinstance(data.get("records"), list) else [],
+        "pending": data.get("pending") if isinstance(data.get("pending"), dict) else {},
+        "duplicate_guards": data.get("duplicate_guards") if isinstance(data.get("duplicate_guards"), dict) else {},
         "updated_at": int(data.get("updated_at", 0) or 0),
     }
+    _prune_guards_unlocked(result)
+    return result
 
 
 def _write_unlocked(data: Dict[str, Any]) -> None:
-    PERFORMANCE_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _prune_guards_unlocked(data)
     data["records"] = list(data.get("records") or [])[-PERFORMANCE_MAX_RECORDS:]
     data["updated_at"] = _now()
+    PERFORMANCE_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = PERFORMANCE_DATA_FILE.with_suffix(PERFORMANCE_DATA_FILE.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(PERFORMANCE_DATA_FILE)
 
 
-def _component_probabilities(prediction: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
-    components: Dict[str, Dict[str, float]] = {}
-    candidates = {
-        "main_final": prediction.get("probabilities"),
-        "raw_core": prediction.get("raw_probabilities"),
-        "hypergeometric": prediction.get("hypergeometric_probabilities"),
-        "monte_carlo": prediction.get("monte_carlo_probabilities"),
-        "particle": prediction.get("particle_probabilities"),
-        "sequence": prediction.get("sequence_probabilities"),
-        "core_before_road": prediction.get("core_probabilities_before_road"),
-    }
-    for name, values in candidates.items():
-        if isinstance(values, Mapping):
-            try:
-                components[name] = _normalize_probabilities(values)
-            except Exception:
-                continue
-    return components
+def _prediction_probabilities(prediction: Mapping[str, Any]) -> Dict[str, float]:
+    if isinstance(prediction.get("probabilities"), Mapping):
+        return _normalize_probabilities(dict(prediction.get("probabilities") or {}))
+    return _normalize_probabilities({
+        "B": float(prediction.get("banker_rate", 0.0) or 0.0) / 100.0,
+        "P": float(prediction.get("player_rate", 0.0) or 0.0) / 100.0,
+        "T": float(prediction.get("tie_rate", 0.0) or 0.0) / 100.0,
+    })
 
 
-def record_prediction(
-    user_id: str,
-    prediction: Mapping[str, Any],
-    *,
-    venue: str = "",
-    room: str = "",
-    metadata: Optional[Mapping[str, Any]] = None,
-) -> str:
-    """保存等待實際結果的預測，回傳 prediction_id。"""
+def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str = "", room: str = "",
+                      metadata: Optional[Mapping[str, Any]] = None) -> str:
     uid = _uid_key(user_id)
-    final_probs = _normalize_probabilities(
-        prediction.get("calibrated_probabilities")
-        if isinstance(prediction.get("calibrated_probabilities"), Mapping)
-        else prediction.get("probabilities")
-        if isinstance(prediction.get("probabilities"), Mapping)
-        else {
-            "B": float(prediction.get("banker_rate", 0.0) or 0.0) / 100.0,
-            "P": float(prediction.get("player_rate", 0.0) or 0.0) / 100.0,
-            "T": float(prediction.get("tie_rate", 0.0) or 0.0) / 100.0,
-        }
-    )
     prediction_id = f"{_now():x}{secrets.token_hex(6)}"
+    selected_arm = str(prediction.get("selected_arm") or prediction.get("action") or prediction.get("recommend") or "").upper().strip()
     record = {
         "prediction_id": prediction_id,
         "uid_key": uid,
@@ -124,22 +124,18 @@ def record_prediction(
         "venue": str(venue or "").upper().strip(),
         "room": str(room or "").strip(),
         "model_version": str(prediction.get("model_version") or prediction.get("engine") or ""),
-        "probabilities": final_probs,
-        "raw_probabilities": _normalize_probabilities(
-            prediction.get("raw_probabilities")
-            if isinstance(prediction.get("raw_probabilities"), Mapping)
-            else prediction.get("probabilities")
-            if isinstance(prediction.get("probabilities"), Mapping)
-            else final_probs
-        ),
-        "components": _component_probabilities(prediction),
-        "recommend": str(prediction.get("recommend") or "").upper(),
-        "action": str(prediction.get("action") or "O").upper(),
+        "probabilities": _prediction_probabilities(prediction),
+        "recommend": str(prediction.get("recommend") or selected_arm).upper(),
+        "action": str(prediction.get("action") or selected_arm).upper(),
+        "selected_arm": selected_arm,
+        "context_vector": list(prediction.get("bandit_context") or prediction.get("context_vector") or []),
+        "context_feature_names": list(prediction.get("context_feature_names") or []),
+        "bandit_scores": dict(prediction.get("bandit_scores") or {}),
         "quality_score": float(prediction.get("quality_score", 0.0) or 0.0),
-        "calibration": dict(prediction.get("calibration") or {}),
-        "adaptive_ensemble": dict(prediction.get("adaptive_ensemble") or {}),
         "metadata": dict(metadata or {}),
         "actual_outcome": "",
+        "reward": None,
+        "bandit_update": {},
     }
     with _LOCK:
         data = _read_unlocked()
@@ -149,62 +145,85 @@ def record_prediction(
     return prediction_id
 
 
-def resolve_latest_prediction(
-    user_id: str,
-    actual_outcome: str,
-    *,
-    venue: str = "",
-    room: str = "",
-) -> Optional[Dict[str, Any]]:
-    """用最新實際 B/P/T 結算該 UID 尚未結算的上一筆預測。"""
+def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str = "", room: str = "",
+                              mark_duplicate_guard: bool = False) -> Optional[Dict[str, Any]]:
     actual = str(actual_outcome or "").upper().strip()
     if actual not in _OUTCOMES:
         raise ValueError("actual_outcome must be B, P or T")
     uid = _uid_key(user_id)
     with _LOCK:
         data = _read_unlocked()
+        guard = dict(data["duplicate_guards"].get(uid) or {})
+        if guard and str(guard.get("actual_outcome") or "") == actual and _now() - int(guard.get("created_at", 0) or 0) <= _GUARD_SECONDS:
+            data["duplicate_guards"].pop(uid, None)
+            _write_unlocked(data)
+            return None
+
         pending_id = str(data["pending"].get(uid) or "")
         target: Optional[Dict[str, Any]] = None
         for record in reversed(data["records"]):
-            if str(record.get("uid_key") or "") != uid:
-                continue
-            if record.get("actual_outcome"):
+            if str(record.get("uid_key") or "") != uid or record.get("actual_outcome"):
                 continue
             if pending_id and str(record.get("prediction_id") or "") != pending_id:
                 continue
             target = record
             break
+
         if target is None:
+            if mark_duplicate_guard:
+                data["duplicate_guards"][uid] = {"actual_outcome": actual, "created_at": _now(), "resolved_prediction_id": ""}
+                _write_unlocked(data)
             return None
 
-        probs = _normalize_probabilities(dict(target.get("probabilities") or {}))
+        probabilities = _normalize_probabilities(dict(target.get("probabilities") or {}))
+        selected_arm = str(target.get("selected_arm") or target.get("action") or target.get("recommend") or "").upper().strip()
+        context = list(target.get("context_vector") or [])
+        reward: Optional[float]
+        if actual == "T":
+            reward = None
+        elif selected_arm in {"B", "P"}:
+            reward = 1.0 if selected_arm == actual else 0.0
+        else:
+            reward = None
+
+        if reward is not None and context:
+            bandit_update = update_bandit(
+                context=context,
+                selected_arm=selected_arm,
+                reward=reward,
+                event_id=str(target.get("prediction_id") or ""),
+                actual_outcome=actual,
+            )
+        elif actual == "T":
+            bandit_update = {"updated": False, "reason": "tie_not_used_for_bp_arms", "actual_outcome": actual}
+        else:
+            bandit_update = {"updated": False, "reason": "missing_context_or_arm", "actual_outcome": actual}
+
         target["actual_outcome"] = actual
         target["resolved_at"] = _now()
+        target["reward"] = reward
+        target["bandit_update"] = bandit_update
         if venue:
             target["venue"] = str(venue).upper().strip()
         if room:
             target["room"] = str(room).strip()
-        target["log_loss"] = -math.log(max(1e-12, probs[actual]))
-        target["brier_score"] = sum(
-            (probs[key] - (1.0 if key == actual else 0.0)) ** 2
-            for key in _OUTCOMES
-        )
-        target["top1_correct"] = max(probs, key=probs.get) == actual
-        action = str(target.get("action") or "O").upper()
-        target["action_correct"] = action == actual if action in _OUTCOMES else None
+        target["log_loss"] = -math.log(max(1e-12, probabilities[actual]))
+        target["brier_score"] = sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in _OUTCOMES)
+        target["top1_correct"] = max(probabilities, key=probabilities.get) == actual
+        target["action_correct"] = selected_arm == actual if actual in {"B", "P"} and selected_arm in {"B", "P"} else None
         data["pending"].pop(uid, None)
+        if mark_duplicate_guard:
+            data["duplicate_guards"][uid] = {
+                "actual_outcome": actual,
+                "created_at": _now(),
+                "resolved_prediction_id": str(target.get("prediction_id") or ""),
+            }
         _write_unlocked(data)
         return dict(target)
 
 
-def get_resolved_records(
-    *,
-    venue: str = "",
-    room: str = "",
-    limit: int = 5000,
-) -> List[Dict[str, Any]]:
-    venue_key = str(venue or "").upper().strip()
-    room_key = str(room or "").strip()
+def get_resolved_records(*, venue: str = "", room: str = "", limit: int = 5000) -> List[Dict[str, Any]]:
+    venue_key, room_key = str(venue or "").upper().strip(), str(room or "").strip()
     with _LOCK:
         records = list(_read_unlocked().get("records") or [])
     result: List[Dict[str, Any]] = []
@@ -223,70 +242,48 @@ def get_resolved_records(
 
 
 def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    sample_count = len(records)
+    valid = [dict(record) for record in records if str(record.get("actual_outcome") or "") in _OUTCOMES]
     counts = {key: 0 for key in _OUTCOMES}
-    mean_predicted = {key: 0.0 for key in _OUTCOMES}
     brier_values: List[float] = []
     log_losses: List[float] = []
-    component_scores: Dict[str, List[float]] = {}
-
-    for record in records:
+    decided = correct = 0
+    rewards: List[float] = []
+    for record in valid:
         actual = str(record.get("actual_outcome") or "").upper()
-        if actual not in _OUTCOMES:
-            continue
         counts[actual] += 1
-        probs = _normalize_probabilities(dict(record.get("probabilities") or {}))
-        for key in _OUTCOMES:
-            mean_predicted[key] += probs[key]
-        brier_values.append(sum(
-            (probs[key] - (1.0 if key == actual else 0.0)) ** 2
-            for key in _OUTCOMES
-        ))
-        log_losses.append(-math.log(max(1e-12, probs[actual])))
-        for name, component in dict(record.get("components") or {}).items():
-            if not isinstance(component, Mapping):
-                continue
-            component_probs = _normalize_probabilities(component)
-            score = sum(
-                (component_probs[key] - (1.0 if key == actual else 0.0)) ** 2
-                for key in _OUTCOMES
-            )
-            component_scores.setdefault(str(name), []).append(score)
-
-    valid = max(1, sum(counts.values()))
-    empirical = {key: counts[key] / valid for key in _OUTCOMES}
-    mean_predicted = {key: mean_predicted[key] / valid for key in _OUTCOMES}
+        try:
+            brier_values.append(float(record.get("brier_score")))
+        except Exception:
+            pass
+        try:
+            log_losses.append(float(record.get("log_loss")))
+        except Exception:
+            pass
+        if record.get("action_correct") is not None:
+            decided += 1
+            correct += int(bool(record.get("action_correct")))
+        if record.get("reward") is not None:
+            rewards.append(float(record.get("reward") or 0.0))
+    total = max(1, len(valid))
     return {
-        "sample_count": sample_count,
+        "sample_count": len(valid),
         "outcome_counts": counts,
-        "empirical_probabilities": empirical,
-        "mean_predicted_probabilities": mean_predicted,
-        "brier_score": sum(brier_values) / len(brier_values) if brier_values else None,
-        "log_loss": sum(log_losses) / len(log_losses) if log_losses else None,
-        "component_brier_scores": {
-            name: sum(values) / len(values)
-            for name, values in component_scores.items()
-            if values
-        },
-        "component_sample_counts": {
-            name: len(values) for name, values in component_scores.items()
-        },
+        "empirical_probabilities": {key: counts[key] / total for key in _OUTCOMES},
+        "decision_count": decided,
+        "correct_count": correct,
+        "accuracy": correct / max(1, decided),
+        "mean_reward": sum(rewards) / max(1, len(rewards)),
+        "mean_brier_score": sum(brier_values) / len(brier_values) if brier_values else None,
+        "mean_log_loss": sum(log_losses) / len(log_losses) if log_losses else None,
+        "component_brier_scores": {},
+        "component_sample_counts": {},
+        "model": "CMAB-LINUCB-V1",
     }
 
 
-def get_performance_summary(
-    *,
-    venue: str = "",
-    room: str = "",
-    limit: int = 5000,
-) -> Dict[str, Any]:
+def get_performance_summary(*, venue: str = "", room: str = "", limit: int = 5000) -> Dict[str, Any]:
     return summarize_records(get_resolved_records(venue=venue, room=room, limit=limit))
 
 
-__all__ = [
-    "get_performance_summary",
-    "get_resolved_records",
-    "record_prediction",
-    "resolve_latest_prediction",
-    "summarize_records",
-]
+__all__ = ["get_performance_summary", "get_resolved_records", "record_prediction",
+           "resolve_latest_prediction", "summarize_records"]

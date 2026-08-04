@@ -1,24 +1,26 @@
-"""遊戲截圖 B/P/T 全歷史預測轉接層 V10.3。
+"""遊戲截圖 cMAB 預測轉接層。
 
-重點：圖片初始化歷史與後續人工輸入分開保存，再合併成模型完整歷史；
-全盤牌路模型可取得初始格位與辨識品質，不再只看最新一局。
+完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB。
+不再建立估計牌組，也不使用 fresh_counts、粒子、超幾何、蒙地卡羅或 Stacking。
+
+為了不修改 app.py 的非模型流程，本檔在人工回報後會先結算上一筆 reward，
+再產生下一局預測；績效紀錄器會略過 app.py 稍後的重複結算呼叫。
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 import os
 import secrets
 
-from particle_filter_points import fresh_counts
-from performance_tracker import record_prediction
+from performance_tracker import record_prediction, resolve_latest_prediction
 from predictor import predict
 from road_model import build_road_context
 
 PERFORMANCE_TRACKING_ENABLED = os.getenv("PERFORMANCE_TRACKING_ENABLED", "1").strip() == "1"
 
 
-def _clean_raw(values: Iterable[Any]) -> List[str]:
-    out: List[str] = []
+def _clean_raw(values: Iterable[Any]) -> list[str]:
+    out: list[str] = []
     for item in values:
         raw = item.get("outcome") if isinstance(item, Mapping) else item
         value = str(raw or "").upper().strip()
@@ -27,29 +29,8 @@ def _clean_raw(values: Iterable[Any]) -> List[str]:
     return out[-2000:]
 
 
-def _clean_bp(values: Iterable[Any]) -> List[str]:
-    return [v for v in _clean_raw(values) if v in {"B", "P"}][-1000:]
-
-
-def _largest_remainder_allocation(weights: Sequence[float], total: int) -> List[int]:
-    positive = [max(0.0, float(v)) for v in weights]
-    if total <= 0:
-        return [0] * len(positive)
-    weight_sum = sum(positive) or float(len(positive))
-    if sum(positive) <= 0:
-        positive = [1.0] * len(positive)
-    exact = [v / weight_sum * total for v in positive]
-    floors = [int(v) for v in exact]
-    for index in sorted(range(len(exact)), key=lambda i: exact[i] - floors[i], reverse=True)[: total - sum(floors)]:
-        floors[index] += 1
-    return floors
-
-
-def estimate_point_counts(remaining_cards: int, *, prior_counts: Optional[Sequence[int]] = None, decks: int = 8) -> Tuple[List[int], str]:
-    total = max(6, min(52 * max(1, min(16, int(decks))), int(remaining_cards)))
-    if isinstance(prior_counts, Sequence) and len(prior_counts) == 10 and sum(max(0, int(v)) for v in prior_counts) >= 6:
-        return _largest_remainder_allocation([max(0, int(v)) for v in prior_counts], total), "session_scaled"
-    return _largest_remainder_allocation(fresh_counts(decks), total), "fresh_shoe_scaled"
+def _clean_bp(values: Iterable[Any]) -> list[str]:
+    return [value for value in _clean_raw(values) if value in {"B", "P"}][-1000:]
 
 
 def predict_from_screenshot(
@@ -74,9 +55,6 @@ def predict_from_screenshot(
         combined_raw = _clean_raw(sequence)
     cleaned = _clean_bp(combined_raw)
 
-    fallback_total = sum(int(v) for v in prior_counts or [] if int(v) >= 0)
-    total = int(remaining_cards or fallback_total or 416)
-    counts, source = estimate_point_counts(total, prior_counts=prior_counts, decks=8)
     seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     context = dict(road_context or build_road_context(
         combined_raw,
@@ -86,17 +64,34 @@ def predict_from_screenshot(
         manual_count=len(manual_raw),
     ))
     metadata = dict(screen_metadata or {})
+
+    previous_resolution = None
+    if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id and manual_raw:
+        previous_resolution = resolve_latest_prediction(
+            user_id,
+            manual_raw[-1],
+            venue=venue,
+            room=room,
+            mark_duplicate_guard=True,
+        )
+
     result = predict(
-        history=combined_raw, venue=venue, room=room, user_id=user_id, run_seed=seed,
-        shoe_context={"remaining_counts": counts}, road_context=context,
+        history=combined_raw,
+        venue=venue,
+        room=room,
+        user_id=user_id,
+        run_seed=seed,
+        shoe_context=None,
+        road_context=context,
     )
     result.update({
-        "model_version": "V10.3-FULL-HISTORY-GRID-AWARE",
-        "mode": "screen_full_history_grid_aware",
-        "screen_remaining_cards": total,
-        "estimated_remaining_counts": counts,
-        "composition_source": source,
-        "composition_quality": "estimated",
+        "model_version": "CMAB-LINUCB-V1-FULL-HISTORY-GRID-AWARE",
+        "mode": "screen_full_history_contextual_bandit",
+        "screen_remaining_cards": int(remaining_cards or 0),
+        "estimated_remaining_counts": [],
+        "composition_source": "not_used_cmab",
+        "composition_quality": "not_applicable_cmab",
+        "prior_counts_ignored": bool(prior_counts),
         "road_sequence_length": len(cleaned),
         "raw_outcome_length": len(combined_raw),
         "initial_image_count": len(initial_raw),
@@ -104,7 +99,7 @@ def predict_from_screenshot(
         "combined_round_count": len(combined_raw),
         "full_history_used_count": len(combined_raw),
         "initial_grid_cells": list(initial_grid_cells or []),
-        "tie_count": sum(1 for v in combined_raw if v == "T"),
+        "tie_count": sum(value == "T" for value in combined_raw),
         "tie_markers": dict(tie_markers or {}),
         "road_support": context,
         "road_pipeline_completed": True,
@@ -112,17 +107,31 @@ def predict_from_screenshot(
         "screen_input_type": str(metadata.get("input_type") or "unknown"),
         "virtual_only": False,
         "external_screen_input": True,
+        "previous_prediction_resolved_before_next": bool(previous_resolution),
     })
-    result["road_fusion"] = dict(result.get("road_integration") or {})
+    result["road_fusion"] = {
+        "applied": True,
+        "mode": "context_features_only",
+        "reason": "牌路資訊作為 cMAB 上下文，不再以 Stacking 機率融合",
+    }
+
     if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id:
-        result["prediction_id"] = record_prediction(user_id, result, venue=venue, room=room, metadata={
-            **metadata, "initial_image_count": len(initial_raw), "manual_round_count": len(manual_raw),
-            "combined_round_count": len(combined_raw),
-        })
+        result["prediction_id"] = record_prediction(
+            user_id,
+            result,
+            venue=venue,
+            room=room,
+            metadata={
+                **metadata,
+                "initial_image_count": len(initial_raw),
+                "manual_round_count": len(manual_raw),
+                "combined_round_count": len(combined_raw),
+            },
+        )
         result["performance_tracking"] = True
     else:
         result["performance_tracking"] = False
     return result
 
 
-__all__ = ["estimate_point_counts", "predict_from_screenshot"]
+__all__ = ["predict_from_screenshot"]
