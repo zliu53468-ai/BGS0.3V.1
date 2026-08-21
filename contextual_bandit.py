@@ -5,18 +5,20 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
-V1.3 動態 OOD 防禦：
+V1.5 多維統計硬煞車：
 - 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
 - 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
   避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
-- 每個 UID 以歷史平均 + 1.5 個標準差建立動態未知區間門檻。
-- 高方差時動作切換為觀望／0%配置，但保留最近 3 局微觀方向先驗。
-- 高方差樣本以 4～5 倍觀測權重完成 Few-shot 更新。
+- 每個 UID 以經驗方差歷史平均 + 1.3 個標準差建立動態門檻。
+- 同時計算最近 12 局排列熵、B/P 卡方與經驗方差診斷。
+- 只有「模型方差超標且排列熵 > 0.95」才標記極端混沌區間。
+- 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
 
 banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
 """
 from __future__ import annotations
 
+from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
@@ -29,7 +31,7 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1.4-GLOBAL-DEFENSE-SIGNAL"
+MODEL_VERSION = "CMAB-LINUCB-V1.5-STATISTICAL-HARD-BRAKE"
 STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V2"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -69,8 +71,11 @@ CMAB_SCORE_TEMPERATURE = _env_float(
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
 CMAB_UNCERTAINTY_SIGMA = _env_float(
-    "CMAB_UNCERTAINTY_SIGMA", 1.50, 0.50, 4.00
+    "CMAB_UNCERTAINTY_SIGMA", 1.30, 0.50, 4.00
 )
+CMAB_PERMUTATION_WINDOW = 12
+CMAB_PERMUTATION_ORDER = 3
+CMAB_PERMUTATION_ENTROPY_THRESHOLD = 0.95
 CMAB_UNCERTAINTY_MIN_SAMPLES = max(
     4,
     min(
@@ -94,10 +99,8 @@ CMAB_UNKNOWN_STD_THRESHOLD = _env_float(
     "CMAB_UNKNOWN_STD_THRESHOLD", 1.35, 0.10, 10.0
 )
 
-# 未知區間每一筆真實 B/P reward 強制視為 4～5 筆同等觀測。
-CMAB_UNKNOWN_UPDATE_MULTIPLIER = _env_float(
-    "CMAB_UNKNOWN_UPDATE_MULTIPLIER", 4.50, 4.00, 5.00
-)
+# V1.5 起完全停用 Few-shot 加權；保留名稱僅供既有監控欄位相容。
+CMAB_UNKNOWN_UPDATE_MULTIPLIER = 1.0
 CMAB_UNKNOWN_CONFIDENCE_CAP = _env_float(
     "CMAB_UNKNOWN_CONFIDENCE_CAP", 0.28, 0.05, 0.49
 )
@@ -294,9 +297,117 @@ def _clean_uncertainty_values(values: Any) -> List[float]:
     return result[-CMAB_UNCERTAINTY_HISTORY_SIZE:]
 
 
+def _rolling_randomness_diagnostics(history: Sequence[str]) -> Dict[str, Any]:
+    """最近 12 局的排列熵、B/P 卡方與經驗方差。
+
+    B/P/T 先映射為 +1/-1/0，再轉成累積隨機漫步；對該連續軌跡做
+    order=3 的 Bandt-Pompe 排列熵。極小的確定性 dither 只用來處理
+    累積值相同的 ordinal tie；它不改變相差至少 1 的大小關係，也不
+    引入隨機數，因此二元序列仍可使用完整六種排列且回測完全可重現。
+    """
+    window = [
+        value for value in history if value in {"B", "P", "T"}
+    ][-CMAB_PERMUTATION_WINDOW:]
+    ready = len(window) >= CMAB_PERMUTATION_WINDOW
+    increments = np.asarray(
+        [1.0 if value == "B" else -1.0 if value == "P" else 0.0 for value in window],
+        dtype=np.float64,
+    )
+    walk = np.cumsum(increments)
+    if walk.size:
+        indices = np.arange(walk.size, dtype=np.float64)
+        deterministic_dither = np.sin(
+            (indices + 1.0) * math.sqrt(2.0)
+        ) * 1e-12
+        walk = walk + deterministic_dither
+
+    patterns: Counter[tuple[int, ...]] = Counter()
+    order = CMAB_PERMUTATION_ORDER
+    for index in range(max(0, len(walk) - order + 1)):
+        segment = walk[index:index + order]
+        pattern = tuple(
+            int(value)
+            for value in np.argsort(segment, kind="mergesort")
+        )
+        patterns[pattern] += 1
+
+    pattern_total = sum(patterns.values())
+    if pattern_total:
+        probabilities = [count / pattern_total for count in patterns.values()]
+        raw_entropy = -sum(
+            probability * math.log(probability)
+            for probability in probabilities
+            if probability > 0.0
+        )
+        maximum_entropy = math.log(math.factorial(order))
+        permutation_entropy = raw_entropy / maximum_entropy
+    else:
+        permutation_entropy = 0.0
+    permutation_entropy = max(0.0, min(1.0, float(permutation_entropy)))
+
+    bp = [value for value in window if value in ARMS]
+    banker_count = sum(value == "B" for value in bp)
+    player_count = len(bp) - banker_count
+    banker_binary = np.asarray(
+        [1.0 if value == "B" else 0.0 for value in bp],
+        dtype=np.float64,
+    )
+    empirical_variance = (
+        float(np.var(banker_binary, ddof=1))
+        if len(banker_binary) >= 2
+        else 0.0
+    )
+
+    # 使用 B/P 排除和局後的長期基準比例；df=1 的 survival function
+    # 可用 erfc(sqrt(chi2/2)) 精確表示，無需新增 scipy 相依套件。
+    banker_expected_ratio = 0.458597 / (0.458597 + 0.446247)
+    expected_banker = len(bp) * banker_expected_ratio
+    expected_player = len(bp) - expected_banker
+    chi_square = 0.0
+    if expected_banker > 0.0 and expected_player > 0.0:
+        chi_square = (
+            (banker_count - expected_banker) ** 2 / expected_banker
+            + (player_count - expected_player) ** 2 / expected_player
+        )
+    chi_square_p_value = math.erfc(math.sqrt(max(0.0, chi_square) / 2.0))
+
+    return {
+        "window_size": len(window),
+        "required_window_size": CMAB_PERMUTATION_WINDOW,
+        "ready": bool(ready),
+        "outcomes": list(window),
+        "permutation_order": int(order),
+        "permutation_entropy": float(permutation_entropy),
+        "permutation_entropy_threshold": float(
+            CMAB_PERMUTATION_ENTROPY_THRESHOLD
+        ),
+        "entropy_indicates_white_noise": bool(
+            ready
+            and permutation_entropy > CMAB_PERMUTATION_ENTROPY_THRESHOLD
+        ),
+        "ordinal_pattern_count": int(pattern_total),
+        "unique_ordinal_patterns": int(len(patterns)),
+        "bp_sample_count": int(len(bp)),
+        "banker_count": int(banker_count),
+        "player_count": int(player_count),
+        "banker_empirical_rate": float(
+            banker_count / len(bp) if bp else 0.0
+        ),
+        "empirical_variance": float(empirical_variance),
+        "chi_square_statistic": float(chi_square),
+        "chi_square_p_value": float(chi_square_p_value),
+    }
+
+
 def _baseline_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
-    baseline = dict(state.get("uncertainty_baseline") or {})
+    """共享 context 預測「方差」的歷史基準，單位保持為 variance。"""
+    baseline = dict(state.get("variance_baseline") or {})
     values = _clean_uncertainty_values(baseline.get("values"))
+    if not values:
+        # V1.4 的 uncertainty_baseline 儲存的是 std；平方後無損遷移。
+        legacy = dict(state.get("uncertainty_baseline") or {})
+        legacy_std = _clean_uncertainty_values(legacy.get("values"))
+        values = [float(value * value) for value in legacy_std]
     sample_count = len(values)
     mean = float(np.mean(values)) if values else 0.0
     std = (
@@ -307,13 +418,13 @@ def _baseline_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
     dynamic_ready = sample_count >= CMAB_UNCERTAINTY_MIN_SAMPLES
     threshold = (
         max(
-            CMAB_DYNAMIC_THRESHOLD_FLOOR,
+            CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2,
             mean + CMAB_UNCERTAINTY_SIGMA * std,
         )
         if dynamic_ready
         else max(
-            CMAB_DYNAMIC_THRESHOLD_FLOOR,
-            CMAB_UNKNOWN_STD_THRESHOLD,
+            CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2,
+            CMAB_UNKNOWN_STD_THRESHOLD ** 2,
         )
     )
     return {
@@ -326,23 +437,24 @@ def _baseline_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
         "sigma_multiplier": float(CMAB_UNCERTAINTY_SIGMA),
         "minimum_samples": int(CMAB_UNCERTAINTY_MIN_SAMPLES),
         "history_size": int(CMAB_UNCERTAINTY_HISTORY_SIZE),
-        "fallback_threshold": float(CMAB_UNKNOWN_STD_THRESHOLD),
-        "threshold_floor": float(CMAB_DYNAMIC_THRESHOLD_FLOOR),
+        "unit": "variance",
+        "fallback_threshold": float(CMAB_UNKNOWN_STD_THRESHOLD ** 2),
+        "threshold_floor": float(CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2),
     }
 
 
 def _update_uncertainty_baseline(
     state: Dict[str, Any],
     *,
-    action_space_std: float,
+    action_space_variance: float,
     unknown_region_active: bool,
     prediction_fingerprint: str,
 ) -> Dict[str, Any]:
-    """只用已判定為分布內的樣本更新基準，避免 OOD 值污染門檻。"""
+    """只用非極端樣本更新經驗方差基準，避免混沌值污染門檻。"""
     summary = _baseline_summary(state)
     values = list(summary["values"])
     previous_fingerprint = str(
-        state.get("last_uncertainty_fingerprint") or ""
+        state.get("last_variance_fingerprint") or ""
     )
     is_new_prediction = (
         bool(prediction_fingerprint)
@@ -350,16 +462,16 @@ def _update_uncertainty_baseline(
     )
 
     if is_new_prediction and not unknown_region_active:
-        values.append(max(0.0, float(action_space_std)))
+        values.append(max(0.0, float(action_space_variance)))
         values = values[-CMAB_UNCERTAINTY_HISTORY_SIZE:]
 
-    state["uncertainty_baseline"] = {
+    state["variance_baseline"] = {
         "values": values,
-        "last_observed_std": max(0.0, float(action_space_std)),
+        "last_observed_variance": max(0.0, float(action_space_variance)),
         "last_unknown_region_active": bool(unknown_region_active),
         "updated_at": int(time.time()),
     }
-    state["last_uncertainty_fingerprint"] = prediction_fingerprint
+    state["last_variance_fingerprint"] = prediction_fingerprint
     return _baseline_summary(state)
 
 
@@ -437,9 +549,16 @@ def _new_state() -> Dict[str, Any]:
             "last_unknown_region_active": False,
             "updated_at": 0,
         },
+        "variance_baseline": {
+            "values": [],
+            "last_observed_variance": 0.0,
+            "last_unknown_region_active": False,
+            "updated_at": 0,
+        },
         "short_term_buffer": [],
         "pending_ood_contexts": [],
         "last_uncertainty_fingerprint": "",
+        "last_variance_fingerprint": "",
         "last_prediction_risk": {},
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
@@ -575,43 +694,41 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         ),
         "updated_at": int(baseline.get("updated_at", 0) or 0),
     }
+    variance_baseline = dict(state.get("variance_baseline") or {})
+    variance_values = _clean_uncertainty_values(
+        variance_baseline.get("values")
+    )
+    if not variance_values:
+        variance_values = [
+            float(value * value)
+            for value in state["uncertainty_baseline"]["values"]
+        ]
+    state["variance_baseline"] = {
+        "values": variance_values,
+        "last_observed_variance": max(
+            0.0,
+            float(
+                variance_baseline.get("last_observed_variance", 0.0)
+                or 0.0
+            ),
+        ),
+        "last_unknown_region_active": bool(
+            variance_baseline.get("last_unknown_region_active", False)
+        ),
+        "updated_at": int(variance_baseline.get("updated_at", 0) or 0),
+    }
     state["short_term_buffer"] = [
         value
         for value in list(state.get("short_term_buffer") or [])
         if value in ARMS
     ][-3:]
-    pending_ood_contexts: List[Dict[str, Any]] = []
-    for item in list(state.get("pending_ood_contexts") or []):
-        if not isinstance(item, Mapping):
-            continue
-        context_hash = str(item.get("context_hash") or "").strip()
-        if not context_hash:
-            continue
-        pending_ood_contexts.append({
-            "context_hash": context_hash,
-            "prediction_fingerprint": str(
-                item.get("prediction_fingerprint") or ""
-            ),
-            "update_weight": max(
-                4.0,
-                min(
-                    5.0,
-                    float(
-                        item.get(
-                            "update_weight",
-                            CMAB_UNKNOWN_UPDATE_MULTIPLIER,
-                        )
-                        or CMAB_UNKNOWN_UPDATE_MULTIPLIER
-                    ),
-                ),
-            ),
-            "created_at": int(item.get("created_at", 0) or 0),
-        })
-    state["pending_ood_contexts"] = pending_ood_contexts[
-        -CMAB_MAX_PENDING_OOD_CONTEXTS:
-    ]
+    # V1.5 不再使用待加速 OOD 快取；部署後主動清除舊項目。
+    state["pending_ood_contexts"] = []
     state["last_uncertainty_fingerprint"] = str(
         state.get("last_uncertainty_fingerprint") or ""
+    )
+    state["last_variance_fingerprint"] = str(
+        state.get("last_variance_fingerprint") or ""
     )
     state["last_prediction_risk"] = (
         dict(state.get("last_prediction_risk") or {})
@@ -934,8 +1051,9 @@ def _uncertainty_braking_metrics(
     state: Mapping[str, Any],
     shared_context: Mapping[str, Any],
     base_direction: str,
+    randomness: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """計算 LinUCB 的精確 xᵀA⁻¹x 與 UID 動態 OOD 閾值。
+    """以模型方差與 12 局排列熵的 AND gate 判定極端混沌。
 
     每個 Arm 的 variance 均為 xᵀA_arm⁻¹x。
     OOD braking 使用共享 A_ctx 的 xᵀA_ctx⁻¹x：A_ctx 在任何 B/P
@@ -966,10 +1084,17 @@ def _uncertainty_braking_metrics(
     selected_std = math.sqrt(selected_variance)
 
     baseline = _baseline_summary(state)
-    threshold = float(baseline["threshold"])
-    active = action_space_std > threshold
+    threshold_variance = float(baseline["threshold"])
+    variance_above_threshold = action_space_variance > threshold_variance
+    entropy_indicates_white_noise = bool(
+        randomness.get("entropy_indicates_white_noise", False)
+    )
+    active = bool(
+        variance_above_threshold
+        and entropy_indicates_white_noise
+    )
     severity_ratio = (
-        action_space_std / max(threshold, 1e-12)
+        action_space_variance / max(threshold_variance, 1e-12)
     )
 
     if active and severity_ratio >= 1.50:
@@ -988,15 +1113,40 @@ def _uncertainty_braking_metrics(
         "variance": float(action_space_variance),
         "uncertainty_level": uncertainty_level,
         "threshold_mode": (
-            "dynamic_mean_plus_1_5_std"
+            "dynamic_variance_mean_plus_1_3_std"
             if baseline["dynamic_ready"]
-            else "cold_start_fallback"
+            else "cold_start_variance_fallback"
         ),
-        "threshold_metric": "shared_context_novelty_std",
-        "threshold_std": threshold,
-        "dynamic_threshold_std": threshold,
-        "historical_mean_std": float(baseline["mean"]),
-        "historical_std_of_std": float(baseline["std"]),
+        "threshold_metric": (
+            "shared_context_variance_AND_permutation_entropy"
+        ),
+        "threshold_variance": float(threshold_variance),
+        "dynamic_threshold_variance": float(threshold_variance),
+        # 保留舊 std 欄位供既有下游讀取，但正式判斷使用 variance。
+        "threshold_std": float(math.sqrt(max(0.0, threshold_variance))),
+        "dynamic_threshold_std": float(
+            math.sqrt(max(0.0, threshold_variance))
+        ),
+        "historical_mean_variance": float(baseline["mean"]),
+        "historical_std_of_variance": float(baseline["std"]),
+        "historical_mean_std": float(
+            math.sqrt(max(0.0, float(baseline["mean"])))
+        ),
+        "historical_std_of_std": 0.0,
+        "variance_above_dynamic_threshold": bool(
+            variance_above_threshold
+        ),
+        "variance_safe": bool(not variance_above_threshold),
+        "permutation_entropy": float(
+            randomness.get("permutation_entropy", 0.0) or 0.0
+        ),
+        "permutation_entropy_threshold": float(
+            CMAB_PERMUTATION_ENTROPY_THRESHOLD
+        ),
+        "entropy_indicates_white_noise": bool(
+            entropy_indicates_white_noise
+        ),
+        "rolling_randomness": dict(randomness),
         "historical_sample_count": int(
             baseline["sample_count"]
         ),
@@ -1052,15 +1202,12 @@ def _uncertainty_braking_metrics(
                 or 0.0
             ),
         },
-        "few_shot_update_weight": (
-            float(CMAB_UNKNOWN_UPDATE_MULTIPLIER)
-            if active
-            else 1.0
-        ),
+        "few_shot_update_weight": 1.0,
+        "few_shot_boost_disabled": True,
         "observe_required": bool(active),
         "bet_multiplier": 0.0 if active else 1.0,
         "downstream_signal_code": (
-            "OOD_EXTREME_UNCERTAINTY_OBSERVE"
+            "STATISTICAL_CHAOS_HARD_BRAKE"
             if active
             else "IN_DISTRIBUTION"
         ),
@@ -1076,6 +1223,7 @@ def _predict_bandit_impl(
     run_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     raw_history = _clean_history(history)
+    randomness = _rolling_randomness_diagnostics(raw_history)
     road = dict(road_context or {})
     vector = build_context_vector(
         raw_history,
@@ -1125,37 +1273,31 @@ def _predict_bandit_impl(
             state,
             shared_context,
             base_direction,
+            randomness,
         )
         short_term = _short_term_trend_buffer(
             raw_history,
             base_direction,
         )
-        short_term["meta_learning_takeover"] = bool(braking["active"])
+        short_term["meta_learning_takeover"] = False
 
         if bool(braking["active"]):
-            probabilities = _blend_ood_probabilities(
-                base_probabilities,
-                dict(short_term["probabilities"]),
-            )
-            direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
-            short_term["blended_probabilities"] = dict(probabilities)
-            short_term["blended_direction"] = direction
+            # 混沌區間不再以 3 局規則覆寫主模型；只保留內部 Arm
+            # 供 1 倍被動學習，公開分數強制中性並交由下游硬熔斷。
+            direction = base_direction
+            probabilities = {"B": 0.5, "P": 0.5, "T": 0.0}
             action_code = "O"
-            action_text = "觀望／降低注碼"
+            action_text = "觀望／絕對不下注"
             direction_source = (
-                "ood_meta_learning_short_term_prior"
+                "statistical_chaos_hard_brake_candidate"
             )
             signal_reason = (
-                "極高不確定性防禦："
-                f"action-space std "
-                f"{float(braking['action_space_std']):.4f} > "
-                f"動態門檻 "
-                f"{float(braking['threshold_std']):.4f}；"
-                f"長週期權重降至 "
-                f"{float(short_term['long_term_weight']) * 100.0:.1f}%，"
-                f"以最近 3 局策略 "
-                f"{short_term['strategy']} 建立方向先驗，"
-                "但本局建議觀望／0%配置。"
+                "統計混沌硬煞車："
+                f"共享方差 {float(braking['action_space_variance']):.4f} > "
+                f"方差門檻 {float(braking['threshold_variance']):.4f}，且"
+                f"12局排列熵 {float(braking['permutation_entropy']):.4f} > "
+                f"{CMAB_PERMUTATION_ENTROPY_THRESHOLD:.2f}；"
+                "本局強制觀望／0%配置。"
             )
         else:
             direction = base_direction
@@ -1212,8 +1354,8 @@ def _predict_bandit_impl(
         )
         baseline_after = _update_uncertainty_baseline(
             state,
-            action_space_std=float(
-                braking["action_space_std"]
+            action_space_variance=float(
+                braking["action_space_variance"]
             ),
             unknown_region_active=bool(
                 braking["active"]
@@ -1221,25 +1363,7 @@ def _predict_bandit_impl(
             prediction_fingerprint=prediction_fingerprint,
         )
         context_hash = _context_fingerprint(vector)
-        pending_ood_contexts = list(
-            state.get("pending_ood_contexts") or []
-        )
-        if bool(braking["active"]):
-            # 同一 context 的重複預測只保留一筆；update 後會消耗。
-            pending_ood_contexts = [
-                item
-                for item in pending_ood_contexts
-                if str(dict(item).get("context_hash") or "") != context_hash
-            ]
-            pending_ood_contexts.append({
-                "context_hash": context_hash,
-                "prediction_fingerprint": prediction_fingerprint,
-                "update_weight": few_shot_weight,
-                "created_at": int(time.time()),
-            })
-        state["pending_ood_contexts"] = pending_ood_contexts[
-            -CMAB_MAX_PENDING_OOD_CONTEXTS:
-        ]
+        state["pending_ood_contexts"] = []
         state["last_prediction_risk"] = {
             "prediction_fingerprint": prediction_fingerprint,
             "context_hash": context_hash,
@@ -1254,6 +1378,12 @@ def _predict_bandit_impl(
             ),
             "dynamic_threshold_std": float(
                 braking["threshold_std"]
+            ),
+            "dynamic_threshold_variance": float(
+                braking["threshold_variance"]
+            ),
+            "permutation_entropy": float(
+                braking["permutation_entropy"]
             ),
             "selected_arm": direction,
             "recommended_action": action_code,
@@ -1295,6 +1425,15 @@ def _predict_bandit_impl(
             else 1.0
         ),
         "few_shot_update_weight": few_shot_weight,
+        "few_shot_boost_disabled": True,
+        "permutation_entropy": float(braking["permutation_entropy"]),
+        "entropy_indicates_white_noise": bool(
+            braking["entropy_indicates_white_noise"]
+        ),
+        "variance_above_dynamic_threshold": bool(
+            braking["variance_above_dynamic_threshold"]
+        ),
+        "variance_safe": bool(braking["variance_safe"]),
         "meta_direction": direction,
         "meta_direction_text": (
             "莊" if direction == "B" else "閒"
@@ -1324,8 +1463,7 @@ def _predict_bandit_impl(
             2,
         ),
         "tie_rate": 0.0,
-        # 高方差時仍保留微觀先驗方向供介面顯示與線上學習；
-        # 真正動作則切換為 O，讓既有資金模組自動給 0 元。
+        # selected_arm 仍供固定 1 倍被動學習；真正資金動作由 action=O 控制。
         "recommend": direction,
         "recommend_text": (
             "莊" if direction == "B" else "閒"
@@ -1339,7 +1477,7 @@ def _predict_bandit_impl(
             braking["downstream_signal_code"]
         ),
         "signal_status_text": (
-            "極高不確定性：觀望／降低注碼"
+            "統計混沌硬煞車：觀望／絕對不下注"
             if braking["active"]
             else "cMAB 下一局方向評估"
         ),
@@ -1380,6 +1518,13 @@ def _predict_bandit_impl(
         # 供全局集成層使用的固定契約：variance 是共享 context
         # x^T A_ctx^-1 x，而非某一個 Arm 的局部方差。
         "variance": float(braking["action_space_variance"]),
+        "variance_threshold": float(braking["threshold_variance"]),
+        "variance_safe": bool(braking["variance_safe"]),
+        "permutation_entropy": float(braking["permutation_entropy"]),
+        "permutation_entropy_threshold": float(
+            braking["permutation_entropy_threshold"]
+        ),
+        "statistical_tests": dict(braking["rolling_randomness"]),
         "decision_gap_uncertainty": float(
             braking["decision_gap_std"]
         ),
@@ -1425,7 +1570,7 @@ def _predict_bandit_impl(
             short_term
         ),
         "meta_learning_takeover": {
-            "active": bool(braking["active"]),
+            "active": False,
             "short_term_buffer": list(
                 short_term["short_term_buffer"]
             ),
@@ -1442,6 +1587,7 @@ def _predict_bandit_impl(
             "prior_probabilities": dict(
                 short_term["probabilities"]
             ),
+            "reason": "V1.5 已停用即時短線接管；只允許 predictor 影子回測",
         },
         # predictor.py 與未來校準器可直接讀取這兩組欄位。
         "predictor_signal": dict(risk_signal),
@@ -1497,6 +1643,9 @@ def _predict_bandit_impl(
             "dynamic_threshold_std": float(
                 braking["threshold_std"]
             ),
+            "dynamic_threshold_variance": float(
+                braking["threshold_variance"]
+            ),
             "dynamic_threshold_ready": bool(
                 braking["dynamic_threshold_ready"]
             ),
@@ -1508,6 +1657,11 @@ def _predict_bandit_impl(
             ),
             "unknown_update_multiplier": (
                 CMAB_UNKNOWN_UPDATE_MULTIPLIER
+            ),
+            "few_shot_boost_disabled": True,
+            "permutation_entropy_window": CMAB_PERMUTATION_WINDOW,
+            "permutation_entropy_threshold": (
+                CMAB_PERMUTATION_ENTROPY_THRESHOLD
             ),
             "state_file": str(CMAB_STATE_FILE),
             "cold_start_tie_break": tie_break,
@@ -1615,46 +1769,9 @@ def _update_bandit_impl(
             and str(last_risk.get("context_hash") or "")
             == context_hash
         )
-        pending_ood_contexts = list(
-            state.get("pending_ood_contexts") or []
-        )
-        matched_pending_ood = next(
-            (
-                dict(item)
-                for item in reversed(pending_ood_contexts)
-                if isinstance(item, Mapping)
-                and str(item.get("context_hash") or "") == context_hash
-            ),
-            {},
-        )
-        boost_requested = (
-            bool(matched_pending_ood)
-            or same_high_variance_context
-            # performance_tracker 會把預測當下保存的 OOD 權重傳回；
-            # 只有合法的 4～5 倍範圍才視為 OOD 證據。
-            or requested_weight >= 4.0
-        )
-
-        # 高方差區間強制 4～5 倍；一般區間固定 1 倍。
-        observation_weight = (
-            max(
-                4.0,
-                min(
-                    5.0,
-                    float(
-                        matched_pending_ood.get(
-                            "update_weight",
-                            requested_weight
-                            if requested_weight >= 4.0
-                            else CMAB_UNKNOWN_UPDATE_MULTIPLIER,
-                        )
-                        or CMAB_UNKNOWN_UPDATE_MULTIPLIER
-                    )
-                ),
-            )
-            if boost_requested
-            else 1.0
-        )
+        # V1.5：無論呼叫端傳入多少權重，一律只視為一筆觀測。
+        # 這能防止單局隨機結果以 4～5 筆證據灌入 posterior。
+        observation_weight = 1.0
 
         arm_state = dict(state["arms"][arm])
         A = np.asarray(
@@ -1666,8 +1783,7 @@ def _update_bandit_impl(
             dtype=np.float64,
         )
 
-        # Weighted Bayesian ridge / LinUCB update：
-        # A += w xxᵀ，b += w r x。
+        # 標準 Bayesian ridge / LinUCB update（固定 w=1）。
         A += observation_weight * np.outer(x, x)
         b += (
             observation_weight
@@ -1701,8 +1817,7 @@ def _update_bandit_impl(
         state["arms"][arm] = arm_state
 
         # 共享 context matrix 不看 reward，也不分 Arm；每筆已揭曉 B/P
-        # 都代表這個特徵區間多了一次觀測。OOD 權重會讓新區間的
-        # x^T A_ctx^-1 x 在 1～2 局內快速下降。
+        # 都代表這個特徵區間多了一次真實觀測。
         context_information = dict(state.get("context_information") or {})
         context_A = _as_information_matrix(context_information.get("A"))
         context_A += observation_weight * np.outer(x, x)
@@ -1738,13 +1853,7 @@ def _update_bandit_impl(
                 -CMAB_MAX_EVENT_IDS:
             ]
 
-        if boost_requested:
-            state["pending_ood_contexts"] = [
-                item
-                for item in pending_ood_contexts
-                if not isinstance(item, Mapping)
-                or str(item.get("context_hash") or "") != context_hash
-            ][-CMAB_MAX_PENDING_OOD_CONTEXTS:]
+        state["pending_ood_contexts"] = []
 
         state["last_update"] = {
             "event_id": event_key,
@@ -1755,13 +1864,12 @@ def _update_bandit_impl(
             "reward": reward_value,
             "requested_weight": requested_weight,
             "applied_weight": observation_weight,
-            "few_shot_boost_applied": bool(
-                observation_weight >= 4.0
-            ),
+            "few_shot_boost_applied": False,
+            "few_shot_boost_disabled": True,
             "same_high_variance_context": bool(
                 same_high_variance_context
             ),
-            "matched_pending_ood_context": bool(matched_pending_ood),
+            "matched_pending_ood_context": False,
             "context_hash": context_hash,
             "updated_at": int(time.time()),
         }
@@ -1779,14 +1887,9 @@ def _update_bandit_impl(
         "reward": reward_value,
         "requested_update_weight": requested_weight,
         "update_weight": observation_weight,
-        "few_shot_boost_applied": bool(
-            observation_weight >= 4.0
-        ),
-        "boost_reason": (
-            "high_variance_previous_prediction"
-            if observation_weight >= 4.0
-            else "standard_update"
-        ),
+        "few_shot_boost_applied": False,
+        "few_shot_boost_disabled": True,
+        "boost_reason": "disabled_to_prevent_random_noise_overfitting",
         "arm_updates": int(arm_state["updates"]),
         "arm_weighted_updates": float(
             arm_state["weighted_updates"]
@@ -1839,6 +1942,7 @@ def _get_bandit_summary_impl(
             CMAB_UNKNOWN_STD_THRESHOLD
         ),
         "dynamic_uncertainty_threshold": {
+            "unit": "variance",
             "ready": bool(
                 baseline["dynamic_ready"]
             ),
@@ -1861,6 +1965,15 @@ def _get_bandit_summary_impl(
         "unknown_update_multiplier": float(
             CMAB_UNKNOWN_UPDATE_MULTIPLIER
         ),
+        "few_shot_boost_disabled": True,
+        "permutation_entropy": {
+            "window": CMAB_PERMUTATION_WINDOW,
+            "order": CMAB_PERMUTATION_ORDER,
+            "threshold": CMAB_PERMUTATION_ENTROPY_THRESHOLD,
+            "extreme_gate": (
+                "variance_above_mean_plus_1.3_std_AND_entropy_above_0.95"
+            ),
+        },
         "short_term_buffer": list(
             state.get("short_term_buffer") or []
         )[-3:],
@@ -2037,4 +2150,3 @@ __all__ = [
     "predict_bandit",
     "update_bandit",
 ]
-
