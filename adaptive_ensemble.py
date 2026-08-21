@@ -1,8 +1,8 @@
 """保守型自適應集成。
 
 正常區間只在累積足夠已結算樣本後，依各子模型的歷史 Brier score
-做小幅再加權。若 cMAB 回報極端未知區間，安全熔斷會立即優先執行，
-不受成熟樣本門檻限制，且至少調降 90% cMAB 決策權重。
+做小幅再加權。任一模型回報極端未知區間時，立即執行零信心、
+零注碼、No Bet 硬熔斷，不嘗試用其他模型修正該局。
 """
 from __future__ import annotations
 
@@ -18,14 +18,6 @@ ADAPTIVE_ENABLED = os.getenv("ADAPTIVE_ENSEMBLE_ENABLED", "1").strip() == "1"
 ADAPTIVE_MIN_SAMPLES = max(50, int(os.getenv("ADAPTIVE_MIN_SAMPLES", "300") or "300"))
 ADAPTIVE_MAX_SHARE = max(0.0, min(0.35, float(os.getenv("ADAPTIVE_MAX_SHARE", "0.15") or "0.15")))
 ADAPTIVE_TEMPERATURE = max(0.01, min(2.0, float(os.getenv("ADAPTIVE_TEMPERATURE", "0.18") or "0.18")))
-# OOD 動態熔斷後只保留 0～10% cMAB 權重；預設保留 5%（調降 95%）。
-EXTREME_UNSEEN_BANDIT_WEIGHT = max(
-    0.0,
-    min(
-        0.10,
-        float(os.getenv("EXTREME_UNSEEN_BANDIT_WEIGHT", "0.05") or "0.05"),
-    ),
-)
 
 
 def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
@@ -54,27 +46,53 @@ def _components(prediction: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
 
 def _is_extreme_unseen(prediction: Mapping[str, Any]) -> bool:
     """接受新舊欄位，避免部署期間因版本差異再次造成訊號斷層。"""
-    braking = prediction.get("uncertainty_braking")
-    predictor_signal = prediction.get("predictor_signal")
-    return bool(
-        prediction.get("is_extreme_unseen")
-        or prediction.get("extreme_uncertainty_signal")
-        or prediction.get("unknown_region_active")
-        or (
-            isinstance(braking, Mapping)
-            and (
-                braking.get("is_extreme_unseen")
-                or braking.get("active")
+    def flagged(model: Mapping[str, Any]) -> bool:
+        braking = model.get("uncertainty_braking")
+        predictor_signal = model.get("predictor_signal")
+        return bool(
+            model.get("is_extreme_unseen")
+            or model.get("extreme_uncertainty_signal")
+            or model.get("unknown_region_active")
+            or (
+                isinstance(braking, Mapping)
+                and (
+                    braking.get("is_extreme_unseen")
+                    or braking.get("active")
+                )
+            )
+            or (
+                isinstance(predictor_signal, Mapping)
+                and (
+                    predictor_signal.get("is_extreme_unseen")
+                    or predictor_signal.get("extreme_uncertainty")
+                )
             )
         )
-        or (
-            isinstance(predictor_signal, Mapping)
-            and (
-                predictor_signal.get("is_extreme_unseen")
-                or predictor_signal.get("extreme_uncertainty")
-            )
-        )
-    )
+
+    if flagged(prediction):
+        return True
+
+    # 預留其他模型以巢狀結果接入的契約：任一成員亮起極端標籤，
+    # 都優先於正常加權與樣本成熟度，立即觸發全局硬熔斷。
+    for collection_name in (
+        "model_predictions",
+        "component_predictions",
+        "ensemble_members",
+        "models",
+    ):
+        collection = prediction.get(collection_name)
+        if isinstance(collection, Mapping):
+            members = collection.values()
+        elif isinstance(collection, (list, tuple)):
+            members = collection
+        else:
+            continue
+        if any(
+            isinstance(member, Mapping) and flagged(member)
+            for member in members
+        ):
+            return True
+    return False
 
 
 def _base_confidence(prediction: Mapping[str, Any], base: Mapping[str, float]) -> float:
@@ -86,33 +104,6 @@ def _base_confidence(prediction: Mapping[str, Any], base: Mapping[str, float]) -
     if quality > 0.0:
         return max(0.0, min(1.0, quality))
     return max(0.0, min(1.0, abs(float(base["B"]) - float(base["P"]))))
-
-
-def _extreme_alternative_fusion(
-    components: Mapping[str, Mapping[str, float]],
-    historical_scores: Mapping[str, Any],
-) -> tuple[Dict[str, float], Dict[str, float]]:
-    """極端區間若仍有獨立子模型，立即融合；沒有則交由 predictor 接管。"""
-    if not components:
-        return {}, {}
-
-    raw_weights: Dict[str, float] = {}
-    for name in components:
-        try:
-            score = float(historical_scores.get(name))
-            raw_weights[name] = math.exp(-score / ADAPTIVE_TEMPERATURE)
-        except Exception:
-            raw_weights[name] = 1.0
-    weight_total = sum(raw_weights.values()) or 1.0
-    weights = {name: value / weight_total for name, value in raw_weights.items()}
-    probabilities = _normalize({
-        outcome: sum(
-            weights[name] * float(components[name][outcome])
-            for name in components
-        )
-        for outcome in OUTCOMES
-    })
-    return probabilities, weights
 
 
 def adapt_prediction(
@@ -140,66 +131,66 @@ def adapt_prediction(
     base_confidence = _base_confidence(result, base)
 
     if extreme_unseen:
-        # 動態熔斷必須早於傳統的最小樣本門檻；風險訊號不能因
-        # ADAPTIVE_MIN_SAMPLES 尚未成熟而被忽略。
-        bandit_weight = EXTREME_UNSEEN_BANDIT_WEIGHT
-        alternative, alternative_weights = _extreme_alternative_fusion(
-            components,
-            historical_scores,
+        # 硬熔斷優先於成熟樣本與正常融合；保留原始分數僅供稽核。
+        learning_arm = str(result.get("selected_arm") or "").upper().strip()
+        result["pre_hard_brake_probabilities"] = dict(base)
+        result["pre_hard_brake_recommend"] = str(
+            result.get("recommend") or learning_arm
         )
-        has_alternative = bool(alternative)
-
-        if has_alternative:
-            blended = _normalize({
-                outcome: (
-                    base[outcome] * bandit_weight
-                    + alternative[outcome] * (1.0 - bandit_weight)
-                )
-                for outcome in OUTCOMES
-            })
-            result["probabilities"] = blended
-            result["banker_rate"] = round(blended["B"] * 100.0, 2)
-            result["player_rate"] = round(blended["P"] * 100.0, 2)
-            result["tie_rate"] = round(blended["T"] * 100.0, 2)
-            # 沒有可靠的跨模型校準值時，只以方向間距作保守信心。
-            overall_confidence = min(
-                base_confidence,
-                abs(blended["B"] - blended["P"]),
-            )
-        else:
-            # 目前正式 predictor 只啟用 cMAB；此處不把剩餘 5% 再
-            # 正規化回 100%，而是把低信心與 fallback_required 傳下去。
-            overall_confidence = base_confidence * bandit_weight
-
-        weight_reduction = 1.0 - bandit_weight
-        result["ensemble_confidence"] = float(overall_confidence)
+        result["probabilities"] = {"B": 0.5, "P": 0.5, "T": 0.0}
+        result["banker_rate"] = 50.0
+        result["player_rate"] = 50.0
+        result["tie_rate"] = 0.0
+        result["recommend"] = "O"
+        result["recommend_text"] = "觀望"
+        result["action"] = "O"
+        result["action_text"] = "觀望／絕對不下注"
+        result["internal_recommend"] = "O"
+        result["internal_action"] = "O"
+        result["next_round_direction"] = "O"
+        result["next_round_direction_text"] = "觀望"
+        result["signal_allowed"] = False
+        result["signal_status_code"] = "HARD_BRAKE_NO_BET"
+        result["signal_status_text"] = "統計混沌硬熔斷：絕對不下注"
+        result["signal_reason"] = (
+            "任一模型回報極端未知區間；集成層不做方向修正，"
+            "本局信心與注碼強制歸零。"
+        )
+        result["internal_signal_reason"] = result["signal_reason"]
+        result["direction_source"] = "adaptive_ensemble_hard_brake"
+        result["ensemble_confidence"] = 0.0
+        result["confidence"] = 0.0
+        result["quality_score"] = 0.0
+        result["confidence_label"] = "零信心／硬熔斷"
+        result["bet_multiplier"] = 0.0
+        result["hard_brake_active"] = True
+        # selected_arm 不覆寫：即使不下注，實際結果仍可用固定 1 倍
+        # 被動更新模型與共享 context 方差。
+        if learning_arm in {"B", "P"}:
+            result["selected_arm"] = learning_arm
         result["is_extreme_unseen"] = True
         result["adaptive_ensemble"] = {
             "active": True,
-            "mode": "extreme_unseen_dynamic_circuit_breaker",
+            "mode": "statistical_chaos_hard_brake",
             "circuit_breaker_active": True,
+            "hard_brake_active": True,
             "sample_count": sample_count,
             "minimum_samples_bypassed_for_safety": True,
             "is_extreme_unseen": True,
             "variance": float(result.get("variance", 0.0) or 0.0),
             "bandit_weight_before": 1.0,
-            "bandit_weight_after": float(bandit_weight),
-            "weight_reduction_ratio": float(weight_reduction),
-            "weight_reduction_percent": round(weight_reduction * 100.0, 2),
-            "alternative_model_weight": float(1.0 - bandit_weight),
+            "bandit_weight_after": 0.0,
+            "weight_reduction_ratio": 1.0,
+            "weight_reduction_percent": 100.0,
+            "alternative_model_weight": 0.0,
             "alternative_components_available": sorted(components),
-            "alternative_weights": {
-                name: round(value, 6)
-                for name, value in alternative_weights.items()
-            },
-            "fallback_required": not has_alternative,
-            "fusion_deferred_to_short_term": not has_alternative,
-            "overall_confidence": float(overall_confidence),
-            "reason": (
-                "偵測到極端未知特徵，cMAB 權重立即熔斷並交由獨立子模型融合"
-                if has_alternative
-                else "偵測到極端未知特徵，cMAB 權重立即熔斷並要求短週期接管"
-            ),
+            "alternative_fusion_attempted": False,
+            "fallback_required": True,
+            "shadow_backtest_required": True,
+            "overall_confidence": 0.0,
+            "final_action": "O",
+            "bet_multiplier": 0.0,
+            "reason": "極端未知區間執行零信心、零注碼硬熔斷",
         }
         return result
 
@@ -218,9 +209,12 @@ def adapt_prediction(
 
     if not active:
         result["ensemble_confidence"] = float(base_confidence)
+        result["confidence"] = float(base_confidence)
+        result["hard_brake_active"] = False
         result["adaptive_ensemble"] = {
             "active": False,
             "circuit_breaker_active": False,
+            "hard_brake_active": False,
             "is_extreme_unseen": False,
             "sample_count": sample_count,
             "minimum_samples": ADAPTIVE_MIN_SAMPLES,
@@ -255,9 +249,12 @@ def adapt_prediction(
     result["player_rate"] = round(blended["P"] * 100.0, 2)
     result["tie_rate"] = round(blended["T"] * 100.0, 2)
     result["ensemble_confidence"] = float(base_confidence)
+    result["confidence"] = float(base_confidence)
+    result["hard_brake_active"] = False
     result["adaptive_ensemble"] = {
         "active": True,
         "circuit_breaker_active": False,
+        "hard_brake_active": False,
         "is_extreme_unseen": False,
         "sample_count": sample_count,
         "minimum_samples": ADAPTIVE_MIN_SAMPLES,
