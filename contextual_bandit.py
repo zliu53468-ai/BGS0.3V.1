@@ -29,7 +29,7 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1.3-SHARED-NOVELTY-FEW-SHOT"
+MODEL_VERSION = "CMAB-LINUCB-V1.4-GLOBAL-DEFENSE-SIGNAL"
 STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V2"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -983,6 +983,9 @@ def _uncertainty_braking_metrics(
 
     return {
         "active": bool(active),
+        # 全局聯動的穩定欄位名稱；adaptive_ensemble.py 直接讀取。
+        "is_extreme_unseen": bool(active),
+        "variance": float(action_space_variance),
         "uncertainty_level": uncertainty_level,
         "threshold_mode": (
             "dynamic_mean_plus_1_5_std"
@@ -1243,6 +1246,8 @@ def _predict_bandit_impl(
             "unknown_region_active": bool(
                 braking["active"]
             ),
+            "is_extreme_unseen": bool(braking["active"]),
+            "variance": float(braking["action_space_variance"]),
             "few_shot_update_weight": few_shot_weight,
             "action_space_std": float(
                 braking["action_space_std"]
@@ -1273,6 +1278,8 @@ def _predict_bandit_impl(
             braking["downstream_signal_code"]
         ),
         "ood_detected": bool(braking["active"]),
+        "is_extreme_unseen": bool(braking["active"]),
+        "variance": float(braking["action_space_variance"]),
         "extreme_uncertainty": bool(
             braking["active"]
         ),
@@ -1370,6 +1377,9 @@ def _predict_bandit_impl(
         "prediction_variance": float(
             selected["variance"]
         ),
+        # 供全局集成層使用的固定契約：variance 是共享 context
+        # x^T A_ctx^-1 x，而非某一個 Arm 的局部方差。
+        "variance": float(braking["action_space_variance"]),
         "decision_gap_uncertainty": float(
             braking["decision_gap_std"]
         ),
@@ -1379,6 +1389,7 @@ def _predict_bandit_impl(
         "unknown_region_active": bool(
             braking["active"]
         ),
+        "is_extreme_unseen": bool(braking["active"]),
         "extreme_uncertainty_signal": bool(
             braking["active"]
         ),
@@ -1597,7 +1608,10 @@ def _update_bandit_impl(
 
         last_risk = dict(state.get("last_prediction_risk") or {})
         same_high_variance_context = bool(
-            last_risk.get("unknown_region_active")
+            last_risk.get(
+                "is_extreme_unseen",
+                last_risk.get("unknown_region_active", False),
+            )
             and str(last_risk.get("context_hash") or "")
             == context_hash
         )
@@ -2023,3 +2037,4 @@ __all__ = [
     "predict_bandit",
     "update_bandit",
 ]
+
