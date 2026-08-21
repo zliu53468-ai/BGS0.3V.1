@@ -5,8 +5,10 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
-V1.2 動態 OOD 防禦：
+V1.3 動態 OOD 防禦：
 - 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
+- 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
+  避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
 - 每個 UID 以歷史平均 + 1.5 個標準差建立動態未知區間門檻。
 - 高方差時動作切換為觀望／0%配置，但保留最近 3 局微觀方向先驗。
 - 高方差樣本以 4～5 倍觀測權重完成 Few-shot 更新。
@@ -27,8 +29,12 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1.2-DYNAMIC-OOD-DEFENSE"
-STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V1"
+MODEL_VERSION = "CMAB-LINUCB-V1.3-SHARED-NOVELTY-FEW-SHOT"
+STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V2"
+COMPATIBLE_STATE_SCHEMA_VERSIONS = {
+    "CMAB-UID-ISOLATED-V1",
+    STATE_SCHEMA_VERSION,
+}
 FEATURE_NAMES = (
     "bias", "history_maturity", "global_banker_balance",
     "recent5_banker_balance", "recent10_banker_balance",
@@ -103,6 +109,13 @@ CMAB_MAX_EVENT_IDS = max(
     min(
         20000,
         int(os.getenv("CMAB_MAX_EVENT_IDS", "5000") or "5000"),
+    ),
+)
+CMAB_MAX_PENDING_OOD_CONTEXTS = max(
+    8,
+    min(
+        128,
+        int(os.getenv("CMAB_MAX_PENDING_OOD_CONTEXTS", "32") or "32"),
     ),
 )
 
@@ -354,11 +367,42 @@ def _current_short_term_buffer(history: Sequence[str]) -> List[str]:
     return [value for value in history if value in ARMS][-3:]
 
 
+def _identity_information_matrix() -> np.ndarray:
+    return np.eye(CONTEXT_DIM, dtype=np.float64) * CMAB_L2
+
+
+def _as_information_matrix(value: Any) -> np.ndarray:
+    """讀取、驗證並對稱化 information matrix。"""
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (CONTEXT_DIM, CONTEXT_DIM):
+        raise ValueError("invalid information matrix shape")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("information matrix contains non-finite values")
+    return 0.5 * (matrix + matrix.T)
+
+
+def _reconstruct_shared_context_matrix(
+    arms: Mapping[str, Any],
+    *,
+    prior_l2: float,
+) -> np.ndarray:
+    """從舊版 disjoint LinUCB matrices 無損重建共享 context matrix。
+
+    A_B = lambda I + sum_B(w xxT)，A_P 同理，因此
+    A_ctx = A_B + A_P - lambda I = lambda I + sum_all(w xxT)。
+    """
+    banker = _as_information_matrix(dict(arms["B"]).get("A"))
+    player = _as_information_matrix(dict(arms["P"]).get("A"))
+    prior = np.eye(CONTEXT_DIM, dtype=np.float64) * max(
+        1e-12, float(prior_l2)
+    )
+    reconstructed = banker + player - prior
+    return 0.5 * (reconstructed + reconstructed.T)
+
+
 def _new_state() -> Dict[str, Any]:
     """建立單一 UID 專屬的 cMAB 狀態。"""
-    identity = (
-        np.eye(CONTEXT_DIM, dtype=np.float64) * CMAB_L2
-    ).tolist()
+    identity = _identity_information_matrix().tolist()
     zeros = np.zeros(CONTEXT_DIM, dtype=np.float64).tolist()
     return {
         "version": MODEL_VERSION,
@@ -368,14 +412,21 @@ def _new_state() -> Dict[str, Any]:
         "l2": CMAB_L2,
         "arms": {
             arm: {
-                "A": identity,
-                "b": zeros,
+                "A": [row[:] for row in identity],
+                "b": list(zeros),
                 "updates": 0,
                 "weighted_updates": 0.0,
                 "reward_sum": 0.0,
                 "weighted_reward_sum": 0.0,
             }
             for arm in ARMS
+        },
+        # 只衡量「這個 context 看過多少」，與選擇哪個 Arm／reward 無關。
+        # 這是 OOD braking 的主要 uncertainty matrix。
+        "context_information": {
+            "A": [row[:] for row in identity],
+            "updates": 0,
+            "weighted_updates": 0.0,
         },
         "applied_event_ids": [],
         "total_updates": 0,
@@ -387,11 +438,13 @@ def _new_state() -> Dict[str, Any]:
             "updated_at": 0,
         },
         "short_term_buffer": [],
+        "pending_ood_contexts": [],
         "last_uncertainty_fingerprint": "",
         "last_prediction_risk": {},
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
     }
+
 
 def _new_state_store() -> Dict[str, Any]:
     """建立全部 UID 的外層容器；每個 UID 仍持有完全獨立的 A／b。"""
@@ -411,6 +464,10 @@ def _new_state_store() -> Dict[str, Any]:
 
 def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
     state = dict(data or {})
+    stored_l2 = max(
+        1e-12,
+        float(state.get("l2", CMAB_L2) or CMAB_L2),
+    )
     if int(state.get("context_dim", 0) or 0) != CONTEXT_DIM:
         raise ValueError("invalid UID state context dimension")
 
@@ -426,15 +483,20 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         if (
             A.shape != (CONTEXT_DIM, CONTEXT_DIM)
             or b.shape != (CONTEXT_DIM,)
+            or not np.all(np.isfinite(A))
+            or not np.all(np.isfinite(b))
         ):
             raise ValueError("invalid UID state matrix shape")
+        arms[arm]["A"] = (0.5 * (A + A.T)).tolist()
+        arms[arm]["b"] = b.tolist()
 
     # 舊 UID 狀態直接延續，不重置已學習的 A／b。
     state["version"] = MODEL_VERSION
     state["context_dim"] = CONTEXT_DIM
     state["feature_names"] = list(FEATURE_NAMES)
     state["alpha"] = CMAB_ALPHA
-    state["l2"] = CMAB_L2
+    # 已訓練矩陣內含建立當時的 ridge prior，不能只改 metadata 偽裝成新值。
+    state["l2"] = stored_l2
     state["total_weighted_updates"] = float(
         state.get(
             "total_weighted_updates",
@@ -460,6 +522,41 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
             or 0.0
         )
 
+    context_information = state.get("context_information")
+    if isinstance(context_information, Mapping):
+        context_matrix = _as_information_matrix(
+            context_information.get("A")
+        )
+        context_updates = int(
+            context_information.get(
+                "updates",
+                state.get("total_updates", 0),
+            )
+            or 0
+        )
+        context_weighted_updates = float(
+            context_information.get(
+                "weighted_updates",
+                state.get("total_weighted_updates", context_updates),
+            )
+            or 0.0
+        )
+    else:
+        # V1 -> V2 就地遷移，不丟失既有 UID 的 A／b 學習成果。
+        context_matrix = _reconstruct_shared_context_matrix(
+            arms,
+            prior_l2=stored_l2,
+        )
+        context_updates = int(state.get("total_updates", 0) or 0)
+        context_weighted_updates = float(
+            state.get("total_weighted_updates", context_updates) or 0.0
+        )
+    state["context_information"] = {
+        "A": context_matrix.tolist(),
+        "updates": max(0, context_updates),
+        "weighted_updates": max(0.0, context_weighted_updates),
+    }
+
     state["applied_event_ids"] = list(
         state.get("applied_event_ids") or []
     )[-CMAB_MAX_EVENT_IDS:]
@@ -483,6 +580,36 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         for value in list(state.get("short_term_buffer") or [])
         if value in ARMS
     ][-3:]
+    pending_ood_contexts: List[Dict[str, Any]] = []
+    for item in list(state.get("pending_ood_contexts") or []):
+        if not isinstance(item, Mapping):
+            continue
+        context_hash = str(item.get("context_hash") or "").strip()
+        if not context_hash:
+            continue
+        pending_ood_contexts.append({
+            "context_hash": context_hash,
+            "prediction_fingerprint": str(
+                item.get("prediction_fingerprint") or ""
+            ),
+            "update_weight": max(
+                4.0,
+                min(
+                    5.0,
+                    float(
+                        item.get(
+                            "update_weight",
+                            CMAB_UNKNOWN_UPDATE_MULTIPLIER,
+                        )
+                        or CMAB_UNKNOWN_UPDATE_MULTIPLIER
+                    ),
+                ),
+            ),
+            "created_at": int(item.get("created_at", 0) or 0),
+        })
+    state["pending_ood_contexts"] = pending_ood_contexts[
+        -CMAB_MAX_PENDING_OOD_CONTEXTS:
+    ]
     state["last_uncertainty_fingerprint"] = str(
         state.get("last_uncertainty_fingerprint") or ""
     )
@@ -507,26 +634,24 @@ def _read_state_unlocked() -> Dict[str, Any]:
 
         users = data.get("users")
         if (
-            str(data.get("schema_version") or "") == STATE_SCHEMA_VERSION
+            str(data.get("schema_version") or "")
+            in COMPATIBLE_STATE_SCHEMA_VERSIONS
             and isinstance(users, dict)
             and int(data.get("context_dim", 0) or 0) == CONTEXT_DIM
         ):
-            normalized_users: Dict[str, Any] = {}
+            # 不在每次預測時正規化全部 UID；只在該 UID 被使用時驗證。
+            # 使用者數量增加後，這可避免 O(number_of_users) 的矩陣轉換。
+            retained_users: Dict[str, Any] = {}
             for uid_key, raw_state in users.items():
-                if not isinstance(raw_state, Mapping):
-                    continue
-                try:
-                    normalized_users[str(uid_key)] = _normalize_user_state(raw_state)
-                except Exception:
-                    # 單一 UID 狀態損壞時只重置該 UID，不影響其他使用者。
-                    normalized_users[str(uid_key)] = _new_state()
+                if isinstance(raw_state, Mapping):
+                    retained_users[str(uid_key)] = dict(raw_state)
             data["schema_version"] = STATE_SCHEMA_VERSION
             data["version"] = MODEL_VERSION
             data["context_dim"] = CONTEXT_DIM
             data["feature_names"] = list(FEATURE_NAMES)
             data["alpha"] = CMAB_ALPHA
             data["l2"] = CMAB_L2
-            data["users"] = normalized_users
+            data["users"] = retained_users
             return data
 
         # 舊版只有一組全域 arms，無法可靠拆回各 UID。
@@ -551,7 +676,10 @@ def _get_user_state_unlocked(
     create: bool,
 ) -> tuple[str, Dict[str, Any]]:
     uid_key = _uid_key(user_id)
-    users = dict(state_store.get("users") or {})
+    users = state_store.get("users")
+    if not isinstance(users, dict):
+        users = {}
+        state_store["users"] = users
     raw_state = users.get(uid_key)
     if isinstance(raw_state, Mapping):
         try:
@@ -584,12 +712,17 @@ def _write_state_unlocked(state_store: Dict[str, Any]) -> None:
     )
     temporary.replace(CMAB_STATE_FILE)
 
+
 def _arm_metrics(
     state: Mapping[str, Any],
     arm: str,
     context: np.ndarray,
 ) -> Dict[str, float]:
-    """以 solve 取代顯式矩陣反矩陣，提升穩定性與速度。"""
+    """精確計算 disjoint LinUCB mean 與 x^T A^-1 x。
+
+    使用同一個 solve 的雙 RHS [b, x]，只分解 A 一次；相較兩次
+    solve 或顯式 inverse，速度更快且數值更穩定。
+    """
     arm_state = dict(
         dict(state.get("arms") or {}).get(arm) or {}
     )
@@ -599,24 +732,20 @@ def _arm_metrics(
     # 避免長期浮點累積造成 A 輕微不對稱。
     A = 0.5 * (A + A.T)
 
-    try:
-        theta = np.linalg.solve(A, b)
-        solved_context = np.linalg.solve(A, context)
-    except np.linalg.LinAlgError:
-        regularized = A + np.eye(
-            CONTEXT_DIM,
-            dtype=np.float64,
-        ) * 1e-8
+    right_hand_sides = np.column_stack((b, context))
+    solved: Optional[np.ndarray] = None
+    regularized = A
+    for jitter in (0.0, 1e-10, 1e-8, 1e-6):
+        regularized = A + np.eye(CONTEXT_DIM, dtype=np.float64) * jitter
         try:
-            theta = np.linalg.solve(regularized, b)
-            solved_context = np.linalg.solve(
-                regularized,
-                context,
-            )
+            solved = np.linalg.solve(regularized, right_hand_sides)
+            break
         except np.linalg.LinAlgError:
-            A_inv = np.linalg.pinv(regularized)
-            theta = A_inv @ b
-            solved_context = A_inv @ context
+            continue
+    if solved is None:
+        solved = np.linalg.pinv(regularized) @ right_hand_sides
+    theta = solved[:, 0]
+    solved_context = solved[:, 1]
 
     estimate = float(theta @ context)
     variance = float(
@@ -653,6 +782,44 @@ def _arm_metrics(
         ),
     }
 
+
+def _shared_context_uncertainty(
+    state: Mapping[str, Any],
+    context: np.ndarray,
+) -> Dict[str, float]:
+    """計算與 Arm／reward 無關的牌路 context 新穎度。"""
+    information = dict(state.get("context_information") or {})
+    matrix = _as_information_matrix(information.get("A"))
+    solved_context: Optional[np.ndarray] = None
+    regularized = matrix
+    for jitter in (0.0, 1e-10, 1e-8, 1e-6):
+        regularized = matrix + np.eye(CONTEXT_DIM, dtype=np.float64) * jitter
+        try:
+            solved_context = np.linalg.solve(regularized, context)
+            break
+        except np.linalg.LinAlgError:
+            continue
+    if solved_context is None:
+        solved_context = np.linalg.pinv(regularized) @ context
+
+    variance = max(0.0, float(context @ solved_context))
+    return {
+        "variance": float(variance),
+        "std": float(math.sqrt(variance)),
+        "confidence_interval_half_width": float(
+            CMAB_ALPHA * math.sqrt(variance)
+        ),
+        "updates": int(information.get("updates", 0) or 0),
+        "weighted_updates": float(
+            information.get(
+                "weighted_updates",
+                information.get("updates", 0),
+            )
+            or 0.0
+        ),
+    }
+
+
 def _softmax_two(score_b: float, score_p: float) -> Dict[str, float]:
     values = np.asarray([score_b, score_p], dtype=np.float64) / max(0.10, CMAB_SCORE_TEMPERATURE)
     values -= float(np.max(values))
@@ -674,7 +841,6 @@ def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any])
         return "B" if recent >= 0.5 else "P"
     bp = [value for value in history if value in ARMS]
     return bp[-1] if bp else "B"
-
 
 
 def _short_term_trend_buffer(
@@ -740,16 +906,42 @@ def _short_term_trend_buffer(
         "meta_learning_takeover": True,
     }
 
+
+def _blend_ood_probabilities(
+    long_term: Mapping[str, Any],
+    short_term: Mapping[str, Any],
+) -> Dict[str, float]:
+    """OOD 時將長週期降權，但不把已學資訊完全切斷。"""
+    long_weight = float(CMAB_UNKNOWN_LONG_TERM_WEIGHT)
+    short_weight = 1.0 - long_weight
+    values = {
+        arm: (
+            long_weight * float(long_term.get(arm, 0.5) or 0.0)
+            + short_weight * float(short_term.get(arm, 0.5) or 0.0)
+        )
+        for arm in ARMS
+    }
+    total = max(1e-12, sum(values.values()))
+    return {
+        "B": float(values["B"] / total),
+        "P": float(values["P"] / total),
+        "T": 0.0,
+    }
+
+
 def _uncertainty_braking_metrics(
     metrics: Mapping[str, Mapping[str, Any]],
     state: Mapping[str, Any],
+    shared_context: Mapping[str, Any],
+    base_direction: str,
 ) -> Dict[str, Any]:
     """計算 LinUCB 的精確 xᵀA⁻¹x 與 UID 動態 OOD 閾值。
 
     每個 Arm 的 variance 均為 xᵀA_arm⁻¹x。
-    action-space variance 使用兩個 Arm variance 的幾何平均；
-    這能保留對雙邊新穎度的敏感度，同時避免單一未選 Arm
-    永久讓系統停留在 OOD 狀態。
+    OOD braking 使用共享 A_ctx 的 xᵀA_ctx⁻¹x：A_ctx 在任何 B/P
+    實際結果回報後都會更新，因此準確代表「此 context 是否見過」，
+    不會被某個 Arm 被選較少所混淆。決策差方差則另行輸出為
+    Var(mu_B - mu_P) = Var(mu_B) + Var(mu_P)。
     """
     variance_b = max(
         0.0,
@@ -762,12 +954,16 @@ def _uncertainty_braking_metrics(
     std_b = math.sqrt(variance_b)
     std_p = math.sqrt(variance_p)
 
-    action_space_variance = math.sqrt(
-        max(0.0, variance_b * variance_p)
+    action_space_variance = max(
+        0.0,
+        float(shared_context.get("variance", 0.0) or 0.0),
     )
     action_space_std = math.sqrt(action_space_variance)
     decision_gap_variance = variance_b + variance_p
     decision_gap_std = math.sqrt(decision_gap_variance)
+    selected_arm = base_direction if base_direction in ARMS else "B"
+    selected_variance = variance_b if selected_arm == "B" else variance_p
+    selected_std = math.sqrt(selected_variance)
 
     baseline = _baseline_summary(state)
     threshold = float(baseline["threshold"])
@@ -793,6 +989,7 @@ def _uncertainty_braking_metrics(
             if baseline["dynamic_ready"]
             else "cold_start_fallback"
         ),
+        "threshold_metric": "shared_context_novelty_std",
         "threshold_std": threshold,
         "dynamic_threshold_std": threshold,
         "historical_mean_std": float(baseline["mean"]),
@@ -813,6 +1010,19 @@ def _uncertainty_braking_metrics(
         "decision_gap_std": float(decision_gap_std),
         "decision_gap_variance": float(
             decision_gap_variance
+        ),
+        "selected_arm": selected_arm,
+        "selected_arm_std": float(selected_std),
+        "selected_arm_variance": float(selected_variance),
+        "shared_context_updates": int(
+            shared_context.get("updates", 0) or 0
+        ),
+        "shared_context_weighted_updates": float(
+            shared_context.get(
+                "weighted_updates",
+                shared_context.get("updates", 0),
+            )
+            or 0.0
         ),
         "severity_ratio": float(severity_ratio),
         "per_arm_std": {
@@ -853,7 +1063,7 @@ def _uncertainty_braking_metrics(
         ),
     }
 
-def predict_bandit(
+def _predict_bandit_impl(
     history: Iterable[Any],
     *,
     road_context: Optional[Mapping[str, Any]] = None,
@@ -887,6 +1097,7 @@ def predict_bandit(
             arm: _arm_metrics(state, arm, context)
             for arm in ARMS
         }
+        shared_context = _shared_context_uncertainty(state, context)
 
         score_b = metrics["B"]["score"]
         score_p = metrics["P"]["score"]
@@ -909,17 +1120,23 @@ def predict_bandit(
         braking = _uncertainty_braking_metrics(
             metrics,
             state,
+            shared_context,
+            base_direction,
         )
         short_term = _short_term_trend_buffer(
             raw_history,
             base_direction,
         )
+        short_term["meta_learning_takeover"] = bool(braking["active"])
 
         if bool(braking["active"]):
-            direction = str(short_term["direction"])
-            probabilities = dict(
-                short_term["probabilities"]
+            probabilities = _blend_ood_probabilities(
+                base_probabilities,
+                dict(short_term["probabilities"]),
             )
+            direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
+            short_term["blended_probabilities"] = dict(probabilities)
+            short_term["blended_direction"] = direction
             action_code = "O"
             action_text = "觀望／降低注碼"
             direction_source = (
@@ -1001,6 +1218,25 @@ def predict_bandit(
             prediction_fingerprint=prediction_fingerprint,
         )
         context_hash = _context_fingerprint(vector)
+        pending_ood_contexts = list(
+            state.get("pending_ood_contexts") or []
+        )
+        if bool(braking["active"]):
+            # 同一 context 的重複預測只保留一筆；update 後會消耗。
+            pending_ood_contexts = [
+                item
+                for item in pending_ood_contexts
+                if str(dict(item).get("context_hash") or "") != context_hash
+            ]
+            pending_ood_contexts.append({
+                "context_hash": context_hash,
+                "prediction_fingerprint": prediction_fingerprint,
+                "update_weight": few_shot_weight,
+                "created_at": int(time.time()),
+            })
+        state["pending_ood_contexts"] = pending_ood_contexts[
+            -CMAB_MAX_PENDING_OOD_CONTEXTS:
+        ]
         state["last_prediction_risk"] = {
             "prediction_fingerprint": prediction_fingerprint,
             "context_hash": context_hash,
@@ -1120,11 +1356,25 @@ def predict_bandit(
         "quality_score": float(quality),
         "confidence_label": confidence_label,
         "model_consistency": float(consistency),
-        "uncertainty": float(
+        # 頂層 uncertainty 是 OOD braking 真正使用的共享 context std。
+        "uncertainty": float(braking["action_space_std"]),
+        "state_novelty_uncertainty": float(
+            braking["action_space_std"]
+        ),
+        "state_novelty_variance": float(
+            braking["action_space_variance"]
+        ),
+        "selected_arm_uncertainty": float(
             selected["uncertainty"]
         ),
         "prediction_variance": float(
             selected["variance"]
+        ),
+        "decision_gap_uncertainty": float(
+            braking["decision_gap_std"]
+        ),
+        "decision_gap_variance": float(
+            braking["decision_gap_variance"]
         ),
         "unknown_region_active": bool(
             braking["active"]
@@ -1279,7 +1529,7 @@ def predict_bandit(
         ),
     }
 
-def update_bandit(
+def _update_bandit_impl(
     *,
     context: Sequence[float],
     selected_arm: str,
@@ -1309,16 +1559,20 @@ def update_bandit(
             f"context must contain {CONTEXT_DIM} values, "
             f"got {x.shape}"
         )
+    if not np.all(np.isfinite(x)):
+        raise ValueError("context contains non-finite values")
     x = np.clip(x, -1.0, 1.0)
     context_hash = _context_fingerprint(x)
+    if not math.isfinite(float(reward)):
+        raise ValueError("reward must be finite")
     reward_value = max(
         0.0,
         min(1.0, float(reward)),
     )
-    requested_weight = max(
-        0.25,
-        min(12.0, float(update_weight)),
-    )
+    requested_weight_value = float(update_weight)
+    if not math.isfinite(requested_weight_value):
+        raise ValueError("update_weight must be finite")
+    requested_weight = max(0.25, min(12.0, requested_weight_value))
     event_key = str(event_id or "").strip()
 
     with _LOCK:
@@ -1341,17 +1595,30 @@ def update_bandit(
                 ),
             }
 
-        last_risk = dict(
-            state.get("last_prediction_risk") or {}
-        )
+        last_risk = dict(state.get("last_prediction_risk") or {})
         same_high_variance_context = bool(
             last_risk.get("unknown_region_active")
             and str(last_risk.get("context_hash") or "")
             == context_hash
         )
+        pending_ood_contexts = list(
+            state.get("pending_ood_contexts") or []
+        )
+        matched_pending_ood = next(
+            (
+                dict(item)
+                for item in reversed(pending_ood_contexts)
+                if isinstance(item, Mapping)
+                and str(item.get("context_hash") or "") == context_hash
+            ),
+            {},
+        )
         boost_requested = (
-            requested_weight > 1.0
+            bool(matched_pending_ood)
             or same_high_variance_context
+            # performance_tracker 會把預測當下保存的 OOD 權重傳回；
+            # 只有合法的 4～5 倍範圍才視為 OOD 證據。
+            or requested_weight >= 4.0
         )
 
         # 高方差區間強制 4～5 倍；一般區間固定 1 倍。
@@ -1360,9 +1627,15 @@ def update_bandit(
                 4.0,
                 min(
                     5.0,
-                    requested_weight
-                    if requested_weight > 1.0
-                    else CMAB_UNKNOWN_UPDATE_MULTIPLIER,
+                    float(
+                        matched_pending_ood.get(
+                            "update_weight",
+                            requested_weight
+                            if requested_weight >= 4.0
+                            else CMAB_UNKNOWN_UPDATE_MULTIPLIER,
+                        )
+                        or CMAB_UNKNOWN_UPDATE_MULTIPLIER
+                    )
                 ),
             )
             if boost_requested
@@ -1412,6 +1685,27 @@ def update_bandit(
         ) + observation_weight * reward_value
 
         state["arms"][arm] = arm_state
+
+        # 共享 context matrix 不看 reward，也不分 Arm；每筆已揭曉 B/P
+        # 都代表這個特徵區間多了一次觀測。OOD 權重會讓新區間的
+        # x^T A_ctx^-1 x 在 1～2 局內快速下降。
+        context_information = dict(state.get("context_information") or {})
+        context_A = _as_information_matrix(context_information.get("A"))
+        context_A += observation_weight * np.outer(x, x)
+        context_information["A"] = (
+            0.5 * (context_A + context_A.T)
+        ).tolist()
+        context_information["updates"] = (
+            int(context_information.get("updates", 0) or 0) + 1
+        )
+        context_information["weighted_updates"] = float(
+            context_information.get(
+                "weighted_updates",
+                context_information["updates"] - 1,
+            )
+            or 0.0
+        ) + observation_weight
+        state["context_information"] = context_information
         state["total_updates"] = (
             int(state.get("total_updates", 0) or 0)
             + 1
@@ -1430,6 +1724,14 @@ def update_bandit(
                 -CMAB_MAX_EVENT_IDS:
             ]
 
+        if boost_requested:
+            state["pending_ood_contexts"] = [
+                item
+                for item in pending_ood_contexts
+                if not isinstance(item, Mapping)
+                or str(item.get("context_hash") or "") != context_hash
+            ][-CMAB_MAX_PENDING_OOD_CONTEXTS:]
+
         state["last_update"] = {
             "event_id": event_key,
             "selected_arm": arm,
@@ -1445,6 +1747,7 @@ def update_bandit(
             "same_high_variance_context": bool(
                 same_high_variance_context
             ),
+            "matched_pending_ood_context": bool(matched_pending_ood),
             "context_hash": context_hash,
             "updated_at": int(time.time()),
         }
@@ -1480,9 +1783,16 @@ def update_bandit(
         "total_weighted_updates": float(
             state["total_weighted_updates"]
         ),
+        "shared_context_updates": int(
+            context_information["updates"]
+        ),
+        "shared_context_weighted_updates": float(
+            context_information["weighted_updates"]
+        ),
     }
 
-def get_bandit_summary(
+
+def _get_bandit_summary_impl(
     user_id: str = "",
 ) -> Dict[str, Any]:
     with _LOCK:
@@ -1543,6 +1853,26 @@ def get_bandit_summary(
         "last_prediction_risk": dict(
             state.get("last_prediction_risk") or {}
         ),
+        "shared_context_information": {
+            "updates": int(
+                dict(state.get("context_information") or {}).get(
+                    "updates", 0
+                )
+                or 0
+            ),
+            "weighted_updates": float(
+                dict(state.get("context_information") or {}).get(
+                    "weighted_updates",
+                    dict(state.get("context_information") or {}).get(
+                        "updates", 0
+                    ),
+                )
+                or 0.0
+            ),
+        },
+        "pending_ood_context_count": len(
+            list(state.get("pending_ood_contexts") or [])
+        ),
         "arms": {
             arm: {
                 "updates": int(
@@ -1585,5 +1915,111 @@ def get_bandit_summary(
         "state_file": str(CMAB_STATE_FILE),
     }
 
-__all__ = ["ARMS", "CONTEXT_DIM", "FEATURE_NAMES", "MODEL_VERSION",
-           "build_context_vector", "get_bandit_summary", "predict_bandit", "update_bandit"]
+
+class ContextualBanditEngine:
+    """BGS LinUCB 核心類別；公開函式由此類別提供相容包裝。"""
+
+    def predict(
+        self,
+        history: Iterable[Any],
+        *,
+        road_context: Optional[Mapping[str, Any]] = None,
+        venue: str = "",
+        room: str = "",
+        user_id: str = "",
+        run_seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return _predict_bandit_impl(
+            history,
+            road_context=road_context,
+            venue=venue,
+            room=room,
+            user_id=user_id,
+            run_seed=run_seed,
+        )
+
+    def update(
+        self,
+        *,
+        context: Sequence[float],
+        selected_arm: str,
+        reward: Optional[float],
+        event_id: str = "",
+        actual_outcome: str = "",
+        update_weight: float = 1.0,
+        user_id: str = "",
+    ) -> Dict[str, Any]:
+        return _update_bandit_impl(
+            context=context,
+            selected_arm=selected_arm,
+            reward=reward,
+            event_id=event_id,
+            actual_outcome=actual_outcome,
+            update_weight=update_weight,
+            user_id=user_id,
+        )
+
+    def summary(self, user_id: str = "") -> Dict[str, Any]:
+        return _get_bandit_summary_impl(user_id=user_id)
+
+
+_DEFAULT_ENGINE = ContextualBanditEngine()
+
+
+def predict_bandit(
+    history: Iterable[Any],
+    *,
+    road_context: Optional[Mapping[str, Any]] = None,
+    venue: str = "",
+    room: str = "",
+    user_id: str = "",
+    run_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """既有 predictor.py 相容入口。"""
+    return _DEFAULT_ENGINE.predict(
+        history,
+        road_context=road_context,
+        venue=venue,
+        room=room,
+        user_id=user_id,
+        run_seed=run_seed,
+    )
+
+
+def update_bandit(
+    *,
+    context: Sequence[float],
+    selected_arm: str,
+    reward: Optional[float],
+    event_id: str = "",
+    actual_outcome: str = "",
+    update_weight: float = 1.0,
+    user_id: str = "",
+) -> Dict[str, Any]:
+    """既有 performance_tracker.py 相容入口。"""
+    return _DEFAULT_ENGINE.update(
+        context=context,
+        selected_arm=selected_arm,
+        reward=reward,
+        event_id=event_id,
+        actual_outcome=actual_outcome,
+        update_weight=update_weight,
+        user_id=user_id,
+    )
+
+
+def get_bandit_summary(user_id: str = "") -> Dict[str, Any]:
+    return _DEFAULT_ENGINE.summary(user_id=user_id)
+
+
+__all__ = [
+    "ARMS",
+    "CONTEXT_DIM",
+    "ContextualBanditEngine",
+    "FEATURE_NAMES",
+    "MODEL_VERSION",
+    "build_context_vector",
+    "get_bandit_summary",
+    "predict_bandit",
+    "update_bandit",
+]
