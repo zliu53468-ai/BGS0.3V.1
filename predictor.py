@@ -1,14 +1,16 @@
 """BGS cMAB 統一預測入口。
 
 正式圖片／真人桌預測使用完整 B/P/T 歷史、牌路上下文與 LinUCB cMAB。
-adaptive_ensemble 僅負責 OOD 權重熔斷；不恢復已移除的粒子、
-超幾何、蒙地卡羅、Stacking 或 DeepSeek。
+adaptive_ensemble 負責統計混沌硬熔斷；predictor 只在後台執行
+三局影子回測，達成連中 2 局且模型方差安全後才解除 No Bet。
+不恢復已移除的粒子、超幾何、蒙地卡羅、Stacking 或 DeepSeek。
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+from hashlib import sha256
 from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
-import os
 import secrets
 
 from adaptive_ensemble import adapt_prediction
@@ -21,23 +23,8 @@ DB_HOLDOUT: Dict[str, Any] = {
     "note": "舊粒子／有限牌組驗證層已從主要預測流程移除",
 }
 
-SHORT_TERM_SAFE_CONFIDENCE = max(
-    0.05,
-    min(
-        0.95,
-        float(os.getenv("SHORT_TERM_SAFE_CONFIDENCE", "0.35") or "0.35"),
-    ),
-)
-SHORT_TERM_TAKEOVER_BET_MULTIPLIER = max(
-    0.0,
-    min(
-        1.0,
-        float(
-            os.getenv("SHORT_TERM_TAKEOVER_BET_MULTIPLIER", "0.35")
-            or "0.35"
-        ),
-    ),
-)
+SHADOW_REQUIRED_CONSECUTIVE_HITS = 2
+SHADOW_MAX_STREAMS = 2048
 
 
 def _normalize_outcome_history(values: Iterable[Any]) -> List[str]:
@@ -116,126 +103,281 @@ def _short_term_trend_prior(
     }
 
 
-class ShortTermTakeoverController:
-    """集成信心崩落時的三局 Buffer 接管器。"""
+class ShadowBacktestController:
+    """No Bet 期間的三局影子回測與雙條件解鎖狀態機。"""
 
     def __init__(self) -> None:
-        self.short_term_buffer: List[str] = []
+        self.shadow_buffer: List[str] = []
+        self._states: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._lock = RLock()
+
+    @staticmethod
+    def stream_key(
+        *,
+        user_id: str,
+        venue: str,
+        room: str,
+        shoe_id: str,
+    ) -> str:
+        raw = "|".join((
+            str(user_id or "__anonymous__"),
+            str(venue or "").upper().strip(),
+            str(room or "").strip(),
+            str(shoe_id or "").strip(),
+        ))
+        return sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _new_state(history: List[str]) -> Dict[str, Any]:
+        return {
+            "hard_brake_latched": False,
+            "pending_direction": "",
+            "consecutive_hits": 0,
+            "total_shadow_bets": 0,
+            "shadow_hits": 0,
+            "shadow_misses": 0,
+            "ties_skipped": 0,
+            "last_history_length": len(history),
+            "last_history_hash": sha256(
+                "".join(history).encode("utf-8")
+            ).hexdigest()[:24],
+        }
+
+    @staticmethod
+    def _variance_status(prediction: Mapping[str, Any]) -> tuple[float, float, bool]:
+        braking = dict(prediction.get("uncertainty_braking") or {})
+        variance = float(
+            prediction.get(
+                "variance",
+                braking.get("action_space_variance", 0.0),
+            )
+            or 0.0
+        )
+        threshold = float(
+            prediction.get(
+                "variance_threshold",
+                braking.get("threshold_variance", float("inf")),
+            )
+            or float("inf")
+        )
+        variance_safe = bool(
+            braking.get("variance_safe", variance <= threshold)
+        )
+        return variance, threshold, variance_safe
+
+    @staticmethod
+    def _force_no_bet(
+        result: Dict[str, Any],
+        *,
+        reason: str,
+    ) -> None:
+        result.setdefault(
+            "pre_hard_brake_probabilities",
+            dict(result.get("probabilities") or {}),
+        )
+        result["probabilities"] = {"B": 0.5, "P": 0.5, "T": 0.0}
+        result["banker_rate"] = 50.0
+        result["player_rate"] = 50.0
+        result["tie_rate"] = 0.0
+        result["recommend"] = "O"
+        result["recommend_text"] = "觀望"
+        result["action"] = "O"
+        result["action_text"] = "觀望／絕對不下注"
+        result["internal_recommend"] = "O"
+        result["internal_action"] = "O"
+        result["next_round_direction"] = "O"
+        result["next_round_direction_text"] = "觀望"
+        result["signal_allowed"] = False
+        result["signal_status_code"] = "HARD_BRAKE_NO_BET"
+        result["signal_status_text"] = "硬熔斷鎖定：觀望／絕對不下注"
+        result["signal_reason"] = reason
+        result["internal_signal_reason"] = reason
+        result["direction_source"] = "shadow_backtest_hard_brake"
+        result["ensemble_confidence"] = 0.0
+        result["confidence"] = 0.0
+        result["quality_score"] = 0.0
+        result["confidence_label"] = "零信心／硬熔斷"
+        result["bet_multiplier"] = 0.0
+        result["hard_brake_active"] = True
 
     def apply(
         self,
         history: List[str],
         prediction: Mapping[str, Any],
+        *,
+        stream_key: str = "__default__",
     ) -> Dict[str, Any]:
         result = dict(prediction or {})
         local_buffer = [value for value in history if value in {"B", "P"}][-3:]
+        history_hash = sha256("".join(history).encode("utf-8")).hexdigest()[:24]
+        current_extreme = bool(
+            result.get("is_extreme_unseen")
+            or result.get("hard_brake_active")
+        )
+        variance, variance_threshold, variance_safe = self._variance_status(result)
+
         with self._lock:
-            # 僅作最新呼叫的可觀測快取；實際判斷使用 local_buffer，
-            # 不會把不同 UID 的牌路混在一起。
-            self.short_term_buffer = list(local_buffer)
+            self.shadow_buffer = list(local_buffer)
+            state = self._states.get(stream_key)
+            if state is None:
+                state = self._new_state(history)
+                self._states[stream_key] = state
+            self._states.move_to_end(stream_key)
+            while len(self._states) > SHADOW_MAX_STREAMS:
+                self._states.popitem(last=False)
 
-        adaptive = dict(result.get("adaptive_ensemble") or {})
-        confidence = float(
-            result.get(
-                "ensemble_confidence",
-                adaptive.get("overall_confidence", result.get("quality_score", 0.0)),
+            previous_length = int(state.get("last_history_length", len(history)))
+            previous_hash = str(state.get("last_history_hash") or "")
+            pending_direction = str(state.get("pending_direction") or "")
+            shadow_result = "PENDING"
+            resolved_actual = ""
+
+            history_replaced = bool(
+                len(history) < previous_length
+                or (
+                    len(history) == previous_length
+                    and previous_hash
+                    and previous_hash != history_hash
+                )
             )
-            or 0.0
-        )
-        circuit_breaker_active = bool(adaptive.get("circuit_breaker_active"))
-        takeover_required = bool(
-            circuit_breaker_active
-            and confidence < SHORT_TERM_SAFE_CONFIDENCE
-        )
-        if not takeover_required:
-            result["short_term_takeover"] = {
-                "active": False,
-                "short_term_buffer": list(local_buffer),
-                "ensemble_confidence": float(confidence),
-                "safe_threshold": float(SHORT_TERM_SAFE_CONFIDENCE),
-                "reason": (
-                    "未觸發 cMAB 熔斷"
-                    if not circuit_breaker_active
-                    else "熔斷後整體信心仍高於安全閾值"
+            if history_replaced:
+                state = self._new_state(history)
+                self._states[stream_key] = state
+                pending_direction = ""
+                shadow_result = "STREAM_RESET"
+            elif len(history) > previous_length and pending_direction in {"B", "P"}:
+                new_outcomes = history[previous_length:]
+                resolved_actual = next(
+                    (value for value in new_outcomes if value in {"B", "P"}),
+                    "",
+                )
+                if resolved_actual:
+                    state["total_shadow_bets"] = int(
+                        state.get("total_shadow_bets", 0) or 0
+                    ) + 1
+                    if pending_direction == resolved_actual:
+                        state["consecutive_hits"] = int(
+                            state.get("consecutive_hits", 0) or 0
+                        ) + 1
+                        state["shadow_hits"] = int(
+                            state.get("shadow_hits", 0) or 0
+                        ) + 1
+                        shadow_result = "HIT"
+                    else:
+                        state["consecutive_hits"] = 0
+                        state["shadow_misses"] = int(
+                            state.get("shadow_misses", 0) or 0
+                        ) + 1
+                        shadow_result = "MISS"
+                    state["pending_direction"] = ""
+                    pending_direction = ""
+                elif any(value == "T" for value in new_outcomes):
+                    state["ties_skipped"] = int(
+                        state.get("ties_skipped", 0) or 0
+                    ) + 1
+                    shadow_result = "TIE_SKIPPED"
+
+            if current_extreme:
+                state["hard_brake_latched"] = True
+
+            consecutive_hits = int(state.get("consecutive_hits", 0) or 0)
+            release_allowed = bool(
+                state.get("hard_brake_latched")
+                and not current_extreme
+                and variance_safe
+                and consecutive_hits >= SHADOW_REQUIRED_CONSECUTIVE_HITS
+            )
+            released_this_round = False
+            if release_allowed:
+                state["hard_brake_latched"] = False
+                state["pending_direction"] = ""
+                pending_direction = ""
+                released_this_round = True
+
+            hard_brake_latched = bool(state.get("hard_brake_latched"))
+            shadow_prior: Dict[str, Any] = {}
+            if hard_brake_latched:
+                if pending_direction not in {"B", "P"}:
+                    shadow_prior = _short_term_trend_prior(
+                        local_buffer,
+                        _fallback_direction(result),
+                    )
+                    pending_direction = str(shadow_prior["direction"])
+                    state["pending_direction"] = pending_direction
+                else:
+                    shadow_prior = _short_term_trend_prior(
+                        local_buffer,
+                        pending_direction,
+                    )
+
+            state["last_history_length"] = len(history)
+            state["last_history_hash"] = history_hash
+            self._states[stream_key] = state
+
+            shadow_payload = {
+                "active": bool(hard_brake_latched),
+                "hard_brake_latched": bool(hard_brake_latched),
+                "released_this_round": bool(released_this_round),
+                "shadow_buffer": list(local_buffer),
+                "pending_direction": pending_direction,
+                "pending_direction_text": (
+                    "莊" if pending_direction == "B"
+                    else "閒" if pending_direction == "P"
+                    else ""
                 ),
+                "strategy": str(shadow_prior.get("strategy") or ""),
+                "last_shadow_result": shadow_result,
+                "last_resolved_actual": resolved_actual,
+                "consecutive_hits": int(state.get("consecutive_hits", 0) or 0),
+                "required_consecutive_hits": SHADOW_REQUIRED_CONSECUTIVE_HITS,
+                "total_shadow_bets": int(state.get("total_shadow_bets", 0) or 0),
+                "shadow_hits": int(state.get("shadow_hits", 0) or 0),
+                "shadow_misses": int(state.get("shadow_misses", 0) or 0),
+                "ties_skipped": int(state.get("ties_skipped", 0) or 0),
+                "variance": float(variance),
+                "variance_threshold": float(variance_threshold),
+                "variance_safe": bool(variance_safe),
+                "model_is_extreme_unseen": bool(current_extreme),
+                "release_allowed": bool(release_allowed),
             }
-            return result
 
-        prior = _short_term_trend_prior(
-            local_buffer,
-            _fallback_direction(result),
-        )
-        direction = str(prior["direction"])
-        probabilities = dict(prior["probabilities"])
-        original_predictor_signal = dict(result.get("predictor_signal") or {})
-        original_probabilities = dict(result.get("probabilities") or {})
-
-        result.update({
-            "ensemble_probabilities_before_takeover": original_probabilities,
-            "bandit_risk_signal": original_predictor_signal,
-            "probabilities": probabilities,
-            "banker_rate": round(probabilities["B"] * 100.0, 2),
-            "player_rate": round(probabilities["P"] * 100.0, 2),
-            "tie_rate": 0.0,
-            "recommend": direction,
-            "recommend_text": "莊" if direction == "B" else "閒",
-            "action": direction,
-            "action_text": "莊" if direction == "B" else "閒",
-            "internal_recommend": direction,
-            "internal_action": direction,
-            "selected_arm": direction,
-            "next_round_direction": direction,
-            "next_round_direction_text": "莊" if direction == "B" else "閒",
-            "signal_allowed": True,
-            "signal_status_code": "SHORT_TERM_META_TREND_TAKEOVER",
-            "signal_status_text": "極端未知區間：三局微觀順勢接管",
-            "signal_reason": (
-                "cMAB 因極端未知特徵遭動態熔斷，整體信心低於安全閾值；"
-                f"改由最近 3 局策略 {prior['strategy']} 輸出短週期方向。"
-            ),
-            "internal_signal_reason": (
-                "全局聯動防禦已啟動：熔斷後由三局微觀趨勢接管"
-            ),
-            "direction_source": "predictor_short_term_meta_takeover",
-            "ensemble_confidence_before_takeover": float(confidence),
-            "ensemble_confidence": float(prior["strength"]),
-            "short_term_confidence": float(prior["strength"]),
-            "bet_multiplier": float(SHORT_TERM_TAKEOVER_BET_MULTIPLIER),
-            "confidence_label": "短週期接管",
-            "predictor_signal": {
-                "code": "SHORT_TERM_META_TREND_TAKEOVER",
-                "is_extreme_unseen": bool(result.get("is_extreme_unseen")),
-                "variance": float(result.get("variance", 0.0) or 0.0),
-                "meta_learning_takeover": True,
-                "short_term_buffer": list(local_buffer),
-                "strategy": str(prior["strategy"]),
-                "direction": direction,
-                "confidence": float(prior["strength"]),
-                "bet_multiplier": float(SHORT_TERM_TAKEOVER_BET_MULTIPLIER),
-            },
-            "meta_learning_takeover": {
+        result["shadow_backtest"] = shadow_payload
+        result["shadow_buffer"] = list(local_buffer)
+        if hard_brake_latched:
+            self._force_no_bet(
+                result,
+                reason=(
+                    "統計混沌熔斷仍鎖定；只有影子回測連中 2 局且"
+                    "模型方差降回安全門檻，才允許恢復正式方向。"
+                ),
+            )
+            adaptive = dict(result.get("adaptive_ensemble") or {})
+            adaptive.update({
                 "active": True,
-                **prior,
-                "trigger": "ensemble_confidence_below_safe_threshold",
-                "ensemble_confidence_before_takeover": float(confidence),
-                "safe_threshold": float(SHORT_TERM_SAFE_CONFIDENCE),
-            },
-            "short_term_takeover": {
-                "active": True,
-                **prior,
-                "ensemble_confidence_before_takeover": float(confidence),
-                "safe_threshold": float(SHORT_TERM_SAFE_CONFIDENCE),
-                "bet_multiplier": float(SHORT_TERM_TAKEOVER_BET_MULTIPLIER),
-            },
-        })
-        adaptive["short_term_takeover_applied"] = True
-        adaptive["final_direction_source"] = "predictor_short_term_meta_takeover"
-        result["adaptive_ensemble"] = adaptive
+                "circuit_breaker_active": True,
+                "hard_brake_active": True,
+                "mode": "shadow_backtest_latched_hard_brake",
+                "overall_confidence": 0.0,
+                "final_action": "O",
+                "bet_multiplier": 0.0,
+                "shadow_backtest_required": True,
+                "shadow_consecutive_hits": shadow_payload["consecutive_hits"],
+                "variance_safe": bool(variance_safe),
+            })
+            result["adaptive_ensemble"] = adaptive
+        elif released_this_round:
+            result["hard_brake_released"] = True
+            result["signal_reason"] = (
+                "影子回測已連中 2 局且模型方差回到安全門檻，解除硬熔斷。"
+            )
         return result
 
 
-_SHORT_TERM_CONTROLLER = ShortTermTakeoverController()
+_SHADOW_CONTROLLER = ShadowBacktestController()
+# 保留前一版類別／單例名稱，避免外部整合在部署過渡期 import 失敗；
+# 行為已統一改為 No Bet 影子回測，不會恢復舊的實盤短線接管。
+ShortTermTakeoverController = ShadowBacktestController
+_SHORT_TERM_CONTROLLER = _SHADOW_CONTROLLER
 
 
 def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", room: str = "",
@@ -258,13 +400,22 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         user_id=user_id,
         run_seed=run_seed,
     )
-    # 全局閉環：cMAB 風險訊號 -> 集成熔斷 -> 低信心三局接管。
+    # 全局閉環：統計風險訊號 -> 集成硬熔斷 -> 三局影子回測解鎖。
     result = adapt_prediction(
         result,
         venue=str(venue or ""),
         room=str(room or ""),
     )
-    result = _SHORT_TERM_CONTROLLER.apply(cleaned, result)
+    result = _SHADOW_CONTROLLER.apply(
+        cleaned,
+        result,
+        stream_key=_SHADOW_CONTROLLER.stream_key(
+            user_id=str(user_id or ""),
+            venue=str(venue or ""),
+            room=str(room or ""),
+            shoe_id=str(shoe_id or ""),
+        ),
+    )
     result.update({
         "shoe_id": str(shoe_id or ""),
         "composition_quality": "not_applicable_cmab",
@@ -296,9 +447,21 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
-    predicted_side = str(prediction.get("recommend") or "").upper()
+    predicted_side = str(
+        prediction.get("action")
+        or prediction.get("recommend")
+        or ""
+    ).upper()
     actual = str(hand.outcome or "").upper()
-    verdict = "TIE_SKIPPED" if actual == "T" else "HIT" if predicted_side == actual else "MISS"
+    verdict = (
+        "OBSERVE"
+        if predicted_side == "O"
+        else "TIE_SKIPPED"
+        if actual == "T"
+        else "HIT"
+        if predicted_side == actual
+        else "MISS"
+    )
     prediction.update({
         "ok": True,
         "mode": "virtual_shoe_cmab_compatibility",
@@ -307,7 +470,12 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         "virtual_outcome": actual,
         "virtual_outcome_text": hand_data["outcome_text"],
         "verdict": verdict,
-        "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict],
+        "verdict_text": {
+            "HIT": "命中",
+            "MISS": "未命中",
+            "TIE_SKIPPED": "和局不計",
+            "OBSERVE": "觀望／不計勝負",
+        }[verdict],
         "cards_consumed": int(hand.cards_used),
         "remaining_cards_after": len(remaining_shoe),
         "remaining_counts_after": counts_from_shoe(remaining_shoe),
@@ -323,4 +491,11 @@ def parse_point_observation(value: Any) -> None:
     return None
 
 
-__all__ = ["DB_HOLDOUT", "parse_point_observation", "predict", "run_virtual_round"]
+__all__ = [
+    "DB_HOLDOUT",
+    "ShadowBacktestController",
+    "ShortTermTakeoverController",
+    "parse_point_observation",
+    "predict",
+    "run_virtual_round",
+]
