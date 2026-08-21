@@ -137,10 +137,16 @@ def adapt_prediction(
         result["pre_hard_brake_recommend"] = str(
             result.get("recommend") or learning_arm
         )
-        result["probabilities"] = {"B": 0.5, "P": 0.5, "T": 0.0}
-        result["banker_rate"] = 50.0
-        result["player_rate"] = 50.0
-        result["tie_rate"] = 0.0
+        tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
+        neutral_bp = (1.0 - tie_probability) * 0.5
+        result["probabilities"] = {
+            "B": neutral_bp,
+            "P": neutral_bp,
+            "T": tie_probability,
+        }
+        result["banker_rate"] = round(neutral_bp * 100.0, 2)
+        result["player_rate"] = round(neutral_bp * 100.0, 2)
+        result["tie_rate"] = round(tie_probability * 100.0, 2)
         result["recommend"] = "O"
         result["recommend_text"] = "觀望"
         result["action"] = "O"

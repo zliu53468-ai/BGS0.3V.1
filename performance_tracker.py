@@ -115,6 +115,9 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
                       metadata: Optional[Mapping[str, Any]] = None) -> str:
     uid = _uid_key(user_id)
     prediction_id = f"{_now():x}{secrets.token_hex(6)}"
+    prediction_fingerprint = str(
+        prediction.get("prediction_fingerprint") or ""
+    ).strip()
     selected_arm = str(prediction.get("selected_arm") or prediction.get("action") or prediction.get("recommend") or "").upper().strip()
     record = {
         "prediction_id": prediction_id,
@@ -124,6 +127,7 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "venue": str(venue or "").upper().strip(),
         "room": str(room or "").strip(),
         "model_version": str(prediction.get("model_version") or prediction.get("engine") or ""),
+        "prediction_fingerprint": prediction_fingerprint,
         "probabilities": _prediction_probabilities(prediction),
         "recommend": str(prediction.get("recommend") or selected_arm).upper(),
         "action": str(prediction.get("action") or selected_arm).upper(),
@@ -131,6 +135,13 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "context_vector": list(prediction.get("bandit_context") or prediction.get("context_vector") or []),
         "context_feature_names": list(prediction.get("context_feature_names") or []),
         "bandit_scores": dict(prediction.get("bandit_scores") or {}),
+        "component_probabilities": dict(
+            prediction.get("component_probabilities")
+            or dict(prediction.get("road_support") or {}).get(
+                "component_probabilities", {}
+            )
+            or {}
+        ),
         "quality_score": float(prediction.get("quality_score", 0.0) or 0.0),
         "unknown_region_active": bool(prediction.get("unknown_region_active", False)),
         "uncertainty_braking": dict(prediction.get("uncertainty_braking") or {}),
@@ -143,6 +154,20 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
     }
     with _LOCK:
         data = _read_unlocked()
+        pending_id = str(data["pending"].get(uid) or "")
+        if pending_id and prediction_fingerprint:
+            for existing in reversed(data["records"]):
+                if str(existing.get("prediction_id") or "") != pending_id:
+                    continue
+                if (
+                    not existing.get("actual_outcome")
+                    and str(existing.get("uid_key") or "") == uid
+                    and str(existing.get("prediction_fingerprint") or "")
+                    == prediction_fingerprint
+                ):
+                    # 同一歷史重試時沿用 pending，不重複建立訓練事件。
+                    return pending_id
+                break
         data["records"].append(record)
         data["pending"][uid] = prediction_id
         _write_unlocked(data)
@@ -150,6 +175,7 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
 
 
 def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str = "", room: str = "",
+                              prediction_id: str = "",
                               mark_duplicate_guard: bool = False) -> Optional[Dict[str, Any]]:
     actual = str(actual_outcome or "").upper().strip()
     if actual not in _OUTCOMES:
@@ -157,8 +183,15 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
     uid = _uid_key(user_id)
     with _LOCK:
         data = _read_unlocked()
+        expected_prediction_id = str(prediction_id or "").strip()
         guard = dict(data["duplicate_guards"].get(uid) or {})
-        if guard and str(guard.get("actual_outcome") or "") == actual and _now() - int(guard.get("created_at", 0) or 0) <= _GUARD_SECONDS:
+        if (
+            not expected_prediction_id
+            and guard
+            and str(guard.get("actual_outcome") or "") == actual
+            and _now() - int(guard.get("created_at", 0) or 0)
+            <= _GUARD_SECONDS
+        ):
             data["duplicate_guards"].pop(uid, None)
             _write_unlocked(data)
             return None
@@ -168,7 +201,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         for record in reversed(data["records"]):
             if str(record.get("uid_key") or "") != uid or record.get("actual_outcome"):
                 continue
-            if pending_id and str(record.get("prediction_id") or "") != pending_id:
+            record_id = str(record.get("prediction_id") or "")
+            if expected_prediction_id and record_id != expected_prediction_id:
+                continue
+            if not expected_prediction_id and pending_id and record_id != pending_id:
                 continue
             target = record
             break
@@ -181,6 +217,7 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
 
         probabilities = _normalize_probabilities(dict(target.get("probabilities") or {}))
         selected_arm = str(target.get("selected_arm") or target.get("action") or target.get("recommend") or "").upper().strip()
+        public_action = str(target.get("action") or target.get("recommend") or "O").upper().strip()
         context = list(target.get("context_vector") or [])
         reward: Optional[float]
         if actual == "T":
@@ -190,11 +227,9 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         else:
             reward = None
 
-        update_weight = (
-            max(1.0, min(12.0, float(target.get("few_shot_update_weight", 1.0) or 1.0)))
-            if bool(target.get("unknown_region_active"))
-            else 1.0
-        )
+        # 統計混沌區也只是一筆新觀測；禁止把單局結果複製成 4～5 筆
+        # 證據，避免 Few-shot Boosting 對隨機雜訊過擬合。
+        update_weight = 1.0
 
         if reward is not None and context:
             bandit_update = update_bandit(
@@ -231,8 +266,21 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         target["log_loss"] = -math.log(max(1e-12, probabilities[actual]))
         target["brier_score"] = sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in _OUTCOMES)
         target["top1_correct"] = max(probabilities, key=probabilities.get) == actual
-        target["action_correct"] = selected_arm == actual if actual in {"B", "P"} and selected_arm in {"B", "P"} else None
-        data["pending"].pop(uid, None)
+        # 正式勝率只能計算前端真正開放的下注動作；No Bet 時保留的
+        # selected_arm 只是被動學習標籤，不能再被算成一筆正式輸贏。
+        target["action_correct"] = (
+            public_action == actual
+            if public_action in _OUTCOMES
+            else None
+        )
+        target["learning_arm_correct"] = (
+            selected_arm == actual
+            if actual in {"B", "P"} and selected_arm in {"B", "P"}
+            else None
+        )
+        target["no_bet"] = public_action == "O"
+        if not pending_id or pending_id == str(target.get("prediction_id") or ""):
+            data["pending"].pop(uid, None)
         if mark_duplicate_guard:
             data["duplicate_guards"][uid] = {
                 "actual_outcome": actual,
@@ -268,12 +316,21 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     brier_values: List[float] = []
     log_losses: List[float] = []
     decided = correct = 0
+    learning_decided = learning_correct = 0
+    no_bet_count = 0
     rewards: List[float] = []
     unknown_region_count = 0
     boosted_update_count = 0
+    predicted_totals = {key: 0.0 for key in _OUTCOMES}
+    component_brier_values: Dict[str, List[float]] = {}
     for record in valid:
         actual = str(record.get("actual_outcome") or "").upper()
         counts[actual] += 1
+        probabilities = _normalize_probabilities(
+            dict(record.get("probabilities") or {})
+        )
+        for key in _OUTCOMES:
+            predicted_totals[key] += probabilities[key]
         try:
             brier_values.append(float(record.get("brier_score")))
         except Exception:
@@ -282,14 +339,37 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             log_losses.append(float(record.get("log_loss")))
         except Exception:
             pass
-        if record.get("action_correct") is not None:
+        public_action = str(
+            record.get("action") or record.get("recommend") or "O"
+        ).upper().strip()
+        public_action_correct = (
+            public_action == actual
+            if public_action in _OUTCOMES
+            else None
+        )
+        if public_action_correct is not None:
             decided += 1
-            correct += int(bool(record.get("action_correct")))
+            correct += int(bool(public_action_correct))
+        if record.get("learning_arm_correct") is not None:
+            learning_decided += 1
+            learning_correct += int(bool(record.get("learning_arm_correct")))
+        no_bet_count += int(public_action == "O")
         if record.get("reward") is not None:
             rewards.append(float(record.get("reward") or 0.0))
         unknown_region_count += int(bool(record.get("unknown_region_active")))
         boosted_update_count += int(bool(record.get("few_shot_boost_applied")))
+        for name, values in dict(record.get("component_probabilities") or {}).items():
+            if not isinstance(values, Mapping):
+                continue
+            component = _normalize_probabilities(values)
+            score = sum(
+                (component[key] - (1.0 if key == actual else 0.0)) ** 2
+                for key in _OUTCOMES
+            )
+            component_brier_values.setdefault(str(name), []).append(score)
     total = max(1, len(valid))
+    mean_brier = sum(brier_values) / len(brier_values) if brier_values else None
+    mean_log_loss = sum(log_losses) / len(log_losses) if log_losses else None
     return {
         "sample_count": len(valid),
         "outcome_counts": counts,
@@ -297,13 +377,32 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "decision_count": decided,
         "correct_count": correct,
         "accuracy": correct / max(1, decided),
+        "decision_coverage": decided / total,
+        "no_bet_count": no_bet_count,
+        "no_bet_rate": no_bet_count / total,
+        "learning_arm_decision_count": learning_decided,
+        "learning_arm_correct_count": learning_correct,
+        "learning_arm_accuracy": learning_correct / max(1, learning_decided),
         "mean_reward": sum(rewards) / max(1, len(rewards)),
         "unknown_region_count": unknown_region_count,
         "few_shot_boosted_update_count": boosted_update_count,
-        "mean_brier_score": sum(brier_values) / len(brier_values) if brier_values else None,
-        "mean_log_loss": sum(log_losses) / len(log_losses) if log_losses else None,
-        "component_brier_scores": {},
-        "component_sample_counts": {},
+        "mean_predicted_probabilities": {
+            key: predicted_totals[key] / total for key in _OUTCOMES
+        },
+        "mean_brier_score": mean_brier,
+        "mean_log_loss": mean_log_loss,
+        # 舊校準器讀取這兩個名稱；保留 mean_* 並補齊相容別名。
+        "brier_score": mean_brier,
+        "log_loss": mean_log_loss,
+        "component_brier_scores": {
+            name: sum(values) / len(values)
+            for name, values in component_brier_values.items()
+            if values
+        },
+        "component_sample_counts": {
+            name: len(values)
+            for name, values in component_brier_values.items()
+        },
         "model": "CMAB-LINUCB-V1",
     }
 

@@ -13,6 +13,7 @@ V1.5 多維統計硬煞車：
 - 同時計算最近 12 局排列熵、B/P 卡方與經驗方差診斷。
 - 只有「模型方差超標且排列熵 > 0.95」才標記極端混沌區間。
 - 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
+- B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
 
 banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
 """
@@ -67,6 +68,17 @@ CMAB_ALPHA = _env_float("CMAB_ALPHA", 0.80, 0.0, 5.0)
 CMAB_L2 = _env_float("CMAB_L2", 1.0, 0.05, 100.0)
 CMAB_SCORE_TEMPERATURE = _env_float(
     "CMAB_SCORE_TEMPERATURE", 1.35, 0.10, 10.0
+)
+CMAB_TIE_PRIOR = 0.095156
+CMAB_TIE_PRIOR_STRENGTH = _env_float(
+    "CMAB_TIE_PRIOR_STRENGTH", 40.0, 10.0, 500.0
+)
+CMAB_MIN_SIGNAL_EDGE = _env_float(
+    "CMAB_MIN_SIGNAL_EDGE", 0.02, 0.0, 0.20
+)
+CMAB_MIN_SIGNAL_UPDATES = max(
+    0,
+    min(200, int(os.getenv("CMAB_MIN_SIGNAL_UPDATES", "8") or "8")),
 )
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
@@ -945,6 +957,16 @@ def _softmax_two(score_b: float, score_p: float) -> Dict[str, float]:
     return {"B": float(exp_values[0] / total), "P": float(exp_values[1] / total), "T": 0.0}
 
 
+def _smoothed_tie_probability(history: Sequence[str]) -> float:
+    """以標準八副牌先驗平滑觀測和局率，避免 T=0 破壞校準指標。"""
+    sample_count = len(history)
+    tie_count = sum(value == "T" for value in history)
+    posterior = (
+        tie_count + CMAB_TIE_PRIOR * CMAB_TIE_PRIOR_STRENGTH
+    ) / max(1e-12, sample_count + CMAB_TIE_PRIOR_STRENGTH)
+    return float(max(0.04, min(0.18, posterior)))
+
+
 def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any]) -> str:
     for key in ("direction", "planning_direction", "recent_direction"):
         value = str(road_context.get(key) or "").upper().strip()
@@ -1264,9 +1286,24 @@ def _predict_bandit_impl(
             )
             tie_break = False
 
-        base_probabilities = _softmax_two(
+        conditional_bp = _softmax_two(
             score_b,
             score_p,
+        )
+        tie_probability = _smoothed_tie_probability(raw_history)
+        bp_mass = 1.0 - tie_probability
+        base_probabilities = {
+            "B": float(conditional_bp["B"] * bp_mass),
+            "P": float(conditional_bp["P"] * bp_mass),
+            "T": float(tie_probability),
+        }
+        total_updates = int(state.get("total_updates", 0) or 0)
+        conditional_edge = abs(
+            float(conditional_bp["B"]) - float(conditional_bp["P"])
+        )
+        maturity_ready = total_updates >= CMAB_MIN_SIGNAL_UPDATES
+        direction_signal_ready = bool(
+            maturity_ready and conditional_edge >= CMAB_MIN_SIGNAL_EDGE
         )
         braking = _uncertainty_braking_metrics(
             metrics,
@@ -1285,7 +1322,11 @@ def _predict_bandit_impl(
             # 混沌區間不再以 3 局規則覆寫主模型；只保留內部 Arm
             # 供 1 倍被動學習，公開分數強制中性並交由下游硬熔斷。
             direction = base_direction
-            probabilities = {"B": 0.5, "P": 0.5, "T": 0.0}
+            probabilities = {
+                "B": float(bp_mass * 0.5),
+                "P": float(bp_mass * 0.5),
+                "T": float(tie_probability),
+            }
             action_code = "O"
             action_text = "觀望／絕對不下注"
             direction_source = (
@@ -1299,7 +1340,7 @@ def _predict_bandit_impl(
                 f"{CMAB_PERMUTATION_ENTROPY_THRESHOLD:.2f}；"
                 "本局強制觀望／0%配置。"
             )
-        else:
+        elif direction_signal_ready:
             direction = base_direction
             probabilities = dict(base_probabilities)
             action_code = direction
@@ -1313,11 +1354,20 @@ def _predict_bandit_impl(
                 "LinUCB 依目前牌路上下文、歷史回饋、"
                 "探索上界與 UID 動態不確定性基準選擇莊／閒 Arm"
             )
+        else:
+            direction = base_direction
+            probabilities = dict(base_probabilities)
+            action_code = "O"
+            action_text = "觀望／方向優勢不足"
+            direction_source = "contextual_bandit_low_edge_brake"
+            signal_reason = (
+                "方向訊號尚未達安全門檻："
+                f"有效回饋 {total_updates}/{CMAB_MIN_SIGNAL_UPDATES}，"
+                f"B/P 條件優勢 {conditional_edge:.4f}/"
+                f"{CMAB_MIN_SIGNAL_EDGE:.4f}；本局不下注。"
+            )
 
         margin = abs(score_b - score_p)
-        total_updates = int(
-            state.get("total_updates", 0) or 0
-        )
         maturity = 1.0 - math.exp(
             -total_updates / 80.0
         )
@@ -1334,10 +1384,10 @@ def _predict_bandit_impl(
                 quality,
                 CMAB_UNKNOWN_CONFIDENCE_CAP,
             )
+        elif not direction_signal_ready:
+            quality = min(quality, 0.49)
 
-        direction_edge = abs(
-            probabilities["B"] - probabilities["P"]
-        )
+        direction_edge = float(conditional_edge)
         consistency = min(
             1.0,
             0.50
@@ -1402,23 +1452,24 @@ def _predict_bandit_impl(
         if quality >= 0.50
         else "偏低"
     )
-    signal_allowed = not bool(braking["active"])
+    signal_allowed = action_code in ARMS
+    output_signal_code = (
+        str(braking["downstream_signal_code"])
+        if braking["active"]
+        else "LOW_EDGE_OBSERVE"
+        if not signal_allowed
+        else "IN_DISTRIBUTION"
+    )
     risk_signal = {
-        "code": str(
-            braking["downstream_signal_code"]
-        ),
+        "code": output_signal_code,
         "ood_detected": bool(braking["active"]),
         "is_extreme_unseen": bool(braking["active"]),
         "variance": float(braking["action_space_variance"]),
         "extreme_uncertainty": bool(
             braking["active"]
         ),
-        "observe_required": bool(
-            braking["active"]
-        ),
-        "bet_multiplier": (
-            0.0 if braking["active"] else 1.0
-        ),
+        "observe_required": bool(not signal_allowed),
+        "bet_multiplier": 1.0 if signal_allowed else 0.0,
         "confidence_cap": (
             float(CMAB_UNKNOWN_CONFIDENCE_CAP)
             if braking["active"]
@@ -1449,6 +1500,7 @@ def _predict_bandit_impl(
         "model_core": (
             "contextual_multi_armed_bandit_linu_cb"
         ),
+        "prediction_fingerprint": prediction_fingerprint,
         "mode": "screen_contextual_bandit",
         "probabilities": dict(probabilities),
         "pre_braking_probabilities": dict(
@@ -1462,7 +1514,10 @@ def _predict_bandit_impl(
             probabilities["P"] * 100.0,
             2,
         ),
-        "tie_rate": 0.0,
+        "tie_rate": round(
+            probabilities["T"] * 100.0,
+            2,
+        ),
         # selected_arm 仍供固定 1 倍被動學習；真正資金動作由 action=O 控制。
         "recommend": direction,
         "recommend_text": (
@@ -1473,12 +1528,12 @@ def _predict_bandit_impl(
         "internal_recommend": direction,
         "internal_action": action_code,
         "signal_allowed": signal_allowed,
-        "signal_status_code": str(
-            braking["downstream_signal_code"]
-        ),
+        "signal_status_code": output_signal_code,
         "signal_status_text": (
             "統計混沌硬煞車：觀望／絕對不下注"
             if braking["active"]
+            else "方向優勢或回饋樣本不足：觀望"
+            if not signal_allowed
             else "cMAB 下一局方向評估"
         ),
         "signal_reason": signal_reason,
@@ -1539,9 +1594,7 @@ def _predict_bandit_impl(
             braking["active"]
         ),
         "few_shot_update_weight": few_shot_weight,
-        "bet_multiplier": (
-            0.0 if braking["active"] else 1.0
-        ),
+        "bet_multiplier": 1.0 if signal_allowed else 0.0,
         "uncertainty_braking": {
             **braking,
             "base_direction": base_direction,
@@ -1663,6 +1716,12 @@ def _predict_bandit_impl(
             "permutation_entropy_threshold": (
                 CMAB_PERMUTATION_ENTROPY_THRESHOLD
             ),
+            "tie_prior": CMAB_TIE_PRIOR,
+            "tie_prior_strength": CMAB_TIE_PRIOR_STRENGTH,
+            "minimum_signal_edge": CMAB_MIN_SIGNAL_EDGE,
+            "minimum_signal_updates": CMAB_MIN_SIGNAL_UPDATES,
+            "signal_maturity_ready": bool(maturity_ready),
+            "direction_signal_ready": bool(direction_signal_ready),
             "state_file": str(CMAB_STATE_FILE),
             "cold_start_tie_break": tie_break,
         },
@@ -1705,6 +1764,7 @@ def _update_bandit_impl(
     user_id: str = "",
 ) -> Dict[str, Any]:
     arm = str(selected_arm or "").upper().strip()
+    actual = str(actual_outcome or "").upper().strip()
     if arm not in ARMS:
         raise ValueError("selected_arm must be B or P")
 
@@ -1713,9 +1773,7 @@ def _update_bandit_impl(
             "updated": False,
             "reason": "tie_or_skipped_reward",
             "selected_arm": arm,
-            "actual_outcome": str(
-                actual_outcome or ""
-            ).upper(),
+            "actual_outcome": actual,
         }
 
     x = np.asarray(list(context), dtype=np.float64)
@@ -1773,48 +1831,62 @@ def _update_bandit_impl(
         # 這能防止單局隨機結果以 4～5 筆證據灌入 posterior。
         observation_weight = 1.0
 
-        arm_state = dict(state["arms"][arm])
-        A = np.asarray(
-            arm_state["A"],
-            dtype=np.float64,
+        # 百家樂揭曉 B/P 後，兩個 Arm 的反事實 reward 都已知：
+        # B 開出即 B=1/P=0，P 開出則相反。舊版只更新「被選 Arm」，
+        # 會引入 action-selection bias 並浪費一半監督訊號。
+        # 有完整結果時同時更新兩 Arm；舊呼叫未提供 actual 時仍相容
+        # selected-arm-only 更新。每個 Arm 仍固定 w=1，沒有 Few-shot。
+        full_information_update = actual in ARMS
+        arm_rewards = (
+            {candidate: 1.0 if candidate == actual else 0.0 for candidate in ARMS}
+            if full_information_update
+            else {arm: reward_value}
         )
-        b = np.asarray(
-            arm_state["b"],
-            dtype=np.float64,
-        )
-
-        # 標準 Bayesian ridge / LinUCB update（固定 w=1）。
-        A += observation_weight * np.outer(x, x)
-        b += (
-            observation_weight
-            * reward_value
-            * x
-        )
-        arm_state["A"] = A.tolist()
-        arm_state["b"] = b.tolist()
-        arm_state["updates"] = (
-            int(arm_state.get("updates", 0) or 0)
-            + 1
-        )
-        arm_state["weighted_updates"] = float(
-            arm_state.get(
-                "weighted_updates",
-                arm_state["updates"] - 1,
+        updated_arm_states: Dict[str, Dict[str, Any]] = {}
+        outer_context = np.outer(x, x)
+        for candidate, candidate_reward in arm_rewards.items():
+            candidate_state = dict(state["arms"][candidate])
+            previous_updates = int(candidate_state.get("updates", 0) or 0)
+            previous_weighted_updates = float(
+                candidate_state.get("weighted_updates", previous_updates)
+                or 0.0
             )
-            or 0.0
-        ) + observation_weight
-        arm_state["reward_sum"] = float(
-            arm_state.get("reward_sum", 0.0) or 0.0
-        ) + reward_value
-        arm_state["weighted_reward_sum"] = float(
-            arm_state.get(
-                "weighted_reward_sum",
-                arm_state["reward_sum"] - reward_value,
+            previous_reward_sum = float(
+                candidate_state.get("reward_sum", 0.0) or 0.0
             )
-            or 0.0
-        ) + observation_weight * reward_value
+            previous_weighted_reward_sum = float(
+                candidate_state.get(
+                    "weighted_reward_sum", previous_reward_sum
+                )
+                or 0.0
+            )
+            candidate_A = np.asarray(
+                candidate_state["A"], dtype=np.float64
+            )
+            candidate_b = np.asarray(
+                candidate_state["b"], dtype=np.float64
+            )
+            candidate_A += observation_weight * outer_context
+            candidate_b += (
+                observation_weight * float(candidate_reward) * x
+            )
+            candidate_state["A"] = candidate_A.tolist()
+            candidate_state["b"] = candidate_b.tolist()
+            candidate_state["updates"] = previous_updates + 1
+            candidate_state["weighted_updates"] = (
+                previous_weighted_updates + observation_weight
+            )
+            candidate_state["reward_sum"] = (
+                previous_reward_sum + float(candidate_reward)
+            )
+            candidate_state["weighted_reward_sum"] = (
+                previous_weighted_reward_sum
+                + observation_weight * float(candidate_reward)
+            )
+            state["arms"][candidate] = candidate_state
+            updated_arm_states[candidate] = candidate_state
 
-        state["arms"][arm] = arm_state
+        arm_state = updated_arm_states[arm]
 
         # 共享 context matrix 不看 reward，也不分 Arm；每筆已揭曉 B/P
         # 都代表這個特徵區間多了一次真實觀測。
@@ -1858,10 +1930,11 @@ def _update_bandit_impl(
         state["last_update"] = {
             "event_id": event_key,
             "selected_arm": arm,
-            "actual_outcome": str(
-                actual_outcome or ""
-            ).upper(),
+            "actual_outcome": actual,
             "reward": reward_value,
+            "full_information_update": bool(full_information_update),
+            "updated_arms": list(updated_arm_states),
+            "arm_rewards": dict(arm_rewards),
             "requested_weight": requested_weight,
             "applied_weight": observation_weight,
             "few_shot_boost_applied": False,
@@ -1881,10 +1954,11 @@ def _update_bandit_impl(
         "updated": True,
         "event_id": event_key,
         "selected_arm": arm,
-        "actual_outcome": str(
-            actual_outcome or ""
-        ).upper(),
+        "actual_outcome": actual,
         "reward": reward_value,
+        "full_information_update": bool(full_information_update),
+        "updated_arms": list(updated_arm_states),
+        "arm_rewards": dict(arm_rewards),
         "requested_update_weight": requested_weight,
         "update_weight": observation_weight,
         "few_shot_boost_applied": False,
@@ -1894,6 +1968,10 @@ def _update_bandit_impl(
         "arm_weighted_updates": float(
             arm_state["weighted_updates"]
         ),
+        "per_arm_updates": {
+            candidate: int(updated_arm_states[candidate]["updates"])
+            for candidate in updated_arm_states
+        },
         "total_updates": int(
             state["total_updates"]
         ),

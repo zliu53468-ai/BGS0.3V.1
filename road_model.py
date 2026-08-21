@@ -9,10 +9,10 @@
 """
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import math
 import os
-import secrets
 
 import numpy as np
 
@@ -346,7 +346,19 @@ def calculate_road_probabilities(
     sequence = [value for value in raw_outcomes if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
     length = len(sequence)
     tie_count = sum(value == "T" for value in raw_outcomes)
-    run_seed = int(seed if seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
+    if seed is None:
+        seed_payload = (
+            "".join(raw_outcomes)
+            + f"|{max(0, int(initial_image_count or 0))}"
+            + f"|{max(0, int(manual_count or 0))}"
+        )
+        run_seed = int.from_bytes(
+            sha256(seed_payload.encode("utf-8")).digest()[:4],
+            byteorder="big",
+            signed=False,
+        )
+    else:
+        run_seed = int(seed) & 0xFFFFFFFF
 
     planning = analyze_full_road_pattern(
         sequence,
@@ -375,8 +387,11 @@ def calculate_road_probabilities(
         for name, probability in recent_components.items()
     ))
 
-    rng = np.random.default_rng(run_seed)
-    recent_samples = np.zeros(ROAD_RECENT_SIMULATIONS, dtype=np.float64)
+    # 這裡只需要加權 Beta 分布的均值與標準差，不需要真的抽樣。
+    # 舊版每次使用新的隨機 seed，會讓完全相同的牌路產生不同 context，
+    # 進而污染 cMAB 的方差基準。解析式同時更快且完全可重現。
+    recent_probability = 0.0
+    recent_variance = 0.0
     for name, model in recent_models.items():
         weight = recent_weights.get(name, 0.0)
         if weight <= 0:
@@ -384,13 +399,25 @@ def calculate_road_probabilities(
         probability = recent_components[name]
         reliability = max(0.05, float(model.get("reliability", 0.0) or 0.0))
         concentration = 12.0 + 30.0 * reliability
-        recent_samples += weight * rng.beta(
-            max(0.5, probability * concentration),
-            max(0.5, (1.0 - probability) * concentration),
-            ROAD_RECENT_SIMULATIONS,
+        alpha = max(0.5, probability * concentration)
+        beta = max(0.5, (1.0 - probability) * concentration)
+        total_concentration = alpha + beta
+        beta_mean = alpha / total_concentration
+        beta_variance = (
+            alpha * beta
+            / (
+                total_concentration * total_concentration
+                * (total_concentration + 1.0)
+            )
         )
-    recent_probability = float(np.mean(recent_samples)) if length else 0.5
-    recent_uncertainty = float(np.std(recent_samples, ddof=1)) if length else 0.5
+        recent_probability += weight * beta_mean
+        recent_variance += weight * weight * beta_variance
+    if length:
+        recent_probability = float(recent_probability)
+        recent_uncertainty = float(math.sqrt(max(0.0, recent_variance)))
+    else:
+        recent_probability = 0.5
+        recent_uncertainty = 0.5
     recent_reliability = max(
         0.0,
         min(
@@ -461,6 +488,7 @@ def calculate_road_probabilities(
         "recent_player_probability": float(1.0 - recent_probability),
         "recent_reliability": float(recent_reliability),
         "recent_uncertainty": float(recent_uncertainty),
+        "recent_uncertainty_method": "analytic_independent_beta_moments",
         "recent_model_disagreement": float(recent_disagreement),
         "full_road_analysis": planning,
         "models": model_outputs,

@@ -38,7 +38,6 @@ from predictor import run_virtual_round
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 from room_ocr import preload_ocr
-from performance_tracker import resolve_latest_prediction
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1260,8 +1259,9 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     adaptive = dict(prediction.get("adaptive_ensemble") or {})
     road_support = dict(prediction.get("road_support") or {})
 
-    # 正式訊號優先採用 internal_*；O 是統計硬熔斷的正式動作，
-    # 不可再由 50/50 中性機率反推成 B/P，否則會破壞 No Bet 閉環。
+    # 正式訊號優先採用 internal_*；O 是正式的風控動作（可能是統計
+    # 硬熔斷，也可能是樣本／方向優勢不足），不可再由中性機率反推
+    # 成 B/P，否則會破壞 No Bet 閉環。
     formal_code = str(
         prediction.get("internal_action")
         or prediction.get("internal_recommend")
@@ -1294,7 +1294,10 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     signal_status = (
         "正式訊號已確認"
         if not internal_observe
-        else "統計混沌硬熔斷：本局絕對不下注"
+        else str(
+            prediction.get("signal_status_text")
+            or "模型信心不足：本局觀望／不下注"
+        )
     )
     signal_reason = str(
         prediction.get("internal_signal_reason")
@@ -1595,6 +1598,12 @@ def _refresh_screen_prediction(
         road_state = _derive_road_state(raw_history)
         sequence = list(road_state["road_sequence"])
         tie_markers = dict(road_state["tie_markers"])
+        previous_prediction_id = str(
+            dict(session.get("screen_last_prediction") or {}).get(
+                "prediction_id", ""
+            )
+            or ""
+        )
 
         current_remaining = int(
             session.get("screen_remaining_cards")
@@ -1652,6 +1661,7 @@ def _refresh_screen_prediction(
                 initial_grid_cells=list(session.get("initial_grid_cells") or []),
                 initial_image_history=initial_history,
                 manual_outcome_history=manual_history,
+                previous_prediction_id=previous_prediction_id,
             )
         finally:
             if prediction_slot_acquired:
@@ -1679,10 +1689,6 @@ def _refresh_screen_prediction(
         }
 
         _raise_if_manual_timed_out(cancel_event, deadline)
-        # 先完成下一局模型，再結算上一筆預測，避免本局答案洩漏進本次模型。
-        resolve_latest_prediction(user_id, value, venue=venue, room=room)
-        _raise_if_manual_timed_out(cancel_event, deadline)
-
         return store.update_screen_analysis(
             user_id,
             ocr=ocr,
@@ -2529,5 +2535,3 @@ async def webhook(request: Request) -> JSONResponse:
             _reply(token, [_text(f"系統忙碌：{message}")])
 
     return JSONResponse({"ok": True})
-
-

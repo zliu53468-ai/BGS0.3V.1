@@ -64,6 +64,26 @@ def _is_ensemble_direction(result: Mapping[str, Any]) -> bool:
     )
 
 
+def _hard_brake_active(result: Mapping[str, Any]) -> bool:
+    braking = result.get("uncertainty_braking")
+    adaptive = result.get("adaptive_ensemble")
+    return bool(
+        result.get("is_extreme_unseen")
+        or result.get("hard_brake_active")
+        or (
+            isinstance(braking, Mapping)
+            and (braking.get("active") or braking.get("is_extreme_unseen"))
+        )
+        or (
+            isinstance(adaptive, Mapping)
+            and (
+                adaptive.get("hard_brake_active")
+                or adaptive.get("circuit_breaker_active")
+            )
+        )
+    )
+
+
 def calibrate_prediction(
     prediction: Mapping[str, Any],
     *,
@@ -81,6 +101,34 @@ def calibrate_prediction(
         }
     )
     result.setdefault("raw_probabilities", dict(raw))
+
+    # 校準層只能調整分布，絕不能解除上游的統計硬熔斷。
+    if _hard_brake_active(result):
+        tie_probability = max(0.0, min(0.30, float(raw.get("T", 0.0))))
+        neutral_bp = (1.0 - tie_probability) * 0.5
+        result["probabilities"] = {
+            "B": neutral_bp,
+            "P": neutral_bp,
+            "T": tie_probability,
+        }
+        result["calibrated_probabilities"] = dict(result["probabilities"])
+        result["banker_rate"] = round(neutral_bp * 100.0, 2)
+        result["player_rate"] = round(neutral_bp * 100.0, 2)
+        result["tie_rate"] = round(tie_probability * 100.0, 2)
+        result["recommend"] = "O"
+        result["recommend_text"] = "觀望"
+        result["action"] = "O"
+        result["action_text"] = "觀望／絕對不下注"
+        result["signal_allowed"] = False
+        result["confidence"] = 0.0
+        result["ensemble_confidence"] = 0.0
+        result["bet_multiplier"] = 0.0
+        result["calibration"] = {
+            "active": False,
+            "bypassed_by_hard_brake": True,
+            "reason": "統計硬熔斷優先，校準器不得恢復下注方向",
+        }
+        return result
 
     scope, summary, minimum = _best_summary(str(venue or ""), str(room or ""))
     sample_count = int(summary.get("sample_count", 0) or 0)
