@@ -7,6 +7,10 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
+    disk:
+      name: bgs-runtime-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
@@ -30,6 +34,12 @@ services:
         value: "2"
       - key: ALLOW_UNSIGNED_WEBHOOK
         value: "0"
+      - key: SESSION_DATA_FILE
+        value: /var/data/sessions.json
+      - key: CMAB_STATE_FILE
+        value: /var/data/contextual_bandit_state.json
+      - key: PERFORMANCE_DATA_FILE
+        value: /var/data/prediction_performance.json
       - key: PF_DECKS
         value: "8"
       - key: PF_PARTICLES
