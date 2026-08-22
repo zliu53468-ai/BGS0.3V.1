@@ -1,9 +1,10 @@
 """風險分層式自適應集成。
 
-正常區間只在累積足夠已結算樣本後，依各子模型的歷史 Brier score
-做小幅再加權；低優勢或模型衝突時，選可靠度／歷史 Brier 最佳的
-單一核心模型，避免平均回 50/50。任一模型回報極端未知區間時，
-仍立即執行零信心、零注碼、No Bet，不允許核心模型繞過硬熔斷。
+正常區間以 reliability + 已結算 Brier 建立權重，使用 logit pooling
+與 plurality evidence 打破簡單平均的 50/50 僵局；若仍完全抵消，
+才由目前證據品質最高的單一模型破局。極端未知區間仍執行 No Bet。
+
+輸出的 B/P 是「方向分數」而非可保證的真實開出機率。
 """
 from __future__ import annotations
 
@@ -45,6 +46,28 @@ ADAPTIVE_CHAMPION_OVERRIDE_BASE_EDGE = max(
 ADAPTIVE_CHAMPION_TEMPERATURE = max(
     0.35,
     min(1.0, float(os.getenv("ADAPTIVE_CHAMPION_TEMPERATURE", "0.85") or "0.85")),
+)
+ADAPTIVE_FUSION_TEMPERATURE = max(
+    0.35,
+    min(
+        1.0,
+        float(os.getenv("ADAPTIVE_FUSION_TEMPERATURE", "0.70") or "0.70"),
+    ),
+)
+ADAPTIVE_PLURALITY_STRENGTH = max(
+    0.0,
+    min(
+        0.50,
+        float(os.getenv("ADAPTIVE_PLURALITY_STRENGTH", "0.18") or "0.18"),
+    ),
+)
+ADAPTIVE_LOGIT_CAP = max(
+    0.5,
+    min(5.0, float(os.getenv("ADAPTIVE_LOGIT_CAP", "2.20") or "2.20")),
+)
+ADAPTIVE_SHOE_MIN_SAMPLES = max(
+    4,
+    min(30, int(os.getenv("ADAPTIVE_SHOE_MIN_SAMPLES", "8") or "8")),
 )
 
 
@@ -250,11 +273,331 @@ def _base_confidence(prediction: Mapping[str, Any], base: Mapping[str, float]) -
     return max(0.0, min(1.0, abs(float(base["B"]) - float(base["P"]))))
 
 
+def _conditional_banker(values: Mapping[str, Any]) -> float:
+    banker = max(0.0, float(values.get("B", 0.0) or 0.0))
+    player = max(0.0, float(values.get("P", 0.0) or 0.0))
+    total = banker + player
+    return 0.5 if total <= 1e-12 else banker / total
+
+
+def _logit(probability: float) -> float:
+    value = max(1e-6, min(1.0 - 1e-6, float(probability)))
+    return max(
+        -ADAPTIVE_LOGIT_CAP,
+        min(ADAPTIVE_LOGIT_CAP, math.log(value / (1.0 - value))),
+    )
+
+
+def _fusion_candidates(
+    prediction: Mapping[str, Any],
+    base: Mapping[str, float],
+    components: Mapping[str, Mapping[str, float]],
+    historical_scores: Mapping[str, Any],
+    component_sample_counts: Mapping[str, Any],
+    shoe_direction_performance: Mapping[str, Any],
+    base_confidence: float,
+) -> list[Dict[str, Any]]:
+    road = prediction.get("road_support")
+    road_data = dict(road) if isinstance(road, Mapping) else {}
+    raw_models = road_data.get("models")
+    metadata = dict(raw_models) if isinstance(raw_models, Mapping) else {}
+    rows: list[Dict[str, Any]] = []
+    all_probabilities: Dict[str, Mapping[str, float]] = {
+        "contextual_bandit": base,
+        **{str(name): values for name, values in components.items()},
+    }
+    for name, values in all_probabilities.items():
+        banker = _conditional_banker(values)
+        edge = abs(2.0 * banker - 1.0)
+        raw_meta = metadata.get(name)
+        meta = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
+        if name != "contextual_bandit" and not bool(
+            meta.get("active", meta.get("ok", True))
+        ):
+            continue
+        reliability = (
+            max(0.20, min(1.0, base_confidence))
+            if name == "contextual_bandit"
+            else max(0.05, min(1.0, float(meta.get("reliability", 0.20) or 0.20)))
+        )
+        samples = int(component_sample_counts.get(name, 0) or 0)
+        historical_brier = historical_scores.get(name)
+        performance_used = samples >= ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES
+        if performance_used:
+            try:
+                performance_quality = math.exp(
+                    -max(0.0, float(historical_brier)) / 0.50
+                )
+            except Exception:
+                performance_quality = 0.50
+                performance_used = False
+        else:
+            performance_quality = 0.50
+        weight = (
+            (0.25 + 0.75 * reliability)
+            * (0.55 + 0.45 * performance_quality)
+            * (0.80 + 0.20 * edge)
+        )
+        support = int(meta.get("support", 0) or 0)
+        raw_shoe_performance = shoe_direction_performance.get(name)
+        shoe_performance = (
+            dict(raw_shoe_performance)
+            if isinstance(raw_shoe_performance, Mapping)
+            else {}
+        )
+        shoe_samples = int(shoe_performance.get("sample_count", 0) or 0)
+        shoe_accuracy = float(
+            shoe_performance.get("posterior_accuracy", 0.50) or 0.50
+        )
+        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
+            weight *= max(
+                0.70, min(1.30, 0.70 + 0.60 * shoe_accuracy)
+            )
+        selection_score = weight * (
+            0.55 + 0.25 * min(1.0, support / 12.0) + 0.20 * edge
+        )
+        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
+            selection_score *= max(
+                0.75, min(1.25, 0.75 + 0.50 * shoe_accuracy)
+            )
+        candidate_logit = _logit(banker)
+        rows.append({
+            "name": name,
+            "banker_probability": float(banker),
+            "direction": (
+                "B" if candidate_logit > 0.0 else "P" if candidate_logit < 0.0 else ""
+            ),
+            "edge": float(edge),
+            "logit": float(candidate_logit),
+            "weight": float(weight),
+            "reliability": float(reliability),
+            "support": support,
+            "performance_samples": samples,
+            "historical_brier": (
+                float(historical_brier) if performance_used else None
+            ),
+            "historical_performance_used": bool(performance_used),
+            "selection_score": float(selection_score),
+            "current_shoe_samples": shoe_samples,
+            "current_shoe_posterior_accuracy": float(shoe_accuracy),
+            "current_shoe_performance_used": bool(
+                shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES
+            ),
+        })
+    return rows
+
+
+def _plurality_logit_fusion(candidates: list[Dict[str, Any]]) -> Dict[str, Any]:
+    active = [row for row in candidates if float(row["weight"]) > 0.0]
+    if not active:
+        return {}
+    weight_total = sum(float(row["weight"]) for row in active) or 1.0
+    pooled_logit = sum(
+        float(row["weight"]) * float(row["logit"])
+        for row in active
+    ) / weight_total
+    plurality_margin = sum(
+        float(row["weight"])
+        * (1.0 if float(row["logit"]) > 0.0 else -1.0 if float(row["logit"]) < 0.0 else 0.0)
+        for row in active
+    ) / weight_total
+    plurality_evidence = sum(
+        float(row["weight"])
+        * math.sqrt(max(0.0, float(row["edge"])))
+        * (1.0 if float(row["logit"]) > 0.0 else -1.0 if float(row["logit"]) < 0.0 else 0.0)
+        for row in active
+    ) / weight_total
+    combined_logit = (
+        pooled_logit
+        + ADAPTIVE_PLURALITY_STRENGTH * plurality_evidence
+    )
+    tiebreaker: Dict[str, Any] = {}
+    if abs(combined_logit) <= 1e-12:
+        directional = [
+            row for row in active if str(row["direction"]) in {"B", "P"}
+        ]
+        if directional:
+            directional.sort(
+                key=lambda row: (
+                    float(row["selection_score"]),
+                    int(row["performance_samples"]),
+                    float(row["reliability"]),
+                    float(row["edge"]),
+                    str(row["name"]),
+                ),
+                reverse=True,
+            )
+            tiebreaker = dict(directional[0])
+            combined_logit = float(tiebreaker["logit"])
+    sharpened_logit = combined_logit / ADAPTIVE_FUSION_TEMPERATURE
+    conditional_banker = 1.0 / (1.0 + math.exp(-sharpened_logit))
+    winning_weight = sum(
+        float(row["weight"])
+        for row in active
+        if (
+            float(row["logit"]) > 0.0 and combined_logit > 0.0
+        ) or (
+            float(row["logit"]) < 0.0 and combined_logit < 0.0
+        )
+    )
+    agreement = winning_weight / weight_total if abs(combined_logit) > 1e-12 else 0.0
+    return {
+        "conditional_banker": float(conditional_banker),
+        "pooled_logit": float(pooled_logit),
+        "plurality_margin": float(plurality_margin),
+        "plurality_evidence": float(plurality_evidence),
+        "combined_logit": float(combined_logit),
+        "agreement": float(agreement),
+        "models_conflict": len(
+            {str(row["direction"]) for row in active if row["direction"]}
+        ) > 1,
+        "candidate_count": len(active),
+        "tiebreaker": tiebreaker,
+        "weights": {
+            str(row["name"]): float(row["weight"]) / weight_total
+            for row in active
+        },
+        "candidates": active,
+    }
+
+
+def _apply_plurality_decision(
+    result: Dict[str, Any],
+    *,
+    base: Mapping[str, float],
+    components: Mapping[str, Mapping[str, float]],
+    historical_scores: Mapping[str, Any],
+    component_sample_counts: Mapping[str, Any],
+    shoe_direction_performance: Mapping[str, Any],
+    shoe_sample_count: int,
+    sample_count: int,
+    base_confidence: float,
+) -> Dict[str, Any]:
+    if not ADAPTIVE_ENABLED:
+        result["ensemble_confidence"] = float(base_confidence)
+        result["confidence"] = float(base_confidence)
+        result["hard_brake_active"] = False
+        result["adaptive_ensemble"] = {
+            "active": False,
+            "mode": "disabled_by_configuration",
+            "hard_brake_active": False,
+            "sample_count": sample_count,
+            "overall_confidence": float(base_confidence),
+        }
+        return result
+
+    candidates = _fusion_candidates(
+        result, base, components, historical_scores,
+        component_sample_counts, shoe_direction_performance,
+        base_confidence,
+    )
+    fusion = _plurality_logit_fusion(candidates)
+    result["pre_adaptive_probabilities"] = dict(base)
+    base_action = str(result.get("action") or "O").upper().strip()
+    combined_logit = float(fusion.get("combined_logit", 0.0) or 0.0)
+    exact_tie = not fusion or abs(combined_logit) <= 1e-12
+    tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
+    bp_mass = 1.0 - tie_probability
+    conditional_banker = float(fusion.get("conditional_banker", 0.5) or 0.5)
+    banker = bp_mass * conditional_banker
+    player = bp_mass * (1.0 - conditional_banker)
+    direction = "O" if exact_tie else "B" if combined_logit > 0.0 else "P"
+    edge = 0.0 if exact_tie else abs(2.0 * conditional_banker - 1.0)
+    agreement = float(fusion.get("agreement", 0.0) or 0.0)
+    maturity = min(1.0, sample_count / max(1.0, float(ADAPTIVE_MIN_SAMPLES)))
+    confidence = (
+        0.0 if exact_tie else min(
+            0.78,
+            0.36 + 0.22 * agreement + 0.10 * maturity
+            + 0.10 * min(1.0, abs(combined_logit))
+            + 0.10 * min(1.0, edge),
+        )
+    )
+    tiebreaker = dict(fusion.get("tiebreaker") or {})
+    if tiebreaker:
+        reason = (
+            f"加權意見完全抵消，改由證據品質最高的 {tiebreaker['name']} "
+            "依可靠度、support 與已結算表現破局。"
+        )
+    elif exact_tie:
+        reason = "所有有效模型完全 50.00%/50.00%，本局保留觀望。"
+    else:
+        reason = (
+            "以 reliability／Brier 權重進行 logit pooling，"
+            "再以 plurality evidence 放大非零方向優勢。"
+        )
+
+    result.update({
+        "probabilities": {"B": banker, "P": player, "T": tie_probability},
+        "banker_rate": round(banker * 100.0, 2),
+        "player_rate": round(player * 100.0, 2),
+        "tie_rate": round(tie_probability * 100.0, 2),
+        "recommend": direction,
+        "recommend_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+        "action": direction,
+        "action_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+        "internal_recommend": direction,
+        "internal_action": direction,
+        "next_round_direction": direction,
+        "next_round_direction_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+        "signal_allowed": direction in {"B", "P"},
+        "signal_status_code": "PLURALITY_SOFTMAX_DIRECTION" if direction in {"B", "P"} else "EXACT_50_50_NO_DIRECTION",
+        "signal_status_text": "可靠度加權 Softmax：正式方向已啟用" if direction in {"B", "P"} else "完全 50/50：觀望",
+        "signal_reason": reason,
+        "internal_signal_reason": reason,
+        "direction_source": "adaptive_ensemble_plurality_softmax",
+        "direction_edge": float(edge),
+        "direction_edge_percent": round(edge * 100.0, 4),
+        "ensemble_confidence": float(confidence),
+        "confidence": float(confidence),
+        "quality_score": float(confidence),
+        "confidence_label": "較高" if confidence >= 0.72 else "中等" if confidence >= 0.56 else "偏低" if confidence > 0.0 else "零方向",
+        "bet_multiplier": 1.0 if direction in {"B", "P"} else 0.0,
+        "hard_brake_active": False,
+        "is_extreme_unseen": False,
+        "probability_semantics": "softmax_direction_score_not_guaranteed_outcome_probability",
+    })
+    if tiebreaker:
+        result["component_champion"] = tiebreaker
+    result["adaptive_ensemble"] = {
+        "active": True,
+        "mode": "reliability_logit_plurality_softmax",
+        "circuit_breaker_active": False,
+        "hard_brake_active": False,
+        "is_extreme_unseen": False,
+        "sample_count": sample_count,
+        "current_shoe_sample_count": shoe_sample_count,
+        "base_action_before": base_action,
+        "candidate_count": int(fusion.get("candidate_count", 0) or 0),
+        "models_conflict": bool(fusion.get("models_conflict", False)),
+        "pooled_logit": float(fusion.get("pooled_logit", 0.0) or 0.0),
+        "plurality_margin": float(fusion.get("plurality_margin", 0.0) or 0.0),
+        "plurality_evidence": float(fusion.get("plurality_evidence", 0.0) or 0.0),
+        "combined_logit": combined_logit,
+        "temperature": ADAPTIVE_FUSION_TEMPERATURE,
+        "plurality_strength": ADAPTIVE_PLURALITY_STRENGTH,
+        "exact_50_50": bool(exact_tie),
+        "tie_breaker_used": bool(tiebreaker),
+        "tie_breaker_model": str(tiebreaker.get("name") or ""),
+        "agreement": agreement,
+        "weights": {name: round(float(value), 8) for name, value in dict(fusion.get("weights") or {}).items()},
+        "candidates": list(fusion.get("candidates") or []),
+        "overall_confidence": float(confidence),
+        "final_action": direction,
+        "bet_multiplier": 1.0 if direction in {"B", "P"} else 0.0,
+        "fallback_required": False,
+        "probability_semantics": result["probability_semantics"],
+        "reason": reason,
+    }
+    return result
+
+
 def adapt_prediction(
     prediction: Mapping[str, Any],
     *,
     venue: str = "",
     room: str = "",
+    shoe_id: str = "",
 ) -> Dict[str, Any]:
     result = dict(prediction or {})
     base = _normalize(
@@ -273,6 +616,19 @@ def adapt_prediction(
     historical_scores = dict(summary.get("component_brier_scores") or {})
     component_sample_counts = dict(
         summary.get("component_sample_counts") or {}
+    )
+    shoe_summary = (
+        get_performance_summary(
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+            limit=500,
+        )
+        if str(shoe_id or "").strip()
+        else {}
+    )
+    shoe_direction_performance = dict(
+        shoe_summary.get("component_direction_performance") or {}
     )
     extreme_unseen = _is_extreme_unseen(result)
     base_confidence = _base_confidence(result, base)
@@ -346,6 +702,20 @@ def adapt_prediction(
             "reason": "極端未知區間執行零信心、零注碼硬熔斷",
         }
         return result
+
+    # 正常區間一律走新版 logit/plurality 決策；下方舊版分支保留於
+    # 部署過渡期方便比對，但不再進入，避免再次平均回 50/50。
+    return _apply_plurality_decision(
+        result,
+        base=base,
+        components=components,
+        historical_scores=historical_scores,
+        component_sample_counts=component_sample_counts,
+        shoe_direction_performance=shoe_direction_performance,
+        shoe_sample_count=int(shoe_summary.get("sample_count", 0) or 0),
+        sample_count=sample_count,
+        base_confidence=base_confidence,
+    )
 
     champion = _select_component_champion(
         result,
