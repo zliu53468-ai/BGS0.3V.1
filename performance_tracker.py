@@ -111,6 +111,33 @@ def _prediction_probabilities(prediction: Mapping[str, Any]) -> Dict[str, float]
     })
 
 
+def _wilson_lower_bound(correct: int, total: int, z: float = 1.2815515655) -> float:
+    """方向命中率的一側 90% Wilson 下限；小樣本不會冒充穩定優勢。"""
+    if total <= 0:
+        return 0.0
+    n = float(total)
+    p = max(0.0, min(1.0, float(correct) / n))
+    z2 = z * z
+    denominator = 1.0 + z2 / n
+    center = p + z2 / (2.0 * n)
+    radius = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n)
+    return max(0.0, min(1.0, (center - radius) / denominator))
+
+
+def _direction_performance(correct: int, total: int) -> Dict[str, Any]:
+    # Beta(12.5, 12.5) 將小樣本溫和收縮回 50%，避免假高勝率。
+    posterior = (float(correct) + 12.5) / (float(total) + 25.0)
+    return {
+        "sample_count": int(total),
+        "correct_count": int(correct),
+        "accuracy": float(correct / max(1, total)),
+        "posterior_accuracy": float(posterior),
+        "wilson_lower_bound_90": float(
+            _wilson_lower_bound(correct, total)
+        ),
+    }
+
+
 def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str = "", room: str = "",
                       metadata: Optional[Mapping[str, Any]] = None) -> str:
     uid = _uid_key(user_id)
@@ -127,6 +154,10 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "venue": str(venue or "").upper().strip(),
         "room": str(room or "").strip(),
         "model_version": str(prediction.get("model_version") or prediction.get("engine") or ""),
+        "shoe_id": str(prediction.get("shoe_id") or ""),
+        "bandit_learning_user_id": str(
+            prediction.get("bandit_learning_user_id") or ""
+        ),
         "prediction_fingerprint": prediction_fingerprint,
         "probabilities": _prediction_probabilities(prediction),
         "recommend": str(prediction.get("recommend") or selected_arm).upper(),
@@ -135,6 +166,13 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "context_vector": list(prediction.get("bandit_context") or prediction.get("context_vector") or []),
         "context_feature_names": list(prediction.get("context_feature_names") or []),
         "bandit_scores": dict(prediction.get("bandit_scores") or {}),
+        "direction_source": str(prediction.get("direction_source") or ""),
+        "component_champion": dict(
+            prediction.get("component_champion") or {}
+        ),
+        "decision_validation": dict(
+            prediction.get("decision_validation") or {}
+        ),
         "component_probabilities": dict(
             prediction.get("component_probabilities")
             or dict(prediction.get("road_support") or {}).get(
@@ -233,7 +271,9 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
 
         if reward is not None and context:
             bandit_update = update_bandit(
-                user_id=user_id,
+                user_id=str(
+                    target.get("bandit_learning_user_id") or user_id
+                ),
                 context=context,
                 selected_arm=selected_arm,
                 reward=reward,
@@ -323,6 +363,8 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     boosted_update_count = 0
     predicted_totals = {key: 0.0 for key in _OUTCOMES}
     component_brier_values: Dict[str, List[float]] = {}
+    component_direction_counts: Dict[str, List[int]] = {}
+    source_direction_counts: Dict[str, List[int]] = {}
     for record in valid:
         actual = str(record.get("actual_outcome") or "").upper()
         counts[actual] += 1
@@ -350,6 +392,11 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         if public_action_correct is not None:
             decided += 1
             correct += int(bool(public_action_correct))
+        if actual in {"B", "P"} and public_action in {"B", "P"}:
+            source = str(record.get("direction_source") or "unknown")
+            source_values = source_direction_counts.setdefault(source, [0, 0])
+            source_values[0] += int(public_action == actual)
+            source_values[1] += 1
         if record.get("learning_arm_correct") is not None:
             learning_decided += 1
             learning_correct += int(bool(record.get("learning_arm_correct")))
@@ -367,6 +414,15 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
                 for key in _OUTCOMES
             )
             component_brier_values.setdefault(str(name), []).append(score)
+            if actual in {"B", "P"}:
+                component_direction = (
+                    "B" if component["B"] >= component["P"] else "P"
+                )
+                direction_values = component_direction_counts.setdefault(
+                    str(name), [0, 0]
+                )
+                direction_values[0] += int(component_direction == actual)
+                direction_values[1] += 1
     total = max(1, len(valid))
     mean_brier = sum(brier_values) / len(brier_values) if brier_values else None
     mean_log_loss = sum(log_losses) / len(log_losses) if log_losses else None
@@ -402,6 +458,14 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "component_sample_counts": {
             name: len(values)
             for name, values in component_brier_values.items()
+        },
+        "component_direction_performance": {
+            name: _direction_performance(values[0], values[1])
+            for name, values in component_direction_counts.items()
+        },
+        "source_direction_performance": {
+            name: _direction_performance(values[0], values[1])
+            for name, values in source_direction_counts.items()
         },
         "model": "CMAB-LINUCB-V1",
     }

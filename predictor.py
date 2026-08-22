@@ -16,6 +16,7 @@ import secrets
 from adaptive_ensemble import adapt_prediction
 from contextual_bandit import predict_bandit
 from particle_filter_points import counts_from_shoe, deal_ordered_hand
+from validated_decision_layer import apply_validated_decision
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
@@ -25,6 +26,29 @@ DB_HOLDOUT: Dict[str, Any] = {
 
 SHADOW_REQUIRED_CONSECUTIVE_HITS = 2
 SHADOW_MAX_STREAMS = 2048
+
+
+def _bandit_learning_scope(
+    *,
+    user_id: str,
+    venue: str,
+    room: str,
+    shoe_id: str,
+) -> str:
+    """把 cMAB 學習狀態隔離到單一使用者／場館／桌／鞋。
+
+    回傳不可逆摘要，避免把外部 user id 直接寫進模型狀態檔。
+    未提供 shoe_id 的舊呼叫仍可運作，但只會落在明確的相容範圍。
+    """
+    raw = "|".join((
+        str(user_id or "__anonymous__"),
+        str(venue or "").upper().strip(),
+        str(room or "").strip(),
+        str(shoe_id or "__unspecified_shoe__").strip(),
+    ))
+    return "__cmab_scope__:" + sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:32]
 
 
 def _normalize_outcome_history(values: Iterable[Any]) -> List[str]:
@@ -405,16 +429,29 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     else:
         history_values = list(history)
     cleaned = _normalize_outcome_history(history_values)
+    bandit_learning_user_id = _bandit_learning_scope(
+        user_id=str(user_id or ""),
+        venue=str(venue or ""),
+        room=str(room or ""),
+        shoe_id=str(shoe_id or ""),
+    )
     result = predict_bandit(
         cleaned,
         road_context=dict(road_context or {}),
         venue=venue,
         room=room,
-        user_id=user_id,
+        user_id=bandit_learning_user_id,
         run_seed=run_seed,
     )
     # 全局閉環：統計風險訊號 -> 集成硬熔斷 -> 三局影子回測解鎖。
     result = adapt_prediction(
+        result,
+        venue=str(venue or ""),
+        room=str(room or ""),
+    )
+    # 只在模型之外使用「已結算、時間順序正確」的真實績效選擇方向，
+    # 並壓低尚未經外驗證的假高信心；不改任何基礎模型參數或公式。
+    result = apply_validated_decision(
         result,
         venue=str(venue or ""),
         room=str(room or ""),
@@ -429,8 +466,22 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             shoe_id=str(shoe_id or ""),
         ),
     )
+    model_fingerprint = str(
+        result.get("prediction_fingerprint") or ""
+    ).strip()
+    result["model_prediction_fingerprint"] = model_fingerprint
+    result["prediction_fingerprint"] = sha256(
+        "|".join((
+            model_fingerprint,
+            str(venue or "").upper().strip(),
+            str(room or "").strip(),
+            str(shoe_id or "__unspecified_shoe__").strip(),
+        )).encode("utf-8")
+    ).hexdigest()[:24]
     result.update({
         "shoe_id": str(shoe_id or ""),
+        "bandit_learning_user_id": bandit_learning_user_id,
+        "bandit_scope_mode": "user_venue_room_shoe",
         "composition_quality": "not_applicable_cmab",
         "remaining_counts_source": "not_used",
         "shoe_context_ignored": bool(shoe_context),

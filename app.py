@@ -1656,6 +1656,7 @@ def _refresh_screen_prediction(
                 prior_counts=None,
                 venue=venue,
                 room=room,
+                shoe_id=str(expected_run_id or ""),
                 user_id=user_id,
                 screen_metadata=screen_metadata,
                 initial_grid_cells=list(session.get("initial_grid_cells") or []),
@@ -1868,6 +1869,7 @@ def _process_screen_image_sync(
                     or current_session.get("last_confirmed_room")
                     or "1"
                 ),
+                shoe_id=str(expected_run_id or ""),
                 user_id=user_id,
                 screen_metadata=screen_metadata,
                 initial_grid_cells=grid_cells,

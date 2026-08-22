@@ -38,7 +38,7 @@ def predict_from_screenshot(
     raw_outcomes: Optional[Iterable[Any]] = None,
     tie_markers: Optional[Mapping[str, Any]] = None,
     prior_counts: Optional[Sequence[int]] = None,
-    venue: str = "", room: str = "", user_id: str = "",
+    venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "",
     run_seed: Optional[int] = None,
     road_context: Optional[Mapping[str, Any]] = None,
     screen_metadata: Optional[Mapping[str, Any]] = None,
@@ -92,6 +92,7 @@ def predict_from_screenshot(
         history=combined_raw,
         venue=venue,
         room=room,
+        shoe_id=shoe_id,
         user_id=user_id,
         run_seed=seed,
         shoe_context=None,
@@ -102,6 +103,7 @@ def predict_from_screenshot(
         # V1.5 誤標成舊 V1；此欄只描述畫面輸入管線。
         "screen_pipeline_version": "CMAB-FULL-HISTORY-GRID-AWARE-V1",
         "mode": "screen_full_history_contextual_bandit",
+        "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
         "estimated_remaining_counts": [],
         "composition_source": "not_used_cmab",
@@ -143,6 +145,7 @@ def predict_from_screenshot(
                 "initial_image_count": len(initial_raw),
                 "manual_round_count": len(manual_raw),
                 "combined_round_count": len(combined_raw),
+                "shoe_id": str(shoe_id or ""),
             },
         )
         result["performance_tracking"] = True
