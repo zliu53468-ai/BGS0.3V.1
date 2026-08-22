@@ -5,7 +5,7 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
-V1.6 動態方向與多維統計硬煞車：
+V2.0 非平穩牌路版：
 - 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
 - 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
   避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
@@ -13,7 +13,11 @@ V1.6 動態方向與多維統計硬煞車：
 - 同時計算最近 12 局排列熵、B/P 卡方與經驗方差診斷。
 - 只有「模型方差超標且排列熵 > 0.95」才標記極端混沌區間。
 - OOD 必須等動態方差基準與真實回饋都成熟，避免新 UID 假熔斷。
-- 一般方向採較低溫度與溫和門檻；牌路衝突交由集成層選核心模型。
+- 上下文新增最近 3 局、5 局轉換波動、斷龍、長龍尾端、單跳開端，
+  以及大眼仔／小路／曱甴路的規律飽和度。
+- 以遞迴 ridge forgetting factor 淡化舊鞋路；偵測斷龍時加速遺忘，
+  但不複製單局樣本，避免 Few-shot 對亂數過擬合。
+- reward 依「預測時信心」調整：高信心命中略增益，高信心失誤重罰。
 - 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
 - B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
 
@@ -34,10 +38,11 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1.6-DYNAMIC-DIRECTION"
-STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V2"
+MODEL_VERSION = "CMAB-LINUCB-V2.0-NONSTATIONARY-CONTEXT"
+STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V3"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
+    "CMAB-UID-ISOLATED-V2",
     STATE_SCHEMA_VERSION,
 }
 FEATURE_NAMES = (
@@ -52,6 +57,13 @@ FEATURE_NAMES = (
     "road_planning_reliability", "road_recent_reliability",
     "road_agreement", "markov1_balance", "markov2_balance",
     "markov3_balance",
+    # V2.0 全部附加在舊 24 維之後，讓既有 A／b 可無損升維。
+    "shoe_round_maturity", "recent3_banker_balance",
+    "recent5_transition_volatility", "recent5_run_volatility",
+    "streak_break_signal", "long_dragon_tail_pressure",
+    "single_jump_onset", "big_eye_saturation",
+    "small_road_saturation", "cockroach_road_saturation",
+    "derived_road_consensus",
 )
 CONTEXT_DIM = len(FEATURE_NAMES)
 BASE_DIR = Path(__file__).resolve().parent
@@ -81,6 +93,14 @@ CMAB_MIN_SIGNAL_EDGE = _env_float(
 CMAB_MIN_SIGNAL_UPDATES = max(
     0,
     min(200, int(os.getenv("CMAB_MIN_SIGNAL_UPDATES", "4") or "4")),
+)
+
+# 遞迴 ridge 衰減：A <- lambda*A + (1-lambda)*ridge*I + xx^T。
+CMAB_FORGETTING_FACTOR = _env_float(
+    "CMAB_FORGETTING_FACTOR", 0.985, 0.90, 1.00
+)
+CMAB_REVERSAL_FORGETTING_FACTOR = _env_float(
+    "CMAB_REVERSAL_FORGETTING_FACTOR", 0.94, 0.85, 1.00
 )
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
@@ -217,6 +237,97 @@ def _streak(sequence: Sequence[str]) -> tuple[str, int]:
     return direction, length
 
 
+def _transition_rate(sequence: Sequence[str], size: int) -> float:
+    """最近窗口的 B/P 轉換率；和局不推進牌路時間軸。"""
+    values = list(sequence[-size:])
+    if len(values) < 2:
+        return 0.0
+    return float(
+        sum(a != b for a, b in zip(values, values[1:]))
+        / (len(values) - 1)
+    )
+
+
+def _recent_run_volatility(sequence: Sequence[str], size: int = 5) -> float:
+    """以窗口內 run length 的離散程度描述短週期震盪。"""
+    values = list(sequence[-size:])
+    if len(values) < 2:
+        return 0.0
+    runs: List[int] = []
+    previous = ""
+    for value in values:
+        if runs and value == previous:
+            runs[-1] += 1
+        else:
+            runs.append(1)
+        previous = value
+    if len(runs) <= 1:
+        return 0.0
+    return float(min(1.0, float(np.std(runs)) / 2.0))
+
+
+def _streak_break_signal(sequence: Sequence[str]) -> float:
+    """最新一局是否剛斷掉至少 3 顆的龍；符號代表新方向。"""
+    values = list(sequence)
+    if len(values) < 4 or values[-1] == values[-2]:
+        return 0.0
+    previous_side = values[-2]
+    previous_run = 1
+    for value in reversed(values[:-2]):
+        if value != previous_side:
+            break
+        previous_run += 1
+    if previous_run < 3:
+        return 0.0
+    sign = 1.0 if values[-1] == "B" else -1.0
+    return sign * min(1.0, previous_run / 6.0)
+
+
+def _long_dragon_tail_pressure(sequence: Sequence[str]) -> float:
+    """長龍尾端壓力，而非宣稱能知道物理上的下一張牌。"""
+    direction, length = _streak(sequence)
+    if length < 4:
+        return 0.0
+    sign = 1.0 if direction == "B" else -1.0
+    return sign * min(1.0, (length - 3) / 5.0)
+
+
+def _single_jump_onset(sequence: Sequence[str]) -> float:
+    """最近 4 局是否形成單跳開端；符號代表最新落點。"""
+    values = list(sequence[-4:])
+    if len(values) < 4 or not all(
+        left != right for left, right in zip(values, values[1:])
+    ):
+        return 0.0
+    return 1.0 if values[-1] == "B" else -1.0
+
+
+def _derived_road_saturation(
+    road_context: Mapping[str, Any],
+    road_name: str,
+) -> float:
+    """下三路規律飽和度：0 為中性，1 為近期顏色／延續高度集中。"""
+    planning = road_context.get("full_road_analysis")
+    if not isinstance(planning, Mapping):
+        models = road_context.get("models")
+        full_road = models.get("full_road") if isinstance(models, Mapping) else None
+        planning = full_road if isinstance(full_road, Mapping) else {}
+    derived_stats = planning.get("derived_stats")
+    stats = (
+        derived_stats.get(road_name)
+        if isinstance(derived_stats, Mapping)
+        else None
+    )
+    if not isinstance(stats, Mapping):
+        return 0.0
+    balance = _clip(stats.get("balance", 0.0), 0.0, 1.0)
+    continuation = _clip(
+        stats.get("recent_continuation", 0.5), 0.0, 1.0
+    )
+    continuation_concentration = abs(2.0 * continuation - 1.0)
+    return float(max(balance, continuation_concentration))
+
+
 def _model_probability(road_context: Mapping[str, Any], model_name: str, fallback: float = 0.5) -> float:
     models = road_context.get("models")
     if not isinstance(models, Mapping):
@@ -231,7 +342,7 @@ def _model_probability(road_context: Mapping[str, Any], model_name: str, fallbac
 
 
 def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None) -> List[float]:
-    """建立固定 24 維上下文；所有值限制在 [-1, 1]。"""
+    """建立固定上下文；B/P 規律特徵不讓和局推進時間軸。"""
     raw = _clean_history(history)
     bp = [value for value in raw if value in ARMS]
     road = dict(road_context or {})
@@ -245,6 +356,27 @@ def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mappi
     recent_reliability = _clip(road.get("recent_reliability", 0.0), 0.0, 1.0)
     disagreement = _clip(road.get("recent_model_disagreement", road.get("model_disagreement", 0.20)), 0.0, 1.0)
     agreement = _clip(1.0 - min(1.0, disagreement / 0.20), 0.0, 1.0)
+    big_eye_saturation = _derived_road_saturation(road, "big_eye")
+    small_road_saturation = _derived_road_saturation(road, "small_road")
+    cockroach_saturation = _derived_road_saturation(
+        road, "cockroach_road"
+    )
+    derived_mean_saturation = (
+        big_eye_saturation + small_road_saturation + cockroach_saturation
+    ) / 3.0
+    derived_consensus = _clip(
+        derived_mean_saturation
+        * (
+            1.0
+            - (
+                abs(big_eye_saturation - small_road_saturation)
+                + abs(small_road_saturation - cockroach_saturation)
+                + abs(cockroach_saturation - big_eye_saturation)
+            ) / 3.0
+        ),
+        0.0,
+        1.0,
+    )
     vector = [
         1.0,
         min(1.0, len(bp) / 60.0),
@@ -259,6 +391,17 @@ def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mappi
         _prob_balance(_model_probability(road, "markov1")),
         _prob_balance(_model_probability(road, "markov2")),
         _prob_balance(_model_probability(road, "markov3")),
+        min(1.0, len(raw) / 80.0),
+        _banker_balance(bp, 3),
+        _transition_rate(bp, 5),
+        _recent_run_volatility(bp, 5),
+        _streak_break_signal(bp),
+        _long_dragon_tail_pressure(bp),
+        _single_jump_onset(bp),
+        big_eye_saturation,
+        small_road_saturation,
+        cockroach_saturation,
+        derived_consensus,
     ]
     if len(vector) != CONTEXT_DIM:
         raise RuntimeError(f"CMAB context dimension mismatch: {len(vector)} != {CONTEXT_DIM}")
@@ -497,6 +640,83 @@ def _identity_information_matrix() -> np.ndarray:
     return np.eye(CONTEXT_DIM, dtype=np.float64) * CMAB_L2
 
 
+def _feature_index_mapping(
+    stored_dim: int,
+    stored_feature_names: Any,
+) -> Dict[int, int]:
+    """將舊欄位映射到新版；舊版 24 維前綴可原位延續。"""
+    names = (
+        [str(value) for value in stored_feature_names]
+        if isinstance(stored_feature_names, (list, tuple))
+        else []
+    )
+    current = {name: index for index, name in enumerate(FEATURE_NAMES)}
+    mapping: Dict[int, int] = {}
+    if len(names) == stored_dim:
+        for old_index, name in enumerate(names):
+            if name in current:
+                mapping[old_index] = current[name]
+    if not mapping:
+        mapping = {
+            index: index
+            for index in range(min(stored_dim, CONTEXT_DIM))
+        }
+    return mapping
+
+
+def _migrate_matrix_and_vector(
+    matrix_value: Any,
+    vector_value: Any,
+    *,
+    stored_l2: float,
+    stored_feature_names: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    old_matrix = np.asarray(matrix_value, dtype=np.float64)
+    old_vector = np.asarray(vector_value, dtype=np.float64)
+    if (
+        old_matrix.ndim != 2
+        or old_matrix.shape[0] != old_matrix.shape[1]
+        or old_vector.shape != (old_matrix.shape[0],)
+        or old_matrix.shape[0] <= 0
+        or old_matrix.shape[0] > CONTEXT_DIM
+        or not np.all(np.isfinite(old_matrix))
+        or not np.all(np.isfinite(old_vector))
+    ):
+        raise ValueError("invalid UID state matrix shape")
+    old_dim = int(old_matrix.shape[0])
+    mapping = _feature_index_mapping(old_dim, stored_feature_names)
+    migrated_matrix = (
+        np.eye(CONTEXT_DIM, dtype=np.float64) * stored_l2
+    )
+    migrated_vector = np.zeros(CONTEXT_DIM, dtype=np.float64)
+    symmetric_old = 0.5 * (old_matrix + old_matrix.T)
+    for old_i, new_i in mapping.items():
+        migrated_vector[new_i] = old_vector[old_i]
+        for old_j, new_j in mapping.items():
+            migrated_matrix[new_i, new_j] = symmetric_old[old_i, old_j]
+    return migrated_matrix, migrated_vector
+
+
+def _migrate_information_matrix(
+    matrix_value: Any,
+    *,
+    stored_l2: float,
+    stored_feature_names: Any,
+) -> np.ndarray:
+    old_matrix = np.asarray(matrix_value, dtype=np.float64)
+    zeros = np.zeros(
+        old_matrix.shape[0] if old_matrix.ndim == 2 else 0,
+        dtype=np.float64,
+    )
+    matrix, _ = _migrate_matrix_and_vector(
+        old_matrix,
+        zeros,
+        stored_l2=stored_l2,
+        stored_feature_names=stored_feature_names,
+    )
+    return matrix
+
+
 def _as_information_matrix(value: Any) -> np.ndarray:
     """讀取、驗證並對稱化 information matrix。"""
     matrix = np.asarray(value, dtype=np.float64)
@@ -601,8 +821,10 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         1e-12,
         float(state.get("l2", CMAB_L2) or CMAB_L2),
     )
-    if int(state.get("context_dim", 0) or 0) != CONTEXT_DIM:
+    stored_dim = int(state.get("context_dim", 0) or 0)
+    if stored_dim <= 0 or stored_dim > CONTEXT_DIM:
         raise ValueError("invalid UID state context dimension")
+    stored_feature_names = state.get("feature_names")
 
     arms = state.get("arms")
     if not isinstance(arms, dict) or any(
@@ -611,16 +833,13 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError("missing UID state arms")
 
     for arm in ARMS:
-        A = np.asarray(arms[arm].get("A"), dtype=np.float64)
-        b = np.asarray(arms[arm].get("b"), dtype=np.float64)
-        if (
-            A.shape != (CONTEXT_DIM, CONTEXT_DIM)
-            or b.shape != (CONTEXT_DIM,)
-            or not np.all(np.isfinite(A))
-            or not np.all(np.isfinite(b))
-        ):
-            raise ValueError("invalid UID state matrix shape")
-        arms[arm]["A"] = (0.5 * (A + A.T)).tolist()
+        A, b = _migrate_matrix_and_vector(
+            arms[arm].get("A"),
+            arms[arm].get("b"),
+            stored_l2=stored_l2,
+            stored_feature_names=stored_feature_names,
+        )
+        arms[arm]["A"] = A.tolist()
         arms[arm]["b"] = b.tolist()
 
     # 舊 UID 狀態直接延續，不重置已學習的 A／b。
@@ -657,8 +876,10 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
 
     context_information = state.get("context_information")
     if isinstance(context_information, Mapping):
-        context_matrix = _as_information_matrix(
-            context_information.get("A")
+        context_matrix = _migrate_information_matrix(
+            context_information.get("A"),
+            stored_l2=stored_l2,
+            stored_feature_names=stored_feature_names,
         )
         context_updates = int(
             context_information.get(
@@ -768,7 +989,7 @@ def _read_state_unlocked() -> Dict[str, Any]:
             str(data.get("schema_version") or "")
             in COMPATIBLE_STATE_SCHEMA_VERSIONS
             and isinstance(users, dict)
-            and int(data.get("context_dim", 0) or 0) == CONTEXT_DIM
+            and 0 < int(data.get("context_dim", 0) or 0) <= CONTEXT_DIM
         ):
             # 不在每次預測時正規化全部 UID；只在該 UID 被使用時驗證。
             # 使用者數量增加後，這可避免 O(number_of_users) 的矩陣轉換。
@@ -1531,6 +1752,18 @@ def _predict_bandit_impl(
         "pre_braking_probabilities": dict(
             base_probabilities
         ),
+        "bandit_learning_probabilities": dict(base_probabilities),
+        "timeline_alignment": {
+            "raw_round_index": len(raw_history),
+            "bp_round_index": sum(
+                value in ARMS for value in raw_history
+            ),
+            "tie_count": sum(
+                value == "T" for value in raw_history
+            ),
+            "structural_features_skip_ties": True,
+            "prediction_uses_history_before_target": True,
+        },
         "banker_rate": round(
             probabilities["B"] * 100.0,
             2,
@@ -1740,6 +1973,13 @@ def _predict_bandit_impl(
                 CMAB_UNKNOWN_UPDATE_MULTIPLIER
             ),
             "few_shot_boost_disabled": True,
+            "forgetting_factor": CMAB_FORGETTING_FACTOR,
+            "reversal_forgetting_factor": (
+                CMAB_REVERSAL_FORGETTING_FACTOR
+            ),
+            "reward_strategy": (
+                "probability_weighted_asymmetric_payoff"
+            ),
             "permutation_entropy_window": CMAB_PERMUTATION_WINDOW,
             "permutation_entropy_threshold": (
                 CMAB_PERMUTATION_ENTROPY_THRESHOLD
@@ -1781,6 +2021,51 @@ def _predict_bandit_impl(
         ),
     }
 
+def _coerce_context_vector(context: Sequence[float]) -> np.ndarray:
+    """接受目前維度與部署切換期間尚未結算的舊 24 維 prediction。"""
+    values = np.asarray(list(context), dtype=np.float64)
+    if values.ndim != 1 or values.size <= 0 or values.size > CONTEXT_DIM:
+        raise ValueError(
+            f"context must contain 1..{CONTEXT_DIM} values, got {values.shape}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("context contains non-finite values")
+    if values.size < CONTEXT_DIM:
+        migrated = np.zeros(CONTEXT_DIM, dtype=np.float64)
+        migrated[:values.size] = values
+        values = migrated
+    return np.clip(values, -1.0, 1.0)
+
+
+def _conditional_bp_probabilities(values: Any) -> Dict[str, float]:
+    if not isinstance(values, Mapping):
+        return {"B": 0.5, "P": 0.5}
+    banker = max(0.0, float(values.get("B", 0.0) or 0.0))
+    player = max(0.0, float(values.get("P", 0.0) or 0.0))
+    total = banker + player
+    if total <= 1e-12:
+        return {"B": 0.5, "P": 0.5}
+    return {"B": banker / total, "P": player / total}
+
+
+def _probability_weighted_arm_rewards(
+    actual: str,
+    prediction_probabilities: Any,
+) -> Dict[str, float]:
+    """方向 payoff 的信心加權版，範圍 [-2, 1]。"""
+    conditional = _conditional_bp_probabilities(prediction_probabilities)
+    rewards: Dict[str, float] = {}
+    for candidate in ARMS:
+        confidence = float(conditional[candidate])
+        if candidate == actual:
+            value = 0.5 + 0.5 * confidence
+        else:
+            excess = max(0.0, (confidence - 0.5) / 0.5)
+            value = -(0.25 + 1.75 * excess * excess)
+        rewards[candidate] = float(max(-2.0, min(1.0, value)))
+    return rewards
+
+
 def _update_bandit_impl(
     *,
     context: Sequence[float],
@@ -1790,6 +2075,7 @@ def _update_bandit_impl(
     actual_outcome: str = "",
     update_weight: float = 1.0,
     user_id: str = "",
+    prediction_probabilities: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     arm = str(selected_arm or "").upper().strip()
     actual = str(actual_outcome or "").upper().strip()
@@ -1804,22 +2090,11 @@ def _update_bandit_impl(
             "actual_outcome": actual,
         }
 
-    x = np.asarray(list(context), dtype=np.float64)
-    if x.shape != (CONTEXT_DIM,):
-        raise ValueError(
-            f"context must contain {CONTEXT_DIM} values, "
-            f"got {x.shape}"
-        )
-    if not np.all(np.isfinite(x)):
-        raise ValueError("context contains non-finite values")
-    x = np.clip(x, -1.0, 1.0)
+    x = _coerce_context_vector(context)
     context_hash = _context_fingerprint(x)
     if not math.isfinite(float(reward)):
         raise ValueError("reward must be finite")
-    reward_value = max(
-        0.0,
-        min(1.0, float(reward)),
-    )
+    reward_value = max(-2.0, min(1.0, float(reward)))
     requested_weight_value = float(update_weight)
     if not math.isfinite(requested_weight_value):
         raise ValueError("update_weight must be finite")
@@ -1866,9 +2141,23 @@ def _update_bandit_impl(
         # selected-arm-only 更新。每個 Arm 仍固定 w=1，沒有 Few-shot。
         full_information_update = actual in ARMS
         arm_rewards = (
-            {candidate: 1.0 if candidate == actual else 0.0 for candidate in ARMS}
+            _probability_weighted_arm_rewards(
+                actual,
+                prediction_probabilities,
+            )
             if full_information_update
             else {arm: reward_value}
+        )
+        feature_index = {
+            name: index for index, name in enumerate(FEATURE_NAMES)
+        }
+        reversal_signal = abs(
+            float(x[feature_index["streak_break_signal"]])
+        )
+        forgetting_factor = (
+            CMAB_REVERSAL_FORGETTING_FACTOR
+            if reversal_signal >= 0.5
+            else CMAB_FORGETTING_FACTOR
         )
         updated_arm_states: Dict[str, Dict[str, Any]] = {}
         outer_context = np.outer(x, x)
@@ -1894,6 +2183,14 @@ def _update_bandit_impl(
             candidate_b = np.asarray(
                 candidate_state["b"], dtype=np.float64
             )
+            ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
+                state.get("l2", CMAB_L2) or CMAB_L2
+            )
+            candidate_A = (
+                forgetting_factor * candidate_A
+                + (1.0 - forgetting_factor) * ridge
+            )
+            candidate_b *= forgetting_factor
             candidate_A += observation_weight * outer_context
             candidate_b += (
                 observation_weight * float(candidate_reward) * x
@@ -1902,13 +2199,14 @@ def _update_bandit_impl(
             candidate_state["b"] = candidate_b.tolist()
             candidate_state["updates"] = previous_updates + 1
             candidate_state["weighted_updates"] = (
-                previous_weighted_updates + observation_weight
+                forgetting_factor * previous_weighted_updates
+                + observation_weight
             )
             candidate_state["reward_sum"] = (
                 previous_reward_sum + float(candidate_reward)
             )
             candidate_state["weighted_reward_sum"] = (
-                previous_weighted_reward_sum
+                forgetting_factor * previous_weighted_reward_sum
                 + observation_weight * float(candidate_reward)
             )
             state["arms"][candidate] = candidate_state
@@ -1920,6 +2218,13 @@ def _update_bandit_impl(
         # 都代表這個特徵區間多了一次真實觀測。
         context_information = dict(state.get("context_information") or {})
         context_A = _as_information_matrix(context_information.get("A"))
+        context_ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
+            state.get("l2", CMAB_L2) or CMAB_L2
+        )
+        context_A = (
+            forgetting_factor * context_A
+            + (1.0 - forgetting_factor) * context_ridge
+        )
         context_A += observation_weight * np.outer(x, x)
         context_information["A"] = (
             0.5 * (context_A + context_A.T)
@@ -1927,7 +2232,7 @@ def _update_bandit_impl(
         context_information["updates"] = (
             int(context_information.get("updates", 0) or 0) + 1
         )
-        context_information["weighted_updates"] = float(
+        context_information["weighted_updates"] = forgetting_factor * float(
             context_information.get(
                 "weighted_updates",
                 context_information["updates"] - 1,
@@ -1939,7 +2244,7 @@ def _update_bandit_impl(
             int(state.get("total_updates", 0) or 0)
             + 1
         )
-        state["total_weighted_updates"] = float(
+        state["total_weighted_updates"] = forgetting_factor * float(
             state.get(
                 "total_weighted_updates",
                 state["total_updates"] - 1,
@@ -1963,6 +2268,15 @@ def _update_bandit_impl(
             "full_information_update": bool(full_information_update),
             "updated_arms": list(updated_arm_states),
             "arm_rewards": dict(arm_rewards),
+            "prediction_probabilities": dict(
+                _conditional_bp_probabilities(prediction_probabilities)
+            ),
+            "reward_strategy": "probability_weighted_asymmetric_payoff",
+            "forgetting_factor": float(forgetting_factor),
+            "reversal_signal": float(reversal_signal),
+            "reversal_decay_applied": bool(
+                forgetting_factor == CMAB_REVERSAL_FORGETTING_FACTOR
+            ),
             "requested_weight": requested_weight,
             "applied_weight": observation_weight,
             "few_shot_boost_applied": False,
@@ -1987,10 +2301,22 @@ def _update_bandit_impl(
         "full_information_update": bool(full_information_update),
         "updated_arms": list(updated_arm_states),
         "arm_rewards": dict(arm_rewards),
+        "prediction_probabilities": dict(
+            _conditional_bp_probabilities(prediction_probabilities)
+        ),
+        "reward_strategy": "probability_weighted_asymmetric_payoff",
+        "forgetting_factor": float(forgetting_factor),
+        "reversal_signal": float(reversal_signal),
+        "reversal_decay_applied": bool(
+            forgetting_factor == CMAB_REVERSAL_FORGETTING_FACTOR
+        ),
         "requested_update_weight": requested_weight,
         "update_weight": observation_weight,
         "few_shot_boost_applied": False,
         "few_shot_boost_disabled": True,
+        "reversal_forgetting_factor": float(
+            CMAB_REVERSAL_FORGETTING_FACTOR
+        ),
         "boost_reason": "disabled_to_prevent_random_noise_overfitting",
         "arm_updates": int(arm_state["updates"]),
         "arm_weighted_updates": float(
@@ -2072,6 +2398,11 @@ def _get_bandit_summary_impl(
             CMAB_UNKNOWN_UPDATE_MULTIPLIER
         ),
         "few_shot_boost_disabled": True,
+        "forgetting_factor": float(CMAB_FORGETTING_FACTOR),
+        "reversal_forgetting_factor": float(
+            CMAB_REVERSAL_FORGETTING_FACTOR
+        ),
+        "reward_strategy": "probability_weighted_asymmetric_payoff",
         "permutation_entropy": {
             "window": CMAB_PERMUTATION_WINDOW,
             "order": CMAB_PERMUTATION_ORDER,
@@ -2181,6 +2512,7 @@ class ContextualBanditEngine:
         actual_outcome: str = "",
         update_weight: float = 1.0,
         user_id: str = "",
+        prediction_probabilities: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         return _update_bandit_impl(
             context=context,
@@ -2190,6 +2522,7 @@ class ContextualBanditEngine:
             actual_outcome=actual_outcome,
             update_weight=update_weight,
             user_id=user_id,
+            prediction_probabilities=prediction_probabilities,
         )
 
     def summary(self, user_id: str = "") -> Dict[str, Any]:
@@ -2228,6 +2561,7 @@ def update_bandit(
     actual_outcome: str = "",
     update_weight: float = 1.0,
     user_id: str = "",
+    prediction_probabilities: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """既有 performance_tracker.py 相容入口。"""
     return _DEFAULT_ENGINE.update(
@@ -2238,6 +2572,7 @@ def update_bandit(
         actual_outcome=actual_outcome,
         update_weight=update_weight,
         user_id=user_id,
+        prediction_probabilities=prediction_probabilities,
     )
 
 
