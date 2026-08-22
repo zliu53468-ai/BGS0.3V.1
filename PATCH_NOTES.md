@@ -1,72 +1,31 @@
-# BGS V10.9 最小必要修正
+# 精確牌組 EV／Kelly 核心修正
 
-## 覆蓋檔案
+## 優先重寫檔案
 
-只需覆蓋以下五個檔案：
+1. `shoe_composition.py`（新增）：精確牌組解析、正式補牌規則、不放回枚舉、EV、Kelly。
+2. `predictor.py`：把物理 EV 設為最後資金閘門；原牌路與 cMAB 只保留診斷。
+3. `screenshot_predictor.py`：不再丟棄 `prior_counts`，並支援 `observed_cards`。
+4. `app.py`：以 Kelly 取代固定信心投注百分比，顯示 EV 並提供牌面 API。
+5. `store.py`：每個 UID 分開保存本靴實際已出牌面。
+6. `static/liff.html`：移除錯誤的 DeepSeek 標示，加入實際牌面輸入與 EV/Kelly 文案。
 
-- `road_detector.py`
-- `baccarat_vision.py`
-- `screen_pipeline.py`
-- `stacking_model.py`
-- `predictor.py`
+## 沒有改動的核心
 
-其餘上傳模組沒有改動。
+`road_model.py`、`contextual_bandit.py`、`adaptive_ensemble.py` 的既有模型公式與學習參數
+均未在本次重寫。它們仍會產生診斷與績效資料，但無法繞過物理 EV 閘門直接建議下注。
 
-## 根因與修正
+## 防幻覺規則
 
-### 掃描
+正式 Python 路徑沒有 DeepSeek 呼叫。本版輸出 `deepseek_active=false`、
+`llm_decision_allowed=false`，摘要由固定程式格式建立，且明確禁止以連莊、連閒、
+斷龍等敘事推導下一局必然反轉。
 
-- 舊固定格直接依 ROI 全寬高等分，手機狀態列、縮放、外框留白與 UI 偏移會讓 6×15 格中心錯位。
-- 舊紅藍分類只看固定 HSV 像素與簡單 dominance；淡色、空心圓、JPEG 壓縮時容易漏判或互污染。
-- 舊綠色只看像素總量，格線或長條綠色雜訊可能被當和局。
-- 舊反推失敗會回傳欄優先排序，可能讓錯誤序列繼續流入預測。
+## 驗證基準
 
-V10.9 在 ROI 內搜尋有限範圍的有效格線起訖，保留固定 6×15；每格輸出紅／藍／綠像素、dominance、confidence、uncertain 與 tie 集中度。反推要求完整且唯一，失敗時 `sequence=[]`、`quality_ok=false` 並提供 `fallback_reason`，不再把座標排序當時間序。
+全新 8 副牌靴的精確計算應為：
 
-### 預測
+- 莊：45.859742%
+- 閒：44.624661%
+- 和：9.515597%
 
-- 舊 Stacking 的 `global_history + road_planning + recent_road` 基礎權重與最低界線過高，路型可能壓過有限牌組。
-- 圖片模式使用新牌靴或估計組成時，容易把有限牌組計算誤解為已知真實剩餘牌。
-- 掃描品質差或方向不穩時，仍可能留下 B/P/T 動作。
-
-V10.9 對路型總權重與序列權重設硬上限；圖片／估計組成把各群組偏移收縮回標準 8 副牌先驗，再套用更高 edge／穩定度／一致度閘門。`quality_ok=false` 或辨識局數不足一律 `action=O`。線上校準器仍保留原方向，不修改 pending/resolve 流程。
-
-估計組成下 `finite` 槽位仍承擔大部分「先驗錨點」結構，但只保留 25% 的原始 finite 偏移；輸出另提供 `finite_effective_signal_weight`、`road_effective_signal_weight` 與 `baseline_anchor_weight`，避免把結構權重誤讀為真實牌靴信心。預設估計模式的隱含先驗錨點通常超過 70%。
-
-## Debug 疊格線
-
-在環境變數設定：
-
-```env
-ROAD_GRID_DEBUG=1
-ROAD_GRID_DEBUG_DIR=/tmp/bgs_road_debug
-```
-
-每次固定格掃描會把有效 6×15 邊界、每格 B/P/?/T 與品質狀態畫回裁圖，輸出路徑在結果的 `debug_overlay_path`。
-
-正式環境建議完成調校後改回：
-
-```env
-ROAD_GRID_DEBUG=0
-```
-
-## 流程行為
-
-- `screen_pipeline.analyze_game_screen` 仍先掃路紙；session 已有館別與桌號時跳過 OCR。
-- OCR 失敗不阻塞路紙。
-- 只有 `quality_ok=true` 且完整反推通過時才建立 `session_patch`。
-- 品質失敗時公開 `sequence/raw_outcomes` 為空，原始診斷保留在 `road`、`detected_sequence` 與 `all_grid_cells`。
-- 後續莊／閒／和按鈕應只使用既有 session sequence 結算；此補丁不改 UI 文案或既有 pending/resolve 介面。
-
-## 已執行測試
-
-- 固定 6×15：一般轉色、12 局長龍、長龍黏邊、淡色 JPEG 壓縮。
-- 和局標記只進 `raw_outcomes/tie_markers`。
-- MT 1728×903 完整畫面與寬型多路圖 auto routing。
-- 明顯錯裁圖：`quality_ok=false`、不建立 session patch。
-- contour 備援：完整反推與斷裂格位阻擋。
-- Stacking 隨機 100 組：機率正規化、路型總權重及序列權重不越界。
-- predictor：可靠組成、估計組成、壞掃描與估計模式和局訊號阻擋。
-- 全部 Python 檔案通過 `py_compile`。
-
-注意：本次未收到實際牌桌截圖樣本，因此影像驗證為合成格線、淡化與 JPEG 壓縮情境；上線前仍應以 MT 實際手機截圖開啟 debug 做一輪閾值確認。
+莊、閒在 5% 莊抽水後均為負 EV，因此新牌靴正確行為是觀望、Kelly 0%。

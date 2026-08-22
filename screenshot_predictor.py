@@ -1,7 +1,7 @@
 """遊戲截圖 cMAB 預測轉接層。
 
-完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB。
-不再建立估計牌組，也不使用 fresh_counts、粒子、超幾何、蒙地卡羅或 Stacking。
+完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB 作診斷；若另有實際
+牌點或精確剩餘點數，則交由 predictor 的不放回 EV 閘門決定資金方向。
 
 人工回報時以 session 保存的 prediction_id 精確結算上一筆 reward，
 再把本局結果加入歷史並產生下一局預測，避免 latest-pending 競態與重複結算。
@@ -38,6 +38,7 @@ def predict_from_screenshot(
     raw_outcomes: Optional[Iterable[Any]] = None,
     tie_markers: Optional[Mapping[str, Any]] = None,
     prior_counts: Optional[Sequence[int]] = None,
+    observed_cards: Optional[Iterable[Any]] = None,
     venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "",
     run_seed: Optional[int] = None,
     road_context: Optional[Mapping[str, Any]] = None,
@@ -88,6 +89,28 @@ def predict_from_screenshot(
             prediction_id=str(previous_prediction_id or ""),
         )
 
+    exact_counts = None
+    if (
+        isinstance(prior_counts, Sequence)
+        and not isinstance(prior_counts, (str, bytes))
+        and len(prior_counts) == 10
+    ):
+        exact_counts = list(prior_counts)
+    observed_card_values = list(observed_cards or [])
+    shoe_context = (
+        {
+            "remaining_counts": exact_counts,
+            "source": "screen_exact_remaining_counts",
+        }
+        if exact_counts is not None
+        else {
+            "observed_cards": observed_card_values,
+            "source": "screen_observed_card_values",
+        }
+        if observed_card_values
+        else None
+    )
+
     result = predict(
         history=combined_raw,
         venue=venue,
@@ -95,7 +118,7 @@ def predict_from_screenshot(
         shoe_id=shoe_id,
         user_id=user_id,
         run_seed=seed,
-        shoe_context=None,
+        shoe_context=shoe_context,
         road_context=context,
     )
     result.update({
@@ -105,10 +128,10 @@ def predict_from_screenshot(
         "mode": "screen_full_history_contextual_bandit",
         "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
-        "estimated_remaining_counts": [],
-        "composition_source": "not_used_cmab",
-        "composition_quality": "not_applicable_cmab",
-        "prior_counts_ignored": bool(prior_counts),
+        "estimated_remaining_counts": list(exact_counts or []),
+        "composition_source": str(result.get("remaining_counts_source") or "outcome_history_only"),
+        "prior_counts_ignored": bool(prior_counts) and exact_counts is None,
+        "observed_card_count": len(observed_card_values),
         "road_sequence_length": len(cleaned),
         "raw_outcome_length": len(combined_raw),
         "initial_image_count": len(initial_raw),

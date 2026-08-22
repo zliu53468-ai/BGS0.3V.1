@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 
 import store
 from predictor import run_virtual_round
+from shoe_composition import DECKS as PHYSICAL_SHOE_DECKS
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 from room_ocr import preload_ocr
@@ -44,6 +45,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+LIFF_ID = os.getenv("LIFF_ID", "").strip()
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 ADMIN_LINE_URL = os.getenv(
@@ -141,7 +143,7 @@ ALL_CODES = PERMANENT_CODES | MONTHLY_CODES | TEMP_CODES
 
 app = FastAPI(
     title="BGS AI預測系統",
-    version="10.4.1",
+    version="10.5.0",
 )
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -163,6 +165,23 @@ class VenueRequest(UserRequest):
 
 class RoomRequest(UserRequest):
     room: str = Field(min_length=1, max_length=24)
+
+
+class ShoeCardsRequest(UserRequest):
+    cards: List[Any] = Field(default_factory=list, max_length=832)
+    replace: bool = True
+
+
+class LiffSessionStartRequest(VenueRequest):
+    shoe_id: str = Field(default="", max_length=80)
+
+
+class RoundResultRequest(UserRequest):
+    result: str = Field(min_length=1, max_length=1)
+
+
+class ActivationRequest(UserRequest):
+    code: str = Field(min_length=1, max_length=160)
 
 
 class AccessExpiredError(Exception):
@@ -436,40 +455,34 @@ def _attach_bankroll_advice(
     prediction: Mapping[str, Any],
     session: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """依正式訊號加入保守型資金配置；不改寫模型機率與方向。"""
+    """依抽水後正 EV 與分數凱利配置；不再用模型信心硬配 1/2/3%。"""
     result = dict(prediction or {})
     bankroll = max(0, int(session.get("bankroll", 0) or 0))
     action_code = str(result.get("action") or "O").upper()
     edge = float(result.get("direction_edge", 0.0) or 0.0)
-    quality = float(result.get("quality_score", result.get("confidence_score", 0.0)) or 0.0)
-    confidence_label = str(result.get("confidence_label") or "偏低")
+    expected_return = float(result.get("selected_expected_return", 0.0) or 0.0)
+    kelly_percentage = max(
+        0.0,
+        min(2.0, float(result.get("recommended_bet_percentage", 0.0) or 0.0)),
+    )
     signal_reason = str(result.get("signal_reason") or "模型正在等待更明確的方向差距")
 
     if bankroll <= 0:
         percentage = 0.0
         level = "尚未設定"
         reason = "請先設定本次分析本金"
-    elif action_code not in {"B", "P"}:
+    elif action_code not in {"B", "P"} or expected_return <= 0.0 or kelly_percentage <= 0.0:
         percentage = 0.0
         level = "暫緩配置"
         reason = signal_reason
-    elif confidence_label == "較高" or (quality >= 0.72 and edge >= 0.04):
-        percentage = 3.0
-        level = "積極區間"
-        reason = "方向差距、模型一致度與訊號品質均達較高區間"
-    elif confidence_label == "中等" or quality >= 0.52:
-        percentage = 2.0
-        level = "標準區間"
-        reason = "方向訊號已開放，採標準風險比例"
     else:
-        percentage = 1.0
-        level = "保守區間"
-        reason = "方向訊號已開放，但品質仍屬保守區間"
+        percentage = kelly_percentage
+        level = "分數凱利（最高 2%）"
+        reason = f"抽水後 EV {expected_return:+.3%}，採四分之一凱利並限制單局風險"
 
     raw_amount = bankroll * percentage / 100.0
-    suggested = int(raw_amount // 10 * 10) if percentage > 0 else 0
-    if percentage > 0 and suggested <= 0:
-        suggested = min(bankroll, 10)
+    # 只向下取整，絕不為了湊最低注碼而超過 Kelly 風險上限。
+    suggested = int(raw_amount) if percentage > 0 else 0
 
     result.update(
         {
@@ -479,6 +492,9 @@ def _attach_bankroll_advice(
             "bet_level_text": level,
             "bet_reason": reason,
             "screen_edge": round(edge, 6),
+            "selected_expected_return": expected_return,
+            "selected_expected_return_percent": expected_return * 100.0,
+            "kelly_percentage_applied": percentage,
         }
     )
     return result
@@ -1316,6 +1332,15 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
+    expected_return_percent = float(
+        prediction.get("selected_expected_return_percent", 0.0) or 0.0
+    )
+    composition_gate = dict(prediction.get("physical_edge_gate") or {})
+    composition_text = (
+        f"精確｜剩餘 {int(dict(composition_gate.get('composition') or {}).get('remaining_cards', 0) or 0)} 張"
+        if composition_gate.get("available")
+        else "未啟用｜需輸入實際牌面"
+    )
     bet_level = str(prediction.get("bet_level_text") or "標準區間")
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
@@ -1401,7 +1426,10 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                                 f"方向優勢：{edge_percent:.2f}%\n"
                                 f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
                                 f"模型一致度：{consistency:.1f}%\n"
-                                f"牌路先行：{road_direction}"
+                                f"牌路診斷：{road_direction}\n"
+                                f"牌組算牌：{composition_text}\n"
+                                f"抽水後 EV：{expected_return_percent:+.3f}%\n"
+                                f"分數凱利：{percentage:.3f}%"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -1654,6 +1682,7 @@ def _refresh_screen_prediction(
                 tie_markers=tie_markers,
                 remaining_cards=remaining,
                 prior_counts=None,
+                observed_cards=list(session.get("observed_cards") or []),
                 venue=venue,
                 room=room,
                 shoe_id=str(expected_run_id or ""),
@@ -1858,6 +1887,7 @@ def _process_screen_image_sync(
                 tie_markers=tie_markers,
                 remaining_cards=remaining,
                 prior_counts=None,
+                observed_cards=list(current_session.get("observed_cards") or []),
                 venue=str(
                     resolved.get("venue_code")
                     or current_session.get("venue")
@@ -2108,12 +2138,53 @@ def _public_session(session: Mapping[str, Any]) -> Dict[str, Any]:
     ]
     copy_session["analysis_history"] = list(session.get("analysis_history") or [])[-40:]
     copy_session["round_history"] = list(session.get("round_history") or [])[-60:]
+    copy_session["history"] = list(session.get("raw_outcomes") or [])[-1000:]
+    copy_session["round_no"] = len(copy_session["history"]) + 1
+    copy_session["last_prediction"] = dict(
+        session.get("screen_last_prediction")
+        or session.get("last_prediction")
+        or {}
+    )
     return data
+
+
+def _liff_access_payload(user_id: str, *, start_trial: bool = False) -> Dict[str, Any]:
+    status = dict(store.access_status(user_id, start_trial=start_trial))
+    session = store.get_session(user_id)
+    permanent = bool(session.get("permanent_access"))
+    trial_started = int(session.get("trial_started_at", 0) or 0)
+    active = bool(status.get("allowed"))
+    can_start_trial = not permanent and trial_started <= 0
+    seconds_left = status.get("seconds_left")
+    return {
+        "user_id": user_id,
+        "active": active,
+        "allowed": active,
+        "can_start_trial": can_start_trial,
+        "state": "active" if active else "trial_available" if can_start_trial else "expired",
+        "plan": "permanent" if permanent else "trial",
+        "plan_label": "永久版" if permanent else "試用中" if active else "可開始試用" if can_start_trial else "已到期",
+        "remaining_seconds": seconds_left,
+        "expires_at_taipei": "永久" if permanent else "",
+        "redirect_after_seconds": 30,
+        "message": (
+            "使用權限正常"
+            if active
+            else "首次分析將自動啟用試用"
+            if can_start_trial
+            else "試用已到期，請聯繫管理員"
+        ),
+    }
 
 
 @app.get("/")
 def root() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "liff.html")
+
+
+@app.get("/liff")
+def liff_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "liff.html")
 
 
 @app.get("/health")
@@ -2121,8 +2192,8 @@ def health() -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
-            "version": "10.4.0-manual-reply-sync",
-            "engine": "V10_3_FULL_HISTORY_GRID_QUALITY",
+            "version": "10.5.0-exact-shoe-ev-kelly",
+            "engine": "EXACT_WITHOUT_REPLACEMENT_EV_KELLY_GATE",
             "activation_code_fix": True,
             "activation_persistence_check": True,
             "storage_path": str(getattr(store, "SESSION_DATA_FILE", "")),
@@ -2146,6 +2217,10 @@ def health() -> JSONResponse:
             "tie_result_supported": True,
             "online_calibration": True,
             "adaptive_ensemble": True,
+            "exact_shoe_composition": True,
+            "banker_commission_ev": True,
+            "fractional_kelly": True,
+            "deepseek_active": False,
             "stale_background_guard": True,
             "bankroll_flow": True,
             "immediate_image_ack": False,
@@ -2178,6 +2253,105 @@ def ping() -> PlainTextResponse:
 def ping_head() -> Response:
     """允許監控以 HEAD /ping 檢查服務狀態。"""
     return Response(status_code=200)
+
+
+@app.get("/api/config")
+def api_config() -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "liffId": LIFF_ID,
+        "adminLineUrl": ADMIN_LINE_URL,
+        "accessRedirectSeconds": 30,
+        "venues": VENUES,
+        "rooms": [str(value) for value in range(1, 21)],
+    })
+
+
+@app.get("/api/access/status")
+def api_access_status(user_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"ok": True, "access": _liff_access_payload(user_id)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/access/activate")
+def api_access_activate(payload: ActivationRequest) -> JSONResponse:
+    try:
+        plan = _activate_code(payload.user_id, payload.code)
+        access = _liff_access_payload(payload.user_id)
+        access["message"] = f"{plan}開通成功"
+        return JSONResponse({"ok": True, "access": access})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/session/current")
+def api_session_current(user_id: str) -> JSONResponse:
+    return JSONResponse({"ok": True, "session": _public_session(store.get_session(user_id))})
+
+
+@app.post("/api/session/start")
+def api_session_start(payload: LiffSessionStartRequest) -> JSONResponse:
+    venue = payload.venue.upper().strip()
+    if venue not in VENUE_BY_CODE:
+        raise HTTPException(status_code=400, detail="無效館別")
+    try:
+        store.select_venue(payload.user_id, venue, payload.room)
+        session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+        session = store.upsert_session(
+            payload.user_id,
+            {
+                "shoe_id": str(payload.shoe_id or session.get("shoe_id") or ""),
+                "status": "輸入中",
+                "analysis_active": True,
+                "awaiting_screenshot": False,
+            },
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/round/add")
+def api_round_add(payload: RoundResultRequest) -> JSONResponse:
+    try:
+        session = store.append_road_result(payload.user_id, payload.result)
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/round/undo")
+def api_round_undo(payload: UserRequest) -> JSONResponse:
+    try:
+        session = store.get_session(payload.user_id)
+        raw = list(session.get("raw_outcomes") or [])
+        if raw:
+            raw.pop()
+        session = store.set_road_sequence(
+            payload.user_id,
+            [value for value in raw if value in {"B", "P"}],
+            raw_outcomes=raw,
+            source="manual",
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/session/reset")
+def api_session_reset(payload: UserRequest) -> JSONResponse:
+    session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/api/session/end")
+def api_session_end(payload: UserRequest) -> JSONResponse:
+    session = _end_uid_analysis(payload.user_id)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
 @app.get("/api/session")
 def api_session(user_id: str) -> JSONResponse:
     try:
@@ -2201,9 +2375,65 @@ def api_room(payload: RoomRequest) -> JSONResponse:
     return JSONResponse({"ok": True, "session": _public_session(session)})
 
 
+@app.post("/api/shoe/cards")
+def api_shoe_cards(payload: ShoeCardsRequest) -> JSONResponse:
+    """寫入本 UID、本牌靴的實際已出牌面，供精確不放回計算。"""
+    try:
+        session = store.set_observed_cards(
+            payload.user_id,
+            payload.cards,
+            replace=bool(payload.replace),
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/predict")
 async def api_predict(payload: UserRequest) -> JSONResponse:
     try:
+        session = store.get_session(payload.user_id)
+        raw_outcomes = list(session.get("raw_outcomes") or [])
+        observed_cards = list(session.get("observed_cards") or [])
+        # LIFF 直接輸入模式：已有路單或實際牌面時直接產生下一局 EV；
+        # 沒有任何資料時才沿用 LINE 截圖啟動流程。
+        if raw_outcomes or observed_cards:
+            _ensure_access(payload.user_id)
+            prediction = await asyncio.to_thread(
+                predict_from_screenshot,
+                [value for value in raw_outcomes if value in {"B", "P"}],
+                raw_outcomes=raw_outcomes,
+                remaining_cards=max(0, 52 * PHYSICAL_SHOE_DECKS - len(observed_cards)),
+                observed_cards=observed_cards,
+                venue=str(session.get("venue") or ""),
+                room=str(session.get("room") or "1"),
+                shoe_id=str(session.get("shoe_id") or session.get("analysis_run_id") or ""),
+                user_id=payload.user_id,
+                initial_image_history=[],
+                manual_outcome_history=raw_outcomes,
+                previous_prediction_id=str(
+                    dict(session.get("screen_last_prediction") or {}).get("prediction_id") or ""
+                ),
+            )
+            prediction = _attach_bankroll_advice(prediction, session)
+            updated = store.upsert_session(
+                payload.user_id,
+                {
+                    "screen_last_prediction": prediction,
+                    "last_prediction": prediction,
+                    "pending_prediction": prediction,
+                    "screen_prediction_version": int(session.get("screen_data_version", 0) or 0),
+                    "screen_analysis_count": int(session.get("screen_analysis_count", 0) or 0) + 1,
+                    "status": "分析完成",
+                },
+            )
+            return JSONResponse({
+                "ok": True,
+                "state": "predicted",
+                "prediction": prediction,
+                "access": _liff_access_payload(payload.user_id),
+                "session": _public_session(updated),
+            })
         result = await asyncio.to_thread(_start_screen_flow, payload.user_id)
         return JSONResponse(
             {
@@ -2212,7 +2442,7 @@ async def api_predict(payload: UserRequest) -> JSONResponse:
                 "session": _public_session(store.get_session(payload.user_id)),
             }
         )
-    except PermissionError as exc:
+    except (PermissionError, AccessExpiredError) as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

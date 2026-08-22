@@ -5,7 +5,7 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
-V2.0 非平穩牌路版：
+V2.1 非平穩牌路版（移除一至三階條件轉移訊號）：
 - 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
 - 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
   避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
@@ -38,11 +38,12 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V2.0-NONSTATIONARY-CONTEXT"
-STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V3"
+MODEL_VERSION = "CMAB-LINUCB-V2.1-NO-TRANSITION-CHAIN"
+STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V4"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
     "CMAB-UID-ISOLATED-V2",
+    "CMAB-UID-ISOLATED-V3",
     STATE_SCHEMA_VERSION,
 }
 FEATURE_NAMES = (
@@ -55,8 +56,8 @@ FEATURE_NAMES = (
     "observed_tie_rate", "road_planning_balance",
     "road_recent_balance", "road_confidence",
     "road_planning_reliability", "road_recent_reliability",
-    "road_agreement", "markov1_balance", "markov2_balance",
-    "markov3_balance",
+    "road_agreement", "reserved_removed_sequence_slot_1",
+    "reserved_removed_sequence_slot_2", "reserved_removed_sequence_slot_3",
     # V2.0 全部附加在舊 24 維之後，讓既有 A／b 可無損升維。
     "shoe_round_maturity", "recent3_banker_balance",
     "recent5_transition_volatility", "recent5_run_volatility",
@@ -328,19 +329,6 @@ def _derived_road_saturation(
     return float(max(balance, continuation_concentration))
 
 
-def _model_probability(road_context: Mapping[str, Any], model_name: str, fallback: float = 0.5) -> float:
-    models = road_context.get("models")
-    if not isinstance(models, Mapping):
-        return fallback
-    model = models.get(model_name)
-    if not isinstance(model, Mapping):
-        return fallback
-    try:
-        return float(model.get("banker_probability", fallback) or fallback)
-    except Exception:
-        return fallback
-
-
 def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None) -> List[float]:
     """建立固定上下文；B/P 規律特徵不讓和局推進時間軸。"""
     raw = _clean_history(history)
@@ -388,9 +376,11 @@ def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mappi
         _prob_balance(road.get("planning_probability", 0.5)),
         _prob_balance(road.get("recent_probability", 0.5)),
         confidence, planning_reliability, recent_reliability, agreement,
-        _prob_balance(_model_probability(road, "markov1")),
-        _prob_balance(_model_probability(road, "markov2")),
-        _prob_balance(_model_probability(road, "markov3")),
+        # 保留三個零值槽位以維持矩陣維度；舊欄位名稱不映射，
+        # 因此既有條件轉移權重不會被帶入新版 A／b。
+        0.0,
+        0.0,
+        0.0,
         min(1.0, len(raw) / 80.0),
         _banker_balance(bp, 3),
         _transition_rate(bp, 5),

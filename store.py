@@ -16,6 +16,11 @@ from particle_filter_points import (
     create_virtual_shoe,
     deal_ordered_hand,
 )
+from shoe_composition import (
+    DECKS as PHYSICAL_SHOE_DECKS,
+    parse_card_value,
+    remaining_counts_from_observed,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -207,6 +212,8 @@ def _default_session(user_id: str) -> Dict[str, Any]:
         "screen_last_analyzed_at": 0,
         "screen_processing_ms": 0.0,
         "screen_manual_rounds": 0,
+        # 真人桌精確算牌資料；B/P/T 結果不得寫入此欄。
+        "observed_cards": [],
         # 本金與建議金額狀態。
         "bankroll": 0,
         "initial_bankroll": 0,
@@ -353,6 +360,13 @@ def _migrate_session(session: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         session["initial_image_history"] = list(raw_history)
     if not isinstance(session.get("initial_grid_cells"), list):
         session["initial_grid_cells"] = []
+    clean_observed_cards: List[int] = []
+    for raw_card in list(session.get("observed_cards") or [])[:52 * PHYSICAL_SHOE_DECKS]:
+        try:
+            clean_observed_cards.append(parse_card_value(raw_card))
+        except (TypeError, ValueError):
+            continue
+    session["observed_cards"] = clean_observed_cards
     session["initial_recognized_count"] = max(0, int(session.get("initial_recognized_count", len(session["initial_image_history"])) or 0))
     session["initial_uncertain_count"] = max(0, int(session.get("initial_uncertain_count", 0) or 0))
     session["combined_round_count"] = len(raw_history)
@@ -566,6 +580,7 @@ def _clear_screen_fields(session: Dict[str, Any]) -> None:
         "screen_remaining_cards": 0, "screen_analysis_count": 0,
         "screen_last_analyzed_at": 0, "screen_processing_ms": 0.0,
         "screen_manual_rounds": 0, "screen_data_version": 0,
+        "observed_cards": [],
         "screen_prediction_version": 0, "screen_last_input_source": "",
         "screen_last_data_updated_at": 0, "screen_input_type": "",
         "screen_venue_source": "", "screen_room_source": "",
@@ -691,6 +706,36 @@ def reset_session(user_id: str) -> Dict[str, Any]:
         }
     )
     return upsert_session(user_id, fresh)
+
+
+def set_observed_cards(
+    user_id: str,
+    cards: List[Any],
+    *,
+    replace: bool = True,
+) -> Dict[str, Any]:
+    """儲存指定 UID 本靴的實際已出牌點；A=1、10/J/Q/K=0。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    parsed = [parse_card_value(value) for value in list(cards or [])]
+    with _LOCK:
+        data = _load_all_unlocked()
+        raw = data.get(uid)
+        session = _migrate_session(raw, uid) if isinstance(raw, dict) else _default_session(uid)
+        existing = [] if replace else list(session.get("observed_cards") or [])
+        combined = existing + parsed
+        if len(combined) > 52 * PHYSICAL_SHOE_DECKS:
+            raise ValueError(f"實際牌面輸入超過 {PHYSICAL_SHOE_DECKS} 副牌上限")
+        # 立即驗證每個點數均未超過八副牌上限。
+        remaining_counts_from_observed(combined, decks=PHYSICAL_SHOE_DECKS)
+        session["observed_cards"] = combined
+        session["screen_data_version"] = int(session.get("screen_data_version", 0) or 0) + 1
+        session["screen_last_data_updated_at"] = _now()
+        session["updated_at"] = _now()
+        data[uid] = session
+        _save_all_unlocked(data)
+        return copy.deepcopy(session)
 
 
 def _update_stats(stats: Dict[str, int], verdict: str) -> Dict[str, int]:
@@ -1248,6 +1293,7 @@ __all__ = [
     "update_road_analysis",
     "update_screen_analysis",
     "set_bankroll",
+    "set_observed_cards",
     "set_room",
     "start_session",
     "upsert_session",
