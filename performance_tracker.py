@@ -1,9 +1,10 @@
 """BGS cMAB 預測績效紀錄器。
 
 每次 cMAB 輸出後建立 pending prediction；使用者回報實際結果時：
-- B/P：以 1 或 0 reward 更新被選擇的 Arm。
+- B/P：使用預測當下的 cMAB B/P 分數產生信心加權獎懲。
 - T：和局不更新 B/P Arm。
 - prediction_id 去重，避免同一局重複學習。
+- 同時保存 raw round 與 B/P round index，避免和局造成時間軸錯位。
 """
 from __future__ import annotations
 
@@ -160,11 +161,21 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         ),
         "prediction_fingerprint": prediction_fingerprint,
         "probabilities": _prediction_probabilities(prediction),
+        "bandit_learning_probabilities": _normalize_probabilities(
+            dict(
+                prediction.get("bandit_learning_probabilities")
+                or prediction.get("pre_braking_probabilities")
+                or _prediction_probabilities(prediction)
+            )
+        ),
         "recommend": str(prediction.get("recommend") or selected_arm).upper(),
         "action": str(prediction.get("action") or selected_arm).upper(),
         "selected_arm": selected_arm,
         "context_vector": list(prediction.get("bandit_context") or prediction.get("context_vector") or []),
         "context_feature_names": list(prediction.get("context_feature_names") or []),
+        "timeline_alignment": dict(
+            prediction.get("timeline_alignment") or {}
+        ),
         "bandit_scores": dict(prediction.get("bandit_scores") or {}),
         "direction_source": str(prediction.get("direction_source") or ""),
         "component_champion": dict(
@@ -280,6 +291,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
                 event_id=str(target.get("prediction_id") or ""),
                 actual_outcome=actual,
                 update_weight=update_weight,
+                prediction_probabilities=dict(
+                    target.get("bandit_learning_probabilities")
+                    or probabilities
+                ),
             )
         elif actual == "T":
             bandit_update = {"updated": False, "reason": "tie_not_used_for_bp_arms", "actual_outcome": actual}
@@ -290,6 +305,8 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         target["resolved_at"] = _now()
         target["reward"] = reward
         target["bandit_update"] = bandit_update
+        target["bp_timeline_advanced"] = actual in {"B", "P"}
+        target["tie_skipped_for_structural_learning"] = actual == "T"
         target["applied_update_weight"] = (
             float(bandit_update.get("update_weight", 0.0) or 0.0)
             if isinstance(bandit_update, Mapping)
@@ -331,8 +348,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         return dict(target)
 
 
-def get_resolved_records(*, venue: str = "", room: str = "", limit: int = 5000) -> List[Dict[str, Any]]:
+def get_resolved_records(*, venue: str = "", room: str = "", shoe_id: str = "",
+                         limit: int = 5000) -> List[Dict[str, Any]]:
     venue_key, room_key = str(venue or "").upper().strip(), str(room or "").strip()
+    shoe_key = str(shoe_id or "").strip()
     with _LOCK:
         records = list(_read_unlocked().get("records") or [])
     result: List[Dict[str, Any]] = []
@@ -342,6 +361,8 @@ def get_resolved_records(*, venue: str = "", room: str = "", limit: int = 5000) 
         if venue_key and str(record.get("venue") or "").upper() != venue_key:
             continue
         if room_key and str(record.get("room") or "") != room_key:
+            continue
+        if shoe_key and str(record.get("shoe_id") or "") != shoe_key:
             continue
         result.append(dict(record))
         if len(result) >= max(1, int(limit)):
@@ -471,8 +492,13 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def get_performance_summary(*, venue: str = "", room: str = "", limit: int = 5000) -> Dict[str, Any]:
-    return summarize_records(get_resolved_records(venue=venue, room=room, limit=limit))
+def get_performance_summary(*, venue: str = "", room: str = "", shoe_id: str = "",
+                            limit: int = 5000) -> Dict[str, Any]:
+    return summarize_records(
+        get_resolved_records(
+            venue=venue, room=room, shoe_id=shoe_id, limit=limit
+        )
+    )
 
 
 __all__ = ["get_performance_summary", "get_resolved_records", "record_prediction",
