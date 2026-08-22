@@ -17,21 +17,21 @@ VALIDATED_COMPONENT_MIN_SAMPLES = max(
     20,
     min(
         500,
-        int(os.getenv("VALIDATED_COMPONENT_MIN_SAMPLES", "40") or "40"),
+        int(os.getenv("VALIDATED_COMPONENT_MIN_SAMPLES", "300") or "300"),
     ),
 )
 VALIDATED_COMPONENT_MIN_POSTERIOR = max(
     0.50,
     min(
         0.65,
-        float(os.getenv("VALIDATED_COMPONENT_MIN_POSTERIOR", "0.515") or "0.515"),
+        float(os.getenv("VALIDATED_COMPONENT_MIN_POSTERIOR", "0.52") or "0.52"),
     ),
 )
 VALIDATED_COMPONENT_MIN_WILSON = max(
     0.40,
     min(
         0.60,
-        float(os.getenv("VALIDATED_COMPONENT_MIN_WILSON", "0.46") or "0.46"),
+        float(os.getenv("VALIDATED_COMPONENT_MIN_WILSON", "0.50") or "0.50"),
     ),
 )
 UNVALIDATED_CONFIDENCE_CAP = max(
@@ -46,6 +46,20 @@ VALIDATED_CONFIDENCE_CAP = max(
     min(
         0.70,
         float(os.getenv("VALIDATED_CONFIDENCE_CAP", "0.62") or "0.62"),
+    ),
+)
+VALIDATION_LOOKBACK = max(
+    VALIDATED_COMPONENT_MIN_SAMPLES,
+    min(
+        5000,
+        int(os.getenv("VALIDATION_LOOKBACK", "1000") or "1000"),
+    ),
+)
+BASE_CMAB_PRIORITY_MIN_UPDATES = max(
+    4,
+    min(
+        200,
+        int(os.getenv("BASE_CMAB_PRIORITY_MIN_UPDATES", "20") or "20"),
     ),
 )
 
@@ -155,20 +169,42 @@ def _validated_component(
     return winner
 
 
-def _road_aggregate_direction(result: Mapping[str, Any]) -> Dict[str, Any]:
-    road = result.get("road_support")
-    road_data = dict(road) if isinstance(road, Mapping) else {}
-    try:
-        banker = max(
-            0.02,
-            min(0.98, float(road_data.get("banker_probability", 0.5) or 0.5)),
-        )
-    except Exception:
-        banker = 0.5
+def _existing_direction(
+    result: Mapping[str, Any],
+    action: str,
+) -> Dict[str, str]:
+    """未通過樣本外驗證時，不再用近期 road aggregate 覆寫方向。
+
+    若 LinUCB 已累積足夠回饋並通過自身 edge 門檻，優先恢復它在
+    adaptive champion 接管前的方向；否則原封不動保留既有集成輸出。
+    """
+    bandit = result.get("bandit_state")
+    bandit_data = dict(bandit) if isinstance(bandit, Mapping) else {}
+    original_source = str(result.get("direction_source") or "")
+    base_direction = str(
+        result.get("base_bandit_direction") or ""
+    ).upper().strip()
+    total_updates = int(bandit_data.get("total_updates", 0) or 0)
+    bandit_ready = bool(
+        bandit_data.get("direction_signal_ready")
+        or total_updates >= BASE_CMAB_PRIORITY_MIN_UPDATES
+    )
+    if (
+        original_source == "adaptive_ensemble_dynamic_champion"
+        and bandit_ready
+        and base_direction in {"B", "P"}
+    ):
+        return {
+            "direction": base_direction,
+            "selection_mode": "mature_base_cmab",
+            "selection_name": "contextual_bandit_linu_cb",
+            "direction_source": "validated_decision_base_cmab",
+        }
     return {
-        "direction": "B" if banker >= 0.5 else "P",
-        "banker_probability": banker,
-        "sample_count": int(road_data.get("sample_count", 0) or 0),
+        "direction": action,
+        "selection_mode": "preserve_existing_direction",
+        "selection_name": original_source or "existing_direction",
+        "direction_source": original_source,
     }
 
 
@@ -289,38 +325,30 @@ def apply_validated_decision(
     summary = get_performance_summary(
         venue=str(venue or ""),
         room=str(room or ""),
-        limit=5000,
+        limit=VALIDATION_LOOKBACK,
     )
     champion = _validated_component(result, summary)
     original_source = str(result.get("direction_source") or "")
-    aggregate_fallback = bool(
-        not champion
-        and original_source == "adaptive_ensemble_dynamic_champion"
-    )
 
     if champion:
         direction = str(champion["direction"])
         selection_mode = "validated_component"
         selection_name = str(champion["name"])
-    elif aggregate_fallback:
-        aggregate = _road_aggregate_direction(result)
-        direction = str(aggregate["direction"])
-        selection_mode = "unvalidated_road_aggregate"
-        selection_name = "road_aggregate"
+        final_direction_source = "validated_decision_component"
     else:
-        direction = action
-        selection_mode = "preserve_existing_direction"
-        selection_name = original_source or "existing_direction"
+        existing = _existing_direction(result, action)
+        direction = str(existing["direction"])
+        selection_mode = str(existing["selection_mode"])
+        selection_name = str(existing["selection_name"])
+        final_direction_source = str(
+            existing["direction_source"] or original_source
+        )
 
     calibration = _calibrated_confidence(
         result,
         summary,
         validated_component=champion,
-        direction_source=(
-            "validated_decision_road_aggregate"
-            if aggregate_fallback
-            else original_source
-        ),
+        direction_source=final_direction_source,
     )
     calibrated_confidence = float(calibration["confidence"])
     _set_direction_distribution(
@@ -329,13 +357,7 @@ def apply_validated_decision(
         confidence=calibrated_confidence,
     )
     result["pre_validation_direction_source"] = original_source
-    result["direction_source"] = (
-        "validated_decision_component"
-        if champion
-        else "validated_decision_road_aggregate"
-        if aggregate_fallback
-        else original_source
-    )
+    result["direction_source"] = final_direction_source
     result["confidence"] = calibrated_confidence
     result["ensemble_confidence"] = calibrated_confidence
     result["quality_score"] = calibrated_confidence
@@ -364,6 +386,10 @@ def apply_validated_decision(
         "confidence_sample_count": int(calibration["sample_count"]),
         "calibrated_confidence": calibrated_confidence,
         "unvalidated_confidence_cap": UNVALIDATED_CONFIDENCE_CAP,
+        "minimum_validation_samples": VALIDATED_COMPONENT_MIN_SAMPLES,
+        "validation_lookback": VALIDATION_LOOKBACK,
+        "base_cmab_priority_min_updates": BASE_CMAB_PRIORITY_MIN_UPDATES,
+        "road_aggregate_override_disabled": True,
         "validated_component": dict(champion),
         "performance_sample_count": int(summary.get("sample_count", 0) or 0),
     }
