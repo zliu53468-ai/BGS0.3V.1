@@ -1,8 +1,8 @@
 """BGS V10.8 牌路模型入口。
 
-本檔保留原有九個牌路專家名稱，但將角色拆開：
+本檔保留六個牌路專家，並完全移除一至三階條件轉移模型：
 - full_road：完整歷史牌路規劃模型
-- 其餘八個：近期／序列型牌路專家
+- short／mid／long／pattern／analogue：其餘近期牌路專家
 
 主引擎可以分別取得 ``planning_probability`` 與 ``recent_probability``，
 避免把全部牌路訊號壓成一個只追近期的群組。
@@ -39,9 +39,6 @@ ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 500, 36, 2000)
 ROAD_SHORT_WINDOW = _env_int("ROAD_SHORT_WINDOW", 8, 4, 30)
 ROAD_MID_WINDOW = _env_int("ROAD_MID_WINDOW", 18, 8, 60)
 ROAD_LONG_WINDOW = _env_int("ROAD_LONG_WINDOW", 36, 12, 160)
-ROAD_MARKOV1_MIN_SUPPORT = _env_int("ROAD_MARKOV1_MIN_SUPPORT", 5, 1, 100)
-ROAD_MARKOV2_MIN_SUPPORT = _env_int("ROAD_MARKOV2_MIN_SUPPORT", 4, 1, 100)
-ROAD_MARKOV3_MIN_SUPPORT = _env_int("ROAD_MARKOV3_MIN_SUPPORT", 3, 1, 100)
 ROAD_RECENT_SIMULATIONS = _env_int("ROAD_RECENT_SIMULATIONS", 3000, 500, 30000)
 ROAD_RECENT_MAX_MODEL_WEIGHT = _env_float("ROAD_RECENT_MAX_MODEL_WEIGHT", 0.22, 0.10, 0.40)
 ROAD_RECENT_MAX_DISAGREEMENT = _env_float("ROAD_RECENT_MAX_DISAGREEMENT", 0.145, 0.03, 0.40)
@@ -110,43 +107,6 @@ def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str,
         "reliability": reliability,
         "window": size,
         "decay": decay,
-    }
-
-
-def _markov_model(sequence: Sequence[str], order: int, minimum_support: int) -> Dict[str, Any]:
-    if len(sequence) <= order:
-        return {
-            "active": False,
-            "support": 0,
-            "banker_probability": 0.5,
-            "direction": "B",
-            "reliability": 0.0,
-            "order": order,
-        }
-    context = tuple(sequence[-order:])
-    banker = 3.0
-    player = 3.0
-    support = 0
-    for index in range(order, len(sequence)):
-        if tuple(sequence[index - order:index]) != context:
-            continue
-        support += 1
-        if sequence[index] == "B":
-            banker += 1.0
-        else:
-            player += 1.0
-    probability = banker / (banker + player)
-    active = support >= minimum_support
-    reliability = min(0.78, support / max(1.0, minimum_support * 4.0)) if active else 0.0
-    return {
-        "active": active,
-        "support": support,
-        "banker_probability": probability,
-        "direction": "B" if probability >= 0.5 else "P",
-        "edge": abs(probability - 0.5) * 2.0,
-        "reliability": reliability,
-        "order": order,
-        "context": "".join(context),
     }
 
 
@@ -292,14 +252,11 @@ def _detect_regime(sequence: Sequence[str]) -> Dict[str, Any]:
 
 def _bounded_recent_weights(models: Mapping[str, Mapping[str, Any]]) -> Dict[str, float]:
     priors = {
-        "short": 0.13,
-        "mid": 0.14,
-        "long": 0.15,
-        "pattern": 0.13,
-        "markov1": 0.12,
-        "markov2": 0.12,
-        "markov3": 0.09,
-        "analogue": 0.12,
+        "short": 0.19,
+        "mid": 0.20,
+        "long": 0.22,
+        "pattern": 0.19,
+        "analogue": 0.20,
     }
     raw: Dict[str, float] = {}
     for name, model in models.items():
@@ -371,9 +328,6 @@ def calculate_road_probabilities(
         "mid": _window_model(sequence, ROAD_MID_WINDOW, 0.91),
         "long": _window_model(sequence, ROAD_LONG_WINDOW, 0.965),
         "pattern": _pattern_model(sequence),
-        "markov1": _markov_model(sequence, 1, ROAD_MARKOV1_MIN_SUPPORT),
-        "markov2": _markov_model(sequence, 2, ROAD_MARKOV2_MIN_SUPPORT),
-        "markov3": _markov_model(sequence, 3, ROAD_MARKOV3_MIN_SUPPORT),
         "analogue": _analogue_model(sequence),
     }
     recent_weights = _bounded_recent_weights(recent_models)
@@ -458,8 +412,8 @@ def calculate_road_probabilities(
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_SPLIT_PLANNING_RECENT_V10_8",
-        "pipeline_stage": "full_road_planning_plus_bounded_recent_experts",
+        "engine": "ROAD_SPLIT_PLANNING_RECENT_V10_9_NO_TRANSITION_CHAIN",
+        "pipeline_stage": "full_road_planning_plus_non_transition_recent_experts",
         "run_seed": run_seed,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
@@ -503,12 +457,14 @@ def calculate_road_probabilities(
         "weights": {name: float(value) for name, value in recent_weights.items()},
         "regime": _detect_regime(sequence),
         "supports": {
-            "first_order": int(recent_models["markov1"].get("support", 0)),
-            "second_order": int(recent_models["markov2"].get("support", 0)),
-            "third_order": int(recent_models["markov3"].get("support", 0)),
+            "short": int(recent_models["short"].get("support", 0)),
+            "mid": int(recent_models["mid"].get("support", 0)),
+            "long": int(recent_models["long"].get("support", 0)),
+            "pattern": int(recent_models["pattern"].get("support", 0)),
             "analogue": int(recent_models["analogue"].get("support", 0)),
             "planning": int(planning.get("support", 0) or 0),
         },
+        "removed_transition_chain_orders": [1, 2, 3],
         "eligible_for_core": length >= 10,
         "suggested_core_weight": 0.0,
         "max_core_weight": 0.0,
