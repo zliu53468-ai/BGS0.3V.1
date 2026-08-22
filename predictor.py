@@ -33,18 +33,17 @@ def _bandit_learning_scope(
     user_id: str,
     venue: str,
     room: str,
-    shoe_id: str,
 ) -> str:
-    """把 cMAB 學習狀態隔離到單一使用者／場館／桌／鞋。
+    """建立可跨鞋泛化、但不跨使用者／場館／桌污染的 cMAB 範圍。
 
     回傳不可逆摘要，避免把外部 user id 直接寫進模型狀態檔。
-    未提供 shoe_id 的舊呼叫仍可運作，但只會落在明確的相容範圍。
+    鞋號仍用於預測去重與影子狀態隔離，但不再重置長期學習矩陣；
+    否則每次換鞋都會永久停留在牌路冷啟動與近期順勢退化。
     """
     raw = "|".join((
         str(user_id or "__anonymous__"),
         str(venue or "").upper().strip(),
         str(room or "").strip(),
-        str(shoe_id or "__unspecified_shoe__").strip(),
     ))
     return "__cmab_scope__:" + sha256(
         raw.encode("utf-8")
@@ -433,7 +432,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         user_id=str(user_id or ""),
         venue=str(venue or ""),
         room=str(room or ""),
-        shoe_id=str(shoe_id or ""),
     )
     result = predict_bandit(
         cleaned,
@@ -481,7 +479,9 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     result.update({
         "shoe_id": str(shoe_id or ""),
         "bandit_learning_user_id": bandit_learning_user_id,
-        "bandit_scope_mode": "user_venue_room_shoe",
+        "bandit_scope_mode": "user_venue_room_long_term",
+        "bandit_shoe_isolated": False,
+        "shoe_event_isolated": True,
         "composition_quality": "not_applicable_cmab",
         "remaining_counts_source": "not_used",
         "shoe_context_ignored": bool(shoe_context),
