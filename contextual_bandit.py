@@ -5,13 +5,15 @@
 每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
 和局不更新 B/P Arm。
 
-V1.5 多維統計硬煞車：
+V1.6 動態方向與多維統計硬煞車：
 - 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
 - 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
   避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
 - 每個 UID 以經驗方差歷史平均 + 1.3 個標準差建立動態門檻。
 - 同時計算最近 12 局排列熵、B/P 卡方與經驗方差診斷。
 - 只有「模型方差超標且排列熵 > 0.95」才標記極端混沌區間。
+- OOD 必須等動態方差基準與真實回饋都成熟，避免新 UID 假熔斷。
+- 一般方向採較低溫度與溫和門檻；牌路衝突交由集成層選核心模型。
 - 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
 - B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
 
@@ -32,7 +34,7 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V1.5-STATISTICAL-HARD-BRAKE"
+MODEL_VERSION = "CMAB-LINUCB-V1.6-DYNAMIC-DIRECTION"
 STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V2"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -67,18 +69,18 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
 CMAB_ALPHA = _env_float("CMAB_ALPHA", 0.80, 0.0, 5.0)
 CMAB_L2 = _env_float("CMAB_L2", 1.0, 0.05, 100.0)
 CMAB_SCORE_TEMPERATURE = _env_float(
-    "CMAB_SCORE_TEMPERATURE", 1.35, 0.10, 10.0
+    "CMAB_SCORE_TEMPERATURE", 0.95, 0.10, 10.0
 )
 CMAB_TIE_PRIOR = 0.095156
 CMAB_TIE_PRIOR_STRENGTH = _env_float(
     "CMAB_TIE_PRIOR_STRENGTH", 40.0, 10.0, 500.0
 )
 CMAB_MIN_SIGNAL_EDGE = _env_float(
-    "CMAB_MIN_SIGNAL_EDGE", 0.02, 0.0, 0.20
+    "CMAB_MIN_SIGNAL_EDGE", 0.012, 0.0, 0.20
 )
 CMAB_MIN_SIGNAL_UPDATES = max(
     0,
-    min(200, int(os.getenv("CMAB_MIN_SIGNAL_UPDATES", "8") or "8")),
+    min(200, int(os.getenv("CMAB_MIN_SIGNAL_UPDATES", "4") or "4")),
 )
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
@@ -1108,11 +1110,23 @@ def _uncertainty_braking_metrics(
     baseline = _baseline_summary(state)
     threshold_variance = float(baseline["threshold"])
     variance_above_threshold = action_space_variance > threshold_variance
+    shared_context_updates = int(
+        shared_context.get("updates", 0) or 0
+    )
+    # 「高於歷史平均 + 1.3 sigma」只有在歷史基準與真實回饋都已
+    # 累積完成後才有統計意義。舊版在新 UID 的第 1～2 局便套用冷啟動
+    # 固定門檻，容易把正常的新使用者誤判成極端 OOD，並讓影子熔斷
+    # 長時間鎖住觀望。
+    ood_detection_ready = bool(
+        baseline["dynamic_ready"]
+        and shared_context_updates >= CMAB_UNCERTAINTY_MIN_SAMPLES
+    )
     entropy_indicates_white_noise = bool(
         randomness.get("entropy_indicates_white_noise", False)
     )
     active = bool(
-        variance_above_threshold
+        ood_detection_ready
+        and variance_above_threshold
         and entropy_indicates_white_noise
     )
     severity_ratio = (
@@ -1171,6 +1185,10 @@ def _uncertainty_braking_metrics(
         "rolling_randomness": dict(randomness),
         "historical_sample_count": int(
             baseline["sample_count"]
+        ),
+        "ood_detection_ready": bool(ood_detection_ready),
+        "ood_minimum_observations": int(
+            CMAB_UNCERTAINTY_MIN_SAMPLES
         ),
         "dynamic_threshold_ready": bool(
             baseline["dynamic_ready"]
@@ -1502,6 +1520,13 @@ def _predict_bandit_impl(
         ),
         "prediction_fingerprint": prediction_fingerprint,
         "mode": "screen_contextual_bandit",
+        # 將真正參與本局特徵計算的牌路專家同步交給集成層。舊版直到
+        # predictor 完成後才在 screenshot_predictor 補回 road_support，
+        # 導致 adaptive_ensemble 在決策當下看不到任何牌路成員。
+        "road_support": dict(road),
+        "component_probabilities": dict(
+            road.get("component_probabilities") or {}
+        ),
         "probabilities": dict(probabilities),
         "pre_braking_probabilities": dict(
             base_probabilities
@@ -1701,6 +1726,9 @@ def _predict_bandit_impl(
             ),
             "dynamic_threshold_ready": bool(
                 braking["dynamic_threshold_ready"]
+            ),
+            "ood_detection_ready": bool(
+                braking["ood_detection_ready"]
             ),
             "uncertainty_history_count": int(
                 braking["historical_sample_count"]
