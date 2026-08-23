@@ -6,7 +6,7 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # 鎖定手動部署：main 有新 commit 時不會自動把正在使用的模型換掉。
+    # main 有新 Commit 時不自動換掉目前模型；改由 Render 後台手動部署。
     autoDeploy: false
     disk:
       name: bgs-runtime-data
@@ -15,16 +15,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      # /health 顯示此識別碼，確認 Render 實際跑的是固定的 14:14 基線包。
+      # 僅供 /health 確認真正執行中的來源版本。
       - key: BGS_BUILD_LABEL
-        value: 14:14-baseline-efea065
+        value: 16:27-baseline-33cf44a
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
         sync: false
       - key: PUBLIC_BASE_URL
-        sync: false
-      - key: LIFF_ID
         sync: false
       - key: ACTIVATION_CODES
         sync: false
@@ -38,7 +36,7 @@ services:
         value: push
       - key: PREDICT_WORKERS
         value: "2"
-      # 這兩項直接對應 app.py 的記憶體保護；避免 EasyOCR 預載與多圖並行 OOM。
+      # 降低 EasyOCR／OpenCV 峰值記憶體，避免 OOM 造成 instance restart。
       - key: APP_MAX_CONCURRENT_PREDICTIONS
         value: "1"
       - key: OCR_PRELOAD
@@ -53,16 +51,6 @@ services:
         value: /var/data/prediction_performance.json
       - key: PF_DECKS
         value: "8"
-      - key: SHOE_DECKS
-        value: "8"
-      - key: BANKER_COMMISSION
-        value: "0.05"
-      - key: PHYSICAL_MIN_EV
-        value: "0.005"
-      - key: KELLY_FRACTION
-        value: "0.25"
-      - key: MAX_BET_FRACTION
-        value: "0.02"
       - key: PF_PARTICLES
         value: "500"
       - key: PF_REPLICAS
