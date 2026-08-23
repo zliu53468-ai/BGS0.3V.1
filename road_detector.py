@@ -1,4 +1,4 @@
-"""遊戲畫面大路偵測模組 V11.3（保留 DG V11.2，新增 MT／DB 手機全畫面自動追焦）。
+"""遊戲畫面大路偵測模組 V11.4（保留既有館別，新增 Android Chrome 直式大路格式）。
 
 重點：
 1. DG 手機／電腦 ROI、滑動搜尋與固定格辨識流程完整保留 V11.2，不改動原有邏輯。
@@ -7,6 +7,7 @@
 4. 每個圓環分別統計紅、藍、綠 HSV 像素；雙色接近或偏離格位者標記 uncertain。
 5. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不把欄排序當正確答案。
 6. 可用 ROAD_GRID_DEBUG=1 輸出追焦疊圖；版型不吻合時仍以品質閘門阻擋錯序列。
+7. 新增 ofalive99 類 Android Chrome 直式全畫面候選；僅在畫面比例與底部白色大路特徵吻合時啟用。
 """
 from __future__ import annotations
 
@@ -117,6 +118,35 @@ DG_MOBILE_LOWER_FULL_VIEW_ROI = _env_roi(
 DG_MOBILE_LOWER_BROWSER_VIEW_ROI = _env_roi(
     "DG_MOBILE_LOWER_BROWSER_VIEW_ROI",
     (0.302, 0.720, 0.653, 0.104),
+)
+
+# Android Chrome（例如 ofalive99）直式全畫面：瀏覽器工具列與底部導覽列
+# 會讓大路落在比既有 DG 手機版更低的位置。此設定是「新增候選」，
+# 不覆寫 DG／MT／DB／其他館別的既有 ROI、HSV 門檻或品質閘門。
+# 以 858×1907 範例換算：約為 x=259~819、y=1350~1598，只保留右側大路六列，
+# 排除左側珠盤路、下三路與右側問路按鈕。
+OFALIVE_ANDROID_PROFILE_ENABLED = (
+    os.getenv("OFALIVE_ANDROID_PROFILE_ENABLED", "1").strip() == "1"
+)
+OFALIVE_ANDROID_BIG_ROAD_ROI = _env_roi(
+    "OFALIVE_ANDROID_BIG_ROAD_ROI",
+    (0.302, 0.708, 0.653, 0.130),
+)
+OFALIVE_ANDROID_SIGNATURE_ROI = _env_roi(
+    "OFALIVE_ANDROID_SIGNATURE_ROI",
+    (0.280, 0.675, 0.680, 0.195),
+)
+OFALIVE_ANDROID_PROFILE_SEARCH_Y = _env_float(
+    "OFALIVE_ANDROID_PROFILE_SEARCH_Y", 0.030, 0.0, 0.12
+)
+OFALIVE_ANDROID_MIN_TALL_RATIO = _env_float(
+    "OFALIVE_ANDROID_MIN_TALL_RATIO", 1.85, 1.20, 4.00
+)
+OFALIVE_ANDROID_MAX_TALL_RATIO = _env_float(
+    "OFALIVE_ANDROID_MAX_TALL_RATIO", 2.65, 1.20, 4.00
+)
+OFALIVE_ANDROID_MIN_BRIGHT_FRACTION = _env_float(
+    "OFALIVE_ANDROID_MIN_BRIGHT_FRACTION", 0.60, 0.10, 0.95
 )
 
 DG_DESKTOP_BIG_ROAD_ROI = _env_roi(
@@ -1689,6 +1719,38 @@ def _looks_like_road_crop(image: np.ndarray) -> bool:
     )
 
 
+def _looks_like_ofalive_android_fullscreen(image: np.ndarray) -> bool:
+    """判斷是否為新增支援的 Android Chrome 直式大路版型。
+
+    不依賴館別名稱，避免使用者選擇既有館別時漏掉 Android 版型；但必須同時
+    滿足高直式比例與畫面下方指定區域的大面積白色路紙特徵，才會新增候選。
+    因此不會改變一般桌面、橫向裁圖或其他不符合此畫面特徵的既有流程。
+    """
+    if not OFALIVE_ANDROID_PROFILE_ENABLED:
+        return False
+
+    height, width = image.shape[:2]
+    if height < 360 or width < 240:
+        return False
+
+    tall_ratio = height / max(1.0, float(width))
+    if not (OFALIVE_ANDROID_MIN_TALL_RATIO <= tall_ratio <= OFALIVE_ANDROID_MAX_TALL_RATIO):
+        return False
+
+    sample, _ = _crop(image, OFALIVE_ANDROID_SIGNATURE_ROI)
+    if sample.size == 0:
+        return False
+
+    # BGR 不需要先轉 HSV：白色路紙同時具有高亮度、低色差，可避免額外耗時。
+    pixels = sample.astype(np.int16, copy=False)
+    channel_min = np.min(pixels, axis=2)
+    channel_span = np.max(pixels, axis=2) - channel_min
+    bright_neutral = (channel_min >= 175) & (channel_span <= 75)
+    return bool(
+        float(np.mean(bright_neutral)) >= OFALIVE_ANDROID_MIN_BRIGHT_FRACTION
+    )
+
+
 def _shifted_profile_rois(
     base: Tuple[float, float, float, float],
     *,
@@ -1741,6 +1803,7 @@ def detect_road_sequence_detailed(
     candidates: List[Dict[str, Any]] = []
     attempted: List[str] = []
     plan: List[Dict[str, Any]] = []
+    ofalive_android_layout = False
 
     if likely_crop:
         plan.append({
@@ -1763,6 +1826,29 @@ def detect_road_sequence_detailed(
     else:
         portrait = image_height > image_width * 1.15
         landscape = image_width > image_height * 1.25
+        ofalive_android_layout = bool(
+            portrait and _looks_like_ofalive_android_fullscreen(image)
+        )
+
+        if ofalive_android_layout:
+            # 這批候選排在既有版型之前，確保 Android Chrome 的完整六列大路
+            # 不會先被較淺的舊手機 ROI 裁掉；若本批未通過，下面所有原有流程
+            # 仍會依原順序繼續執行。
+            for index, roi in enumerate(
+                _shifted_profile_rois(
+                    OFALIVE_ANDROID_BIG_ROAD_ROI,
+                    y_radius=OFALIVE_ANDROID_PROFILE_SEARCH_Y,
+                )
+            ):
+                plan.append({
+                    "name": f"ofalive_android_big_road_{index}",
+                    "roi": roi,
+                    "preference": 60.0 - index * 0.4,
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "ofalive_android_chrome_full_screen",
+                })
+
         if portrait and venue_code == "DG":
             # 新增兩種 DG 942×2048 手機畫面；先嘗試精準 ROI，
             # 未通過品質閘門時才繼續執行原本 dg_mobile_big_road_* 流程。
@@ -1941,6 +2027,7 @@ def detect_road_sequence_detailed(
         "fast_early_exit": len(candidates) < len(plan),
         "wide_layout_detected": bool(wide_multi_road),
         "road_crop_signature": bool(crop_signature),
+        "ofalive_android_profile_detected": bool(ofalive_android_layout),
         "image_size": {"width": image_width, "height": image_height},
         "candidate_regions": [
             {
