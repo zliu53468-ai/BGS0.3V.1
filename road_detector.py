@@ -1,4 +1,4 @@
-"""遊戲畫面大路偵測模組 V11.4（保留既有館別，新增 Android Chrome 直式大路格式）。
+"""遊戲畫面大路偵測模組 V11.5（保留既有館別，新增兩種手機全畫面格式）。
 
 重點：
 1. DG 手機／電腦 ROI、滑動搜尋與固定格辨識流程完整保留 V11.2，不改動原有邏輯。
@@ -8,6 +8,7 @@
 5. 依標準大路落點規則（含長龍右黏狀態）反推時間序列；失敗不把欄排序當正確答案。
 6. 可用 ROAD_GRID_DEBUG=1 輸出追焦疊圖；版型不吻合時仍以品質閘門阻擋錯序列。
 7. 新增 ofalive99 類 Android Chrome 直式全畫面候選；僅在畫面比例與底部白色大路特徵吻合時啟用。
+8. 新增 Dream Gaming 緊湊手機版候選；獨立辨識中間大路，不將右側下三路混入。
 """
 from __future__ import annotations
 
@@ -147,6 +148,37 @@ OFALIVE_ANDROID_MAX_TALL_RATIO = _env_float(
 )
 OFALIVE_ANDROID_MIN_BRIGHT_FRACTION = _env_float(
     "OFALIVE_ANDROID_MIN_BRIGHT_FRACTION", 0.60, 0.10, 0.95
+)
+
+# Dream Gaming 緊湊手機版（例如 new-dd-cn.ahsy114.com）：珠盤路在左、中間為
+# 六列大路、右側另有下三路。其大路寬度遠小於 Android Chrome 的 ofalive99 版型，
+# 必須獨立取中間區塊，否則會把右側下三路誤當成同一張大路。
+# 以 591×1280 範例換算：約為 x=161~427、y=928~1114；app.py 放大圖片後
+# 仍以等比例座標辨識，不能依賴原始像素寬度。
+DREAM_COMPACT_MOBILE_PROFILE_ENABLED = (
+    os.getenv("DREAM_COMPACT_MOBILE_PROFILE_ENABLED", "1").strip() == "1"
+)
+DREAM_COMPACT_MOBILE_BIG_ROAD_ROI = _env_roi(
+    "DREAM_COMPACT_MOBILE_BIG_ROAD_ROI",
+    (0.272, 0.725, 0.450, 0.145),
+)
+DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y = _env_float(
+    "DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y", 0.020, 0.0, 0.10
+)
+DREAM_COMPACT_MOBILE_MIN_WIDTH = _env_int(
+    "DREAM_COMPACT_MOBILE_MIN_WIDTH", 320, 240, 1600
+)
+DREAM_COMPACT_MOBILE_MAX_WIDTH = _env_int(
+    "DREAM_COMPACT_MOBILE_MAX_WIDTH", 1200, 240, 2400
+)
+DREAM_COMPACT_MOBILE_MIN_TALL_RATIO = _env_float(
+    "DREAM_COMPACT_MOBILE_MIN_TALL_RATIO", 2.10, 1.20, 4.00
+)
+DREAM_COMPACT_MOBILE_MAX_TALL_RATIO = _env_float(
+    "DREAM_COMPACT_MOBILE_MAX_TALL_RATIO", 2.19, 1.20, 4.00
+)
+DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION = _env_float(
+    "DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION", 0.62, 0.10, 0.95
 )
 
 DG_DESKTOP_BIG_ROAD_ROI = _env_roi(
@@ -1751,6 +1783,39 @@ def _looks_like_ofalive_android_fullscreen(image: np.ndarray) -> bool:
     )
 
 
+def _looks_like_dream_compact_mobile_fullscreen(image: np.ndarray) -> bool:
+    """判斷珠盤路／大路／下三路橫向並列的 Dream 緊湊手機版。"""
+    if not DREAM_COMPACT_MOBILE_PROFILE_ENABLED:
+        return False
+
+    height, width = image.shape[:2]
+    if height < 500 or not (
+        DREAM_COMPACT_MOBILE_MIN_WIDTH <= width <= DREAM_COMPACT_MOBILE_MAX_WIDTH
+    ):
+        return False
+
+    tall_ratio = height / max(1.0, float(width))
+    if not (
+        DREAM_COMPACT_MOBILE_MIN_TALL_RATIO
+        <= tall_ratio
+        <= DREAM_COMPACT_MOBILE_MAX_TALL_RATIO
+    ):
+        return False
+
+    sample, _ = _crop(image, DREAM_COMPACT_MOBILE_BIG_ROAD_ROI)
+    if sample.size == 0:
+        return False
+
+    pixels = sample.astype(np.int16, copy=False)
+    channel_min = np.min(pixels, axis=2)
+    channel_span = np.max(pixels, axis=2) - channel_min
+    bright_neutral = (channel_min >= 175) & (channel_span <= 75)
+    return bool(
+        float(np.mean(bright_neutral))
+        >= DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION
+    )
+
+
 def _shifted_profile_rois(
     base: Tuple[float, float, float, float],
     *,
@@ -1803,6 +1868,7 @@ def detect_road_sequence_detailed(
     candidates: List[Dict[str, Any]] = []
     attempted: List[str] = []
     plan: List[Dict[str, Any]] = []
+    dream_compact_mobile_layout = False
     ofalive_android_layout = False
 
     if likely_crop:
@@ -1826,9 +1892,34 @@ def detect_road_sequence_detailed(
     else:
         portrait = image_height > image_width * 1.15
         landscape = image_width > image_height * 1.25
-        ofalive_android_layout = bool(
-            portrait and _looks_like_ofalive_android_fullscreen(image)
+        dream_compact_mobile_layout = bool(
+            portrait
+            and venue_code in {"", "DG"}
+            and _looks_like_dream_compact_mobile_fullscreen(image)
         )
+        ofalive_android_layout = bool(
+            portrait
+            and not dream_compact_mobile_layout
+            and _looks_like_ofalive_android_fullscreen(image)
+        )
+
+        if dream_compact_mobile_layout:
+            # 必須先於 ofalive 與既有 DG 手機候選執行；這張版型的右側是下三路，
+            # 只有中間白色六列區塊可作為大路反推。候選失敗時仍會繼續原有流程。
+            for index, roi in enumerate(
+                _shifted_profile_rois(
+                    DREAM_COMPACT_MOBILE_BIG_ROAD_ROI,
+                    y_radius=DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y,
+                )
+            ):
+                plan.append({
+                    "name": f"dream_compact_mobile_big_road_{index}",
+                    "roi": roi,
+                    "preference": 64.0 - index * 0.4,
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "dream_compact_mobile_full_screen",
+                })
 
         if ofalive_android_layout:
             # 這批候選排在既有版型之前，確保 Android Chrome 的完整六列大路
@@ -2027,6 +2118,7 @@ def detect_road_sequence_detailed(
         "fast_early_exit": len(candidates) < len(plan),
         "wide_layout_detected": bool(wide_multi_road),
         "road_crop_signature": bool(crop_signature),
+        "dream_compact_mobile_profile_detected": bool(dream_compact_mobile_layout),
         "ofalive_android_profile_detected": bool(ofalive_android_layout),
         "image_size": {"width": image_width, "height": image_height},
         "candidate_regions": [
