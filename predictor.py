@@ -3,8 +3,7 @@
 正式圖片／真人桌預測使用完整 B/P/T 歷史、牌路上下文與 LinUCB cMAB。
 adaptive_ensemble 負責統計混沌硬熔斷；predictor 只在後台執行
 三局影子回測，達成連中 2 局且模型方差安全後才解除 No Bet。
-路單／cMAB 僅保留為診斷訊號；正式資金方向必須通過精確剩餘牌組的
-不放回機率、抽水後 EV 與分數凱利閘門。DeepSeek 不參與決策。
+不恢復已移除的粒子、超幾何、蒙地卡羅、Stacking 或 DeepSeek。
 """
 from __future__ import annotations
 
@@ -17,11 +16,6 @@ import secrets
 from adaptive_ensemble import adapt_prediction
 from contextual_bandit import predict_bandit
 from particle_filter_points import counts_from_shoe, deal_ordered_hand
-from shoe_composition import (
-    STANDARD_EIGHT_DECK_BASELINE,
-    analyze_shoe_composition,
-    parse_card_value,
-)
 from validated_decision_layer import apply_validated_decision
 
 DB_HOLDOUT: Dict[str, Any] = {
@@ -422,112 +416,6 @@ ShortTermTakeoverController = ShadowBacktestController
 _SHORT_TERM_CONTROLLER = _SHADOW_CONTROLLER
 
 
-def _apply_physical_edge_gate(
-    prediction: Mapping[str, Any],
-    shoe_context: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """以精確牌組 EV 作為最後資金閘門，路單模型只留作診斷。
-
-    B/P/T 歷史不能反推牌點。沒有 exact counts／observed cards 時必須
-    No Bet，而不是讓路單的相關性分數偽裝成物理勝率。
-    """
-    result = dict(prediction or {})
-    result["road_model_diagnostic"] = {
-        "action": str(result.get("action") or result.get("recommend") or "O"),
-        "probabilities": dict(result.get("probabilities") or {}),
-        "banker_rate": float(result.get("banker_rate", 0.0) or 0.0),
-        "player_rate": float(result.get("player_rate", 0.0) or 0.0),
-        "tie_rate": float(result.get("tie_rate", 0.0) or 0.0),
-        "quality_score": float(result.get("quality_score", 0.0) or 0.0),
-        "purpose": "pattern_diagnostic_only_not_a_betting_probability",
-    }
-
-    physical = analyze_shoe_composition(shoe_context)
-    available = bool(physical.get("available"))
-    probabilities = dict(
-        physical.get("probabilities")
-        if available
-        else STANDARD_EIGHT_DECK_BASELINE
-    )
-    action = str(physical.get("action") or "O").upper()
-    if action not in {"B", "P"}:
-        action = "O"
-
-    banker_probability = float(probabilities.get("B", 0.0) or 0.0)
-    player_probability = float(probabilities.get("P", 0.0) or 0.0)
-    tie_probability = float(probabilities.get("T", 0.0) or 0.0)
-    selected_ev = float(physical.get("selected_expected_return", 0.0) or 0.0)
-    best_raw_ev = float(physical.get("best_raw_expected_return", selected_ev) or 0.0)
-    bet_percentage = float(physical.get("recommended_bet_percentage", 0.0) or 0.0)
-    reason = str(physical.get("reason") or "沒有可驗證的牌組物理優勢")
-    direction_edge = abs(banker_probability - player_probability)
-    action_text = "莊" if action == "B" else "閒" if action == "P" else "觀望／無優勢"
-
-    result.update({
-        "probabilities": {
-            "B": banker_probability,
-            "P": player_probability,
-            "T": tie_probability,
-        },
-        "banker_rate": round(banker_probability * 100.0, 6),
-        "player_rate": round(player_probability * 100.0, 6),
-        "tie_rate": round(tie_probability * 100.0, 6),
-        "action": action,
-        "recommend": action,
-        "internal_action": action,
-        "internal_recommend": action,
-        "action_text": action_text,
-        "recommend_text": action_text,
-        "direction_edge": direction_edge,
-        "direction_edge_percent": direction_edge * 100.0,
-        "expected_returns": dict(physical.get("expected_returns") or {}),
-        "selected_expected_return": selected_ev,
-        "selected_expected_return_percent": selected_ev * 100.0,
-        "best_raw_expected_return": best_raw_ev,
-        "best_raw_expected_return_percent": best_raw_ev * 100.0,
-        "kelly_fraction": float(physical.get("kelly_fraction", 0.0) or 0.0),
-        "recommended_bet_percentage": bet_percentage,
-        "signal_reason": reason,
-        "internal_signal_reason": reason,
-        "signal_status_text": (
-            "精確牌組正期望訊號已通過"
-            if action in {"B", "P"}
-            else "物理優勢不足：觀望／不下注"
-        ),
-        "confidence_score": min(1.0, max(0.0, selected_ev / 0.03)) if action in {"B", "P"} else 0.0,
-        "quality_score": min(1.0, max(0.0, selected_ev / 0.03)) if action in {"B", "P"} else 0.0,
-        "confidence_label": "物理正期望" if action in {"B", "P"} else "無可下注優勢",
-        "bet_multiplier": float(physical.get("kelly_fraction", 0.0) or 0.0),
-        "input_required": not available,
-        "composition_quality": "exact" if available else "unavailable_from_bpt_results",
-        "remaining_counts_source": str(physical.get("source") or "outcome_history_only"),
-        "shoe_context_ignored": False,
-        "physical_edge_gate": physical,
-        "risk_gate_open": bool(physical.get("risk_gate_open")),
-        "deepseek_active": False,
-        "llm_decision_allowed": False,
-        "decision_engine": "deterministic_exact_composition_ev_kelly",
-        "deterministic_statistical_summary": (
-            f"精確不放回機率：莊 {banker_probability:.4%}、"
-            f"閒 {player_probability:.4%}、和 {tie_probability:.4%}；"
-            f"最佳抽水後 EV {best_raw_ev:+.4%}。"
-            if available
-            else "目前只有 B/P/T 路單，無法識別實際剩餘牌組；未啟用物理算牌訊號。"
-        ),
-        "risk_warning": (
-            "每局仍為高變異事件；正 EV 不保證下一局命中。禁止以連莊、連閒或斷龍推導必然反轉。"
-        ),
-    })
-    result["physical_input_fingerprint"] = sha256(
-        repr((
-            physical.get("source"),
-            physical.get("remaining_counts"),
-            physical.get("reason_code"),
-        )).encode("utf-8")
-    ).hexdigest()[:24]
-    return result
-
-
 def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", room: str = "",
             shoe_id: str = "", user_id: str = "", run_seed: Optional[int] = None,
             shoe_context: Optional[Mapping[str, Any]] = None,
@@ -558,7 +446,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         result,
         venue=str(venue or ""),
         room=str(room or ""),
-        shoe_id=str(shoe_id or ""),
     )
     # 只在模型之外使用「已結算、時間順序正確」的真實績效選擇方向，
     # 並壓低尚未經外驗證的假高信心；不改任何基礎模型參數或公式。
@@ -577,9 +464,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             shoe_id=str(shoe_id or ""),
         ),
     )
-    # 最後一道資金閘門：不論任何牌路模型如何推薦，都必須有可驗證的
-    # 剩餘牌組、抽水後正 EV 與 Kelly > 0 才能輸出 B/P。
-    result = _apply_physical_edge_gate(result, shoe_context)
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
     ).strip()
@@ -590,7 +474,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             str(venue or "").upper().strip(),
             str(room or "").strip(),
             str(shoe_id or "__unspecified_shoe__").strip(),
-            str(result.get("physical_input_fingerprint") or ""),
         )).encode("utf-8")
     ).hexdigest()[:24]
     result.update({
@@ -599,9 +482,13 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "bandit_scope_mode": "user_venue_room_long_term",
         "bandit_shoe_isolated": False,
         "shoe_event_isolated": True,
+        "composition_quality": "not_applicable_cmab",
+        "remaining_counts_source": "not_used",
+        "shoe_context_ignored": bool(shoe_context),
         "road_quality_ok": bool(dict(road_context or {}).get(
             "quality_ok", dict(road_context or {}).get("recognition_quality_ok", True)
         )),
+        "input_required": False,
     })
     return result
 
@@ -620,10 +507,6 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         shoe_id=str(session.get("shoe_id") or ""),
         user_id=str(session.get("user_id") or ""),
         run_seed=seed,
-        shoe_context={
-            "remaining_counts": counts_from_shoe(hidden_shoe),
-            "source": "virtual_shoe_exact_remaining_counts",
-        },
         road_context=None,
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
@@ -668,9 +551,8 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
 
-def parse_point_observation(value: Any) -> int:
-    """相容入口：解析 A/2..9/10/J/Q/K 為百家樂點數。"""
-    return parse_card_value(value)
+def parse_point_observation(value: Any) -> None:
+    return None
 
 
 __all__ = [
