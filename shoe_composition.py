@@ -16,8 +16,19 @@ import os
 
 DECKS = max(1, min(16, int(os.getenv("SHOE_DECKS", "8") or "8")))
 BANKER_COMMISSION = min(0.20, max(0.0, float(os.getenv("BANKER_COMMISSION", "0.05") or "0.05")))
-MIN_POSITIVE_EV = max(0.0, float(os.getenv("PHYSICAL_MIN_EV", "0.005") or "0.005"))
+MIN_POSITIVE_EV = max(0.0, float(os.getenv("PHYSICAL_MIN_EV", "0.002") or "0.002"))
 KELLY_FRACTION = min(1.0, max(0.0, float(os.getenv("KELLY_FRACTION", "0.25") or "0.25")))
+WEAK_EV_UPPER_BOUND = max(
+    MIN_POSITIVE_EV,
+    float(os.getenv("WEAK_EV_UPPER_BOUND", "0.005") or "0.005"),
+)
+WEAK_EV_KELLY_FRACTION = min(
+    KELLY_FRACTION,
+    max(
+        0.0,
+        float(os.getenv("WEAK_EV_KELLY_FRACTION", "0.125") or "0.125"),
+    ),
+)
 MAX_BET_FRACTION = min(0.10, max(0.0, float(os.getenv("MAX_BET_FRACTION", "0.02") or "0.02")))
 
 # 8 副牌標準牌靴的公開理論基準；僅用於比較，不會在未知牌組時產生下注訊號。
@@ -202,7 +213,12 @@ def kelly_fraction(
     side: str,
     probabilities: Mapping[str, float],
 ) -> float:
-    """含和局 push 的 full Kelly，再套用分數凱利與硬上限。"""
+    """含和局 push 的 full Kelly，再套用動態分數凱利與硬上限。
+
+    最佳淨 EV 剛跨過出手門檻、但尚未超過弱優勢上限時，只採用
+    八分之一 Kelly。EV 較明顯時才恢復一般分數 Kelly，避免為了
+    提高出手率而同步放大本金波動。
+    """
     code = str(side or "").upper()
     if code not in {"B", "P"}:
         return 0.0
@@ -212,8 +228,22 @@ def kelly_fraction(
     resolved_probability = p_win + p_loss
     if resolved_probability <= 0.0 or odds <= 0.0:
         return 0.0
-    full_kelly = (odds * p_win - p_loss) / (odds * resolved_probability)
-    return min(MAX_BET_FRACTION, max(0.0, full_kelly) * KELLY_FRACTION)
+    raw_ev = odds * p_win - p_loss
+    full_kelly = raw_ev / (odds * resolved_probability)
+    applied_fraction = (
+        WEAK_EV_KELLY_FRACTION
+        if MIN_POSITIVE_EV <= raw_ev <= WEAK_EV_UPPER_BOUND
+        else KELLY_FRACTION
+    )
+    return min(MAX_BET_FRACTION, max(0.0, full_kelly) * applied_fraction)
+
+
+def _applied_kelly_fraction(*, expected_return: float) -> float:
+    """回傳本次使用的 Kelly 比例，供 API 與回測完整稽核。"""
+    value = float(expected_return)
+    if MIN_POSITIVE_EV <= value <= WEAK_EV_UPPER_BOUND:
+        return float(WEAK_EV_KELLY_FRACTION)
+    return float(KELLY_FRACTION)
 
 
 def _full_kelly_fraction(*, side: str, probabilities: Mapping[str, float]) -> float:
@@ -298,6 +328,7 @@ def analyze_shoe_composition(
         selected_ev = float(returns[selected_side])
         action = selected_side if selected_ev >= MIN_POSITIVE_EV else "O"
         full_kelly = _full_kelly_fraction(side=action, probabilities=probabilities)
+        applied_kelly = _applied_kelly_fraction(expected_return=selected_ev)
         fraction = kelly_fraction(side=action, probabilities=probabilities)
         baseline = STANDARD_EIGHT_DECK_BASELINE
         return {
@@ -318,9 +349,17 @@ def analyze_shoe_composition(
             "selected_expected_return": selected_ev if action in {"B", "P"} else 0.0,
             "best_raw_expected_return": selected_ev,
             "minimum_positive_ev": MIN_POSITIVE_EV,
-            "kelly_method": "quarter_kelly_with_tie_push_and_hard_cap",
+            "kelly_method": (
+                "eighth_kelly_for_weak_positive_ev_with_tie_push_and_hard_cap"
+                if action in {"B", "P"}
+                and selected_ev <= WEAK_EV_UPPER_BOUND
+                else "fractional_kelly_with_tie_push_and_hard_cap"
+            ),
+            "applied_kelly_fraction": applied_kelly if action in {"B", "P"} else 0.0,
+            "weak_ev_upper_bound": WEAK_EV_UPPER_BOUND,
+            "weak_ev_kelly_fraction": WEAK_EV_KELLY_FRACTION,
             "full_kelly_before_fraction": full_kelly,
-            "fractional_kelly_before_cap": full_kelly * KELLY_FRACTION,
+            "fractional_kelly_before_cap": full_kelly * applied_kelly,
             "kelly_fraction": fraction,
             "recommended_bet_percentage": fraction * 100.0,
             "risk_gate_open": action in {"B", "P"} and fraction > 0.0,
@@ -353,6 +392,8 @@ __all__ = [
     "KELLY_FRACTION",
     "MAX_BET_FRACTION",
     "MIN_POSITIVE_EV",
+    "WEAK_EV_KELLY_FRACTION",
+    "WEAK_EV_UPPER_BOUND",
     "analyze_shoe_composition",
     "exact_next_hand_probabilities",
     "expected_returns",
