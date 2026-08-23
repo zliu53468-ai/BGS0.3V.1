@@ -20,8 +20,6 @@ services:
         sync: false
       - key: PUBLIC_BASE_URL
         sync: false
-      - key: LIFF_ID
-        sync: false
       - key: ACTIVATION_CODES
         sync: false
       - key: ADMIN_LINE_ID
@@ -44,16 +42,6 @@ services:
         value: /var/data/prediction_performance.json
       - key: PF_DECKS
         value: "8"
-      - key: SHOE_DECKS
-        value: "8"
-      - key: BANKER_COMMISSION
-        value: "0.05"
-      - key: PHYSICAL_MIN_EV
-        value: "0.005"
-      - key: KELLY_FRACTION
-        value: "0.25"
-      - key: MAX_BET_FRACTION
-        value: "0.02"
       - key: PF_PARTICLES
         value: "500"
       - key: PF_REPLICAS
