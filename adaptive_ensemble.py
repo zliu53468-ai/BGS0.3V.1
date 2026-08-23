@@ -16,7 +16,6 @@ from performance_tracker import get_performance_summary
 
 
 OUTCOMES = ("B", "P", "T")
-REMOVED_COMPONENTS = frozenset({"markov1", "markov2", "markov3"})
 ADAPTIVE_ENABLED = os.getenv("ADAPTIVE_ENSEMBLE_ENABLED", "1").strip() == "1"
 ADAPTIVE_MIN_SAMPLES = max(50, int(os.getenv("ADAPTIVE_MIN_SAMPLES", "300") or "300"))
 ADAPTIVE_MAX_SHARE = max(0.0, min(0.35, float(os.getenv("ADAPTIVE_MAX_SHARE", "0.15") or "0.15")))
@@ -90,8 +89,6 @@ def _components(prediction: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
     nested = prediction.get("component_probabilities")
     if isinstance(nested, Mapping):
         for name, values in nested.items():
-            if str(name).lower().strip() in REMOVED_COMPONENTS:
-                continue
             if not isinstance(values, Mapping):
                 continue
             try:
@@ -591,7 +588,6 @@ def _apply_plurality_decision(
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,
-        "excluded_components": sorted(REMOVED_COMPONENTS),
     }
     return result
 
