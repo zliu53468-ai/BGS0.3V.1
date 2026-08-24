@@ -1,4 +1,4 @@
-"""BGS cMAB 主模型：LinUCB 上下文相關多臂老虎機。
+""BGS cMAB 主模型：LinUCB 上下文相關多臂老虎機。
 
 主要方向只有兩個 Arm：B（莊）與 P（閒）。
 本模組不使用粒子濾波、超幾何分布、蒙地卡羅或 Stacking。
