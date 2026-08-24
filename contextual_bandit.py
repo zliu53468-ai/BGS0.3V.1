@@ -41,7 +41,7 @@ import numpy as np
 from road_model import build_road_context
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V3.1-REGIME-STABLE-PREQUENTIAL"
+MODEL_VERSION = "CMAB-LINUCB-V3.2-REGIME-FIRST-PREQUENTIAL"
 STATE_SCHEMA_VERSION = "CMAB-EPISODE-REPLAY-V4"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -88,6 +88,21 @@ CMAB_TIE_PRIOR = 0.095156
 CMAB_TIE_PRIOR_STRENGTH = 40.0
 CMAB_MIN_SIGNAL_EDGE = 0.012
 CMAB_MIN_SIGNAL_UPDATES = 6
+
+# 路型優先決策：這不是另一組機率加權，而是先辨識「目前正在走哪一種
+# 結構」，再決定該由結構規則或 LinUCB 分數作為本局的方向來源。
+#
+# 只有已知的 B/P 時序可作判斷，T 會保留在完整歷史中，但不推進大路結構。
+# 規則刻意要求至少三顆同向或高度交替，避免把「最後剛開的一顆」錯當成龍。
+CMAB_REGIME_WINDOW = 8
+CMAB_REGIME_MIN_HISTORY = 4
+CMAB_TREND_MIN_STREAK = 3
+CMAB_TREND_MAX_TRANSITION_RATE = 0.45
+CMAB_CHOP_MIN_TRANSITION_RATE = 0.70
+CMAB_REGIME_MIN_STRENGTH = 0.66
+# 當 LinUCB 的條件分數差已很大時，不用簡單路型規則硬蓋掉它；反之，
+# 分數接近時，優先採用可直接解釋的長龍／單跳結構。
+CMAB_REGIME_OVERRIDE_MAX_BANDIT_EDGE = 0.10
 
 # 遞迴 ridge 衰減：A <- lambda*A + (1-lambda)*ridge*I + xx^T。
 # 舊版最快掉到 0.89，單局跳路便只剩約 9 局有效記憶；新版仍會對真實
@@ -1400,6 +1415,145 @@ def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any])
     return "B" if (digest[0] & 1) == 0 else "P"
 
 
+def _road_regime_decision(history: Sequence[str]) -> Dict[str, Any]:
+    """以可解釋的大路結構產生「路型先行」候選方向。
+
+    這個函式特意不讀取 ``road_context.direction``、各模型機率或上一局的
+    預測結果。它只讀取已揭曉的 B/P 序列，避免把外部模型的方向再包裝成
+    「牌路規律」，也避免按下結果按鈕後直接跟著最後一顆走。
+
+    判斷順序：
+
+    1. **長龍盤**：末端至少三顆同向，且最近窗口的轉換率不高，才視為
+       可驗證的延續結構。
+    2. **單跳／跳路盤**：最近窗口的轉換率很高，才選擇最後一顆的反向，
+       也就是延續 B/P 交替結構。
+    3. **混合盤**：不強塞規則方向，回交給 LinUCB 的完整 35 維 context。
+
+    回傳的 ``strength`` 是結構辨識強度，並非下一局真實開出機率。
+    """
+    bp = [value for value in history if value in ARMS]
+    if len(bp) < CMAB_REGIME_MIN_HISTORY:
+        return {
+            "regime": "neutral",
+            "direction": "",
+            "strength": 0.0,
+            "sample_count": len(bp),
+            "window": list(bp),
+            "transition_rate": 0.0,
+            "current_streak": 0,
+            "reason": "B/P 樣本不足，交由 LinUCB context 決定。",
+        }
+
+    recent = bp[-CMAB_REGIME_WINDOW:]
+    last_direction, current_streak = _streak(recent)
+    transition_rate = _transition_rate(recent, len(recent))
+
+    if (
+        current_streak >= CMAB_TREND_MIN_STREAK
+        and transition_rate <= CMAB_TREND_MAX_TRANSITION_RATE
+    ):
+        # 龍越長、近期切換越少，結構越明確。下限故意不低於接管門檻，
+        # 但最高仍封頂，避免把短靴的長龍誤當成必然事件。
+        stability = 1.0 - min(
+            1.0,
+            transition_rate / CMAB_TREND_MAX_TRANSITION_RATE,
+        )
+        strength = min(
+            0.90,
+            0.66
+            + 0.055 * min(3, current_streak - CMAB_TREND_MIN_STREAK)
+            + 0.08 * stability,
+        )
+        return {
+            "regime": "trend",
+            "direction": last_direction,
+            "strength": float(strength),
+            "sample_count": len(bp),
+            "window": list(recent),
+            "transition_rate": float(transition_rate),
+            "current_streak": int(current_streak),
+            "reason": (
+                f"末端 {current_streak} 顆{'莊' if last_direction == 'B' else '閒'}"
+                f"，最近 {len(recent)} 手轉換率 {transition_rate:.0%}；"
+                "符合低切換長龍結構。"
+            ),
+        }
+
+    if transition_rate >= CMAB_CHOP_MIN_TRANSITION_RATE:
+        # 只有高轉換才反向；這不是看到單一斷龍就立即反打，而是至少有一個
+        # 窗口的交替證據。對 B-P-B-P 與雙跳混合盤都比單看比例更敏感。
+        direction = "P" if last_direction == "B" else "B"
+        strength = min(
+            0.90,
+            0.66
+            + 0.18
+            * min(
+                1.0,
+                (transition_rate - CMAB_CHOP_MIN_TRANSITION_RATE)
+                / max(1e-9, 1.0 - CMAB_CHOP_MIN_TRANSITION_RATE),
+            ),
+        )
+        return {
+            "regime": "chop",
+            "direction": direction,
+            "strength": float(strength),
+            "sample_count": len(bp),
+            "window": list(recent),
+            "transition_rate": float(transition_rate),
+            "current_streak": int(current_streak),
+            "reason": (
+                f"最近 {len(recent)} 手轉換率 {transition_rate:.0%}；"
+                "符合單跳／跳路結構，選擇反向延續交替。"
+            ),
+        }
+
+    return {
+        "regime": "neutral",
+        "direction": "",
+        "strength": 0.0,
+        "sample_count": len(bp),
+        "window": list(recent),
+        "transition_rate": float(transition_rate),
+        "current_streak": int(current_streak),
+        "reason": "長龍與跳路結構皆不明確，交由 LinUCB 35 維 context 決定。",
+    }
+
+
+def _select_regime_first_direction(
+    bandit_direction: str,
+    conditional_bp: Mapping[str, Any],
+    regime: Mapping[str, Any],
+) -> tuple[str, str]:
+    """在「路型規則」與「LinUCB」之間選擇單一最終來源。
+
+    這是來源選擇而不是把兩個百分比相加：因此畫面與紀錄能明確說出本局
+    是由長龍、跳路或 cMAB 所決定。當兩者同向時直接確認；相反時只有路型
+    足夠明確且 LinUCB edge 小，才讓路型優先。
+    """
+    bandit = bandit_direction if bandit_direction in ARMS else "B"
+    regime_direction = str(regime.get("direction") or "").upper()
+    regime_strength = float(regime.get("strength", 0.0) or 0.0)
+    try:
+        bandit_edge = abs(
+            float(conditional_bp.get("B", 0.5))
+            - float(conditional_bp.get("P", 0.5))
+        )
+    except Exception:
+        bandit_edge = 0.0
+
+    if regime_direction not in ARMS:
+        return bandit, "bandit_neutral_regime"
+    if regime_direction == bandit:
+        return bandit, "regime_and_bandit_agree"
+    if (
+        regime_strength >= CMAB_REGIME_MIN_STRENGTH
+        and bandit_edge <= CMAB_REGIME_OVERRIDE_MAX_BANDIT_EDGE
+    ):
+        return regime_direction, "regime_priority_low_bandit_edge"
+    return bandit, "bandit_priority_clear_edge"
+
+
 def _short_term_trend_buffer(
     history: Sequence[str],
     fallback_direction: str,
@@ -1724,6 +1878,14 @@ def _predict_bandit_impl(
             score_b,
             score_p,
         )
+        # 路型先行不把規則硬混成另一個機率；它先確認目前是否真的呈現
+        # 長龍或高轉換跳路，再和 LinUCB 的原始方向做來源選擇。
+        regime_decision = _road_regime_decision(raw_history)
+        direction, direction_source = _select_regime_first_direction(
+            base_direction,
+            conditional_bp,
+            regime_decision,
+        )
         tie_probability = _smoothed_tie_probability(raw_history)
         bp_mass = 1.0 - tie_probability
         base_probabilities = {
@@ -1752,15 +1914,30 @@ def _predict_bandit_impl(
         )
         short_term["meta_learning_takeover"] = False
 
-        direction = base_direction
         probabilities = dict(base_probabilities)
         action_code = direction
         action_text = "莊" if direction == "B" else "閒"
-        direction_source = "contextual_bandit_linu_cb_forced_direction"
-        signal_reason = (
-            "LinUCB 依目前牌路 context、歷史回饋、非平穩遺忘與動態探索"
-            "選擇當局 B/P；混沌診斷只調整學習速度，不再輸出觀望。"
-        )
+        if direction_source == "regime_and_bandit_agree":
+            signal_reason = (
+                f"牌路{regime_decision['regime']}結構與 LinUCB 同向；"
+                f"{regime_decision['reason']}"
+            )
+        elif direction_source == "regime_priority_low_bandit_edge":
+            signal_reason = (
+                f"LinUCB B/P 分數差距小，改由牌路{regime_decision['regime']}"
+                f"結構先行；{regime_decision['reason']}"
+            )
+        elif direction_source == "bandit_priority_clear_edge":
+            signal_reason = (
+                f"牌路{regime_decision['regime']}與 LinUCB 相反，但 LinUCB"
+                "分數差距明顯，保留 cMAB 35 維 context 的方向；"
+                f"牌路診斷：{regime_decision['reason']}"
+            )
+        else:
+            signal_reason = (
+                "牌路未形成可驗證的長龍／跳路結構，使用 LinUCB 依目前"
+                "context、歷史回饋、非平穩遺忘與動態探索選擇 B/P。"
+            )
 
         margin = abs(score_b - score_p)
         maturity = 1.0 - math.exp(
@@ -1902,6 +2079,9 @@ def _predict_bandit_impl(
         # predictor 完成後才在 screenshot_predictor 補回 road_support，
         # 導致 adaptive_ensemble 在決策當下看不到任何牌路成員。
         "road_support": dict(road),
+        # 供 LINE／LIFF 面板或日誌顯示：本局不是只看正規化分數，而是
+        # 清楚紀錄是否辨識到長龍、跳路，及最終由哪個來源決定。
+        "road_regime_decision": dict(regime_decision),
         "component_probabilities": dict(
             road.get("component_probabilities") or {}
         ),
