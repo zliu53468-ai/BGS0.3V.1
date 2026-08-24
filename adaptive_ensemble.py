@@ -1,74 +1,45 @@
-"""風險分層式自適應集成。
+"""牌路主導的自適應集成。
 
-正常區間以 reliability + 已結算 Brier 建立權重，使用 logit pooling
-與 plurality evidence 打破簡單平均的 50/50 僵局；若仍完全抵消，
-才由目前證據品質最高的單一模型破局。極端未知區間仍執行 No Bet。
+決策順序固定為：Full Road Pattern Model 建立完整路圖與牌路專家 →
+Adaptive Ensemble 整合牌路專家 → Contextual Bandit 僅以小權重提供
+上下文輔助。這裡不混入算牌、EV、粒子或外部模型，並永遠維持 B/P。
 
-輸出的 B/P 是「方向分數」而非可保證的真實開出機率。
+輸出的 B/P 是方向分數，不是未來開出機率或勝率保證。
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 import math
-import os
 
 from performance_tracker import get_performance_summary
 
 
 OUTCOMES = ("B", "P", "T")
-ADAPTIVE_ENABLED = os.getenv("ADAPTIVE_ENSEMBLE_ENABLED", "1").strip() == "1"
-ADAPTIVE_MIN_SAMPLES = max(50, int(os.getenv("ADAPTIVE_MIN_SAMPLES", "300") or "300"))
-ADAPTIVE_MAX_SHARE = max(0.0, min(0.35, float(os.getenv("ADAPTIVE_MAX_SHARE", "0.15") or "0.15")))
-ADAPTIVE_TEMPERATURE = max(0.01, min(2.0, float(os.getenv("ADAPTIVE_TEMPERATURE", "0.18") or "0.18")))
-ADAPTIVE_CHAMPION_ENABLED = os.getenv(
-    "ADAPTIVE_CHAMPION_ENABLED", "1"
-).strip() == "1"
-ADAPTIVE_CHAMPION_MIN_HISTORY = max(
-    8,
-    min(100, int(os.getenv("ADAPTIVE_CHAMPION_MIN_HISTORY", "12") or "12")),
+# 方向架構參數固定在程式內，避免 Render 遺留的 ADAPTIVE_* 環境變數讓
+# 同一張截圖在不同部署得到不同結果。
+ADAPTIVE_ENABLED = True
+ADAPTIVE_MIN_SAMPLES = 12
+ADAPTIVE_MAX_SHARE = 1.0
+ADAPTIVE_TEMPERATURE = 0.30
+ADAPTIVE_CHAMPION_ENABLED = True
+ADAPTIVE_CHAMPION_MIN_HISTORY = 8
+ADAPTIVE_CHAMPION_MIN_EDGE = 0.015
+ADAPTIVE_CHAMPION_MIN_RELIABILITY = 0.20
+ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES = 30
+ADAPTIVE_CHAMPION_OVERRIDE_BASE_EDGE = 0.035
+ADAPTIVE_CHAMPION_TEMPERATURE = 0.85
+ADAPTIVE_FUSION_TEMPERATURE = 0.80
+ADAPTIVE_PLURALITY_STRENGTH = 0.12
+ADAPTIVE_LOGIT_CAP = 2.20
+ADAPTIVE_SHOE_MIN_SAMPLES = 8
+
+# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。cMAB 是
+# 輔助訊號，最多佔總融合權重 15%，不再把它當作主輸出。
+ROAD_PRIMARY_COMPONENTS = (
+    "full_road", "short", "mid", "long", "pattern", "analogue",
 )
-ADAPTIVE_CHAMPION_MIN_EDGE = max(
-    0.0,
-    min(0.20, float(os.getenv("ADAPTIVE_CHAMPION_MIN_EDGE", "0.015") or "0.015")),
-)
-ADAPTIVE_CHAMPION_MIN_RELIABILITY = max(
-    0.0,
-    min(0.90, float(os.getenv("ADAPTIVE_CHAMPION_MIN_RELIABILITY", "0.20") or "0.20")),
-)
-ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES = max(
-    12,
-    min(500, int(os.getenv("ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES", "30") or "30")),
-)
-ADAPTIVE_CHAMPION_OVERRIDE_BASE_EDGE = max(
-    0.0,
-    min(0.20, float(os.getenv("ADAPTIVE_CHAMPION_OVERRIDE_BASE_EDGE", "0.035") or "0.035")),
-)
-ADAPTIVE_CHAMPION_TEMPERATURE = max(
-    0.35,
-    min(1.0, float(os.getenv("ADAPTIVE_CHAMPION_TEMPERATURE", "0.85") or "0.85")),
-)
-ADAPTIVE_FUSION_TEMPERATURE = max(
-    0.35,
-    min(
-        1.0,
-        float(os.getenv("ADAPTIVE_FUSION_TEMPERATURE", "0.70") or "0.70"),
-    ),
-)
-ADAPTIVE_PLURALITY_STRENGTH = max(
-    0.0,
-    min(
-        0.50,
-        float(os.getenv("ADAPTIVE_PLURALITY_STRENGTH", "0.18") or "0.18"),
-    ),
-)
-ADAPTIVE_LOGIT_CAP = max(
-    0.5,
-    min(5.0, float(os.getenv("ADAPTIVE_LOGIT_CAP", "2.20") or "2.20")),
-)
-ADAPTIVE_SHOE_MIN_SAMPLES = max(
-    4,
-    min(30, int(os.getenv("ADAPTIVE_SHOE_MIN_SAMPLES", "8") or "8")),
-)
+FULL_ROAD_PRIMARY_MULTIPLIER = 1.25
+CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.15
 
 
 def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
@@ -78,27 +49,24 @@ def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
 
 
 def _components(prediction: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
-    mapping = {
-        "hypergeometric": prediction.get("hypergeometric_probabilities"),
-        "monte_carlo": prediction.get("monte_carlo_probabilities"),
-        "particle": prediction.get("particle_probabilities"),
-        "sequence": prediction.get("sequence_probabilities"),
-        "core_before_road": prediction.get("core_probabilities_before_road"),
-    }
+    """只收 Full Road Pattern Model 與既有牌路專家。
+
+    舊版會讓 particle、Monte Carlo、算牌或其他遺留欄位混入候選，造成
+    Adaptive 的主輸出不再純粹代表牌路。現在白名單只保留 road_model
+    已產生、且由 Full Road Pattern Model 帶頭的六個成員。
+    """
     result: Dict[str, Dict[str, float]] = {}
     nested = prediction.get("component_probabilities")
     if isinstance(nested, Mapping):
         for name, values in nested.items():
-            if not isinstance(values, Mapping):
+            normalized_name = str(name)
+            if (
+                normalized_name not in ROAD_PRIMARY_COMPONENTS
+                or not isinstance(values, Mapping)
+            ):
                 continue
             try:
-                result[str(name)] = _normalize(values)
-            except Exception:
-                pass
-    for name, values in mapping.items():
-        if isinstance(values, Mapping):
-            try:
-                result.setdefault(name, _normalize(values))
+                result[normalized_name] = _normalize(values)
             except Exception:
                 pass
     return result
@@ -297,28 +265,30 @@ def _fusion_candidates(
     shoe_direction_performance: Mapping[str, Any],
     base_confidence: float,
 ) -> list[Dict[str, Any]]:
+    """建立「牌路主、cMAB 輔」的融合候選。
+
+    Full Road Pattern Model 的完整歷史結論與五個既有路子專家是唯一主要
+    成員。LinUCB 的輸出不再和它們同權競爭，只在主要路子已存在時以最多
+    15% 的權重協助處理 context 新穎度與模型衝突。
+    """
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
     raw_models = road_data.get("models")
     metadata = dict(raw_models) if isinstance(raw_models, Mapping) else {}
     rows: list[Dict[str, Any]] = []
-    all_probabilities: Dict[str, Mapping[str, float]] = {
-        "contextual_bandit": base,
-        **{str(name): values for name, values in components.items()},
-    }
-    for name, values in all_probabilities.items():
+    for name in ROAD_PRIMARY_COMPONENTS:
+        values = components.get(name)
+        if not isinstance(values, Mapping):
+            continue
         banker = _conditional_banker(values)
         edge = abs(2.0 * banker - 1.0)
         raw_meta = metadata.get(name)
         meta = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
-        if name != "contextual_bandit" and not bool(
-            meta.get("active", meta.get("ok", True))
-        ):
+        if not bool(meta.get("active", meta.get("ok", True))):
             continue
-        reliability = (
-            max(0.20, min(1.0, base_confidence))
-            if name == "contextual_bandit"
-            else max(0.05, min(1.0, float(meta.get("reliability", 0.20) or 0.20)))
+        reliability = max(
+            0.05,
+            min(1.0, float(meta.get("reliability", 0.20) or 0.20)),
         )
         samples = int(component_sample_counts.get(name, 0) or 0)
         historical_brier = historical_scores.get(name)
@@ -338,6 +308,10 @@ def _fusion_candidates(
             * (0.55 + 0.45 * performance_quality)
             * (0.80 + 0.20 * edge)
         )
+        if name == "full_road":
+            # 完整路圖是第一層產物，給予溫和優先權；不是硬鎖方向，仍需
+            # 接受其他近期牌路專家與 cMAB context 的交叉驗證。
+            weight *= FULL_ROAD_PRIMARY_MULTIPLIER
         support = int(meta.get("support", 0) or 0)
         raw_shoe_performance = shoe_direction_performance.get(name)
         shoe_performance = (
@@ -383,6 +357,61 @@ def _fusion_candidates(
             "current_shoe_performance_used": bool(
                 shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES
             ),
+            "role": "road_primary",
+        })
+
+    primary_weight = sum(float(row["weight"]) for row in rows)
+    bandit_banker = _conditional_banker(base)
+    bandit_edge = abs(2.0 * bandit_banker - 1.0)
+    bandit_logit = _logit(bandit_banker)
+    bandit_direction = (
+        "B" if bandit_logit > 0.0 else "P" if bandit_logit < 0.0 else ""
+    )
+    if primary_weight > 1e-12:
+        # aux / (primary + aux) <= max_share，因此 cMAB 永遠是輔助，
+        # 而不是把長龍或跳路重新平均成單純機率。
+        auxiliary_weight = primary_weight * (
+            CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE
+            / (1.0 - CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE)
+        )
+        rows.append({
+            "name": "contextual_bandit_auxiliary",
+            "banker_probability": float(bandit_banker),
+            "direction": bandit_direction,
+            "edge": float(bandit_edge),
+            "logit": float(bandit_logit),
+            "weight": float(auxiliary_weight),
+            "reliability": max(0.20, min(1.0, base_confidence)),
+            "support": 0,
+            "performance_samples": 0,
+            "historical_brier": None,
+            "historical_performance_used": False,
+            "selection_score": float(auxiliary_weight),
+            "current_shoe_samples": 0,
+            "current_shoe_posterior_accuracy": 0.50,
+            "current_shoe_performance_used": False,
+            "role": "contextual_auxiliary",
+        })
+    else:
+        # 路紙剛開始或 ROI 沒有可用路子成員時，仍強制輸出 B/P；這是唯一
+        # 允許 cMAB 直接當方向來源的冷啟動例外。
+        rows.append({
+            "name": "contextual_bandit_fallback",
+            "banker_probability": float(bandit_banker),
+            "direction": bandit_direction,
+            "edge": float(bandit_edge),
+            "logit": float(bandit_logit),
+            "weight": 1.0,
+            "reliability": max(0.20, min(1.0, base_confidence)),
+            "support": 0,
+            "performance_samples": 0,
+            "historical_brier": None,
+            "historical_performance_used": False,
+            "selection_score": float(max(0.01, bandit_edge)),
+            "current_shoe_samples": 0,
+            "current_shoe_posterior_accuracy": 0.50,
+            "current_shoe_performance_used": False,
+            "role": "cold_start_bandit_fallback",
         })
     return rows
 
@@ -498,15 +527,36 @@ def _apply_plurality_decision(
     exact_tie = not fusion or abs(combined_logit) <= 1e-12
     tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
     bp_mass = 1.0 - tie_probability
-    conditional_banker = float(fusion.get("conditional_banker", 0.5) or 0.5)
+    # 如果牌路專家完全抵消，才退回 cMAB 的輔助方向；不輸出 O，也不把
+    # 50/50 假裝成一個新的牌路規則。
+    conditional_banker = (
+        _conditional_banker(base)
+        if exact_tie
+        else float(
+            fusion.get("conditional_banker", _conditional_banker(base))
+            or _conditional_banker(base)
+        )
+    )
     banker = bp_mass * conditional_banker
     player = bp_mass * (1.0 - conditional_banker)
-    direction = "O" if exact_tie else "B" if combined_logit > 0.0 else "P"
-    edge = 0.0 if exact_tie else abs(2.0 * conditional_banker - 1.0)
+    fallback_direction = str(
+        result.get("selected_arm")
+        or result.get("base_bandit_direction")
+        or result.get("recommend")
+        or "B"
+    ).upper().strip()
+    if fallback_direction not in {"B", "P"}:
+        fallback_direction = "B"
+    direction = (
+        fallback_direction
+        if exact_tie
+        else "B" if combined_logit > 0.0 else "P"
+    )
+    edge = abs(2.0 * conditional_banker - 1.0)
     agreement = float(fusion.get("agreement", 0.0) or 0.0)
     maturity = min(1.0, sample_count / max(1.0, float(ADAPTIVE_MIN_SAMPLES)))
     confidence = (
-        0.0 if exact_tie else min(
+        min(
             0.78,
             0.36 + 0.22 * agreement + 0.10 * maturity
             + 0.10 * min(1.0, abs(combined_logit))
@@ -520,7 +570,7 @@ def _apply_plurality_decision(
             "依可靠度、support 與已結算表現破局。"
         )
     elif exact_tie:
-        reason = "所有有效模型完全 50.00%/50.00%，本局保留觀望。"
+        reason = "牌路專家完全抵消，依 Contextual Bandit 輔助方向強制輸出 B/P。"
     else:
         reason = (
             "以 reliability／Brier 權重進行 logit pooling，"
@@ -533,26 +583,30 @@ def _apply_plurality_decision(
         "player_rate": round(player * 100.0, 2),
         "tie_rate": round(tie_probability * 100.0, 2),
         "recommend": direction,
-        "recommend_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+        "recommend_text": "莊" if direction == "B" else "閒",
         "action": direction,
-        "action_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
+        "action_text": "莊" if direction == "B" else "閒",
         "internal_recommend": direction,
         "internal_action": direction,
         "next_round_direction": direction,
-        "next_round_direction_text": "莊" if direction == "B" else "閒" if direction == "P" else "觀望",
-        "signal_allowed": direction in {"B", "P"},
-        "signal_status_code": "PLURALITY_SOFTMAX_DIRECTION" if direction in {"B", "P"} else "EXACT_50_50_NO_DIRECTION",
-        "signal_status_text": "可靠度加權 Softmax：正式方向已啟用" if direction in {"B", "P"} else "完全 50/50：觀望",
+        "next_round_direction_text": "莊" if direction == "B" else "閒",
+        "signal_allowed": True,
+        "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_DIRECTION",
+        "signal_status_text": "牌路主導 Adaptive Ensemble：正式方向已啟用",
         "signal_reason": reason,
         "internal_signal_reason": reason,
-        "direction_source": "adaptive_ensemble_plurality_softmax",
+        "direction_source": (
+            "contextual_bandit_cold_start_fallback"
+            if exact_tie
+            else "road_primary_adaptive_ensemble"
+        ),
         "direction_edge": float(edge),
         "direction_edge_percent": round(edge * 100.0, 4),
         "ensemble_confidence": float(confidence),
         "confidence": float(confidence),
         "quality_score": float(confidence),
         "confidence_label": "較高" if confidence >= 0.72 else "中等" if confidence >= 0.56 else "偏低" if confidence > 0.0 else "零方向",
-        "bet_multiplier": 1.0 if direction in {"B", "P"} else 0.0,
+        "bet_multiplier": 1.0,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
         "probability_semantics": "softmax_direction_score_not_guaranteed_outcome_probability",
@@ -561,7 +615,7 @@ def _apply_plurality_decision(
         result["component_champion"] = tiebreaker
     result["adaptive_ensemble"] = {
         "active": True,
-        "mode": "reliability_logit_plurality_softmax",
+        "mode": "road_primary_adaptive_ensemble",
         "circuit_breaker_active": False,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
@@ -584,7 +638,9 @@ def _apply_plurality_decision(
         "candidates": list(fusion.get("candidates") or []),
         "overall_confidence": float(confidence),
         "final_action": direction,
-        "bet_multiplier": 1.0 if direction in {"B", "P"} else 0.0,
+        "bet_multiplier": 1.0,
+        "road_primary": True,
+        "contextual_bandit_role": "auxiliary_max_15_percent",
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,
@@ -634,45 +690,50 @@ def adapt_prediction(
     base_confidence = _base_confidence(result, base)
 
     if extreme_unseen:
-        # 硬熔斷優先於成熟樣本與正常融合；保留原始分數僅供稽核。
+        # 保留極端未知診斷，但產品契約要求每局皆輸出 B/P。因此極端區間
+        # 不再改成 O；改由 cMAB 原始 Arm 作為明確的輔助 fallback。
         learning_arm = str(result.get("selected_arm") or "").upper().strip()
+        if learning_arm not in {"B", "P"}:
+            learning_arm = "B" if float(base.get("B", 0.5)) >= float(base.get("P", 0.5)) else "P"
         result["pre_hard_brake_probabilities"] = dict(base)
         result["pre_hard_brake_recommend"] = str(
             result.get("recommend") or learning_arm
         )
         tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
-        neutral_bp = (1.0 - tie_probability) * 0.5
+        conditional_banker = _conditional_banker(base)
+        neutral_bp = 1.0 - tie_probability
         result["probabilities"] = {
-            "B": neutral_bp,
-            "P": neutral_bp,
+            "B": neutral_bp * conditional_banker,
+            "P": neutral_bp * (1.0 - conditional_banker),
             "T": tie_probability,
         }
-        result["banker_rate"] = round(neutral_bp * 100.0, 2)
-        result["player_rate"] = round(neutral_bp * 100.0, 2)
+        result["banker_rate"] = round(result["probabilities"]["B"] * 100.0, 2)
+        result["player_rate"] = round(result["probabilities"]["P"] * 100.0, 2)
         result["tie_rate"] = round(tie_probability * 100.0, 2)
-        result["recommend"] = "O"
-        result["recommend_text"] = "觀望"
-        result["action"] = "O"
-        result["action_text"] = "觀望／絕對不下注"
-        result["internal_recommend"] = "O"
-        result["internal_action"] = "O"
-        result["next_round_direction"] = "O"
-        result["next_round_direction_text"] = "觀望"
-        result["signal_allowed"] = False
-        result["signal_status_code"] = "HARD_BRAKE_NO_BET"
-        result["signal_status_text"] = "統計混沌硬熔斷：絕對不下注"
+        result["recommend"] = learning_arm
+        result["recommend_text"] = "莊" if learning_arm == "B" else "閒"
+        result["action"] = learning_arm
+        result["action_text"] = result["recommend_text"]
+        result["internal_recommend"] = learning_arm
+        result["internal_action"] = learning_arm
+        result["next_round_direction"] = learning_arm
+        result["next_round_direction_text"] = result["recommend_text"]
+        result["signal_allowed"] = True
+        result["signal_status_code"] = "CHAOS_FORCED_BANDIT_AUXILIARY"
+        result["signal_status_text"] = "統計混沌：cMAB 輔助方向已啟用"
         result["signal_reason"] = (
-            "任一模型回報極端未知區間；集成層不做方向修正，"
-            "本局信心與注碼強制歸零。"
+            "牌路模型回報極端未知區間；保留診斷標記，但依產品設定"
+            "由 Contextual Bandit 輔助方向強制輸出 B/P。"
         )
         result["internal_signal_reason"] = result["signal_reason"]
-        result["direction_source"] = "adaptive_ensemble_hard_brake"
-        result["ensemble_confidence"] = 0.0
-        result["confidence"] = 0.0
-        result["quality_score"] = 0.0
-        result["confidence_label"] = "零信心／硬熔斷"
-        result["bet_multiplier"] = 0.0
-        result["hard_brake_active"] = True
+        result["direction_source"] = "contextual_bandit_chaos_fallback"
+        result["ensemble_confidence"] = min(0.45, base_confidence)
+        result["confidence"] = min(0.45, base_confidence)
+        result["quality_score"] = min(0.45, base_confidence)
+        result["confidence_label"] = "偏低"
+        result["bet_multiplier"] = 1.0
+        result["hard_brake_active"] = False
+        result["chaos_diagnostic_active"] = True
         # selected_arm 不覆寫：即使不下注，實際結果仍可用固定 1 倍
         # 被動更新模型與共享 context 方差。
         if learning_arm in {"B", "P"}:
@@ -680,26 +741,28 @@ def adapt_prediction(
         result["is_extreme_unseen"] = True
         result["adaptive_ensemble"] = {
             "active": True,
-            "mode": "statistical_chaos_hard_brake",
-            "circuit_breaker_active": True,
-            "hard_brake_active": True,
+            "mode": "statistical_chaos_forced_bandit_auxiliary",
+            "circuit_breaker_active": False,
+            "hard_brake_active": False,
             "sample_count": sample_count,
             "minimum_samples_bypassed_for_safety": True,
             "is_extreme_unseen": True,
             "variance": float(result.get("variance", 0.0) or 0.0),
-            "bandit_weight_before": 1.0,
-            "bandit_weight_after": 0.0,
-            "weight_reduction_ratio": 1.0,
-            "weight_reduction_percent": 100.0,
+            "bandit_weight_before": 0.15,
+            "bandit_weight_after": 1.0,
+            "weight_reduction_ratio": 0.0,
+            "weight_reduction_percent": 0.0,
             "alternative_model_weight": 0.0,
             "alternative_components_available": sorted(components),
             "alternative_fusion_attempted": False,
             "fallback_required": True,
             "shadow_backtest_required": True,
-            "overall_confidence": 0.0,
-            "final_action": "O",
-            "bet_multiplier": 0.0,
-            "reason": "極端未知區間執行零信心、零注碼硬熔斷",
+            "overall_confidence": min(0.45, base_confidence),
+            "final_action": learning_arm,
+            "bet_multiplier": 1.0,
+            "road_primary": False,
+            "contextual_bandit_role": "forced_cold_or_chaos_fallback",
+            "reason": "極端未知區間保留診斷，並強制使用 cMAB 輔助方向",
         }
         return result
 

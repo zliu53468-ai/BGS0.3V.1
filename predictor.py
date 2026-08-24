@@ -1,9 +1,8 @@
 """BGS cMAB 統一預測入口。
 
 正式圖片／真人桌預測使用完整 B/P/T 歷史、牌路上下文與 LinUCB cMAB。
-本檔保留既有 API 與虛擬相容工具，但正式方向不再交給 ensemble、
-驗證選模或影子控制器覆寫；畫面輸出直接採用 contextual_bandit.py
-的原始 B/P Arm 選擇結果。
+最後階段會比較「固定牌路規則」與 cMAB 的最近真實 B/P 命中率，
+只輸出一個最終 B/P 方向；不使用算牌、EV 或觀望方向。
 """
 from __future__ import annotations
 
@@ -14,10 +13,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
 from adaptive_ensemble import adapt_prediction
-from contextual_bandit import predict_bandit, select_decision_strategy
-from particle_filter_points import counts_from_shoe, deal_ordered_hand
-from shoe_composition import analyze_shoe_composition, validate_remaining_counts
-from validated_decision_layer import apply_strategy_decision, apply_validated_decision
+from contextual_bandit import predict_bandit
+from road_model import build_road_context
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
@@ -28,10 +25,13 @@ DB_HOLDOUT: Dict[str, Any] = {
 SHADOW_REQUIRED_CONSECUTIVE_HITS = 2
 SHADOW_MAX_STREAMS = 2048
 
-# 測試期間固定使用 cMAB 原始 B/P Arm，避免「沒有精確牌組／EV」時被
-# 資金風控層改寫成 O。此模式只用於紀錄方向命中率；下注欄位一律維持 0，
-# 不能把牌路方向分數當成已通過 EV 的正式下注訊號。
-FORCE_BANDIT_DIRECTION_FOR_TESTING = True
+# 正式方向選擇器只保留最近已經真正開出的 B/P 結果。它是
+# predictor.py 內的短期記憶，不會碰 cMAB 的 A/b 矩陣，也不會把
+# 牌路先行的輸贏誤回灌成 cMAB 的 reward。
+DIRECTION_SOURCE_WINDOW = 20
+DIRECTION_SOURCE_MIN_SAMPLES = 12
+DIRECTION_SOURCE_ADVANTAGE = 0.04
+DIRECTION_SOURCE_MAX_STREAMS = 2048
 
 
 def _bandit_learning_scope(
@@ -84,85 +84,6 @@ def _fallback_direction(prediction: Mapping[str, Any]) -> str:
     return "B" if banker >= player else "P"
 
 
-def _apply_forced_test_direction(result: Mapping[str, Any]) -> Dict[str, Any]:
-    """讓測試面板每局固定呈現 cMAB 原始 B/P，並鎖住所有下注欄位。
-
-    ``apply_strategy_decision`` 仍會先執行，以保留既有資料結構與策略
-    稽核資訊；但測試模式不讓它的 No Bet 動作覆寫方向。實際回報結果時，
-    performance_tracker 仍可用這個 B/P 方向更新原本的 Contextual Bandit。
-    """
-    output = dict(result or {})
-    direction = str(output.get("bandit_diagnostic_direction") or "").upper()
-    if direction not in {"B", "P"}:
-        direction = _fallback_direction(output)
-    direction_text = "莊" if direction == "B" else "閒"
-    reason = "測試模式：固定採用 Contextual Bandit 原始 B/P 方向；不代表 EV 或下注建議。"
-    output.update({
-        "action": direction,
-        "recommend": direction,
-        "internal_action": direction,
-        "internal_recommend": direction,
-        "next_round_direction": direction,
-        "action_text": direction_text,
-        "recommend_text": direction_text,
-        "next_round_direction_text": direction_text,
-        "direction_source": "contextual_bandit_raw_test_mode",
-        "signal_allowed": False,
-        "risk_gate_open": False,
-        "test_mode": True,
-        "test_mode_name": "forced_contextual_bandit_direction",
-        "signal_status_code": "TEST_DIRECTION_ONLY",
-        "signal_status_text": "測試模式：已輸出 cMAB 原始方向，未啟用下注。",
-        "signal_reason": reason,
-        "internal_signal_reason": reason,
-        "recommended_bet_percentage": 0.0,
-        "bet_percentage": 0.0,
-        "kelly_fraction": 0.0,
-        "kelly_percentage_applied": 0.0,
-        "suggested_bet_amount": 0.0,
-        "bet_level_text": "測試模式／不配置",
-    })
-    return output
-
-
-def _trusted_physical_signal(
-    shoe_context: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """只接受 10 維精確剩餘點數計數作正式 EV 輸入。
-
-    ``observed_cards``、OCR 的剩餘總張數或 B/P/T 路單都無法證明每種點數
-    各剩多少張，因此不會被誤升格為可信算牌來源。虛擬牌靴或使用者明確
-    輸入並通過驗證的 ``remaining_counts`` 才能開啟這條資金決策管線。
-    """
-    context = dict(shoe_context or {})
-    raw_counts = context.get("remaining_counts")
-    if not isinstance(raw_counts, (list, tuple)) or len(raw_counts) != 10:
-        signal = analyze_shoe_composition(None)
-        signal["trusted_exact_counts"] = False
-        signal["trust_reason"] = "missing_exact_remaining_counts"
-        return signal
-    try:
-        decks = int(context.get("decks", 8) or 8)
-        counts = validate_remaining_counts(raw_counts, decks=decks)
-    except (TypeError, ValueError) as exc:
-        signal = analyze_shoe_composition(None)
-        signal.update({
-            "trusted_exact_counts": False,
-            "trust_reason": "invalid_exact_remaining_counts",
-            "reason": str(exc),
-        })
-        return signal
-    trusted_context = {
-        "remaining_counts": list(counts),
-        "decks": decks,
-        "source": str(context.get("source") or "user_exact_remaining_counts"),
-    }
-    signal = analyze_shoe_composition(trusted_context)
-    signal["trusted_exact_counts"] = bool(signal.get("available"))
-    signal["trust_reason"] = "validated_10_value_remaining_counts"
-    return signal
-
-
 def _short_term_trend_prior(
     buffer: List[str],
     fallback_direction: str,
@@ -209,6 +130,240 @@ def _short_term_trend_prior(
             "T": 0.0,
         },
     }
+
+
+def _bp_history(values: Iterable[Any]) -> List[str]:
+    """保留 B/P 時序；和局不推進兩個方向來源的命中統計。"""
+    return [
+        value for value in _normalize_outcome_history(values)
+        if value in {"B", "P"}
+    ]
+
+
+def _road_prior_direction(
+    history: Iterable[Any],
+    fallback_direction: str,
+) -> Dict[str, Any]:
+    """以固定、可解釋的牌路規則產生第二個候選方向。
+
+    規則刻意不讀取牌面、EV、算牌或外部模型：
+    1. 末段同向至少 3 手時，優先延續長龍；
+    2. 最近 3 手為單跳，或最近 8 手轉換率很高時，反向最後一手；
+    3. 其餘以最近 5～8 手多數決，平手時才回到 Bandit 候選。
+    """
+    bp = _bp_history(history)
+    fallback = fallback_direction if fallback_direction in {"B", "P"} else "B"
+    if not bp:
+        return {
+            "direction": fallback,
+            "rule": "insufficient_history_bandit_fallback",
+            "streak_length": 0,
+            "switch_rate": 0.0,
+            "window": [],
+        }
+
+    last = bp[-1]
+    streak = 1
+    for value in reversed(bp[:-1]):
+        if value != last:
+            break
+        streak += 1
+
+    recent = bp[-min(8, len(bp)):]
+    switch_rate = (
+        sum(left != right for left, right in zip(recent, recent[1:]))
+        / max(1, len(recent) - 1)
+    )
+    alternating = (
+        len(bp) >= 3
+        and bp[-3] == bp[-1]
+        and bp[-2] != bp[-1]
+    )
+    opposite = "P" if last == "B" else "B"
+
+    if streak >= 3:
+        direction, rule = last, "streak_follow"
+    elif alternating:
+        direction, rule = opposite, "single_chop_reverse"
+    elif len(recent) >= 5 and switch_rate >= 0.65:
+        direction, rule = opposite, "high_switch_rate_reverse"
+    else:
+        majority_window = bp[-min(8, len(bp)):]
+        banker_count = sum(value == "B" for value in majority_window)
+        player_count = len(majority_window) - banker_count
+        if banker_count == player_count:
+            direction, rule = fallback, "recent_majority_tie_bandit_fallback"
+        else:
+            direction = "B" if banker_count > player_count else "P"
+            rule = "recent_majority"
+
+    return {
+        "direction": direction,
+        "rule": rule,
+        "streak_length": int(streak),
+        "switch_rate": round(float(switch_rate), 4),
+        "window": list(recent),
+    }
+
+
+class DirectionSourceSelector:
+    """比較牌路先行與 cMAB 最近真實命中率的輕量選擇器。
+
+    每個 user／場館／桌／靴各自隔離。只有新的 B/P 結果出現時，才會
+    結算上一筆兩個候選方向；同一張圖重按預測不會重複計算。
+    """
+
+    def __init__(self) -> None:
+        self._states: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._lock = RLock()
+
+    @staticmethod
+    def stream_key(
+        *,
+        user_id: str,
+        venue: str,
+        room: str,
+        shoe_id: str,
+    ) -> str:
+        raw = "|".join((
+            str(user_id or "__anonymous__"),
+            str(venue or "").upper().strip(),
+            str(room or "").strip(),
+            str(shoe_id or "__unspecified_shoe__").strip(),
+        ))
+        return sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _new_state(bp: List[str]) -> Dict[str, Any]:
+        return {
+            "last_bp_history": list(bp),
+            "pending_bandit_direction": "",
+            "pending_road_direction": "",
+            "bandit_hits": [],
+            "road_hits": [],
+        }
+
+    @staticmethod
+    def _performance(values: Iterable[Any]) -> Dict[str, Any]:
+        hits = [bool(value) for value in list(values)[-DIRECTION_SOURCE_WINDOW:]]
+        sample_count = len(hits)
+        correct_count = sum(hits)
+        return {
+            "sample_count": sample_count,
+            "correct_count": correct_count,
+            "accuracy": (
+                round(correct_count / sample_count, 4)
+                if sample_count else None
+            ),
+            "window": DIRECTION_SOURCE_WINDOW,
+        }
+
+    def select(
+        self,
+        history: Iterable[Any],
+        *,
+        bandit_direction: str,
+        road_direction: str,
+        stream_key: str,
+    ) -> Dict[str, Any]:
+        """以當下之前已結算的績效決定這一局使用哪個來源。"""
+        bp = _bp_history(history)
+        bandit = bandit_direction if bandit_direction in {"B", "P"} else "B"
+        road = road_direction if road_direction in {"B", "P"} else bandit
+
+        with self._lock:
+            state = self._states.get(stream_key)
+            if state is None:
+                state = self._new_state([])
+                self._states[stream_key] = state
+            self._states.move_to_end(stream_key)
+            while len(self._states) > DIRECTION_SOURCE_MAX_STREAMS:
+                self._states.popitem(last=False)
+
+            previous_bp = list(state.get("last_bp_history") or [])
+            history_replaced = bool(
+                len(bp) < len(previous_bp)
+                or bp[:len(previous_bp)] != previous_bp
+            )
+            resolved_actual = ""
+            if history_replaced:
+                # 換靴、換桌或截圖從不同位置開始時，不拿舊預測結算新歷史。
+                state = self._new_state(bp)
+                self._states[stream_key] = state
+            elif len(bp) > len(previous_bp):
+                # 一筆 pending 只結算「下一個」新 B/P；若呼叫端一次補了多局，
+                # 其餘局沒有對應預測，絕不虛構命中率。
+                resolved_actual = bp[len(previous_bp)]
+                old_bandit = str(state.get("pending_bandit_direction") or "")
+                old_road = str(state.get("pending_road_direction") or "")
+                if old_bandit in {"B", "P"}:
+                    state["bandit_hits"] = list(
+                        state.get("bandit_hits") or []
+                    )[-(DIRECTION_SOURCE_WINDOW - 1):] + [
+                        old_bandit == resolved_actual
+                    ]
+                if old_road in {"B", "P"}:
+                    state["road_hits"] = list(
+                        state.get("road_hits") or []
+                    )[-(DIRECTION_SOURCE_WINDOW - 1):] + [
+                        old_road == resolved_actual
+                    ]
+                state["last_bp_history"] = list(bp)
+            else:
+                state["last_bp_history"] = list(bp)
+
+            bandit_performance = self._performance(
+                state.get("bandit_hits") or []
+            )
+            road_performance = self._performance(
+                state.get("road_hits") or []
+            )
+            bandit_accuracy = bandit_performance["accuracy"]
+            road_accuracy = road_performance["accuracy"]
+            enough_samples = bool(
+                bandit_performance["sample_count"] >= DIRECTION_SOURCE_MIN_SAMPLES
+                and road_performance["sample_count"] >= DIRECTION_SOURCE_MIN_SAMPLES
+            )
+
+            if bandit == road:
+                final_direction = bandit
+                direction_source = "road_bandit_agree"
+            elif (
+                enough_samples
+                and road_accuracy is not None
+                and bandit_accuracy is not None
+                and road_accuracy > bandit_accuracy + DIRECTION_SOURCE_ADVANTAGE
+            ):
+                final_direction = road
+                direction_source = "road_prior_better"
+            elif (
+                enough_samples
+                and road_accuracy is not None
+                and bandit_accuracy is not None
+                and bandit_accuracy > road_accuracy + DIRECTION_SOURCE_ADVANTAGE
+            ):
+                final_direction = bandit
+                direction_source = "bandit_better"
+            else:
+                final_direction = bandit
+                direction_source = "bandit_default"
+
+            state["pending_bandit_direction"] = bandit
+            state["pending_road_direction"] = road
+            self._states[stream_key] = state
+
+        return {
+            "direction": final_direction,
+            "direction_source": direction_source,
+            "bandit_performance": bandit_performance,
+            "road_performance": road_performance,
+            "enough_samples": enough_samples,
+            "resolved_actual": resolved_actual,
+            "history_replaced": history_replaced,
+        }
+
+
+_DIRECTION_SOURCE_SELECTOR = DirectionSourceSelector()
 
 
 class ShadowBacktestController:
@@ -505,7 +660,7 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             shoe_id: str = "", user_id: str = "", run_seed: Optional[int] = None,
             shoe_context: Optional[Mapping[str, Any]] = None,
             road_context: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """統一預測 API：物理 EV 決策，牌路 cMAB 選擇決策策略。"""
+    """統一預測 API；保留舊參數名稱以相容 app.py。"""
     if history is None:
         history_values: List[Any] = []
     elif isinstance(history, str):
@@ -513,6 +668,14 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     else:
         history_values = list(history)
     cleaned = _normalize_outcome_history(history_values)
+    # 第一層：Full Road Pattern Model。截圖入口若已附上完整 road_context
+    # 則直接沿用；否則從目前 B/P/T 歷史建構，確保不會跳過全路圖分析。
+    road = dict(road_context or {})
+    if not isinstance(road.get("models"), Mapping):
+        road = build_road_context(cleaned, seed=run_seed)
+
+    # 第二層所需的 cMAB 先獨立評估。它保留自己的 Arm 與 state，只提供
+    # context 輔助訊號，不能先覆寫 Full Road／Adaptive 的最終方向。
     bandit_learning_user_id = _bandit_learning_scope(
         user_id=str(user_id or ""),
         venue=str(venue or ""),
@@ -520,40 +683,65 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     )
     result = predict_bandit(
         cleaned,
-        road_context=dict(road_context or {}),
+        road_context=road,
         venue=venue,
         room=room,
         user_id=bandit_learning_user_id,
         run_seed=run_seed,
     )
-    # B/P cMAB 原始選擇只保留作可稽核的牌路診斷。正式下注的資格、方向
-    # 與基礎 Kelly 由可信 exact remaining counts 的不放回 EV 決定。
-    result["bandit_diagnostic_direction"] = _fallback_direction(result)
-    result["bandit_diagnostic_selected_arm"] = str(result.get("selected_arm") or "")
-    result["road_context"] = dict(road_context or {})
-    physical_signal = _trusted_physical_signal(shoe_context)
-    strategy_selection = select_decision_strategy(
-        cleaned,
-        road_context=dict(road_context or {}),
-        physical_signal=physical_signal,
+    bandit_direction = _fallback_direction(result)
+
+    # 第二層：Adaptive Ensemble 只讀取 Full Road 與既有路子專家的機率。
+    # particle、算牌、EV、外部模型都不會透過這裡注入。
+    result["road_support"] = dict(road)
+    result["component_probabilities"] = dict(
+        road.get("component_probabilities") or {}
+    )
+    result["decision_pipeline"] = (
+        "full_road_pattern_to_adaptive_ensemble_with_contextual_bandit_auxiliary"
+    )
+    result["bandit_direction"] = bandit_direction
+    result["bandit_original_direction"] = bandit_direction
+    result["bandit_learning_direction"] = bandit_direction
+    result = adapt_prediction(
+        result,
         venue=venue,
         room=room,
-        user_id=bandit_learning_user_id,
+        shoe_id=shoe_id,
     )
-    result["physical_signal"] = physical_signal
-    result["decision_strategy_bandit"] = strategy_selection
-    result = apply_strategy_decision(
-        result,
-        strategy_selection=strategy_selection,
-        bankroll=float(dict(shoe_context or {}).get("bankroll", 0.0) or 0.0),
-    )
-    if FORCE_BANDIT_DIRECTION_FOR_TESTING:
-        result = _apply_forced_test_direction(result)
-        result["decision_pipeline"] = "contextual_bandit_raw_direction_test_only"
-        result["direction_overwrite_disabled"] = False
-    else:
-        result["decision_pipeline"] = "trusted_exact_ev -> strategy_linucb -> capped_kelly"
-        result["direction_overwrite_disabled"] = True
+
+    # 產品契約：不論路圖樣本、模型衝突或混沌診斷，都對外強制一致輸出 B/P。
+    final_direction = _fallback_direction(result)
+    if final_direction not in {"B", "P"}:
+        final_direction = bandit_direction if bandit_direction in {"B", "P"} else "B"
+    final_text = "莊" if final_direction == "B" else "閒"
+    road_direction = str(road.get("direction") or "").upper().strip()
+    if road_direction not in {"B", "P"}:
+        road_direction = final_direction
+
+    result.update({
+        "forced_bp_direction": True,
+        "bandit_direction": bandit_direction,
+        "bandit_original_direction": bandit_direction,
+        "bandit_learning_direction": bandit_direction,
+        "road_direction": road_direction,
+        "road_prior": {
+            "direction": road_direction,
+            "rule": "full_road_pattern_model",
+            "regime": dict(road.get("regime") or {}),
+        },
+        "recommend": final_direction,
+        "recommend_text": final_text,
+        "action": final_direction,
+        "action_text": final_text,
+        "next_round_direction": final_direction,
+        "next_round_direction_text": final_text,
+        "internal_recommend": final_direction,
+        "internal_action": final_direction,
+        "signal_allowed": True,
+        "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_DIRECTION",
+        "signal_status_text": "全路圖 → Adaptive Ensemble → cMAB 輔助：已輸出 B/P",
+    })
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
     ).strip()
@@ -564,11 +752,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             str(venue or "").upper().strip(),
             str(room or "").strip(),
             str(shoe_id or "__unspecified_shoe__").strip(),
-            sha256(
-                ",".join(str(value) for value in list(
-                    physical_signal.get("remaining_counts") or []
-                )).encode("utf-8")
-            ).hexdigest()[:12],
         )).encode("utf-8")
     ).hexdigest()[:24]
     result.update({
@@ -577,23 +760,23 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "bandit_scope_mode": "user_venue_room_long_term",
         "bandit_shoe_isolated": False,
         "shoe_event_isolated": True,
-        "composition_quality": (
-            "trusted_exact_remaining_counts"
-            if physical_signal.get("trusted_exact_counts")
-            else "unavailable_or_untrusted"
-        ),
-        "remaining_counts_source": str(physical_signal.get("source") or "not_used"),
-        "shoe_context_ignored": False,
-        "road_quality_ok": bool(dict(road_context or {}).get(
-            "quality_ok", dict(road_context or {}).get("recognition_quality_ok", True)
+        "composition_quality": "not_applicable_cmab",
+        "remaining_counts_source": "not_used",
+        "shoe_context_ignored": bool(shoe_context),
+        "road_quality_ok": bool(road.get(
+            "quality_ok", road.get("recognition_quality_ok", True)
         )),
-        "input_required": not bool(physical_signal.get("trusted_exact_counts")),
+        "input_required": False,
     })
     return result
 
 
 def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None) -> Dict[str, Any]:
     """保留舊虛擬牌靴介面，但方向同樣由 cMAB 產生。"""
+    # 虛擬牌靴僅供舊相容入口使用；真人圖片預測不載入粒子／算牌模組，
+    # 避免其環境參數或初始化副作用混入正式 cMAB 路徑。
+    from particle_filter_points import counts_from_shoe, deal_ordered_hand
+
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
     if len(hidden_shoe) < 6:
         raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
@@ -606,12 +789,6 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         shoe_id=str(session.get("shoe_id") or ""),
         user_id=str(session.get("user_id") or ""),
         run_seed=seed,
-        shoe_context={
-            "remaining_counts": counts_from_shoe(hidden_shoe),
-            "decks": int(session.get("decks", 8) or 8),
-            "source": "virtual_exact_remaining_counts",
-            "bankroll": float(session.get("bankroll", 0.0) or 0.0),
-        },
         road_context=None,
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
