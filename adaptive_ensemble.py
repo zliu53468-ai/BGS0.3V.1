@@ -11,9 +11,6 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 import math
 
-from performance_tracker import get_performance_summary
-
-
 OUTCOMES = ("B", "P", "T")
 # 方向架構參數固定在程式內，避免 Render 遺留的 ADAPTIVE_* 環境變數讓
 # 同一張截圖在不同部署得到不同結果。
@@ -47,7 +44,9 @@ STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 1.30
 STRUCTURAL_AGREES_WITH_FULL_MULTIPLIER = 1.35
 STRUCTURAL_CONFLICTS_WITH_FULL_MULTIPLIER = 0.42
 RECENT_CONFIRMATION_REDUCTION = 0.68
-CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.12
+# cMAB 僅保留非常小的 context 輔助；它不得在使用者持續回報結果後變成
+# B/P 累積偏好來源。
+CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.06
 
 
 def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
@@ -279,6 +278,10 @@ def _fusion_candidates(
     相位，因此是唯一長程主幹。結構與短中長視窗只確認目前尾段是否仍在
     延續全盤相位；若衝突，不允許單純「最後一顆」訊號反客為主。
     """
+    # 保留參數以維持內部／舊測試呼叫相容，但正式方向不再依任何已結算
+    # 命中率或本靴績效動態放大權重。否則「剛好順著某邊連中」會形成正回饋。
+    del historical_scores, component_sample_counts, shoe_direction_performance
+
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
     raw_models = road_data.get("models")
@@ -298,19 +301,10 @@ def _fusion_candidates(
             0.05,
             min(1.0, float(meta.get("reliability", 0.20) or 0.20)),
         )
-        samples = int(component_sample_counts.get(name, 0) or 0)
-        historical_brier = historical_scores.get(name)
-        performance_used = samples >= ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES
-        if performance_used:
-            try:
-                performance_quality = math.exp(
-                    -max(0.0, float(historical_brier)) / 0.50
-                )
-            except Exception:
-                performance_quality = 0.50
-                performance_used = False
-        else:
-            performance_quality = 0.50
+        samples = 0
+        historical_brier = None
+        performance_used = False
+        performance_quality = 0.50
         weight = (
             (0.25 + 0.75 * reliability)
             * (0.55 + 0.45 * performance_quality)
@@ -330,27 +324,11 @@ def _fusion_candidates(
         elif name == "structural_regime":
             weight *= STRUCTURAL_REGIME_PRIMARY_MULTIPLIER
         support = int(meta.get("support", 0) or 0)
-        raw_shoe_performance = shoe_direction_performance.get(name)
-        shoe_performance = (
-            dict(raw_shoe_performance)
-            if isinstance(raw_shoe_performance, Mapping)
-            else {}
-        )
-        shoe_samples = int(shoe_performance.get("sample_count", 0) or 0)
-        shoe_accuracy = float(
-            shoe_performance.get("posterior_accuracy", 0.50) or 0.50
-        )
-        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
-            weight *= max(
-                0.70, min(1.30, 0.70 + 0.60 * shoe_accuracy)
-            )
+        shoe_samples = 0
+        shoe_accuracy = 0.50
         selection_score = weight * (
             0.55 + 0.25 * min(1.0, support / 12.0) + 0.20 * edge
         )
-        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
-            selection_score *= max(
-                0.75, min(1.25, 0.75 + 0.50 * shoe_accuracy)
-            )
         candidate_logit = _logit(banker)
         rows.append({
             "name": name,
@@ -371,9 +349,8 @@ def _fusion_candidates(
             "selection_score": float(selection_score),
             "current_shoe_samples": shoe_samples,
             "current_shoe_posterior_accuracy": float(shoe_accuracy),
-            "current_shoe_performance_used": bool(
-                shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES
-            ),
+            "current_shoe_performance_used": False,
+            "performance_feedback_role": "diagnostic_only_not_direction_weight",
             "role": "road_primary",
         })
 
@@ -710,7 +687,8 @@ def _apply_plurality_decision(
             dict((result.get("road_support") or {})).get("full_history_used_count", 0)
             or 0
         ),
-        "contextual_bandit_role": "auxiliary_max_12_percent",
+        "contextual_bandit_role": "auxiliary_max_6_percent_structure_only",
+        "online_performance_weighting": "disabled_for_final_direction",
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,
@@ -737,26 +715,25 @@ def adapt_prediction(
     )
     result.setdefault("raw_probabilities", dict(base))
     components = _components(result)
-    summary = get_performance_summary(venue=venue, room=room, limit=5000)
-    sample_count = int(summary.get("sample_count", 0) or 0)
-    historical_scores = dict(summary.get("component_brier_scores") or {})
-    component_sample_counts = dict(
-        summary.get("component_sample_counts") or {}
-    )
-    shoe_summary = (
-        get_performance_summary(
-            venue=venue,
-            room=room,
-            shoe_id=shoe_id,
-            limit=500,
+    road_support = result.get("road_support")
+    road_support = dict(road_support) if isinstance(road_support, Mapping) else {}
+    # 不再從 performance_tracker 取命中率來改寫權重：按鈕逐局結算後，
+    # 「剛好連中的順勢模型」會被越放越大，這正是追著最後一顆跑的正回饋。
+    # 結構 support 與全盤相位是唯一允許影響正式方向權重的證據。
+    sample_count = int(road_support.get("sample_count", 0) or 0)
+    historical_scores: Dict[str, Any] = {}
+    component_sample_counts: Dict[str, Any] = {}
+    shoe_summary: Dict[str, Any] = {}
+    shoe_direction_performance: Dict[str, Any] = {}
+    extreme_unseen_diagnostic = _is_extreme_unseen(result)
+    # 混沌僅作診斷；若 Full Road 已有可用成員，不能再把方向完全交回
+    # cMAB，否則同一副牌靴的線上回報會重新主導輸出。
+    extreme_unseen = False
+    if extreme_unseen_diagnostic:
+        result["chaos_diagnostic_active"] = True
+        result["chaos_diagnostic_note"] = (
+            "保留混沌診斷，但仍由全盤牌路融合輸出，不切換成 cMAB 單獨方向。"
         )
-        if str(shoe_id or "").strip()
-        else {}
-    )
-    shoe_direction_performance = dict(
-        shoe_summary.get("component_direction_performance") or {}
-    )
-    extreme_unseen = _is_extreme_unseen(result)
     base_confidence = _base_confidence(result, base)
 
     if extreme_unseen:
@@ -845,7 +822,7 @@ def adapt_prediction(
         historical_scores=historical_scores,
         component_sample_counts=component_sample_counts,
         shoe_direction_performance=shoe_direction_performance,
-        shoe_sample_count=int(shoe_summary.get("sample_count", 0) or 0),
+        shoe_sample_count=0,
         sample_count=sample_count,
         base_confidence=base_confidence,
     )

@@ -66,22 +66,47 @@ def _runs(sequence: Sequence[str]) -> List[Tuple[str, int]]:
     return result
 
 
-def _weighted_probability(sequence: Sequence[str], decay: float) -> float:
-    banker = 3.0
-    player = 3.0
-    for reverse_index, outcome in enumerate(reversed(sequence)):
-        weight = decay ** reverse_index
-        if outcome == "B":
-            banker += weight
-        elif outcome == "P":
-            player += weight
-    return banker / max(1e-12, banker + player)
+def _continuation_probability(
+    sequence: Sequence[str],
+    decay: float,
+) -> tuple[float, float]:
+    """只計算「延續或反轉」，完全不統計莊／閒各自出現次數。
+
+    舊版直接把最近窗口的 B/P 數量做指數加權；例如最近莊多，短期模型便
+    自動偏莊，即使牌路結構已經轉折。這裡改成對相鄰兩手的關係做 Beta
+    平滑：``P(continue) = (2 + Σw·I[x_t=x_{t-1}]) / (4 + Σw)``。
+    最後才依目前最後一手把「續／反」映射為 B 或 P，故整個模型對交換
+    B/P 標籤保持對稱，不會因哪一邊累積較多而偏移。
+    """
+    values = list(sequence)
+    if len(values) < 2:
+        return 0.5, 0.0
+    continue_mass = 2.0
+    reverse_mass = 2.0
+    for reverse_index, (previous, current) in enumerate(
+        reversed(list(zip(values, values[1:])))
+    ):
+        weight = float(decay) ** reverse_index
+        if previous == current:
+            continue_mass += weight
+        else:
+            reverse_mass += weight
+    total = continue_mass + reverse_mass
+    return continue_mass / max(1e-12, total), total - 4.0
 
 
 def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str, Any]:
     window = list(sequence[-size:])
-    probability = _weighted_probability(window, decay)
+    continuation_probability, effective_transitions = _continuation_probability(
+        window, decay
+    )
     support = len(window)
+    last = window[-1] if window else "B"
+    probability = (
+        continuation_probability
+        if last == "B"
+        else 1.0 - continuation_probability
+    )
     reliability = min(0.82, support / max(1.0, float(size)))
     return {
         "active": support >= min(4, size),
@@ -92,27 +117,40 @@ def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str,
         "reliability": reliability,
         "window": size,
         "decay": decay,
+        "continuation_probability": continuation_probability,
+        "effective_transition_support": effective_transitions,
+        "direction_semantics": "continuation_or_reversal_not_bp_frequency",
     }
 
 
 def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
-    for order in (7, 6, 5, 4, 3):
-        if len(sequence) <= order:
+    transitions = [
+        "C" if current == previous else "R"
+        for previous, current in zip(sequence, sequence[1:])
+    ]
+    for order in (6, 5, 4, 3, 2):
+        if len(transitions) < order + 1:
             continue
-        suffix = tuple(sequence[-order:])
-        banker = 2.5
-        player = 2.5
+        suffix = tuple(transitions[-order:])
+        continued = 2.5
+        reversed_mass = 2.5
         support = 0
-        for index in range(order, len(sequence)):
-            if tuple(sequence[index - order:index]) != suffix:
+        for next_index in range(order + 1, len(sequence)):
+            prefix_transitions = transitions[:next_index - 1]
+            if tuple(prefix_transitions[-order:]) != suffix:
                 continue
             support += 1
-            if sequence[index] == "B":
-                banker += 1.0
+            if sequence[next_index] == sequence[next_index - 1]:
+                continued += 1.0
             else:
-                player += 1.0
+                reversed_mass += 1.0
         if support >= 2:
-            probability = banker / (banker + player)
+            continuation_probability = continued / (continued + reversed_mass)
+            probability = (
+                continuation_probability
+                if sequence[-1] == "B"
+                else 1.0 - continuation_probability
+            )
             return {
                 "active": True,
                 "support": support,
@@ -121,6 +159,8 @@ def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
                 "edge": abs(probability - 0.5) * 2.0,
                 "reliability": min(0.76, support / 10.0),
                 "order": order,
+                "continuation_probability": continuation_probability,
+                "direction_semantics": "relative_transition_analogue",
             }
     return {
         "active": False,
@@ -129,6 +169,7 @@ def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
         "direction": "B",
         "reliability": 0.0,
         "order": 0,
+        "direction_semantics": "relative_transition_analogue",
     }
 
 
@@ -170,28 +211,33 @@ def _pattern_model(sequence: Sequence[str]) -> Dict[str, Any]:
             "hard_pattern_rule": False,
         }
     target = _pattern_features(sequence)
-    candidates: List[Tuple[float, str]] = []
+    candidates: List[Tuple[float, bool]] = []
     for index in range(10, len(sequence)):
         prefix = sequence[:index]
         vector = _pattern_features(prefix)
         distance = float(np.sqrt(np.mean(np.square(target - vector))))
         similarity = math.exp(-4.4 * distance)
-        candidates.append((similarity, sequence[index]))
+        candidates.append((similarity, sequence[index] == sequence[index - 1]))
     candidates.sort(key=lambda item: item[0], reverse=True)
     neighbors = candidates[:24]
-    banker = 3.0
-    player = 3.0
+    continued = 3.0
+    reversed_mass = 3.0
     support = 0
     similarity_total = 0.0
-    for similarity, actual in neighbors:
+    for similarity, did_continue in neighbors:
         similarity_total += similarity
         if similarity >= 0.42:
             support += 1
-        if actual == "B":
-            banker += similarity
+        if did_continue:
+            continued += similarity
         else:
-            player += similarity
-    probability = banker / (banker + player)
+            reversed_mass += similarity
+    continuation_probability = continued / (continued + reversed_mass)
+    probability = (
+        continuation_probability
+        if sequence[-1] == "B"
+        else 1.0 - continuation_probability
+    )
     mean_similarity = similarity_total / max(1, len(neighbors))
     reliability = min(0.78, min(1.0, support / 12.0) * (0.45 + 0.55 * mean_similarity))
     return {
@@ -203,6 +249,8 @@ def _pattern_model(sequence: Sequence[str]) -> Dict[str, Any]:
         "reliability": reliability if support >= 2 else 0.0,
         "mean_similarity": mean_similarity,
         "hard_pattern_rule": False,
+        "continuation_probability": continuation_probability,
+        "direction_semantics": "relative_pattern_walk_forward",
     }
 
 
