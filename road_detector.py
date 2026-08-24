@@ -1,4 +1,4 @@
-"""遊戲畫面大路偵測模組 V11.5（保留既有館別，新增兩種手機全畫面格式）。
+"""遊戲畫面大路偵測模組 V11.6（保留既有館別，補強手機全畫面容錯）。
 
 重點：
 1. DG 手機／電腦 ROI、滑動搜尋與固定格辨識流程完整保留 V11.2，不改動原有邏輯。
@@ -9,6 +9,7 @@
 6. 可用 ROAD_GRID_DEBUG=1 輸出追焦疊圖；版型不吻合時仍以品質閘門阻擋錯序列。
 7. 新增 ofalive99 類 Android Chrome 直式全畫面候選；僅在畫面比例與底部白色大路特徵吻合時啟用。
 8. 新增 Dream Gaming 緊湊手機版候選；獨立辨識中間大路，不將右側下三路混入。
+9. 專用版型未命中時，最後追加兩個低優先級手機大路候選；不覆蓋既有成功格式。
 """
 from __future__ import annotations
 
@@ -179,6 +180,24 @@ DREAM_COMPACT_MOBILE_MAX_TALL_RATIO = _env_float(
 )
 DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION = _env_float(
     "DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION", 0.62, 0.10, 0.95
+)
+
+# 專用手機 Profile 只先嘗試最接近的兩個 ROI，避免某一張全圖因為
+# Safari／Chrome 工具列不同而把 5×3 個滑動 ROI 與舊備援全數疊加，
+# 造成 LINE 圖片回覆逾時。
+MOBILE_PROFILE_MAX_CANDIDATES = _env_int(
+    "MOBILE_PROFILE_MAX_CANDIDATES", 2, 1, 2
+)
+
+# 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
+# 所有既有專用 ROI 與 legacy generic ROI 之後；因此原本成功的格式
+# 會先照原邏輯返回，新候選僅處理「原本沒有任何可信結果」的版型。
+MOBILE_FULLSCREEN_FALLBACK_ENABLED = (
+    os.getenv("MOBILE_FULLSCREEN_FALLBACK_ENABLED", "1").strip() == "1"
+)
+MOBILE_FULLSCREEN_FALLBACK_ROIS = (
+    _env_roi("MOBILE_FULLSCREEN_COMPACT_ROI", (0.250, 0.690, 0.500, 0.190)),
+    _env_roi("MOBILE_FULLSCREEN_WIDE_ROI", (0.280, 0.670, 0.680, 0.200)),
 )
 
 DG_DESKTOP_BIG_ROAD_ROI = _env_roi(
@@ -1894,7 +1913,6 @@ def detect_road_sequence_detailed(
         landscape = image_width > image_height * 1.25
         dream_compact_mobile_layout = bool(
             portrait
-            and venue_code in {"", "DG"}
             and _looks_like_dream_compact_mobile_fullscreen(image)
         )
         ofalive_android_layout = bool(
@@ -1910,7 +1928,7 @@ def detect_road_sequence_detailed(
                 _shifted_profile_rois(
                     DREAM_COMPACT_MOBILE_BIG_ROAD_ROI,
                     y_radius=DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y,
-                )
+                )[:MOBILE_PROFILE_MAX_CANDIDATES]
             ):
                 plan.append({
                     "name": f"dream_compact_mobile_big_road_{index}",
@@ -1929,7 +1947,7 @@ def detect_road_sequence_detailed(
                 _shifted_profile_rois(
                     OFALIVE_ANDROID_BIG_ROAD_ROI,
                     y_radius=OFALIVE_ANDROID_PROFILE_SEARCH_Y,
-                )
+                )[:MOBILE_PROFILE_MAX_CANDIDATES]
             ):
                 plan.append({
                     "name": f"ofalive_android_big_road_{index}",
@@ -2046,6 +2064,19 @@ def detect_road_sequence_detailed(
             "grid_columns": None,
             "profile": "legacy_generic",
         })
+        if portrait and MOBILE_FULLSCREEN_FALLBACK_ENABLED:
+            # 只有前面所有已知版型與 generic ROI 都沒有達到品質門檻時才會
+            # 執行到這裡。兩個候選分別覆蓋 Dream 的中間窄大路與 Android／
+            # Safari 較寬、較低的大路，不以裝置比例作為前置條件。
+            for index, roi in enumerate(MOBILE_FULLSCREEN_FALLBACK_ROIS):
+                plan.append({
+                    "name": f"mobile_fullscreen_fallback_{index}",
+                    "roi": roi,
+                    "preference": 0.8 - index * 0.1,
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "mobile_fullscreen_fallback",
+                })
         if ROAD_AUTO_FULL_FALLBACK:
             plan.append({
                 "name": "full_image",
