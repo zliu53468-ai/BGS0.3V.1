@@ -1,7 +1,7 @@
 """遊戲截圖 cMAB 預測轉接層。
 
-完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB 作診斷；若另有實際
-牌點或精確剩餘點數，則交由 predictor 的不放回 EV 閘門決定資金方向。
+完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB。``prior_counts`` 與
+``observed_cards`` 僅保留為舊呼叫端的相容參數，絕不參與真人桌預測。
 
 人工回報時以 session 保存的 prediction_id 精確結算上一筆 reward，
 再把本局結果加入歷史並產生下一局預測，避免 latest-pending 競態與重複結算。
@@ -47,6 +47,7 @@ def predict_from_screenshot(
     initial_image_history: Optional[Iterable[Any]] = None,
     manual_outcome_history: Optional[Iterable[Any]] = None,
     previous_prediction_id: str = "",
+    latest_actual_outcome: str = "",
     record_for_learning: bool = True,
 ) -> Dict[str, Any]:
     initial_raw = _clean_raw(initial_image_history or [])
@@ -79,37 +80,31 @@ def predict_from_screenshot(
     ))
     metadata = dict(screen_metadata or {})
 
+    # 只有呼叫端「明確告知」這次確實新增加了一局結果時，才能結算上一筆
+    # pending prediction。絕不能以 manual_raw[-1] 推論：同一份歷史在
+    # 使用者重按「開始 AI 判斷」時仍會有最後一局，若直接拿它當答案，會
+    # 把已包含於特徵的資料回灌模型，造成目標洩漏與錯誤的線上學習。
+    latest_actual = str(latest_actual_outcome or "").upper().strip()
+    latest_actual_is_new = latest_actual in {"B", "P", "T"}
     previous_resolution = None
-    if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id and manual_raw:
+    if (
+        PERFORMANCE_TRACKING_ENABLED
+        and record_for_learning
+        and user_id
+        and latest_actual_is_new
+    ):
         previous_resolution = resolve_latest_prediction(
             user_id,
-            manual_raw[-1],
+            latest_actual,
             venue=venue,
             room=room,
             prediction_id=str(previous_prediction_id or ""),
         )
 
-    exact_counts = None
-    if (
-        isinstance(prior_counts, Sequence)
-        and not isinstance(prior_counts, (str, bytes))
-        and len(prior_counts) == 10
-    ):
-        exact_counts = list(prior_counts)
-    observed_card_values = list(observed_cards or [])
-    shoe_context = (
-        {
-            "remaining_counts": exact_counts,
-            "source": "screen_exact_remaining_counts",
-        }
-        if exact_counts is not None
-        else {
-            "observed_cards": observed_card_values,
-            "source": "screen_observed_card_values",
-        }
-        if observed_card_values
-        else None
-    )
+    # 兼容舊版 API，但嚴格隔離逐張牌面／剩餘牌數；真人桌正式判斷只看
+    # 時間對齊的 B/P/T 歷史與路圖 Context。
+    prior_counts_ignored = bool(prior_counts)
+    observed_cards_ignored = bool(observed_cards)
 
     result = predict(
         history=combined_raw,
@@ -118,7 +113,7 @@ def predict_from_screenshot(
         shoe_id=shoe_id,
         user_id=user_id,
         run_seed=seed,
-        shoe_context=shoe_context,
+        shoe_context=None,
         road_context=context,
     )
     result.update({
@@ -128,10 +123,11 @@ def predict_from_screenshot(
         "mode": "screen_full_history_contextual_bandit",
         "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
-        "estimated_remaining_counts": list(exact_counts or []),
-        "composition_source": str(result.get("remaining_counts_source") or "outcome_history_only"),
-        "prior_counts_ignored": bool(prior_counts) and exact_counts is None,
-        "observed_card_count": len(observed_card_values),
+        "estimated_remaining_counts": [],
+        "composition_source": "not_used_cmab",
+        "composition_quality": "not_applicable_cmab",
+        "prior_counts_ignored": prior_counts_ignored,
+        "observed_cards_ignored": observed_cards_ignored,
         "road_sequence_length": len(cleaned),
         "raw_outcome_length": len(combined_raw),
         "initial_image_count": len(initial_raw),
@@ -149,6 +145,7 @@ def predict_from_screenshot(
         "external_screen_input": True,
         "previous_prediction_resolved_before_next": bool(previous_resolution),
         "previous_prediction_id": str(previous_prediction_id or ""),
+        "learning_update_triggered_by_new_actual": latest_actual_is_new,
         "deterministic_feature_seed": True,
     })
     result["road_fusion"] = {
