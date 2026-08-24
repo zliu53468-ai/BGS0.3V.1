@@ -1354,18 +1354,50 @@ def _smoothed_tie_probability(history: Sequence[str]) -> float:
 
 
 def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any]) -> str:
-    for key in ("direction", "planning_direction", "recent_direction"):
-        value = str(road_context.get(key) or "").upper().strip()
-        if value in ARMS:
-            return value
-    planning = float(road_context.get("planning_probability", 0.5) or 0.5)
-    recent = float(road_context.get("recent_probability", 0.5) or 0.5)
-    if abs(planning - 0.5) > 1e-9:
-        return "B" if planning >= 0.5 else "P"
-    if abs(recent - 0.5) > 1e-9:
-        return "B" if recent >= 0.5 else "P"
+    """LinUCB 平手時的結構性決勝，絕不直接跟最後一顆。
+
+    舊版在 B/P 分數完全相同時，最後會 ``return bp[-1]``；因此使用者剛
+    按下「本局結果：莊／閒」後，冷啟動或平手局常直接回報相同的一邊，
+    造成看似按鈕在堆疊方向權重的錯覺。
+
+    這裡只在模型沒有分數優勢時使用，且只讀取已知 B/P 結構：
+    1. 近期 transition 的延續／切換次數；
+    2. 最近 8 手的多數；
+    3. 完全平手時以整段歷史 hash 作可重現中性決勝。
+    ``road_context`` 參數保留以維持既有對外呼叫相容，但不再允許其中的
+    ``direction``／``planning_direction`` 偷渡成「跟最後一顆」的預設值。
+    """
+    del road_context
     bp = [value for value in history if value in ARMS]
-    return bp[-1] if bp else "B"
+    if not bp:
+        return "B"
+    if len(bp) == 1:
+        # 一顆歷史不包含任何「延續」或「反轉」證據；固定中性起點，避免
+        # 唯一一顆是 P 時就直接回 P。
+        return "B"
+
+    recent = bp[-8:]
+    same_transitions = sum(
+        left == right for left, right in zip(recent, recent[1:])
+    )
+    switch_transitions = (len(recent) - 1) - same_transitions
+
+    if same_transitions > switch_transitions:
+        # 有可驗證的延續結構才順勢；不是因為最後一顆本身。
+        return recent[-1]
+    if switch_transitions > same_transitions:
+        # 單跳／跳路佔優時，取反向延續該結構。
+        return "P" if recent[-1] == "B" else "B"
+
+    banker_count = sum(value == "B" for value in recent)
+    player_count = len(recent) - banker_count
+    if banker_count != player_count:
+        return "B" if banker_count > player_count else "P"
+
+    # 所有結構都平手時，不允許回落到最後一顆。hash 使同一段歷史永遠
+    # 得到相同結果，且不保存隱藏狀態、不受重按按鈕影響。
+    digest = sha256("|".join(bp).encode("utf-8")).digest()
+    return "B" if (digest[0] & 1) == 0 else "P"
 
 
 def _short_term_trend_buffer(
