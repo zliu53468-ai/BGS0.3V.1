@@ -66,47 +66,22 @@ def _runs(sequence: Sequence[str]) -> List[Tuple[str, int]]:
     return result
 
 
-def _continuation_probability(
-    sequence: Sequence[str],
-    decay: float,
-) -> tuple[float, float]:
-    """只計算「延續或反轉」，完全不統計莊／閒各自出現次數。
-
-    舊版直接把最近窗口的 B/P 數量做指數加權；例如最近莊多，短期模型便
-    自動偏莊，即使牌路結構已經轉折。這裡改成對相鄰兩手的關係做 Beta
-    平滑：``P(continue) = (2 + Σw·I[x_t=x_{t-1}]) / (4 + Σw)``。
-    最後才依目前最後一手把「續／反」映射為 B 或 P，故整個模型對交換
-    B/P 標籤保持對稱，不會因哪一邊累積較多而偏移。
-    """
-    values = list(sequence)
-    if len(values) < 2:
-        return 0.5, 0.0
-    continue_mass = 2.0
-    reverse_mass = 2.0
-    for reverse_index, (previous, current) in enumerate(
-        reversed(list(zip(values, values[1:])))
-    ):
-        weight = float(decay) ** reverse_index
-        if previous == current:
-            continue_mass += weight
-        else:
-            reverse_mass += weight
-    total = continue_mass + reverse_mass
-    return continue_mass / max(1e-12, total), total - 4.0
+def _weighted_probability(sequence: Sequence[str], decay: float) -> float:
+    banker = 3.0
+    player = 3.0
+    for reverse_index, outcome in enumerate(reversed(sequence)):
+        weight = decay ** reverse_index
+        if outcome == "B":
+            banker += weight
+        elif outcome == "P":
+            player += weight
+    return banker / max(1e-12, banker + player)
 
 
 def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str, Any]:
     window = list(sequence[-size:])
-    continuation_probability, effective_transitions = _continuation_probability(
-        window, decay
-    )
+    probability = _weighted_probability(window, decay)
     support = len(window)
-    last = window[-1] if window else "B"
-    probability = (
-        continuation_probability
-        if last == "B"
-        else 1.0 - continuation_probability
-    )
     reliability = min(0.82, support / max(1.0, float(size)))
     return {
         "active": support >= min(4, size),
@@ -117,40 +92,27 @@ def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str,
         "reliability": reliability,
         "window": size,
         "decay": decay,
-        "continuation_probability": continuation_probability,
-        "effective_transition_support": effective_transitions,
-        "direction_semantics": "continuation_or_reversal_not_bp_frequency",
     }
 
 
 def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
-    transitions = [
-        "C" if current == previous else "R"
-        for previous, current in zip(sequence, sequence[1:])
-    ]
-    for order in (6, 5, 4, 3, 2):
-        if len(transitions) < order + 1:
+    for order in (7, 6, 5, 4, 3):
+        if len(sequence) <= order:
             continue
-        suffix = tuple(transitions[-order:])
-        continued = 2.5
-        reversed_mass = 2.5
+        suffix = tuple(sequence[-order:])
+        banker = 2.5
+        player = 2.5
         support = 0
-        for next_index in range(order + 1, len(sequence)):
-            prefix_transitions = transitions[:next_index - 1]
-            if tuple(prefix_transitions[-order:]) != suffix:
+        for index in range(order, len(sequence)):
+            if tuple(sequence[index - order:index]) != suffix:
                 continue
             support += 1
-            if sequence[next_index] == sequence[next_index - 1]:
-                continued += 1.0
+            if sequence[index] == "B":
+                banker += 1.0
             else:
-                reversed_mass += 1.0
+                player += 1.0
         if support >= 2:
-            continuation_probability = continued / (continued + reversed_mass)
-            probability = (
-                continuation_probability
-                if sequence[-1] == "B"
-                else 1.0 - continuation_probability
-            )
+            probability = banker / (banker + player)
             return {
                 "active": True,
                 "support": support,
@@ -159,8 +121,6 @@ def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
                 "edge": abs(probability - 0.5) * 2.0,
                 "reliability": min(0.76, support / 10.0),
                 "order": order,
-                "continuation_probability": continuation_probability,
-                "direction_semantics": "relative_transition_analogue",
             }
     return {
         "active": False,
@@ -169,7 +129,6 @@ def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
         "direction": "B",
         "reliability": 0.0,
         "order": 0,
-        "direction_semantics": "relative_transition_analogue",
     }
 
 
@@ -211,33 +170,28 @@ def _pattern_model(sequence: Sequence[str]) -> Dict[str, Any]:
             "hard_pattern_rule": False,
         }
     target = _pattern_features(sequence)
-    candidates: List[Tuple[float, bool]] = []
+    candidates: List[Tuple[float, str]] = []
     for index in range(10, len(sequence)):
         prefix = sequence[:index]
         vector = _pattern_features(prefix)
         distance = float(np.sqrt(np.mean(np.square(target - vector))))
         similarity = math.exp(-4.4 * distance)
-        candidates.append((similarity, sequence[index] == sequence[index - 1]))
+        candidates.append((similarity, sequence[index]))
     candidates.sort(key=lambda item: item[0], reverse=True)
     neighbors = candidates[:24]
-    continued = 3.0
-    reversed_mass = 3.0
+    banker = 3.0
+    player = 3.0
     support = 0
     similarity_total = 0.0
-    for similarity, did_continue in neighbors:
+    for similarity, actual in neighbors:
         similarity_total += similarity
         if similarity >= 0.42:
             support += 1
-        if did_continue:
-            continued += similarity
+        if actual == "B":
+            banker += similarity
         else:
-            reversed_mass += similarity
-    continuation_probability = continued / (continued + reversed_mass)
-    probability = (
-        continuation_probability
-        if sequence[-1] == "B"
-        else 1.0 - continuation_probability
-    )
+            player += similarity
+    probability = banker / (banker + player)
     mean_similarity = similarity_total / max(1, len(neighbors))
     reliability = min(0.78, min(1.0, support / 12.0) * (0.45 + 0.55 * mean_similarity))
     return {
@@ -249,8 +203,6 @@ def _pattern_model(sequence: Sequence[str]) -> Dict[str, Any]:
         "reliability": reliability if support >= 2 else 0.0,
         "mean_similarity": mean_similarity,
         "hard_pattern_rule": False,
-        "continuation_probability": continuation_probability,
-        "direction_semantics": "relative_pattern_walk_forward",
     }
 
 
@@ -515,18 +467,8 @@ def calculate_road_probabilities(
     planning_probability = _clip_probability(planning.get("banker_probability", 0.5))
     planning_reliability = max(0.0, min(1.0, float(planning.get("reliability", 0.0) or 0.0)))
 
-    # 相容舊欄位的 road aggregate。完整截圖歷史一旦達到可用長度，就以
-    # Full Road 的全盤相位作為主幹；近期元件只負責確認目前尾段是否延續或
-    # 轉折。這裡的比例不是機率勝率，而是「全盤與近期資訊」的資料涵蓋率。
-    whole_shoe_evidence = max(
-        0.0, min(1.0, float(planning.get("whole_shoe_evidence", 0.0) or 0.0))
-    )
-    if bool(planning.get("active")):
-        planning_share = 0.70 + 0.15 * whole_shoe_evidence
-    elif bool(planning.get("ok")):
-        planning_share = 0.58
-    else:
-        planning_share = 0.0
+    # 相容舊欄位的 road aggregate；主引擎 V10.8 會分別使用 planning/recent，不依賴此固定融合。
+    planning_share = 0.60 if bool(planning.get("ok")) else 0.0
     recent_share = 1.0 - planning_share
     banker_probability = planning_probability * planning_share + recent_probability * recent_share
     direction = "B" if banker_probability >= 0.5 else "P"
@@ -557,8 +499,8 @@ def calculate_road_probabilities(
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_FULL_SCREENSHOT_HISTORY_PRIMARY_V11",
-        "pipeline_stage": "full_screenshot_history_planning_then_recent_confirmation",
+        "engine": "ROAD_SPLIT_PLANNING_RECENT_V10_9_NO_TRANSITION_CHAIN",
+        "pipeline_stage": "full_road_planning_plus_non_transition_recent_experts",
         "run_seed": run_seed,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
@@ -570,11 +512,11 @@ def calculate_road_probabilities(
         "player_probability": float(1.0 - banker_probability),
         "direction": direction,
         "direction_text": "莊" if direction == "B" else "閒",
-        "action": direction,
-        "action_text": "莊" if direction == "B" else "閒",
-        "signal_allowed": bool(sequence),
-        "signal_status_text": "完整截圖歷史已納入全盤規劃" if length >= 12 else "完整牌路樣本累積中",
-        "signal_reason": "先以完整截圖 B/P/T 歷史建立全盤相位，再以近期專家確認下一局方向。",
+        "action": direction if combined_reliability >= 0.50 else "O",
+        "action_text": "莊" if direction == "B" and combined_reliability >= 0.50 else "閒" if direction == "P" and combined_reliability >= 0.50 else "觀望",
+        "signal_allowed": combined_reliability >= 0.50,
+        "signal_status_text": "牌路規劃與近期專家已完成" if length >= 10 else "牌路樣本累積中",
+        "signal_reason": "完整牌路規劃與受限近期專家分開輸出，交由主 Stacking 統整",
         "confidence_score": float(combined_reliability),
         "confidence_label": "較高" if combined_reliability >= 0.72 else "中等" if combined_reliability >= 0.50 else "偏低",
         "uncertainty": float(recent_uncertainty),
@@ -582,10 +524,7 @@ def calculate_road_probabilities(
         "planning_probability": float(planning_probability),
         "planning_player_probability": float(1.0 - planning_probability),
         "planning_reliability": float(planning_reliability),
-        "planning_available": bool(planning.get("active")),
-        "planning_share": float(planning_share),
-        "whole_shoe_evidence": float(whole_shoe_evidence),
-        "whole_shoe_regime": dict(planning.get("whole_shoe_regime") or {}),
+        "planning_available": bool(planning.get("ok")),
         "recent_probability": float(recent_probability),
         "recent_player_probability": float(1.0 - recent_probability),
         "recent_reliability": float(recent_reliability),
@@ -618,7 +557,7 @@ def calculate_road_probabilities(
         "eligible_for_core": length >= 10,
         "suggested_core_weight": 0.0,
         "max_core_weight": 0.0,
-        "data_scope": "all_recognized_screenshot_history_primary_then_bounded_recent_confirmation",
+        "data_scope": "entire_history_planning_and_bounded_recent_experts",
         "full_history_used_count": length,
         "initial_image_count": max(0, int(initial_image_count or 0)),
         "manual_count": max(0, int(manual_count or 0)),

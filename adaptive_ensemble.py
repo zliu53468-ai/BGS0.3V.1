@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 import math
 
+from performance_tracker import get_performance_summary
+
+
 OUTCOMES = ("B", "P", "T")
 # 方向架構參數固定在程式內，避免 Render 遺留的 ADAPTIVE_* 環境變數讓
 # 同一張截圖在不同部署得到不同結果。
@@ -28,25 +31,29 @@ ADAPTIVE_CHAMPION_TEMPERATURE = 0.85
 ADAPTIVE_FUSION_TEMPERATURE = 0.80
 ADAPTIVE_PLURALITY_STRENGTH = 0.12
 ADAPTIVE_LOGIT_CAP = 2.20
-ADAPTIVE_SHOE_MIN_SAMPLES = 8
+ADAPTIVE_SHOE_MIN_SAMPLES = 12
 
-# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。完整截圖
-# 歷史的 Full Road 是主幹；近期結構只做目前相位的確認。cMAB 是輔助
-# 訊號，最多佔總融合權重 12%，不再把它當作主輸出。
+# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。cMAB 是
+# 輔助訊號，最多佔總融合權重 12%，不再把它當作主輸出。
 ROAD_PRIMARY_COMPONENTS = (
     "structural_regime", "full_road", "short", "mid", "long", "pattern", "analogue",
 )
-FULL_ROAD_PRIMARY_MULTIPLIER = 2.15
-FULL_ROAD_EVIDENCE_MULTIPLIER = 0.80
-FULL_ROAD_MIN_PRIMARY_SHARE = 0.38
-FULL_ROAD_EVIDENCE_SHARE_BONUS = 0.18
-STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 1.30
-STRUCTURAL_AGREES_WITH_FULL_MULTIPLIER = 1.35
-STRUCTURAL_CONFLICTS_WITH_FULL_MULTIPLIER = 0.42
-RECENT_CONFIRMATION_REDUCTION = 0.68
-# cMAB 僅保留非常小的 context 輔助；它不得在使用者持續回報結果後變成
-# B/P 累積偏好來源。
-CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.06
+FULL_ROAD_PRIMARY_MULTIPLIER = 1.40
+STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 2.20
+STRUCTURAL_RECENCY_REDUCTION = 0.55
+CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.12
+
+# V34.1 穩定性微調：同一牌靴剛好連中幾次時，不讓短期成績把某個成員
+# 放大到 1.30 倍。12 手以上才採用，且權重只允許在 0.92～1.08 間小幅
+# 校準；50% 命中率剛好是 1.00，不改變原本的基準融合。
+CURRENT_SHOE_WEIGHT_MIN = 0.92
+CURRENT_SHOE_WEIGHT_MAX = 1.08
+CURRENT_SHOE_SELECTION_MIN = 0.95
+CURRENT_SHOE_SELECTION_MAX = 1.05
+
+# 結構規則與全牌路模型若方向衝突，保留 V34 的結構優先，但先扣掉一小段
+# 結構權重，避免「剛形成三連」單獨壓過完整牌路的長視窗證據。
+STRUCTURAL_FULL_ROAD_CONFLICT_FACTOR = 0.82
 
 
 def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
@@ -263,6 +270,29 @@ def _logit(probability: float) -> float:
     )
 
 
+def _current_shoe_performance_factor(
+    posterior_accuracy: float,
+    *,
+    for_selection: bool = False,
+) -> float:
+    """把同鞋短期表現限制為小幅校準，而不是正回饋放大。
+
+    後驗命中率 0.50 對應 1.00；即使短期全中或全錯，也不會讓某個模型
+    被放大／削弱到足以取代完整牌路與結構證據。
+    """
+    accuracy = max(0.0, min(1.0, float(posterior_accuracy)))
+    if for_selection:
+        return (
+            CURRENT_SHOE_SELECTION_MIN
+            + (CURRENT_SHOE_SELECTION_MAX - CURRENT_SHOE_SELECTION_MIN)
+            * accuracy
+        )
+    return (
+        CURRENT_SHOE_WEIGHT_MIN
+        + (CURRENT_SHOE_WEIGHT_MAX - CURRENT_SHOE_WEIGHT_MIN) * accuracy
+    )
+
+
 def _fusion_candidates(
     prediction: Mapping[str, Any],
     base: Mapping[str, float],
@@ -272,16 +302,12 @@ def _fusion_candidates(
     shoe_direction_performance: Mapping[str, Any],
     base_confidence: float,
 ) -> list[Dict[str, Any]]:
-    """建立「完整截圖歷史主、近期確認、cMAB 輔」的融合候選。
+    """建立「牌路主、cMAB 輔」的融合候選。
 
-    Full Road Pattern Model 使用截圖辨識出的所有 B/P/T 歷史建立整盤
-    相位，因此是唯一長程主幹。結構與短中長視窗只確認目前尾段是否仍在
-    延續全盤相位；若衝突，不允許單純「最後一顆」訊號反客為主。
+    Full Road Pattern Model 的完整歷史結論與五個既有路子專家是唯一主要
+    成員。LinUCB 的輸出不再和它們同權競爭，只在主要路子已存在時以最多
+    12% 的權重協助處理 context 新穎度與模型衝突。
     """
-    # 保留參數以維持內部／舊測試呼叫相容，但正式方向不再依任何已結算
-    # 命中率或本靴績效動態放大權重。否則「剛好順著某邊連中」會形成正回饋。
-    del historical_scores, component_sample_counts, shoe_direction_performance
-
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
     raw_models = road_data.get("models")
@@ -301,34 +327,52 @@ def _fusion_candidates(
             0.05,
             min(1.0, float(meta.get("reliability", 0.20) or 0.20)),
         )
-        samples = 0
-        historical_brier = None
-        performance_used = False
-        performance_quality = 0.50
+        samples = int(component_sample_counts.get(name, 0) or 0)
+        historical_brier = historical_scores.get(name)
+        performance_used = samples >= ADAPTIVE_CHAMPION_PERFORMANCE_SAMPLES
+        if performance_used:
+            try:
+                performance_quality = math.exp(
+                    -max(0.0, float(historical_brier)) / 0.50
+                )
+            except Exception:
+                performance_quality = 0.50
+                performance_used = False
+        else:
+            performance_quality = 0.50
         weight = (
             (0.25 + 0.75 * reliability)
             * (0.55 + 0.45 * performance_quality)
             * (0.80 + 0.20 * edge)
         )
         if name == "full_road":
-            # 只要已有至少 12 個 B/P 結果，Full Road 就必須參與融合；它
-            # 的權重隨全盤相位證據提升，而不是只靠最後一段 run length。
-            whole_evidence = max(
-                0.0,
-                min(1.0, float(meta.get("whole_shoe_evidence", 0.0) or 0.0)),
-            )
-            weight *= (
-                FULL_ROAD_PRIMARY_MULTIPLIER
-                + FULL_ROAD_EVIDENCE_MULTIPLIER * whole_evidence
-            )
+            # 完整路圖是第一層產物，給予溫和優先權；不是硬鎖方向，仍需
+            # 接受其他近期牌路專家與 cMAB context 的交叉驗證。
+            weight *= FULL_ROAD_PRIMARY_MULTIPLIER
         elif name == "structural_regime":
+            # 已通過 run-length 確認的單跳／雙跳／跳跳龍，不能再被三個
+            # 「最後一顆權重較高」的近期比例模型平均回原方向。
             weight *= STRUCTURAL_REGIME_PRIMARY_MULTIPLIER
         support = int(meta.get("support", 0) or 0)
-        shoe_samples = 0
-        shoe_accuracy = 0.50
+        raw_shoe_performance = shoe_direction_performance.get(name)
+        shoe_performance = (
+            dict(raw_shoe_performance)
+            if isinstance(raw_shoe_performance, Mapping)
+            else {}
+        )
+        shoe_samples = int(shoe_performance.get("sample_count", 0) or 0)
+        shoe_accuracy = float(
+            shoe_performance.get("posterior_accuracy", 0.50) or 0.50
+        )
+        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
+            weight *= _current_shoe_performance_factor(shoe_accuracy)
         selection_score = weight * (
             0.55 + 0.25 * min(1.0, support / 12.0) + 0.20 * edge
         )
+        if shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES:
+            selection_score *= _current_shoe_performance_factor(
+                shoe_accuracy, for_selection=True
+            )
         candidate_logit = _logit(banker)
         rows.append({
             "name": name,
@@ -349,58 +393,50 @@ def _fusion_candidates(
             "selection_score": float(selection_score),
             "current_shoe_samples": shoe_samples,
             "current_shoe_posterior_accuracy": float(shoe_accuracy),
-            "current_shoe_performance_used": False,
-            "performance_feedback_role": "diagnostic_only_not_direction_weight",
+            "current_shoe_performance_used": bool(
+                shoe_samples >= ADAPTIVE_SHOE_MIN_SAMPLES
+            ),
             "role": "road_primary",
         })
 
-    # 全盤模型啟用時，所有近期專家只能當確認者。結構路型和全盤方向一致
-    # 時可加權；方向矛盾時須大幅降權，防止剛出一顆就把全盤判讀推翻。
-    full_row = next((row for row in rows if row["name"] == "full_road"), None)
-    if full_row is not None:
-        full_direction = str(full_row.get("direction") or "")
-        for row in rows:
-            if row["name"] == "full_road":
-                continue
-            if row["name"] == "structural_regime":
-                multiplier = (
-                    STRUCTURAL_AGREES_WITH_FULL_MULTIPLIER
-                    if str(row.get("direction") or "") == full_direction
-                    else STRUCTURAL_CONFLICTS_WITH_FULL_MULTIPLIER
-                )
-                row["weight"] = float(row["weight"]) * multiplier
-            elif row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
-                row["weight"] = float(row["weight"]) * RECENT_CONFIRMATION_REDUCTION
+    # Full Road 和結構規則同時存在卻不同向時，代表「近期局型」和「完整
+    # 路紙」正出現分歧。只溫和收斂結構權重，並非取消 V34 的結構優先。
+    structural_row = next(
+        (row for row in rows if row["name"] == "structural_regime"), None
+    )
+    full_road_row = next(
+        (row for row in rows if row["name"] == "full_road"), None
+    )
+    if structural_row is not None and full_road_row is not None:
+        structural_direction = str(structural_row.get("direction") or "")
+        full_road_direction = str(full_road_row.get("direction") or "")
+        aligned = (
+            structural_direction in {"B", "P"}
+            and structural_direction == full_road_direction
+        )
+        structural_row["full_road_aligned"] = aligned
+        if (
+            structural_direction in {"B", "P"}
+            and full_road_direction in {"B", "P"}
+            and not aligned
+        ):
+            structural_row["weight"] = float(structural_row["weight"]) * (
+                STRUCTURAL_FULL_ROAD_CONFLICT_FACTOR
+            )
+            structural_row["selection_score"] = float(
+                structural_row["selection_score"]
+            ) * STRUCTURAL_FULL_ROAD_CONFLICT_FACTOR
+            structural_row["full_road_conflict_downweighted"] = True
 
-        # 「全盤」不能只是名字上的 primary。當完整截圖歷史已可用，保留
-        # Full Road 在主要牌路成員中的最低占比；全盤證據愈完整，最低占比
-        # 愈高。這不是硬鎖方向，仍會讓結構模型在相位一致時共同加分。
-        full_meta = metadata.get("full_road")
-        full_meta = dict(full_meta) if isinstance(full_meta, Mapping) else {}
-        whole_evidence = max(
-            0.0,
-            min(1.0, float(
-                full_meta.get(
-                    "whole_shoe_evidence", 0.0
-                ) or 0.0
-            )),
-        )
-        target_share = min(
-            0.56,
-            FULL_ROAD_MIN_PRIMARY_SHARE
-            + FULL_ROAD_EVIDENCE_SHARE_BONUS * whole_evidence,
-        )
-        other_weight = sum(
-            float(row["weight"])
-            for row in rows
-            if row is not full_row
-        )
-        required_full_weight = other_weight * target_share / max(
-            1e-12, 1.0 - target_share
-        )
-        full_row["weight"] = max(
-            float(full_row["weight"]), required_full_weight
-        )
+    # 結構元件一旦啟用，近期比例仍保留參考，但降低其合計影響力。這個
+    # 動作只對已確認結構生效；混合盤仍完全使用原本的多專家融合。
+    structural_active = any(
+        row["name"] == "structural_regime" for row in rows
+    )
+    if structural_active:
+        for row in rows:
+            if row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
+                row["weight"] = float(row["weight"]) * STRUCTURAL_RECENCY_REDUCTION
 
     primary_weight = sum(float(row["weight"]) for row in rows)
     bandit_banker = _conditional_banker(base)
@@ -615,8 +651,8 @@ def _apply_plurality_decision(
         reason = "牌路專家完全抵消，依 Contextual Bandit 輔助方向強制輸出 B/P。"
     else:
         reason = (
-            "先以完整截圖歷史 Full Road 的全盤相位作為主幹，再以近期結構"
-            "確認尾段；cMAB 僅以受限權重處理模型衝突。"
+            "以 reliability／Brier 權重進行 logit pooling，"
+            "再以 plurality evidence 放大非零方向優勢。"
         )
 
     result.update({
@@ -657,7 +693,7 @@ def _apply_plurality_decision(
         result["component_champion"] = tiebreaker
     result["adaptive_ensemble"] = {
         "active": True,
-        "mode": "full_screenshot_history_primary_adaptive_ensemble",
+        "mode": "road_primary_adaptive_ensemble",
         "circuit_breaker_active": False,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
@@ -682,13 +718,7 @@ def _apply_plurality_decision(
         "final_action": direction,
         "bet_multiplier": 1.0,
         "road_primary": True,
-        "full_screenshot_history_primary": True,
-        "full_road_used_count": int(
-            dict((result.get("road_support") or {})).get("full_history_used_count", 0)
-            or 0
-        ),
-        "contextual_bandit_role": "auxiliary_max_6_percent_structure_only",
-        "online_performance_weighting": "disabled_for_final_direction",
+        "contextual_bandit_role": "auxiliary_max_12_percent",
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,
@@ -715,25 +745,26 @@ def adapt_prediction(
     )
     result.setdefault("raw_probabilities", dict(base))
     components = _components(result)
-    road_support = result.get("road_support")
-    road_support = dict(road_support) if isinstance(road_support, Mapping) else {}
-    # 不再從 performance_tracker 取命中率來改寫權重：按鈕逐局結算後，
-    # 「剛好連中的順勢模型」會被越放越大，這正是追著最後一顆跑的正回饋。
-    # 結構 support 與全盤相位是唯一允許影響正式方向權重的證據。
-    sample_count = int(road_support.get("sample_count", 0) or 0)
-    historical_scores: Dict[str, Any] = {}
-    component_sample_counts: Dict[str, Any] = {}
-    shoe_summary: Dict[str, Any] = {}
-    shoe_direction_performance: Dict[str, Any] = {}
-    extreme_unseen_diagnostic = _is_extreme_unseen(result)
-    # 混沌僅作診斷；若 Full Road 已有可用成員，不能再把方向完全交回
-    # cMAB，否則同一副牌靴的線上回報會重新主導輸出。
-    extreme_unseen = False
-    if extreme_unseen_diagnostic:
-        result["chaos_diagnostic_active"] = True
-        result["chaos_diagnostic_note"] = (
-            "保留混沌診斷，但仍由全盤牌路融合輸出，不切換成 cMAB 單獨方向。"
+    summary = get_performance_summary(venue=venue, room=room, limit=5000)
+    sample_count = int(summary.get("sample_count", 0) or 0)
+    historical_scores = dict(summary.get("component_brier_scores") or {})
+    component_sample_counts = dict(
+        summary.get("component_sample_counts") or {}
+    )
+    shoe_summary = (
+        get_performance_summary(
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+            limit=500,
         )
+        if str(shoe_id or "").strip()
+        else {}
+    )
+    shoe_direction_performance = dict(
+        shoe_summary.get("component_direction_performance") or {}
+    )
+    extreme_unseen = _is_extreme_unseen(result)
     base_confidence = _base_confidence(result, base)
 
     if extreme_unseen:
@@ -795,7 +826,7 @@ def adapt_prediction(
             "minimum_samples_bypassed_for_safety": True,
             "is_extreme_unseen": True,
             "variance": float(result.get("variance", 0.0) or 0.0),
-            "bandit_weight_before": 0.15,
+            "bandit_weight_before": CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE,
             "bandit_weight_after": 1.0,
             "weight_reduction_ratio": 0.0,
             "weight_reduction_percent": 0.0,
@@ -822,7 +853,7 @@ def adapt_prediction(
         historical_scores=historical_scores,
         component_sample_counts=component_sample_counts,
         shoe_direction_performance=shoe_direction_performance,
-        shoe_sample_count=0,
+        shoe_sample_count=int(shoe_summary.get("sample_count", 0) or 0),
         sample_count=sample_count,
         base_confidence=base_confidence,
     )

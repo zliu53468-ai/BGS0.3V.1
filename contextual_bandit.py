@@ -41,12 +41,13 @@ import numpy as np
 from road_model import build_road_context
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V3.3-STRUCTURE-ONLY-PREQUENTIAL"
-# 35 維欄位數與對外接口不變，但其中原本的 B/P 數量平衡欄位改成了
-# 續走／反轉結構語意。舊矩陣的係數不能再安全沿用，故部署後會自動建立
-# 新 state，而不是把既有「莊多／閒多」偏差帶入新版。
-STATE_SCHEMA_VERSION = "CMAB-STRUCTURE-ONLY-V5"
-COMPATIBLE_STATE_SCHEMA_VERSIONS = {STATE_SCHEMA_VERSION}
+MODEL_VERSION = "CMAB-LINUCB-V3.2-REGIME-FIRST-PREQUENTIAL"
+STATE_SCHEMA_VERSION = "CMAB-EPISODE-REPLAY-V4"
+COMPATIBLE_STATE_SCHEMA_VERSIONS = {
+    "CMAB-UID-ISOLATED-V1",
+    "CMAB-UID-ISOLATED-V2",
+    STATE_SCHEMA_VERSION,
+}
 FEATURE_NAMES = (
     "bias", "history_maturity", "global_banker_balance",
     "recent5_banker_balance", "recent10_banker_balance",
@@ -217,21 +218,11 @@ def _prob_balance(probability: Any) -> float:
 
 
 def _banker_balance(sequence: Sequence[str], size: Optional[int] = None) -> float:
-    """保留舊函式與 35 維欄位位置，但改回傳相對路型平衡。
-
-    舊實作是 ``B 的數量比例 - 0.5``，這會讓 Contextual Bandit 將「哪邊
-    開得多」誤當成方向證據。新版固定比較相鄰局的延續／反轉比例，回傳
-    ``P(continue) - P(reverse)``；B/P 對調後數值不變，因此不再累積莊或
-    閒的顏色偏好。
-    """
     values = list(sequence[-size:] if size else sequence)
-    if len(values) < 2:
+    if not values:
         return 0.0
-    continued = sum(
-        previous == current for previous, current in zip(values, values[1:])
-    )
-    rate = continued / (len(values) - 1)
-    return _clip((rate - 0.5) * 2.0)
+    banker = sum(value == "B" for value in values)
+    return _clip((banker / len(values) - 0.5) * 2.0)
 
 
 def _alternation(sequence: Sequence[str], size: int) -> float:
@@ -284,7 +275,7 @@ def _recent_run_volatility(sequence: Sequence[str], size: int = 5) -> float:
 
 
 def _streak_break_signal(sequence: Sequence[str]) -> float:
-    """最新一局是否剛斷掉至少 3 顆的龍；不攜帶 B/P 顏色符號。"""
+    """最新一局是否剛斷掉至少 3 顆的龍；符號代表新方向。"""
     values = list(sequence)
     if len(values) < 4 or values[-1] == values[-2]:
         return 0.0
@@ -296,25 +287,27 @@ def _streak_break_signal(sequence: Sequence[str]) -> float:
         previous_run += 1
     if previous_run < 3:
         return 0.0
-    return min(1.0, previous_run / 6.0)
+    sign = 1.0 if values[-1] == "B" else -1.0
+    return sign * min(1.0, previous_run / 6.0)
 
 
 def _long_dragon_tail_pressure(sequence: Sequence[str]) -> float:
-    """長龍尾端壓力；只描述龍長，不攜帶莊／閒顏色。"""
-    _, length = _streak(sequence)
+    """長龍尾端壓力，而非宣稱能知道物理上的下一張牌。"""
+    direction, length = _streak(sequence)
     if length < 4:
         return 0.0
-    return min(1.0, (length - 3) / 5.0)
+    sign = 1.0 if direction == "B" else -1.0
+    return sign * min(1.0, (length - 3) / 5.0)
 
 
 def _single_jump_onset(sequence: Sequence[str]) -> float:
-    """最近 4 局是否形成單跳開端；只描述結構，不攜帶最新落點。"""
+    """最近 4 局是否形成單跳開端；符號代表最新落點。"""
     values = list(sequence[-4:])
     if len(values) < 4 or not all(
         left != right for left, right in zip(values, values[1:])
     ):
         return 0.0
-    return 1.0
+    return 1.0 if values[-1] == "B" else -1.0
 
 
 def _derived_road_saturation(
@@ -392,28 +385,14 @@ def _stabilize_context_vector(values: Sequence[float]) -> List[float]:
 
 
 def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None) -> List[float]:
-    """建立固定 35 維上下文；只輸入路型關係而非 B/P 出現比例。
-
-    維度與對外接口維持 35 不變。原先以 ``*_banker_balance`` 命名的欄位
-    改放各窗口的續走／反轉平衡；原先帶 B/P 正負號的欄位則改成「是否為
-    延續、是否為斷龍」等結構編碼。如此 cMAB 可辨識盤型，但不會因使用者
-    連續回報莊或閒而把顏色本身累積成下一局方向。
-    """
+    """建立固定上下文；B/P 規律特徵不讓和局推進時間軸。"""
     raw = _clean_history(history)
     bp = [value for value in raw if value in ARMS]
     road = dict(road_context or {})
-    _, streak_length = _streak(bp)
-    last_relation = (
-        1.0 if bp[-1] == bp[-2] else -1.0
-        if len(bp) >= 2 else 0.0
-    )
-    previous_relation = (
-        1.0 if bp[-2] == bp[-3] else -1.0
-        if len(bp) >= 3 else 0.0
-    )
-    # 這個位置舊名為 current_streak_direction；新版只表示「是否已形成
-    # 可辨識的延續 run」，不再把 B 或 P 的顏色直接送進 LinUCB。
-    streak_mode = 1.0 if streak_length >= 3 else -1.0 if len(bp) >= 2 else 0.0
+    streak_direction, streak_length = _streak(bp)
+    last_direction = 1.0 if bp and bp[-1] == "B" else -1.0 if bp else 0.0
+    previous_direction = 1.0 if len(bp) >= 2 and bp[-2] == "B" else -1.0 if len(bp) >= 2 else 0.0
+    streak_sign = 1.0 if streak_direction == "B" else -1.0 if streak_direction == "P" else 0.0
     tie_rate = sum(value == "T" for value in raw) / max(1, len(raw))
     confidence = _clip(road.get("confidence_score", 0.0), 0.0, 1.0)
     planning_reliability = _clip(road.get("planning_reliability", 0.0), 0.0, 1.0)
@@ -446,9 +425,9 @@ def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mappi
         min(1.0, len(bp) / 60.0),
         _banker_balance(bp), _banker_balance(bp, 5), _banker_balance(bp, 10),
         _banker_balance(bp, 20), _banker_balance(bp, 40),
-        streak_mode, min(1.0, streak_length / 8.0),
+        streak_sign, min(1.0, streak_length / 8.0),
         _alternation(bp, 5), _alternation(bp, 10), _alternation(bp, 20),
-        last_relation, previous_relation, _clip(tie_rate / 0.20, 0.0, 1.0),
+        last_direction, previous_direction, _clip(tie_rate / 0.20, 0.0, 1.0),
         _prob_balance(road.get("planning_probability", 0.5)),
         _prob_balance(road.get("recent_probability", 0.5)),
         confidence, planning_reliability, recent_reliability, agreement,
@@ -1398,7 +1377,8 @@ def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any])
 
     這裡只在模型沒有分數優勢時使用，且只讀取已知 B/P 結構：
     1. 近期 transition 的延續／切換次數；
-    2. 完全平手時以整段歷史 hash 作可重現中性決勝。
+    2. 最近 8 手的多數；
+    3. 完全平手時以整段歷史 hash 作可重現中性決勝。
     ``road_context`` 參數保留以維持既有對外呼叫相容，但不再允許其中的
     ``direction``／``planning_direction`` 偷渡成「跟最後一顆」的預設值。
     """
@@ -1423,6 +1403,11 @@ def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any])
     if switch_transitions > same_transitions:
         # 單跳／跳路佔優時，取反向延續該結構。
         return "P" if recent[-1] == "B" else "B"
+
+    banker_count = sum(value == "B" for value in recent)
+    player_count = len(recent) - banker_count
+    if banker_count != player_count:
+        return "B" if banker_count > player_count else "P"
 
     # 所有結構都平手時，不允許回落到最後一顆。hash 使同一段歷史永遠
     # 得到相同結果，且不保存隱藏狀態、不受重按按鈕影響。
@@ -1596,21 +1581,9 @@ def _short_term_trend_buffer(
         strength = 0.57
         evidence = buffer[-3:]
     elif len(buffer) >= 3:
-        same = sum(
-            previous == current
-            for previous, current in zip(buffer, buffer[1:])
-        )
-        switched = (len(buffer) - 1) - same
-        if same > switched:
-            direction = buffer[-1]
-            strategy = "recent_transition_continuation"
-        elif switched > same:
-            direction = "P" if buffer[-1] == "B" else "B"
-            strategy = "recent_transition_reversal"
-        else:
-            digest = sha256("|".join(buffer).encode("utf-8")).digest()
-            direction = "B" if (digest[0] & 1) == 0 else "P"
-            strategy = "recent_transition_neutral_hash_tiebreak"
+        banker = sum(value == "B" for value in buffer)
+        direction = "B" if banker >= 2 else "P"
+        strategy = "recent_three_majority"
         strength = 0.55
         evidence = buffer[-3:]
     else:

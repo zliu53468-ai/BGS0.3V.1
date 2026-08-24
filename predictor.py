@@ -84,32 +84,6 @@ def _fallback_direction(prediction: Mapping[str, Any]) -> str:
     return "B" if banker >= player else "P"
 
 
-def _road_context_matches_history(
-    road_context: Mapping[str, Any],
-    history: Iterable[Any],
-) -> bool:
-    """確認截圖路圖 context 與目前完整歷史是同一版本。
-
-    使用者上傳截圖後再按莊／閒／和按鈕時，history 會增加；舊版只要收到
-    一個含 ``models`` 的 road_context 就直接沿用，可能繼續以截圖當下的
-    舊牌路預測。這裡比對完整 B/P 時序，不一致就重新建構全盤模型，確保每
-    一次預測都看得到「截圖結果 + 後續按鈕新增結果」的全部歷史。
-    """
-    if not isinstance(road_context.get("models"), Mapping):
-        return False
-    expected = _normalize_outcome_history(history)
-    expected_bp = [value for value in expected if value in {"B", "P"}]
-    raw = road_context.get("raw_outcomes")
-    has_raw_bpt_timeline = isinstance(raw, (list, tuple))
-    if not has_raw_bpt_timeline:
-        raw = road_context.get("sequence")
-    observed = _normalize_outcome_history(raw or [])
-    if has_raw_bpt_timeline:
-        return observed == expected
-    observed_bp = [value for value in observed if value in {"B", "P"}]
-    return observed_bp == expected_bp
-
-
 def _short_term_trend_prior(
     buffer: List[str],
     fallback_direction: str,
@@ -694,11 +668,10 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     else:
         history_values = list(history)
     cleaned = _normalize_outcome_history(history_values)
-    # 第一層：Full Road Pattern Model。只有在輸入 context 和目前完整
-    # B/P/T 歷史完全一致時才沿用；任何一顆按鈕新增結果都會重建，避免
-    # 全盤模型停在第一張截圖而沒有看到後續路紙。
+    # 第一層：Full Road Pattern Model。截圖入口若已附上完整 road_context
+    # 則直接沿用；否則從目前 B/P/T 歷史建構，確保不會跳過全路圖分析。
     road = dict(road_context or {})
-    if not _road_context_matches_history(road, cleaned):
+    if not isinstance(road.get("models"), Mapping):
         road = build_road_context(cleaned, seed=run_seed)
 
     # 第二層所需的 cMAB 先獨立評估。它保留自己的 Arm 與 state，只提供
@@ -756,15 +729,6 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             "direction": road_direction,
             "rule": "full_road_pattern_model",
             "regime": dict(road.get("regime") or {}),
-        },
-        "history_scope": {
-            "raw_bpt_count": len(cleaned),
-            "bp_count": sum(value in {"B", "P"} for value in cleaned),
-            "tie_count": sum(value == "T" for value in cleaned),
-            "full_road_used_count": int(
-                road.get("full_history_used_count", road.get("sample_count", 0)) or 0
-            ),
-            "all_current_screenshot_history_used": True,
         },
         "recommend": final_direction,
         "recommend_text": final_text,
