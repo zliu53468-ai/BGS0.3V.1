@@ -1292,11 +1292,8 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
-    """精簡預測面板：正式訊號就是下一局方向評估。"""
+    """預測面板：保留方向、機率與操作按鈕，不顯示內部技術診斷。"""
     prediction = dict(session.get("screen_last_prediction") or {})
-    calibration = dict(prediction.get("calibration") or {})
-    adaptive = dict(prediction.get("adaptive_ensemble") or {})
-    road_support = dict(prediction.get("road_support") or {})
 
     # 正式訊號優先採用 internal_*；O 是正式的風控動作（可能是統計
     # 硬熔斷，也可能是樣本／方向優勢不足），不可再由中性機率反推
@@ -1328,59 +1325,15 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     prediction["next_round_direction"] = formal_code
     prediction["next_round_direction_text"] = formal_text
 
-    action_code = str(prediction.get("internal_action") or "").upper().strip()
-    internal_observe = action_code == "O"
-    signal_status = (
-        "正式訊號已確認"
-        if not internal_observe
-        else str(
-            prediction.get("signal_status_text")
-            or "模型信心不足：本局觀望／不下注"
-        )
-    )
-    signal_reason = str(
-        prediction.get("internal_signal_reason")
-        or prediction.get("signal_reason")
-        or "依正式模型、校準結果與方向機率產生"
-    )
-
-    quality_score = float(prediction.get("quality_score", 0.0) or 0.0)
-    confidence_label = str(prediction.get("confidence_label") or "偏低")
-    edge_percent = float(
-        prediction.get("direction_edge_percent")
-        or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0
-    )
-    consistency = float(prediction.get("model_consistency", 0.0) or 0.0) * 100.0
     analysis_number = int(session.get("screen_analysis_count", 0) or 0)
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
     bet_level = str(prediction.get("bet_level_text") or "標準區間")
-    strategy_bandit = dict(prediction.get("decision_strategy_bandit") or {})
-    strategy_profile = dict(strategy_bandit.get("profile") or {})
-    physical_signal = dict(prediction.get("physical_signal") or {})
-    strategy_text = str(
-        strategy_profile.get("label")
-        or prediction.get("decision_strategy")
-        or "尚未選擇"
-    )
-    physical_source = str(physical_signal.get("source") or "未提供精確牌組")
-    physical_ev = float(prediction.get("selected_expected_return", 0.0) or 0.0)
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
         if suggested > 0
         else "0 元"
-    )
-    road_direction = str(road_support.get("direction_text") or "資料建立中")
-    calibration_text = (
-        f"已啟用｜{calibration.get('scope')}｜{int(calibration.get('sample_count', 0) or 0)} 筆"
-        if calibration.get("active")
-        else f"累積中｜{int(calibration.get('sample_count', 0) or 0)} 筆"
-    )
-    adaptive_text = (
-        f"已啟用｜{float(adaptive.get('effective_share', 0.0) or 0.0) * 100.0:.1f}%"
-        if adaptive.get("active")
-        else "樣本累積中"
     )
 
     return _clean_flex(
@@ -1441,44 +1394,6 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                                     "weight": "bold",
                                 },
                             ],
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"正式訊號：{formal_text}\n"
-                                f"訊號狀態：{signal_status}\n"
-                                f"方向優勢：{edge_percent:.2f}%\n"
-                                f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
-                                f"模型一致度：{consistency:.1f}%\n"
-                                f"牌路診斷：{road_direction}\n"
-                                f"策略 Bandit：{strategy_text}\n"
-                                f"精確牌組來源：{physical_source}\n"
-                                f"抽水後 EV：{physical_ev:.3%}\n"
-                                "安全規則：牌路只確認／縮倉，不可取代精確 EV\n"
-                                "注碼限制：Kelly Fraction 與 MAX_BET_FRACTION 硬上限"
-                            ),
-                            "wrap": True,
-                            "margin": "md",
-                            "color": "#3E3100",
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"校準狀態：{calibration_text}\n"
-                                f"自適應集成：{adaptive_text}"
-                            ),
-                            "wrap": True,
-                            "size": "sm",
-                            "margin": "md",
-                            "color": "#665000",
-                        },
-                        {
-                            "type": "text",
-                            "text": f"訊號說明：{signal_reason}",
-                            "wrap": True,
-                            "size": "sm",
-                            "margin": "md",
-                            "color": "#665000",
                         },
                         {
                             "type": "separator",
