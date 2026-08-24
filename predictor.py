@@ -1,9 +1,9 @@
 """BGS cMAB 統一預測入口。
 
 正式圖片／真人桌預測使用完整 B/P/T 歷史、牌路上下文與 LinUCB cMAB。
-adaptive_ensemble 負責統計混沌硬熔斷；predictor 只在後台執行
-三局影子回測，達成連中 2 局且模型方差安全後才解除 No Bet。
-不恢復已移除的粒子、超幾何、蒙地卡羅、Stacking 或 DeepSeek。
+本檔保留既有 API 與虛擬相容工具，但正式方向不再交給 ensemble、
+驗證選模或影子控制器覆寫；畫面輸出直接採用 contextual_bandit.py
+的原始 B/P Arm 選擇結果。
 """
 from __future__ import annotations
 
@@ -441,29 +441,11 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         user_id=bandit_learning_user_id,
         run_seed=run_seed,
     )
-    # 全局閉環：統計風險訊號 -> 集成硬熔斷 -> 三局影子回測解鎖。
-    result = adapt_prediction(
-        result,
-        venue=str(venue or ""),
-        room=str(room or ""),
-    )
-    # 只在模型之外使用「已結算、時間順序正確」的真實績效選擇方向，
-    # 並壓低尚未經外驗證的假高信心；不改任何基礎模型參數或公式。
-    result = apply_validated_decision(
-        result,
-        venue=str(venue or ""),
-        room=str(room or ""),
-    )
-    result = _SHADOW_CONTROLLER.apply(
-        cleaned,
-        result,
-        stream_key=_SHADOW_CONTROLLER.stream_key(
-            user_id=str(user_id or ""),
-            venue=str(venue or ""),
-            room=str(room or ""),
-            shoe_id=str(shoe_id or ""),
-        ),
-    )
+    # 正式決策單一路徑：任何後段診斷模組均不得寫入這些方向欄位。
+    # 因此 action/recommend/selected_arm/next_round_direction 與 cMAB
+    # predict_bandit() 的原始輸出逐欄保留，不做二次融合或覆寫。
+    result["decision_pipeline"] = "contextual_bandit_direct"
+    result["direction_overwrite_disabled"] = True
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
     ).strip()
