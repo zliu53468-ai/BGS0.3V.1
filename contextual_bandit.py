@@ -21,6 +21,12 @@ V2.0 非平穩牌路版：
 - 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
 - B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
 
+V2.1 自適應穩定版：
+- 以排列熵、卡方 p 值與斷龍訊號連續調整遺忘因子，不再二元切換。
+- 依冷啟動成熟度、下三路共識與長龍調整 LinUCB exploration alpha。
+- 反事實 reward 使用每個 Arm 的時序 EMA，降低單局斷龍的矩陣震盪。
+- 解線性系統前做對稱化、最小特徵值檢查與尺度自適應 ridge jitter。
+
 banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
 """
 from __future__ import annotations
@@ -38,7 +44,7 @@ import time
 import numpy as np
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V2.0-NONSTATIONARY-CONTEXT"
+MODEL_VERSION = "CMAB-LINUCB-V2.1-ADAPTIVE-STABLE-CONTEXT"
 STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V3"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -101,6 +107,16 @@ CMAB_FORGETTING_FACTOR = _env_float(
 )
 CMAB_REVERSAL_FORGETTING_FACTOR = _env_float(
     "CMAB_REVERSAL_FORGETTING_FACTOR", 0.94, 0.85, 1.00
+)
+# V2.1：更新時依預測當下的混沌診斷連續調整遺忘速度。
+CMAB_STABLE_FORGETTING_FACTOR = _env_float(
+    "CMAB_STABLE_FORGETTING_FACTOR", 0.99, 0.90, 1.00
+)
+CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = _env_float(
+    "CMAB_MIN_DYNAMIC_FORGETTING_FACTOR", 0.90, 0.85, 0.99
+)
+CMAB_REWARD_SMOOTHING = _env_float(
+    "CMAB_REWARD_SMOOTHING", 0.35, 0.05, 1.0
 )
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
@@ -764,6 +780,8 @@ def _new_state() -> Dict[str, Any]:
                 "weighted_updates": 0.0,
                 "reward_sum": 0.0,
                 "weighted_reward_sum": 0.0,
+                # V2.1：下一次更新用作時序平滑的上一筆反事實回報。
+                "last_smoothed_reward": 0.0,
             }
             for arm in ARMS
         },
@@ -872,6 +890,9 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
                 arm_state.get("reward_sum", 0.0),
             )
             or 0.0
+        )
+        arm_state["last_smoothed_reward"] = _clip(
+            arm_state.get("last_smoothed_reward", 0.0)
         )
 
     context_information = state.get("context_information")
@@ -1065,6 +1086,66 @@ def _write_state_unlocked(state_store: Dict[str, Any]) -> None:
     temporary.replace(CMAB_STATE_FILE)
 
 
+def _dynamic_alpha(context: np.ndarray, updates: int) -> float:
+    """冷啟動提高探索；高度共識長龍只溫和縮小探索，避免追龍綁架。"""
+    index = {name: i for i, name in enumerate(FEATURE_NAMES)}
+    maturity = float(context[index["shoe_round_maturity"]])
+    consensus = float(context[index["derived_road_consensus"]])
+    long_dragon = abs(float(context[index["current_streak_length"]])) >= 0.50
+    update_maturity = min(1.0, max(0.0, updates / 40.0))
+    early_uncertainty = 1.0 - min(maturity, update_maturity)
+    alpha = CMAB_ALPHA * (1.0 + 0.50 * early_uncertainty)
+    if long_dragon and consensus >= 0.75:
+        alpha *= 1.0 - 0.35 * ((consensus - 0.75) / 0.25)
+    return max(0.05, min(5.0, float(alpha)))
+
+
+def _stable_solve(matrix: np.ndarray, rhs: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """對稱化後依矩陣尺度與最小特徵值加入 ridge jitter。"""
+    symmetric = 0.5 * (matrix + matrix.T)
+    diagonal_scale = max(CMAB_L2, float(np.mean(np.abs(np.diag(symmetric)))), 1.0)
+    try:
+        minimum_eigenvalue = float(np.min(np.linalg.eigvalsh(symmetric)))
+    except np.linalg.LinAlgError:
+        minimum_eigenvalue = -diagonal_scale
+    jitter = max(1e-9 * diagonal_scale, -minimum_eigenvalue + 1e-9 * diagonal_scale)
+    identity = np.eye(CONTEXT_DIM, dtype=np.float64)
+    regularized = symmetric + jitter * identity
+    for _ in range(5):
+        try:
+            solution = np.linalg.solve(regularized, rhs)
+            condition_number = float(np.linalg.cond(regularized))
+            if not math.isfinite(condition_number):
+                condition_number = 1e16
+            return solution, float(jitter), min(1e16, condition_number)
+        except np.linalg.LinAlgError:
+            jitter = max(1e-8, jitter * 10.0)
+            regularized = symmetric + jitter * identity
+    return np.linalg.pinv(regularized, rcond=1e-8) @ rhs, float(jitter), 1e16
+
+
+def _stabilize_information_matrix(
+    matrix: np.ndarray,
+    ridge_level: float,
+) -> tuple[np.ndarray, float]:
+    """將遞迴更新後的資訊矩陣投回數值上半正定的對稱形式。"""
+    ridge = max(1e-12, float(ridge_level))
+    candidate = np.asarray(matrix, dtype=np.float64)
+    if (
+        candidate.shape != (CONTEXT_DIM, CONTEXT_DIM)
+        or not np.all(np.isfinite(candidate))
+    ):
+        return np.eye(CONTEXT_DIM, dtype=np.float64) * ridge, ridge
+    symmetric = 0.5 * (candidate + candidate.T)
+    scale = max(ridge, float(np.mean(np.abs(np.diag(symmetric)))), 1.0)
+    try:
+        minimum_eigenvalue = float(np.min(np.linalg.eigvalsh(symmetric)))
+    except np.linalg.LinAlgError:
+        minimum_eigenvalue = -scale
+    jitter = max(0.0, -minimum_eigenvalue + 1e-10 * scale)
+    return symmetric + jitter * np.eye(CONTEXT_DIM, dtype=np.float64), float(jitter)
+
+
 def _arm_metrics(
     state: Mapping[str, Any],
     arm: str,
@@ -1081,21 +1162,8 @@ def _arm_metrics(
     A = np.asarray(arm_state.get("A"), dtype=np.float64)
     b = np.asarray(arm_state.get("b"), dtype=np.float64)
 
-    # 避免長期浮點累積造成 A 輕微不對稱。
-    A = 0.5 * (A + A.T)
-
     right_hand_sides = np.column_stack((b, context))
-    solved: Optional[np.ndarray] = None
-    regularized = A
-    for jitter in (0.0, 1e-10, 1e-8, 1e-6):
-        regularized = A + np.eye(CONTEXT_DIM, dtype=np.float64) * jitter
-        try:
-            solved = np.linalg.solve(regularized, right_hand_sides)
-            break
-        except np.linalg.LinAlgError:
-            continue
-    if solved is None:
-        solved = np.linalg.pinv(regularized) @ right_hand_sides
+    solved, ridge_jitter, condition_number = _stable_solve(A, right_hand_sides)
     theta = solved[:, 0]
     solved_context = solved[:, 1]
 
@@ -1104,7 +1172,9 @@ def _arm_metrics(
         max(0.0, float(context @ solved_context))
     )
     uncertainty = float(math.sqrt(variance))
-    exploration = float(CMAB_ALPHA * uncertainty)
+    updates = int(arm_state.get("updates", 0) or 0)
+    effective_alpha = _dynamic_alpha(context, updates)
+    exploration = float(effective_alpha * uncertainty)
 
     return {
         "estimate": estimate,
@@ -1113,8 +1183,11 @@ def _arm_metrics(
         "confidence_interval_half_width": exploration,
         "confidence_interval_full_width": 2.0 * exploration,
         "exploration": exploration,
+        "effective_alpha": effective_alpha,
+        "ridge_jitter": ridge_jitter,
+        "condition_number": condition_number,
         "score": estimate + exploration,
-        "updates": int(arm_state.get("updates", 0) or 0),
+        "updates": updates,
         "weighted_updates": float(
             arm_state.get(
                 "weighted_updates",
@@ -1142,25 +1215,17 @@ def _shared_context_uncertainty(
     """計算與 Arm／reward 無關的牌路 context 新穎度。"""
     information = dict(state.get("context_information") or {})
     matrix = _as_information_matrix(information.get("A"))
-    solved_context: Optional[np.ndarray] = None
-    regularized = matrix
-    for jitter in (0.0, 1e-10, 1e-8, 1e-6):
-        regularized = matrix + np.eye(CONTEXT_DIM, dtype=np.float64) * jitter
-        try:
-            solved_context = np.linalg.solve(regularized, context)
-            break
-        except np.linalg.LinAlgError:
-            continue
-    if solved_context is None:
-        solved_context = np.linalg.pinv(regularized) @ context
+    solved_context, ridge_jitter, condition_number = _stable_solve(matrix, context)
 
     variance = max(0.0, float(context @ solved_context))
     return {
         "variance": float(variance),
         "std": float(math.sqrt(variance)),
         "confidence_interval_half_width": float(
-            CMAB_ALPHA * math.sqrt(variance)
+            _dynamic_alpha(context, int(information.get("updates", 0) or 0)) * math.sqrt(variance)
         ),
+        "ridge_jitter": ridge_jitter,
+        "condition_number": condition_number,
         "updates": int(information.get("updates", 0) or 0),
         "weighted_updates": float(
             information.get(
@@ -1674,6 +1739,14 @@ def _predict_bandit_impl(
             "permutation_entropy": float(
                 braking["permutation_entropy"]
             ),
+            "chi_square_p_value": float(
+                braking["rolling_randomness"].get(
+                    "chi_square_p_value", 1.0
+                )
+            ),
+            "randomness_ready": bool(
+                braking["rolling_randomness"].get("ready", False)
+            ),
             "selected_arm": direction,
             "recommended_action": action_code,
             "created_at": int(time.time()),
@@ -1973,13 +2046,27 @@ def _predict_bandit_impl(
                 CMAB_UNKNOWN_UPDATE_MULTIPLIER
             ),
             "few_shot_boost_disabled": True,
-            "forgetting_factor": CMAB_FORGETTING_FACTOR,
+            "forgetting_factor": CMAB_STABLE_FORGETTING_FACTOR,
+            "dynamic_forgetting_factor": {
+                "stable": CMAB_STABLE_FORGETTING_FACTOR,
+                "minimum": CMAB_MIN_DYNAMIC_FORGETTING_FACTOR,
+                "inputs": [
+                    "permutation_entropy",
+                    "chi_square_p_value",
+                    "streak_break_signal",
+                ],
+            },
             "reversal_forgetting_factor": (
                 CMAB_REVERSAL_FORGETTING_FACTOR
             ),
             "reward_strategy": (
-                "probability_weighted_asymmetric_payoff"
+                "temporally_smoothed_counterfactual_payoff"
             ),
+            "reward_smoothing": CMAB_REWARD_SMOOTHING,
+            "effective_alpha_by_arm": {
+                arm: float(metrics[arm]["effective_alpha"])
+                for arm in ARMS
+            },
             "permutation_entropy_window": CMAB_PERMUTATION_WINDOW,
             "permutation_entropy_threshold": (
                 CMAB_PERMUTATION_ENTROPY_THRESHOLD
@@ -2051,19 +2138,95 @@ def _conditional_bp_probabilities(values: Any) -> Dict[str, float]:
 def _probability_weighted_arm_rewards(
     actual: str,
     prediction_probabilities: Any,
+    *,
+    previous_rewards: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, float]:
-    """方向 payoff 的信心加權版，範圍 [-2, 1]。"""
+    """以時序 EMA 平滑的反事實方向回報，範圍固定為 [-1, 1]。
+
+    每局 B/P 都已揭曉，所以兩個 Arm 的反事實方向 payoff 均可觀測。
+    單局命中／失誤的瞬時回報先受預測信心調節，再和該 Arm 上一筆
+    平滑回報做 EMA；因此一次斷龍不會把 ridge posterior 推向極端。
+    這是方向學習損失，不是百家樂真實投注 EV 或賠付公式。
+    """
     conditional = _conditional_bp_probabilities(prediction_probabilities)
+    previous = dict(previous_rewards or {})
     rewards: Dict[str, float] = {}
     for candidate in ARMS:
         confidence = float(conditional[candidate])
+        # 正確方向獲得正效用、錯誤方向承擔相對稱的負效用；信心愈高，
+        # 當局的訊號幅度愈大，但始終有界，避免 -2.0 的單局矩陣震盪。
         if candidate == actual:
-            value = 0.5 + 0.5 * confidence
+            instantaneous = 0.5 + 0.5 * confidence
         else:
-            excess = max(0.0, (confidence - 0.5) / 0.5)
-            value = -(0.25 + 1.75 * excess * excess)
-        rewards[candidate] = float(max(-2.0, min(1.0, value)))
+            instantaneous = -(0.5 + 0.5 * confidence)
+
+        prior = previous.get(candidate)
+        try:
+            previous_reward = float(prior)
+        except (TypeError, ValueError):
+            previous_reward = instantaneous
+        if not math.isfinite(previous_reward):
+            previous_reward = instantaneous
+        # 尚未有前一筆回報時直接採用第一筆，避免冷啟動被無意義地縮小。
+        if candidate not in previous:
+            previous_reward = instantaneous
+        value = (
+            (1.0 - CMAB_REWARD_SMOOTHING) * previous_reward
+            + CMAB_REWARD_SMOOTHING * instantaneous
+        )
+        rewards[candidate] = float(max(-1.0, min(1.0, value)))
     return rewards
+
+
+def _continuous_forgetting_factor(
+    prediction_risk: Mapping[str, Any],
+    reversal_signal: float,
+) -> tuple[float, Dict[str, float]]:
+    """以預測當下的混沌診斷連續控制遺忘係數。
+
+    白噪音排列熵與低卡方 p 值各自都可代表 regime 可能變動；兩者是
+    連續分數而非 V2.0 的二元斷龍開關。沒有足夠 12 局視窗時，只讓
+    斷龍特徵提供較小的保守壓力，避免冷啟動因 p 值不穩定而過度遺忘。
+    """
+    try:
+        entropy = float(prediction_risk.get("permutation_entropy", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        entropy = 0.0
+    try:
+        p_value = float(prediction_risk.get("chi_square_p_value", 1.0))
+    except (TypeError, ValueError):
+        p_value = 1.0
+    entropy = min(1.0, max(0.0, entropy if math.isfinite(entropy) else 0.0))
+    p_value = min(1.0, max(0.0, p_value if math.isfinite(p_value) else 1.0))
+    reversal = min(1.0, max(0.0, abs(float(reversal_signal))))
+    randomness_ready = bool(prediction_risk.get("randomness_ready", False))
+
+    entropy_pressure = (
+        min(1.0, max(0.0, (entropy - 0.70) / 0.30))
+        if randomness_ready
+        else 0.0
+    )
+    chi_square_pressure = (
+        min(1.0, max(0.0, (0.15 - p_value) / 0.15))
+        if randomness_ready
+        else 0.0
+    )
+    # 任一統計異常都可以加速遺忘；reversal 只作為輔助，不再直接把
+    # forgetting factor 切到固定常數。
+    randomness_pressure = max(entropy_pressure, chi_square_pressure)
+    instability = max(randomness_pressure, 0.35 * reversal)
+    stable = max(CMAB_MIN_DYNAMIC_FORGETTING_FACTOR, CMAB_STABLE_FORGETTING_FACTOR)
+    minimum = min(CMAB_MIN_DYNAMIC_FORGETTING_FACTOR, stable)
+    factor = stable - (stable - minimum) * instability
+    return float(factor), {
+        "permutation_entropy": float(entropy),
+        "chi_square_p_value": float(p_value),
+        "entropy_pressure": float(entropy_pressure),
+        "chi_square_pressure": float(chi_square_pressure),
+        "reversal_pressure": float(0.35 * reversal),
+        "instability": float(instability),
+        "randomness_ready": float(1.0 if randomness_ready else 0.0),
+    }
 
 
 def _update_bandit_impl(
@@ -2122,13 +2285,15 @@ def _update_bandit_impl(
             }
 
         last_risk = dict(state.get("last_prediction_risk") or {})
+        prediction_context_matches = bool(
+            str(last_risk.get("context_hash") or "") == context_hash
+        )
         same_high_variance_context = bool(
             last_risk.get(
                 "is_extreme_unseen",
                 last_risk.get("unknown_region_active", False),
             )
-            and str(last_risk.get("context_hash") or "")
-            == context_hash
+            and prediction_context_matches
         )
         # V1.5：無論呼叫端傳入多少權重，一律只視為一筆觀測。
         # 這能防止單局隨機結果以 4～5 筆證據灌入 posterior。
@@ -2140,10 +2305,20 @@ def _update_bandit_impl(
         # 有完整結果時同時更新兩 Arm；舊呼叫未提供 actual 時仍相容
         # selected-arm-only 更新。每個 Arm 仍固定 w=1，沒有 Few-shot。
         full_information_update = actual in ARMS
+        previous_rewards = {
+            candidate: dict(state["arms"][candidate]).get(
+                "last_smoothed_reward"
+            )
+            for candidate in ARMS
+            if int(
+                dict(state["arms"][candidate]).get("updates", 0) or 0
+            ) > 0
+        }
         arm_rewards = (
             _probability_weighted_arm_rewards(
                 actual,
                 prediction_probabilities,
+                previous_rewards=previous_rewards,
             )
             if full_information_update
             else {arm: reward_value}
@@ -2154,12 +2329,14 @@ def _update_bandit_impl(
         reversal_signal = abs(
             float(x[feature_index["streak_break_signal"]])
         )
-        forgetting_factor = (
-            CMAB_REVERSAL_FORGETTING_FACTOR
-            if reversal_signal >= 0.5
-            else CMAB_FORGETTING_FACTOR
+        forgetting_factor, forgetting_diagnostics = (
+            _continuous_forgetting_factor(
+                last_risk if prediction_context_matches else {},
+                reversal_signal,
+            )
         )
         updated_arm_states: Dict[str, Dict[str, Any]] = {}
+        matrix_update_jitter: Dict[str, float] = {}
         outer_context = np.outer(x, x)
         for candidate, candidate_reward in arm_rewards.items():
             candidate_state = dict(state["arms"][candidate])
@@ -2195,6 +2372,10 @@ def _update_bandit_impl(
             candidate_b += (
                 observation_weight * float(candidate_reward) * x
             )
+            candidate_A, update_jitter = _stabilize_information_matrix(
+                candidate_A,
+                float(state.get("l2", CMAB_L2) or CMAB_L2),
+            )
             candidate_state["A"] = candidate_A.tolist()
             candidate_state["b"] = candidate_b.tolist()
             candidate_state["updates"] = previous_updates + 1
@@ -2209,8 +2390,12 @@ def _update_bandit_impl(
                 forgetting_factor * previous_weighted_reward_sum
                 + observation_weight * float(candidate_reward)
             )
+            candidate_state["last_smoothed_reward"] = _clip(
+                candidate_reward
+            )
             state["arms"][candidate] = candidate_state
             updated_arm_states[candidate] = candidate_state
+            matrix_update_jitter[candidate] = float(update_jitter)
 
         arm_state = updated_arm_states[arm]
 
@@ -2226,8 +2411,12 @@ def _update_bandit_impl(
             + (1.0 - forgetting_factor) * context_ridge
         )
         context_A += observation_weight * np.outer(x, x)
+        context_A, context_matrix_jitter = _stabilize_information_matrix(
+            context_A,
+            float(state.get("l2", CMAB_L2) or CMAB_L2),
+        )
         context_information["A"] = (
-            0.5 * (context_A + context_A.T)
+            context_A
         ).tolist()
         context_information["updates"] = (
             int(context_information.get("updates", 0) or 0) + 1
@@ -2271,11 +2460,17 @@ def _update_bandit_impl(
             "prediction_probabilities": dict(
                 _conditional_bp_probabilities(prediction_probabilities)
             ),
-            "reward_strategy": "probability_weighted_asymmetric_payoff",
+            "reward_strategy": "temporally_smoothed_counterfactual_payoff",
             "forgetting_factor": float(forgetting_factor),
             "reversal_signal": float(reversal_signal),
             "reversal_decay_applied": bool(
-                forgetting_factor == CMAB_REVERSAL_FORGETTING_FACTOR
+                forgetting_diagnostics["reversal_pressure"] > 0.0
+            ),
+            "continuous_forgetting": dict(forgetting_diagnostics),
+            "matrix_update_jitter": dict(matrix_update_jitter),
+            "shared_matrix_update_jitter": float(context_matrix_jitter),
+            "prediction_context_matches": bool(
+                prediction_context_matches
             ),
             "requested_weight": requested_weight,
             "applied_weight": observation_weight,
@@ -2304,12 +2499,16 @@ def _update_bandit_impl(
         "prediction_probabilities": dict(
             _conditional_bp_probabilities(prediction_probabilities)
         ),
-        "reward_strategy": "probability_weighted_asymmetric_payoff",
+        "reward_strategy": "temporally_smoothed_counterfactual_payoff",
         "forgetting_factor": float(forgetting_factor),
         "reversal_signal": float(reversal_signal),
         "reversal_decay_applied": bool(
-            forgetting_factor == CMAB_REVERSAL_FORGETTING_FACTOR
+            forgetting_diagnostics["reversal_pressure"] > 0.0
         ),
+        "continuous_forgetting": dict(forgetting_diagnostics),
+        "matrix_update_jitter": dict(matrix_update_jitter),
+        "shared_matrix_update_jitter": float(context_matrix_jitter),
+        "prediction_context_matches": bool(prediction_context_matches),
         "requested_update_weight": requested_weight,
         "update_weight": observation_weight,
         "few_shot_boost_applied": False,
@@ -2398,11 +2597,21 @@ def _get_bandit_summary_impl(
             CMAB_UNKNOWN_UPDATE_MULTIPLIER
         ),
         "few_shot_boost_disabled": True,
-        "forgetting_factor": float(CMAB_FORGETTING_FACTOR),
+        "forgetting_factor": float(CMAB_STABLE_FORGETTING_FACTOR),
+        "dynamic_forgetting_factor": {
+            "stable": float(CMAB_STABLE_FORGETTING_FACTOR),
+            "minimum": float(CMAB_MIN_DYNAMIC_FORGETTING_FACTOR),
+            "inputs": [
+                "permutation_entropy",
+                "chi_square_p_value",
+                "streak_break_signal",
+            ],
+        },
         "reversal_forgetting_factor": float(
             CMAB_REVERSAL_FORGETTING_FACTOR
         ),
-        "reward_strategy": "probability_weighted_asymmetric_payoff",
+        "reward_strategy": "temporally_smoothed_counterfactual_payoff",
+        "reward_smoothing": float(CMAB_REWARD_SMOOTHING),
         "permutation_entropy": {
             "window": CMAB_PERMUTATION_WINDOW,
             "order": CMAB_PERMUTATION_ORDER,
