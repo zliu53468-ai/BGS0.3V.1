@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from hashlib import sha256
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
-import os
 
 from performance_tracker import record_prediction, resolve_latest_prediction
 from predictor import predict
 from road_model import build_road_context
 
-PERFORMANCE_TRACKING_ENABLED = os.getenv("PERFORMANCE_TRACKING_ENABLED", "1").strip() == "1"
+# 正式畫面模型固定啟用「上一筆 prediction_id 精準結算」。不再讓舊的
+# PERFORMANCE_TRACKING_ENABLED 環境變數意外關閉線上標記與時間軸防呆。
+PERFORMANCE_TRACKING_ENABLED = True
 
 
 def _clean_raw(values: Iterable[Any]) -> list[str]:

@@ -1,4 +1,4 @@
-""BGS cMAB 主模型：LinUCB 上下文相關多臂老虎機。
+"""BGS cMAB 主模型：LinUCB 上下文相關多臂老虎機。
 
 主要方向只有兩個 Arm：B（莊）與 P（閒）。
 本模組不使用粒子濾波、超幾何分布、蒙地卡羅或 Stacking。
@@ -17,9 +17,11 @@ V2.0 非平穩牌路版：
   以及大眼仔／小路／曱甴路的規律飽和度。
 - 以遞迴 ridge forgetting factor 淡化舊鞋路；偵測斷龍時加速遺忘，
   但不複製單局樣本，避免 Few-shot 對亂數過擬合。
-- reward 依「預測時信心」調整：高信心命中略增益，高信心失誤重罰。
-- 完全停用 4～5 倍 Few-shot；每局一律 1 倍更新，避免放大隨機噪音。
 - B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
+- reward 只由已揭曉的真實 B/P 決定，模型自己的信心、選擇方向與連錯
+  不能再回頭改寫訓練標籤，避免正回授把隨機單局誤當成規律。
+- 每次預測會從目前已看見、且早於目標局的路紙做 prequential replay，
+  讓初始截圖的完整歷史真正參與擬合，且不跨鞋污染。
 
 banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
 """
@@ -32,14 +34,15 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import json
 import math
-import os
 import time
 
 import numpy as np
 
+from road_model import build_road_context
+
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V2.2-FORCED-DIRECTION-ADAPTIVE"
-STATE_SCHEMA_VERSION = "CMAB-UID-ISOLATED-V3"
+MODEL_VERSION = "CMAB-LINUCB-V3.0-OUTCOME-ONLY-PREQUENTIAL"
+STATE_SCHEMA_VERSION = "CMAB-EPISODE-REPLAY-V4"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
     "CMAB-UID-ISOLATED-V2",
@@ -70,113 +73,75 @@ BASE_DIR = Path(__file__).resolve().parent
 _LOCK = RLock()
 
 
-def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
-    try:
-        value = float(str(os.getenv(name, default)).strip())
-    except Exception:
-        value = default
-    return max(minimum, min(maximum, value))
+"""正式牌路模型參數。
 
+數值固定在程式碼內，避免 Render 裡遺留的 CMAB_* 參數在重新部署後改變
+同一套模型。LINE Token／密鑰屬部署機密，不在此硬寫。
+"""
 
-CMAB_ALPHA = _env_float("CMAB_ALPHA", 0.80, 0.0, 5.0)
-CMAB_L2 = _env_float("CMAB_L2", 1.0, 0.05, 100.0)
-CMAB_SCORE_TEMPERATURE = _env_float(
-    "CMAB_SCORE_TEMPERATURE", 0.95, 0.10, 10.0
-)
+# 35 維、每靴通常只有數十筆 B/P 樣本：較強 ridge 抑制單一長龍／單跳的
+# 過度擬合；較高 temperature 讓輸出的方向分數不因微小差異而假裝極端。
+CMAB_ALPHA = 0.72
+CMAB_L2 = 3.00
+CMAB_SCORE_TEMPERATURE = 1.10
 CMAB_TIE_PRIOR = 0.095156
-CMAB_TIE_PRIOR_STRENGTH = _env_float(
-    "CMAB_TIE_PRIOR_STRENGTH", 40.0, 10.0, 500.0
-)
-CMAB_MIN_SIGNAL_EDGE = _env_float(
-    "CMAB_MIN_SIGNAL_EDGE", 0.012, 0.0, 0.20
-)
-CMAB_MIN_SIGNAL_UPDATES = max(
-    0,
-    min(200, int(os.getenv("CMAB_MIN_SIGNAL_UPDATES", "4") or "4")),
-)
+CMAB_TIE_PRIOR_STRENGTH = 40.0
+CMAB_MIN_SIGNAL_EDGE = 0.012
+CMAB_MIN_SIGNAL_UPDATES = 6
 
 # 遞迴 ridge 衰減：A <- lambda*A + (1-lambda)*ridge*I + xx^T。
-CMAB_FORGETTING_FACTOR = _env_float(
-    "CMAB_FORGETTING_FACTOR", 0.985, 0.90, 1.00
-)
-CMAB_REVERSAL_FORGETTING_FACTOR = _env_float(
-    "CMAB_REVERSAL_FORGETTING_FACTOR", 0.94, 0.85, 1.00
-)
-# V2.2：連續非平穩遺忘的上下界；保留舊 env 常數僅為舊部署相容。
-CMAB_STABLE_FORGETTING_FACTOR = _env_float(
-    "CMAB_STABLE_FORGETTING_FACTOR", 0.99, 0.90, 1.00
-)
-CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = _env_float(
-    "CMAB_MIN_DYNAMIC_FORGETTING_FACTOR", 0.90, 0.80, 0.99
-)
-CMAB_PHASE_SOFT_RESET_MAX = _env_float(
-    "CMAB_PHASE_SOFT_RESET_MAX", 0.22, 0.0, 0.45
-)
-CMAB_PHASE_DISTANCE_THRESHOLD = _env_float(
-    "CMAB_PHASE_DISTANCE_THRESHOLD", 0.18, 0.02, 1.00
-)
-CMAB_RECENT_ACCURACY_WINDOW = max(
-    6,
-    min(64, int(os.getenv("CMAB_RECENT_ACCURACY_WINDOW", "16") or "16")),
-)
+# 舊版最快掉到 0.89，單局跳路便只剩約 9 局有效記憶；新版仍會對真實
+# 相變遺忘，但最低保留 0.96，避免一直追著剛開的一顆跑。
+CMAB_FORGETTING_FACTOR = 0.985
+CMAB_REVERSAL_FORGETTING_FACTOR = 0.970
+CMAB_STABLE_FORGETTING_FACTOR = 0.992
+CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = 0.960
+CMAB_PHASE_SOFT_RESET_MAX = 0.06
+CMAB_PHASE_DISTANCE_THRESHOLD = 0.28
+CMAB_RECENT_ACCURACY_WINDOW = 20
+
+# Full-information 下兩個 Arm 的不確定性項是對稱的，Alpha 僅保留為
+# 診斷／分數平滑用途，不能再因長龍把方向硬鎖死。
+CMAB_ALPHA_TREND_FLOOR = 0.70
+CMAB_ALPHA_MISS_BOOST = 0.15
+CMAB_ALPHA_ENTROPY_BOOST = 0.20
+
+# 每張完整路紙至少以六個已結算 B/P 前綴開始 prequential replay；所有
+# 每一步 context 都只看目標局之前的資料，絕不偷看下一局答案。
+CMAB_PREQUENTIAL_WARMUP_BP = 6
+CMAB_HISTORY_REPLAY_LIMIT = 160
+REWARD_SEMANTICS = "outcome_only_full_information_v1"
 
 # 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
-CMAB_UNCERTAINTY_SIGMA = _env_float(
-    "CMAB_UNCERTAINTY_SIGMA", 1.30, 0.50, 4.00
-)
+CMAB_UNCERTAINTY_SIGMA = 1.30
 CMAB_PERMUTATION_WINDOW = 12
 CMAB_PERMUTATION_ORDER = 3
 CMAB_PERMUTATION_ENTROPY_THRESHOLD = 0.95
-CMAB_UNCERTAINTY_MIN_SAMPLES = max(
-    4,
-    min(
-        100,
-        int(os.getenv("CMAB_UNCERTAINTY_MIN_SAMPLES", "8") or "8"),
-    ),
-)
-CMAB_UNCERTAINTY_HISTORY_SIZE = max(
-    16,
-    min(
-        512,
-        int(os.getenv("CMAB_UNCERTAINTY_HISTORY_SIZE", "128") or "128"),
-    ),
-)
-CMAB_DYNAMIC_THRESHOLD_FLOOR = _env_float(
-    "CMAB_DYNAMIC_THRESHOLD_FLOOR", 0.25, 0.05, 5.00
-)
+CMAB_UNCERTAINTY_MIN_SAMPLES = 8
+CMAB_UNCERTAINTY_HISTORY_SIZE = 128
+CMAB_DYNAMIC_THRESHOLD_FLOOR = 0.25
+CMAB_UNKNOWN_STD_THRESHOLD = 1.35
 
-# 冷啟動時尚無足夠歷史基準，沿用原本固定門檻作為安全 fallback。
-CMAB_UNKNOWN_STD_THRESHOLD = _env_float(
-    "CMAB_UNKNOWN_STD_THRESHOLD", 1.35, 0.10, 10.0
-)
-
-# V1.5 起完全停用 Few-shot 加權；保留名稱僅供既有監控欄位相容。
+# Few-shot／短線接管均停用；僅保留輸出欄位相容。
 CMAB_UNKNOWN_UPDATE_MULTIPLIER = 1.0
-CMAB_UNKNOWN_CONFIDENCE_CAP = _env_float(
-    "CMAB_UNKNOWN_CONFIDENCE_CAP", 0.28, 0.05, 0.49
-)
-CMAB_UNKNOWN_LONG_TERM_WEIGHT = _env_float(
-    "CMAB_UNKNOWN_LONG_TERM_WEIGHT", 0.08, 0.00, 0.25
-)
-CMAB_MAX_EVENT_IDS = max(
-    100,
-    min(
-        20000,
-        int(os.getenv("CMAB_MAX_EVENT_IDS", "5000") or "5000"),
-    ),
-)
-CMAB_MAX_PENDING_OOD_CONTEXTS = max(
-    8,
-    min(
-        128,
-        int(os.getenv("CMAB_MAX_PENDING_OOD_CONTEXTS", "32") or "32"),
-    ),
-)
+CMAB_UNKNOWN_CONFIDENCE_CAP = 0.28
+CMAB_UNKNOWN_LONG_TERM_WEIGHT = 0.08
+CMAB_MAX_EVENT_IDS = 5000
+CMAB_MAX_PENDING_OOD_CONTEXTS = 32
 
 
 def _resolve_state_file() -> Path:
-    configured = Path(os.getenv("CMAB_STATE_FILE", str(BASE_DIR / "data" / "contextual_bandit_state.json"))).expanduser()
-    candidates = [configured, BASE_DIR / "data" / "contextual_bandit_state.json", Path("/tmp/bgs_contextual_bandit_state.json")]
+    """選擇 V3 專用狀態檔，絕不讀取舊 reward 的矩陣。
+
+    原 ``contextual_bandit_state.json`` 不刪除，保留做舊版稽核；新模型另用
+    V3 檔案，避免舊版自我強化的 A/b 在部署後繼續影響新方向。
+    """
+    configured = Path("/var/data/contextual_bandit_state_v3.json")
+    candidates = [
+        configured,
+        BASE_DIR / "data" / "contextual_bandit_state_v3.json",
+        Path("/tmp/bgs_contextual_bandit_state_v3.json"),
+    ]
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate)
@@ -185,14 +150,14 @@ def _resolve_state_file() -> Path:
         seen.add(key)
         try:
             candidate.parent.mkdir(parents=True, exist_ok=True)
-            probe = candidate.parent / f".cmab_write_test_{os.getpid()}"
+            probe = candidate.parent / f".cmab_write_test_{time.time_ns()}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             if candidate != configured:
-                print(f"CMAB_STATE_FILE fallback: {configured} -> {candidate}")
+                print(f"CMAB V3 state fallback: {configured} -> {candidate}")
             return candidate
         except OSError as exc:
-            print(f"CMAB_STATE_FILE unavailable: {candidate}: {exc}")
+            print(f"CMAB V3 state unavailable: {candidate}: {exc}")
     raise RuntimeError("No writable CMAB_STATE_FILE path is available")
 
 
@@ -769,6 +734,7 @@ def _new_state() -> Dict[str, Any]:
     zeros = np.zeros(CONTEXT_DIM, dtype=np.float64).tolist()
     return {
         "version": MODEL_VERSION,
+        "reward_semantics": REWARD_SEMANTICS,
         "context_dim": CONTEXT_DIM,
         "feature_names": list(FEATURE_NAMES),
         "alpha": CMAB_ALPHA,
@@ -816,6 +782,13 @@ def _new_state() -> Dict[str, Any]:
         "recent_direction_correctness": [],
         "consecutive_hits": 0,
         "consecutive_misses": 0,
+        # 同一張路紙重按預測會得到同一個 replay 結果；歷史一變才重建。
+        "history_replay": {
+            "history_fingerprint": "",
+            "raw_round_count": 0,
+            "bp_training_samples": 0,
+            "replayed_at": 0,
+        },
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
     }
@@ -839,6 +812,17 @@ def _new_state_store() -> Dict[str, Any]:
 
 def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
     state = dict(data or {})
+    # V2.x reward 會依自己的 confidence、selected arm 與連錯調整 label。
+    # 這些 b 向量與新版本的真實 outcome-only label 不可混用。回傳新的
+    # 空白 episode state，而不是偷偷延續被污染的係數。
+    if state.get("reward_semantics") != REWARD_SEMANTICS:
+        fresh = _new_state()
+        fresh["reinitialized_from"] = {
+            "version": str(state.get("version") or "unknown"),
+            "reason": "legacy_self_reinforcing_reward_not_reused",
+            "at": int(time.time()),
+        }
+        return fresh
     stored_l2 = max(
         1e-12,
         float(state.get("l2", CMAB_L2) or CMAB_L2),
@@ -864,8 +848,9 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
         arms[arm]["A"] = A.tolist()
         arms[arm]["b"] = b.tolist()
 
-    # 舊 UID 狀態直接延續，不重置已學習的 A／b。
+    # 只有同一 reward 語意的 V3 state 才可延續 A／b。
     state["version"] = MODEL_VERSION
+    state["reward_semantics"] = REWARD_SEMANTICS
     state["context_dim"] = CONTEXT_DIM
     state["feature_names"] = list(FEATURE_NAMES)
     state["alpha"] = CMAB_ALPHA
@@ -1002,6 +987,13 @@ def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
     state["consecutive_misses"] = max(
         0, min(100, int(state.get("consecutive_misses", 0) or 0))
     )
+    replay = dict(state.get("history_replay") or {})
+    state["history_replay"] = {
+        "history_fingerprint": str(replay.get("history_fingerprint") or ""),
+        "raw_round_count": max(0, int(replay.get("raw_round_count", 0) or 0)),
+        "bp_training_samples": max(0, int(replay.get("bp_training_samples", 0) or 0)),
+        "replayed_at": max(0, int(replay.get("replayed_at", 0) or 0)),
+    }
     state["created_at"] = int(
         state.get("created_at", time.time()) or time.time()
     )
@@ -1123,18 +1115,21 @@ def _recent_accuracy(state: Mapping[str, Any]) -> float:
 
 
 def _dynamic_alpha(state: Mapping[str, Any], context: np.ndarray) -> float:
-    """以近期正確率、混沌度及連錯狀態連續調整 UCB 探索寬度。"""
-    accuracy = _recent_accuracy(state)
+    """只依資料成熟度與混沌度平滑 UCB 寬度。
+
+    完整資訊更新時 B/P 兩臂得到相同的 information matrix，因此 UCB bonus
+    在方向比較中理論上會相消。舊版卻再用模型連中／連錯去極端縮放 Alpha，
+    讓診斷分數看似很有把握、也間接放大追龍心理。新版不以命中紀錄當成
+    趨勢證據，只用資料量與排列熵維持溫和、可解釋的數值穩定度。
+    """
     risk = dict(state.get("last_prediction_risk") or {})
     entropy = _clip(risk.get("permutation_entropy", 0.0), 0.0, 1.0)
-    misses = max(0, int(state.get("consecutive_misses", 0) or 0))
-    # 命中率高時往 exploitation 收斂；混沌與連錯時只適度擴張探索，
-    # 並有上下界，防止單局噪音把 UCB 分數推成極端值。
-    exploit_scale = 1.25 - 0.50 * accuracy
-    chaos_scale = 1.0 + 0.30 * max(0.0, (entropy - 0.70) / 0.30)
-    miss_scale = 1.0 + 0.12 * min(3.0, math.log1p(misses))
-    cold_scale = 1.0 + 0.25 * (1.0 - min(1.0, int(state.get("total_updates", 0) or 0) / 24.0))
-    return float(max(0.10, min(3.0, CMAB_ALPHA * exploit_scale * chaos_scale * miss_scale * cold_scale)))
+    updates = max(0, int(state.get("total_updates", 0) or 0))
+    maturity = min(1.0, updates / 24.0)
+    entropy_pressure = _clip((entropy - 0.72) / 0.28, 0.0, 1.0)
+    cold_scale = 1.0 + 0.12 * (1.0 - maturity)
+    chaos_scale = 1.0 + CMAB_ALPHA_ENTROPY_BOOST * entropy_pressure
+    return float(max(0.20, min(1.20, CMAB_ALPHA * cold_scale * chaos_scale)))
 
 
 def _phase_transition(previous_context: Any, context: np.ndarray) -> Dict[str, float]:
@@ -1174,18 +1169,31 @@ def _continuous_forgetting_factor(
     reversal_signal: float,
     phase_strength: float,
 ) -> tuple[float, Dict[str, float]]:
-    """lambda = lambda_stable - (lambda_stable-lambda_min) * instability。"""
+    """依混沌／斷龍／真正相變作溫和的連續遺忘。
+
+    單局 B/P 本來就會使 ``last_outcome``、龍長等 context 改變；不能把
+    每次位移都當成 regime change。故只有高於 0.70 的相變分數才逐步加入
+    壓力，而且三個來源採加權平均而非舊版的任一項 ``max``／近似 OR。
+    """
     entropy = _clip(last_risk.get("permutation_entropy", 0.0), 0.0, 1.0)
-    entropy_pressure = max(0.0, min(1.0, (entropy - 0.70) / 0.30))
+    entropy_pressure = _clip((entropy - 0.72) / 0.28, 0.0, 1.0)
     reversal_pressure = max(0.0, min(1.0, abs(float(reversal_signal))))
-    instability = max(entropy_pressure, 0.55 * reversal_pressure, float(phase_strength))
+    phase_pressure = _clip((phase_strength - 0.70) / 0.30, 0.0, 1.0)
+    entropy_component = 0.55 * entropy_pressure
+    reversal_component = 0.30 * reversal_pressure
+    phase_component = 0.15 * phase_pressure
+    instability = entropy_component + reversal_component + phase_component
+    instability = _clip(instability, 0.0, 1.0)
     stable = max(CMAB_STABLE_FORGETTING_FACTOR, CMAB_MIN_DYNAMIC_FORGETTING_FACTOR)
     minimum = min(CMAB_STABLE_FORGETTING_FACTOR, CMAB_MIN_DYNAMIC_FORGETTING_FACTOR)
     factor = stable - (stable - minimum) * instability
     return float(factor), {
         "entropy_pressure": float(entropy_pressure),
         "reversal_pressure": float(reversal_pressure),
-        "phase_strength": float(phase_strength),
+        "phase_strength": float(phase_pressure),
+        "entropy_component": float(entropy_component),
+        "reversal_component": float(reversal_component),
+        "phase_component": float(phase_component),
         "instability": float(instability),
     }
 
@@ -1606,11 +1614,11 @@ def _predict_bandit_impl(
 
     with _LOCK:
         state_store = _read_state_unlocked()
-        uid_key, state = _get_user_state_unlocked(
-            state_store,
-            user_id,
-            create=True,
-        )
+        # 方向模型不再沿用不同牌靴／不同部署留下的隱藏 A/b。每次都從目前
+        # 已辨識的完整路紙 prequential 重播；這是唯一路徑可同時保證「初始
+        # 截圖有參與學習」與「下一局答案未進入自身特徵」。
+        uid_key = _uid_key(user_id)
+        state = _replay_observed_history(raw_history)
         metrics = {
             arm: _arm_metrics(state, arm, context)
             for arm in ARMS
@@ -1994,6 +2002,8 @@ def _predict_bandit_impl(
             for arm in ARMS
         },
         "bandit_state": {
+            "reward_semantics": REWARD_SEMANTICS,
+            "history_replay": dict(state.get("history_replay") or {}),
             "total_updates": total_updates,
             "total_weighted_updates": float(
                 state.get(
@@ -2043,9 +2053,7 @@ def _predict_bandit_impl(
             "reversal_forgetting_factor": (
                 CMAB_REVERSAL_FORGETTING_FACTOR
             ),
-            "reward_strategy": (
-                "probability_weighted_asymmetric_payoff"
-            ),
+            "reward_strategy": "outcome_only_full_information",
             "permutation_entropy_window": CMAB_PERMUTATION_WINDOW,
             "permutation_entropy_threshold": (
                 CMAB_PERMUTATION_ENTROPY_THRESHOLD
@@ -2083,7 +2091,7 @@ def _predict_bandit_impl(
         "input_required": False,
         "disclaimer": (
             "莊／閒百分比是 cMAB 方向分數正規化結果，"
-            "不是真實開出機率；高不確定性時系統會建議觀望。"
+            "不是真實開出機率；高不確定性只會降低診斷分數，不覆寫 B/P。"
         ),
     }
 
@@ -2122,32 +2130,188 @@ def _probability_weighted_arm_rewards(
     consecutive_hits: int = 0,
     consecutive_misses: int = 0,
 ) -> Dict[str, float]:
-    """完整反事實 reward，對實際預測結果施加有界非線性連中／連錯調整。
+    """完整資訊的真實 outcome-only 標籤。
 
-    命中 Arm 的增益採 log(1+k)，避免長龍正回饋無限擴張；選中的錯誤
-    Arm 採 exp(c*k) 加速修正，但封頂於 -2.5，避免雙跳隨機噪音令 A/b
-    爆炸。另一個 counterfactual Arm 保持基礎回報，維持完整資訊更新。
+    結果揭曉後，B 與 P 的反事實結果都已知，因此對本局 context 的唯一
+    合法監督訊號為 ``y_B=+1,y_P=-1``（或相反）。舊版把「模型自己給的
+    機率、自己選的 Arm、連中／連錯」乘進 reward；這會讓一開始偏向某邊的
+    預測越學越偏，正是面板常出現一顆後就一直跟的根因。
+
+    參數仍保留，以維持既有 ``update_bandit`` 對外介面，但故意不參與
+    label 計算。連中／連錯僅能做診斷，不能偽裝成額外的真實樣本。
     """
-    conditional = _conditional_bp_probabilities(prediction_probabilities)
-    selected = str(selected_arm or "").upper().strip()
-    hit_boost = 1.0 + 0.18 * math.log1p(max(0, consecutive_hits))
-    miss_penalty = min(
-        2.50,
-        math.exp(0.28 * min(4, max(0, consecutive_misses))),
+    del prediction_probabilities, selected_arm, consecutive_hits, consecutive_misses
+    outcome = str(actual or "").upper().strip()
+    if outcome not in ARMS:
+        raise ValueError("actual outcome must be B or P for arm rewards")
+    return {
+        candidate: 1.0 if candidate == outcome else -1.0
+        for candidate in ARMS
+    }
+
+
+def _apply_full_information_observation(
+    state: Dict[str, Any],
+    context: np.ndarray,
+    actual: str,
+    *,
+    forgetting_factor: float,
+    soft_reset: float,
+) -> Dict[str, Dict[str, Any]]:
+    """以一筆已揭曉 B/P，對兩個 Arm 做對稱且可重現的 ridge 更新。
+
+    此函式被「完整路紙 replay」與「上一局剛揭曉」共用。兩條路徑皆使用
+    outcome-only label，確保重按預測、重新部署或補輸上一局都不會得到不同
+    的模型係數。
+    """
+    outcome = str(actual or "").upper().strip()
+    if outcome not in ARMS:
+        raise ValueError("actual must be B or P")
+
+    ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
+        state.get("l2", CMAB_L2) or CMAB_L2
     )
-    rewards: Dict[str, float] = {}
-    for candidate in ARMS:
-        confidence = float(conditional[candidate])
-        if candidate == actual:
-            value = 0.5 + 0.5 * confidence
-            if candidate == selected:
-                value *= hit_boost
-        else:
-            value = -(0.35 + 0.65 * confidence)
-            if candidate == selected:
-                value *= miss_penalty
-        rewards[candidate] = float(max(-2.5, min(1.5, value)))
-    return rewards
+    outer_context = np.outer(context, context)
+    rewards = _probability_weighted_arm_rewards(outcome, None)
+    updated: Dict[str, Dict[str, Any]] = {}
+    for arm in ARMS:
+        arm_state = dict(state["arms"][arm])
+        A = np.asarray(arm_state["A"], dtype=np.float64)
+        b = np.asarray(arm_state["b"], dtype=np.float64)
+        # 對稱化防止長期 JSON 序列化／浮點累積造成非 PSD 矩陣。
+        A = 0.5 * (A + A.T)
+        A = forgetting_factor * A + (1.0 - forgetting_factor) * ridge
+        A = (1.0 - soft_reset) * A + soft_reset * ridge
+        A += outer_context
+        b = (forgetting_factor * b) * (1.0 - soft_reset)
+        b += float(rewards[arm]) * context
+
+        previous_weighted = float(
+            arm_state.get("weighted_updates", arm_state.get("updates", 0))
+            or 0.0
+        )
+        previous_weighted_reward = float(
+            arm_state.get(
+                "weighted_reward_sum", arm_state.get("reward_sum", 0.0)
+            )
+            or 0.0
+        )
+        arm_state.update({
+            "A": (0.5 * (A + A.T)).tolist(),
+            "b": b.tolist(),
+            "updates": int(arm_state.get("updates", 0) or 0) + 1,
+            "weighted_updates": forgetting_factor * previous_weighted + 1.0,
+            "reward_sum": float(arm_state.get("reward_sum", 0.0) or 0.0)
+            + float(rewards[arm]),
+            "weighted_reward_sum": (
+                forgetting_factor * previous_weighted_reward
+                + float(rewards[arm])
+            ),
+        })
+        state["arms"][arm] = arm_state
+        updated[arm] = arm_state
+
+    information = dict(state.get("context_information") or {})
+    context_A = _as_information_matrix(information.get("A"))
+    context_A = (
+        forgetting_factor * context_A
+        + (1.0 - forgetting_factor) * ridge
+    )
+    context_A = (1.0 - soft_reset) * context_A + soft_reset * ridge
+    context_A += outer_context
+    previous_context_weighted = float(
+        information.get("weighted_updates", information.get("updates", 0))
+        or 0.0
+    )
+    information.update({
+        "A": (0.5 * (context_A + context_A.T)).tolist(),
+        "updates": int(information.get("updates", 0) or 0) + 1,
+        "weighted_updates": forgetting_factor * previous_context_weighted + 1.0,
+    })
+    state["context_information"] = information
+    state["total_updates"] = int(state.get("total_updates", 0) or 0) + 1
+    state["total_weighted_updates"] = (
+        forgetting_factor * float(
+            state.get("total_weighted_updates", state["total_updates"] - 1)
+            or 0.0
+        )
+        + 1.0
+    )
+    return updated
+
+
+def _replay_observed_history(raw_history: Sequence[str]) -> Dict[str, Any]:
+    """以 prequential 方式重建「目標局以前」可知的 cMAB 狀態。
+
+    對第 t 局的訓練 context 只使用 ``history[:t]``，target 才是第 t 局
+    的實際 B/P。這讓使用者第一次上傳含 30~60 局的大路時，模型不會仍是
+    全零冷啟動；也不會把第 t 局答案放進第 t 局特徵，杜絕時間洩漏。
+    """
+    history = list(raw_history)[-CMAB_HISTORY_REPLAY_LIMIT:]
+    state = _new_state()
+    prefix: List[str] = []
+    bp_before = 0
+    previous_context: Optional[np.ndarray] = None
+    previous_entropy = 0.0
+    replayed = 0
+
+    for actual in history:
+        outcome = str(actual or "").upper().strip()
+        if outcome in ARMS and bp_before >= CMAB_PREQUENTIAL_WARMUP_BP:
+            # prefix 是目前目標局之前的完整 raw 時間軸；T 保留其中但不作
+            # B/P label。每個前綴獨立建 road context，不把未來格子倒灌。
+            prefix_road = build_road_context(
+                prefix,
+                initial_image_count=len(prefix),
+                manual_count=0,
+            )
+            vector = np.asarray(
+                build_context_vector(prefix, road_context=prefix_road),
+                dtype=np.float64,
+            )
+            randomness = _rolling_randomness_diagnostics(prefix)
+            phase = (
+                _phase_transition(previous_context, vector)
+                if previous_context is not None
+                else {"strength": 0.0}
+            )
+            reversal_index = FEATURE_NAMES.index("streak_break_signal")
+            forgetting_factor, diagnostics = _continuous_forgetting_factor(
+                {"permutation_entropy": previous_entropy},
+                float(vector[reversal_index]),
+                float(phase.get("strength", 0.0)),
+            )
+            reset_pressure = max(
+                0.0,
+                min(1.0, float(diagnostics["phase_component"])),
+            )
+            _apply_full_information_observation(
+                state,
+                vector,
+                outcome,
+                forgetting_factor=forgetting_factor,
+                soft_reset=CMAB_PHASE_SOFT_RESET_MAX * reset_pressure,
+            )
+            previous_context = vector
+            previous_entropy = float(
+                randomness.get("permutation_entropy", 0.0) or 0.0
+            )
+            replayed += 1
+
+        prefix.append(outcome)
+        if outcome in ARMS:
+            bp_before += 1
+
+    fingerprint = sha256("".join(history).encode("utf-8")).hexdigest()[:24]
+    state["history_replay"] = {
+        "history_fingerprint": fingerprint,
+        "raw_round_count": len(history),
+        "bp_training_samples": replayed,
+        "replayed_at": int(time.time()),
+    }
+    state["reward_semantics"] = REWARD_SEMANTICS
+    state["replay_mode"] = "prequential_history_before_target"
+    return state
 
 
 def _update_bandit_impl(
@@ -2263,7 +2427,17 @@ def _update_bandit_impl(
                 float(phase["strength"]),
             )
         )
-        soft_reset = float(CMAB_PHASE_SOFT_RESET_MAX * phase["strength"])
+        # 非平穩更新：lambda 已由排列熵、斷龍與相變連續決定。除原本的
+        # phase reset 外，極端混沌亦施加較小的 ridge 回拉，等價於：
+        # A <- lambda*A + (1-lambda)*ridge*I，再保留新觀測 xx^T。
+        # 混沌 reset 僅取 instability 的 35%，避免單局高熵直接抹除矩陣。
+        regime_reset_pressure = max(
+            float(phase["strength"]),
+            0.35 * float(forgetting_diagnostics["instability"]),
+        )
+        soft_reset = float(
+            CMAB_PHASE_SOFT_RESET_MAX * regime_reset_pressure
+        )
         updated_arm_states: Dict[str, Dict[str, Any]] = {}
         outer_context = np.outer(x, x)
         for candidate, candidate_reward in arm_rewards.items():
@@ -2392,7 +2566,7 @@ def _update_bandit_impl(
             "prediction_probabilities": dict(
                 _conditional_bp_probabilities(prediction_probabilities)
             ),
-            "reward_strategy": "bounded_nonlinear_streak_counterfactual",
+            "reward_strategy": "outcome_only_full_information",
             "forgetting_factor": float(forgetting_factor),
             "reversal_signal": float(reversal_signal),
             "reversal_decay_applied": bool(
@@ -2400,6 +2574,7 @@ def _update_bandit_impl(
             ),
             "continuous_forgetting": dict(forgetting_diagnostics),
             "phase_transition": dict(phase),
+            "regime_reset_pressure": regime_reset_pressure,
             "soft_reset_strength": soft_reset,
             "direction_correct": direction_correct,
             "consecutive_hits": consecutive_hits,
@@ -2431,7 +2606,7 @@ def _update_bandit_impl(
         "prediction_probabilities": dict(
             _conditional_bp_probabilities(prediction_probabilities)
         ),
-        "reward_strategy": "bounded_nonlinear_streak_counterfactual",
+        "reward_strategy": "outcome_only_full_information",
         "forgetting_factor": float(forgetting_factor),
         "reversal_signal": float(reversal_signal),
         "reversal_decay_applied": bool(
@@ -2439,6 +2614,7 @@ def _update_bandit_impl(
         ),
         "continuous_forgetting": dict(forgetting_diagnostics),
         "phase_transition": dict(phase),
+        "regime_reset_pressure": regime_reset_pressure,
         "soft_reset_strength": soft_reset,
         "direction_correct": direction_correct,
         "consecutive_hits": consecutive_hits,
@@ -2535,7 +2711,7 @@ def _get_bandit_summary_impl(
         "reversal_forgetting_factor": float(
             CMAB_REVERSAL_FORGETTING_FACTOR
         ),
-        "reward_strategy": "probability_weighted_asymmetric_payoff",
+        "reward_strategy": "outcome_only_full_information",
         "permutation_entropy": {
             "window": CMAB_PERMUTATION_WINDOW,
             "order": CMAB_PERMUTATION_ORDER,

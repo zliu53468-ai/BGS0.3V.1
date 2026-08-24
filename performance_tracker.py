@@ -14,7 +14,6 @@ from threading import RLock
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 import json
 import math
-import os
 import secrets
 import time
 
@@ -23,13 +22,19 @@ from contextual_bandit import update_bandit
 BASE_DIR = Path(__file__).resolve().parent
 _LOCK = RLock()
 _OUTCOMES = ("B", "P", "T")
-_GUARD_SECONDS = max(5, min(300, int(os.getenv("CMAB_DUPLICATE_GUARD_SECONDS", "90") or "90")))
-PERFORMANCE_MAX_RECORDS = max(1000, min(200000, int(os.getenv("PERFORMANCE_MAX_RECORDS", "30000") or "30000")))
+# 這些是新 cMAB 版本的固定資料保護參數；不受 Render 舊環境變數覆寫。
+_GUARD_SECONDS = 90
+PERFORMANCE_MAX_RECORDS = 30000
 
 
 def _resolve_performance_file() -> Path:
-    configured = Path(os.getenv("PERFORMANCE_DATA_FILE", str(BASE_DIR / "data" / "prediction_performance.json"))).expanduser()
-    candidates = [configured, BASE_DIR / "data" / "prediction_performance.json", Path("/tmp/bgs_prediction_performance.json")]
+    """使用 V3 績效檔，保留舊資料作為歷史稽核而不混入新模型。"""
+    configured = Path("/var/data/prediction_performance_v3.json")
+    candidates = [
+        configured,
+        BASE_DIR / "data" / "prediction_performance_v3.json",
+        Path("/tmp/bgs_prediction_performance_v3.json"),
+    ]
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate)
@@ -38,14 +43,14 @@ def _resolve_performance_file() -> Path:
         seen.add(key)
         try:
             candidate.parent.mkdir(parents=True, exist_ok=True)
-            probe = candidate.parent / f".performance_write_test_{os.getpid()}"
+            probe = candidate.parent / f".performance_write_test_{time.time_ns()}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             if candidate != configured:
-                print(f"PERFORMANCE_DATA_FILE fallback: {configured} -> {candidate}")
+                print(f"Performance V3 fallback: {configured} -> {candidate}")
             return candidate
         except OSError as exc:
-            print(f"PERFORMANCE_DATA_FILE unavailable: {candidate}: {exc}")
+            print(f"Performance V3 unavailable: {candidate}: {exc}")
     raise RuntimeError("No writable PERFORMANCE_DATA_FILE path is available")
 
 

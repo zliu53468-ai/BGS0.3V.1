@@ -12,36 +12,21 @@ from __future__ import annotations
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import math
-import os
 
 import numpy as np
 
 from full_road_pattern_model import analyze_full_road_pattern
 
 
-def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(str(os.getenv(name, default)).strip())
-    except Exception:
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
-    try:
-        value = float(str(os.getenv(name, default)).strip())
-    except Exception:
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-ROAD_HISTORY_LIMIT = _env_int("ROAD_HISTORY_LIMIT", 500, 36, 2000)
-ROAD_SHORT_WINDOW = _env_int("ROAD_SHORT_WINDOW", 8, 4, 30)
-ROAD_MID_WINDOW = _env_int("ROAD_MID_WINDOW", 18, 8, 60)
-ROAD_LONG_WINDOW = _env_int("ROAD_LONG_WINDOW", 36, 12, 160)
-ROAD_RECENT_SIMULATIONS = _env_int("ROAD_RECENT_SIMULATIONS", 3000, 500, 30000)
-ROAD_RECENT_MAX_MODEL_WEIGHT = _env_float("ROAD_RECENT_MAX_MODEL_WEIGHT", 0.22, 0.10, 0.40)
-ROAD_RECENT_MAX_DISAGREEMENT = _env_float("ROAD_RECENT_MAX_DISAGREEMENT", 0.145, 0.03, 0.40)
+# 正式牌路特徵固定在程式碼內，避免 Render 的舊 ROAD_* 值在重啟後使同一張
+# 路紙得到不同 context。這些是特徵窗口，不是勝率或下注參數。
+ROAD_HISTORY_LIMIT = 500
+ROAD_SHORT_WINDOW = 8
+ROAD_MID_WINDOW = 18
+ROAD_LONG_WINDOW = 36
+ROAD_RECENT_SIMULATIONS = 3000
+ROAD_RECENT_MAX_MODEL_WEIGHT = 0.22
+ROAD_RECENT_MAX_DISAGREEMENT = 0.145
 
 
 def normalize_raw_outcomes(values: Iterable[Any]) -> List[str]:

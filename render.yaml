@@ -6,7 +6,8 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # main 有新 Commit 時不自動換掉目前模型；改由 Render 後台手動部署。
+    # 避免 GitHub 上傳未完成檔案時自動替換目前健康版本；改由確認 commit
+    # 後在 Render 手動部署。
     autoDeploy: false
     disk:
       name: bgs-runtime-data
@@ -15,9 +16,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      # 僅供 /health 確認真正執行中的來源版本。
       - key: BGS_BUILD_LABEL
-        value: 16:27-baseline-33cf44a
+        value: cmab-v3-outcome-only-prequential
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
@@ -34,9 +34,6 @@ services:
         value: "30"
       - key: RESULT_DELIVERY_MODE
         value: push
-      - key: PREDICT_WORKERS
-        value: "2"
-      # 降低 EasyOCR／OpenCV 峰值記憶體，避免 OOM 造成 instance restart。
       - key: APP_MAX_CONCURRENT_PREDICTIONS
         value: "1"
       - key: OCR_PRELOAD
@@ -45,55 +42,3 @@ services:
         value: "0"
       - key: SESSION_DATA_FILE
         value: /var/data/sessions.json
-      - key: CMAB_STATE_FILE
-        value: /var/data/contextual_bandit_state.json
-      - key: PERFORMANCE_DATA_FILE
-        value: /var/data/prediction_performance.json
-      - key: PF_DECKS
-        value: "8"
-      - key: PF_PARTICLES
-        value: "500"
-      - key: PF_REPLICAS
-        value: "5"
-      - key: PF_TARGET_MATCHES
-        value: "320"
-      - key: PF_TARGET_ESS
-        value: "210"
-      - key: PF_MIN_MATCHES
-        value: "40"
-      - key: PF_MAX_UPDATE_PROPOSALS
-        value: "45000"
-      - key: PF_DRAW_PATH_TARGET_MATCHES
-        value: "16"
-      - key: PF_DRAW_PATH_MIN_MATCHES
-        value: "5"
-      - key: PF_DRAW_PATH_MIN_ESS
-        value: "3"
-      - key: PF_MIN_DRAW_PATH_COVERAGE
-        value: "0.80"
-      - key: PF_DRAW_PATH_UNCERTAINTY
-        value: "0.40"
-      - key: PF_PREDICT_SIMULATIONS_PER_REPLICA
-        value: "600"
-      - key: PF_POINT_JOINT_SIMULATIONS_PER_REPLICA
-        value: "600"
-      - key: PF_SPLIT_UNCERTAINTY
-        value: "0.50"
-      - key: PF_MIN_EFFECTIVE_REPLICAS
-        value: "3.5"
-      - key: PF_ADAPTIVE_REPLICA_WEIGHT
-        value: "1"
-      - key: PF_DATABASE_WEIGHT
-        value: "0"
-      - key: PF_DATABASE_VALIDATION_MODE
-        value: diagnostic
-      - key: PF_DECISION_MODE
-        value: validated
-      - key: PF_UNCERTAINTY_PENALTY
-        value: "1.28"
-      - key: PF_MIN_VALIDATED_EDGE
-        value: "0.0012"
-      - key: PF_MIN_REPLICA_AGREEMENT
-        value: "0.71"
-      - key: PF_RANDOMIZE_EACH_CALL
-        value: "1"

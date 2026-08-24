@@ -13,10 +13,7 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
-from adaptive_ensemble import adapt_prediction
 from contextual_bandit import predict_bandit
-from particle_filter_points import counts_from_shoe, deal_ordered_hand
-from validated_decision_layer import apply_validated_decision
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
@@ -477,6 +474,10 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
 
 def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None) -> Dict[str, Any]:
     """保留舊虛擬牌靴介面，但方向同樣由 cMAB 產生。"""
+    # 虛擬牌靴僅供舊相容入口使用；真人圖片預測不載入粒子／算牌模組，
+    # 避免其環境參數或初始化副作用混入正式 cMAB 路徑。
+    from particle_filter_points import counts_from_shoe, deal_ordered_hand
+
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
     if len(hidden_shoe) < 6:
         raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
