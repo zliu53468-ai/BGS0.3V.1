@@ -1240,3 +1240,1514 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
                 "body": {
                     "type": "box",
                     "layout": "vertical",
+                    "backgroundColor": "#FFF4B8",
+                    "paddingAll": "18px",
+                    "contents": body_contents,
+                },
+            },
+        }
+    )
+
+
+
+
+def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
+    """精簡預測面板：正式訊號就是下一局方向評估。"""
+    prediction = dict(session.get("screen_last_prediction") or {})
+    calibration = dict(prediction.get("calibration") or {})
+    adaptive = dict(prediction.get("adaptive_ensemble") or {})
+    road_support = dict(prediction.get("road_support") or {})
+
+    # 正式訊號優先採用 internal_*；O 是正式的風控動作（可能是統計
+    # 硬熔斷，也可能是樣本／方向優勢不足），不可再由中性機率反推
+    # 成 B/P，否則會破壞 No Bet 閉環。
+    formal_code = str(
+        prediction.get("internal_action")
+        or prediction.get("internal_recommend")
+        or prediction.get("action")
+        or prediction.get("recommend")
+        or ""
+    ).upper().strip()
+    if formal_code not in {"B", "P", "O"}:
+        banker = float(prediction.get("banker_rate", 0.0) or 0.0)
+        player = float(prediction.get("player_rate", 0.0) or 0.0)
+        formal_code = "B" if banker >= player else "P"
+
+    formal_text = (
+        "莊" if formal_code == "B"
+        else "閒" if formal_code == "P"
+        else "觀望／絕對不下注"
+    )
+    direction_color = (
+        "#D52B2B" if formal_code == "B"
+        else "#2667D8" if formal_code == "P"
+        else "#6B7280"
+    )
+    prediction["formal_direction"] = formal_code
+    prediction["formal_direction_text"] = formal_text
+    prediction["next_round_direction"] = formal_code
+    prediction["next_round_direction_text"] = formal_text
+
+    action_code = str(prediction.get("internal_action") or "").upper().strip()
+    internal_observe = action_code == "O"
+    signal_status = (
+        "正式訊號已確認"
+        if not internal_observe
+        else str(
+            prediction.get("signal_status_text")
+            or "模型信心不足：本局觀望／不下注"
+        )
+    )
+    signal_reason = str(
+        prediction.get("internal_signal_reason")
+        or prediction.get("signal_reason")
+        or "依正式模型、校準結果與方向機率產生"
+    )
+
+    quality_score = float(prediction.get("quality_score", 0.0) or 0.0)
+    confidence_label = str(prediction.get("confidence_label") or "偏低")
+    edge_percent = float(
+        prediction.get("direction_edge_percent")
+        or float(prediction.get("direction_edge", 0.0) or 0.0) * 100.0
+    )
+    consistency = float(prediction.get("model_consistency", 0.0) or 0.0) * 100.0
+    analysis_number = int(session.get("screen_analysis_count", 0) or 0)
+    bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
+    suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
+    percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
+    bet_level = str(prediction.get("bet_level_text") or "標準區間")
+    bet_text = (
+        f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
+        if suggested > 0
+        else "0 元"
+    )
+    road_direction = str(road_support.get("direction_text") or "資料建立中")
+    calibration_text = (
+        f"已啟用｜{calibration.get('scope')}｜{int(calibration.get('sample_count', 0) or 0)} 筆"
+        if calibration.get("active")
+        else f"累積中｜{int(calibration.get('sample_count', 0) or 0)} 筆"
+    )
+    adaptive_text = (
+        f"已啟用｜{float(adaptive.get('effective_share', 0.0) or 0.0) * 100.0:.1f}%"
+        if adaptive.get("active")
+        else "樣本累積中"
+    )
+
+    return _clean_flex(
+        {
+            "type": "flex",
+            "altText": f"BGS AI 下一局方向：{formal_text}",
+            "contents": {
+                "type": "bubble",
+                "size": "mega",
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#FFF4B8",
+                    "paddingAll": "18px",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"BGS AI 下一局分析 #{analysis_number}",
+                            "weight": "bold",
+                            "size": "xl",
+                            "color": "#7B5600",
+                        },
+                        {
+                            "type": "separator",
+                            "margin": "md",
+                            "color": "#E1BD43",
+                        },
+                        {
+                            "type": "text",
+                            "text": f"下一局方向評估：{formal_text}",
+                            "weight": "bold",
+                            "size": "xl",
+                            "margin": "md",
+                            "color": direction_color,
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "spacing": "sm",
+                            "margin": "md",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%",
+                                    "color": "#D52B2B",
+                                    "weight": "bold",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%",
+                                    "color": "#2667D8",
+                                    "weight": "bold",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%",
+                                    "color": "#259B55",
+                                    "weight": "bold",
+                                },
+                            ],
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"正式訊號：{formal_text}\n"
+                                f"訊號狀態：{signal_status}\n"
+                                f"方向優勢：{edge_percent:.2f}%\n"
+                                f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
+                                f"模型一致度：{consistency:.1f}%\n"
+                                f"牌路診斷：{road_direction}\n"
+                                "資料來源：完整 B/P/T 牌路與路圖 Context\n"
+                                "方向分數：牌路模型傾向，非物理開出機率\n"
+                                "自動配置：未啟用 EV／Kelly"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"校準狀態：{calibration_text}\n"
+                                f"自適應集成：{adaptive_text}"
+                            ),
+                            "wrap": True,
+                            "size": "sm",
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                        {
+                            "type": "text",
+                            "text": f"訊號說明：{signal_reason}",
+                            "wrap": True,
+                            "size": "sm",
+                            "margin": "md",
+                            "color": "#665000",
+                        },
+                        {
+                            "type": "separator",
+                            "margin": "md",
+                            "color": "#E1BD43",
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"分析本金：{_format_money(bankroll)} 元\n"
+                                f"建議配置：{bet_text}"
+                            ),
+                            "wrap": True,
+                            "margin": "md",
+                            "color": "#3E3100",
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "spacing": "sm",
+                            "margin": "lg",
+                            "contents": [
+                                _postback_button(
+                                    "🔴 本局結果：莊",
+                                    "road_append",
+                                    color="#D52B2B",
+                                    result="B",
+                                ),
+                                _postback_button(
+                                    "🔵 本局結果：閒",
+                                    "road_append",
+                                    color="#2667D8",
+                                    result="P",
+                                ),
+                                _postback_button(
+                                    "🟢 本局結果：和",
+                                    "road_append",
+                                    color="#159447",
+                                    result="T",
+                                ),
+                                _postback_button(
+                                    "結束本次分析",
+                                    "end",
+                                    style="secondary",
+                                ),
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+    )
+
+
+
+def ended_panel() -> Dict[str, Any]:
+    """結束後回到使用指南，不自動跳過館別與本金流程。"""
+    return guide_panel()
+
+
+
+def _activate_code(user_id: str, code: str) -> str:
+    code = _normalize_access_code(code)
+    now = int(datetime.now().timestamp())
+    if code in PERMANENT_CODES:
+        store.upsert_session(
+            user_id,
+            {"permanent_access": True, "access_until": 0, "status": "分析中"},
+        )
+        return "永久版"
+    if code in MONTHLY_CODES:
+        store.upsert_session(
+            user_id,
+            {
+                "permanent_access": False,
+                "trial_started_at": now,
+                "access_until": now + 30 * 24 * 60 * 60,
+                "status": "分析中",
+            },
+        )
+        return "30日版"
+    if code in TEMP_CODES:
+        store.upsert_session(
+            user_id,
+            {
+                "permanent_access": False,
+                "trial_started_at": now,
+                "access_until": now + 30 * 60,
+                "status": "分析中",
+            },
+        )
+        return "30分鐘版"
+    raise ValueError("開通碼錯誤")
+
+
+def _ensure_access(user_id: str) -> Dict[str, Any]:
+    status = store.access_status(user_id, start_trial=True)
+    if not status.get("allowed"):
+        raise AccessExpiredError("試用已到期")
+    return status
+
+
+def _run_prediction(user_id: str) -> Dict[str, Any]:
+    _ensure_access(user_id)
+    acquired = _PREDICTION_SLOTS.acquire(timeout=PREDICTION_QUEUE_TIMEOUT)
+    if not acquired:
+        raise RuntimeError("目前分析人數較多，請稍後再點一次。")
+    try:
+        return store.run_virtual_round(user_id, run_virtual_round)
+    finally:
+        _PREDICTION_SLOTS.release()
+
+
+
+def _refresh_screen_prediction(
+    user_id: str,
+    outcome: str,
+    expected_run_id: str,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> Dict[str, Any]:
+    """加入本局 B/P/T 並更新下一局模型；全程受 deadline 與同 UID 鎖保護。"""
+    value = str(outcome or "").upper().strip()
+    if value not in {"B", "P", "T"}:
+        raise ValueError("本局結果只能是莊、閒或和。")
+
+    operation_lock = _user_image_lock(user_id)
+    operation_lock_acquired = False
+    prediction_slot_acquired = False
+
+    try:
+        _raise_if_manual_timed_out(cancel_event, deadline)
+        lock_wait = _remaining_manual_time(deadline)
+        if lock_wait <= 0.0 or not operation_lock.acquire(timeout=lock_wait):
+            raise TimeoutError("同一使用者的上一個分析仍在處理中。")
+        operation_lock_acquired = True
+
+        _raise_if_manual_timed_out(cancel_event, deadline)
+        _ensure_access(user_id)
+        session = store.get_session(user_id)
+        if str(session.get("analysis_run_id") or "") != str(expected_run_id):
+            raise RuntimeError("本次分析已結束或已重新開始，舊操作已忽略。")
+        if not bool(session.get("analysis_active")):
+            raise RuntimeError("本次分析已結束，請重新開始分析。")
+        if not session.get("screen_last_prediction"):
+            raise ValueError("請先上傳一次遊戲畫面，建立初始牌路。")
+
+        expected_version = int(session.get("screen_data_version", 0) or 0)
+        ocr = dict(session.get("screen_last_ocr") or {})
+        detection = dict(session.get("screen_last_detection") or {})
+        venue = str(ocr.get("venue_code") or session.get("venue") or "")
+        room = str(
+            ocr.get("room")
+            or session.get("room")
+            or session.get("last_confirmed_room")
+            or "1"
+        )
+
+        initial_history = [
+            str(item).upper()
+            for item in list(session.get("initial_image_history") or [])
+            if str(item).upper() in {"B", "P", "T"}
+        ]
+        manual_history = [
+            str(item).upper()
+            for item in list(session.get("manual_outcome_history") or [])
+            if str(item).upper() in {"B", "P", "T"}
+        ]
+        manual_history.append(value)
+        raw_history = initial_history + manual_history
+        road_state = _derive_road_state(raw_history)
+        sequence = list(road_state["road_sequence"])
+        tie_markers = dict(road_state["tie_markers"])
+        previous_prediction_id = str(
+            dict(session.get("screen_last_prediction") or {}).get(
+                "prediction_id", ""
+            )
+            or ""
+        )
+
+        current_remaining = int(
+            session.get("screen_remaining_cards")
+            or ocr.get("remaining_cards")
+            or 416
+        )
+        remaining = max(6, current_remaining - SCREEN_ESTIMATED_CARDS_PER_ROUND)
+        screen_metadata = {
+            "input_type": str(
+                session.get("screen_input_type")
+                or detection.get("input_type")
+                or "full_screen"
+            ),
+            "venue_source": str(
+                session.get("screen_venue_source")
+                or ocr.get("venue_source")
+                or "session_selected"
+            ),
+            "room_source": str(
+                session.get("screen_room_source")
+                or ocr.get("room_source")
+                or "session_previous"
+            ),
+            "room_confidence": float(
+                session.get("screen_room_confidence", 0.0) or 0.0
+            ),
+            "manual_update": True,
+        }
+
+        _raise_if_manual_timed_out(cancel_event, deadline)
+        semaphore_wait = min(
+            float(PREDICTION_QUEUE_TIMEOUT),
+            _remaining_manual_time(deadline),
+        )
+        if semaphore_wait <= 0.0:
+            raise TimeoutError("等待模型分析名額時已超時。")
+
+        prediction_slot_acquired = _PREDICTION_SLOTS.acquire(
+            timeout=semaphore_wait
+        )
+        if not prediction_slot_acquired:
+            raise TimeoutError("目前分析人數較多，等待模型分析名額已超時。")
+
+        try:
+            prediction = predict_from_screenshot(
+                sequence,
+                raw_outcomes=raw_history,
+                tie_markers=tie_markers,
+                remaining_cards=remaining,
+                venue=venue,
+                room=room,
+                shoe_id=str(expected_run_id or ""),
+                user_id=user_id,
+                screen_metadata=screen_metadata,
+                initial_grid_cells=list(session.get("initial_grid_cells") or []),
+                initial_image_history=initial_history,
+                manual_outcome_history=manual_history,
+                previous_prediction_id=previous_prediction_id,
+                # value 是本次按鈕剛新增的真實結果；明確傳入才允許 cMAB
+                # 結算上一筆 pending prediction，避免重複按預測自我回灌。
+                latest_actual_outcome=value,
+            )
+        finally:
+            if prediction_slot_acquired:
+                _PREDICTION_SLOTS.release()
+                prediction_slot_acquired = False
+
+        # asyncio.to_thread 超時時底層執行緒不會自動停止；寫入前再次檢查，
+        # 避免逾時後的舊執行緒把結果寫回 Session。
+        _raise_if_manual_timed_out(cancel_event, deadline)
+
+        prediction["latest_actual_outcome"] = value
+        prediction["latest_actual_outcome_text"] = {
+            "B": "莊",
+            "P": "閒",
+            "T": "和",
+        }[value]
+        prediction["remaining_cards_estimated_after_manual"] = True
+        prediction = _attach_bankroll_advice(prediction, session)
+        resolved = {
+            "venue_code": venue,
+            "venue_name": str(ocr.get("venue_name") or ""),
+            "room": room,
+            "remaining_cards": remaining,
+            **screen_metadata,
+        }
+
+        _raise_if_manual_timed_out(cancel_event, deadline)
+        return store.update_screen_analysis(
+            user_id,
+            ocr=ocr,
+            detection=detection,
+            sequence=sequence,
+            raw_outcomes=raw_history,
+            tie_markers=tie_markers,
+            initial_image_history=initial_history,
+            manual_outcome_history=manual_history,
+            initial_grid_cells=list(session.get("initial_grid_cells") or []),
+            recognition_quality={
+                "recognized_count": int(
+                    session.get("initial_recognized_count", len(initial_history))
+                    or len(initial_history)
+                ),
+                "uncertain_count": int(
+                    session.get("initial_uncertain_count", 0) or 0
+                ),
+            },
+            prediction=prediction,
+            resolved=resolved,
+            processing_ms=0.0,
+            source=f"manual_result_{value}",
+            expected_run_id=expected_run_id,
+            expected_data_version=expected_version,
+        )
+    finally:
+        if prediction_slot_acquired:
+            try:
+                _PREDICTION_SLOTS.release()
+            except Exception:
+                pass
+        if operation_lock_acquired:
+            operation_lock.release()
+
+def _start_screen_flow(
+    user_id: str,
+    *,
+    new_session: bool = True,
+) -> Dict[str, Any]:
+    """開始分析時，只建立／清除目前 UID 的獨立分析 Session。"""
+    _ensure_access(user_id)
+    session = store.get_session(user_id)
+    if not session.get("venue"):
+        return {"panel": venue_panel(user_id), "state": "venue"}
+
+    session = (
+        _start_new_uid_analysis(user_id)
+        if new_session
+        else store.begin_screen_analysis(user_id, clear_existing=False)
+    )
+    if int(session.get("bankroll", 0) or 0) <= 0:
+        session = _request_bankroll(user_id)
+        return {"panel": bankroll_panel(user_id, session), "state": "bankroll"}
+
+    return {"panel": upload_request_panel(user_id, session), "state": "image"}
+
+
+
+def _process_screen_image_sync(
+    user_id: str,
+    message_id: str,
+    expected_run_id: str,
+    cancel_event: threading.Event,
+    deadline: float,
+) -> List[Dict[str, Any]]:
+    """在工作執行緒內完整處理圖片，最後把 Reply API 所需訊息直接回傳給 Webhook。"""
+    temporary_image: Optional[Path] = None
+    analysis_image: Optional[Path] = None
+    started = time.perf_counter()
+    image_lock = _user_image_lock(user_id)
+    image_lock_acquired = False
+    prediction_slot_acquired = False
+
+    try:
+        _raise_if_image_timed_out(cancel_event, deadline)
+        lock_wait = _remaining_image_time(deadline)
+        if lock_wait <= 0.0 or not image_lock.acquire(timeout=lock_wait):
+            raise TimeoutError("同一使用者的上一張圖片仍在分析中。")
+        image_lock_acquired = True
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        _ensure_access(user_id)
+        current_session = store.get_session(user_id)
+        if str(current_session.get("analysis_run_id") or "") != str(expected_run_id):
+            return [_text("本次分析已重新開始，請重新上傳最新圖片。")]
+        if not bool(current_session.get("analysis_active")):
+            return [_text("本次分析已結束，請重新點擊「開始分析」。")]
+
+        # 圖片下載、OpenCV 路圖偵測與 OCR 才是記憶體尖峰；必須在它們開始
+        # 前取得名額，不能只限制後段很輕量的 cMAB 預測。
+        semaphore_wait = min(
+            float(PREDICTION_QUEUE_TIMEOUT),
+            _remaining_image_time(deadline),
+        )
+        if semaphore_wait <= 0.0:
+            raise TimeoutError("等待圖片分析名額時已超時。")
+        prediction_slot_acquired = _PREDICTION_SLOTS.acquire(timeout=semaphore_wait)
+        if not prediction_slot_acquired:
+            raise TimeoutError("目前分析人數較多，等待圖片分析名額已超時。")
+
+        download_started = time.perf_counter()
+        temporary_image = _download_line_image(
+            message_id,
+            timeout_seconds=_remaining_image_time(deadline),
+        )
+        download_ms = (time.perf_counter() - download_started) * 1000.0
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        analysis_image = _prepare_analysis_image(temporary_image)
+        screen = analyze_game_screen(analysis_image, current_session)
+        _raise_if_image_timed_out(cancel_event, deadline)
+
+        sequence = list(screen.get("sequence") or [])
+        raw_outcomes = list(screen.get("raw_outcomes") or sequence)
+        tie_markers = dict(screen.get("tie_markers") or {})
+        grid_cells = [
+            dict(item)
+            for item in list(screen.get("grid_cells") or [])
+            if isinstance(item, Mapping)
+        ]
+        recognized_count = int(screen.get("recognized_count", len(sequence)) or len(sequence))
+        uncertain_count = int(screen.get("uncertain_count", 0) or 0)
+        recognition_quality_ok = bool(screen.get("recognition_quality_ok", True))
+
+        if not sequence:
+            road_errors = list((screen.get("road") or {}).get("errors") or [])
+            detail = road_errors[-1] if road_errors else "未偵測到大路圓圈"
+            return [
+                _road_error_message(
+                    f"{detail}。請傳送包含完整大路的畫面或牌路裁切圖。"
+                )
+            ]
+
+        if not recognition_quality_ok:
+            return [
+                _road_error_message(
+                    f"本次只確認 {recognized_count} 格，另有 {uncertain_count} 格無法可靠判定；"
+                    "為避免總局數錯誤，已停止送入模型。請裁切只保留完整大路後重新上傳。"
+                )
+            ]
+
+        resolved = dict(screen.get("resolved") or {})
+        remaining = int(resolved.get("remaining_cards") or 416)
+        resolved["remaining_cards"] = remaining
+        expected_version = int(current_session.get("screen_data_version", 0) or 0)
+        screen_metadata = {
+            "input_type": str(
+                screen.get("input_type") or resolved.get("input_type") or "full_screen"
+            ),
+            "venue_source": str(resolved.get("venue_source") or "session_selected"),
+            "room_source": str(resolved.get("room_source") or "session_selected"),
+            "room_confidence": float(resolved.get("room_confidence", 0.0) or 0.0),
+            "ocr_timed_out": bool(resolved.get("ocr_timed_out")),
+            "vision_timings": dict(screen.get("timings") or {}),
+        }
+        resolved.update(screen_metadata)
+
+        _raise_if_image_timed_out(cancel_event, deadline)
+        model_started = time.perf_counter()
+        prediction = predict_from_screenshot(
+            sequence,
+            raw_outcomes=raw_outcomes,
+            tie_markers=tie_markers,
+            remaining_cards=remaining,
+            venue=str(
+                resolved.get("venue_code")
+                or current_session.get("venue")
+                or ""
+            ),
+            room=str(
+                resolved.get("room")
+                or current_session.get("room")
+                or current_session.get("last_confirmed_room")
+                or "1"
+            ),
+            shoe_id=str(expected_run_id or ""),
+            user_id=user_id,
+            screen_metadata=screen_metadata,
+            initial_grid_cells=grid_cells,
+            initial_image_history=raw_outcomes,
+            manual_outcome_history=[],
+        )
+
+        model_ms = (time.perf_counter() - model_started) * 1000.0
+        _raise_if_image_timed_out(cancel_event, deadline)
+
+        prediction = _attach_bankroll_advice(prediction, current_session)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        source = f"screen_image_{screen_metadata['input_type']}"
+        session = store.update_screen_analysis(
+            user_id,
+            ocr=dict(screen.get("ocr") or {}),
+            detection=dict(screen.get("road") or {}),
+            sequence=sequence,
+            raw_outcomes=raw_outcomes,
+            tie_markers=tie_markers,
+            initial_image_history=raw_outcomes,
+            manual_outcome_history=[],
+            initial_grid_cells=grid_cells,
+            recognition_quality={
+                "recognized_count": recognized_count,
+                "uncertain_count": uncertain_count,
+                "quality_ok": recognition_quality_ok,
+            },
+            prediction=prediction,
+            resolved=resolved,
+            processing_ms=elapsed_ms,
+            source=source,
+            expected_run_id=expected_run_id,
+            expected_data_version=expected_version,
+        )
+
+        print(
+            "screen_timing",
+            json.dumps(
+                {
+                    "uid": user_id[-8:],
+                    "download_ms": round(download_ms, 2),
+                    **dict(screen.get("timings") or {}),
+                    "model_ms": round(model_ms, 2),
+                    "total_ms": round(elapsed_ms, 2),
+                    "input_type": screen_metadata["input_type"],
+                    "room_source": screen_metadata["room_source"],
+                    "road_count": len(sequence),
+                    "reply_mode": True,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return [screen_result_panel(user_id, session)]
+
+    except AccessExpiredError:
+        return [_text("試用已到期，請聯繫管理員開通。")]
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        message = str(exc)
+        if "舊結果已忽略" in message or "已重新開始" in message or "已結束" in message:
+            return [_text("本次圖片已失效，請重新上傳最新圖片。")]
+        return [_road_error_message(f"圖片處理失敗：{message}")]
+    finally:
+        # 雙重安全：任何例外、超時或取消路徑都不能遺漏釋放 Semaphore。
+        if prediction_slot_acquired:
+            try:
+                _PREDICTION_SLOTS.release()
+            finally:
+                prediction_slot_acquired = False
+        if analysis_image is not None and analysis_image != temporary_image:
+            analysis_image.unlink(missing_ok=True)
+        if temporary_image is not None:
+            temporary_image.unlink(missing_ok=True)
+        if image_lock_acquired:
+            image_lock.release()
+
+
+async def _process_manual_outcome_via_reply(
+    token: str,
+    user_id: str,
+    outcome: str,
+    expected_run_id: str,
+) -> bool:
+    """在 webhook 內完成手動結果更新，最後只用同一個 replyToken 回覆。"""
+    uid_tail = str(user_id or "")[-8:]
+    started = time.perf_counter()
+    cancel_event = threading.Event()
+    # 內部工作 deadline 比 wait_for 提前 2 秒，讓同步函式能在外層取消前自行停止，
+    # 避免 asyncio.to_thread 已逾時但底層執行緒仍寫回舊 Session。
+    work_timeout = max(1.0, MANUAL_OUTCOME_TIMEOUT - 2.0)
+    deadline = started + work_timeout
+    value = str(outcome or "").upper().strip()
+
+    print(
+        "manual_start",
+        json.dumps(
+            {
+                "event": "manual_start",
+                "uid": uid_tail,
+                "outcome": value,
+                "run_id": str(expected_run_id or "")[:12],
+                "delivery": "replyToken",
+                "timeout_s": MANUAL_OUTCOME_TIMEOUT,
+                "work_deadline_s": work_timeout,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    messages: List[Dict[str, Any]]
+    result_event = "manual_reply_result"
+    try:
+        session = await asyncio.wait_for(
+            asyncio.to_thread(
+                _refresh_screen_prediction,
+                user_id,
+                value,
+                expected_run_id,
+                cancel_event,
+                deadline,
+            ),
+            timeout=MANUAL_OUTCOME_TIMEOUT,
+        )
+        predict_ms = (time.perf_counter() - started) * 1000.0
+        print(
+            "manual_predict_ok",
+            json.dumps(
+                {
+                    "event": "manual_predict_ok",
+                    "uid": uid_tail,
+                    "outcome": value,
+                    "ms": round(predict_ms, 2),
+                    "delivery": "replyToken",
+                },
+                ensure_ascii=False,
+            ),
+        )
+        messages = [screen_result_panel(user_id, session)]
+    except (asyncio.TimeoutError, TimeoutError):
+        cancel_event.set()
+        result_event = "manual_timeout"
+        print(
+            "manual_timeout",
+            json.dumps(
+                {
+                    "event": "manual_timeout",
+                    "uid": uid_tail,
+                    "outcome": value,
+                    "timeout_s": MANUAL_OUTCOME_TIMEOUT,
+                    "work_deadline_s": work_timeout,
+                    "delivery": "replyToken",
+                },
+                ensure_ascii=False,
+            ),
+        )
+        messages = [
+            _text(
+                "⚠️ 本局結果更新超時，已取消本次寫入。\n"
+                "請稍後再按一次莊／閒／和；若持續發生，請重新上傳圖片。"
+            )
+        ]
+    except AccessExpiredError:
+        cancel_event.set()
+        result_event = "manual_access_expired"
+        messages = [_text("試用已到期，請聯繫管理員開通。")]
+    except Exception as exc:
+        cancel_event.set()
+        traceback.print_exc()
+        message = str(exc)
+        result_event = "manual_error"
+        print(
+            "manual_error",
+            json.dumps(
+                {
+                    "event": "manual_error",
+                    "uid": uid_tail,
+                    "outcome": value,
+                    "error": message[:300],
+                    "delivery": "replyToken",
+                },
+                ensure_ascii=False,
+            ),
+        )
+        if any(
+            key in message
+            for key in (
+                "舊操作已忽略",
+                "舊結果已忽略",
+                "已重新開始",
+                "已結束",
+            )
+        ):
+            messages = [
+                _text("本次操作已過期（分析已重新開始或結束），請重新開始分析。")
+            ]
+        else:
+            messages = [_text(f"本局結果更新失敗：{message}")]
+
+    # Reply API 也放到工作執行緒，避免 requests 阻塞事件迴圈。
+    replied = await asyncio.to_thread(_reply, token, messages)
+    total_ms = (time.perf_counter() - started) * 1000.0
+    print(
+        "manual_reply_ok" if replied else "manual_reply_fail",
+        json.dumps(
+            {
+                "event": "manual_reply_ok" if replied else "manual_reply_fail",
+                "uid": uid_tail,
+                "outcome": value,
+                "result_event": result_event,
+                "total_ms": round(total_ms, 2),
+                "delivery": "replyToken",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return replied
+
+def _public_session(session: Mapping[str, Any]) -> Dict[str, Any]:
+    data = copy_session = dict(session)
+    copy_session.pop("virtual_shoe", None)
+    copy_session["remaining_cards"] = len(session.get("virtual_shoe") or [])
+    copy_session["venue_name"] = _venue_name(str(session.get("venue") or ""))
+    copy_session["venues"] = [
+        {
+            **venue,
+            "image_url": f"/static/venues/{venue['image']}",
+        }
+        for venue in VENUES
+    ]
+    copy_session["analysis_history"] = list(session.get("analysis_history") or [])[-40:]
+    copy_session["round_history"] = list(session.get("round_history") or [])[-60:]
+    copy_session["history"] = list(session.get("raw_outcomes") or [])[-1000:]
+    copy_session["round_no"] = len(copy_session["history"]) + 1
+    copy_session["last_prediction"] = dict(
+        session.get("screen_last_prediction")
+        or session.get("last_prediction")
+        or {}
+    )
+    return data
+
+
+def _liff_access_payload(user_id: str, *, start_trial: bool = False) -> Dict[str, Any]:
+    status = dict(store.access_status(user_id, start_trial=start_trial))
+    session = store.get_session(user_id)
+    permanent = bool(session.get("permanent_access"))
+    trial_started = int(session.get("trial_started_at", 0) or 0)
+    active = bool(status.get("allowed"))
+    can_start_trial = not permanent and trial_started <= 0
+    seconds_left = status.get("seconds_left")
+    return {
+        "user_id": user_id,
+        "active": active,
+        "allowed": active,
+        "can_start_trial": can_start_trial,
+        "state": "active" if active else "trial_available" if can_start_trial else "expired",
+        "plan": "permanent" if permanent else "trial",
+        "plan_label": "永久版" if permanent else "試用中" if active else "可開始試用" if can_start_trial else "已到期",
+        "remaining_seconds": seconds_left,
+        "expires_at_taipei": "永久" if permanent else "",
+        "redirect_after_seconds": 30,
+        "message": (
+            "使用權限正常"
+            if active
+            else "首次分析將自動啟用試用"
+            if can_start_trial
+            else "試用已到期，請聯繫管理員"
+        ),
+    }
+
+
+@app.get("/")
+def root() -> FileResponse:
+    return FileResponse(STATIC_DIR / "liff.html")
+
+
+@app.get("/liff")
+def liff_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "liff.html")
+
+
+@app.get("/health")
+def health() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": True,
+            "version": "10.6.0-road-cmab-stable",
+            "engine": "CMAB_ROAD_HISTORY_ONLY",
+            "activation_code_fix": True,
+            "activation_persistence_check": True,
+            "storage_path": str(getattr(store, "SESSION_DATA_FILE", "")),
+            "activation_code_counts": {
+                "permanent": len(PERMANENT_CODES),
+                "monthly": len(MONTHLY_CODES),
+                "temporary": len(TEMP_CODES),
+            },
+            "default_permanent_code_loaded": "aaa1888007" in PERMANENT_CODES,
+            "input_required": True,
+            "virtual_only": False,
+            "public_base_url_configured": bool(PUBLIC_BASE_URL),
+            "venues": [venue["code"] for venue in VENUES],
+            "max_concurrent_predictions": MAX_CONCURRENT_PREDICTIONS,
+            "road_image_recognition": True,
+            "room_info_ocr": True,
+            "parallel_screen_pipeline": True,
+            "road_manual_quick_reply": True,
+            "uid_isolated_sessions": True,
+            "first_image_then_bpt_only": True,
+            "tie_result_supported": True,
+            "online_calibration": True,
+            "adaptive_ensemble": True,
+            "exact_shoe_composition": False,
+            "banker_commission_ev": False,
+            "fractional_kelly": False,
+            "ocr_preload_enabled": os.getenv("OCR_PRELOAD", "0").strip() == "1",
+            "deepseek_active": False,
+            "stale_background_guard": True,
+            "bankroll_flow": True,
+            "immediate_image_ack": False,
+            "background_push_result": False,
+            "manual_background_push": False,
+            "manual_result_via_reply": True,
+            "image_result_via_reply": True,
+            "image_reply_timeout_seconds": LINE_IMAGE_ANALYSIS_TIMEOUT,
+            "manual_outcome_timeout_seconds": MANUAL_OUTCOME_TIMEOUT,
+            "push_max_retries": PUSH_MAX_RETRIES,
+            "line_default_mode": "screen",
+        }
+    )
+
+
+
+
+@app.head("/health")
+def health_head() -> Response:
+    """Render／外部監控使用 HEAD 健康檢查時回傳 200。"""
+    return Response(status_code=200)
+
+@app.get("/ping")
+def ping() -> PlainTextResponse:
+    return PlainTextResponse("OK")
+
+
+
+@app.head("/ping")
+def ping_head() -> Response:
+    """允許監控以 HEAD /ping 檢查服務狀態。"""
+    return Response(status_code=200)
+
+
+@app.get("/api/config")
+def api_config() -> JSONResponse:
+    return JSONResponse({
+        "ok": True,
+        "liffId": LIFF_ID,
+        "adminLineUrl": ADMIN_LINE_URL,
+        "accessRedirectSeconds": 30,
+        "venues": VENUES,
+        "rooms": [str(value) for value in range(1, 21)],
+    })
+
+
+@app.get("/api/access/status")
+def api_access_status(user_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"ok": True, "access": _liff_access_payload(user_id)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/access/activate")
+def api_access_activate(payload: ActivationRequest) -> JSONResponse:
+    try:
+        plan = _activate_code(payload.user_id, payload.code)
+        access = _liff_access_payload(payload.user_id)
+        access["message"] = f"{plan}開通成功"
+        return JSONResponse({"ok": True, "access": access})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/session/current")
+def api_session_current(user_id: str) -> JSONResponse:
+    return JSONResponse({"ok": True, "session": _public_session(store.get_session(user_id))})
+
+
+@app.post("/api/session/start")
+def api_session_start(payload: LiffSessionStartRequest) -> JSONResponse:
+    venue = payload.venue.upper().strip()
+    if venue not in VENUE_BY_CODE:
+        raise HTTPException(status_code=400, detail="無效館別")
+    try:
+        store.select_venue(payload.user_id, venue, payload.room)
+        session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+        session = store.upsert_session(
+            payload.user_id,
+            {
+                "shoe_id": str(payload.shoe_id or session.get("shoe_id") or ""),
+                "status": "輸入中",
+                "analysis_active": True,
+                "awaiting_screenshot": False,
+            },
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/round/add")
+def api_round_add(payload: RoundResultRequest) -> JSONResponse:
+    try:
+        session = store.append_road_result(payload.user_id, payload.result)
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/round/undo")
+def api_round_undo(payload: UserRequest) -> JSONResponse:
+    try:
+        session = store.get_session(payload.user_id)
+        raw = list(session.get("raw_outcomes") or [])
+        if raw:
+            raw.pop()
+        session = store.set_road_sequence(
+            payload.user_id,
+            [value for value in raw if value in {"B", "P"}],
+            raw_outcomes=raw,
+            source="manual",
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/session/reset")
+def api_session_reset(payload: UserRequest) -> JSONResponse:
+    session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/api/session/end")
+def api_session_end(payload: UserRequest) -> JSONResponse:
+    session = _end_uid_analysis(payload.user_id)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.get("/api/session")
+def api_session(user_id: str) -> JSONResponse:
+    try:
+        return JSONResponse({"ok": True, "session": _public_session(store.get_session(user_id))})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/venue")
+def api_venue(payload: VenueRequest) -> JSONResponse:
+    venue = payload.venue.upper()
+    if venue not in VENUE_BY_CODE:
+        raise HTTPException(status_code=400, detail="無效館別")
+    session = store.select_venue(payload.user_id, venue, payload.room)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/api/room")
+def api_room(payload: RoomRequest) -> JSONResponse:
+    session = store.set_room(payload.user_id, payload.room)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/api/shoe/cards")
+def api_shoe_cards(payload: ShoeCardsRequest) -> JSONResponse:
+    """保留舊版 API 相容性；逐張牌面不會參與目前的路圖 cMAB 預測。"""
+    try:
+        session = store.set_observed_cards(
+            payload.user_id,
+            payload.cards,
+            replace=bool(payload.replace),
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/predict")
+async def api_predict(payload: UserRequest) -> JSONResponse:
+    try:
+        session = store.get_session(payload.user_id)
+        raw_outcomes = list(session.get("raw_outcomes") or [])
+        # LIFF 直接輸入模式只以 B/P/T 路單產生方向評估；沒有路單時才
+        # 沿用 LINE 截圖啟動流程。舊 observed_cards 資料不參與此判斷。
+        if raw_outcomes:
+            _ensure_access(payload.user_id)
+            previous_screen_prediction = dict(
+                session.get("screen_last_prediction") or {}
+            )
+            previous_timeline = dict(
+                previous_screen_prediction.get("timeline_alignment") or {}
+            )
+            # 只有歷史局數真的比「上一次預測採用的局數」多，最後一局才
+            # 是可用於結算上一筆預測的新答案。相同歷史的重新按預測不學習。
+            previous_raw_rounds = int(
+                previous_timeline.get("raw_round_index", -1) or -1
+            )
+            latest_actual_outcome = (
+                str(raw_outcomes[-1]).upper()
+                if len(raw_outcomes) > previous_raw_rounds
+                and str(raw_outcomes[-1]).upper() in {"B", "P", "T"}
+                else ""
+            )
+            prediction = await asyncio.to_thread(
+                predict_from_screenshot,
+                [value for value in raw_outcomes if value in {"B", "P"}],
+                raw_outcomes=raw_outcomes,
+                remaining_cards=0,
+                venue=str(session.get("venue") or ""),
+                room=str(session.get("room") or "1"),
+                shoe_id=str(session.get("shoe_id") or session.get("analysis_run_id") or ""),
+                user_id=payload.user_id,
+                initial_image_history=[],
+                manual_outcome_history=raw_outcomes,
+                previous_prediction_id=str(
+                    previous_screen_prediction.get("prediction_id") or ""
+                ),
+                latest_actual_outcome=latest_actual_outcome,
+            )
+            prediction = _attach_bankroll_advice(prediction, session)
+            updated = store.upsert_session(
+                payload.user_id,
+                {
+                    "screen_last_prediction": prediction,
+                    "last_prediction": prediction,
+                    "pending_prediction": prediction,
+                    "screen_prediction_version": int(session.get("screen_data_version", 0) or 0),
+                    "screen_analysis_count": int(session.get("screen_analysis_count", 0) or 0) + 1,
+                    "status": "分析完成",
+                },
+            )
+            return JSONResponse({
+                "ok": True,
+                "state": "predicted",
+                "prediction": prediction,
+                "access": _liff_access_payload(payload.user_id),
+                "session": _public_session(updated),
+            })
+        result = await asyncio.to_thread(_start_screen_flow, payload.user_id)
+        return JSONResponse(
+            {
+                "ok": True,
+                "state": result["state"],
+                "session": _public_session(store.get_session(payload.user_id)),
+            }
+        )
+    except (PermissionError, AccessExpiredError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.post("/api/reset")
+def api_reset(payload: UserRequest) -> JSONResponse:
+    session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/api/end")
+def api_end(payload: UserRequest) -> JSONResponse:
+    session = _end_uid_analysis(payload.user_id)
+    return JSONResponse({"ok": True, "session": _public_session(session)})
+
+
+@app.post("/webhook")
+async def webhook(request: Request) -> JSONResponse:
+    body = await request.body()
+    if not _verify_signature(body, request.headers.get("X-Line-Signature")):
+        return JSONResponse({"ok": False}, status_code=401)
+
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        return JSONResponse({"ok": False}, status_code=400)
+
+    for event in payload.get("events", []):
+        token = str(event.get("replyToken") or "")
+        source = event.get("source") or {}
+        user_id = str(source.get("userId") or "").strip()
+        if not user_id:
+            _reply(token, [_text("無法取得 LINE UID，請改在與機器人的一對一聊天室操作。")])
+            continue
+        try:
+            event_type = event.get("type")
+            message = event.get("message") or {}
+            message_type = str(message.get("type") or "")
+
+            if event_type == "follow":
+                _reply(token, [guide_panel()])
+                continue
+
+            # 圖片事件：直接在 Webhook 內等待分析完成，再用同一個 replyToken 回覆。
+            if event_type == "message" and message_type == "image":
+                _ensure_access(user_id)
+                session = store.get_session(user_id)
+                if not session.get("venue"):
+                    _reply(token, [_text("請先選擇遊戲館。"), venue_panel(user_id)])
+                    continue
+                if int(session.get("bankroll", 0) or 0) <= 0:
+                    session = _request_bankroll(user_id)
+                    _reply(token, [bankroll_panel(user_id, session)])
+                    continue
+                if not bool(session.get("analysis_active")):
+                    _reply(
+                        token,
+                        [
+                            _text("請先點擊「開始分析」，再上傳圖片。"),
+                            ready_panel(user_id, session),
+                        ],
+                    )
+                    continue
+
+                session = store.begin_screen_analysis(user_id, clear_existing=False)
+                message_id = str(message.get("id") or "").strip()
+                if not message_id:
+                    raise ValueError("LINE 圖片 messageId 不存在。")
+
+                run_id = str(session.get("analysis_run_id") or "")
+                cancel_event = threading.Event()
+                deadline = time.perf_counter() + LINE_IMAGE_ANALYSIS_TIMEOUT
+                try:
+                    messages = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _process_screen_image_sync,
+                            user_id,
+                            message_id,
+                            run_id,
+                            cancel_event,
+                            deadline,
+                        ),
+                        timeout=LINE_IMAGE_ANALYSIS_TIMEOUT,
+                    )
+                except TimeoutError:
+                    cancel_event.set()
+                    messages = [
+                        _text(
+                            "⚠️ 伺服器分析超時，請重新上傳一次圖片試試看！"
+                        )
+                    ]
+                except Exception as exc:
+                    cancel_event.set()
+                    traceback.print_exc()
+                    messages = [_road_error_message(f"圖片處理失敗：{exc}")]
+
+                _reply(token, messages or [_text("圖片分析未產生結果，請重新上傳一次。")])
+                continue
+
+            if event_type == "message" and message_type == "text":
+                raw_text = str(message.get("text") or "")
+                text = unicodedata.normalize("NFKC", raw_text).strip()
+                access_code = _normalize_access_code(raw_text)
+
+                activation_match = access_code in ALL_CODES
+                print(
+                    "activation_debug",
+                    json.dumps(
+                        {
+                            "uid": user_id[-8:],
+                            "normalized": access_code,
+                            "length": len(access_code),
+                            "matched": activation_match,
+                            "permanent": access_code in PERMANENT_CODES,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                if activation_match:
+                    plan = _activate_code(user_id, access_code)
+                    saved = store.get_session(user_id)
+                    if plan == "永久版" and not bool(saved.get("permanent_access")):
+                        raise RuntimeError("開通資料未成功寫入，請檢查 SESSION_DATA_FILE 儲存路徑。")
+                    _reply(token, [_text(f"✅ 已開通：{plan}"), guide_panel()])
+                    continue
+
+                if text in {"開通碼檢查", "檢查開通碼", "版本檢查"}:
+                    _reply(
+                        token,
+                        [
+                            _text(
+                                "BGS AI預測系統版本：10.4.1\n"
+                                f"永久碼載入數：{len(PERMANENT_CODES)}\n"
+                                f"aaa1888007 已載入：{'是' if 'aaa1888007' in PERMANENT_CODES else '否'}"
+                            )
+                        ],
+                    )
+                    continue
+
+                session = store.get_session(user_id)
+
+                # 本金輸入與本金指令。
+                bankroll_command = bool(
+                    re.fullmatch(
+                        r"(?:本金|金額|資金)\s*[:：=]?\s*[0-9,，＄$ ]+",
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                if bool(session.get("awaiting_bankroll")) or bankroll_command:
+                    try:
+                        bankroll = _parse_bankroll(text)
+                        session = store.set_bankroll(user_id, bankroll, begin_screen=True)
+                        _reply(
+                            token,
+                            [
+                                _text(f"✅ 本金已設定為 {_format_money(bankroll)} 元"),
+                                upload_request_panel(user_id, session),
+                            ],
+                        )
+                    except ValueError as exc:
+                        _reply(token, [_text(str(exc)), bankroll_panel(user_id, session)])
+                    continue
+
+                # 首次圖片完成後，文字入口同樣接受莊／閒／和。
+                if text in {"🔴 本局：莊", "🔴 本局結果：莊", "補輸莊", "補莊", "莊"}:
+                    current = store.get_session(user_id)
+                    if not current.get("screen_last_prediction"):
+                        _reply(token, [_text("請先點擊開始分析並上傳一次遊戲畫面。")])
+                        continue
+                    run_id = str(current.get("analysis_run_id") or "")
+                    await _process_manual_outcome_via_reply(token, user_id, "B", run_id)
+                    continue
+                if text in {"🔵 本局：閒", "🔵 本局結果：閒", "補輸閒", "補閒", "閒"}:
+                    current = store.get_session(user_id)
+                    if not current.get("screen_last_prediction"):
+                        _reply(token, [_text("請先點擊開始分析並上傳一次遊戲畫面。")])
+                        continue
+                    run_id = str(current.get("analysis_run_id") or "")
+                    await _process_manual_outcome_via_reply(token, user_id, "P", run_id)
+                    continue
+                if text in {"🟢 本局：和", "🟢 本局結果：和", "補輸和", "補和", "和"}:
+                    current = store.get_session(user_id)
+                    if not current.get("screen_last_prediction"):
+                        _reply(token, [_text("請先點擊開始分析並上傳一次遊戲畫面。")])
+                        continue
+                    run_id = str(current.get("analysis_run_id") or "")
+                    await _process_manual_outcome_via_reply(token, user_id, "T", run_id)
+                    continue
+                if text in {"🔄 清除重來", "清除路紙", "清除畫面", "重來"}:
+                    result = _start_screen_flow(user_id, new_session=True)
+                    _reply(token, [_text("🔄 已清除這個 UID 的舊牌路。"), result["panel"]])
+                    continue
+
+                if text in {"開始", "選館", "重新選館", "館別"}:
+                    _reply(token, [venue_panel(user_id)])
+                    continue
+                if text in {"開始分析"}:
+                    _reply(token, [venue_panel(user_id)])
+                    continue
+                if text in {"上傳圖片", "圖片辨識", "路紙", "路單"}:
+                    result = _start_screen_flow(user_id, new_session=False)
+                    _reply(token, [result["panel"]])
+                    continue
+                if text in {"繼續分析"}:
+                    _reply(token, [_text("首次圖片完成後，請直接按「本局結果：莊」或「本局結果：閒」。")])
+                    continue
+                if text in {"更改本金", "設定本金", "本金", "金額", "資金"}:
+                    session = _request_bankroll(user_id)
+                    _reply(token, [bankroll_panel(user_id, session)])
+                    continue
+                if text in {"結束", "結束分析"}:
+                    _end_uid_analysis(user_id)
+                    _reply(token, [ended_panel()])
+                    continue
+
+                if session.get("awaiting_screenshot"):
+                    _reply(token, [_text("目前正在等待圖片，請直接上傳最新完整遊戲畫面。")])
+                elif session.get("venue"):
+                    _reply(token, [ready_panel(user_id, session)])
+                else:
+                    _reply(token, [venue_panel(user_id)])
+                continue
+
+            if event_type == "postback":
+                query = {
+                    key: values[0]
+                    for key, values in urllib.parse.parse_qs(
+                        str((event.get("postback") or {}).get("data") or "")
+                    ).items()
+                }
+                action_name = str(query.get("action") or "")
+
+                if action_name == "start_guide":
+                    _reply(token, [venue_panel(user_id)])
+                elif action_name == "road_append":
+                    value = str(query.get("result") or "").upper()
+                    if value not in {"B", "P", "T"}:
+                        raise ValueError("手動牌局結果不正確。")
+                    current = store.get_session(user_id)
+                    if not bool(current.get("analysis_active")):
+                        _reply(token, [_text("本次分析已結束，請重新開始分析。")])
+                        continue
+                    if not current.get("screen_last_prediction"):
+                        _reply(token, [_text("請先上傳一次遊戲畫面，建立初始牌路。")])
+                        continue
+                    run_id = str(current.get("analysis_run_id") or "")
+                    await _process_manual_outcome_via_reply(
+                        token, user_id, value, run_id
+                    )
+                elif action_name == "road_clear":
+                    result = _start_screen_flow(user_id, new_session=True)
+                    _reply(token, [_text("🔄 已清除這個 UID 的舊牌路。"), result["panel"]])
+                elif action_name == "venue":
+                    venue = str(query.get("venue") or "").upper()
+                    if venue not in VENUE_BY_CODE:
+                        raise ValueError("無效館別")
+                    session = store.select_venue(
+                        user_id,
+                        venue,
+                        str(query.get("room") or "1"),
+                    )
+                    session = _request_bankroll(user_id)
+                    _reply(
+                        token,
+                        [
+                            selected_venue_panel(session),
+                            bankroll_panel(user_id, session),
+                        ],
+                    )
+                elif action_name in {"start_screen", "restart_screen"}:
+                    result = _start_screen_flow(user_id, new_session=True)
+                    _reply(token, [result["panel"]])
+                elif action_name in {"request_screen", "predict"}:
+                    result = _start_screen_flow(user_id, new_session=False)
+                    _reply(token, [result["panel"]])
+                elif action_name == "change_bankroll":
+                    session = _request_bankroll(user_id)
+                    _reply(token, [bankroll_panel(user_id, session)])
+                elif action_name in {"screen_clear", "reset"}:
+                    result = _start_screen_flow(user_id, new_session=True)
+                    _reply(token, [_text("🔄 已清除這個 UID 的舊牌路。"), result["panel"]])
+                elif action_name == "end":
+                    _end_uid_analysis(user_id)
+                    _reply(token, [ended_panel()])
+                elif action_name == "venues":
+                    _reply(token, [venue_panel(user_id)])
+                else:
+                    _reply(token, [venue_panel(user_id)])
+                continue
+        except AccessExpiredError:
+            _reply(
+                token,
+                [
+                    _text("試用已到期，請聯繫管理員開通。"),
+                    {
+                        "type": "template",
+                        "altText": "聯繫管理員",
+                        "template": {
+                            "type": "buttons",
+                            "text": "試用已到期",
+                            "actions": [
+                                {
+                                    "type": "uri",
+                                    "label": "聯繫管理員",
+                                    "uri": ADMIN_LINE_URL,
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+        except PermissionError as exc:
+            traceback.print_exc()
+            storage_path = str(getattr(store, "SESSION_DATA_FILE", "未設定"))
+            _reply(token, [_text(f"資料儲存權限錯誤：{storage_path}\n請確認 Render Persistent Disk 掛載或移除錯誤的 SESSION_DATA_FILE。")])
+        except Exception as exc:
+            traceback.print_exc()
+            message = str(exc)
+            if "has no attribute" in message and "store" in message:
+                message = "app.py 與 store.py 版本不一致，請同時覆蓋兩支檔案後重新部署。"
+            _reply(token, [_text(f"系統忙碌：{message}")])
+
+    return JSONResponse({"ok": True})
