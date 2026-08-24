@@ -1,7 +1,8 @@
 """遊戲截圖 cMAB 預測轉接層。
 
-完整 B/P/T 歷史與牌路上下文送入 LinUCB cMAB。``prior_counts`` 與
-``observed_cards`` 僅保留為舊呼叫端的相容參數，絕不參與真人桌預測。
+完整 B/P/T 歷史與牌路上下文送入 cMAB；若呼叫端明確提供經驗證的 10 維
+``shoe_context.remaining_counts``，同時交由物理 EV／策略 Bandit 管線。
+``prior_counts`` 與 ``observed_cards`` 仍只保留舊呼叫端相容，不可自動升格。
 
 人工回報時以 session 保存的 prediction_id 精確結算上一筆 reward，
 再把本局結果加入歷史並產生下一局預測，避免 latest-pending 競態與重複結算。
@@ -40,6 +41,7 @@ def predict_from_screenshot(
     tie_markers: Optional[Mapping[str, Any]] = None,
     prior_counts: Optional[Sequence[int]] = None,
     observed_cards: Optional[Iterable[Any]] = None,
+    shoe_context: Optional[Mapping[str, Any]] = None,
     venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "",
     run_seed: Optional[int] = None,
     road_context: Optional[Mapping[str, Any]] = None,
@@ -102,10 +104,11 @@ def predict_from_screenshot(
             prediction_id=str(previous_prediction_id or ""),
         )
 
-    # 兼容舊版 API，但嚴格隔離逐張牌面／剩餘牌數；真人桌正式判斷只看
-    # 時間對齊的 B/P/T 歷史與路圖 Context。
+    # 只有呼叫端明確帶入的 ``remaining_counts`` 可以進物理決策；截圖
+    # OCR 的剩餘總張數、prior_counts 與 observed_cards 都不能替代它。
     prior_counts_ignored = bool(prior_counts)
     observed_cards_ignored = bool(observed_cards)
+    physical_context = dict(shoe_context or {})
 
     result = predict(
         history=combined_raw,
@@ -114,19 +117,27 @@ def predict_from_screenshot(
         shoe_id=shoe_id,
         user_id=user_id,
         run_seed=seed,
-        shoe_context=None,
+        shoe_context=physical_context,
         road_context=context,
     )
     result.update({
         # 保留 contextual_bandit 回傳的真實模型版本，避免績效資料把
         # V1.5 誤標成舊 V1；此欄只描述畫面輸入管線。
-        "screen_pipeline_version": "CMAB-FULL-HISTORY-GRID-AWARE-V1",
-        "mode": "screen_full_history_contextual_bandit",
+        "screen_pipeline_version": "CMAB-PHYSICAL-STRATEGY-GRID-AWARE-V1",
+        "mode": "screen_full_history_strategy_bandit",
         "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
         "estimated_remaining_counts": [],
-        "composition_source": "not_used_cmab",
-        "composition_quality": "not_applicable_cmab",
+        "composition_source": str(
+            dict(result.get("physical_signal") or {}).get("source") or "not_supplied"
+        ),
+        "composition_quality": str(
+            result.get("composition_quality") or "unavailable_or_untrusted"
+        ),
+        "exact_remaining_counts_supplied": bool(
+            isinstance(physical_context.get("remaining_counts"), (list, tuple))
+            and len(physical_context.get("remaining_counts") or []) == 10
+        ),
         "prior_counts_ignored": prior_counts_ignored,
         "observed_cards_ignored": observed_cards_ignored,
         "road_sequence_length": len(cleaned),

@@ -10,6 +10,7 @@ from typing import Any, Dict, Mapping
 import os
 
 from performance_tracker import get_performance_summary
+from shoe_composition import KELLY_FRACTION, MAX_BET_FRACTION, MIN_POSITIVE_EV
 
 
 OUTCOMES = ("B", "P", "T")
@@ -370,4 +371,188 @@ def apply_validated_decision(
     return result
 
 
-__all__ = ["apply_validated_decision"]
+def _strategy_road_direction(result: Mapping[str, Any]) -> tuple[str, float]:
+    """從既有 road context 取得確認方向與強度；它沒有單獨下注權。"""
+    road = result.get("road_support")
+    if not isinstance(road, Mapping):
+        road = result.get("road_context")
+    road = dict(road or {})
+    try:
+        probability = float(road.get("planning_probability", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        probability = 0.5
+    direction = "B" if probability > 0.5 else "P" if probability < 0.5 else ""
+    try:
+        confidence = float(road.get("confidence_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    try:
+        consensus = float(road.get("derived_road_consensus", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        consensus = 0.0
+    return direction, max(0.0, min(1.0, max(confidence, consensus)))
+
+
+def _set_no_bet(result: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """統一清空所有可被前端誤當成正式下注的欄位。"""
+    result.update({
+        "action": "O",
+        "recommend": "O",
+        "internal_action": "O",
+        "internal_recommend": "O",
+        "next_round_direction": "O",
+        "action_text": "觀望／無物理優勢",
+        "recommend_text": "觀望／無物理優勢",
+        "next_round_direction_text": "觀望／無物理優勢",
+        "signal_allowed": False,
+        "risk_gate_open": False,
+        "kelly_fraction": 0.0,
+        "recommended_bet_percentage": 0.0,
+        "suggested_bet_amount": 0.0,
+        "bet_percentage": 0.0,
+        "selected_expected_return": 0.0,
+        "selected_expected_return_percent": 0.0,
+        "kelly_percentage_applied": 0.0,
+        "signal_reason": reason,
+        "reason": reason,
+    })
+    return result
+
+
+def apply_strategy_decision(
+    prediction: Mapping[str, Any],
+    *,
+    strategy_selection: Mapping[str, Any],
+    bankroll: float = 0.0,
+) -> Dict[str, Any]:
+    """將「策略 Bandit Arm」限制在精確 EV/Kelly 安全網內。
+
+    重要不變量：
+    1. 沒有可信 10 維 exact remaining counts，一律 O。
+    2. 牌路只可確認或縮小既有物理正 EV 注碼，不能翻轉方向、降低正 EV
+       門檻，或把負 EV 變成下注。
+    3. 最終注碼永遠同時受既有 fractional ``KELLY_FRACTION`` 計算結果與
+       ``MAX_BET_FRACTION`` 硬上限保護。
+    """
+    result = dict(prediction or {})
+    physical = dict(result.get("physical_signal") or {})
+    selection = dict(strategy_selection or {})
+    profile = dict(selection.get("profile") or {})
+    arm = str(selection.get("selected_arm") or "math_only")
+    counts = physical.get("remaining_counts")
+    trusted = bool(
+        physical.get("trusted_exact_counts")
+        and physical.get("available")
+        and isinstance(counts, (list, tuple))
+        and len(counts) == 10
+    )
+    physical_action = str(physical.get("action") or "O").upper().strip()
+    try:
+        physical_ev = float(physical.get("selected_expected_return", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        physical_ev = 0.0
+    try:
+        base_kelly = max(0.0, float(physical.get("kelly_fraction", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        base_kelly = 0.0
+    required_ev = max(
+        float(MIN_POSITIVE_EV),
+        float(MIN_POSITIVE_EV) * float(profile.get("minimum_ev_multiplier", 1.0) or 1.0),
+    )
+
+    result["decision_strategy_bandit"] = selection
+    result["decision_strategy"] = arm
+    result["physical_signal"] = physical
+    result["strategy_hard_limits"] = {
+        "kelly_fraction": float(KELLY_FRACTION),
+        "max_bet_fraction": float(MAX_BET_FRACTION),
+        "minimum_positive_ev": float(MIN_POSITIVE_EV),
+    }
+
+    if not trusted:
+        return _set_no_bet(
+            result,
+            "尚未提供可信的 10 維精確剩餘牌點計數；B/P/T 路單不能取代物理 EV。",
+        )
+    if physical_action not in {"B", "P"} or physical_ev < required_ev or base_kelly <= 0.0:
+        return _set_no_bet(
+            result,
+            "精確不放回機率在抽水後未達本策略要求的正 EV／Kelly 條件。",
+        )
+
+    road_direction, road_strength = _strategy_road_direction(result)
+    multiplier = min(1.0, max(0.0, float(profile.get("kelly_multiplier", 1.0) or 1.0)))
+    road_note = "純數學策略，不讀牌路調整注碼。"
+    if arm == "ev_road_blend":
+        # 路圖同向僅確認、不同向且強度高才縮倉；不允許加碼超過既有 Kelly
+        # 結果，因此不會突破 KELLY_FRACTION 的原始風控意義。
+        if road_direction and road_direction != physical_action and road_strength >= 0.60:
+            multiplier *= 0.65
+            road_note = "牌路與物理正 EV 方向衝突，已將既有 Kelly 注碼縮至 65%。"
+        elif road_direction == physical_action and road_strength >= 0.60:
+            road_note = "牌路與物理正 EV 同向，只確認既有 Kelly 注碼，不額外加碼。"
+        else:
+            multiplier *= 0.85
+            road_note = "牌路確認度不足，已將既有 Kelly 注碼縮至 85%。"
+    elif arm == "conservative":
+        road_note = "保守策略提高 EV 要求並將既有 Kelly 注碼減半。"
+
+    final_kelly = min(float(MAX_BET_FRACTION), base_kelly * multiplier)
+    if final_kelly <= 0.0:
+        return _set_no_bet(result, "策略縮放後的下注比例為零，保留觀望。")
+
+    probabilities = dict(physical.get("probabilities") or {})
+    result.update({
+        "action": physical_action,
+        "recommend": physical_action,
+        "internal_action": physical_action,
+        "internal_recommend": physical_action,
+        "next_round_direction": physical_action,
+        "action_text": "莊" if physical_action == "B" else "閒",
+        "recommend_text": "莊" if physical_action == "B" else "閒",
+        "next_round_direction_text": "莊" if physical_action == "B" else "閒",
+        "signal_allowed": True,
+        "risk_gate_open": True,
+        "direction_source": "trusted_exact_ev_with_strategy_bandit",
+        "selected_expected_return": physical_ev,
+        "selected_expected_return_percent": physical_ev * 100.0,
+        "kelly_fraction": final_kelly,
+        "kelly_percentage_applied": final_kelly * 100.0,
+        "recommended_bet_percentage": final_kelly * 100.0,
+        "bet_percentage": final_kelly * 100.0,
+        "suggested_bet_amount": max(0.0, float(bankroll or 0.0)) * final_kelly,
+        "bankroll": max(0.0, float(bankroll or 0.0)),
+        "strategy_weights": {
+            "physical_weight": float(profile.get("physical_weight", 1.0) or 1.0),
+            "road_weight": float(profile.get("road_weight", 0.0) or 0.0),
+            "road_direction": road_direction,
+            "road_strength": road_strength,
+            "kelly_multiplier": multiplier,
+        },
+        "strategy_required_ev": required_ev,
+        "kelly_cap_enforced": True,
+        "banker_rate": round(float(probabilities.get("B", 0.0) or 0.0) * 100.0, 4),
+        "player_rate": round(float(probabilities.get("P", 0.0) or 0.0) * 100.0, 4),
+        "tie_rate": round(float(probabilities.get("T", 0.0) or 0.0) * 100.0, 4),
+        "signal_reason": (
+            f"{profile.get('label', arm)}：精確不放回 EV {physical_ev:.3%}；{road_note}"
+        ),
+    })
+    result["reason"] = result["signal_reason"]
+    result["decision_validation"] = {
+        "active": True,
+        "mode": "strategy_bandit_physical_ev_gate",
+        "selected_strategy_arm": arm,
+        "trusted_exact_counts": True,
+        "physical_action": physical_action,
+        "physical_ev": physical_ev,
+        "required_ev": required_ev,
+        "base_kelly": base_kelly,
+        "final_kelly": final_kelly,
+        "max_bet_fraction": float(MAX_BET_FRACTION),
+        "road_note": road_note,
+    }
+    return result
+
+
+__all__ = ["apply_strategy_decision", "apply_validated_decision"]

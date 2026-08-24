@@ -14,9 +14,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
 from adaptive_ensemble import adapt_prediction
-from contextual_bandit import predict_bandit
+from contextual_bandit import predict_bandit, select_decision_strategy
 from particle_filter_points import counts_from_shoe, deal_ordered_hand
-from validated_decision_layer import apply_validated_decision
+from shoe_composition import analyze_shoe_composition, validate_remaining_counts
+from validated_decision_layer import apply_strategy_decision, apply_validated_decision
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
@@ -76,6 +77,44 @@ def _fallback_direction(prediction: Mapping[str, Any]) -> str:
     banker = float(prediction.get("banker_rate", 0.0) or 0.0)
     player = float(prediction.get("player_rate", 0.0) or 0.0)
     return "B" if banker >= player else "P"
+
+
+def _trusted_physical_signal(
+    shoe_context: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """只接受 10 維精確剩餘點數計數作正式 EV 輸入。
+
+    ``observed_cards``、OCR 的剩餘總張數或 B/P/T 路單都無法證明每種點數
+    各剩多少張，因此不會被誤升格為可信算牌來源。虛擬牌靴或使用者明確
+    輸入並通過驗證的 ``remaining_counts`` 才能開啟這條資金決策管線。
+    """
+    context = dict(shoe_context or {})
+    raw_counts = context.get("remaining_counts")
+    if not isinstance(raw_counts, (list, tuple)) or len(raw_counts) != 10:
+        signal = analyze_shoe_composition(None)
+        signal["trusted_exact_counts"] = False
+        signal["trust_reason"] = "missing_exact_remaining_counts"
+        return signal
+    try:
+        decks = int(context.get("decks", 8) or 8)
+        counts = validate_remaining_counts(raw_counts, decks=decks)
+    except (TypeError, ValueError) as exc:
+        signal = analyze_shoe_composition(None)
+        signal.update({
+            "trusted_exact_counts": False,
+            "trust_reason": "invalid_exact_remaining_counts",
+            "reason": str(exc),
+        })
+        return signal
+    trusted_context = {
+        "remaining_counts": list(counts),
+        "decks": decks,
+        "source": str(context.get("source") or "user_exact_remaining_counts"),
+    }
+    signal = analyze_shoe_composition(trusted_context)
+    signal["trusted_exact_counts"] = bool(signal.get("available"))
+    signal["trust_reason"] = "validated_10_value_remaining_counts"
+    return signal
 
 
 def _short_term_trend_prior(
@@ -420,7 +459,7 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             shoe_id: str = "", user_id: str = "", run_seed: Optional[int] = None,
             shoe_context: Optional[Mapping[str, Any]] = None,
             road_context: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """統一預測 API；保留舊參數名稱以相容 app.py。"""
+    """統一預測 API：物理 EV 決策，牌路 cMAB 選擇決策策略。"""
     if history is None:
         history_values: List[Any] = []
     elif isinstance(history, str):
@@ -441,10 +480,28 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         user_id=bandit_learning_user_id,
         run_seed=run_seed,
     )
-    # 正式決策單一路徑：任何後段診斷模組均不得寫入這些方向欄位。
-    # 因此 action/recommend/selected_arm/next_round_direction 與 cMAB
-    # predict_bandit() 的原始輸出逐欄保留，不做二次融合或覆寫。
-    result["decision_pipeline"] = "contextual_bandit_direct"
+    # B/P cMAB 原始選擇只保留作可稽核的牌路診斷。正式下注的資格、方向
+    # 與基礎 Kelly 由可信 exact remaining counts 的不放回 EV 決定。
+    result["bandit_diagnostic_direction"] = _fallback_direction(result)
+    result["bandit_diagnostic_selected_arm"] = str(result.get("selected_arm") or "")
+    result["road_context"] = dict(road_context or {})
+    physical_signal = _trusted_physical_signal(shoe_context)
+    strategy_selection = select_decision_strategy(
+        cleaned,
+        road_context=dict(road_context or {}),
+        physical_signal=physical_signal,
+        venue=venue,
+        room=room,
+        user_id=bandit_learning_user_id,
+    )
+    result["physical_signal"] = physical_signal
+    result["decision_strategy_bandit"] = strategy_selection
+    result = apply_strategy_decision(
+        result,
+        strategy_selection=strategy_selection,
+        bankroll=float(dict(shoe_context or {}).get("bankroll", 0.0) or 0.0),
+    )
+    result["decision_pipeline"] = "trusted_exact_ev -> strategy_linucb -> capped_kelly"
     result["direction_overwrite_disabled"] = True
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
@@ -456,6 +513,11 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
             str(venue or "").upper().strip(),
             str(room or "").strip(),
             str(shoe_id or "__unspecified_shoe__").strip(),
+            sha256(
+                ",".join(str(value) for value in list(
+                    physical_signal.get("remaining_counts") or []
+                )).encode("utf-8")
+            ).hexdigest()[:12],
         )).encode("utf-8")
     ).hexdigest()[:24]
     result.update({
@@ -464,13 +526,17 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "bandit_scope_mode": "user_venue_room_long_term",
         "bandit_shoe_isolated": False,
         "shoe_event_isolated": True,
-        "composition_quality": "not_applicable_cmab",
-        "remaining_counts_source": "not_used",
-        "shoe_context_ignored": bool(shoe_context),
+        "composition_quality": (
+            "trusted_exact_remaining_counts"
+            if physical_signal.get("trusted_exact_counts")
+            else "unavailable_or_untrusted"
+        ),
+        "remaining_counts_source": str(physical_signal.get("source") or "not_used"),
+        "shoe_context_ignored": False,
         "road_quality_ok": bool(dict(road_context or {}).get(
             "quality_ok", dict(road_context or {}).get("recognition_quality_ok", True)
         )),
-        "input_required": False,
+        "input_required": not bool(physical_signal.get("trusted_exact_counts")),
     })
     return result
 
@@ -489,6 +555,12 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         shoe_id=str(session.get("shoe_id") or ""),
         user_id=str(session.get("user_id") or ""),
         run_seed=seed,
+        shoe_context={
+            "remaining_counts": counts_from_shoe(hidden_shoe),
+            "decks": int(session.get("decks", 8) or 8),
+            "source": "virtual_exact_remaining_counts",
+            "bankroll": float(session.get("bankroll", 0.0) or 0.0),
+        },
         road_context=None,
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)

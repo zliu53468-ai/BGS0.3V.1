@@ -17,7 +17,8 @@ import math
 import secrets
 import time
 
-from contextual_bandit import update_bandit
+from contextual_bandit import update_bandit, update_decision_strategy
+from shoe_composition import BANKER_COMMISSION, MAX_BET_FRACTION
 
 BASE_DIR = Path(__file__).resolve().parent
 _LOCK = RLock()
@@ -69,6 +70,22 @@ def _normalize_probabilities(values: Mapping[str, Any]) -> Dict[str, float]:
     raw = {key: max(1e-12, float(values.get(key, 0.0) or 0.0)) for key in _OUTCOMES}
     total = sum(raw.values()) or 1.0
     return {key: raw[key] / total for key in _OUTCOMES}
+
+
+def _strategy_actual_profit(record: Mapping[str, Any], actual: str) -> float:
+    """依預測當時已鎖定的 Kelly 注碼計算真實單位損益。
+
+    和局對莊／閒注為 push；沒有通過物理閘門的 O 不會虛構一筆輸贏。
+    """
+    action = str(record.get("action") or record.get("recommend") or "O").upper()
+    if action not in {"B", "P"} or actual not in {"B", "P"}:
+        return 0.0
+    bankroll = max(0.0, float(record.get("bankroll", 0.0) or 0.0))
+    kelly = max(0.0, min(float(MAX_BET_FRACTION), float(record.get("kelly_fraction", 0.0) or 0.0)))
+    stake = bankroll * kelly
+    if actual != action:
+        return -stake
+    return stake * (1.0 - float(BANKER_COMMISSION)) if action == "B" else stake
 
 
 def _prune_guards_unlocked(data: Dict[str, Any]) -> None:
@@ -189,6 +206,31 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "decision_validation": dict(
             prediction.get("decision_validation") or {}
         ),
+        # 策略 Bandit 的 Context 與 Arm 和 B/P 診斷 cMAB 分開保存；前者
+        # 以實際 Kelly 損益更新，後者仍可保留既有牌路方向的研究紀錄。
+        "decision_strategy_arm": str(
+            dict(prediction.get("decision_strategy_bandit") or {}).get(
+                "selected_arm", prediction.get("decision_strategy", "")
+            )
+            or ""
+        ),
+        "decision_strategy_context": list(
+            dict(prediction.get("decision_strategy_bandit") or {}).get(
+                "context", []
+            )
+            or []
+        ),
+        "decision_strategy_selection": dict(
+            prediction.get("decision_strategy_bandit") or {}
+        ),
+        "bankroll": max(0.0, float(prediction.get("bankroll", 0.0) or 0.0)),
+        "kelly_fraction": max(0.0, float(prediction.get("kelly_fraction", 0.0) or 0.0)),
+        "recommended_bet_percentage": max(
+            0.0, float(prediction.get("recommended_bet_percentage", 0.0) or 0.0)
+        ),
+        "selected_expected_return": float(
+            prediction.get("selected_expected_return", 0.0) or 0.0
+        ),
         "component_probabilities": dict(
             prediction.get("component_probabilities")
             or dict(prediction.get("road_support") or {}).get(
@@ -205,6 +247,8 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "actual_outcome": "",
         "reward": None,
         "bandit_update": {},
+        "strategy_bandit_update": {},
+        "actual_profit": None,
     }
     with _LOCK:
         data = _read_unlocked()
@@ -306,10 +350,32 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         else:
             bandit_update = {"updated": False, "reason": "missing_context_or_arm", "actual_outcome": actual}
 
+        strategy_arm = str(target.get("decision_strategy_arm") or "").strip()
+        strategy_context = list(target.get("decision_strategy_context") or [])
+        actual_profit = _strategy_actual_profit(target, actual)
+        if strategy_arm and strategy_context:
+            strategy_bandit_update = update_decision_strategy(
+                context=strategy_context,
+                selected_arm=strategy_arm,
+                actual_profit=actual_profit,
+                bankroll=float(target.get("bankroll", 0.0) or 0.0),
+                event_id=str(target.get("prediction_id") or ""),
+                venue=str(target.get("venue") or venue or ""),
+                room=str(target.get("room") or room or ""),
+                user_id=str(target.get("bandit_learning_user_id") or user_id),
+            )
+        else:
+            strategy_bandit_update = {
+                "updated": False,
+                "reason": "missing_strategy_context_or_arm",
+            }
+
         target["actual_outcome"] = actual
         target["resolved_at"] = _now()
         target["reward"] = reward
         target["bandit_update"] = bandit_update
+        target["strategy_bandit_update"] = strategy_bandit_update
+        target["actual_profit"] = actual_profit
         target["bp_timeline_advanced"] = actual in {"B", "P"}
         target["tie_skipped_for_structural_learning"] = actual == "T"
         target["applied_update_weight"] = (

@@ -38,6 +38,7 @@ from predictor import run_virtual_round
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 from room_ocr import preload_ocr
+from shoe_composition import validate_remaining_counts
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -169,6 +170,12 @@ class RoomRequest(UserRequest):
 class ShoeCardsRequest(UserRequest):
     cards: List[Any] = Field(default_factory=list, max_length=832)
     replace: bool = True
+
+
+class ExactRemainingCountsRequest(UserRequest):
+    """使用者明確輸入的點數 0..9 剩餘張數；不是 OCR 猜測值。"""
+    remaining_counts: List[Any] = Field(default_factory=list)
+    decks: int = Field(default=8, ge=1, le=16)
 
 
 class LiffSessionStartRequest(VenueRequest):
@@ -454,9 +461,27 @@ def _attach_bankroll_advice(
     prediction: Mapping[str, Any],
     session: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """保留本金欄位相容性，但不把牌路方向分數偽裝成 EV／Kelly 注碼。"""
+    """補齊本金金額；只有已通過物理 EV 閘門才保留 Kelly 結果。"""
     result = dict(prediction or {})
     bankroll = max(0, int(session.get("bankroll", 0) or 0))
+    physical = dict(result.get("physical_signal") or {})
+    physical_ready = bool(
+        physical.get("trusted_exact_counts")
+        and result.get("risk_gate_open")
+        and str(result.get("action") or "").upper() in {"B", "P"}
+    )
+    if physical_ready:
+        fraction = max(0.0, float(result.get("kelly_fraction", 0.0) or 0.0))
+        amount = bankroll * fraction
+        result.update({
+            "bankroll": bankroll,
+            "suggested_bet_amount": amount,
+            "bet_percentage": fraction * 100.0,
+            "bet_level_text": "精確 EV／Kelly 上限內",
+            "bet_reason": str(result.get("signal_reason") or "精確牌組 EV 已通過風控"),
+            "screen_edge": round(float(result.get("selected_expected_return", 0.0) or 0.0), 6),
+        })
+        return result
     edge = float(result.get("direction_edge", 0.0) or 0.0)
     signal_reason = str(result.get("signal_reason") or "模型正在等待更明確的方向差距")
 
@@ -481,6 +506,21 @@ def _attach_bankroll_advice(
         }
     )
     return result
+
+
+def _exact_shoe_context(session: Mapping[str, Any]) -> Dict[str, Any]:
+    """由 Session 取回已驗證的 counts；不採信截圖的剩餘總張數。"""
+    context: Dict[str, Any] = {
+        "bankroll": max(0.0, float(session.get("bankroll", 0.0) or 0.0)),
+    }
+    counts = session.get("exact_remaining_counts")
+    if isinstance(counts, list) and len(counts) == 10:
+        context.update({
+            "remaining_counts": list(counts),
+            "decks": int(session.get("exact_remaining_decks", 8) or 8),
+            "source": "user_exact_remaining_counts",
+        })
+    return context
 
 
 def _road_quick_reply() -> Dict[str, Any]:
@@ -1316,6 +1356,16 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
     bet_level = str(prediction.get("bet_level_text") or "標準區間")
+    strategy_bandit = dict(prediction.get("decision_strategy_bandit") or {})
+    strategy_profile = dict(strategy_bandit.get("profile") or {})
+    physical_signal = dict(prediction.get("physical_signal") or {})
+    strategy_text = str(
+        strategy_profile.get("label")
+        or prediction.get("decision_strategy")
+        or "尚未選擇"
+    )
+    physical_source = str(physical_signal.get("source") or "未提供精確牌組")
+    physical_ev = float(prediction.get("selected_expected_return", 0.0) or 0.0)
     bet_text = (
         f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）"
         if suggested > 0
@@ -1401,9 +1451,11 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                                 f"模型信心：{quality_score * 100.0:.1f}%（{confidence_label}）\n"
                                 f"模型一致度：{consistency:.1f}%\n"
                                 f"牌路診斷：{road_direction}\n"
-                                "資料來源：完整 B/P/T 牌路與路圖 Context\n"
-                                "方向分數：牌路模型傾向，非物理開出機率\n"
-                                "自動配置：未啟用 EV／Kelly"
+                                f"策略 Bandit：{strategy_text}\n"
+                                f"精確牌組來源：{physical_source}\n"
+                                f"抽水後 EV：{physical_ev:.3%}\n"
+                                "安全規則：牌路只確認／縮倉，不可取代精確 EV\n"
+                                "注碼限制：Kelly Fraction 與 MAX_BET_FRACTION 硬上限"
                             ),
                             "wrap": True,
                             "margin": "md",
@@ -1667,6 +1719,7 @@ def _refresh_screen_prediction(
                 # value 是本次按鈕剛新增的真實結果；明確傳入才允許 cMAB
                 # 結算上一筆 pending prediction，避免重複按預測自我回灌。
                 latest_actual_outcome=value,
+                shoe_context=_exact_shoe_context(session),
             )
         finally:
             if prediction_slot_acquired:
@@ -1876,6 +1929,7 @@ def _process_screen_image_sync(
             initial_grid_cells=grid_cells,
             initial_image_history=raw_outcomes,
             manual_outcome_history=[],
+            shoe_context=_exact_shoe_context(current_session),
         )
 
         model_ms = (time.perf_counter() - model_started) * 1000.0
@@ -2274,6 +2328,9 @@ def api_session_start(payload: LiffSessionStartRequest) -> JSONResponse:
                 "status": "輸入中",
                 "analysis_active": True,
                 "awaiting_screenshot": False,
+                # 新靴不可沿用前靴的精確組成；避免舊 counts 造成假 EV。
+                "exact_remaining_counts": [],
+                "exact_remaining_updated_at": 0,
             },
         )
         return JSONResponse({"ok": True, "session": _public_session(session)})
@@ -2311,6 +2368,10 @@ def api_round_undo(payload: UserRequest) -> JSONResponse:
 @app.post("/api/session/reset")
 def api_session_reset(payload: UserRequest) -> JSONResponse:
     session = store.clear_screen_analysis(payload.user_id, keep_mode=True)
+    session = store.upsert_session(
+        payload.user_id,
+        {"exact_remaining_counts": [], "exact_remaining_updated_at": 0},
+    )
     return JSONResponse({"ok": True, "session": _public_session(session)})
 
 
@@ -2351,6 +2412,30 @@ def api_shoe_cards(payload: ShoeCardsRequest) -> JSONResponse:
             payload.user_id,
             payload.cards,
             replace=bool(payload.replace),
+        )
+        return JSONResponse({"ok": True, "session": _public_session(session)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/shoe/exact-counts")
+def api_exact_remaining_counts(payload: ExactRemainingCountsRequest) -> JSONResponse:
+    """儲存可信的 0..9 精確剩餘張數，供下一次預測使用。
+
+    這個端點刻意不接受 OCR 產出的「剩餘總張數」：它不足以做不放回 EV。
+    """
+    try:
+        counts = validate_remaining_counts(
+            payload.remaining_counts,
+            decks=int(payload.decks),
+        )
+        session = store.upsert_session(
+            payload.user_id,
+            {
+                "exact_remaining_counts": list(counts),
+                "exact_remaining_decks": int(payload.decks),
+                "exact_remaining_updated_at": int(time.time()),
+            },
         )
         return JSONResponse({"ok": True, "session": _public_session(session)})
     except ValueError as exc:
@@ -2398,6 +2483,7 @@ async def api_predict(payload: UserRequest) -> JSONResponse:
                     previous_screen_prediction.get("prediction_id") or ""
                 ),
                 latest_actual_outcome=latest_actual_outcome,
+                shoe_context=_exact_shoe_context(session),
             )
             prediction = _attach_bankroll_advice(prediction, session)
             updated = store.upsert_session(
