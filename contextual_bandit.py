@@ -41,7 +41,7 @@ import numpy as np
 from road_model import build_road_context
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V3.0-OUTCOME-ONLY-PREQUENTIAL"
+MODEL_VERSION = "CMAB-LINUCB-V3.1-REGIME-STABLE-PREQUENTIAL"
 STATE_SCHEMA_VERSION = "CMAB-EPISODE-REPLAY-V4"
 COMPATIBLE_STATE_SCHEMA_VERSIONS = {
     "CMAB-UID-ISOLATED-V1",
@@ -95,10 +95,21 @@ CMAB_MIN_SIGNAL_UPDATES = 6
 CMAB_FORGETTING_FACTOR = 0.985
 CMAB_REVERSAL_FORGETTING_FACTOR = 0.970
 CMAB_STABLE_FORGETTING_FACTOR = 0.992
-CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = 0.960
-CMAB_PHASE_SOFT_RESET_MAX = 0.06
-CMAB_PHASE_DISTANCE_THRESHOLD = 0.28
+CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = 0.935
+CMAB_PHASE_SOFT_RESET_MAX = 0.10
+CMAB_PHASE_DISTANCE_THRESHOLD = 0.24
 CMAB_RECENT_ACCURACY_WINDOW = 20
+
+# 35 維中有幾組是同一條牌路現象的不同投影。例如 recent5 balance、
+# streak 與 road planning 都可能同時對一條長龍作出同方向反應。LinUCB 在
+# 一靴僅數十筆資料時，會把這類共線特徵誤當成多份獨立證據。以下係數不
+# 改變任何對外特徵名稱或維度，只在進矩陣前把同群訊號的總能量收斂。
+CMAB_CONTEXT_GROUP_SCALES = {
+    "balance": 0.82,
+    "recent_direction": 0.78,
+    "road_probability": 0.72,
+    "derived_road": 0.78,
+}
 
 # Full-information 下兩個 Arm 的不確定性項是對稱的，Alpha 僅保留為
 # 診斷／分數平滑用途，不能再因長龍把方向硬鎖死。
@@ -323,6 +334,41 @@ def _model_probability(road_context: Mapping[str, Any], model_name: str, fallbac
         return fallback
 
 
+def _stabilize_context_vector(values: Sequence[float]) -> List[float]:
+    """在不改變 35 維接口下抑制共線牌路證據。
+
+    不刪除任何牌路資料，也不直接改寫 B/P；只是避免同一條長龍同時由
+    近期比例、上一局、長龍與 road probability 多次放大成獨立證據。
+    """
+    vector = [float(value) for value in values]
+    index = {name: position for position, name in enumerate(FEATURE_NAMES)}
+    groups = {
+        "balance": (
+            "global_banker_balance", "recent5_banker_balance",
+            "recent10_banker_balance", "recent20_banker_balance",
+            "recent40_banker_balance", "recent3_banker_balance",
+        ),
+        "recent_direction": (
+            "current_streak_direction", "current_streak_length",
+            "last_outcome_direction", "previous_outcome_direction",
+            "long_dragon_tail_pressure", "single_jump_onset",
+        ),
+        "road_probability": (
+            "road_planning_balance", "road_recent_balance",
+            "markov1_balance", "markov2_balance", "markov3_balance",
+        ),
+        "derived_road": (
+            "big_eye_saturation", "small_road_saturation",
+            "cockroach_road_saturation", "derived_road_consensus",
+        ),
+    }
+    for group_name, feature_names in groups.items():
+        scale = float(CMAB_CONTEXT_GROUP_SCALES[group_name])
+        for name in feature_names:
+            vector[index[name]] *= scale
+    return [round(_clip(value), 10) for value in vector]
+
+
 def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None) -> List[float]:
     """建立固定上下文；B/P 規律特徵不讓和局推進時間軸。"""
     raw = _clean_history(history)
@@ -387,7 +433,7 @@ def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mappi
     ]
     if len(vector) != CONTEXT_DIM:
         raise RuntimeError(f"CMAB context dimension mismatch: {len(vector)} != {CONTEXT_DIM}")
-    return [round(_clip(value), 10) for value in vector]
+    return _stabilize_context_vector(vector)
 
 
 def _uid_key(user_id: str) -> str:
@@ -1179,9 +1225,12 @@ def _continuous_forgetting_factor(
     entropy_pressure = _clip((entropy - 0.72) / 0.28, 0.0, 1.0)
     reversal_pressure = max(0.0, min(1.0, abs(float(reversal_signal))))
     phase_pressure = _clip((phase_strength - 0.70) / 0.30, 0.0, 1.0)
-    entropy_component = 0.55 * entropy_pressure
-    reversal_component = 0.30 * reversal_pressure
-    phase_component = 0.15 * phase_pressure
+    # 相變是「原本學到的路型」最可能失效的證據，因此比單純高熵更重要。
+    # 這使真正的斷龍／跳路切換可更快遺忘，但白噪音的一次抖動不會單獨
+    # 清空歷史。三項總和剛好為 1，維持 factor 的可解釋性。
+    entropy_component = 0.25 * entropy_pressure
+    reversal_component = 0.35 * reversal_pressure
+    phase_component = 0.40 * phase_pressure
     instability = entropy_component + reversal_component + phase_component
     instability = _clip(instability, 0.0, 1.0)
     stable = max(CMAB_STABLE_FORGETTING_FACTOR, CMAB_MIN_DYNAMIC_FORGETTING_FACTOR)
