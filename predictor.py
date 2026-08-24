@@ -28,6 +28,11 @@ DB_HOLDOUT: Dict[str, Any] = {
 SHADOW_REQUIRED_CONSECUTIVE_HITS = 2
 SHADOW_MAX_STREAMS = 2048
 
+# 測試期間固定使用 cMAB 原始 B/P Arm，避免「沒有精確牌組／EV」時被
+# 資金風控層改寫成 O。此模式只用於紀錄方向命中率；下注欄位一律維持 0，
+# 不能把牌路方向分數當成已通過 EV 的正式下注訊號。
+FORCE_BANDIT_DIRECTION_FOR_TESTING = True
+
 
 def _bandit_learning_scope(
     *,
@@ -77,6 +82,47 @@ def _fallback_direction(prediction: Mapping[str, Any]) -> str:
     banker = float(prediction.get("banker_rate", 0.0) or 0.0)
     player = float(prediction.get("player_rate", 0.0) or 0.0)
     return "B" if banker >= player else "P"
+
+
+def _apply_forced_test_direction(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """讓測試面板每局固定呈現 cMAB 原始 B/P，並鎖住所有下注欄位。
+
+    ``apply_strategy_decision`` 仍會先執行，以保留既有資料結構與策略
+    稽核資訊；但測試模式不讓它的 No Bet 動作覆寫方向。實際回報結果時，
+    performance_tracker 仍可用這個 B/P 方向更新原本的 Contextual Bandit。
+    """
+    output = dict(result or {})
+    direction = str(output.get("bandit_diagnostic_direction") or "").upper()
+    if direction not in {"B", "P"}:
+        direction = _fallback_direction(output)
+    direction_text = "莊" if direction == "B" else "閒"
+    reason = "測試模式：固定採用 Contextual Bandit 原始 B/P 方向；不代表 EV 或下注建議。"
+    output.update({
+        "action": direction,
+        "recommend": direction,
+        "internal_action": direction,
+        "internal_recommend": direction,
+        "next_round_direction": direction,
+        "action_text": direction_text,
+        "recommend_text": direction_text,
+        "next_round_direction_text": direction_text,
+        "direction_source": "contextual_bandit_raw_test_mode",
+        "signal_allowed": False,
+        "risk_gate_open": False,
+        "test_mode": True,
+        "test_mode_name": "forced_contextual_bandit_direction",
+        "signal_status_code": "TEST_DIRECTION_ONLY",
+        "signal_status_text": "測試模式：已輸出 cMAB 原始方向，未啟用下注。",
+        "signal_reason": reason,
+        "internal_signal_reason": reason,
+        "recommended_bet_percentage": 0.0,
+        "bet_percentage": 0.0,
+        "kelly_fraction": 0.0,
+        "kelly_percentage_applied": 0.0,
+        "suggested_bet_amount": 0.0,
+        "bet_level_text": "測試模式／不配置",
+    })
+    return output
 
 
 def _trusted_physical_signal(
@@ -501,8 +547,13 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         strategy_selection=strategy_selection,
         bankroll=float(dict(shoe_context or {}).get("bankroll", 0.0) or 0.0),
     )
-    result["decision_pipeline"] = "trusted_exact_ev -> strategy_linucb -> capped_kelly"
-    result["direction_overwrite_disabled"] = True
+    if FORCE_BANDIT_DIRECTION_FOR_TESTING:
+        result = _apply_forced_test_direction(result)
+        result["decision_pipeline"] = "contextual_bandit_raw_direction_test_only"
+        result["direction_overwrite_disabled"] = False
+    else:
+        result["decision_pipeline"] = "trusted_exact_ev -> strategy_linucb -> capped_kelly"
+        result["direction_overwrite_disabled"] = True
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
     ).strip()
