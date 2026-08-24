@@ -8,31 +8,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import math
-import os
-
 import numpy as np
 
-
-def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(str(os.getenv(name, default)).strip())
-    except Exception:
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
-    try:
-        value = float(str(os.getenv(name, default)).strip())
-    except Exception:
-        value = default
-    return max(minimum, min(maximum, value))
-
-
-ROAD_PLAN_MIN_PREFIX = _env_int("ROAD_PLAN_MIN_PREFIX", 10, 6, 40)
-ROAD_PLAN_NEIGHBORS = _env_int("ROAD_PLAN_NEIGHBORS", 32, 8, 120)
-ROAD_PLAN_LOOKBACK = _env_int("ROAD_PLAN_LOOKBACK", 500, 36, 2000)
-ROAD_PLAN_SIMILARITY_SCALE = _env_float("ROAD_PLAN_SIMILARITY_SCALE", 4.0, 1.0, 12.0)
+# 全盤規劃參數固定於程式碼。舊的 ROAD_PLAN_* Render 環境變數不再參與，
+# 避免不同部署把同一張截圖裁成不同的歷史深度或相似度尺度。
+ROAD_PLAN_MIN_PREFIX = 10
+ROAD_PLAN_NEIGHBORS = 32
+ROAD_PLAN_LOOKBACK = 500
+ROAD_PLAN_SIMILARITY_SCALE = 4.0
+FULL_SHOE_MIN_HISTORY = 12
 
 
 def _clean(values: Iterable[Any]) -> List[str]:
@@ -261,6 +245,99 @@ def _distance(left: np.ndarray, right: np.ndarray) -> float:
     return float(math.sqrt(np.sum(weights * np.square(difference)) / np.sum(weights)))
 
 
+def _phase_profile(state: Mapping[str, Any]) -> np.ndarray:
+    """取出不依賴最後一顆顏色的全盤相位輪廓。
+
+    這個向量刻意使用整副路紙的早／中／後段轉換率、龍長分布、大路欄高與
+    下三路連續性；它描述的是「目前是哪種盤」，不是直接用莊／閒總數猜邊。
+    因此可用完整截圖歷史找出過去真正相似的 *盤面狀態*，再讀取該歷史狀態
+    的下一局結果，保持 walk-forward 而不偷看未來。
+    """
+    histogram = list(state.get("run_histogram") or [])
+    histogram = ([0.0] * 4 + histogram)[-4:]
+    derived = state.get("derived_stats")
+    derived = dict(derived) if isinstance(derived, Mapping) else {}
+
+    def _derived_value(name: str, key: str) -> float:
+        item = derived.get(name)
+        item = dict(item) if isinstance(item, Mapping) else {}
+        return max(0.0, min(1.0, float(item.get(key, 0.5) or 0.5)))
+
+    return np.asarray([
+        max(0.0, min(1.0, float(state.get("alternation_rate", 0.5) or 0.5))),
+        max(0.0, min(1.0, float(state.get("early_alternation_rate", 0.5) or 0.5))),
+        max(0.0, min(1.0, float(state.get("middle_alternation_rate", 0.5) or 0.5))),
+        max(0.0, min(1.0, float(state.get("late_alternation_rate", 0.5) or 0.5))),
+        max(0.0, min(1.0, float(state.get("equal_foot_rate", 0.0) or 0.0))),
+        max(0.0, min(1.0, float(state.get("recent_equal_foot_rate", 0.0) or 0.0))),
+        *[max(0.0, min(1.0, float(value or 0.0))) for value in histogram],
+        _derived_value("big_eye", "continuation"),
+        _derived_value("small_road", "continuation"),
+        _derived_value("cockroach_road", "continuation"),
+        _derived_value("big_eye", "recent_continuation"),
+        _derived_value("small_road", "recent_continuation"),
+        _derived_value("cockroach_road", "recent_continuation"),
+    ], dtype=np.float64)
+
+
+def _phase_similarity(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    """衡量兩個完整牌靴相位是否相近，範圍固定為 0～1。"""
+    left_profile = _phase_profile(left)
+    right_profile = _phase_profile(right)
+    difference = float(np.sqrt(np.mean(np.square(left_profile - right_profile))))
+    return float(math.exp(-4.5 * difference))
+
+
+def _whole_shoe_regime(state: Mapping[str, Any], sample_count: int) -> Dict[str, Any]:
+    """由整副已開歷史判定路型相位與長程證據強度。
+
+    這裡不根據 B/P 的累計數量直接選邊；它只量化全盤是否長期穩定、是否
+    正在轉折、或是否屬於交替盤，供 Adaptive Ensemble 決定應該信任全盤
+    規劃、結構元件或近期元件多少。
+    """
+    early = float(state.get("early_alternation_rate", 0.5) or 0.5)
+    middle = float(state.get("middle_alternation_rate", 0.5) or 0.5)
+    late = float(state.get("late_alternation_rate", 0.5) or 0.5)
+    overall = float(state.get("alternation_rate", 0.5) or 0.5)
+    current_run = int(state.get("current_run", 0) or 0)
+    run_variance = float(state.get("run_variance", 0.0) or 0.0)
+    equal_foot = float(state.get("equal_foot_rate", 0.0) or 0.0)
+
+    segment_spread = max(early, middle, late) - min(early, middle, late)
+    late_drift = abs(late - (early + middle) / 2.0)
+    stable = max(0.0, 1.0 - min(1.0, segment_spread / 0.34))
+    maturity = min(1.0, sample_count / 60.0)
+    evidence = max(
+        0.16,
+        min(0.86, 0.18 + 0.34 * maturity + 0.30 * stable + 0.18 * equal_foot),
+    )
+
+    if late >= 0.67:
+        label = "whole_shoe_alternating"
+    elif late <= 0.33 and current_run >= 2:
+        label = "whole_shoe_trend"
+    elif late_drift >= 0.18:
+        label = "whole_shoe_transition"
+        evidence *= 0.78
+    elif abs(overall - 0.50) >= 0.10:
+        label = "whole_shoe_structured"
+    else:
+        label = "whole_shoe_mixed"
+        evidence *= 0.86
+
+    return {
+        "label": label,
+        "sample_count": int(sample_count),
+        "maturity": float(maturity),
+        "evidence": float(max(0.10, min(0.86, evidence))),
+        "segment_spread": float(segment_spread),
+        "late_drift": float(late_drift),
+        "stable": float(stable),
+        "long_horizon_ready": bool(sample_count >= FULL_SHOE_MIN_HISTORY),
+        "uses_entire_current_shoe": True,
+    }
+
+
 def _run_suffix_probability(sequence: Sequence[str]) -> Dict[str, Any]:
     """比較完整歷史中相同龍長尾段，標籤為下一顆續龍或轉折。"""
     target_runs = [length for _, length in _runs(sequence)]
@@ -315,13 +392,19 @@ def analyze_road_planning(
     sample_count = len(sequence)
     current = _state(sequence)
     last_side = sequence[-1] if sequence else ""
+    whole_shoe_regime = _whole_shoe_regime(current, sample_count)
 
     candidates: List[Tuple[float, int, bool, str]] = []
     for index in range(ROAD_PLAN_MIN_PREFIX, sample_count):
         prefix = sequence[:index]
         past = _state(prefix)
-        distance = _distance(current["vector"], past["vector"])
-        similarity = math.exp(-ROAD_PLAN_SIMILARITY_SCALE * distance)
+        # 先比較完整大路幾何與龍長特徵，再比較早／中／後段和下三路形成的
+        # 「整盤相位」。這樣每一個歷史候選都使用 prefix 當時的完整已知
+        # 資訊，且其標籤 sequence[index] 是當時真正的下一局，沒有洩漏。
+        shape_distance = _distance(current["vector"], past["vector"])
+        shape_similarity = math.exp(-ROAD_PLAN_SIMILARITY_SCALE * shape_distance)
+        phase_similarity = _phase_similarity(current, past)
+        similarity = 0.58 * shape_similarity + 0.42 * phase_similarity
         actual_next = sequence[index]
         continued = actual_next == prefix[-1]
         candidates.append((similarity, index, continued, actual_next))
@@ -370,22 +453,29 @@ def analyze_road_planning(
             + len(current["derived_roads"]["cockroach_road"])
         ) / 36.0,
     )
+    # 全盤路型不應因為「同形歷史樣本很少」就完全失效。整盤資料仍然提供
+    # 相位與下三路資訊，只是 reliability 會較低，而不是退回只看最後幾局。
+    whole_shoe_evidence = float(whole_shoe_regime["evidence"])
     reliability = min(
-        0.84,
-        maturity * (
-            0.28
-            + 0.30 * support_score
-            + 0.24 * mean_similarity
+        0.86,
+        0.62 * maturity * (
+            0.24
+            + 0.28 * support_score
+            + 0.22 * mean_similarity
             + 0.10 * suffix_reliability
             + 0.08 * derived_depth
-        ),
+            + 0.08 * whole_shoe_evidence
+        )
+        + 0.38 * whole_shoe_evidence,
     )
 
     direction = "B" if banker_probability >= 0.5 else "P"
     return {
         "ok": sample_count >= ROAD_PLAN_MIN_PREFIX,
-        "active": sample_count >= ROAD_PLAN_MIN_PREFIX and strong_support >= 2,
-        "engine": "FULL_ROAD_PLANNING_WALK_FORWARD_V10_8",
+        # 只要已累積足夠完整截圖歷史，就讓 Full Road 進入融合。相似樣本
+        # 少會反映在 reliability，不可以把整盤分析直接排除。
+        "active": sample_count >= FULL_SHOE_MIN_HISTORY,
+        "engine": "FULL_ROAD_PLANNING_WALK_FORWARD_V11_FULL_SHOE",
         "sample_count": sample_count,
         "full_history_used_count": sample_count,
         "support": strong_support,
@@ -411,6 +501,9 @@ def analyze_road_planning(
         "recent_equal_foot_rate": float(current["recent_equal_foot_rate"]),
         "run_variance": float(current["run_variance"]),
         "run_histogram": [float(value) for value in current["run_histogram"]],
+        "whole_shoe_regime": whole_shoe_regime,
+        "whole_shoe_evidence": whole_shoe_evidence,
+        "long_horizon_ready": bool(whole_shoe_regime["long_horizon_ready"]),
         "derived_roads": current["derived_roads"],
         "derived_stats": current["derived_stats"],
         "geometry": current["road"],

@@ -33,15 +33,21 @@ ADAPTIVE_PLURALITY_STRENGTH = 0.12
 ADAPTIVE_LOGIT_CAP = 2.20
 ADAPTIVE_SHOE_MIN_SAMPLES = 8
 
-# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。cMAB 是
-# 輔助訊號，最多佔總融合權重 15%，不再把它當作主輸出。
+# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。完整截圖
+# 歷史的 Full Road 是主幹；近期結構只做目前相位的確認。cMAB 是輔助
+# 訊號，最多佔總融合權重 12%，不再把它當作主輸出。
 ROAD_PRIMARY_COMPONENTS = (
     "structural_regime", "full_road", "short", "mid", "long", "pattern", "analogue",
 )
-FULL_ROAD_PRIMARY_MULTIPLIER = 1.25
-STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 2.60
-STRUCTURAL_RECENCY_REDUCTION = 0.55
-CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.15
+FULL_ROAD_PRIMARY_MULTIPLIER = 2.15
+FULL_ROAD_EVIDENCE_MULTIPLIER = 0.80
+FULL_ROAD_MIN_PRIMARY_SHARE = 0.38
+FULL_ROAD_EVIDENCE_SHARE_BONUS = 0.18
+STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 1.30
+STRUCTURAL_AGREES_WITH_FULL_MULTIPLIER = 1.35
+STRUCTURAL_CONFLICTS_WITH_FULL_MULTIPLIER = 0.42
+RECENT_CONFIRMATION_REDUCTION = 0.68
+CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.12
 
 
 def _normalize(values: Mapping[str, Any]) -> Dict[str, float]:
@@ -267,11 +273,11 @@ def _fusion_candidates(
     shoe_direction_performance: Mapping[str, Any],
     base_confidence: float,
 ) -> list[Dict[str, Any]]:
-    """建立「牌路主、cMAB 輔」的融合候選。
+    """建立「完整截圖歷史主、近期確認、cMAB 輔」的融合候選。
 
-    Full Road Pattern Model 的完整歷史結論與五個既有路子專家是唯一主要
-    成員。LinUCB 的輸出不再和它們同權競爭，只在主要路子已存在時以最多
-    15% 的權重協助處理 context 新穎度與模型衝突。
+    Full Road Pattern Model 使用截圖辨識出的所有 B/P/T 歷史建立整盤
+    相位，因此是唯一長程主幹。結構與短中長視窗只確認目前尾段是否仍在
+    延續全盤相位；若衝突，不允許單純「最後一顆」訊號反客為主。
     """
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
@@ -311,12 +317,17 @@ def _fusion_candidates(
             * (0.80 + 0.20 * edge)
         )
         if name == "full_road":
-            # 完整路圖是第一層產物，給予溫和優先權；不是硬鎖方向，仍需
-            # 接受其他近期牌路專家與 cMAB context 的交叉驗證。
-            weight *= FULL_ROAD_PRIMARY_MULTIPLIER
+            # 只要已有至少 12 個 B/P 結果，Full Road 就必須參與融合；它
+            # 的權重隨全盤相位證據提升，而不是只靠最後一段 run length。
+            whole_evidence = max(
+                0.0,
+                min(1.0, float(meta.get("whole_shoe_evidence", 0.0) or 0.0)),
+            )
+            weight *= (
+                FULL_ROAD_PRIMARY_MULTIPLIER
+                + FULL_ROAD_EVIDENCE_MULTIPLIER * whole_evidence
+            )
         elif name == "structural_regime":
-            # 已通過 run-length 確認的單跳／雙跳／跳跳龍，不能再被三個
-            # 「最後一顆權重較高」的近期比例模型平均回原方向。
             weight *= STRUCTURAL_REGIME_PRIMARY_MULTIPLIER
         support = int(meta.get("support", 0) or 0)
         raw_shoe_performance = shoe_direction_performance.get(name)
@@ -366,15 +377,53 @@ def _fusion_candidates(
             "role": "road_primary",
         })
 
-    # 結構元件一旦啟用，近期比例仍保留參考，但降低其合計影響力。這個
-    # 動作只對已確認結構生效；混合盤仍完全使用原本的多專家融合。
-    structural_active = any(
-        row["name"] == "structural_regime" for row in rows
-    )
-    if structural_active:
+    # 全盤模型啟用時，所有近期專家只能當確認者。結構路型和全盤方向一致
+    # 時可加權；方向矛盾時須大幅降權，防止剛出一顆就把全盤判讀推翻。
+    full_row = next((row for row in rows if row["name"] == "full_road"), None)
+    if full_row is not None:
+        full_direction = str(full_row.get("direction") or "")
         for row in rows:
-            if row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
-                row["weight"] = float(row["weight"]) * STRUCTURAL_RECENCY_REDUCTION
+            if row["name"] == "full_road":
+                continue
+            if row["name"] == "structural_regime":
+                multiplier = (
+                    STRUCTURAL_AGREES_WITH_FULL_MULTIPLIER
+                    if str(row.get("direction") or "") == full_direction
+                    else STRUCTURAL_CONFLICTS_WITH_FULL_MULTIPLIER
+                )
+                row["weight"] = float(row["weight"]) * multiplier
+            elif row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
+                row["weight"] = float(row["weight"]) * RECENT_CONFIRMATION_REDUCTION
+
+        # 「全盤」不能只是名字上的 primary。當完整截圖歷史已可用，保留
+        # Full Road 在主要牌路成員中的最低占比；全盤證據愈完整，最低占比
+        # 愈高。這不是硬鎖方向，仍會讓結構模型在相位一致時共同加分。
+        full_meta = metadata.get("full_road")
+        full_meta = dict(full_meta) if isinstance(full_meta, Mapping) else {}
+        whole_evidence = max(
+            0.0,
+            min(1.0, float(
+                full_meta.get(
+                    "whole_shoe_evidence", 0.0
+                ) or 0.0
+            )),
+        )
+        target_share = min(
+            0.56,
+            FULL_ROAD_MIN_PRIMARY_SHARE
+            + FULL_ROAD_EVIDENCE_SHARE_BONUS * whole_evidence,
+        )
+        other_weight = sum(
+            float(row["weight"])
+            for row in rows
+            if row is not full_row
+        )
+        required_full_weight = other_weight * target_share / max(
+            1e-12, 1.0 - target_share
+        )
+        full_row["weight"] = max(
+            float(full_row["weight"]), required_full_weight
+        )
 
     primary_weight = sum(float(row["weight"]) for row in rows)
     bandit_banker = _conditional_banker(base)
@@ -589,8 +638,8 @@ def _apply_plurality_decision(
         reason = "牌路專家完全抵消，依 Contextual Bandit 輔助方向強制輸出 B/P。"
     else:
         reason = (
-            "以 reliability／Brier 權重進行 logit pooling，"
-            "再以 plurality evidence 放大非零方向優勢。"
+            "先以完整截圖歷史 Full Road 的全盤相位作為主幹，再以近期結構"
+            "確認尾段；cMAB 僅以受限權重處理模型衝突。"
         )
 
     result.update({
@@ -631,7 +680,7 @@ def _apply_plurality_decision(
         result["component_champion"] = tiebreaker
     result["adaptive_ensemble"] = {
         "active": True,
-        "mode": "road_primary_adaptive_ensemble",
+        "mode": "full_screenshot_history_primary_adaptive_ensemble",
         "circuit_breaker_active": False,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
@@ -656,7 +705,12 @@ def _apply_plurality_decision(
         "final_action": direction,
         "bet_multiplier": 1.0,
         "road_primary": True,
-        "contextual_bandit_role": "auxiliary_max_15_percent",
+        "full_screenshot_history_primary": True,
+        "full_road_used_count": int(
+            dict((result.get("road_support") or {})).get("full_history_used_count", 0)
+            or 0
+        ),
+        "contextual_bandit_role": "auxiliary_max_12_percent",
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,

@@ -467,8 +467,18 @@ def calculate_road_probabilities(
     planning_probability = _clip_probability(planning.get("banker_probability", 0.5))
     planning_reliability = max(0.0, min(1.0, float(planning.get("reliability", 0.0) or 0.0)))
 
-    # 相容舊欄位的 road aggregate；主引擎 V10.8 會分別使用 planning/recent，不依賴此固定融合。
-    planning_share = 0.60 if bool(planning.get("ok")) else 0.0
+    # 相容舊欄位的 road aggregate。完整截圖歷史一旦達到可用長度，就以
+    # Full Road 的全盤相位作為主幹；近期元件只負責確認目前尾段是否延續或
+    # 轉折。這裡的比例不是機率勝率，而是「全盤與近期資訊」的資料涵蓋率。
+    whole_shoe_evidence = max(
+        0.0, min(1.0, float(planning.get("whole_shoe_evidence", 0.0) or 0.0))
+    )
+    if bool(planning.get("active")):
+        planning_share = 0.70 + 0.15 * whole_shoe_evidence
+    elif bool(planning.get("ok")):
+        planning_share = 0.58
+    else:
+        planning_share = 0.0
     recent_share = 1.0 - planning_share
     banker_probability = planning_probability * planning_share + recent_probability * recent_share
     direction = "B" if banker_probability >= 0.5 else "P"
@@ -499,8 +509,8 @@ def calculate_road_probabilities(
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_SPLIT_PLANNING_RECENT_V10_9_NO_TRANSITION_CHAIN",
-        "pipeline_stage": "full_road_planning_plus_non_transition_recent_experts",
+        "engine": "ROAD_FULL_SCREENSHOT_HISTORY_PRIMARY_V11",
+        "pipeline_stage": "full_screenshot_history_planning_then_recent_confirmation",
         "run_seed": run_seed,
         "sequence": sequence,
         "raw_outcomes": raw_outcomes,
@@ -512,11 +522,11 @@ def calculate_road_probabilities(
         "player_probability": float(1.0 - banker_probability),
         "direction": direction,
         "direction_text": "莊" if direction == "B" else "閒",
-        "action": direction if combined_reliability >= 0.50 else "O",
-        "action_text": "莊" if direction == "B" and combined_reliability >= 0.50 else "閒" if direction == "P" and combined_reliability >= 0.50 else "觀望",
-        "signal_allowed": combined_reliability >= 0.50,
-        "signal_status_text": "牌路規劃與近期專家已完成" if length >= 10 else "牌路樣本累積中",
-        "signal_reason": "完整牌路規劃與受限近期專家分開輸出，交由主 Stacking 統整",
+        "action": direction,
+        "action_text": "莊" if direction == "B" else "閒",
+        "signal_allowed": bool(sequence),
+        "signal_status_text": "完整截圖歷史已納入全盤規劃" if length >= 12 else "完整牌路樣本累積中",
+        "signal_reason": "先以完整截圖 B/P/T 歷史建立全盤相位，再以近期專家確認下一局方向。",
         "confidence_score": float(combined_reliability),
         "confidence_label": "較高" if combined_reliability >= 0.72 else "中等" if combined_reliability >= 0.50 else "偏低",
         "uncertainty": float(recent_uncertainty),
@@ -524,7 +534,10 @@ def calculate_road_probabilities(
         "planning_probability": float(planning_probability),
         "planning_player_probability": float(1.0 - planning_probability),
         "planning_reliability": float(planning_reliability),
-        "planning_available": bool(planning.get("ok")),
+        "planning_available": bool(planning.get("active")),
+        "planning_share": float(planning_share),
+        "whole_shoe_evidence": float(whole_shoe_evidence),
+        "whole_shoe_regime": dict(planning.get("whole_shoe_regime") or {}),
         "recent_probability": float(recent_probability),
         "recent_player_probability": float(1.0 - recent_probability),
         "recent_reliability": float(recent_reliability),
@@ -557,7 +570,7 @@ def calculate_road_probabilities(
         "eligible_for_core": length >= 10,
         "suggested_core_weight": 0.0,
         "max_core_weight": 0.0,
-        "data_scope": "entire_history_planning_and_bounded_recent_experts",
+        "data_scope": "all_recognized_screenshot_history_primary_then_bounded_recent_confirmation",
         "full_history_used_count": length,
         "initial_image_count": max(0, int(initial_image_count or 0)),
         "manual_count": max(0, int(manual_count or 0)),
