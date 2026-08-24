@@ -235,6 +235,102 @@ def _detect_regime(sequence: Sequence[str]) -> Dict[str, Any]:
     }
 
 
+def _structural_regime_component(sequence: Sequence[str]) -> Dict[str, Any]:
+    """將可重複的大路結構轉為 Adaptive 可用的正式成員。
+
+    short/mid/long 是近期比例模型，最後一顆天然權重最高；它們不能單獨
+    代表「單跳」或「雙跳」。此元件只在 run-length 結構已重複確認時啟用：
+
+    - 長龍：末段至少三顆同向。
+    - 單跳：最近四個 run 都是 1。
+    - 雙跳：最近三個完整 run 都是 2；若目前只走到 pair 的第一顆，先補
+      同邊，pair 完成才切到另一邊。
+    - 跳跳龍：最近四個 run 的長度交替為 1/2 或 2/1。
+
+    未確認時固定中性且 inactive，避免把單一最新結果偽裝成規律。
+    """
+    values = list(sequence[-36:])
+    runs = _runs(values)
+    if not runs:
+        return {
+            "active": False, "name": "mixed", "direction": "",
+            "banker_probability": 0.5, "reliability": 0.0,
+            "support": len(runs), "edge": 0.0, "reason": "run 不足",
+        }
+
+    last_side, last_length = runs[-1]
+    opposite = "P" if last_side == "B" else "B"
+    lengths = [length for _, length in runs]
+
+    def _active(name: str, direction: str, reliability: float, reason: str) -> Dict[str, Any]:
+        probability = 0.5 + (0.5 * reliability if direction == "B" else -0.5 * reliability)
+        return {
+            "active": True,
+            "name": name,
+            "direction": direction,
+            "banker_probability": float(max(0.02, min(0.98, probability))),
+            "reliability": float(reliability),
+            "support": len(runs),
+            "edge": float(reliability),
+            "run_lengths": lengths[-6:],
+            "reason": reason,
+        }
+
+    if last_length >= 3:
+        return _active(
+            "dragon",
+            last_side,
+            min(0.82, 0.64 + 0.045 * min(4, last_length - 3)),
+            f"末段 {last_length} 顆同向長龍",
+        )
+
+    if len(runs) < 3:
+        return {
+            "active": False, "name": "mixed", "direction": "",
+            "banker_probability": 0.5, "reliability": 0.0,
+            "support": len(runs), "edge": 0.0,
+            "run_lengths": lengths[-6:], "reason": "run 不足",
+        }
+
+    if len(lengths) >= 4 and all(length == 1 for length in lengths[-4:]):
+        return _active("single_chop", opposite, 0.76, "最近四個 run 均為單跳")
+
+    # 雙跳的最後一組若只出現一顆，代表該 pair 尚未完成，方向應補同邊；
+    # 若 pair 已完成，才切換到另一邊。這可避免 BBPPBBP 被誤判為反打。
+    if len(lengths) >= 3 and all(length == 2 for length in lengths[-3:]):
+        return _active("double_chop", opposite, 0.74, "最近三個完整 run 均為雙跳")
+    if (
+        last_length == 1
+        and len(lengths) >= 3
+        and all(length == 2 for length in lengths[-3:-1])
+    ):
+        return _active("double_chop_building", last_side, 0.70, "雙跳結構中，正在補足 pair")
+
+    if len(lengths) >= 4:
+        tail = lengths[-4:]
+        if tail in ([1, 2, 1, 2], [2, 1, 2, 1]):
+            expected = tail[-1]
+            direction = last_side if last_length < expected else opposite
+            return _active(
+                "alternating_run_pattern",
+                direction,
+                0.70,
+                f"run 長度重複 {tail} 的跳跳龍節奏",
+            )
+
+    return {
+        "active": False,
+        "name": "mixed",
+        "direction": "",
+        "banker_probability": 0.5,
+        "reliability": 0.0,
+        "support": len(runs),
+        "edge": 0.0,
+        "run_lengths": lengths[-6:],
+        "reason": "沒有通過長龍／單跳／雙跳／跳跳龍確認",
+    }
+
+
 def _bounded_recent_weights(models: Mapping[str, Mapping[str, Any]]) -> Dict[str, float]:
     priors = {
         "short": 0.19,
@@ -308,6 +404,7 @@ def calculate_road_probabilities(
         initial_image_count=initial_image_count,
         manual_count=manual_count,
     )
+    structural_regime = _structural_regime_component(sequence)
     recent_models: Dict[str, Dict[str, Any]] = {
         "short": _window_model(sequence, ROAD_SHORT_WINDOW, 0.84),
         "mid": _window_model(sequence, ROAD_MID_WINDOW, 0.91),
@@ -393,6 +490,11 @@ def calculate_road_probabilities(
             "effective_weight": 1.0,
             "group": "road_planning",
         },
+        "structural_regime": {
+            **structural_regime,
+            "effective_weight": 1.0 if structural_regime.get("active") else 0.0,
+            "group": "confirmed_run_length_structure",
+        },
     }
 
     return {
@@ -430,6 +532,7 @@ def calculate_road_probabilities(
         "recent_uncertainty_method": "analytic_independent_beta_moments",
         "recent_model_disagreement": float(recent_disagreement),
         "full_road_analysis": planning,
+        "structural_regime": dict(structural_regime),
         "models": model_outputs,
         "component_probabilities": {
             name: {
@@ -448,6 +551,7 @@ def calculate_road_probabilities(
             "pattern": int(recent_models["pattern"].get("support", 0)),
             "analogue": int(recent_models["analogue"].get("support", 0)),
             "planning": int(planning.get("support", 0) or 0),
+            "structural_regime": int(structural_regime.get("support", 0) or 0),
         },
         "removed_transition_chain_orders": [1, 2, 3],
         "eligible_for_core": length >= 10,

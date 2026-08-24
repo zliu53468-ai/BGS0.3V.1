@@ -36,9 +36,11 @@ ADAPTIVE_SHOE_MIN_SAMPLES = 8
 # Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。cMAB 是
 # 輔助訊號，最多佔總融合權重 15%，不再把它當作主輸出。
 ROAD_PRIMARY_COMPONENTS = (
-    "full_road", "short", "mid", "long", "pattern", "analogue",
+    "structural_regime", "full_road", "short", "mid", "long", "pattern", "analogue",
 )
 FULL_ROAD_PRIMARY_MULTIPLIER = 1.25
+STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 2.60
+STRUCTURAL_RECENCY_REDUCTION = 0.55
 CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.15
 
 
@@ -312,6 +314,10 @@ def _fusion_candidates(
             # 完整路圖是第一層產物，給予溫和優先權；不是硬鎖方向，仍需
             # 接受其他近期牌路專家與 cMAB context 的交叉驗證。
             weight *= FULL_ROAD_PRIMARY_MULTIPLIER
+        elif name == "structural_regime":
+            # 已通過 run-length 確認的單跳／雙跳／跳跳龍，不能再被三個
+            # 「最後一顆權重較高」的近期比例模型平均回原方向。
+            weight *= STRUCTURAL_REGIME_PRIMARY_MULTIPLIER
         support = int(meta.get("support", 0) or 0)
         raw_shoe_performance = shoe_direction_performance.get(name)
         shoe_performance = (
@@ -359,6 +365,16 @@ def _fusion_candidates(
             ),
             "role": "road_primary",
         })
+
+    # 結構元件一旦啟用，近期比例仍保留參考，但降低其合計影響力。這個
+    # 動作只對已確認結構生效；混合盤仍完全使用原本的多專家融合。
+    structural_active = any(
+        row["name"] == "structural_regime" for row in rows
+    )
+    if structural_active:
+        for row in rows:
+            if row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
+                row["weight"] = float(row["weight"]) * STRUCTURAL_RECENCY_REDUCTION
 
     primary_weight = sum(float(row["weight"]) for row in rows)
     bandit_banker = _conditional_banker(base)
