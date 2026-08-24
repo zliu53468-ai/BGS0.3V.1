@@ -2789,6 +2789,528 @@ def _get_bandit_summary_impl(
     }
 
 
+# ---------------------------------------------------------------------------
+# 決策策略 LinUCB（與既有 B/P 牌路 cMAB 分離）
+# ---------------------------------------------------------------------------
+# 既有 ``ARMS = ("B", "P")`` 的 ContextualBanditEngine 仍完整保留，供
+# 牌路診斷與原始 B/P 傾向使用。以下三個 Arm 不選莊／閒；它們只選擇要以
+# 何種保守程度使用已通過精確牌組 EV 閘門的訊號。這樣不會讓路圖資料把
+# 抽水後為負的物理 EV 偽裝成可以下注的方向。
+DECISION_STRATEGY_ARMS = (
+    "math_only",
+    "ev_road_blend",
+    "conservative",
+)
+DECISION_STRATEGY_CONTEXT_DIM = 34
+DECISION_STRATEGY_ALPHA = 0.42
+DECISION_STRATEGY_L2 = 1.50
+DECISION_STRATEGY_MAX_EVENT_IDS = 5000
+DECISION_STRATEGY_VERSION = "DECISION-STRATEGY-LINUCB-V2-ROAD-STATE"
+
+
+def _resolve_strategy_state_file() -> Path:
+    """策略 Bandit 使用獨立狀態，絕不污染既有 B/P cMAB 的 A/b。"""
+    configured = Path("/var/data/decision_strategy_bandit_state_v2.json")
+    candidates = [
+        configured,
+        BASE_DIR / "data" / "decision_strategy_bandit_state_v2.json",
+        Path("/tmp/bgs_decision_strategy_bandit_state_v2.json"),
+    ]
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            probe = candidate.parent / f".strategy_write_test_{time.time_ns()}"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+    raise RuntimeError("No writable decision-strategy state path is available")
+
+
+DECISION_STRATEGY_STATE_FILE = _resolve_strategy_state_file()
+
+
+def _strategy_clip(value: Any, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        return max(minimum, min(maximum, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _strategy_side(value: Any) -> str:
+    side = str(value or "").upper().strip()
+    return side if side in ARMS else ""
+
+
+def _strategy_road_direction(road_context: Mapping[str, Any], history: Sequence[str]) -> str:
+    """只抽取現成牌路 Context 的診斷方向，絕不把它當物理機率。"""
+    try:
+        probability = float(road_context.get("planning_probability", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        probability = 0.5
+    if probability != 0.5:
+        return "B" if probability > 0.5 else "P"
+    bp = [value for value in history if value in ARMS]
+    direction, length = _streak(bp)
+    if length >= 3:
+        return direction
+    return bp[-1] if bp else ""
+
+
+def _strategy_number(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _strategy_full_road(road_context: Mapping[str, Any]) -> Dict[str, Any]:
+    """讀取 road_model 已算好的完整路紙，不重跑模型也不直接碰影像。"""
+    planning = road_context.get("full_road_analysis")
+    if isinstance(planning, Mapping):
+        return dict(planning)
+    models = road_context.get("models")
+    model = models.get("full_road") if isinstance(models, Mapping) else None
+    return dict(model) if isinstance(model, Mapping) else {}
+
+
+def _strategy_jump_dragon_score(run_lengths: Sequence[Any]) -> float:
+    """跳跳龍：短 run 與長 run 在最近欄位交替出現的程度。"""
+    values = [max(0, int(value)) for value in list(run_lengths or [])[-6:]]
+    if len(values) < 4:
+        return 0.0
+    marks = [1 if value <= 1 else 0 for value in values]
+    switches = sum(left != right for left, right in zip(marks, marks[1:]))
+    alternation = switches / max(1, len(marks) - 1)
+    has_short = any(value <= 1 for value in values)
+    has_long = any(value >= 3 for value in values)
+    return _strategy_clip(alternation * (1.0 if has_short and has_long else 0.0))
+
+
+def _strategy_derived_recent(planning: Mapping[str, Any], name: str) -> float:
+    stats = dict(planning.get("derived_stats") or {}).get(name)
+    if not isinstance(stats, Mapping):
+        return 0.5
+    return _strategy_clip(stats.get("recent_continuation", 0.5), 0.0, 1.0)
+
+
+def _strategy_road_pattern_state(
+    history: Sequence[str], road_context: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """將 full_road_pattern_model 的結構結果轉成有限、可學習的狀態。
+
+    這裡只讀取 ``road_model.build_road_context`` 事先建出的 full-road
+    walk-forward 狀態，不將固定「見龍追龍」規則直接寫成下注指令。
+    """
+    planning = _strategy_full_road(road_context)
+    regime = dict(road_context.get("regime") or {})
+    bp = [value for value in history if value in ARMS]
+    run_lengths = list(planning.get("run_lengths") or [])
+    if not run_lengths:
+        _, fallback_run = _streak(bp)
+        run_lengths = [fallback_run] if fallback_run else []
+    current_run = max(0, int(planning.get("current_run", run_lengths[-1] if run_lengths else 0) or 0))
+    alternating_tail = _strategy_clip(_transition_rate(bp, 6))
+    single_jump_score = abs(_single_jump_onset(bp))
+    jump_dragon_score = _strategy_jump_dragon_score(run_lengths)
+    continuation = _strategy_clip(planning.get("continuation_probability", 0.5), 0.0, 1.0)
+
+    # 只用作 Context 的狀態標籤；策略 Arm 仍必須通過 exact EV gate。
+    if current_run >= 4 and continuation >= 0.52:
+        label = "long_dragon"
+    elif single_jump_score >= 0.99:
+        label = "single_jump"
+    elif jump_dragon_score >= 0.55:
+        label = "jump_dragon"
+    elif alternating_tail >= 0.68:
+        label = "high_alternation"
+    else:
+        label = "mixed"
+    labels = ("long_dragon", "single_jump", "jump_dragon", "high_alternation", "mixed")
+    return {
+        "label": label,
+        "one_hot": [1.0 if label == candidate else 0.0 for candidate in labels],
+        "current_run": current_run,
+        "continuation_probability": continuation,
+        "alternation_rate": _strategy_clip(
+            planning.get("alternation_rate", regime.get("alternation_rate", 0.5)),
+            0.0,
+            1.0,
+        ),
+        "early_alternation_rate": _strategy_clip(planning.get("early_alternation_rate", 0.5), 0.0, 1.0),
+        "late_alternation_rate": _strategy_clip(planning.get("late_alternation_rate", 0.5), 0.0, 1.0),
+        "equal_foot_rate": _strategy_clip(planning.get("equal_foot_rate", 0.0), 0.0, 1.0),
+        "recent_equal_foot_rate": _strategy_clip(planning.get("recent_equal_foot_rate", 0.0), 0.0, 1.0),
+        "run_variance": _strategy_clip(_strategy_number(planning.get("run_variance")) / 8.0),
+        "run_histogram": list(planning.get("run_histogram") or [0.0, 0.0, 0.0, 0.0])[:4],
+        "single_jump_score": single_jump_score,
+        "jump_dragon_score": jump_dragon_score,
+        "big_eye_recent_continuation": _strategy_derived_recent(planning, "big_eye"),
+        "small_road_recent_continuation": _strategy_derived_recent(planning, "small_road"),
+        "cockroach_recent_continuation": _strategy_derived_recent(planning, "cockroach_road"),
+        "planning_reliability": _strategy_clip(planning.get("reliability", 0.0)),
+        "planning_edge": _strategy_clip(planning.get("edge", 0.0)),
+        "neighbor_similarity": _strategy_clip(planning.get("mean_neighbor_similarity", 0.0)),
+        "support": _strategy_clip(_strategy_number(planning.get("support")) / 14.0),
+        "grid_coverage": _strategy_clip(_strategy_number(planning.get("grid_cell_count")) / 80.0),
+    }
+
+
+def build_decision_strategy_context(
+    history: Iterable[Any],
+    *,
+    road_context: Optional[Mapping[str, Any]] = None,
+    physical_signal: Optional[Mapping[str, Any]] = None,
+) -> List[float]:
+    """建立固定 34 維「策略選擇」Context。
+
+    前 5 維是可信牌靴／EV 狀態；其餘維度直接擷取
+    ``road_detector -> road_model -> full_road_pattern_model`` 已建立的完整
+    路紙結構：龍長、單跳、跳跳龍、交替率、齊腳率、下三路延續度、相似
+    歷史支持度與圖格覆蓋率。這些是策略選擇特徵，不能單獨產生下注方向。
+    """
+    raw = _clean_history(history)
+    bp = [value for value in raw if value in ARMS]
+    road = dict(road_context or {})
+    physical = dict(physical_signal or {})
+    counts = physical.get("remaining_counts")
+    exact_counts = (
+        isinstance(counts, Sequence)
+        and not isinstance(counts, (str, bytes))
+        and len(counts) == 10
+        and bool(physical.get("available"))
+    )
+    remaining_cards = sum(int(value) for value in counts) if exact_counts else 0
+    decks = max(1, min(16, int(physical.get("decks", 8) or 8)))
+    total_cards = decks * 52
+    selected_ev = _strategy_clip(
+        physical.get("selected_expected_return", 0.0), -0.08, 0.08
+    )
+    physical_direction = _strategy_side(
+        physical.get("action") or physical.get("selected_side_by_ev")
+    )
+    road_direction = _strategy_road_direction(road, bp)
+    pattern_state = _strategy_road_pattern_state(bp, road)
+    planning = _strategy_full_road(road)
+    consensus = _strategy_clip(road.get("derived_road_consensus", 0.0))
+    # build_road_context 版本不同時，此欄可能在 full_road_analysis 之下；
+    # 缺失時回到 0，不猜測不存在的下三路資料。
+    if consensus == 0.0:
+        full_road_payload = road.get("full_road_analysis")
+        if isinstance(full_road_payload, Mapping):
+            consensus = _strategy_clip(
+                full_road_payload.get("derived_consensus", 0.0)
+            )
+    if consensus == 0.0:
+        consensus = _strategy_clip((
+            _derived_road_saturation(road, "big_eye")
+            + _derived_road_saturation(road, "small_road")
+            + _derived_road_saturation(road, "cockroach_road")
+        ) / 3.0)
+    histogram = list(pattern_state.get("run_histogram") or [])
+    histogram = (histogram + [0.0] * 4)[:4]
+    alternation_phase = _strategy_clip(
+        (
+            float(pattern_state["late_alternation_rate"])
+            - float(pattern_state["early_alternation_rate"])
+            + 1.0
+        ) / 2.0
+    )
+    planning_maturity = _strategy_clip(
+        _strategy_number(planning.get("sample_count")) / 80.0
+    )
+    agreement = 1.0 if physical_direction and physical_direction == road_direction else 0.0
+    vector = [
+        1.0,
+        1.0 if exact_counts else 0.0,
+        _strategy_clip((selected_ev + 0.08) / 0.16),
+        _strategy_clip(remaining_cards / max(1, total_cards)),
+        _strategy_clip(1.0 - remaining_cards / max(1, total_cards)),
+        planning_maturity,
+        _strategy_clip(float(pattern_state["current_run"]) / 8.0),
+        float(pattern_state["continuation_probability"]),
+        float(pattern_state["planning_reliability"]),
+        float(pattern_state["planning_edge"]),
+        float(pattern_state["alternation_rate"]),
+        alternation_phase,
+        float(pattern_state["equal_foot_rate"]),
+        float(pattern_state["recent_equal_foot_rate"]),
+        float(pattern_state["run_variance"]),
+        *[_strategy_clip(value) for value in histogram],
+        float(pattern_state["single_jump_score"]),
+        float(pattern_state["jump_dragon_score"]),
+        float(pattern_state["big_eye_recent_continuation"]),
+        float(pattern_state["small_road_recent_continuation"]),
+        float(pattern_state["cockroach_recent_continuation"]),
+        consensus,
+        float(pattern_state["neighbor_similarity"]),
+        float(pattern_state["support"]),
+        float(pattern_state["grid_coverage"]),
+        agreement,
+        *list(pattern_state["one_hot"]),
+    ]
+    if len(vector) != DECISION_STRATEGY_CONTEXT_DIM:
+        raise RuntimeError("decision strategy context dimension mismatch")
+    return [round(float(value), 10) for value in vector]
+
+
+def _new_strategy_arm_state() -> Dict[str, Any]:
+    return {
+        "A": (np.eye(DECISION_STRATEGY_CONTEXT_DIM) * DECISION_STRATEGY_L2).tolist(),
+        "b": np.zeros(DECISION_STRATEGY_CONTEXT_DIM, dtype=np.float64).tolist(),
+        "updates": 0,
+        "reward_sum": 0.0,
+    }
+
+
+def _new_strategy_user_state() -> Dict[str, Any]:
+    return {
+        "version": DECISION_STRATEGY_VERSION,
+        "arms": {arm: _new_strategy_arm_state() for arm in DECISION_STRATEGY_ARMS},
+        "applied_event_ids": [],
+        "total_updates": 0,
+        "updated_at": 0,
+    }
+
+
+def _read_strategy_state_unlocked() -> Dict[str, Any]:
+    try:
+        payload = json.loads(DECISION_STRATEGY_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    users = payload.get("users") if isinstance(payload, Mapping) else None
+    return {"schema_version": DECISION_STRATEGY_VERSION, "users": dict(users or {})}
+
+
+def _write_strategy_state_unlocked(payload: Mapping[str, Any]) -> None:
+    temporary = DECISION_STRATEGY_STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temporary.replace(DECISION_STRATEGY_STATE_FILE)
+
+
+def _strategy_scope_key(user_id: str, venue: str, room: str) -> str:
+    raw = "|".join((str(user_id or "__anonymous__"), str(venue or "").upper().strip(), str(room or "").strip()))
+    return sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _strategy_user_state(store: Dict[str, Any], scope: str) -> Dict[str, Any]:
+    raw = store["users"].get(scope)
+    if not isinstance(raw, Mapping):
+        state = _new_strategy_user_state()
+    else:
+        state = dict(raw)
+        state["version"] = DECISION_STRATEGY_VERSION
+        arms = dict(state.get("arms") or {})
+        for arm in DECISION_STRATEGY_ARMS:
+            candidate = arms.get(arm)
+            if not isinstance(candidate, Mapping):
+                arms[arm] = _new_strategy_arm_state()
+        state["arms"] = arms
+        state["applied_event_ids"] = list(state.get("applied_event_ids") or [])[-DECISION_STRATEGY_MAX_EVENT_IDS:]
+    store["users"][scope] = state
+    return state
+
+
+def _strategy_solve(matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """對稱化與遞增 ridge jitter，避免長期線上更新數值失穩。"""
+    symmetric = 0.5 * (matrix + matrix.T)
+    identity = np.eye(symmetric.shape[0], dtype=np.float64)
+    for jitter in (1e-9, 1e-7, 1e-5, 1e-3):
+        try:
+            return np.linalg.solve(symmetric + jitter * identity, vector)
+        except np.linalg.LinAlgError:
+            continue
+    return np.linalg.pinv(symmetric + 1e-3 * identity) @ vector
+
+
+def _strategy_arm_score(arm_state: Mapping[str, Any], context: np.ndarray) -> Dict[str, float]:
+    try:
+        matrix = np.asarray(arm_state.get("A"), dtype=np.float64)
+        target = np.asarray(arm_state.get("b"), dtype=np.float64)
+        if matrix.shape != (DECISION_STRATEGY_CONTEXT_DIM, DECISION_STRATEGY_CONTEXT_DIM):
+            raise ValueError("invalid A")
+        if target.shape != (DECISION_STRATEGY_CONTEXT_DIM,):
+            raise ValueError("invalid b")
+    except (TypeError, ValueError):
+        default = _new_strategy_arm_state()
+        matrix = np.asarray(default["A"], dtype=np.float64)
+        target = np.asarray(default["b"], dtype=np.float64)
+    theta = _strategy_solve(matrix, target)
+    precision_context = _strategy_solve(matrix, context)
+    variance = max(0.0, float(context @ precision_context))
+    mean = float(theta @ context)
+    ucb = float(mean + DECISION_STRATEGY_ALPHA * math.sqrt(variance))
+    return {"mean_reward": mean, "uncertainty": math.sqrt(variance), "ucb_score": ucb}
+
+
+def _strategy_profile(arm: str) -> Dict[str, Any]:
+    profiles = {
+        "math_only": {
+            "label": "純精確 EV",
+            "physical_weight": 1.0,
+            "road_weight": 0.0,
+            "minimum_ev_multiplier": 1.0,
+            "kelly_multiplier": 1.0,
+        },
+        "ev_road_blend": {
+            "label": "EV 主導＋牌路確認",
+            "physical_weight": 0.90,
+            "road_weight": 0.10,
+            "minimum_ev_multiplier": 1.0,
+            "kelly_multiplier": 1.0,
+        },
+        "conservative": {
+            "label": "保守精確 EV",
+            "physical_weight": 1.0,
+            "road_weight": 0.0,
+            "minimum_ev_multiplier": 1.75,
+            "kelly_multiplier": 0.50,
+        },
+    }
+    return dict(profiles.get(arm, profiles["math_only"]))
+
+
+def select_decision_strategy(
+    history: Iterable[Any],
+    *,
+    road_context: Optional[Mapping[str, Any]] = None,
+    physical_signal: Optional[Mapping[str, Any]] = None,
+    venue: str = "",
+    room: str = "",
+    user_id: str = "",
+) -> Dict[str, Any]:
+    """以 LinUCB 選擇「如何使用物理 EV」，非 B/P 方向選擇器。"""
+    physical = dict(physical_signal or {})
+    context = build_decision_strategy_context(
+        history, road_context=road_context, physical_signal=physical
+    )
+    exact_eligible = bool(context[1])
+    scope = _strategy_scope_key(user_id, venue, room)
+    with _LOCK:
+        store = _read_strategy_state_unlocked()
+        state = _strategy_user_state(store, scope)
+        scores = {
+            arm: _strategy_arm_score(state["arms"][arm], np.asarray(context, dtype=np.float64))
+            for arm in DECISION_STRATEGY_ARMS
+        }
+
+    # 冷啟動中分數同分時固定先走 math_only，避免未學習資料時牌路策略
+    # 被偶然排序選中。沒有可信 exact count 時仍回傳可觀測的選擇資訊，
+    # 但 validated layer 會保留 No Bet。
+    priority = {"math_only": 2, "ev_road_blend": 1, "conservative": 0}
+    selected_arm = max(DECISION_STRATEGY_ARMS, key=lambda arm: (scores[arm]["ucb_score"], priority[arm]))
+    return {
+        "version": DECISION_STRATEGY_VERSION,
+        "selected_arm": selected_arm,
+        "profile": _strategy_profile(selected_arm),
+        "eligible_exact_composition": exact_eligible,
+        "context": context,
+        "context_feature_names": [
+            "bias", "trusted_exact_counts", "normalized_physical_ev",
+            "remaining_card_ratio", "shoe_progress", "full_road_maturity",
+            "current_run_length", "continuation_probability",
+            "full_road_reliability", "full_road_edge", "alternation_rate",
+            "alternation_phase_shift", "equal_foot_rate",
+            "recent_equal_foot_rate", "run_variance",
+            "run_length_1_share", "run_length_2_share", "run_length_3_share",
+            "run_length_4plus_share", "single_jump_score", "jump_dragon_score",
+            "big_eye_recent_continuation", "small_road_recent_continuation",
+            "cockroach_road_recent_continuation", "derived_road_consensus",
+            "nearest_state_similarity", "full_road_support", "detected_grid_coverage",
+            "physical_road_agreement", "state_long_dragon", "state_single_jump",
+            "state_jump_dragon", "state_high_alternation", "state_mixed",
+        ],
+        "road_pattern_state": _strategy_road_pattern_state(
+            _clean_history(history), dict(road_context or {})
+        ),
+        "scores": scores,
+        "scope": scope,
+        "state_file": str(DECISION_STRATEGY_STATE_FILE),
+        "reason": (
+            "策略 Arm 以歷史風險調整後實際損益的 LinUCB 上界選出；"
+            "牌路不具單獨下注權。"
+        ),
+    }
+
+
+def update_decision_strategy(
+    *,
+    context: Sequence[float],
+    selected_arm: str,
+    actual_profit: float,
+    bankroll: float,
+    event_id: str = "",
+    venue: str = "",
+    room: str = "",
+    user_id: str = "",
+) -> Dict[str, Any]:
+    """用實際 Kelly 損益更新被採用策略的後驗。
+
+    為使不同本金可比較，內部 reward = actual_profit / (bankroll × 2%) 並
+    截斷於 [-1, 1]；原始損益仍完整記錄在績效檔。這是風險單位標準化，
+    不是把輸贏偷換為命中率。
+    """
+    arm = str(selected_arm or "").strip()
+    if arm not in DECISION_STRATEGY_ARMS:
+        return {"updated": False, "reason": "invalid_strategy_arm"}
+    x = np.asarray(list(context or []), dtype=np.float64)
+    if x.shape != (DECISION_STRATEGY_CONTEXT_DIM,) or not np.all(np.isfinite(x)):
+        return {"updated": False, "reason": "invalid_strategy_context"}
+    raw_profit = float(actual_profit or 0.0)
+    risk_unit = max(1.0, float(bankroll or 0.0) * 0.02)
+    reward = max(-1.0, min(1.0, raw_profit / risk_unit))
+    scope = _strategy_scope_key(user_id, venue, room)
+    event_key = str(event_id or "").strip()
+    with _LOCK:
+        store = _read_strategy_state_unlocked()
+        state = _strategy_user_state(store, scope)
+        applied = list(state.get("applied_event_ids") or [])
+        if event_key and event_key in applied:
+            return {"updated": False, "reason": "duplicate_event", "event_id": event_key}
+        arm_state = dict(state["arms"][arm])
+        try:
+            matrix = np.asarray(arm_state["A"], dtype=np.float64)
+            target = np.asarray(arm_state["b"], dtype=np.float64)
+            if matrix.shape != (DECISION_STRATEGY_CONTEXT_DIM, DECISION_STRATEGY_CONTEXT_DIM):
+                raise ValueError
+            if target.shape != (DECISION_STRATEGY_CONTEXT_DIM,):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            defaults = _new_strategy_arm_state()
+            matrix = np.asarray(defaults["A"], dtype=np.float64)
+            target = np.asarray(defaults["b"], dtype=np.float64)
+        # Ridge prior 加上一筆真實策略回報，並顯式對稱化避免累積浮點誤差。
+        matrix = 0.5 * (matrix + matrix.T) + np.outer(x, x)
+        target = target + reward * x
+        arm_state["A"] = matrix.tolist()
+        arm_state["b"] = target.tolist()
+        arm_state["updates"] = int(arm_state.get("updates", 0) or 0) + 1
+        arm_state["reward_sum"] = float(arm_state.get("reward_sum", 0.0) or 0.0) + reward
+        state["arms"][arm] = arm_state
+        state["total_updates"] = int(state.get("total_updates", 0) or 0) + 1
+        state["updated_at"] = int(time.time())
+        if event_key:
+            applied.append(event_key)
+            state["applied_event_ids"] = applied[-DECISION_STRATEGY_MAX_EVENT_IDS:]
+        store["users"][scope] = state
+        _write_strategy_state_unlocked(store)
+    return {
+        "updated": True,
+        "event_id": event_key,
+        "selected_arm": arm,
+        "actual_profit": raw_profit,
+        "risk_unit": risk_unit,
+        "normalized_reward": reward,
+        "arm_updates": int(arm_state["updates"]),
+        "total_updates": int(state["total_updates"]),
+    }
+
+
 class ContextualBanditEngine:
     """BGS LinUCB 核心類別；公開函式由此類別提供相容包裝。"""
 
@@ -2836,6 +3358,52 @@ class ContextualBanditEngine:
 
     def summary(self, user_id: str = "") -> Dict[str, Any]:
         return _get_bandit_summary_impl(user_id=user_id)
+
+
+class DecisionStrategyBanditEngine:
+    """策略層 LinUCB 包裝；保留主 B/P Engine 的對外相容性。"""
+
+    def select(
+        self,
+        history: Iterable[Any],
+        *,
+        road_context: Optional[Mapping[str, Any]] = None,
+        physical_signal: Optional[Mapping[str, Any]] = None,
+        venue: str = "",
+        room: str = "",
+        user_id: str = "",
+    ) -> Dict[str, Any]:
+        return select_decision_strategy(
+            history,
+            road_context=road_context,
+            physical_signal=physical_signal,
+            venue=venue,
+            room=room,
+            user_id=user_id,
+        )
+
+    def update(
+        self,
+        *,
+        context: Sequence[float],
+        selected_arm: str,
+        actual_profit: float,
+        bankroll: float,
+        event_id: str = "",
+        venue: str = "",
+        room: str = "",
+        user_id: str = "",
+    ) -> Dict[str, Any]:
+        return update_decision_strategy(
+            context=context,
+            selected_arm=selected_arm,
+            actual_profit=actual_profit,
+            bankroll=bankroll,
+            event_id=event_id,
+            venue=venue,
+            room=room,
+            user_id=user_id,
+        )
 
 
 _DEFAULT_ENGINE = ContextualBanditEngine()
@@ -2893,10 +3461,16 @@ __all__ = [
     "ARMS",
     "CONTEXT_DIM",
     "ContextualBanditEngine",
+    "DecisionStrategyBanditEngine",
+    "DECISION_STRATEGY_ARMS",
+    "DECISION_STRATEGY_CONTEXT_DIM",
     "FEATURE_NAMES",
     "MODEL_VERSION",
+    "build_decision_strategy_context",
     "build_context_vector",
     "get_bandit_summary",
     "predict_bandit",
+    "select_decision_strategy",
+    "update_decision_strategy",
     "update_bandit",
 ]
