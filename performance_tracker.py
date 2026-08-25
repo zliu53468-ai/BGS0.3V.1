@@ -1,8 +1,8 @@
-"""BGS 純牌路預測績效紀錄器。
+"""BGS 牌路預測績效紀錄器。
 
 每次正式牌路預測後建立 pending prediction；使用者回報實際結果時：
-- B/P：只結算正式方向的稽核資料，不更新任何 Bandit Arm。
-- T：只記錄結果，不進行模型學習。
+- B/P：結算正式方向的稽核資料，並只更新 CUSUM-LinUCB 預測當下選中的 Arm。
+- T：只記錄結果，不進行 B/P Arm 學習。
 - prediction_id 去重，避免同一局重複寫入績效紀錄。
 - 同時保存 raw round 與 B/P round index，避免和局造成時間軸錯位。
 """
@@ -17,15 +17,18 @@ import math
 import secrets
 import time
 
+from contextual_bandit import update_bandit
+
 BASE_DIR = Path(__file__).resolve().parent
 _LOCK = RLock()
 _OUTCOMES = ("B", "P", "T")
 # 固定資料保護參數；不受 Render 舊環境變數覆寫。
 _GUARD_SECONDS = 90
 PERFORMANCE_MAX_RECORDS = 30000
-# 正式模式固定關閉 UCB 線上學習。這個常數寫在程式內，Render 舊環境變數
-# 無法重新啟用；績效檔僅供後續人工檢視，不回灌任何預測權重。
-CONTEXTUAL_BANDIT_ONLINE_UPDATE_ENABLED = False
+# CUSUM-LinUCB 的更新固定只寫入它自己的狀態檔；Adaptive Ensemble 永遠
+# 不讀取 prediction_performance 檔加權，因此使用者按鈕不會再把「剛開哪邊
+# 就追哪邊」回灌成路子專家權重。
+CONTEXTUAL_BANDIT_ONLINE_UPDATE_ENABLED = True
 
 
 def _resolve_performance_file() -> Path:
@@ -152,9 +155,23 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
     prediction_fingerprint = str(
         prediction.get("prediction_fingerprint") or ""
     ).strip()
-    # 純牌路模式不再存在 Bandit Arm。正式 action 仍完整保存並可統計命中，
-    # 但 selected_arm 保持空白，避免 resolve 時將按鈕結果回灌成 UCB 學習。
-    selected_arm = ""
+    selected_arm = str(
+        prediction.get("selected_arm")
+        or prediction.get("base_bandit_direction")
+        or ""
+    ).upper().strip()
+    if selected_arm not in {"B", "P"}:
+        selected_arm = ""
+    bandit_probabilities = prediction.get("bandit_learning_probabilities")
+    if not isinstance(bandit_probabilities, Mapping):
+        bandit_probabilities = prediction.get("pre_braking_probabilities")
+    if not isinstance(bandit_probabilities, Mapping):
+        bandit_probabilities = {}
+    context_vector = prediction.get("bandit_context")
+    if not isinstance(context_vector, (list, tuple)):
+        context_vector = prediction.get("context_vector")
+    if not isinstance(context_vector, (list, tuple)):
+        context_vector = []
     record = {
         "prediction_id": prediction_id,
         "uid_key": uid,
@@ -165,29 +182,38 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "model_version": str(prediction.get("model_version") or prediction.get("engine") or ""),
         "model_variant": str(prediction.get("model_variant") or "").strip(),
         "shoe_id": str(prediction.get("shoe_id") or ""),
-        "bandit_learning_user_id": "",
-        "contextual_bandit_enabled": False,
+        "bandit_learning_user_id": str(
+            prediction.get("bandit_learning_user_id") or ""
+        ),
+        "contextual_bandit_enabled": bool(
+            prediction.get("contextual_bandit_enabled", False)
+        ),
         "prediction_fingerprint": prediction_fingerprint,
         "probabilities": _prediction_probabilities(prediction),
-        "bandit_learning_probabilities": {},
+        "bandit_learning_probabilities": _normalize_probabilities(
+            dict(bandit_probabilities)
+        ) if bandit_probabilities else {},
         "recommend": str(prediction.get("recommend") or selected_arm).upper(),
         "action": str(prediction.get("action") or selected_arm).upper(),
         "selected_arm": selected_arm,
-        # 純牌路模式只有正式 Adaptive 方向；不保存 UCB 影子方向。
+        # 正式方向仍是 Adaptive 的輸出；selected_arm 是 CUSUM 預測當下的
+        # 學習 Arm，不會被事後的正式融合方向覆寫。
         "adaptive_only_direction": str(
             prediction.get("adaptive_only_direction")
             or prediction.get("action")
             or prediction.get("recommend")
             or ""
         ).upper().strip(),
-        "ucb_shadow_direction": "",
-        "shadow_comparison_eligible": False,
-        "context_vector": [],
-        "context_feature_names": [],
+        "ucb_shadow_direction": selected_arm,
+        "shadow_comparison_eligible": bool(selected_arm),
+        "context_vector": [float(value) for value in context_vector],
+        "context_feature_names": list(
+            prediction.get("context_feature_names") or []
+        ),
         "timeline_alignment": dict(
             prediction.get("timeline_alignment") or {}
         ),
-        "bandit_scores": {},
+        "bandit_scores": dict(prediction.get("bandit_scores") or {}),
         "direction_source": str(prediction.get("direction_source") or ""),
         "component_champion": dict(
             prediction.get("component_champion") or {}
@@ -276,24 +302,60 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
             return None
 
         probabilities = _normalize_probabilities(dict(target.get("probabilities") or {}))
-        selected_arm = ""
+        selected_arm = str(target.get("selected_arm") or "").upper().strip()
+        if selected_arm not in {"B", "P"}:
+            selected_arm = ""
         public_action = str(target.get("action") or target.get("recommend") or "O").upper().strip()
         reward: Optional[float]
         if actual == "T":
             reward = None
-        elif public_action in {"B", "P"}:
-            # 僅記錄正式方向的測試結果；reward 不會傳入任何學習器。
-            reward = 1.0 if public_action == actual else 0.0
+        elif selected_arm in {"B", "P"}:
+            # Reward 僅評估 CUSUM 在「預測當下」選的 Arm。正式 Adaptive
+            # 結果可與它不同，不能拿正式方向的輸贏錯誤回灌給 Bandit。
+            reward = 1.0 if selected_arm == actual else 0.0
         else:
             reward = None
 
-        # 不論 B/P/T，絕不觸發 update_bandit。這避免按鈕輸入的單局結果
-        # 累積到 contextual_bandit_state_v3.json，並保證它無法影響後續預測。
-        bandit_update = {
-            "updated": False,
-            "reason": "contextual_bandit_disabled_road_only_mode",
-            "actual_outcome": actual,
-        }
+        # 只有一筆已建立的 pending prediction 可更新一次；prediction_id
+        # 會同時傳入 CUSUM event 去重，重複按 LINE 按鈕不會使矩陣疊加。
+        if (
+            CONTEXTUAL_BANDIT_ONLINE_UPDATE_ENABLED
+            and bool(target.get("contextual_bandit_enabled"))
+            and selected_arm in {"B", "P"}
+            and actual in {"B", "P"}
+            and isinstance(target.get("context_vector"), list)
+        ):
+            try:
+                bandit_update = update_bandit(
+                    context=list(target.get("context_vector") or []),
+                    selected_arm=selected_arm,
+                    reward=reward,
+                    event_id=str(target.get("prediction_id") or ""),
+                    actual_outcome=actual,
+                    update_weight=1.0,
+                    user_id=str(target.get("bandit_learning_user_id") or ""),
+                    prediction_probabilities=dict(
+                        target.get("bandit_learning_probabilities") or {}
+                    ),
+                )
+            except Exception as exc:
+                # 執行期儲存失敗只能讓這一筆不學習，不能阻斷使用者回報結果。
+                bandit_update = {
+                    "updated": False,
+                    "reason": "cusum_update_error",
+                    "error": str(exc),
+                    "actual_outcome": actual,
+                }
+        else:
+            reason = (
+                "tie_not_used_for_bp_arms" if actual == "T"
+                else "missing_cusum_prediction_context"
+            )
+            bandit_update = {
+                "updated": False,
+                "reason": reason,
+                "actual_outcome": actual,
+            }
 
         target["actual_outcome"] = actual
         target["resolved_at"] = _now()
@@ -301,7 +363,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         target["bandit_update"] = bandit_update
         target["bp_timeline_advanced"] = actual in {"B", "P"}
         target["tie_skipped_for_structural_learning"] = actual == "T"
-        target["applied_update_weight"] = 0.0
+        target["applied_update_weight"] = float(
+            bandit_update.get("update_weight", 1.0)
+            if bandit_update.get("updated") else 0.0
+        )
         target["few_shot_boost_applied"] = False
         if venue:
             target["venue"] = str(venue).upper().strip()
@@ -310,13 +375,18 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         target["log_loss"] = -math.log(max(1e-12, probabilities[actual]))
         target["brier_score"] = sum((probabilities[key] - (1.0 if key == actual else 0.0)) ** 2 for key in _OUTCOMES)
         target["top1_correct"] = max(probabilities, key=probabilities.get) == actual
-        # 正式勝率只計算對外輸出的牌路方向；本模式沒有 Bandit learning arm。
+        # 正式勝率只計算對外輸出的 Adaptive 方向；學習 Arm 的命中另外記錄，
+        # 絕不拿它來改寫正式路子專家權重。
         target["action_correct"] = (
             public_action == actual
             if public_action in _OUTCOMES
             else None
         )
-        target["learning_arm_correct"] = None
+        target["learning_arm_correct"] = (
+            selected_arm == actual
+            if actual in {"B", "P"} and selected_arm in {"B", "P"}
+            else None
+        )
         adaptive_only_direction = str(
             target.get("adaptive_only_direction") or public_action
         ).upper().strip()
@@ -325,8 +395,13 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
             if actual in {"B", "P"} and adaptive_only_direction in {"B", "P"}
             else None
         )
-        target["ucb_shadow_correct"] = None
-        target["adaptive_ucb_agree"] = None
+        target["ucb_shadow_correct"] = target["learning_arm_correct"]
+        target["adaptive_ucb_agree"] = (
+            adaptive_only_direction == selected_arm
+            if adaptive_only_direction in {"B", "P"}
+            and selected_arm in {"B", "P"}
+            else None
+        )
         target["no_bet"] = public_action == "O"
         if not pending_id or pending_id == str(target.get("prediction_id") or ""):
             data["pending"].pop(uid, None)
