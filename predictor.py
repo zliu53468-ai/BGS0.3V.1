@@ -1,8 +1,9 @@
 """BGS cMAB 統一預測入口。
 
-正式圖片／真人桌預測使用完整 B/P/T 歷史、牌路上下文與 LinUCB cMAB。
-最後階段會比較「固定牌路規則」與 cMAB 的最近真實 B/P 命中率，
-只輸出一個最終 B/P 方向；不使用算牌、EV 或觀望方向。
+正式圖片／真人桌預測使用完整 B/P/T 歷史與牌路上下文。Full Road、結構
+規律與其他牌路專家先由 Adaptive Ensemble 融合，該結果是唯一正式 B/P
+方向；LinUCB cMAB 只記錄同手影子方向並接收結果回饋，不使用算牌、EV 或
+觀望方向。
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
-from adaptive_ensemble import adapt_prediction
+from adaptive_ensemble import ADAPTIVE_MODEL_VARIANT, adapt_prediction
 from contextual_bandit import predict_bandit
 from road_model import build_road_context
 
@@ -691,15 +692,17 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     )
     bandit_direction = _fallback_direction(result)
 
-    # 第二層：Adaptive Ensemble 只讀取 Full Road 與既有路子專家的機率。
-    # particle、算牌、EV、外部模型都不會透過這裡注入。
+    # 第二層：Adaptive Ensemble 只讀取 Full Road 與既有路子專家的機率，
+    # 並成為唯一正式 B/P 輸出。particle、算牌、EV、外部模型都不會透過
+    # 這裡注入；cMAB 僅保存同手影子方向與線上學習資料，不可翻轉正式方向。
     result["road_support"] = dict(road)
     result["component_probabilities"] = dict(
         road.get("component_probabilities") or {}
     )
     result["decision_pipeline"] = (
-        "full_road_pattern_to_adaptive_ensemble_with_contextual_bandit_auxiliary"
+        "full_road_pattern_to_adaptive_ensemble_road_primary_with_ucb_shadow"
     )
+    result["model_variant"] = ADAPTIVE_MODEL_VARIANT
     result["bandit_direction"] = bandit_direction
     result["bandit_original_direction"] = bandit_direction
     result["bandit_learning_direction"] = bandit_direction
@@ -711,10 +714,22 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     )
 
     # 產品契約：不論路圖樣本、模型衝突或混沌診斷，都對外強制一致輸出 B/P。
-    final_direction = _fallback_direction(result)
+    # final_direction 必須優先採用 Adaptive 的純牌路輸出；不允許 UCB 的
+    # selected_arm 經由通用 fallback 函式反向接管正式面板。
+    final_direction = str(
+        result.get("adaptive_only_direction") or ""
+    ).upper().strip()
     if final_direction not in {"B", "P"}:
-        final_direction = bandit_direction if bandit_direction in {"B", "P"} else "B"
+        final_direction = str(road.get("direction") or "").upper().strip()
+    if final_direction not in {"B", "P"}:
+        # 只可能發生在完全空白的新鞋；維持 B/P 契約，但不能改用 UCB。
+        final_direction = "B"
     final_text = "莊" if final_direction == "B" else "閒"
+    ucb_shadow_direction = str(
+        result.get("ucb_shadow_direction") or bandit_direction
+    ).upper().strip()
+    if ucb_shadow_direction not in {"B", "P"}:
+        ucb_shadow_direction = "B"
     road_direction = str(road.get("direction") or "").upper().strip()
     if road_direction not in {"B", "P"}:
         road_direction = final_direction
@@ -724,6 +739,9 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "bandit_direction": bandit_direction,
         "bandit_original_direction": bandit_direction,
         "bandit_learning_direction": bandit_direction,
+        "adaptive_only_direction": final_direction,
+        "ucb_shadow_direction": ucb_shadow_direction,
+        "ucb_influenced_final_direction": False,
         "road_direction": road_direction,
         "road_prior": {
             "direction": road_direction,
@@ -740,7 +758,7 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "internal_action": final_direction,
         "signal_allowed": True,
         "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_DIRECTION",
-        "signal_status_text": "全路圖 → Adaptive Ensemble → cMAB 輔助：已輸出 B/P",
+        "signal_status_text": "全路圖 → Adaptive Ensemble 正式方向；cMAB 僅影子評估",
     })
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
