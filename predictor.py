@@ -1,9 +1,9 @@
-"""BGS cMAB 統一預測入口。
+"""BGS 純牌路統一預測入口。
 
 正式圖片／真人桌預測使用完整 B/P/T 歷史與牌路上下文。Full Road、結構
 規律與其他牌路專家先由 Adaptive Ensemble 融合，該結果是唯一正式 B/P
-方向；LinUCB cMAB 只記錄同手影子方向並接收結果回饋，不使用算牌、EV 或
-觀望方向。
+方向。此版本完全不呼叫、讀取或更新 LinUCB／Contextual Bandit；不使用
+算牌、EV 或觀望方向。
 """
 from __future__ import annotations
 
@@ -13,13 +13,16 @@ from threading import RLock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
-from adaptive_ensemble import ADAPTIVE_MODEL_VARIANT, adapt_prediction
-from contextual_bandit import predict_bandit
+from adaptive_ensemble import adapt_prediction
 from road_model import build_road_context
+
+# 僅用於本版績效資料隔離；刻意不從 adaptive_ensemble 匯入，避免部署時若
+# 其他舊模組也載入 predictor 而造成循環 import。
+ADAPTIVE_MODEL_VARIANT = "V34.3_SCREEN_ROAD_ADAPTIVE_NO_UCB"
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
-    "replacement": "CMAB-LINUCB-V1",
+    "replacement": "FULL_ROAD_ADAPTIVE_V34.3",
     "note": "舊粒子／有限牌組驗證層已從主要預測流程移除",
 }
 
@@ -83,6 +86,69 @@ def _fallback_direction(prediction: Mapping[str, Any]) -> str:
     banker = float(prediction.get("banker_rate", 0.0) or 0.0)
     player = float(prediction.get("player_rate", 0.0) or 0.0)
     return "B" if banker >= player else "P"
+
+
+def _road_seed_prediction(
+    road: Mapping[str, Any],
+    history: Iterable[Any],
+) -> Dict[str, Any]:
+    """將 Full Road 的當前截圖結果轉為 Adaptive 的穩定輸入。
+
+    這裡只使用本次圖片已辨識出的 B/P/T 歷史。不能用先前預測命中、
+    UCB state 或任何下注回饋校正這個初始機率，確保同一張牌路無論
+    之前按過幾次按鈕，送入 Adaptive 的資料都一致。
+    """
+    try:
+        banker = float(road.get("banker_probability", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        banker = 0.5
+    try:
+        player = float(road.get("player_probability", 1.0 - banker) or 0.0)
+    except (TypeError, ValueError):
+        player = 1.0 - banker
+    bp_total = banker + player
+    if bp_total <= 1e-12:
+        banker, player = 0.5, 0.5
+    else:
+        banker, player = banker / bp_total, player / bp_total
+
+    try:
+        observed_tie_rate = float(road.get("observed_tie_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        observed_tie_rate = 0.0
+    tie = max(0.0, min(0.30, observed_tie_rate))
+    bp_mass = 1.0 - tie
+    banker_probability = bp_mass * banker
+    player_probability = bp_mass * player
+    direction = str(road.get("direction") or "").upper().strip()
+    if direction not in {"B", "P"}:
+        direction = "B" if banker >= player else "P"
+    normalized_history = _normalize_outcome_history(history)
+    history_fingerprint = sha256(
+        "|".join(normalized_history).encode("utf-8")
+    ).hexdigest()[:24]
+    return {
+        "model_version": "FULL_ROAD_ADAPTIVE_V34.3",
+        "prediction_fingerprint": history_fingerprint,
+        "probabilities": {
+            "B": float(banker_probability),
+            "P": float(player_probability),
+            "T": float(tie),
+        },
+        "raw_probabilities": {
+            "B": float(banker_probability),
+            "P": float(player_probability),
+            "T": float(tie),
+        },
+        "banker_rate": round(banker_probability * 100.0, 2),
+        "player_rate": round(player_probability * 100.0, 2),
+        "tie_rate": round(tie * 100.0, 2),
+        "action": direction,
+        "recommend": direction,
+        "internal_action": direction,
+        "internal_recommend": direction,
+        "next_round_direction": direction,
+    }
 
 
 def _short_term_trend_prior(
@@ -675,37 +741,19 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     if not isinstance(road.get("models"), Mapping):
         road = build_road_context(cleaned, seed=run_seed)
 
-    # 第二層所需的 cMAB 先獨立評估。它保留自己的 Arm 與 state，只提供
-    # context 輔助訊號，不能先覆寫 Full Road／Adaptive 的最終方向。
-    bandit_learning_user_id = _bandit_learning_scope(
-        user_id=str(user_id or ""),
-        venue=str(venue or ""),
-        room=str(room or ""),
-    )
-    result = predict_bandit(
-        cleaned,
-        road_context=road,
-        venue=venue,
-        room=room,
-        user_id=bandit_learning_user_id,
-        run_seed=run_seed,
-    )
-    bandit_direction = _fallback_direction(result)
-
-    # 第二層：Adaptive Ensemble 只讀取 Full Road 與既有路子專家的機率，
-    # 並成為唯一正式 B/P 輸出。particle、算牌、EV、外部模型都不會透過
-    # 這裡注入；cMAB 僅保存同手影子方向與線上學習資料，不可翻轉正式方向。
+    # 第二層：只把 Full Road 的本次截圖輸出交給 Adaptive Ensemble。
+    # 不建立 cMAB Context、不載入 state、也不產生任何 UCB 方向。
+    result = _road_seed_prediction(road, cleaned)
     result["road_support"] = dict(road)
     result["component_probabilities"] = dict(
         road.get("component_probabilities") or {}
     )
     result["decision_pipeline"] = (
-        "full_road_pattern_to_adaptive_ensemble_road_primary_with_ucb_shadow"
+        "full_road_pattern_to_adaptive_ensemble_screen_only"
     )
     result["model_variant"] = ADAPTIVE_MODEL_VARIANT
-    result["bandit_direction"] = bandit_direction
-    result["bandit_original_direction"] = bandit_direction
-    result["bandit_learning_direction"] = bandit_direction
+    result["contextual_bandit_enabled"] = False
+    result["contextual_bandit_update_enabled"] = False
     result = adapt_prediction(
         result,
         venue=venue,
@@ -714,34 +762,26 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     )
 
     # 產品契約：不論路圖樣本、模型衝突或混沌診斷，都對外強制一致輸出 B/P。
-    # final_direction 必須優先採用 Adaptive 的純牌路輸出；不允許 UCB 的
-    # selected_arm 經由通用 fallback 函式反向接管正式面板。
+    # final_direction 只會來自 Adaptive 的純牌路輸出或 Full Road fallback。
     final_direction = str(
         result.get("adaptive_only_direction") or ""
     ).upper().strip()
     if final_direction not in {"B", "P"}:
         final_direction = str(road.get("direction") or "").upper().strip()
     if final_direction not in {"B", "P"}:
-        # 只可能發生在完全空白的新鞋；維持 B/P 契約，但不能改用 UCB。
+        # 只可能發生在完全空白的新鞋；維持 B/P 契約。
         final_direction = "B"
     final_text = "莊" if final_direction == "B" else "閒"
-    ucb_shadow_direction = str(
-        result.get("ucb_shadow_direction") or bandit_direction
-    ).upper().strip()
-    if ucb_shadow_direction not in {"B", "P"}:
-        ucb_shadow_direction = "B"
     road_direction = str(road.get("direction") or "").upper().strip()
     if road_direction not in {"B", "P"}:
         road_direction = final_direction
 
     result.update({
         "forced_bp_direction": True,
-        "bandit_direction": bandit_direction,
-        "bandit_original_direction": bandit_direction,
-        "bandit_learning_direction": bandit_direction,
         "adaptive_only_direction": final_direction,
-        "ucb_shadow_direction": ucb_shadow_direction,
         "ucb_influenced_final_direction": False,
+        "contextual_bandit_enabled": False,
+        "contextual_bandit_update_enabled": False,
         "road_direction": road_direction,
         "road_prior": {
             "direction": road_direction,
@@ -758,7 +798,7 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "internal_action": final_direction,
         "signal_allowed": True,
         "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_DIRECTION",
-        "signal_status_text": "全路圖 → Adaptive Ensemble 正式方向；cMAB 僅影子評估",
+        "signal_status_text": "全路圖 → Adaptive Ensemble 正式方向（UCB 已關閉）",
     })
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
@@ -774,11 +814,11 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     ).hexdigest()[:24]
     result.update({
         "shoe_id": str(shoe_id or ""),
-        "bandit_learning_user_id": bandit_learning_user_id,
-        "bandit_scope_mode": "user_venue_room_long_term",
-        "bandit_shoe_isolated": False,
+        "bandit_learning_user_id": "",
+        "bandit_scope_mode": "disabled",
+        "bandit_shoe_isolated": True,
         "shoe_event_isolated": True,
-        "composition_quality": "not_applicable_cmab",
+        "composition_quality": "not_applicable_road_only",
         "remaining_counts_source": "not_used",
         "shoe_context_ignored": bool(shoe_context),
         "road_quality_ok": bool(road.get(
@@ -790,9 +830,9 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
 
 
 def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None) -> Dict[str, Any]:
-    """保留舊虛擬牌靴介面，但方向同樣由 cMAB 產生。"""
+    """保留舊虛擬牌靴介面，方向同樣走純牌路 Adaptive。"""
     # 虛擬牌靴僅供舊相容入口使用；真人圖片預測不載入粒子／算牌模組，
-    # 避免其環境參數或初始化副作用混入正式 cMAB 路徑。
+    # 避免其環境參數或初始化副作用混入正式純牌路路徑。
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
 
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
@@ -828,8 +868,8 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     )
     prediction.update({
         "ok": True,
-        "mode": "virtual_shoe_cmab_compatibility",
-        "model_version": "CMAB-LINUCB-V1-VIRTUAL-COMPAT",
+        "mode": "virtual_shoe_road_adaptive_compatibility",
+        "model_version": "FULL_ROAD_ADAPTIVE_V34.3-VIRTUAL-COMPAT",
         "virtual_hand": hand_data,
         "virtual_outcome": actual,
         "virtual_outcome_text": hand_data["outcome_text"],
@@ -846,7 +886,7 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         "round_number": int(session.get("hand_number", 0) or 0) + 1,
         "warmup_rounds": int(session.get("warmup_rounds", 0) or 0),
         "bandit_learning_applied": False,
-        "disclaimer": "虛擬相容模式方向由 cMAB 產生；虛擬結果不回寫正式 cMAB。",
+        "disclaimer": "虛擬相容模式方向由 Full Road 與 Adaptive Ensemble 產生；不使用 UCB。",
     })
     return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
