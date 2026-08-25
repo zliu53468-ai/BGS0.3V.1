@@ -1,11 +1,9 @@
-
-
-
 """牌路主導的自適應集成。
 
 決策順序固定為：Full Road Pattern Model 建立完整路圖與牌路專家 →
-Adaptive Ensemble 整合牌路專家並輸出正式方向。這裡不呼叫、讀取或更新
-Contextual Bandit，也不混入算牌、EV、粒子或外部模型，並永遠維持 B/P。
+Adaptive Ensemble 整合牌路專家並輸出正式方向。CUSUM-LinUCB 只會在通過
+重置冷卻與樣本暖身後，以受限權重成為其中一位專家；不混入算牌、EV、粒子
+或外部模型，並永遠維持 B/P。
 
 輸出的 B/P 是方向分數，不是未來開出機率或勝率保證。
 """
@@ -17,9 +15,9 @@ import math
 # 正式融合不匯入、不讀取 prediction_performance_v3.json；避免過去按鈕
 # 回報的預測對錯改寫當前截圖的路子專家權重。
 OUTCOMES = ("B", "P", "T")
-# 正式融合採用獨立版本標籤。它只代表本次完整牌路的結構融合，不帶 UCB
-# state 或歷史預測命中權重。
-ADAPTIVE_MODEL_VARIANT = "V34.3_SCREEN_ROAD_ADAPTIVE_NO_UCB"
+# 正式融合採用獨立版本標籤。線上資料不會改變原有牌路專家權重；CUSUM
+# 專家只依其自身當前 reset / uncertainty 狀態取得受限融合席位。
+ADAPTIVE_MODEL_VARIANT = "V35_CUSUM_LINUCB_GATED_ROAD_ADAPTIVE"
 # 方向架構參數固定在程式內，避免 Render 遺留的 ADAPTIVE_* 環境變數讓
 # 同一張截圖在不同部署得到不同結果。
 ADAPTIVE_ENABLED = True
@@ -46,6 +44,11 @@ ADAPTIVE_SHOE_MIN_SAMPLES = 12
 # 注意：performance_tracker 仍可保存正式方向的稽核紀錄，但所有紀錄都不會
 # 回讀、加權或改變 Adaptive 的正式 B/P 方向。
 FORMAL_ONLINE_PERFORMANCE_WEIGHTING = False
+
+# CUSUM-LinUCB 專家調度：剛重置時 0%，完成五局冷卻但更新仍不足八局時
+# 仍維持 0%，避免還在高方差探索期就翻轉牌路主方向；穩定後最多只佔 18%。
+CUSUM_EXPERT_MAX_SHARE = 0.18
+CUSUM_EXPERT_MIN_STABLE_UPDATES = 8
 
 # Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。V34.2 起，
 # cMAB 不再參與正式融合；它只保留自己的原始方向，供同一筆預測的影子
@@ -348,6 +351,58 @@ def _road_primary_fallback(
     }
 
 
+def _cusum_expert_schedule(prediction: Mapping[str, Any]) -> Dict[str, Any]:
+    """依 CUSUM reset 狀態決定 LinUCB 在融合中的最大席位。
+
+    這是重要的風險隔離：變點剛觸發時 A/b 已被清空，UCB 方差刻意變大；
+    在它重新取得足夠結果前，不能用高探索分數介入 Full Road 的正式方向。
+    """
+    enabled = bool(prediction.get("contextual_bandit_enabled"))
+    selected = str(prediction.get("selected_arm") or "").upper().strip()
+    raw_probabilities = prediction.get("pre_braking_probabilities")
+    if not isinstance(raw_probabilities, Mapping):
+        raw_probabilities = prediction.get("probabilities")
+    values = dict(raw_probabilities) if isinstance(raw_probabilities, Mapping) else {}
+    banker = _conditional_banker(values)
+    risk = prediction.get("reset_risk")
+    risk_data = dict(risk) if isinstance(risk, Mapping) else {}
+    cusum = prediction.get("cusum")
+    cusum_data = dict(cusum) if isinstance(cusum, Mapping) else {}
+    cooldown = max(0, int(risk_data.get("cooldown_remaining", cusum_data.get("cooldown_remaining", 0)) or 0))
+    updates = max(0, int(risk_data.get("updates_since_reset", cusum_data.get("updates_since_reset", 0)) or 0))
+    reset_exploration = bool(
+        risk_data.get("active", cusum_data.get("post_reset_exploration", False))
+    )
+    confidence = max(0.0, min(1.0, float(
+        prediction.get(
+            "bandit_confidence_score",
+            prediction.get("confidence_score", prediction.get("confidence", 0.0)),
+        ) or 0.0
+    )))
+
+    if not enabled or selected not in {"B", "P"}:
+        share, reason = 0.0, "CUSUM-LinUCB 未提供有效方向"
+    elif cooldown > 0:
+        share, reason = 0.0, "CUSUM reset 冷卻期：正式融合權重固定為 0%"
+    elif reset_exploration or updates < CUSUM_EXPERT_MIN_STABLE_UPDATES:
+        share, reason = 0.0, "CUSUM 暖身期：更新樣本不足，正式融合權重固定為 0%"
+    else:
+        # 信心只調整 0.55~1.00 倍，防止 Bandit 自己報高分就取得過大權重。
+        share = CUSUM_EXPERT_MAX_SHARE * (0.55 + 0.45 * confidence)
+        reason = "CUSUM 穩定期：以受限權重加入牌路融合"
+    return {
+        "enabled": enabled,
+        "direction": selected,
+        "banker_probability": float(banker),
+        "confidence_score": float(confidence),
+        "cooldown_remaining": cooldown,
+        "updates_since_reset": updates,
+        "post_reset_exploration": reset_exploration,
+        "requested_share": float(max(0.0, min(CUSUM_EXPERT_MAX_SHARE, share))),
+        "reason": reason,
+    }
+
+
 def _fusion_candidates(
     prediction: Mapping[str, Any],
     components: Mapping[str, Mapping[str, float]],
@@ -357,8 +412,9 @@ def _fusion_candidates(
 ) -> list[Dict[str, Any]]:
     """建立純牌路融合候選。
 
-    Full Road Pattern Model 的完整歷史結論與既有路子專家是唯一成員。
-    本函式沒有 UCB 輸入、UCB fallback 或外部模型權重。
+    Full Road Pattern Model 的完整歷史結論與既有路子專家是主成員。CUSUM
+    只會在最後以已排程、最大 18% 的輔助席位加入；它不能成為 fallback，
+    也不能讀取舊績效來放大權重。
     """
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
@@ -490,6 +546,34 @@ def _fusion_candidates(
             if row["name"] in {"short", "mid", "long", "pattern", "analogue"}:
                 row["weight"] = float(row["weight"]) * STRUCTURAL_RECENCY_REDUCTION
 
+    # 只有至少一個原生牌路專家可用時，才允許 CUSUM-LinUCB 加入。它不能
+    # 在冷啟動、OCR 資料不足或 Full Road 全部 inactive 時自行變成最終方向。
+    schedule = _cusum_expert_schedule(prediction)
+    primary_weight = sum(float(row["weight"]) for row in rows)
+    requested_share = float(schedule["requested_share"])
+    if primary_weight > 1e-12 and requested_share > 0.0:
+        auxiliary_weight = primary_weight * requested_share / (1.0 - requested_share)
+        banker = float(schedule["banker_probability"])
+        logit = _logit(banker)
+        rows.append({
+            "name": "cusum_linu_cb",
+            "banker_probability": banker,
+            "direction": str(schedule["direction"]),
+            "edge": float(abs(2.0 * banker - 1.0)),
+            "logit": float(logit),
+            "weight": float(auxiliary_weight),
+            "reliability": float(schedule["confidence_score"]),
+            "support": int(schedule["updates_since_reset"]),
+            "performance_samples": 0,
+            "historical_brier": None,
+            "historical_performance_used": False,
+            "selection_score": float(auxiliary_weight),
+            "current_shoe_samples": 0,
+            "current_shoe_posterior_accuracy": 0.50,
+            "current_shoe_performance_used": False,
+            "role": "cusum_linu_cb_gated_auxiliary",
+            "cusum_schedule": dict(schedule),
+        })
     return rows
 
 
@@ -597,6 +681,14 @@ def _apply_plurality_decision(
         component_sample_counts, shoe_direction_performance,
     )
     fusion = _plurality_logit_fusion(candidates)
+    # 不直接相信 bandit 的 self-report：以實際進入 fusion 的正規化權重
+    # 為準。這可讓面板明確區分「CUSUM 有產生方向」與「CUSUM 實際影響
+    # 了這一手的 Ensemble」。
+    cusum_schedule = _cusum_expert_schedule(result)
+    effective_cusum_share = float(
+        dict(fusion.get("weights") or {}).get("cusum_linu_cb", 0.0) or 0.0
+    )
+    cusum_active = effective_cusum_share > 0.0
     result["pre_adaptive_probabilities"] = dict(base)
     base_action = str(result.get("action") or "O").upper().strip()
     road_fallback = _road_primary_fallback(result, components)
@@ -656,8 +748,15 @@ def _apply_plurality_decision(
     else:
         reason = (
             "以本次截圖牌路的 reliability、support 與方向差進行 logit pooling，"
-            "再以 plurality evidence 放大非零方向優勢；不讀取過往命中資料。"
+            "再以 plurality evidence 放大非零方向優勢；不讀取路子專家的過往命中資料。"
         )
+    if cusum_active:
+        reason += (
+            f" CUSUM-LinUCB 已通過重置冷卻，以 {effective_cusum_share:.1%} "
+            "受限權重提供輔助證據。"
+        )
+    elif bool(result.get("contextual_bandit_enabled")):
+        reason += " CUSUM-LinUCB 仍在重置／暖機保護期，本手未參與融合。"
 
     result.update({
         "probabilities": {"B": banker, "P": player, "T": tie_probability},
@@ -686,8 +785,9 @@ def _apply_plurality_decision(
         "adaptive_only_probabilities": {
             "B": float(banker), "P": float(player), "T": float(tie_probability),
         },
-        "ucb_influenced_final_direction": False,
-        "contextual_bandit_enabled": False,
+        "ucb_influenced_final_direction": bool(cusum_active),
+        "cusum_linu_cb_influenced_final_direction": bool(cusum_active),
+        "contextual_bandit_enabled": bool(result.get("contextual_bandit_enabled")),
         "direction_edge": float(edge),
         "direction_edge_percent": round(edge * 100.0, 4),
         "ensemble_confidence": float(confidence),
@@ -703,7 +803,7 @@ def _apply_plurality_decision(
         result["component_champion"] = tiebreaker
     result["adaptive_ensemble"] = {
         "active": True,
-        "mode": "adaptive_ensemble_screen_road_only",
+        "mode": "adaptive_ensemble_road_primary_cusum_gated",
         "circuit_breaker_active": False,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
@@ -730,7 +830,14 @@ def _apply_plurality_decision(
         "road_primary": True,
         "current_screen_only": True,
         "online_performance_weighting_enabled": False,
-        "contextual_bandit_enabled": False,
+        "contextual_bandit_enabled": bool(result.get("contextual_bandit_enabled")),
+        "contextual_bandit_role": "gated_auxiliary_max_18_percent",
+        "cusum_linu_cb": {
+            **dict(cusum_schedule),
+            "active_in_fusion": bool(cusum_active),
+            "effective_share": float(effective_cusum_share),
+            "max_share": float(CUSUM_EXPERT_MAX_SHARE),
+        },
         "adaptive_only_direction": direction,
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
@@ -781,7 +888,9 @@ def adapt_prediction(
 
     if extreme_unseen:
         # 保留極端未知診斷，但產品契約要求每局皆輸出 B/P；正式 fallback
-        # 一律來自當前牌路，不建立 UCB Arm 或影子方向。
+        # 一律來自當前牌路。CUSUM-LinUCB 仍會保留自己的 reset 狀態供
+        # 面板與下一手使用，但在這個分支強制不取得任何融合權重。
+        cusum_schedule = _cusum_expert_schedule(result)
         road_fallback = _road_primary_fallback(result, components)
         road_direction = str(road_fallback["direction"])
         road_banker = float(road_fallback["banker_probability"])
@@ -825,7 +934,10 @@ def adapt_prediction(
         result["adaptive_only_direction"] = road_direction
         result["adaptive_only_probabilities"] = dict(result["probabilities"])
         result["ucb_influenced_final_direction"] = False
-        result["contextual_bandit_enabled"] = False
+        result["cusum_linu_cb_influenced_final_direction"] = False
+        result["contextual_bandit_enabled"] = bool(
+            result.get("contextual_bandit_enabled")
+        )
         result["ensemble_confidence"] = min(0.45, base_confidence)
         result["confidence"] = min(0.45, base_confidence)
         result["quality_score"] = min(0.45, base_confidence)
@@ -836,7 +948,7 @@ def adapt_prediction(
         result["is_extreme_unseen"] = True
         result["adaptive_ensemble"] = {
             "active": True,
-            "mode": "statistical_chaos_adaptive_road_only",
+            "mode": "statistical_chaos_adaptive_road_primary",
             "circuit_breaker_active": False,
             "hard_brake_active": False,
             "sample_count": sample_count,
@@ -854,7 +966,17 @@ def adapt_prediction(
             "road_primary": True,
             "current_screen_only": True,
             "online_performance_weighting_enabled": False,
-            "contextual_bandit_enabled": False,
+            "contextual_bandit_enabled": bool(
+                result.get("contextual_bandit_enabled")
+            ),
+            "contextual_bandit_role": "held_out_during_extreme_road_state",
+            "cusum_linu_cb": {
+                **dict(cusum_schedule),
+                "active_in_fusion": False,
+                "effective_share": 0.0,
+                "max_share": float(CUSUM_EXPERT_MAX_SHARE),
+                "reason": "extreme_road_state_forces_road_fallback",
+            },
             "adaptive_only_direction": road_direction,
             "reason": "極端未知區間保留診斷，正式方向仍由 Adaptive 牌路 fallback 輸出",
         }
