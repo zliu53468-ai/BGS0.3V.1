@@ -1,39 +1,47 @@
-"""BGS V10.8 牌路模型入口。
+"""Lightweight baccarat road analyzer for the direct Markov predictor.
 
-本檔保留六個牌路專家，並完全移除一至三階條件轉移模型：
-- full_road：完整歷史牌路規劃模型
-- short／mid／long／pattern／analogue：其餘近期牌路專家
-
-主引擎可以分別取得 ``planning_probability`` 與 ``recent_probability``，
-避免把全部牌路訊號壓成一個只追近期的群組。
+This module does not contain an ensemble, bandit, stacking model, or Monte Carlo
+predictor.  It converts the recognized B/P/T history into the original 21 road
+features used by the first 29D design and exposes a small structural road signal
+for Markov calibration.
 """
 from __future__ import annotations
 
-from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import math
 
-import numpy as np
-
-from full_road_pattern_model import analyze_full_road_pattern
-
-
-# 正式牌路特徵固定在程式碼內，避免 Render 的舊 ROAD_* 值在重啟後使同一張
-# 路紙得到不同 context。這些是特徵窗口，不是勝率或下注參數。
 ROAD_HISTORY_LIMIT = 500
-ROAD_SHORT_WINDOW = 8
-ROAD_MID_WINDOW = 18
-ROAD_LONG_WINDOW = 36
-ROAD_RECENT_SIMULATIONS = 3000
-ROAD_RECENT_MAX_MODEL_WEIGHT = 0.22
-ROAD_RECENT_MAX_DISAGREEMENT = 0.145
+
+ROAD_FEATURE_NAMES = (
+    "bias", "history_maturity", "global_banker_balance", "recent3_banker_balance",
+    "recent8_banker_balance", "current_streak_direction", "current_streak_length",
+    "alternation6", "alternation12", "transition_acceleration", "streak_break_signal",
+    "long_dragon_tail_pressure", "observed_tie_rate", "road_planning_balance",
+    "road_recent_balance", "road_confidence", "road_agreement", "big_eye_saturation",
+    "small_road_saturation", "cockroach_road_saturation", "derived_road_consensus",
+)
+
+
+def _clip(value: Any, lo: float = -1.0, hi: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return max(lo, min(hi, number))
 
 
 def normalize_raw_outcomes(values: Iterable[Any]) -> List[str]:
     result: List[str] = []
     for item in values:
         if isinstance(item, Mapping):
-            raw = item.get("outcome") or item.get("actual") or item.get("virtual_outcome")
+            raw = (
+                item.get("outcome")
+                or item.get("actual")
+                or item.get("actual_outcome")
+                or item.get("virtual_outcome")
+            )
         else:
             raw = item
         value = str(raw or "").upper().strip()
@@ -49,327 +57,170 @@ def normalize_road_sequence(values: Iterable[Any]) -> List[str]:
     ][-ROAD_HISTORY_LIMIT:]
 
 
-def _clip_probability(value: Any) -> float:
-    try:
-        return max(0.02, min(0.98, float(value)))
-    except Exception:
-        return 0.5
-
-
 def _runs(sequence: Sequence[str]) -> List[Tuple[str, int]]:
     result: List[Tuple[str, int]] = []
     for value in sequence:
         if result and result[-1][0] == value:
-            result[-1] = (value, result[-1][1] + 1)
+            side, length = result[-1]
+            result[-1] = (side, length + 1)
         else:
             result.append((value, 1))
     return result
 
 
-def _weighted_probability(sequence: Sequence[str], decay: float) -> float:
-    banker = 3.0
-    player = 3.0
-    for reverse_index, outcome in enumerate(reversed(sequence)):
-        weight = decay ** reverse_index
-        if outcome == "B":
-            banker += weight
-        elif outcome == "P":
-            player += weight
-    return banker / max(1e-12, banker + player)
+def build_big_road(sequence: Sequence[str]) -> Dict[str, Any]:
+    """Return the logical big-road columns.
 
-
-def _window_model(sequence: Sequence[str], size: int, decay: float) -> Dict[str, Any]:
-    window = list(sequence[-size:])
-    probability = _weighted_probability(window, decay)
-    support = len(window)
-    reliability = min(0.82, support / max(1.0, float(size)))
+    For prediction we only need the ordered run/column structure. The detector
+    remains responsible for pixel/grid reconstruction.
+    """
+    seq = [str(v).upper().strip() for v in sequence if str(v).upper().strip() in {"B", "P"}]
+    runs = _runs(seq)
+    columns = [
+        {"side": side, "height": int(length), "index": index}
+        for index, (side, length) in enumerate(runs)
+    ]
     return {
-        "active": support >= min(4, size),
-        "support": support,
-        "banker_probability": probability,
-        "direction": "B" if probability >= 0.5 else "P",
-        "edge": abs(probability - 0.5) * 2.0,
-        "reliability": reliability,
-        "window": size,
-        "decay": decay,
+        "columns": columns,
+        "column_heights": [item["height"] for item in columns],
+        "column_sides": [item["side"] for item in columns],
+        "column_count": len(columns),
     }
 
 
-def _analogue_model(sequence: Sequence[str]) -> Dict[str, Any]:
-    for order in (7, 6, 5, 4, 3):
-        if len(sequence) <= order:
-            continue
-        suffix = tuple(sequence[-order:])
-        banker = 2.5
-        player = 2.5
-        support = 0
-        for index in range(order, len(sequence)):
-            if tuple(sequence[index - order:index]) != suffix:
-                continue
-            support += 1
-            if sequence[index] == "B":
-                banker += 1.0
-            else:
-                player += 1.0
-        if support >= 2:
-            probability = banker / (banker + player)
-            return {
-                "active": True,
-                "support": support,
-                "banker_probability": probability,
-                "direction": "B" if probability >= 0.5 else "P",
-                "edge": abs(probability - 0.5) * 2.0,
-                "reliability": min(0.76, support / 10.0),
-                "order": order,
-            }
+def _transition_rate(sequence: Sequence[str], size: int) -> float:
+    values = list(sequence[-size:])
+    if len(values) < 2:
+        return 0.5
+    return sum(a != b for a, b in zip(values, values[1:])) / (len(values) - 1)
+
+
+def _balance(sequence: Sequence[str], size: int | None = None) -> float:
+    values = list(sequence[-size:] if size else sequence)
+    if not values:
+        return 0.0
+    return _clip((values.count("B") / len(values) - 0.5) * 2.0)
+
+
+def _streak(sequence: Sequence[str]) -> Tuple[str, int]:
+    if not sequence:
+        return "", 0
+    side = sequence[-1]
+    length = 1
+    for value in reversed(sequence[:-1]):
+        if value != side:
+            break
+        length += 1
+    return side, length
+
+
+def _streak_break(sequence: Sequence[str]) -> float:
+    values = list(sequence)
+    if len(values) < 4 or values[-1] == values[-2]:
+        return 0.0
+    previous_side = values[-2]
+    run = 1
+    for value in reversed(values[:-2]):
+        if value != previous_side:
+            break
+        run += 1
+    if run < 3:
+        return 0.0
+    return (1.0 if values[-1] == "B" else -1.0) * min(1.0, run / 6.0)
+
+
+def _derived_road(heights: Sequence[int], offset: int) -> List[str]:
+    result: List[str] = []
+    for index in range(offset + 1, len(heights)):
+        current = int(heights[index])
+        reference = int(heights[index - offset])
+        previous_reference = int(heights[index - offset - 1])
+        delta_current = current - reference
+        delta_previous = reference - previous_reference
+        regular = (
+            current == reference
+            or delta_current == delta_previous
+            or abs(current - reference) <= 1
+        )
+        result.append("R" if regular else "U")
+    return result
+
+
+def _derived_stats(values: Sequence[str]) -> Dict[str, float]:
+    sequence = [str(v).upper() for v in values if str(v).upper() in {"R", "U"}]
+    if not sequence:
+        return {
+            "continuation": 0.5,
+            "recent_continuation": 0.5,
+            "balance": 0.0,
+            "saturation": 0.0,
+        }
+    if len(sequence) >= 2:
+        continuation = sum(a == b for a, b in zip(sequence, sequence[1:])) / (len(sequence) - 1)
+    else:
+        continuation = 0.5
+    recent = sequence[-5:]
+    if len(recent) >= 2:
+        recent_continuation = sum(a == b for a, b in zip(recent, recent[1:])) / (len(recent) - 1)
+    else:
+        recent_continuation = 0.5
+    balance = abs(sequence.count("R") / len(sequence) - 0.5) * 2.0
+    saturation = max(balance, abs(2.0 * recent_continuation - 1.0))
     return {
-        "active": False,
-        "support": 0,
-        "banker_probability": 0.5,
-        "direction": "B",
-        "reliability": 0.0,
-        "order": 0,
+        "continuation": float(continuation),
+        "recent_continuation": float(recent_continuation),
+        "balance": float(balance),
+        "saturation": float(_clip(saturation, 0.0, 1.0)),
     }
 
 
-def _pattern_features(sequence: Sequence[str]) -> np.ndarray:
+def _road_structural_probability(
+    sequence: Sequence[str],
+    *,
+    derived_consensus: float,
+) -> Tuple[float, str, float]:
+    """Small B/P road calibration signal; Markov remains the primary predictor."""
     seq = list(sequence)
+    if not seq:
+        return 0.5, "", 0.0
+
+    last_side, run = _streak(seq)
+    alternation6 = _transition_rate(seq, 6)
+    alternation12 = _transition_rate(seq, 12)
     runs = _runs(seq)
     lengths = [length for _, length in runs]
-    recent_runs = lengths[-10:]
 
-    def change_rate(size: int) -> float:
-        window = seq[-size:]
-        if len(window) < 2:
-            return 0.5
-        return sum(a != b for a, b in zip(window, window[1:])) / (len(window) - 1)
-
-    mean_run = float(np.mean(recent_runs)) if recent_runs else 0.0
-    variance = float(np.var(recent_runs)) if recent_runs else 0.0
-    return np.asarray([
-        min(1.0, (recent_runs[-1] if recent_runs else 0) / 6.0),
-        change_rate(8),
-        change_rate(18),
-        change_rate(36),
-        min(1.0, mean_run / 5.0),
-        min(1.0, variance / 8.0),
-        sum(value == 1 for value in recent_runs) / max(1, len(recent_runs)),
-        sum(value == 2 for value in recent_runs) / max(1, len(recent_runs)),
-        sum(value >= 4 for value in recent_runs) / max(1, len(recent_runs)),
-    ], dtype=np.float64)
-
-
-def _pattern_model(sequence: Sequence[str]) -> Dict[str, Any]:
-    if len(sequence) < 10:
-        return {
-            "active": False,
-            "support": 0,
-            "banker_probability": 0.5,
-            "direction": "B",
-            "reliability": 0.0,
-            "hard_pattern_rule": False,
-        }
-    target = _pattern_features(sequence)
-    candidates: List[Tuple[float, str]] = []
-    for index in range(10, len(sequence)):
-        prefix = sequence[:index]
-        vector = _pattern_features(prefix)
-        distance = float(np.sqrt(np.mean(np.square(target - vector))))
-        similarity = math.exp(-4.4 * distance)
-        candidates.append((similarity, sequence[index]))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    neighbors = candidates[:24]
-    banker = 3.0
-    player = 3.0
-    support = 0
-    similarity_total = 0.0
-    for similarity, actual in neighbors:
-        similarity_total += similarity
-        if similarity >= 0.42:
-            support += 1
-        if actual == "B":
-            banker += similarity
-        else:
-            player += similarity
-    probability = banker / (banker + player)
-    mean_similarity = similarity_total / max(1, len(neighbors))
-    reliability = min(0.78, min(1.0, support / 12.0) * (0.45 + 0.55 * mean_similarity))
-    return {
-        "active": support >= 2,
-        "support": support,
-        "banker_probability": probability,
-        "direction": "B" if probability >= 0.5 else "P",
-        "edge": abs(probability - 0.5) * 2.0,
-        "reliability": reliability if support >= 2 else 0.0,
-        "mean_similarity": mean_similarity,
-        "hard_pattern_rule": False,
-    }
-
-
-def _detect_regime(sequence: Sequence[str]) -> Dict[str, Any]:
-    recent = list(sequence[-18:])
-    runs = _runs(recent)
-    current_run = runs[-1][1] if runs else 0
-    alternation = (
-        sum(a != b for a, b in zip(recent, recent[1:])) / max(1, len(recent) - 1)
-        if len(recent) >= 2 else 0.0
-    )
-    pair_rate = sum(length == 2 for _, length in runs[-8:]) / max(1, len(runs[-8:]))
-    if current_run >= 4:
-        name = "streak"
-    elif alternation >= 0.78:
-        name = "alternating"
-    elif pair_rate >= 0.60:
-        name = "double"
-    elif 0.42 <= alternation <= 0.68:
-        name = "chaotic"
-    else:
-        name = "transition"
-    return {
-        "name": name,
-        "current_run": current_run,
-        "alternation_rate": alternation,
-        "pair_rate": pair_rate,
-        "descriptor_only": True,
-        "controls_weight": False,
-    }
-
-
-def _structural_regime_component(sequence: Sequence[str]) -> Dict[str, Any]:
-    """將可重複的大路結構轉為 Adaptive 可用的正式成員。
-
-    short/mid/long 是近期比例模型，最後一顆天然權重最高；它們不能單獨
-    代表「單跳」或「雙跳」。此元件只在 run-length 結構已重複確認時啟用：
-
-    - 長龍：末段至少三顆同向。
-    - 單跳：最近四個 run 都是 1。
-    - 雙跳：最近三個完整 run 都是 2；若目前只走到 pair 的第一顆，先補
-      同邊，pair 完成才切到另一邊。
-    - 跳跳龍：最近四個 run 的長度交替為 1/2 或 2/1。
-
-    未確認時固定中性且 inactive，避免把單一最新結果偽裝成規律。
-    """
-    values = list(sequence[-36:])
-    runs = _runs(values)
-    if not runs:
-        return {
-            "active": False, "name": "mixed", "direction": "",
-            "banker_probability": 0.5, "reliability": 0.0,
-            "support": len(runs), "edge": 0.0, "reason": "run 不足",
-        }
-
-    last_side, last_length = runs[-1]
-    opposite = "P" if last_side == "B" else "B"
-    lengths = [length for _, length in runs]
-
-    def _active(name: str, direction: str, reliability: float, reason: str) -> Dict[str, Any]:
-        probability = 0.5 + (0.5 * reliability if direction == "B" else -0.5 * reliability)
-        return {
-            "active": True,
-            "name": name,
-            "direction": direction,
-            "banker_probability": float(max(0.02, min(0.98, probability))),
-            "reliability": float(reliability),
-            "support": len(runs),
-            "edge": float(reliability),
-            "run_lengths": lengths[-6:],
-            "reason": reason,
-        }
-
-    if last_length >= 3:
-        return _active(
-            "dragon",
-            last_side,
-            min(0.82, 0.64 + 0.045 * min(4, last_length - 3)),
-            f"末段 {last_length} 顆同向長龍",
-        )
-
-    if len(runs) < 3:
-        return {
-            "active": False, "name": "mixed", "direction": "",
-            "banker_probability": 0.5, "reliability": 0.0,
-            "support": len(runs), "edge": 0.0,
-            "run_lengths": lengths[-6:], "reason": "run 不足",
-        }
+    direction = last_side
+    edge = 0.0
 
     if len(lengths) >= 4 and all(length == 1 for length in lengths[-4:]):
-        return _active("single_chop", opposite, 0.76, "最近四個 run 均為單跳")
+        direction = "P" if last_side == "B" else "B"
+        edge = 0.10
+    elif len(lengths) >= 3 and all(length == 2 for length in lengths[-3:]):
+        direction = "P" if last_side == "B" else "B"
+        edge = 0.085
+    elif run == 1 and len(lengths) >= 3 and all(length == 2 for length in lengths[-3:-1]):
+        direction = last_side
+        edge = 0.08
+    elif run >= 3:
+        direction = last_side
+        edge = min(0.09, 0.045 + 0.01 * (run - 3))
+    elif alternation6 >= 0.80 and alternation12 >= 0.70:
+        direction = "P" if last_side == "B" else "B"
+        edge = 0.075
+    else:
+        recent_balance = _balance(seq, 8)
+        direction = "B" if recent_balance >= 0.0 else "P"
+        edge = min(0.045, abs(recent_balance) * 0.045)
 
-    # 雙跳的最後一組若只出現一顆，代表該 pair 尚未完成，方向應補同邊；
-    # 若 pair 已完成，才切換到另一邊。這可避免 BBPPBBP 被誤判為反打。
-    if len(lengths) >= 3 and all(length == 2 for length in lengths[-3:]):
-        return _active("double_chop", opposite, 0.74, "最近三個完整 run 均為雙跳")
-    if (
-        last_length == 1
-        and len(lengths) >= 3
-        and all(length == 2 for length in lengths[-3:-1])
-    ):
-        return _active("double_chop_building", last_side, 0.70, "雙跳結構中，正在補足 pair")
-
-    if len(lengths) >= 4:
-        tail = lengths[-4:]
-        if tail in ([1, 2, 1, 2], [2, 1, 2, 1]):
-            expected = tail[-1]
-            direction = last_side if last_length < expected else opposite
-            return _active(
-                "alternating_run_pattern",
-                direction,
-                0.70,
-                f"run 長度重複 {tail} 的跳跳龍節奏",
-            )
-
-    return {
-        "active": False,
-        "name": "mixed",
-        "direction": "",
-        "banker_probability": 0.5,
-        "reliability": 0.0,
-        "support": len(runs),
-        "edge": 0.0,
-        "run_lengths": lengths[-6:],
-        "reason": "沒有通過長龍／單跳／雙跳／跳跳龍確認",
-    }
-
-
-def _bounded_recent_weights(models: Mapping[str, Mapping[str, Any]]) -> Dict[str, float]:
-    priors = {
-        "short": 0.19,
-        "mid": 0.20,
-        "long": 0.22,
-        "pattern": 0.19,
-        "analogue": 0.20,
-    }
-    raw: Dict[str, float] = {}
-    for name, model in models.items():
-        if not bool(model.get("active", True)):
-            raw[name] = 0.0
-            continue
-        reliability = max(0.0, min(1.0, float(model.get("reliability", 0.0) or 0.0)))
-        support = max(0, int(model.get("support", 0) or 0))
-        support_score = min(1.0, support / 18.0)
-        probability = _clip_probability(model.get("banker_probability", 0.5))
-        edge_score = min(1.0, abs(probability - 0.5) / 0.12)
-        raw[name] = priors[name] * (0.48 + 0.34 * reliability + 0.12 * support_score + 0.06 * edge_score)
-
-    total = sum(raw.values()) or 1.0
-    weights = {name: value / total for name, value in raw.items()}
-    # 單一近期模型不得過度主導。
-    for _ in range(8):
-        excess = 0.0
-        free: List[str] = []
-        for name, value in weights.items():
-            if value > ROAD_RECENT_MAX_MODEL_WEIGHT:
-                excess += value - ROAD_RECENT_MAX_MODEL_WEIGHT
-                weights[name] = ROAD_RECENT_MAX_MODEL_WEIGHT
-            else:
-                free.append(name)
-        if excess <= 1e-12 or not free:
-            break
-        free_total = sum(max(1e-12, raw[name]) for name in free)
-        for name in free:
-            weights[name] += excess * max(1e-12, raw[name]) / free_total
-    total = sum(weights.values()) or 1.0
-    return {name: value / total for name, value in weights.items()}
+    confidence = _clip(
+        min(0.75, len(seq) / 36.0) * (0.55 + 0.45 * derived_consensus),
+        0.0,
+        0.75,
+    )
+    signed = edge if direction == "B" else -edge
+    p_b = _clip(0.5 + signed * confidence, 0.35, 0.65)
+    return float(p_b), direction, float(confidence)
 
 
 def calculate_road_probabilities(
@@ -380,188 +231,116 @@ def calculate_road_probabilities(
     initial_image_count: int = 0,
     manual_count: int = 0,
 ) -> Dict[str, Any]:
-    raw_outcomes = normalize_raw_outcomes(values)
-    sequence = [value for value in raw_outcomes if value in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
-    length = len(sequence)
-    tie_count = sum(value == "T" for value in raw_outcomes)
-    if seed is None:
-        seed_payload = (
-            "".join(raw_outcomes)
-            + f"|{max(0, int(initial_image_count or 0))}"
-            + f"|{max(0, int(manual_count or 0))}"
-        )
-        run_seed = int.from_bytes(
-            sha256(seed_payload.encode("utf-8")).digest()[:4],
-            byteorder="big",
-            signed=False,
-        )
-    else:
-        run_seed = int(seed) & 0xFFFFFFFF
+    del seed
+    raw = normalize_raw_outcomes(values)
+    sequence = [v for v in raw if v in {"B", "P"}][-ROAD_HISTORY_LIMIT:]
+    road = build_big_road(sequence)
+    heights = list(road["column_heights"])
 
-    planning = analyze_full_road_pattern(
+    big_eye = _derived_road(heights, 1)
+    small_road = _derived_road(heights, 2)
+    cockroach_road = _derived_road(heights, 3)
+    derived_stats = {
+        "big_eye": _derived_stats(big_eye),
+        "small_road": _derived_stats(small_road),
+        "cockroach_road": _derived_stats(cockroach_road),
+    }
+    saturations = [derived_stats[name]["saturation"] for name in ("big_eye", "small_road", "cockroach_road")]
+    mean_sat = sum(saturations) / 3.0
+    dispersion = (
+        abs(saturations[0] - saturations[1])
+        + abs(saturations[1] - saturations[2])
+        + abs(saturations[2] - saturations[0])
+    ) / 3.0
+    derived_consensus = _clip(mean_sat * (1.0 - dispersion), 0.0, 1.0)
+
+    side, run = _streak(sequence)
+    streak_sign = 1.0 if side == "B" else -1.0 if side == "P" else 0.0
+    tie_rate = raw.count("T") / max(1, len(raw))
+    alt6 = (_transition_rate(sequence, 6) - 0.5) * 2.0
+    alt12 = (_transition_rate(sequence, 12) - 0.5) * 2.0
+    acceleration = _transition_rate(sequence, 6) - _transition_rate(sequence, 14)
+
+    road_b, road_direction, road_confidence = _road_structural_probability(
         sequence,
-        grid_cells=grid_cells,
-        initial_image_count=initial_image_count,
-        manual_count=manual_count,
+        derived_consensus=derived_consensus,
     )
-    structural_regime = _structural_regime_component(sequence)
-    recent_models: Dict[str, Dict[str, Any]] = {
-        "short": _window_model(sequence, ROAD_SHORT_WINDOW, 0.84),
-        "mid": _window_model(sequence, ROAD_MID_WINDOW, 0.91),
-        "long": _window_model(sequence, ROAD_LONG_WINDOW, 0.965),
-        "pattern": _pattern_model(sequence),
-        "analogue": _analogue_model(sequence),
-    }
-    recent_weights = _bounded_recent_weights(recent_models)
-    recent_components = {
-        name: _clip_probability(model.get("banker_probability", 0.5))
-        for name, model in recent_models.items()
-    }
-    recent_center = sum(recent_weights.get(name, 0.0) * probability for name, probability in recent_components.items())
-    recent_disagreement = math.sqrt(sum(
-        recent_weights.get(name, 0.0) * (probability - recent_center) ** 2
-        for name, probability in recent_components.items()
-    ))
+    recent_balance = _balance(sequence, 8)
+    road_agreement = _clip(1.0 - abs(road_b - (0.5 + 0.08 * recent_balance)) / 0.20, 0.0, 1.0)
 
-    # 這裡只需要加權 Beta 分布的均值與標準差，不需要真的抽樣。
-    # 舊版每次使用新的隨機 seed，會讓完全相同的牌路產生不同 context，
-    # 進而污染 cMAB 的方差基準。解析式同時更快且完全可重現。
-    recent_probability = 0.0
-    recent_variance = 0.0
-    for name, model in recent_models.items():
-        weight = recent_weights.get(name, 0.0)
-        if weight <= 0:
-            continue
-        probability = recent_components[name]
-        reliability = max(0.05, float(model.get("reliability", 0.0) or 0.0))
-        concentration = 12.0 + 30.0 * reliability
-        alpha = max(0.5, probability * concentration)
-        beta = max(0.5, (1.0 - probability) * concentration)
-        total_concentration = alpha + beta
-        beta_mean = alpha / total_concentration
-        beta_variance = (
-            alpha * beta
-            / (
-                total_concentration * total_concentration
-                * (total_concentration + 1.0)
-            )
-        )
-        recent_probability += weight * beta_mean
-        recent_variance += weight * weight * beta_variance
-    if length:
-        recent_probability = float(recent_probability)
-        recent_uncertainty = float(math.sqrt(max(0.0, recent_variance)))
-    else:
-        recent_probability = 0.5
-        recent_uncertainty = 0.5
-    recent_reliability = max(
-        0.0,
-        min(
-            0.82,
-            0.34 * min(1.0, length / 36.0)
-            + 0.34 * (1.0 - min(1.0, recent_disagreement / ROAD_RECENT_MAX_DISAGREEMENT))
-            + 0.32 * (1.0 - min(1.0, recent_uncertainty / 0.16)),
-        ),
-    )
-
-    planning_probability = _clip_probability(planning.get("banker_probability", 0.5))
-    planning_reliability = max(0.0, min(1.0, float(planning.get("reliability", 0.0) or 0.0)))
-
-    # 相容舊欄位的 road aggregate；主引擎 V10.8 會分別使用 planning/recent，不依賴此固定融合。
-    planning_share = 0.60 if bool(planning.get("ok")) else 0.0
-    recent_share = 1.0 - planning_share
-    banker_probability = planning_probability * planning_share + recent_probability * recent_share
-    direction = "B" if banker_probability >= 0.5 else "P"
-    combined_reliability = planning_reliability * planning_share + recent_reliability * recent_share
-
-    model_outputs: Dict[str, Dict[str, Any]] = {
-        **{
-            name: {
-                **model,
-                "banker_probability": round(recent_components[name], 8),
-                "effective_weight": round(recent_weights.get(name, 0.0), 8),
-                "group": "recent_road",
-            }
-            for name, model in recent_models.items()
-        },
-        "full_road": {
-            **planning,
-            "banker_probability": round(planning_probability, 8),
-            "effective_weight": 1.0,
-            "group": "road_planning",
-        },
-        "structural_regime": {
-            **structural_regime,
-            "effective_weight": 1.0 if structural_regime.get("active") else 0.0,
-            "group": "confirmed_run_length_structure",
-        },
-    }
+    road_features = [
+        1.0,
+        min(1.0, len(sequence) / 60.0),
+        _balance(sequence),
+        _balance(sequence, 3),
+        recent_balance,
+        streak_sign,
+        min(1.0, run / 8.0),
+        _clip(alt6),
+        _clip(alt12),
+        _clip(acceleration),
+        _streak_break(sequence),
+        streak_sign * min(1.0, max(0, run - 3) / 5.0),
+        _clip(tie_rate / 0.20, 0.0, 1.0),
+        _clip((road_b - 0.5) * 2.0),
+        _clip(recent_balance),
+        road_confidence,
+        road_agreement,
+        saturations[0],
+        saturations[1],
+        saturations[2],
+        derived_consensus,
+    ]
+    if len(road_features) != len(ROAD_FEATURE_NAMES):
+        raise RuntimeError("Road 21D feature dimension mismatch")
 
     return {
         "ok": bool(sequence),
-        "engine": "ROAD_SPLIT_PLANNING_RECENT_V10_9_NO_TRANSITION_CHAIN",
-        "pipeline_stage": "full_road_planning_plus_non_transition_recent_experts",
-        "run_seed": run_seed,
+        "engine": "ROAD_FEATURE_EXTRACTOR_21D_V1",
+        "pipeline_stage": "image_history_to_road_features",
         "sequence": sequence,
-        "raw_outcomes": raw_outcomes,
-        "sample_count": length,
-        "raw_sample_count": len(raw_outcomes),
-        "tie_count": tie_count,
-        "observed_tie_rate": tie_count / max(1, len(raw_outcomes)),
-        "banker_probability": float(banker_probability),
-        "player_probability": float(1.0 - banker_probability),
-        "direction": direction,
-        "direction_text": "莊" if direction == "B" else "閒",
-        "action": direction if combined_reliability >= 0.50 else "O",
-        "action_text": "莊" if direction == "B" and combined_reliability >= 0.50 else "閒" if direction == "P" and combined_reliability >= 0.50 else "觀望",
-        "signal_allowed": combined_reliability >= 0.50,
-        "signal_status_text": "牌路規劃與近期專家已完成" if length >= 10 else "牌路樣本累積中",
-        "signal_reason": "完整牌路規劃與受限近期專家分開輸出，交由主 Stacking 統整",
-        "confidence_score": float(combined_reliability),
-        "confidence_label": "較高" if combined_reliability >= 0.72 else "中等" if combined_reliability >= 0.50 else "偏低",
-        "uncertainty": float(recent_uncertainty),
-        "model_disagreement": float(recent_disagreement),
-        "planning_probability": float(planning_probability),
-        "planning_player_probability": float(1.0 - planning_probability),
-        "planning_reliability": float(planning_reliability),
-        "planning_available": bool(planning.get("ok")),
-        "recent_probability": float(recent_probability),
-        "recent_player_probability": float(1.0 - recent_probability),
-        "recent_reliability": float(recent_reliability),
-        "recent_uncertainty": float(recent_uncertainty),
-        "recent_uncertainty_method": "analytic_independent_beta_moments",
-        "recent_model_disagreement": float(recent_disagreement),
-        "full_road_analysis": planning,
-        "structural_regime": dict(structural_regime),
-        "models": model_outputs,
+        "raw_outcomes": raw,
+        "sample_count": len(sequence),
+        "raw_sample_count": len(raw),
+        "tie_count": raw.count("T"),
+        "observed_tie_rate": tie_rate,
+        "banker_probability": float(road_b),
+        "player_probability": float(1.0 - road_b),
+        "direction": road_direction or ("B" if road_b >= 0.5 else "P"),
+        "direction_text": "莊" if (road_direction or "B") == "B" else "閒",
+        "confidence_score": float(road_confidence),
+        "confidence_label": (
+            "較高" if road_confidence >= 0.65 else
+            "中等" if road_confidence >= 0.45 else "偏低"
+        ),
+        "road_feature_names": list(ROAD_FEATURE_NAMES),
+        "road_features": [round(float(v), 10) for v in road_features],
+        "geometry": road,
+        "column_heights": heights,
+        "run_lengths": [length for _, length in _runs(sequence)],
+        "derived_roads": {
+            "big_eye": big_eye,
+            "small_road": small_road,
+            "cockroach_road": cockroach_road,
+        },
+        "derived_stats": derived_stats,
+        "derived_road_consensus": float(derived_consensus),
         "component_probabilities": {
-            name: {
-                "B": float(model_outputs[name].get("banker_probability", 0.5)),
-                "P": 1.0 - float(model_outputs[name].get("banker_probability", 0.5)),
-                "T": 0.0,
+            "road_structure": {"B": float(road_b), "P": float(1.0 - road_b), "T": 0.0}
+        },
+        "models": {
+            "road_structure": {
+                "active": bool(sequence),
+                "banker_probability": float(road_b),
+                "player_probability": float(1.0 - road_b),
+                "direction": road_direction,
+                "reliability": float(road_confidence),
             }
-            for name in model_outputs
         },
-        "weights": {name: float(value) for name, value in recent_weights.items()},
-        "regime": _detect_regime(sequence),
-        "supports": {
-            "short": int(recent_models["short"].get("support", 0)),
-            "mid": int(recent_models["mid"].get("support", 0)),
-            "long": int(recent_models["long"].get("support", 0)),
-            "pattern": int(recent_models["pattern"].get("support", 0)),
-            "analogue": int(recent_models["analogue"].get("support", 0)),
-            "planning": int(planning.get("support", 0) or 0),
-            "structural_regime": int(structural_regime.get("support", 0) or 0),
-        },
-        "removed_transition_chain_orders": [1, 2, 3],
-        "eligible_for_core": length >= 10,
-        "suggested_core_weight": 0.0,
-        "max_core_weight": 0.0,
-        "data_scope": "entire_history_planning_and_bounded_recent_experts",
-        "full_history_used_count": length,
+        "grid_cell_count": len(list(grid_cells or [])),
         "initial_image_count": max(0, int(initial_image_count or 0)),
         "manual_count": max(0, int(manual_count or 0)),
-        "grid_cell_count": len(list(grid_cells or [])),
+        "data_scope": "recognized_history_only",
     }
 
 
@@ -586,19 +365,14 @@ def fuse_road_with_main_prediction(
     main_prediction: Mapping[str, Any],
     road_analysis: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """相容舊版呼叫；V10.8 主引擎內已完成 Stacking，不再做第二次融合。"""
     result = dict(main_prediction or {})
     result["road_support"] = dict(road_analysis or {})
-    internal = dict(result.get("road_integration") or {})
-    result["road_fusion"] = internal or {
-        "processed_inside_core": False,
-        "applied": False,
-        "reason": "V10.8 建議由主引擎內部統整",
-    }
     return result
 
 
 __all__ = [
+    "ROAD_FEATURE_NAMES",
+    "build_big_road",
     "build_road_context",
     "calculate_road_probabilities",
     "fuse_road_with_main_prediction",
