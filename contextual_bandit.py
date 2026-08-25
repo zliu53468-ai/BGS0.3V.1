@@ -1,33 +1,12 @@
-"""BGS cMAB 主模型：LinUCB 上下文相關多臂老虎機。
+"""CUSUM-LinUCB core for BGS.
 
-主要方向只有兩個 Arm：B（莊）與 P（閒）。
-本模組不使用粒子濾波、超幾何分布、蒙地卡羅或 Stacking。
-每次預測保存上下文向量；使用者回報實際結果後，再以 reward 更新 Arm。
-和局不更新 B/P Arm。
-
-V2.0 非平穩牌路版：
-- 精確使用每個 Arm 的 x^T A^-1 x 預測方差與置信區間寬度。
-- 另以共享 context information matrix 的 x^T A_ctx^-1 x 判定牌路新穎度，
-  避免某一個 Arm 樣本較少時讓系統永久誤判為 OOD。
-- 每個 UID 以經驗方差歷史平均 + 1.3 個標準差建立動態門檻。
-- 同時計算最近 12 局排列熵、B/P 卡方與經驗方差診斷。
-- 只有「模型方差超標且排列熵 > 0.95」才標記極端混沌區間。
-- OOD 必須等動態方差基準與真實回饋都成熟，避免新 UID 假熔斷。
-- 上下文新增最近 3 局、5 局轉換波動、斷龍、長龍尾端、單跳開端，
-  以及大眼仔／小路／曱甴路的規律飽和度。
-- 以遞迴 ridge forgetting factor 淡化舊鞋路；偵測斷龍時加速遺忘，
-  但不複製單局樣本，避免 Few-shot 對亂數過擬合。
-- B/P 結果揭曉後以完整資訊同時更新兩個 Arm，消除選擇偏誤。
-- reward 只由已揭曉的真實 B/P 決定，模型自己的信心、選擇方向與連錯
-  不能再回頭改寫訓練標籤，避免正回授把隨機單局誤當成規律。
-- 每次預測會從目前已看見、且早於目標局的路紙做 prequential replay，
-  讓初始截圖的完整歷史真正參與擬合，且不跨鞋污染。
-
-banker_rate / player_rate 是方向分數正規化結果，不是真實開出機率。
+Two-sided CUSUM watches residual = observed_reward - expected_reward.  A sustained
+shift hard-resets A to the ridge identity and b to zero.  The first 3 resolved B/P
+hands after a reset are an observe-only vacuum; hands 4-5 re-enter with low weight.
+Returned B/P percentages are normalized model scores, not guaranteed probabilities.
 """
 from __future__ import annotations
 
-from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
@@ -37,3701 +16,438 @@ import math
 import time
 
 import numpy as np
-
 from road_model import build_road_context
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CMAB-LINUCB-V3.2-REGIME-FIRST-PREQUENTIAL"
-STATE_SCHEMA_VERSION = "CMAB-EPISODE-REPLAY-V4"
-COMPATIBLE_STATE_SCHEMA_VERSIONS = {
-    "CMAB-UID-ISOLATED-V1",
-    "CMAB-UID-ISOLATED-V2",
-    STATE_SCHEMA_VERSION,
-}
+MODEL_VERSION = "CUSUM-LINUCB-V1.0-DYNAMIC-RESET"
+STATE_SCHEMA_VERSION = "CUSUM-LINUCB-STATE-V1"
 FEATURE_NAMES = (
-    "bias", "history_maturity", "global_banker_balance",
-    "recent5_banker_balance", "recent10_banker_balance",
-    "recent20_banker_balance", "recent40_banker_balance",
-    "current_streak_direction", "current_streak_length",
-    "alternation5", "alternation10", "alternation20",
-    "last_outcome_direction", "previous_outcome_direction",
-    "observed_tie_rate", "road_planning_balance",
-    "road_recent_balance", "road_confidence",
-    "road_planning_reliability", "road_recent_reliability",
-    "road_agreement", "markov1_balance", "markov2_balance",
-    "markov3_balance",
-    # V2.0 全部附加在舊 24 維之後，讓既有 A／b 可無損升維。
-    "shoe_round_maturity", "recent3_banker_balance",
-    "recent5_transition_volatility", "recent5_run_volatility",
-    "streak_break_signal", "long_dragon_tail_pressure",
-    "single_jump_onset", "big_eye_saturation",
-    "small_road_saturation", "cockroach_road_saturation",
-    "derived_road_consensus",
+    "bias", "history_maturity", "global_banker_balance", "recent3_banker_balance",
+    "recent8_banker_balance", "current_streak_direction", "current_streak_length",
+    "alternation6", "alternation12", "transition_acceleration", "streak_break_signal",
+    "long_dragon_tail_pressure", "observed_tie_rate", "road_planning_balance",
+    "road_recent_balance", "road_confidence", "road_agreement", "big_eye_saturation",
+    "small_road_saturation", "cockroach_road_saturation", "derived_road_consensus",
 )
 CONTEXT_DIM = len(FEATURE_NAMES)
-BASE_DIR = Path(__file__).resolve().parent
+
+# Defaults tuned to avoid one-hand resets in a noisy +/-1 reward stream.
+CUSUM_ALPHA = 0.65
+CUSUM_L2 = 1.0
+CUSUM_FORGETTING_FACTOR = 0.985
+CUSUM_DRIFT_V = 0.15
+CUSUM_THRESHOLD_H = 4.50
+CUSUM_MIN_OBSERVATIONS = 8
+CUSUM_VACUUM_HANDS = 5
+CUSUM_FORCE_OBSERVE_HANDS = 3
+PREQUENTIAL_WARMUP_BP = 6
+HISTORY_REPLAY_LIMIT = 120
+TIE_PRIOR = 0.095156
+TIE_PRIOR_STRENGTH = 40.0
 _LOCK = RLock()
+BASE_DIR = Path(__file__).resolve().parent
 
 
-"""正式牌路模型參數。
-
-數值固定在程式碼內，避免 Render 裡遺留的 CMAB_* 參數在重新部署後改變
-同一套模型。LINE Token／密鑰屬部署機密，不在此硬寫。
-"""
-
-# 35 維、每靴通常只有數十筆 B/P 樣本：較強 ridge 抑制單一長龍／單跳的
-# 過度擬合；較高 temperature 讓輸出的方向分數不因微小差異而假裝極端。
-CMAB_ALPHA = 0.72
-CMAB_L2 = 3.00
-CMAB_SCORE_TEMPERATURE = 1.10
-CMAB_TIE_PRIOR = 0.095156
-CMAB_TIE_PRIOR_STRENGTH = 40.0
-CMAB_MIN_SIGNAL_EDGE = 0.012
-CMAB_MIN_SIGNAL_UPDATES = 6
-
-# 路型優先決策：這不是另一組機率加權，而是先辨識「目前正在走哪一種
-# 結構」，再決定該由結構規則或 LinUCB 分數作為本局的方向來源。
-#
-# 只有已知的 B/P 時序可作判斷，T 會保留在完整歷史中，但不推進大路結構。
-# 規則刻意要求至少三顆同向或高度交替，避免把「最後剛開的一顆」錯當成龍。
-CMAB_REGIME_WINDOW = 8
-CMAB_REGIME_MIN_HISTORY = 4
-CMAB_TREND_MIN_STREAK = 3
-CMAB_TREND_MAX_TRANSITION_RATE = 0.45
-CMAB_CHOP_MIN_TRANSITION_RATE = 0.70
-CMAB_REGIME_MIN_STRENGTH = 0.66
-# 當 LinUCB 的條件分數差已很大時，不用簡單路型規則硬蓋掉它；反之，
-# 分數接近時，優先採用可直接解釋的長龍／單跳結構。
-CMAB_REGIME_OVERRIDE_MAX_BANDIT_EDGE = 0.10
-
-# 遞迴 ridge 衰減：A <- lambda*A + (1-lambda)*ridge*I + xx^T。
-# 舊版最快掉到 0.89，單局跳路便只剩約 9 局有效記憶；新版仍會對真實
-# 相變遺忘，但最低保留 0.96，避免一直追著剛開的一顆跑。
-CMAB_FORGETTING_FACTOR = 0.985
-CMAB_REVERSAL_FORGETTING_FACTOR = 0.970
-CMAB_STABLE_FORGETTING_FACTOR = 0.992
-CMAB_MIN_DYNAMIC_FORGETTING_FACTOR = 0.935
-CMAB_PHASE_SOFT_RESET_MAX = 0.10
-CMAB_PHASE_DISTANCE_THRESHOLD = 0.24
-CMAB_RECENT_ACCURACY_WINDOW = 20
-
-# 35 維中有幾組是同一條牌路現象的不同投影。例如 recent5 balance、
-# streak 與 road planning 都可能同時對一條長龍作出同方向反應。LinUCB 在
-# 一靴僅數十筆資料時，會把這類共線特徵誤當成多份獨立證據。以下係數不
-# 改變任何對外特徵名稱或維度，只在進矩陣前把同群訊號的總能量收斂。
-CMAB_CONTEXT_GROUP_SCALES = {
-    "balance": 0.82,
-    "recent_direction": 0.78,
-    "road_probability": 0.72,
-    "derived_road": 0.78,
-}
-
-# Full-information 下兩個 Arm 的不確定性項是對稱的，Alpha 僅保留為
-# 診斷／分數平滑用途，不能再因長龍把方向硬鎖死。
-CMAB_ALPHA_TREND_FLOOR = 0.70
-CMAB_ALPHA_MISS_BOOST = 0.15
-CMAB_ALPHA_ENTROPY_BOOST = 0.20
-
-# 每張完整路紙至少以六個已結算 B/P 前綴開始 prequential replay；所有
-# 每一步 context 都只看目標局之前的資料，絕不偷看下一局答案。
-CMAB_PREQUENTIAL_WARMUP_BP = 6
-CMAB_HISTORY_REPLAY_LIMIT = 160
-REWARD_SEMANTICS = "outcome_only_full_information_v1"
-
-# 動態 OOD 閾值：歷史平均 + sigma × 歷史標準差。
-CMAB_UNCERTAINTY_SIGMA = 1.30
-CMAB_PERMUTATION_WINDOW = 12
-CMAB_PERMUTATION_ORDER = 3
-CMAB_PERMUTATION_ENTROPY_THRESHOLD = 0.95
-CMAB_UNCERTAINTY_MIN_SAMPLES = 8
-CMAB_UNCERTAINTY_HISTORY_SIZE = 128
-CMAB_DYNAMIC_THRESHOLD_FLOOR = 0.25
-CMAB_UNKNOWN_STD_THRESHOLD = 1.35
-
-# Few-shot／短線接管均停用；僅保留輸出欄位相容。
-CMAB_UNKNOWN_UPDATE_MULTIPLIER = 1.0
-CMAB_UNKNOWN_CONFIDENCE_CAP = 0.28
-CMAB_UNKNOWN_LONG_TERM_WEIGHT = 0.08
-CMAB_MAX_EVENT_IDS = 5000
-CMAB_MAX_PENDING_OOD_CONTEXTS = 32
-
-
-def _resolve_state_file() -> Path:
-    """選擇 V3 專用狀態檔，絕不讀取舊 reward 的矩陣。
-
-    原 ``contextual_bandit_state.json`` 不刪除，保留做舊版稽核；新模型另用
-    V3 檔案，避免舊版自我強化的 A/b 在部署後繼續影響新方向。
-    """
-    configured = Path("/var/data/contextual_bandit_state_v3.json")
-    candidates = [
-        configured,
-        BASE_DIR / "data" / "contextual_bandit_state_v3.json",
-        Path("/tmp/bgs_contextual_bandit_state_v3.json"),
-    ]
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
+def _state_file() -> Path:
+    for p in (
+        Path("/var/data/contextual_bandit_state_cusum_v1.json"),
+        BASE_DIR / "data" / "contextual_bandit_state_cusum_v1.json",
+        Path("/tmp/bgs_contextual_bandit_state_cusum_v1.json"),
+    ):
         try:
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            probe = candidate.parent / f".cmab_write_test_{time.time_ns()}"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            if candidate != configured:
-                print(f"CMAB V3 state fallback: {configured} -> {candidate}")
-            return candidate
-        except OSError as exc:
-            print(f"CMAB V3 state unavailable: {candidate}: {exc}")
-    raise RuntimeError("No writable CMAB_STATE_FILE path is available")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            q = p.parent / f".cusum_probe_{time.time_ns()}"
+            q.write_text("ok", encoding="utf-8"); q.unlink(missing_ok=True)
+            return p
+        except OSError:
+            pass
+    raise RuntimeError("No writable CUSUM state path")
 
 
-CMAB_STATE_FILE = _resolve_state_file()
+CMAB_STATE_FILE = _state_file()
 
 
-def _clean_history(values: Iterable[Any]) -> List[str]:
-    result: List[str] = []
+def _clip(v: Any, lo: float = -1.0, hi: float = 1.0) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(lo, min(hi, x)) if math.isfinite(x) else 0.0
+
+
+def _clean(values: Iterable[Any]) -> List[str]:
+    out: List[str] = []
     for item in values:
-        if isinstance(item, Mapping):
-            raw = item.get("outcome") or item.get("actual") or item.get("actual_outcome") or item.get("virtual_outcome")
-        else:
-            raw = item
+        raw = item.get("outcome") if isinstance(item, Mapping) else item
         value = str(raw or "").upper().strip()
         if value in {"B", "P", "T"}:
-            result.append(value)
-    return result[-2000:]
+            out.append(value)
+    return out[-2000:]
 
 
-def _clip(value: Any, minimum: float = -1.0, maximum: float = 1.0) -> float:
-    try:
-        return max(minimum, min(maximum, float(value)))
-    except Exception:
-        return 0.0
+def _balance(seq: Sequence[str], n: Optional[int] = None) -> float:
+    s = list(seq[-n:] if n else seq)
+    return 0.0 if not s else _clip((sum(x == "B" for x in s) / len(s) - 0.5) * 2.0)
 
 
-def _prob_balance(probability: Any) -> float:
-    try:
-        return _clip((float(probability) - 0.5) * 2.0)
-    except Exception:
-        return 0.0
+def _transition_rate(seq: Sequence[str], n: int) -> float:
+    s = list(seq[-n:])
+    return 0.0 if len(s) < 2 else sum(a != b for a, b in zip(s, s[1:])) / (len(s) - 1)
 
 
-def _banker_balance(sequence: Sequence[str], size: Optional[int] = None) -> float:
-    values = list(sequence[-size:] if size else sequence)
-    if not values:
-        return 0.0
-    banker = sum(value == "B" for value in values)
-    return _clip((banker / len(values) - 0.5) * 2.0)
+def _alternation(seq: Sequence[str], n: int) -> float:
+    return _clip((_transition_rate(seq, n) - 0.5) * 2.0)
 
 
-def _alternation(sequence: Sequence[str], size: int) -> float:
-    values = list(sequence[-size:])
-    if len(values) < 2:
-        return 0.0
-    rate = sum(a != b for a, b in zip(values, values[1:])) / (len(values) - 1)
-    return _clip((rate - 0.5) * 2.0)
-
-
-def _streak(sequence: Sequence[str]) -> tuple[str, int]:
-    if not sequence:
+def _streak(seq: Sequence[str]) -> tuple[str, int]:
+    if not seq:
         return "", 0
-    direction = sequence[-1]
-    length = 1
-    for value in reversed(sequence[:-1]):
-        if value != direction:
+    side, length = seq[-1], 1
+    for x in reversed(seq[:-1]):
+        if x != side:
             break
         length += 1
-    return direction, length
+    return side, length
 
 
-def _transition_rate(sequence: Sequence[str], size: int) -> float:
-    """最近窗口的 B/P 轉換率；和局不推進牌路時間軸。"""
-    values = list(sequence[-size:])
-    if len(values) < 2:
+def _streak_break(seq: Sequence[str]) -> float:
+    s = list(seq)
+    if len(s) < 4 or s[-1] == s[-2]:
         return 0.0
-    return float(
-        sum(a != b for a, b in zip(values, values[1:]))
-        / (len(values) - 1)
-    )
-
-
-def _recent_run_volatility(sequence: Sequence[str], size: int = 5) -> float:
-    """以窗口內 run length 的離散程度描述短週期震盪。"""
-    values = list(sequence[-size:])
-    if len(values) < 2:
-        return 0.0
-    runs: List[int] = []
-    previous = ""
-    for value in values:
-        if runs and value == previous:
-            runs[-1] += 1
-        else:
-            runs.append(1)
-        previous = value
-    if len(runs) <= 1:
-        return 0.0
-    return float(min(1.0, float(np.std(runs)) / 2.0))
-
-
-def _streak_break_signal(sequence: Sequence[str]) -> float:
-    """最新一局是否剛斷掉至少 3 顆的龍；符號代表新方向。"""
-    values = list(sequence)
-    if len(values) < 4 or values[-1] == values[-2]:
-        return 0.0
-    previous_side = values[-2]
-    previous_run = 1
-    for value in reversed(values[:-2]):
-        if value != previous_side:
+    old, run = s[-2], 1
+    for x in reversed(s[:-2]):
+        if x != old:
             break
-        previous_run += 1
-    if previous_run < 3:
+        run += 1
+    if run < 3:
         return 0.0
-    sign = 1.0 if values[-1] == "B" else -1.0
-    return sign * min(1.0, previous_run / 6.0)
+    return (1.0 if s[-1] == "B" else -1.0) * min(1.0, run / 6.0)
 
 
-def _long_dragon_tail_pressure(sequence: Sequence[str]) -> float:
-    """長龍尾端壓力，而非宣稱能知道物理上的下一張牌。"""
-    direction, length = _streak(sequence)
-    if length < 4:
-        return 0.0
-    sign = 1.0 if direction == "B" else -1.0
-    return sign * min(1.0, (length - 3) / 5.0)
-
-
-def _single_jump_onset(sequence: Sequence[str]) -> float:
-    """最近 4 局是否形成單跳開端；符號代表最新落點。"""
-    values = list(sequence[-4:])
-    if len(values) < 4 or not all(
-        left != right for left, right in zip(values, values[1:])
-    ):
-        return 0.0
-    return 1.0 if values[-1] == "B" else -1.0
-
-
-def _derived_road_saturation(
-    road_context: Mapping[str, Any],
-    road_name: str,
-) -> float:
-    """下三路規律飽和度：0 為中性，1 為近期顏色／延續高度集中。"""
-    planning = road_context.get("full_road_analysis")
+def _road_saturation(road: Mapping[str, Any], name: str) -> float:
+    planning = road.get("full_road_analysis")
     if not isinstance(planning, Mapping):
-        models = road_context.get("models")
-        full_road = models.get("full_road") if isinstance(models, Mapping) else None
-        planning = full_road if isinstance(full_road, Mapping) else {}
-    derived_stats = planning.get("derived_stats")
-    stats = (
-        derived_stats.get(road_name)
-        if isinstance(derived_stats, Mapping)
-        else None
-    )
+        models = road.get("models")
+        planning = models.get("full_road") if isinstance(models, Mapping) else {}
+    stats = dict(planning.get("derived_stats") or {}).get(name) if isinstance(planning, Mapping) else None
     if not isinstance(stats, Mapping):
         return 0.0
     balance = _clip(stats.get("balance", 0.0), 0.0, 1.0)
-    continuation = _clip(
-        stats.get("recent_continuation", 0.5), 0.0, 1.0
-    )
-    continuation_concentration = abs(2.0 * continuation - 1.0)
-    return float(max(balance, continuation_concentration))
+    cont = _clip(stats.get("recent_continuation", 0.5), 0.0, 1.0)
+    return max(balance, abs(2.0 * cont - 1.0))
 
 
-def _model_probability(road_context: Mapping[str, Any], model_name: str, fallback: float = 0.5) -> float:
-    models = road_context.get("models")
-    if not isinstance(models, Mapping):
-        return fallback
-    model = models.get(model_name)
-    if not isinstance(model, Mapping):
-        return fallback
+def _prob_balance(v: Any) -> float:
     try:
-        return float(model.get("banker_probability", fallback) or fallback)
-    except Exception:
-        return fallback
-
-
-def _stabilize_context_vector(values: Sequence[float]) -> List[float]:
-    """在不改變 35 維接口下抑制共線牌路證據。
-
-    不刪除任何牌路資料，也不直接改寫 B/P；只是避免同一條長龍同時由
-    近期比例、上一局、長龍與 road probability 多次放大成獨立證據。
-    """
-    vector = [float(value) for value in values]
-    index = {name: position for position, name in enumerate(FEATURE_NAMES)}
-    groups = {
-        "balance": (
-            "global_banker_balance", "recent5_banker_balance",
-            "recent10_banker_balance", "recent20_banker_balance",
-            "recent40_banker_balance", "recent3_banker_balance",
-        ),
-        "recent_direction": (
-            "current_streak_direction", "current_streak_length",
-            "last_outcome_direction", "previous_outcome_direction",
-            "long_dragon_tail_pressure", "single_jump_onset",
-        ),
-        "road_probability": (
-            "road_planning_balance", "road_recent_balance",
-            "markov1_balance", "markov2_balance", "markov3_balance",
-        ),
-        "derived_road": (
-            "big_eye_saturation", "small_road_saturation",
-            "cockroach_road_saturation", "derived_road_consensus",
-        ),
-    }
-    for group_name, feature_names in groups.items():
-        scale = float(CMAB_CONTEXT_GROUP_SCALES[group_name])
-        for name in feature_names:
-            vector[index[name]] *= scale
-    return [round(_clip(value), 10) for value in vector]
+        p = float(v)
+    except (TypeError, ValueError):
+        p = 0.5
+    return _clip((p - 0.5) * 2.0)
 
 
 def build_context_vector(history: Iterable[Any], *, road_context: Optional[Mapping[str, Any]] = None) -> List[float]:
-    """建立固定上下文；B/P 規律特徵不讓和局推進時間軸。"""
-    raw = _clean_history(history)
-    bp = [value for value in raw if value in ARMS]
+    raw = _clean(history)
+    bp = [x for x in raw if x in ARMS]
     road = dict(road_context or {})
-    streak_direction, streak_length = _streak(bp)
-    last_direction = 1.0 if bp and bp[-1] == "B" else -1.0 if bp else 0.0
-    previous_direction = 1.0 if len(bp) >= 2 and bp[-2] == "B" else -1.0 if len(bp) >= 2 else 0.0
-    streak_sign = 1.0 if streak_direction == "B" else -1.0 if streak_direction == "P" else 0.0
-    tie_rate = sum(value == "T" for value in raw) / max(1, len(raw))
-    confidence = _clip(road.get("confidence_score", 0.0), 0.0, 1.0)
-    planning_reliability = _clip(road.get("planning_reliability", 0.0), 0.0, 1.0)
-    recent_reliability = _clip(road.get("recent_reliability", 0.0), 0.0, 1.0)
+    side, run = _streak(bp)
+    streak_sign = 1.0 if side == "B" else -1.0 if side == "P" else 0.0
+    tie_rate = sum(x == "T" for x in raw) / max(1, len(raw))
     disagreement = _clip(road.get("recent_model_disagreement", road.get("model_disagreement", 0.20)), 0.0, 1.0)
-    agreement = _clip(1.0 - min(1.0, disagreement / 0.20), 0.0, 1.0)
-    big_eye_saturation = _derived_road_saturation(road, "big_eye")
-    small_road_saturation = _derived_road_saturation(road, "small_road")
-    cockroach_saturation = _derived_road_saturation(
-        road, "cockroach_road"
-    )
-    derived_mean_saturation = (
-        big_eye_saturation + small_road_saturation + cockroach_saturation
-    ) / 3.0
-    derived_consensus = _clip(
-        derived_mean_saturation
-        * (
-            1.0
-            - (
-                abs(big_eye_saturation - small_road_saturation)
-                + abs(small_road_saturation - cockroach_saturation)
-                + abs(cockroach_saturation - big_eye_saturation)
-            ) / 3.0
-        ),
-        0.0,
-        1.0,
-    )
-    vector = [
-        1.0,
-        min(1.0, len(bp) / 60.0),
-        _banker_balance(bp), _banker_balance(bp, 5), _banker_balance(bp, 10),
-        _banker_balance(bp, 20), _banker_balance(bp, 40),
-        streak_sign, min(1.0, streak_length / 8.0),
-        _alternation(bp, 5), _alternation(bp, 10), _alternation(bp, 20),
-        last_direction, previous_direction, _clip(tie_rate / 0.20, 0.0, 1.0),
-        _prob_balance(road.get("planning_probability", 0.5)),
-        _prob_balance(road.get("recent_probability", 0.5)),
-        confidence, planning_reliability, recent_reliability, agreement,
-        _prob_balance(_model_probability(road, "markov1")),
-        _prob_balance(_model_probability(road, "markov2")),
-        _prob_balance(_model_probability(road, "markov3")),
-        min(1.0, len(raw) / 80.0),
-        _banker_balance(bp, 3),
-        _transition_rate(bp, 5),
-        _recent_run_volatility(bp, 5),
-        _streak_break_signal(bp),
-        _long_dragon_tail_pressure(bp),
-        _single_jump_onset(bp),
-        big_eye_saturation,
-        small_road_saturation,
-        cockroach_saturation,
-        derived_consensus,
+    big = _road_saturation(road, "big_eye")
+    small = _road_saturation(road, "small_road")
+    cock = _road_saturation(road, "cockroach_road")
+    mean = (big + small + cock) / 3.0
+    consensus = _clip(mean * (1.0 - (abs(big-small)+abs(small-cock)+abs(cock-big))/3.0), 0.0, 1.0)
+    values = [
+        1.0, min(1.0, len(bp)/60.0), _balance(bp), _balance(bp,3), _balance(bp,8),
+        streak_sign, min(1.0, run/8.0), _alternation(bp,6), _alternation(bp,12),
+        _clip(_transition_rate(bp,6)-_transition_rate(bp,14)), _streak_break(bp),
+        streak_sign * min(1.0, max(0, run-3)/5.0), _clip(tie_rate/0.20, 0.0, 1.0),
+        _prob_balance(road.get("planning_probability",0.5)), _prob_balance(road.get("recent_probability",0.5)),
+        _clip(road.get("confidence_score",0.0),0.0,1.0), _clip(1.0-min(1.0,disagreement/0.20),0.0,1.0),
+        big, small, cock, consensus,
     ]
-    if len(vector) != CONTEXT_DIM:
-        raise RuntimeError(f"CMAB context dimension mismatch: {len(vector)} != {CONTEXT_DIM}")
-    return _stabilize_context_vector(vector)
+    if len(values) != CONTEXT_DIM:
+        raise RuntimeError("CUSUM context dimension mismatch")
+    return [round(_clip(v), 10) for v in values]
 
 
-def _uid_key(user_id: str) -> str:
-    """以雜湊鍵隔離各 LINE UID，不把原始 UID 寫進模型狀態檔。"""
-    normalized = str(user_id or "").strip() or "__anonymous__"
-    return sha256(normalized.encode("utf-8")).hexdigest()[:24]
+def _vec(context: Sequence[float]) -> np.ndarray:
+    x = np.asarray(list(context), dtype=np.float64)
+    if x.shape != (CONTEXT_DIM,) or not np.all(np.isfinite(x)):
+        raise ValueError(f"context must be finite {CONTEXT_DIM}-vector")
+    return np.clip(x, -1.0, 1.0)
 
 
-def _context_fingerprint(context: Sequence[float]) -> str:
-    values = np.asarray(list(context), dtype=np.float64)
-    rounded = np.round(values, decimals=8)
-    return sha256(rounded.tobytes()).hexdigest()[:24]
+def _softmax(b: float, p: float) -> Dict[str, float]:
+    z = np.asarray([b,p], dtype=np.float64) / 0.85
+    z -= np.max(z); e = np.exp(np.clip(z,-40,40)); e /= max(1e-12, float(e.sum()))
+    return {"B": float(e[0]), "P": float(e[1])}
 
 
-def _prediction_fingerprint(
-    history: Sequence[str],
-    *,
-    venue: str,
-    room: str,
-    context: Sequence[float],
-) -> str:
-    payload = {
-        "history": "".join(history[-2000:]),
-        "venue": str(venue or "").upper().strip(),
-        "room": str(room or "").strip(),
-        "context": [round(float(value), 8) for value in context],
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return sha256(encoded).hexdigest()[:24]
+def _tie_prob(raw: Sequence[str]) -> float:
+    p = (sum(x=="T" for x in raw) + TIE_PRIOR*TIE_PRIOR_STRENGTH) / (len(raw)+TIE_PRIOR_STRENGTH)
+    return max(0.04, min(0.18, float(p)))
 
 
-def _clean_uncertainty_values(values: Any) -> List[float]:
-    result: List[float] = []
-    for value in list(values or []):
+class CUSUMLinUCB:
+    """Dynamic two-arm LinUCB with two-sided CUSUM and active hard reset."""
+    def __init__(self, *, alpha: float=CUSUM_ALPHA, l2: float=CUSUM_L2,
+                 forgetting_factor: float=CUSUM_FORGETTING_FACTOR,
+                 cusum_h: float=CUSUM_THRESHOLD_H, cusum_v: float=CUSUM_DRIFT_V,
+                 min_cusum_observations: int=CUSUM_MIN_OBSERVATIONS,
+                 vacuum_hands: int=CUSUM_VACUUM_HANDS) -> None:
+        self.alpha=float(alpha); self.l2=max(1e-9,float(l2))
+        self.forgetting_factor=max(0.80,min(1.0,float(forgetting_factor)))
+        self.cusum_h=max(0.5,float(cusum_h)); self.cusum_v=max(0.0,float(cusum_v))
+        self.min_cusum_observations=max(2,int(min_cusum_observations)); self.vacuum_hands=max(1,int(vacuum_hands))
+        self.total_observations=0; self.observations_since_reset=0; self.reset_count=0
+        self.g_plus=0.0; self.g_minus=0.0; self.last_residual=0.0
+        self.last_expected_reward=0.0; self.last_observed_reward=0.0; self.last_reset: Dict[str,Any]={}
+        self.applied_event_ids: List[str]=[]; self._fresh_matrices()
+
+    def _fresh_matrices(self) -> None:
+        I=np.eye(CONTEXT_DIM,dtype=np.float64)*self.l2; z=np.zeros(CONTEXT_DIM,dtype=np.float64)
+        self.arms={a:{"A":I.copy(),"b":z.copy(),"updates":0,"reward_sum":0.0} for a in ARMS}
+        self.context_information={"A":I.copy(),"updates":0}
+
+    @staticmethod
+    def _pinv(A: np.ndarray) -> np.ndarray:
+        A=0.5*(A+A.T)
+        try: inv=np.linalg.pinv(A,rcond=1e-10,hermitian=True)
+        except TypeError: inv=np.linalg.pinv(A,rcond=1e-10)
+        if not np.all(np.isfinite(inv)):
+            inv=np.linalg.pinv(A+np.eye(A.shape[0])*1e-6,rcond=1e-8)
+        return inv
+
+    def arm_metrics(self, arm: str, context: Sequence[float]) -> Dict[str,float]:
+        x=_vec(context); s=self.arms[arm]; inv=self._pinv(np.asarray(s["A"],dtype=float))
+        theta=inv@np.asarray(s["b"],dtype=float); mean=float(theta@x)
+        var=max(0.0,float(x@inv@x)); std=math.sqrt(var); bonus=self.alpha*std
+        return {"expected_reward":mean,"mean_reward":mean,"variance":var,"uncertainty":std,
+                "ucb_bonus":bonus,"ucb_score":mean+bonus,"updates":int(s["updates"]),"reward_sum":float(s["reward_sum"])}
+
+    def predict_context(self, context: Sequence[float]) -> Dict[str,Any]:
+        x=_vec(context); m={a:self.arm_metrics(a,x) for a in ARMS}
+        b,p=m["B"]["ucb_score"],m["P"]["ucb_score"]
+        selected="B" if b>=p else "P"; inv=self._pinv(np.asarray(self.context_information["A"],dtype=float))
+        var=max(0.0,float(x@inv@x))
+        return {"selected_arm":selected,"metrics":m,"conditional_probabilities":_softmax(b,p),
+                "shared_uncertainty":{"variance":var,"uncertainty":math.sqrt(var),"updates":int(self.context_information["updates"])}}
+
+    def _cusum(self, observed: float, expected: float) -> Dict[str,Any]:
+        residual=float(observed-expected); self.last_residual=residual
+        self.last_observed_reward=float(observed); self.last_expected_reward=float(expected)
+        self.g_plus=max(0.0,self.g_plus+residual-self.cusum_v)
+        self.g_minus=max(0.0,self.g_minus-residual-self.cusum_v)
+        ready=self.observations_since_reset>=self.min_cusum_observations and self.total_observations>=self.min_cusum_observations
+        plus=bool(ready and self.g_plus>self.cusum_h); minus=bool(ready and self.g_minus>self.cusum_h)
+        return {"residual":residual,"g_plus":self.g_plus,"g_minus":self.g_minus,"ready":ready,
+                "alarm":plus or minus,"alarm_side":"positive" if plus else "negative" if minus else "",
+                "threshold_h":self.cusum_h,"drift_v":self.cusum_v}
+
+    def reset_model(self, *, reason: str="cusum_change_point", alarm_side: str="", residual: Optional[float]=None) -> Dict[str,Any]:
+        self.reset_count+=1
+        event={"triggered":True,"reason":reason,"alarm_side":alarm_side,
+               "residual":float(self.last_residual if residual is None else residual),
+               "g_plus_before_reset":float(self.g_plus),"g_minus_before_reset":float(self.g_minus),
+               "threshold_h":self.cusum_h,"drift_v":self.cusum_v,
+               "at_total_observation":self.total_observations,"reset_count":self.reset_count,"timestamp":int(time.time())}
+        self._fresh_matrices(); self.observations_since_reset=0; self.g_plus=0.0; self.g_minus=0.0; self.last_reset=event
+        return dict(event)
+
+    def _update(self, x: np.ndarray, rewards: Mapping[str,float]) -> None:
+        I=np.eye(CONTEXT_DIM)*self.l2; outer=np.outer(x,x); lam=self.forgetting_factor
+        for arm,reward in rewards.items():
+            s=self.arms[arm]; A=np.asarray(s["A"],dtype=float); b=np.asarray(s["b"],dtype=float)
+            A=lam*(0.5*(A+A.T))+(1-lam)*I+outer; b=lam*b+float(reward)*x
+            s.update(A=0.5*(A+A.T),b=b,updates=int(s["updates"])+1,reward_sum=float(s["reward_sum"])+float(reward))
+        info=self.context_information; A=np.asarray(info["A"],dtype=float)
+        info["A"]=0.5*((lam*(0.5*(A+A.T))+(1-lam)*I+outer)+(lam*(0.5*(A+A.T))+(1-lam)*I+outer).T)
+        info["updates"]=int(info["updates"])+1
+
+    def observe(self, context: Sequence[float], actual_outcome: str, *, selected_arm: str="") -> Dict[str,Any]:
+        actual=str(actual_outcome or "").upper().strip()
+        if actual not in ARMS: return {"updated":False,"reason":"tie_or_invalid_outcome"}
+        x=_vec(context); pred=self.predict_context(x); chosen=str(selected_arm or pred["selected_arm"]).upper()
+        if chosen not in ARMS: chosen=pred["selected_arm"]
+        expected=_clip(pred["metrics"][chosen]["expected_reward"]); observed=1.0 if chosen==actual else -1.0
+        c=self._cusum(observed,expected); reset={}
+        if c["alarm"]: reset=self.reset_model(reason="cusum_residual_change_point",alarm_side=c["alarm_side"],residual=c["residual"])
+        self._update(x,{a:(1.0 if a==actual else -1.0) for a in ARMS})
+        self.total_observations+=1; self.observations_since_reset+=1
+        return {"updated":True,"actual_outcome":actual,"selected_arm":chosen,"observed_reward":observed,
+                "expected_reward":expected,"cusum":c,"reset_triggered":bool(reset),"reset_event":reset}
+
+    def observe_reward(self, context: Sequence[float], *, selected_arm: str, reward: float) -> Dict[str,Any]:
+        arm=str(selected_arm).upper(); x=_vec(context); expected=_clip(self.arm_metrics(arm,x)["expected_reward"]); r=_clip(reward)
+        c=self._cusum(r,expected); reset={}
+        if c["alarm"]: reset=self.reset_model(reason="cusum_selected_arm_reward_change_point",alarm_side=c["alarm_side"],residual=c["residual"])
+        self._update(x,{arm:r}); self.total_observations+=1; self.observations_since_reset+=1
+        return {"updated":True,"selected_arm":arm,"reward":r,"expected_reward":expected,"cusum":c,"reset_triggered":bool(reset),"reset_event":reset}
+
+    def risk_status(self, context: Sequence[float]) -> Dict[str,Any]:
+        shared=self.predict_context(context)["shared_uncertainty"]; uncertainty=float(shared["uncertainty"])
+        info=1.0/(1.0+uncertainty); ref=self.observations_since_reset if self.reset_count else self.total_observations
+        maturity=min(1.0,ref/12.0); confidence=_clip(0.10+0.55*info+0.35*maturity,0.0,0.90)
+        vacuum=bool(self.reset_count and self.observations_since_reset<=self.vacuum_hands)
+        if vacuum: confidence=min(confidence,min(0.48,0.08+0.08*self.observations_since_reset))
+        observe=bool(vacuum and self.observations_since_reset<=CUSUM_FORCE_OBSERVE_HANDS)
+        if observe: weight,bet=0.0,0.0
+        elif vacuum: weight,bet=min(0.18,0.04+0.03*self.observations_since_reset),(0.35 if self.observations_since_reset==4 else 0.60)
+        elif self.total_observations<PREQUENTIAL_WARMUP_BP: weight,bet=0.08,0.50
+        else: weight,bet=min(0.45,0.15+0.35*confidence),min(1.0,0.55+0.50*confidence)
+        return {"confidence_score":confidence,"post_reset_vacuum_active":vacuum,"vacuum_hands_required":self.vacuum_hands,
+                "observations_since_reset":self.observations_since_reset,"force_observe":observe,"bet_multiplier":bet,
+                "ensemble_weight_suggestion":weight,"uncertainty":uncertainty,"variance":float(shared["variance"]),"maturity":maturity}
+
+    def to_state(self) -> Dict[str,Any]:
+        return {"version":MODEL_VERSION,"context_dim":CONTEXT_DIM,"alpha":self.alpha,"l2":self.l2,
+                "forgetting_factor":self.forgetting_factor,"cusum_h":self.cusum_h,"cusum_v":self.cusum_v,
+                "min_cusum_observations":self.min_cusum_observations,"vacuum_hands":self.vacuum_hands,
+                "total_observations":self.total_observations,"observations_since_reset":self.observations_since_reset,
+                "reset_count":self.reset_count,"g_plus":self.g_plus,"g_minus":self.g_minus,"last_residual":self.last_residual,
+                "last_expected_reward":self.last_expected_reward,"last_observed_reward":self.last_observed_reward,
+                "last_reset":self.last_reset,"applied_event_ids":self.applied_event_ids[-5000:],
+                "arms":{a:{"A":np.asarray(self.arms[a]["A"]).tolist(),"b":np.asarray(self.arms[a]["b"]).tolist(),
+                            "updates":int(self.arms[a]["updates"]),"reward_sum":float(self.arms[a]["reward_sum"])} for a in ARMS},
+                "context_information":{"A":np.asarray(self.context_information["A"]).tolist(),"updates":int(self.context_information["updates"])}}
+
+    @classmethod
+    def from_state(cls, state: Mapping[str,Any]) -> "CUSUMLinUCB":
+        if not isinstance(state,Mapping) or int(state.get("context_dim",0) or 0)!=CONTEXT_DIM: return cls()
+        m=cls(alpha=state.get("alpha",CUSUM_ALPHA),l2=state.get("l2",CUSUM_L2),forgetting_factor=state.get("forgetting_factor",CUSUM_FORGETTING_FACTOR),
+              cusum_h=state.get("cusum_h",CUSUM_THRESHOLD_H),cusum_v=state.get("cusum_v",CUSUM_DRIFT_V),
+              min_cusum_observations=state.get("min_cusum_observations",CUSUM_MIN_OBSERVATIONS),vacuum_hands=state.get("vacuum_hands",CUSUM_VACUUM_HANDS))
         try:
-            number = float(value)
-        except Exception:
-            continue
-        if math.isfinite(number) and number >= 0.0:
-            result.append(number)
-    return result[-CMAB_UNCERTAINTY_HISTORY_SIZE:]
-
-
-def _rolling_randomness_diagnostics(history: Sequence[str]) -> Dict[str, Any]:
-    """最近 12 局的排列熵、B/P 卡方與經驗方差。
-
-    B/P/T 先映射為 +1/-1/0，再轉成累積隨機漫步；對該連續軌跡做
-    order=3 的 Bandt-Pompe 排列熵。極小的確定性 dither 只用來處理
-    累積值相同的 ordinal tie；它不改變相差至少 1 的大小關係，也不
-    引入隨機數，因此二元序列仍可使用完整六種排列且回測完全可重現。
-    """
-    window = [
-        value for value in history if value in {"B", "P", "T"}
-    ][-CMAB_PERMUTATION_WINDOW:]
-    ready = len(window) >= CMAB_PERMUTATION_WINDOW
-    increments = np.asarray(
-        [1.0 if value == "B" else -1.0 if value == "P" else 0.0 for value in window],
-        dtype=np.float64,
-    )
-    walk = np.cumsum(increments)
-    if walk.size:
-        indices = np.arange(walk.size, dtype=np.float64)
-        deterministic_dither = np.sin(
-            (indices + 1.0) * math.sqrt(2.0)
-        ) * 1e-12
-        walk = walk + deterministic_dither
-
-    patterns: Counter[tuple[int, ...]] = Counter()
-    order = CMAB_PERMUTATION_ORDER
-    for index in range(max(0, len(walk) - order + 1)):
-        segment = walk[index:index + order]
-        pattern = tuple(
-            int(value)
-            for value in np.argsort(segment, kind="mergesort")
-        )
-        patterns[pattern] += 1
-
-    pattern_total = sum(patterns.values())
-    if pattern_total:
-        probabilities = [count / pattern_total for count in patterns.values()]
-        raw_entropy = -sum(
-            probability * math.log(probability)
-            for probability in probabilities
-            if probability > 0.0
-        )
-        maximum_entropy = math.log(math.factorial(order))
-        permutation_entropy = raw_entropy / maximum_entropy
-    else:
-        permutation_entropy = 0.0
-    permutation_entropy = max(0.0, min(1.0, float(permutation_entropy)))
-
-    bp = [value for value in window if value in ARMS]
-    banker_count = sum(value == "B" for value in bp)
-    player_count = len(bp) - banker_count
-    banker_binary = np.asarray(
-        [1.0 if value == "B" else 0.0 for value in bp],
-        dtype=np.float64,
-    )
-    empirical_variance = (
-        float(np.var(banker_binary, ddof=1))
-        if len(banker_binary) >= 2
-        else 0.0
-    )
-
-    # 使用 B/P 排除和局後的長期基準比例；df=1 的 survival function
-    # 可用 erfc(sqrt(chi2/2)) 精確表示，無需新增 scipy 相依套件。
-    banker_expected_ratio = 0.458597 / (0.458597 + 0.446247)
-    expected_banker = len(bp) * banker_expected_ratio
-    expected_player = len(bp) - expected_banker
-    chi_square = 0.0
-    if expected_banker > 0.0 and expected_player > 0.0:
-        chi_square = (
-            (banker_count - expected_banker) ** 2 / expected_banker
-            + (player_count - expected_player) ** 2 / expected_player
-        )
-    chi_square_p_value = math.erfc(math.sqrt(max(0.0, chi_square) / 2.0))
-
-    return {
-        "window_size": len(window),
-        "required_window_size": CMAB_PERMUTATION_WINDOW,
-        "ready": bool(ready),
-        "outcomes": list(window),
-        "permutation_order": int(order),
-        "permutation_entropy": float(permutation_entropy),
-        "permutation_entropy_threshold": float(
-            CMAB_PERMUTATION_ENTROPY_THRESHOLD
-        ),
-        "entropy_indicates_white_noise": bool(
-            ready
-            and permutation_entropy > CMAB_PERMUTATION_ENTROPY_THRESHOLD
-        ),
-        "ordinal_pattern_count": int(pattern_total),
-        "unique_ordinal_patterns": int(len(patterns)),
-        "bp_sample_count": int(len(bp)),
-        "banker_count": int(banker_count),
-        "player_count": int(player_count),
-        "banker_empirical_rate": float(
-            banker_count / len(bp) if bp else 0.0
-        ),
-        "empirical_variance": float(empirical_variance),
-        "chi_square_statistic": float(chi_square),
-        "chi_square_p_value": float(chi_square_p_value),
-    }
-
-
-def _baseline_summary(state: Mapping[str, Any]) -> Dict[str, Any]:
-    """共享 context 預測「方差」的歷史基準，單位保持為 variance。"""
-    baseline = dict(state.get("variance_baseline") or {})
-    values = _clean_uncertainty_values(baseline.get("values"))
-    if not values:
-        # V1.4 的 uncertainty_baseline 儲存的是 std；平方後無損遷移。
-        legacy = dict(state.get("uncertainty_baseline") or {})
-        legacy_std = _clean_uncertainty_values(legacy.get("values"))
-        values = [float(value * value) for value in legacy_std]
-    sample_count = len(values)
-    mean = float(np.mean(values)) if values else 0.0
-    std = (
-        float(np.std(values, ddof=1))
-        if sample_count >= 2
-        else 0.0
-    )
-    dynamic_ready = sample_count >= CMAB_UNCERTAINTY_MIN_SAMPLES
-    threshold = (
-        max(
-            CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2,
-            mean + CMAB_UNCERTAINTY_SIGMA * std,
-        )
-        if dynamic_ready
-        else max(
-            CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2,
-            CMAB_UNKNOWN_STD_THRESHOLD ** 2,
-        )
-    )
-    return {
-        "values": values,
-        "sample_count": sample_count,
-        "mean": mean,
-        "std": std,
-        "threshold": float(threshold),
-        "dynamic_ready": bool(dynamic_ready),
-        "sigma_multiplier": float(CMAB_UNCERTAINTY_SIGMA),
-        "minimum_samples": int(CMAB_UNCERTAINTY_MIN_SAMPLES),
-        "history_size": int(CMAB_UNCERTAINTY_HISTORY_SIZE),
-        "unit": "variance",
-        "fallback_threshold": float(CMAB_UNKNOWN_STD_THRESHOLD ** 2),
-        "threshold_floor": float(CMAB_DYNAMIC_THRESHOLD_FLOOR ** 2),
-    }
-
-
-def _update_uncertainty_baseline(
-    state: Dict[str, Any],
-    *,
-    action_space_variance: float,
-    unknown_region_active: bool,
-    prediction_fingerprint: str,
-) -> Dict[str, Any]:
-    """只用非極端樣本更新經驗方差基準，避免混沌值污染門檻。"""
-    summary = _baseline_summary(state)
-    values = list(summary["values"])
-    previous_fingerprint = str(
-        state.get("last_variance_fingerprint") or ""
-    )
-    is_new_prediction = (
-        bool(prediction_fingerprint)
-        and prediction_fingerprint != previous_fingerprint
-    )
-
-    if is_new_prediction and not unknown_region_active:
-        values.append(max(0.0, float(action_space_variance)))
-        values = values[-CMAB_UNCERTAINTY_HISTORY_SIZE:]
-
-    state["variance_baseline"] = {
-        "values": values,
-        "last_observed_variance": max(0.0, float(action_space_variance)),
-        "last_unknown_region_active": bool(unknown_region_active),
-        "updated_at": int(time.time()),
-    }
-    state["last_variance_fingerprint"] = prediction_fingerprint
-    return _baseline_summary(state)
-
-
-def _current_short_term_buffer(history: Sequence[str]) -> List[str]:
-    return [value for value in history if value in ARMS][-3:]
-
-
-def _identity_information_matrix() -> np.ndarray:
-    return np.eye(CONTEXT_DIM, dtype=np.float64) * CMAB_L2
-
-
-def _feature_index_mapping(
-    stored_dim: int,
-    stored_feature_names: Any,
-) -> Dict[int, int]:
-    """將舊欄位映射到新版；舊版 24 維前綴可原位延續。"""
-    names = (
-        [str(value) for value in stored_feature_names]
-        if isinstance(stored_feature_names, (list, tuple))
-        else []
-    )
-    current = {name: index for index, name in enumerate(FEATURE_NAMES)}
-    mapping: Dict[int, int] = {}
-    if len(names) == stored_dim:
-        for old_index, name in enumerate(names):
-            if name in current:
-                mapping[old_index] = current[name]
-    if not mapping:
-        mapping = {
-            index: index
-            for index in range(min(stored_dim, CONTEXT_DIM))
-        }
-    return mapping
-
-
-def _migrate_matrix_and_vector(
-    matrix_value: Any,
-    vector_value: Any,
-    *,
-    stored_l2: float,
-    stored_feature_names: Any,
-) -> tuple[np.ndarray, np.ndarray]:
-    old_matrix = np.asarray(matrix_value, dtype=np.float64)
-    old_vector = np.asarray(vector_value, dtype=np.float64)
-    if (
-        old_matrix.ndim != 2
-        or old_matrix.shape[0] != old_matrix.shape[1]
-        or old_vector.shape != (old_matrix.shape[0],)
-        or old_matrix.shape[0] <= 0
-        or old_matrix.shape[0] > CONTEXT_DIM
-        or not np.all(np.isfinite(old_matrix))
-        or not np.all(np.isfinite(old_vector))
-    ):
-        raise ValueError("invalid UID state matrix shape")
-    old_dim = int(old_matrix.shape[0])
-    mapping = _feature_index_mapping(old_dim, stored_feature_names)
-    migrated_matrix = (
-        np.eye(CONTEXT_DIM, dtype=np.float64) * stored_l2
-    )
-    migrated_vector = np.zeros(CONTEXT_DIM, dtype=np.float64)
-    symmetric_old = 0.5 * (old_matrix + old_matrix.T)
-    for old_i, new_i in mapping.items():
-        migrated_vector[new_i] = old_vector[old_i]
-        for old_j, new_j in mapping.items():
-            migrated_matrix[new_i, new_j] = symmetric_old[old_i, old_j]
-    return migrated_matrix, migrated_vector
-
-
-def _migrate_information_matrix(
-    matrix_value: Any,
-    *,
-    stored_l2: float,
-    stored_feature_names: Any,
-) -> np.ndarray:
-    old_matrix = np.asarray(matrix_value, dtype=np.float64)
-    zeros = np.zeros(
-        old_matrix.shape[0] if old_matrix.ndim == 2 else 0,
-        dtype=np.float64,
-    )
-    matrix, _ = _migrate_matrix_and_vector(
-        old_matrix,
-        zeros,
-        stored_l2=stored_l2,
-        stored_feature_names=stored_feature_names,
-    )
-    return matrix
-
-
-def _as_information_matrix(value: Any) -> np.ndarray:
-    """讀取、驗證並對稱化 information matrix。"""
-    matrix = np.asarray(value, dtype=np.float64)
-    if matrix.shape != (CONTEXT_DIM, CONTEXT_DIM):
-        raise ValueError("invalid information matrix shape")
-    if not np.all(np.isfinite(matrix)):
-        raise ValueError("information matrix contains non-finite values")
-    return 0.5 * (matrix + matrix.T)
-
-
-def _reconstruct_shared_context_matrix(
-    arms: Mapping[str, Any],
-    *,
-    prior_l2: float,
-) -> np.ndarray:
-    """從舊版 disjoint LinUCB matrices 無損重建共享 context matrix。
-
-    A_B = lambda I + sum_B(w xxT)，A_P 同理，因此
-    A_ctx = A_B + A_P - lambda I = lambda I + sum_all(w xxT)。
-    """
-    banker = _as_information_matrix(dict(arms["B"]).get("A"))
-    player = _as_information_matrix(dict(arms["P"]).get("A"))
-    prior = np.eye(CONTEXT_DIM, dtype=np.float64) * max(
-        1e-12, float(prior_l2)
-    )
-    reconstructed = banker + player - prior
-    return 0.5 * (reconstructed + reconstructed.T)
-
-
-def _new_state() -> Dict[str, Any]:
-    """建立單一 UID 專屬的 cMAB 狀態。"""
-    identity = _identity_information_matrix().tolist()
-    zeros = np.zeros(CONTEXT_DIM, dtype=np.float64).tolist()
-    return {
-        "version": MODEL_VERSION,
-        "reward_semantics": REWARD_SEMANTICS,
-        "context_dim": CONTEXT_DIM,
-        "feature_names": list(FEATURE_NAMES),
-        "alpha": CMAB_ALPHA,
-        "l2": CMAB_L2,
-        "arms": {
-            arm: {
-                "A": [row[:] for row in identity],
-                "b": list(zeros),
-                "updates": 0,
-                "weighted_updates": 0.0,
-                "reward_sum": 0.0,
-                "weighted_reward_sum": 0.0,
-            }
-            for arm in ARMS
-        },
-        # 只衡量「這個 context 看過多少」，與選擇哪個 Arm／reward 無關。
-        # 這是 OOD braking 的主要 uncertainty matrix。
-        "context_information": {
-            "A": [row[:] for row in identity],
-            "updates": 0,
-            "weighted_updates": 0.0,
-        },
-        "applied_event_ids": [],
-        "total_updates": 0,
-        "total_weighted_updates": 0.0,
-        "uncertainty_baseline": {
-            "values": [],
-            "last_observed_std": 0.0,
-            "last_unknown_region_active": False,
-            "updated_at": 0,
-        },
-        "variance_baseline": {
-            "values": [],
-            "last_observed_variance": 0.0,
-            "last_unknown_region_active": False,
-            "updated_at": 0,
-        },
-        "short_term_buffer": [],
-        "pending_ood_contexts": [],
-        "last_uncertainty_fingerprint": "",
-        "last_variance_fingerprint": "",
-        "last_prediction_risk": {},
-        # V2.2：只保存有限的方向正確性與上一局 context，不改變 35 維
-        # 特徵本身；供連錯保護、動態 alpha 與相變軟重設使用。
-        "recent_direction_correctness": [],
-        "consecutive_hits": 0,
-        "consecutive_misses": 0,
-        # 同一張路紙重按預測會得到同一個 replay 結果；歷史一變才重建。
-        "history_replay": {
-            "history_fingerprint": "",
-            "raw_round_count": 0,
-            "bp_training_samples": 0,
-            "replayed_at": 0,
-        },
-        "created_at": int(time.time()),
-        "updated_at": int(time.time()),
-    }
-
-
-def _new_state_store() -> Dict[str, Any]:
-    """建立全部 UID 的外層容器；每個 UID 仍持有完全獨立的 A／b。"""
-    now = int(time.time())
-    return {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "version": MODEL_VERSION,
-        "context_dim": CONTEXT_DIM,
-        "feature_names": list(FEATURE_NAMES),
-        "alpha": CMAB_ALPHA,
-        "l2": CMAB_L2,
-        "users": {},
-        "created_at": now,
-        "updated_at": now,
-    }
-
-
-def _normalize_user_state(data: Mapping[str, Any]) -> Dict[str, Any]:
-    state = dict(data or {})
-    # V2.x reward 會依自己的 confidence、selected arm 與連錯調整 label。
-    # 這些 b 向量與新版本的真實 outcome-only label 不可混用。回傳新的
-    # 空白 episode state，而不是偷偷延續被污染的係數。
-    if state.get("reward_semantics") != REWARD_SEMANTICS:
-        fresh = _new_state()
-        fresh["reinitialized_from"] = {
-            "version": str(state.get("version") or "unknown"),
-            "reason": "legacy_self_reinforcing_reward_not_reused",
-            "at": int(time.time()),
-        }
-        return fresh
-    stored_l2 = max(
-        1e-12,
-        float(state.get("l2", CMAB_L2) or CMAB_L2),
-    )
-    stored_dim = int(state.get("context_dim", 0) or 0)
-    if stored_dim <= 0 or stored_dim > CONTEXT_DIM:
-        raise ValueError("invalid UID state context dimension")
-    stored_feature_names = state.get("feature_names")
-
-    arms = state.get("arms")
-    if not isinstance(arms, dict) or any(
-        arm not in arms for arm in ARMS
-    ):
-        raise ValueError("missing UID state arms")
-
-    for arm in ARMS:
-        A, b = _migrate_matrix_and_vector(
-            arms[arm].get("A"),
-            arms[arm].get("b"),
-            stored_l2=stored_l2,
-            stored_feature_names=stored_feature_names,
-        )
-        arms[arm]["A"] = A.tolist()
-        arms[arm]["b"] = b.tolist()
-
-    # 只有同一 reward 語意的 V3 state 才可延續 A／b。
-    state["version"] = MODEL_VERSION
-    state["reward_semantics"] = REWARD_SEMANTICS
-    state["context_dim"] = CONTEXT_DIM
-    state["feature_names"] = list(FEATURE_NAMES)
-    state["alpha"] = CMAB_ALPHA
-    # 已訓練矩陣內含建立當時的 ridge prior，不能只改 metadata 偽裝成新值。
-    state["l2"] = stored_l2
-    state["total_weighted_updates"] = float(
-        state.get(
-            "total_weighted_updates",
-            state.get("total_updates", 0),
-        )
-        or 0.0
-    )
-
-    for arm in ARMS:
-        arm_state = arms[arm]
-        arm_state["weighted_updates"] = float(
-            arm_state.get(
-                "weighted_updates",
-                arm_state.get("updates", 0),
-            )
-            or 0.0
-        )
-        arm_state["weighted_reward_sum"] = float(
-            arm_state.get(
-                "weighted_reward_sum",
-                arm_state.get("reward_sum", 0.0),
-            )
-            or 0.0
-        )
-
-    context_information = state.get("context_information")
-    if isinstance(context_information, Mapping):
-        context_matrix = _migrate_information_matrix(
-            context_information.get("A"),
-            stored_l2=stored_l2,
-            stored_feature_names=stored_feature_names,
-        )
-        context_updates = int(
-            context_information.get(
-                "updates",
-                state.get("total_updates", 0),
-            )
-            or 0
-        )
-        context_weighted_updates = float(
-            context_information.get(
-                "weighted_updates",
-                state.get("total_weighted_updates", context_updates),
-            )
-            or 0.0
-        )
-    else:
-        # V1 -> V2 就地遷移，不丟失既有 UID 的 A／b 學習成果。
-        context_matrix = _reconstruct_shared_context_matrix(
-            arms,
-            prior_l2=stored_l2,
-        )
-        context_updates = int(state.get("total_updates", 0) or 0)
-        context_weighted_updates = float(
-            state.get("total_weighted_updates", context_updates) or 0.0
-        )
-    state["context_information"] = {
-        "A": context_matrix.tolist(),
-        "updates": max(0, context_updates),
-        "weighted_updates": max(0.0, context_weighted_updates),
-    }
-
-    state["applied_event_ids"] = list(
-        state.get("applied_event_ids") or []
-    )[-CMAB_MAX_EVENT_IDS:]
-
-    baseline = dict(state.get("uncertainty_baseline") or {})
-    state["uncertainty_baseline"] = {
-        "values": _clean_uncertainty_values(
-            baseline.get("values")
-        ),
-        "last_observed_std": max(
-            0.0,
-            float(baseline.get("last_observed_std", 0.0) or 0.0),
-        ),
-        "last_unknown_region_active": bool(
-            baseline.get("last_unknown_region_active", False)
-        ),
-        "updated_at": int(baseline.get("updated_at", 0) or 0),
-    }
-    variance_baseline = dict(state.get("variance_baseline") or {})
-    variance_values = _clean_uncertainty_values(
-        variance_baseline.get("values")
-    )
-    if not variance_values:
-        variance_values = [
-            float(value * value)
-            for value in state["uncertainty_baseline"]["values"]
-        ]
-    state["variance_baseline"] = {
-        "values": variance_values,
-        "last_observed_variance": max(
-            0.0,
-            float(
-                variance_baseline.get("last_observed_variance", 0.0)
-                or 0.0
-            ),
-        ),
-        "last_unknown_region_active": bool(
-            variance_baseline.get("last_unknown_region_active", False)
-        ),
-        "updated_at": int(variance_baseline.get("updated_at", 0) or 0),
-    }
-    state["short_term_buffer"] = [
-        value
-        for value in list(state.get("short_term_buffer") or [])
-        if value in ARMS
-    ][-3:]
-    # V1.5 不再使用待加速 OOD 快取；部署後主動清除舊項目。
-    state["pending_ood_contexts"] = []
-    state["last_uncertainty_fingerprint"] = str(
-        state.get("last_uncertainty_fingerprint") or ""
-    )
-    state["last_variance_fingerprint"] = str(
-        state.get("last_variance_fingerprint") or ""
-    )
-    state["last_prediction_risk"] = (
-        dict(state.get("last_prediction_risk") or {})
-        if isinstance(state.get("last_prediction_risk"), Mapping)
-        else {}
-    )
-    state["recent_direction_correctness"] = [
-        1 if bool(value) else 0
-        for value in list(state.get("recent_direction_correctness") or [])
-    ][-CMAB_RECENT_ACCURACY_WINDOW:]
-    state["consecutive_hits"] = max(
-        0, min(100, int(state.get("consecutive_hits", 0) or 0))
-    )
-    state["consecutive_misses"] = max(
-        0, min(100, int(state.get("consecutive_misses", 0) or 0))
-    )
-    replay = dict(state.get("history_replay") or {})
-    state["history_replay"] = {
-        "history_fingerprint": str(replay.get("history_fingerprint") or ""),
-        "raw_round_count": max(0, int(replay.get("raw_round_count", 0) or 0)),
-        "bp_training_samples": max(0, int(replay.get("bp_training_samples", 0) or 0)),
-        "replayed_at": max(0, int(replay.get("replayed_at", 0) or 0)),
-    }
-    state["created_at"] = int(
-        state.get("created_at", time.time()) or time.time()
-    )
-    state["updated_at"] = int(
-        state.get("updated_at", time.time()) or time.time()
-    )
-    return state
-
-def _read_state_unlocked() -> Dict[str, Any]:
-    try:
-        data = json.loads(CMAB_STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("invalid state store")
-
-        users = data.get("users")
-        if (
-            str(data.get("schema_version") or "")
-            in COMPATIBLE_STATE_SCHEMA_VERSIONS
-            and isinstance(users, dict)
-            and 0 < int(data.get("context_dim", 0) or 0) <= CONTEXT_DIM
-        ):
-            # 不在每次預測時正規化全部 UID；只在該 UID 被使用時驗證。
-            # 使用者數量增加後，這可避免 O(number_of_users) 的矩陣轉換。
-            retained_users: Dict[str, Any] = {}
-            for uid_key, raw_state in users.items():
-                if isinstance(raw_state, Mapping):
-                    retained_users[str(uid_key)] = dict(raw_state)
-            data["schema_version"] = STATE_SCHEMA_VERSION
-            data["version"] = MODEL_VERSION
-            data["context_dim"] = CONTEXT_DIM
-            data["feature_names"] = list(FEATURE_NAMES)
-            data["alpha"] = CMAB_ALPHA
-            data["l2"] = CMAB_L2
-            data["users"] = retained_users
-            return data
-
-        # 舊版只有一組全域 arms，無法可靠拆回各 UID。
-        # 為避免把其他人的學習複製給新 UID，改版後每個 UID 從自己的空白模型開始。
-        if isinstance(data.get("arms"), dict):
-            store = _new_state_store()
-            store["legacy_shared_state_detected"] = True
-            store["legacy_shared_total_updates"] = int(
-                data.get("total_updates", 0) or 0
-            )
-            return store
-
-        raise ValueError("unsupported state store schema")
-    except Exception:
-        return _new_state_store()
-
-
-def _get_user_state_unlocked(
-    state_store: Dict[str, Any],
-    user_id: str,
-    *,
-    create: bool,
-) -> tuple[str, Dict[str, Any]]:
-    uid_key = _uid_key(user_id)
-    users = state_store.get("users")
-    if not isinstance(users, dict):
-        users = {}
-        state_store["users"] = users
-    raw_state = users.get(uid_key)
-    if isinstance(raw_state, Mapping):
-        try:
-            state = _normalize_user_state(raw_state)
-        except Exception:
-            state = _new_state()
-    else:
-        state = _new_state()
-
-    if create:
-        users[uid_key] = state
-        state_store["users"] = users
-    return uid_key, state
-
-
-def _write_state_unlocked(state_store: Dict[str, Any]) -> None:
-    state_store["schema_version"] = STATE_SCHEMA_VERSION
-    state_store["version"] = MODEL_VERSION
-    state_store["context_dim"] = CONTEXT_DIM
-    state_store["feature_names"] = list(FEATURE_NAMES)
-    state_store["alpha"] = CMAB_ALPHA
-    state_store["l2"] = CMAB_L2
-    state_store["updated_at"] = int(time.time())
-    state_store["users"] = dict(state_store.get("users") or {})
-    CMAB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = CMAB_STATE_FILE.with_suffix(CMAB_STATE_FILE.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(state_store, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(CMAB_STATE_FILE)
-
-
-def _safe_solve(matrix: np.ndarray, rhs: np.ndarray) -> tuple[np.ndarray, float]:
-    """以對稱化、最小特徵值修正與 ridge jitter 穩定解 LinUCB 方程。"""
-    symmetric = 0.5 * (np.asarray(matrix, dtype=np.float64) + np.asarray(matrix, dtype=np.float64).T)
-    scale = max(CMAB_L2, float(np.mean(np.abs(np.diag(symmetric)))), 1.0)
-    try:
-        minimum = float(np.min(np.linalg.eigvalsh(symmetric)))
-    except np.linalg.LinAlgError:
-        minimum = -scale
-    jitter = max(1e-9 * scale, -minimum + 1e-9 * scale)
-    identity = np.eye(CONTEXT_DIM, dtype=np.float64)
-    regularized = symmetric + jitter * identity
-    for _ in range(4):
-        try:
-            return np.linalg.solve(regularized, rhs), float(jitter)
-        except np.linalg.LinAlgError:
-            jitter = max(1e-8, jitter * 10.0)
-            regularized = symmetric + jitter * identity
-    return np.linalg.pinv(regularized, rcond=1e-8) @ rhs, float(jitter)
-
-
-def _recent_accuracy(state: Mapping[str, Any]) -> float:
-    values = [int(value) for value in list(state.get("recent_direction_correctness") or [])]
-    return float(sum(values) / len(values)) if values else 0.5
-
-
-def _dynamic_alpha(state: Mapping[str, Any], context: np.ndarray) -> float:
-    """只依資料成熟度與混沌度平滑 UCB 寬度。
-
-    完整資訊更新時 B/P 兩臂得到相同的 information matrix，因此 UCB bonus
-    在方向比較中理論上會相消。舊版卻再用模型連中／連錯去極端縮放 Alpha，
-    讓診斷分數看似很有把握、也間接放大追龍心理。新版不以命中紀錄當成
-    趨勢證據，只用資料量與排列熵維持溫和、可解釋的數值穩定度。
-    """
-    risk = dict(state.get("last_prediction_risk") or {})
-    entropy = _clip(risk.get("permutation_entropy", 0.0), 0.0, 1.0)
-    updates = max(0, int(state.get("total_updates", 0) or 0))
-    maturity = min(1.0, updates / 24.0)
-    entropy_pressure = _clip((entropy - 0.72) / 0.28, 0.0, 1.0)
-    cold_scale = 1.0 + 0.12 * (1.0 - maturity)
-    chaos_scale = 1.0 + CMAB_ALPHA_ENTROPY_BOOST * entropy_pressure
-    return float(max(0.20, min(1.20, CMAB_ALPHA * cold_scale * chaos_scale)))
-
-
-def _phase_transition(previous_context: Any, context: np.ndarray) -> Dict[str, float]:
-    """以標準化歐氏距離與餘弦位移辨識牌路 context 相變。"""
-    try:
-        previous = _coerce_context_vector(previous_context)
-    except Exception:
-        previous = np.asarray(context, dtype=np.float64)
-    delta = np.asarray(context, dtype=np.float64) - previous
-    euclidean = float(np.linalg.norm(delta) / math.sqrt(CONTEXT_DIM))
-    denominator = float(np.linalg.norm(context) * np.linalg.norm(previous))
-    cosine_distance = 0.0 if denominator <= 1e-12 else float(1.0 - np.clip((context @ previous) / denominator, -1.0, 1.0))
-    # B/P balance、龍長、斷龍、下三路飽和度在相變時更重要；不新增維度。
-    index = {name: i for i, name in enumerate(FEATURE_NAMES)}
-    focus = (
-        "global_banker_balance", "recent5_banker_balance", "recent10_banker_balance",
-        "current_streak_length", "streak_break_signal", "long_dragon_tail_pressure",
-        "big_eye_saturation", "small_road_saturation", "cockroach_road_saturation",
-        "derived_road_consensus",
-    )
-    focused_change = float(np.mean([abs(delta[index[name]]) for name in focus]))
-    score = max(
-        euclidean / max(1e-9, CMAB_PHASE_DISTANCE_THRESHOLD),
-        cosine_distance / 0.35,
-        focused_change / 0.25,
-    )
-    return {
-        "euclidean_distance": euclidean,
-        "cosine_distance": cosine_distance,
-        "focused_change": focused_change,
-        "strength": float(max(0.0, min(1.0, score))),
-    }
-
-
-def _continuous_forgetting_factor(
-    last_risk: Mapping[str, Any],
-    reversal_signal: float,
-    phase_strength: float,
-) -> tuple[float, Dict[str, float]]:
-    """依混沌／斷龍／真正相變作溫和的連續遺忘。
-
-    單局 B/P 本來就會使 ``last_outcome``、龍長等 context 改變；不能把
-    每次位移都當成 regime change。故只有高於 0.70 的相變分數才逐步加入
-    壓力，而且三個來源採加權平均而非舊版的任一項 ``max``／近似 OR。
-    """
-    entropy = _clip(last_risk.get("permutation_entropy", 0.0), 0.0, 1.0)
-    entropy_pressure = _clip((entropy - 0.72) / 0.28, 0.0, 1.0)
-    reversal_pressure = max(0.0, min(1.0, abs(float(reversal_signal))))
-    phase_pressure = _clip((phase_strength - 0.70) / 0.30, 0.0, 1.0)
-    # 相變是「原本學到的路型」最可能失效的證據，因此比單純高熵更重要。
-    # 這使真正的斷龍／跳路切換可更快遺忘，但白噪音的一次抖動不會單獨
-    # 清空歷史。三項總和剛好為 1，維持 factor 的可解釋性。
-    entropy_component = 0.25 * entropy_pressure
-    reversal_component = 0.35 * reversal_pressure
-    phase_component = 0.40 * phase_pressure
-    instability = entropy_component + reversal_component + phase_component
-    instability = _clip(instability, 0.0, 1.0)
-    stable = max(CMAB_STABLE_FORGETTING_FACTOR, CMAB_MIN_DYNAMIC_FORGETTING_FACTOR)
-    minimum = min(CMAB_STABLE_FORGETTING_FACTOR, CMAB_MIN_DYNAMIC_FORGETTING_FACTOR)
-    factor = stable - (stable - minimum) * instability
-    return float(factor), {
-        "entropy_pressure": float(entropy_pressure),
-        "reversal_pressure": float(reversal_pressure),
-        "phase_strength": float(phase_pressure),
-        "entropy_component": float(entropy_component),
-        "reversal_component": float(reversal_component),
-        "phase_component": float(phase_component),
-        "instability": float(instability),
-    }
-
-
-def _arm_metrics(
-    state: Mapping[str, Any],
-    arm: str,
-    context: np.ndarray,
-) -> Dict[str, float]:
-    """精確計算 disjoint LinUCB mean 與 x^T A^-1 x。
-
-    使用同一個 solve 的雙 RHS [b, x]，只分解 A 一次；相較兩次
-    solve 或顯式 inverse，速度更快且數值更穩定。
-    """
-    arm_state = dict(
-        dict(state.get("arms") or {}).get(arm) or {}
-    )
-    A = np.asarray(arm_state.get("A"), dtype=np.float64)
-    b = np.asarray(arm_state.get("b"), dtype=np.float64)
-
-    right_hand_sides = np.column_stack((b, context))
-    solved, ridge_jitter = _safe_solve(A, right_hand_sides)
-    theta = solved[:, 0]
-    solved_context = solved[:, 1]
-
-    estimate = float(theta @ context)
-    variance = float(
-        max(0.0, float(context @ solved_context))
-    )
-    uncertainty = float(math.sqrt(variance))
-    effective_alpha = _dynamic_alpha(state, context)
-    exploration = float(effective_alpha * uncertainty)
-
-    return {
-        "estimate": estimate,
-        "variance": variance,
-        "uncertainty": uncertainty,
-        "confidence_interval_half_width": exploration,
-        "confidence_interval_full_width": 2.0 * exploration,
-        "exploration": exploration,
-        "effective_alpha": effective_alpha,
-        "ridge_jitter": ridge_jitter,
-        "score": estimate + exploration,
-        "updates": int(arm_state.get("updates", 0) or 0),
-        "weighted_updates": float(
-            arm_state.get(
-                "weighted_updates",
-                arm_state.get("updates", 0),
-            )
-            or 0.0
-        ),
-        "reward_sum": float(
-            arm_state.get("reward_sum", 0.0) or 0.0
-        ),
-        "weighted_reward_sum": float(
-            arm_state.get(
-                "weighted_reward_sum",
-                arm_state.get("reward_sum", 0.0),
-            )
-            or 0.0
-        ),
-    }
-
-
-def _shared_context_uncertainty(
-    state: Mapping[str, Any],
-    context: np.ndarray,
-) -> Dict[str, float]:
-    """計算與 Arm／reward 無關的牌路 context 新穎度。"""
-    information = dict(state.get("context_information") or {})
-    matrix = _as_information_matrix(information.get("A"))
-    solved_context, ridge_jitter = _safe_solve(matrix, context)
-
-    variance = max(0.0, float(context @ solved_context))
-    return {
-        "variance": float(variance),
-        "std": float(math.sqrt(variance)),
-        "confidence_interval_half_width": float(
-            _dynamic_alpha(state, context) * math.sqrt(variance)
-        ),
-        "ridge_jitter": ridge_jitter,
-        "updates": int(information.get("updates", 0) or 0),
-        "weighted_updates": float(
-            information.get(
-                "weighted_updates",
-                information.get("updates", 0),
-            )
-            or 0.0
-        ),
-    }
-
-
-def _softmax_two(score_b: float, score_p: float) -> Dict[str, float]:
-    values = np.asarray([score_b, score_p], dtype=np.float64) / max(0.10, CMAB_SCORE_TEMPERATURE)
-    values -= float(np.max(values))
-    exp_values = np.exp(np.clip(values, -40.0, 40.0))
-    total = float(exp_values.sum()) or 1.0
-    return {"B": float(exp_values[0] / total), "P": float(exp_values[1] / total), "T": 0.0}
-
-
-def _smoothed_tie_probability(history: Sequence[str]) -> float:
-    """以標準八副牌先驗平滑觀測和局率，避免 T=0 破壞校準指標。"""
-    sample_count = len(history)
-    tie_count = sum(value == "T" for value in history)
-    posterior = (
-        tie_count + CMAB_TIE_PRIOR * CMAB_TIE_PRIOR_STRENGTH
-    ) / max(1e-12, sample_count + CMAB_TIE_PRIOR_STRENGTH)
-    return float(max(0.04, min(0.18, posterior)))
-
-
-def _fallback_direction(history: Sequence[str], road_context: Mapping[str, Any]) -> str:
-    """LinUCB 平手時的結構性決勝，絕不直接跟最後一顆。
-
-    舊版在 B/P 分數完全相同時，最後會 ``return bp[-1]``；因此使用者剛
-    按下「本局結果：莊／閒」後，冷啟動或平手局常直接回報相同的一邊，
-    造成看似按鈕在堆疊方向權重的錯覺。
-
-    這裡只在模型沒有分數優勢時使用，且只讀取已知 B/P 結構：
-    1. 近期 transition 的延續／切換次數；
-    2. 最近 8 手的多數；
-    3. 完全平手時以整段歷史 hash 作可重現中性決勝。
-    ``road_context`` 參數保留以維持既有對外呼叫相容，但不再允許其中的
-    ``direction``／``planning_direction`` 偷渡成「跟最後一顆」的預設值。
-    """
-    del road_context
-    bp = [value for value in history if value in ARMS]
-    if not bp:
-        return "B"
-    if len(bp) == 1:
-        # 一顆歷史不包含任何「延續」或「反轉」證據；固定中性起點，避免
-        # 唯一一顆是 P 時就直接回 P。
-        return "B"
-
-    recent = bp[-8:]
-    same_transitions = sum(
-        left == right for left, right in zip(recent, recent[1:])
-    )
-    switch_transitions = (len(recent) - 1) - same_transitions
-
-    if same_transitions > switch_transitions:
-        # 有可驗證的延續結構才順勢；不是因為最後一顆本身。
-        return recent[-1]
-    if switch_transitions > same_transitions:
-        # 單跳／跳路佔優時，取反向延續該結構。
-        return "P" if recent[-1] == "B" else "B"
-
-    banker_count = sum(value == "B" for value in recent)
-    player_count = len(recent) - banker_count
-    if banker_count != player_count:
-        return "B" if banker_count > player_count else "P"
-
-    # 所有結構都平手時，不允許回落到最後一顆。hash 使同一段歷史永遠
-    # 得到相同結果，且不保存隱藏狀態、不受重按按鈕影響。
-    digest = sha256("|".join(bp).encode("utf-8")).digest()
-    return "B" if (digest[0] & 1) == 0 else "P"
-
-
-def _road_regime_decision(history: Sequence[str]) -> Dict[str, Any]:
-    """以可解釋的大路結構產生「路型先行」候選方向。
-
-    這個函式特意不讀取 ``road_context.direction``、各模型機率或上一局的
-    預測結果。它只讀取已揭曉的 B/P 序列，避免把外部模型的方向再包裝成
-    「牌路規律」，也避免按下結果按鈕後直接跟著最後一顆走。
-
-    判斷順序：
-
-    1. **長龍盤**：末端至少三顆同向，且最近窗口的轉換率不高，才視為
-       可驗證的延續結構。
-    2. **單跳／跳路盤**：最近窗口的轉換率很高，才選擇最後一顆的反向，
-       也就是延續 B/P 交替結構。
-    3. **混合盤**：不強塞規則方向，回交給 LinUCB 的完整 35 維 context。
-
-    回傳的 ``strength`` 是結構辨識強度，並非下一局真實開出機率。
-    """
-    bp = [value for value in history if value in ARMS]
-    if len(bp) < CMAB_REGIME_MIN_HISTORY:
-        return {
-            "regime": "neutral",
-            "direction": "",
-            "strength": 0.0,
-            "sample_count": len(bp),
-            "window": list(bp),
-            "transition_rate": 0.0,
-            "current_streak": 0,
-            "reason": "B/P 樣本不足，交由 LinUCB context 決定。",
-        }
-
-    recent = bp[-CMAB_REGIME_WINDOW:]
-    last_direction, current_streak = _streak(recent)
-    transition_rate = _transition_rate(recent, len(recent))
-
-    if (
-        current_streak >= CMAB_TREND_MIN_STREAK
-        and transition_rate <= CMAB_TREND_MAX_TRANSITION_RATE
-    ):
-        # 龍越長、近期切換越少，結構越明確。下限故意不低於接管門檻，
-        # 但最高仍封頂，避免把短靴的長龍誤當成必然事件。
-        stability = 1.0 - min(
-            1.0,
-            transition_rate / CMAB_TREND_MAX_TRANSITION_RATE,
-        )
-        strength = min(
-            0.90,
-            0.66
-            + 0.055 * min(3, current_streak - CMAB_TREND_MIN_STREAK)
-            + 0.08 * stability,
-        )
-        return {
-            "regime": "trend",
-            "direction": last_direction,
-            "strength": float(strength),
-            "sample_count": len(bp),
-            "window": list(recent),
-            "transition_rate": float(transition_rate),
-            "current_streak": int(current_streak),
-            "reason": (
-                f"末端 {current_streak} 顆{'莊' if last_direction == 'B' else '閒'}"
-                f"，最近 {len(recent)} 手轉換率 {transition_rate:.0%}；"
-                "符合低切換長龍結構。"
-            ),
-        }
-
-    if transition_rate >= CMAB_CHOP_MIN_TRANSITION_RATE:
-        # 只有高轉換才反向；這不是看到單一斷龍就立即反打，而是至少有一個
-        # 窗口的交替證據。對 B-P-B-P 與雙跳混合盤都比單看比例更敏感。
-        direction = "P" if last_direction == "B" else "B"
-        strength = min(
-            0.90,
-            0.66
-            + 0.18
-            * min(
-                1.0,
-                (transition_rate - CMAB_CHOP_MIN_TRANSITION_RATE)
-                / max(1e-9, 1.0 - CMAB_CHOP_MIN_TRANSITION_RATE),
-            ),
-        )
-        return {
-            "regime": "chop",
-            "direction": direction,
-            "strength": float(strength),
-            "sample_count": len(bp),
-            "window": list(recent),
-            "transition_rate": float(transition_rate),
-            "current_streak": int(current_streak),
-            "reason": (
-                f"最近 {len(recent)} 手轉換率 {transition_rate:.0%}；"
-                "符合單跳／跳路結構，選擇反向延續交替。"
-            ),
-        }
-
-    return {
-        "regime": "neutral",
-        "direction": "",
-        "strength": 0.0,
-        "sample_count": len(bp),
-        "window": list(recent),
-        "transition_rate": float(transition_rate),
-        "current_streak": int(current_streak),
-        "reason": "長龍與跳路結構皆不明確，交由 LinUCB 35 維 context 決定。",
-    }
-
-
-def _select_regime_first_direction(
-    bandit_direction: str,
-    conditional_bp: Mapping[str, Any],
-    regime: Mapping[str, Any],
-) -> tuple[str, str]:
-    """在「路型規則」與「LinUCB」之間選擇單一最終來源。
-
-    這是來源選擇而不是把兩個百分比相加：因此畫面與紀錄能明確說出本局
-    是由長龍、跳路或 cMAB 所決定。當兩者同向時直接確認；相反時只有路型
-    足夠明確且 LinUCB edge 小，才讓路型優先。
-    """
-    bandit = bandit_direction if bandit_direction in ARMS else "B"
-    regime_direction = str(regime.get("direction") or "").upper()
-    regime_strength = float(regime.get("strength", 0.0) or 0.0)
-    try:
-        bandit_edge = abs(
-            float(conditional_bp.get("B", 0.5))
-            - float(conditional_bp.get("P", 0.5))
-        )
-    except Exception:
-        bandit_edge = 0.0
-
-    if regime_direction not in ARMS:
-        return bandit, "bandit_neutral_regime"
-    if regime_direction == bandit:
-        return bandit, "regime_and_bandit_agree"
-    if (
-        regime_strength >= CMAB_REGIME_MIN_STRENGTH
-        and bandit_edge <= CMAB_REGIME_OVERRIDE_MAX_BANDIT_EDGE
-    ):
-        return regime_direction, "regime_priority_low_bandit_edge"
-    return bandit, "bandit_priority_clear_edge"
-
-
-def _short_term_trend_buffer(
-    history: Sequence[str],
-    fallback_direction: str,
-) -> Dict[str, Any]:
-    """只使用最新 3 個 B/P 建立 OOD 微觀趨勢先驗。"""
-    buffer = _current_short_term_buffer(history)
-    fallback = (
-        fallback_direction
-        if fallback_direction in ARMS
-        else "B"
-    )
-
-    if len(buffer) >= 2 and buffer[-1] == buffer[-2]:
-        direction = buffer[-1]
-        strategy = "follow_last_two_streak"
-        strength = 0.60
-        evidence = buffer[-2:]
-    elif (
-        len(buffer) >= 3
-        and buffer[-3] == buffer[-1]
-        and buffer[-2] != buffer[-1]
-    ):
-        direction = "P" if buffer[-1] == "B" else "B"
-        strategy = "continue_three_step_alternation"
-        strength = 0.57
-        evidence = buffer[-3:]
-    elif len(buffer) >= 3:
-        banker = sum(value == "B" for value in buffer)
-        direction = "B" if banker >= 2 else "P"
-        strategy = "recent_three_majority"
-        strength = 0.55
-        evidence = buffer[-3:]
-    else:
-        direction = fallback
-        strategy = "insufficient_micro_history_fallback"
-        strength = 0.52
-        evidence = buffer[-3:]
-
-    opposite = "P" if direction == "B" else "B"
-    probabilities = {
-        direction: strength,
-        opposite: 1.0 - strength,
-        "T": 0.0,
-    }
-    return {
-        "direction": direction,
-        "direction_text": "莊" if direction == "B" else "閒",
-        "strategy": strategy,
-        "strength": strength,
-        "evidence": list(evidence),
-        "short_term_buffer": list(buffer),
-        "probabilities": probabilities,
-        "short_term_weight": round(
-            1.0 - CMAB_UNKNOWN_LONG_TERM_WEIGHT,
-            6,
-        ),
-        "long_term_weight": round(
-            CMAB_UNKNOWN_LONG_TERM_WEIGHT,
-            6,
-        ),
-        "meta_learning_takeover": True,
-    }
-
-
-def _blend_ood_probabilities(
-    long_term: Mapping[str, Any],
-    short_term: Mapping[str, Any],
-) -> Dict[str, float]:
-    """OOD 時將長週期降權，但不把已學資訊完全切斷。"""
-    long_weight = float(CMAB_UNKNOWN_LONG_TERM_WEIGHT)
-    short_weight = 1.0 - long_weight
-    values = {
-        arm: (
-            long_weight * float(long_term.get(arm, 0.5) or 0.0)
-            + short_weight * float(short_term.get(arm, 0.5) or 0.0)
-        )
-        for arm in ARMS
-    }
-    total = max(1e-12, sum(values.values()))
-    return {
-        "B": float(values["B"] / total),
-        "P": float(values["P"] / total),
-        "T": 0.0,
-    }
-
-
-def _uncertainty_braking_metrics(
-    metrics: Mapping[str, Mapping[str, Any]],
-    state: Mapping[str, Any],
-    shared_context: Mapping[str, Any],
-    base_direction: str,
-    randomness: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """以模型方差與 12 局排列熵的 AND gate 判定極端混沌。
-
-    每個 Arm 的 variance 均為 xᵀA_arm⁻¹x。
-    OOD braking 使用共享 A_ctx 的 xᵀA_ctx⁻¹x：A_ctx 在任何 B/P
-    實際結果回報後都會更新，因此準確代表「此 context 是否見過」，
-    不會被某個 Arm 被選較少所混淆。決策差方差則另行輸出為
-    Var(mu_B - mu_P) = Var(mu_B) + Var(mu_P)。
-    """
-    variance_b = max(
-        0.0,
-        float(metrics["B"].get("variance", 0.0) or 0.0),
-    )
-    variance_p = max(
-        0.0,
-        float(metrics["P"].get("variance", 0.0) or 0.0),
-    )
-    std_b = math.sqrt(variance_b)
-    std_p = math.sqrt(variance_p)
-
-    action_space_variance = max(
-        0.0,
-        float(shared_context.get("variance", 0.0) or 0.0),
-    )
-    action_space_std = math.sqrt(action_space_variance)
-    decision_gap_variance = variance_b + variance_p
-    decision_gap_std = math.sqrt(decision_gap_variance)
-    selected_arm = base_direction if base_direction in ARMS else "B"
-    selected_variance = variance_b if selected_arm == "B" else variance_p
-    selected_std = math.sqrt(selected_variance)
-
-    baseline = _baseline_summary(state)
-    threshold_variance = float(baseline["threshold"])
-    variance_above_threshold = action_space_variance > threshold_variance
-    shared_context_updates = int(
-        shared_context.get("updates", 0) or 0
-    )
-    # 「高於歷史平均 + 1.3 sigma」只有在歷史基準與真實回饋都已
-    # 累積完成後才有統計意義。舊版在新 UID 的第 1～2 局便套用冷啟動
-    # 固定門檻，容易把正常的新使用者誤判成極端 OOD，並讓影子熔斷
-    # 長時間鎖住觀望。
-    ood_detection_ready = bool(
-        baseline["dynamic_ready"]
-        and shared_context_updates >= CMAB_UNCERTAINTY_MIN_SAMPLES
-    )
-    entropy_indicates_white_noise = bool(
-        randomness.get("entropy_indicates_white_noise", False)
-    )
-    active = bool(
-        ood_detection_ready
-        and variance_above_threshold
-        and entropy_indicates_white_noise
-    )
-    severity_ratio = (
-        action_space_variance / max(threshold_variance, 1e-12)
-    )
-
-    if active and severity_ratio >= 1.50:
-        uncertainty_level = "extreme"
-    elif active:
-        uncertainty_level = "high"
-    elif severity_ratio >= 0.80:
-        uncertainty_level = "elevated"
-    else:
-        uncertainty_level = "normal"
-
-    return {
-        "active": bool(active),
-        # 全局聯動的穩定欄位名稱；adaptive_ensemble.py 直接讀取。
-        "is_extreme_unseen": bool(active),
-        "variance": float(action_space_variance),
-        "uncertainty_level": uncertainty_level,
-        "threshold_mode": (
-            "dynamic_variance_mean_plus_1_3_std"
-            if baseline["dynamic_ready"]
-            else "cold_start_variance_fallback"
-        ),
-        "threshold_metric": (
-            "shared_context_variance_AND_permutation_entropy"
-        ),
-        "threshold_variance": float(threshold_variance),
-        "dynamic_threshold_variance": float(threshold_variance),
-        # 保留舊 std 欄位供既有下游讀取，但正式判斷使用 variance。
-        "threshold_std": float(math.sqrt(max(0.0, threshold_variance))),
-        "dynamic_threshold_std": float(
-            math.sqrt(max(0.0, threshold_variance))
-        ),
-        "historical_mean_variance": float(baseline["mean"]),
-        "historical_std_of_variance": float(baseline["std"]),
-        "historical_mean_std": float(
-            math.sqrt(max(0.0, float(baseline["mean"])))
-        ),
-        "historical_std_of_std": 0.0,
-        "variance_above_dynamic_threshold": bool(
-            variance_above_threshold
-        ),
-        "variance_safe": bool(not variance_above_threshold),
-        "permutation_entropy": float(
-            randomness.get("permutation_entropy", 0.0) or 0.0
-        ),
-        "permutation_entropy_threshold": float(
-            CMAB_PERMUTATION_ENTROPY_THRESHOLD
-        ),
-        "entropy_indicates_white_noise": bool(
-            entropy_indicates_white_noise
-        ),
-        "rolling_randomness": dict(randomness),
-        "historical_sample_count": int(
-            baseline["sample_count"]
-        ),
-        "ood_detection_ready": bool(ood_detection_ready),
-        "ood_minimum_observations": int(
-            CMAB_UNCERTAINTY_MIN_SAMPLES
-        ),
-        "dynamic_threshold_ready": bool(
-            baseline["dynamic_ready"]
-        ),
-        "sigma_multiplier": float(
-            baseline["sigma_multiplier"]
-        ),
-        "action_space_std": float(action_space_std),
-        "action_space_variance": float(
-            action_space_variance
-        ),
-        "decision_gap_std": float(decision_gap_std),
-        "decision_gap_variance": float(
-            decision_gap_variance
-        ),
-        "selected_arm": selected_arm,
-        "selected_arm_std": float(selected_std),
-        "selected_arm_variance": float(selected_variance),
-        "shared_context_updates": int(
-            shared_context.get("updates", 0) or 0
-        ),
-        "shared_context_weighted_updates": float(
-            shared_context.get(
-                "weighted_updates",
-                shared_context.get("updates", 0),
-            )
-            or 0.0
-        ),
-        "severity_ratio": float(severity_ratio),
-        "per_arm_std": {
-            "B": float(std_b),
-            "P": float(std_p),
-        },
-        "per_arm_variance": {
-            "B": float(variance_b),
-            "P": float(variance_p),
-        },
-        "per_arm_ci_half_width": {
-            "B": float(
-                metrics["B"].get(
-                    "confidence_interval_half_width",
-                    0.0,
-                )
-                or 0.0
-            ),
-            "P": float(
-                metrics["P"].get(
-                    "confidence_interval_half_width",
-                    0.0,
-                )
-                or 0.0
-            ),
-        },
-        "few_shot_update_weight": 1.0,
-        "few_shot_boost_disabled": True,
-        "observe_required": bool(active),
-        "bet_multiplier": 0.0 if active else 1.0,
-        "downstream_signal_code": (
-            "STATISTICAL_CHAOS_HARD_BRAKE"
-            if active
-            else "IN_DISTRIBUTION"
-        ),
-    }
-
-def _predict_bandit_impl(
-    history: Iterable[Any],
-    *,
-    road_context: Optional[Mapping[str, Any]] = None,
-    venue: str = "",
-    room: str = "",
-    user_id: str = "",
-    run_seed: Optional[int] = None,
-) -> Dict[str, Any]:
-    raw_history = _clean_history(history)
-    randomness = _rolling_randomness_diagnostics(raw_history)
-    road = dict(road_context or {})
-    vector = build_context_vector(
-        raw_history,
-        road_context=road,
-    )
-    context = np.asarray(vector, dtype=np.float64)
-    prediction_fingerprint = _prediction_fingerprint(
-        raw_history,
-        venue=venue,
-        room=room,
-        context=vector,
-    )
-
-    with _LOCK:
-        state_store = _read_state_unlocked()
-        # 方向模型不再沿用不同牌靴／不同部署留下的隱藏 A/b。每次都從目前
-        # 已辨識的完整路紙 prequential 重播；這是唯一路徑可同時保證「初始
-        # 截圖有參與學習」與「下一局答案未進入自身特徵」。
-        uid_key = _uid_key(user_id)
-        state = _replay_observed_history(raw_history)
-        metrics = {
-            arm: _arm_metrics(state, arm, context)
-            for arm in ARMS
-        }
-        shared_context = _shared_context_uncertainty(state, context)
-
-        score_b = metrics["B"]["score"]
-        score_p = metrics["P"]["score"]
-        if abs(score_b - score_p) <= 1e-12:
-            base_direction = _fallback_direction(
-                raw_history,
-                road,
-            )
-            tie_break = True
-        else:
-            base_direction = (
-                "B" if score_b > score_p else "P"
-            )
-            tie_break = False
-
-        conditional_bp = _softmax_two(
-            score_b,
-            score_p,
-        )
-        # 路型先行不把規則硬混成另一個機率；它先確認目前是否真的呈現
-        # 長龍或高轉換跳路，再和 LinUCB 的原始方向做來源選擇。
-        regime_decision = _road_regime_decision(raw_history)
-        direction, direction_source = _select_regime_first_direction(
-            base_direction,
-            conditional_bp,
-            regime_decision,
-        )
-        tie_probability = _smoothed_tie_probability(raw_history)
-        bp_mass = 1.0 - tie_probability
-        base_probabilities = {
-            "B": float(conditional_bp["B"] * bp_mass),
-            "P": float(conditional_bp["P"] * bp_mass),
-            "T": float(tie_probability),
-        }
-        total_updates = int(state.get("total_updates", 0) or 0)
-        conditional_edge = abs(
-            float(conditional_bp["B"]) - float(conditional_bp["P"])
-        )
-        maturity_ready = total_updates >= CMAB_MIN_SIGNAL_UPDATES
-        # V2.2 的產品契約：不因樣本數、edge 或 OOD 停止輸出，永遠輸出
-        # 當前 LinUCB 分數較高的 B/P；這些量只保留為診斷資訊。
-        direction_signal_ready = True
-        braking = _uncertainty_braking_metrics(
-            metrics,
-            state,
-            shared_context,
-            base_direction,
-            randomness,
-        )
-        short_term = _short_term_trend_buffer(
-            raw_history,
-            base_direction,
-        )
-        short_term["meta_learning_takeover"] = False
-
-        probabilities = dict(base_probabilities)
-        action_code = direction
-        action_text = "莊" if direction == "B" else "閒"
-        if direction_source == "regime_and_bandit_agree":
-            signal_reason = (
-                f"牌路{regime_decision['regime']}結構與 LinUCB 同向；"
-                f"{regime_decision['reason']}"
-            )
-        elif direction_source == "regime_priority_low_bandit_edge":
-            signal_reason = (
-                f"LinUCB B/P 分數差距小，改由牌路{regime_decision['regime']}"
-                f"結構先行；{regime_decision['reason']}"
-            )
-        elif direction_source == "bandit_priority_clear_edge":
-            signal_reason = (
-                f"牌路{regime_decision['regime']}與 LinUCB 相反，但 LinUCB"
-                "分數差距明顯，保留 cMAB 35 維 context 的方向；"
-                f"牌路診斷：{regime_decision['reason']}"
-            )
-        else:
-            signal_reason = (
-                "牌路未形成可驗證的長龍／跳路結構，使用 LinUCB 依目前"
-                "context、歷史回饋、非平穩遺忘與動態探索選擇 B/P。"
-            )
-
-        margin = abs(score_b - score_p)
-        maturity = 1.0 - math.exp(
-            -total_updates / 80.0
-        )
-        quality = min(
-            0.95,
-            0.34
-            + 0.36 * maturity
-            + 0.25 * math.tanh(margin),
-        )
-        if sum(value in ARMS for value in raw_history) < 8:
-            quality = min(quality, 0.45)
-        if bool(braking["active"]):
-            quality = min(quality, CMAB_UNKNOWN_CONFIDENCE_CAP)
-
-        direction_edge = float(conditional_edge)
-        consistency = min(
-            1.0,
-            0.50
-            + 0.50 * math.tanh(margin * 1.5),
-        )
-        selected = metrics[direction]
-        few_shot_weight = float(
-            braking["few_shot_update_weight"]
-        )
-
-        # 更新 UID 專屬的最新 3 局 Buffer 與「分布內」不確定性基準。
-        state["short_term_buffer"] = list(
-            short_term["short_term_buffer"]
-        )
-        baseline_after = _update_uncertainty_baseline(
-            state,
-            action_space_variance=float(
-                braking["action_space_variance"]
-            ),
-            unknown_region_active=bool(
-                braking["active"]
-            ),
-            prediction_fingerprint=prediction_fingerprint,
-        )
-        context_hash = _context_fingerprint(vector)
-        previous_context_vector = list(
-            dict(state.get("last_prediction_risk") or {}).get(
-                "context_vector", []
-            )
-            or []
-        )
-        state["pending_ood_contexts"] = []
-        state["last_prediction_risk"] = {
-            "prediction_fingerprint": prediction_fingerprint,
-            "context_hash": context_hash,
-            "unknown_region_active": bool(
-                braking["active"]
-            ),
-            "is_extreme_unseen": bool(braking["active"]),
-            "variance": float(braking["action_space_variance"]),
-            "few_shot_update_weight": few_shot_weight,
-            "action_space_std": float(
-                braking["action_space_std"]
-            ),
-            "dynamic_threshold_std": float(
-                braking["threshold_std"]
-            ),
-            "dynamic_threshold_variance": float(
-                braking["threshold_variance"]
-            ),
-            "permutation_entropy": float(
-                braking["permutation_entropy"]
-            ),
-            "previous_context_vector": previous_context_vector,
-            "context_vector": list(vector),
-            "selected_arm": direction,
-            "recommended_action": action_code,
-            "created_at": int(time.time()),
-        }
-        state["updated_at"] = int(time.time())
-        state_store["users"][uid_key] = state
-        _write_state_unlocked(state_store)
-
-    confidence_label = (
-        "極低"
-        if braking["active"]
-        else "較高"
-        if quality >= 0.72
-        else "中等"
-        if quality >= 0.50
-        else "偏低"
-    )
-    signal_allowed = action_code in ARMS
-    output_signal_code = (
-        "CHAOS_ADAPTIVE_FORCED_DIRECTION"
-        if braking["active"]
-        else "IN_DISTRIBUTION"
-    )
-    risk_signal = {
-        "code": output_signal_code,
-        "ood_detected": bool(braking["active"]),
-        "is_extreme_unseen": bool(braking["active"]),
-        "variance": float(braking["action_space_variance"]),
-        "extreme_uncertainty": bool(
-            braking["active"]
-        ),
-        "observe_required": bool(not signal_allowed),
-        "bet_multiplier": 1.0 if signal_allowed else 0.0,
-        "confidence_cap": (
-            float(CMAB_UNKNOWN_CONFIDENCE_CAP)
-            if braking["active"]
-            else 1.0
-        ),
-        "few_shot_update_weight": few_shot_weight,
-        "few_shot_boost_disabled": True,
-        "permutation_entropy": float(braking["permutation_entropy"]),
-        "entropy_indicates_white_noise": bool(
-            braking["entropy_indicates_white_noise"]
-        ),
-        "variance_above_dynamic_threshold": bool(
-            braking["variance_above_dynamic_threshold"]
-        ),
-        "variance_safe": bool(braking["variance_safe"]),
-        "meta_direction": direction,
-        "meta_direction_text": (
-            "莊" if direction == "B" else "閒"
-        ),
-    }
-
-    return {
-        "ok": True,
-        "engine": (
-            "CONTEXTUAL_MULTI_ARMED_BANDIT_LINUCB"
-        ),
-        "model_version": MODEL_VERSION,
-        "model_core": (
-            "contextual_multi_armed_bandit_linu_cb"
-        ),
-        "prediction_fingerprint": prediction_fingerprint,
-        "mode": "screen_contextual_bandit",
-        # 將真正參與本局特徵計算的牌路專家同步交給集成層。舊版直到
-        # predictor 完成後才在 screenshot_predictor 補回 road_support，
-        # 導致 adaptive_ensemble 在決策當下看不到任何牌路成員。
-        "road_support": dict(road),
-        # 供 LINE／LIFF 面板或日誌顯示：本局不是只看正規化分數，而是
-        # 清楚紀錄是否辨識到長龍、跳路，及最終由哪個來源決定。
-        "road_regime_decision": dict(regime_decision),
-        "component_probabilities": dict(
-            road.get("component_probabilities") or {}
-        ),
-        "probabilities": dict(probabilities),
-        "pre_braking_probabilities": dict(
-            base_probabilities
-        ),
-        "bandit_learning_probabilities": dict(base_probabilities),
-        "timeline_alignment": {
-            "raw_round_index": len(raw_history),
-            "bp_round_index": sum(
-                value in ARMS for value in raw_history
-            ),
-            "tie_count": sum(
-                value == "T" for value in raw_history
-            ),
-            "structural_features_skip_ties": True,
-            "prediction_uses_history_before_target": True,
-        },
-        "banker_rate": round(
-            probabilities["B"] * 100.0,
-            2,
-        ),
-        "player_rate": round(
-            probabilities["P"] * 100.0,
-            2,
-        ),
-        "tie_rate": round(
-            probabilities["T"] * 100.0,
-            2,
-        ),
-        # 每局的 selected_arm 與 action 同步為 B/P，供完整資訊更新使用。
-        "recommend": direction,
-        "recommend_text": (
-            "莊" if direction == "B" else "閒"
-        ),
-        "action": action_code,
-        "action_text": action_text,
-        "internal_recommend": direction,
-        "internal_action": action_code,
-        "signal_allowed": signal_allowed,
-        "signal_status_code": output_signal_code,
-        "signal_status_text": (
-            "統計混沌：仍輸出方向，並加速非平穩學習"
-            if braking["active"]
-            else "cMAB 下一局方向評估"
-        ),
-        "signal_reason": signal_reason,
-        "internal_signal_reason": signal_reason,
-        "selected_arm": direction,
-        "base_bandit_direction": base_direction,
-        "base_bandit_direction_text": (
-            "莊" if base_direction == "B" else "閒"
-        ),
-        "next_round_direction": direction,
-        "next_round_direction_text": (
-            "莊" if direction == "B" else "閒"
-        ),
-        "direction_source": direction_source,
-        "direction_edge": float(direction_edge),
-        "direction_edge_percent": round(
-            direction_edge * 100.0,
-            4,
-        ),
-        "quality_score": float(quality),
-        "confidence_label": confidence_label,
-        "model_consistency": float(consistency),
-        # 頂層 uncertainty 是 OOD braking 真正使用的共享 context std。
-        "uncertainty": float(braking["action_space_std"]),
-        "state_novelty_uncertainty": float(
-            braking["action_space_std"]
-        ),
-        "state_novelty_variance": float(
-            braking["action_space_variance"]
-        ),
-        "selected_arm_uncertainty": float(
-            selected["uncertainty"]
-        ),
-        "prediction_variance": float(
-            selected["variance"]
-        ),
-        # 供全局集成層使用的固定契約：variance 是共享 context
-        # x^T A_ctx^-1 x，而非某一個 Arm 的局部方差。
-        "variance": float(braking["action_space_variance"]),
-        "variance_threshold": float(braking["threshold_variance"]),
-        "variance_safe": bool(braking["variance_safe"]),
-        "permutation_entropy": float(braking["permutation_entropy"]),
-        "permutation_entropy_threshold": float(
-            braking["permutation_entropy_threshold"]
-        ),
-        "statistical_tests": dict(braking["rolling_randomness"]),
-        "decision_gap_uncertainty": float(
-            braking["decision_gap_std"]
-        ),
-        "decision_gap_variance": float(
-            braking["decision_gap_variance"]
-        ),
-        "unknown_region_active": bool(
-            braking["active"]
-        ),
-        "is_extreme_unseen": bool(braking["active"]),
-        "extreme_uncertainty_signal": bool(
-            braking["active"]
-        ),
-        "few_shot_update_weight": few_shot_weight,
-        "bet_multiplier": 1.0 if signal_allowed else 0.0,
-        "uncertainty_braking": {
-            **braking,
-            "base_direction": base_direction,
-            "selected_direction": direction,
-            "recommended_action": action_code,
-            "baseline_after_prediction": {
-                "sample_count": int(
-                    baseline_after["sample_count"]
-                ),
-                "mean": float(
-                    baseline_after["mean"]
-                ),
-                "std": float(
-                    baseline_after["std"]
-                ),
-                "threshold": float(
-                    baseline_after["threshold"]
-                ),
-                "dynamic_ready": bool(
-                    baseline_after["dynamic_ready"]
-                ),
-            },
-            "short_term_buffer": dict(short_term),
-        },
-        "short_term_trend_buffer": dict(
-            short_term
-        ),
-        "meta_learning_takeover": {
-            "active": False,
-            "short_term_buffer": list(
-                short_term["short_term_buffer"]
-            ),
-            "strategy": str(
-                short_term["strategy"]
-            ),
-            "long_term_weight": float(
-                short_term["long_term_weight"]
-            ),
-            "short_term_weight": float(
-                short_term["short_term_weight"]
-            ),
-            "prior_direction": direction,
-            "prior_probabilities": dict(
-                short_term["probabilities"]
-            ),
-            "reason": "V1.5 已停用即時短線接管；只允許 predictor 影子回測",
-        },
-        # predictor.py 與未來校準器可直接讀取這兩組欄位。
-        "predictor_signal": dict(risk_signal),
-        "online_calibrator_signal": {
-            **risk_signal,
-            "calibration_weight": (
-                0.15 if braking["active"] else 1.0
-            ),
-            "confidence_scale": (
-                0.25 if braking["active"] else 1.0
-            ),
-        },
-        "bandit_context": list(vector),
-        "context_vector": list(vector),
-        "context_feature_names": list(
-            FEATURE_NAMES
-        ),
-        "bandit_scores": {
-            arm: {
-                key: (
-                    int(value)
-                    if key == "updates"
-                    else round(float(value), 10)
-                )
-                for key, value in metrics[arm].items()
-            }
-            for arm in ARMS
-        },
-        "bandit_state": {
-            "reward_semantics": REWARD_SEMANTICS,
-            "history_replay": dict(state.get("history_replay") or {}),
-            "total_updates": total_updates,
-            "total_weighted_updates": float(
-                state.get(
-                    "total_weighted_updates",
-                    total_updates,
-                )
-                or 0.0
-            ),
-            "arm_updates": {
-                arm: int(metrics[arm]["updates"])
-                for arm in ARMS
-            },
-            "arm_weighted_updates": {
-                arm: float(
-                    metrics[arm]["weighted_updates"]
-                )
-                for arm in ARMS
-            },
-            "alpha": CMAB_ALPHA,
-            "l2": CMAB_L2,
-            "unknown_std_threshold": (
-                CMAB_UNKNOWN_STD_THRESHOLD
-            ),
-            "dynamic_threshold_std": float(
-                braking["threshold_std"]
-            ),
-            "dynamic_threshold_variance": float(
-                braking["threshold_variance"]
-            ),
-            "dynamic_threshold_ready": bool(
-                braking["dynamic_threshold_ready"]
-            ),
-            "ood_detection_ready": bool(
-                braking["ood_detection_ready"]
-            ),
-            "uncertainty_history_count": int(
-                braking["historical_sample_count"]
-            ),
-            "uncertainty_sigma_multiplier": (
-                CMAB_UNCERTAINTY_SIGMA
-            ),
-            "unknown_update_multiplier": (
-                CMAB_UNKNOWN_UPDATE_MULTIPLIER
-            ),
-            "few_shot_boost_disabled": True,
-            "forgetting_factor": CMAB_FORGETTING_FACTOR,
-            "reversal_forgetting_factor": (
-                CMAB_REVERSAL_FORGETTING_FACTOR
-            ),
-            "reward_strategy": "outcome_only_full_information",
-            "permutation_entropy_window": CMAB_PERMUTATION_WINDOW,
-            "permutation_entropy_threshold": (
-                CMAB_PERMUTATION_ENTROPY_THRESHOLD
-            ),
-            "tie_prior": CMAB_TIE_PRIOR,
-            "tie_prior_strength": CMAB_TIE_PRIOR_STRENGTH,
-            "minimum_signal_edge": CMAB_MIN_SIGNAL_EDGE,
-            "minimum_signal_updates": CMAB_MIN_SIGNAL_UPDATES,
-            "signal_maturity_ready": bool(maturity_ready),
-            "direction_signal_ready": bool(direction_signal_ready),
-            "state_file": str(CMAB_STATE_FILE),
-            "cold_start_tie_break": tie_break,
-        },
-        "calibration": {
-            "active": total_updates > 0,
-            "scope": "cmab_online_reward",
-            "sample_count": total_updates,
-            "reason": (
-                "cMAB 直接使用每局 reward 更新；"
-                "高方差時另輸出 online_calibrator_signal"
-            ),
-        },
-        "adaptive_ensemble": {
-            "active": False,
-            "effective_share": 0.0,
-            "sample_count": total_updates,
-            "reason": (
-                "已由 LinUCB 線上更新取代舊自適應 Stacking"
-            ),
-        },
-        "venue": str(venue or ""),
-        "room": str(room or ""),
-        "user_id": str(user_id or ""),
-        "run_seed": run_seed,
-        "input_required": False,
-        "disclaimer": (
-            "莊／閒百分比是 cMAB 方向分數正規化結果，"
-            "不是真實開出機率；高不確定性只會降低診斷分數，不覆寫 B/P。"
-        ),
-    }
-
-def _coerce_context_vector(context: Sequence[float]) -> np.ndarray:
-    """接受目前維度與部署切換期間尚未結算的舊 24 維 prediction。"""
-    values = np.asarray(list(context), dtype=np.float64)
-    if values.ndim != 1 or values.size <= 0 or values.size > CONTEXT_DIM:
-        raise ValueError(
-            f"context must contain 1..{CONTEXT_DIM} values, got {values.shape}"
-        )
-    if not np.all(np.isfinite(values)):
-        raise ValueError("context contains non-finite values")
-    if values.size < CONTEXT_DIM:
-        migrated = np.zeros(CONTEXT_DIM, dtype=np.float64)
-        migrated[:values.size] = values
-        values = migrated
-    return np.clip(values, -1.0, 1.0)
-
-
-def _conditional_bp_probabilities(values: Any) -> Dict[str, float]:
-    if not isinstance(values, Mapping):
-        return {"B": 0.5, "P": 0.5}
-    banker = max(0.0, float(values.get("B", 0.0) or 0.0))
-    player = max(0.0, float(values.get("P", 0.0) or 0.0))
-    total = banker + player
-    if total <= 1e-12:
-        return {"B": 0.5, "P": 0.5}
-    return {"B": banker / total, "P": player / total}
-
-
-def _probability_weighted_arm_rewards(
-    actual: str,
-    prediction_probabilities: Any,
-    *,
-    selected_arm: str = "",
-    consecutive_hits: int = 0,
-    consecutive_misses: int = 0,
-) -> Dict[str, float]:
-    """完整資訊的真實 outcome-only 標籤。
-
-    結果揭曉後，B 與 P 的反事實結果都已知，因此對本局 context 的唯一
-    合法監督訊號為 ``y_B=+1,y_P=-1``（或相反）。舊版把「模型自己給的
-    機率、自己選的 Arm、連中／連錯」乘進 reward；這會讓一開始偏向某邊的
-    預測越學越偏，正是面板常出現一顆後就一直跟的根因。
-
-    參數仍保留，以維持既有 ``update_bandit`` 對外介面，但故意不參與
-    label 計算。連中／連錯僅能做診斷，不能偽裝成額外的真實樣本。
-    """
-    del prediction_probabilities, selected_arm, consecutive_hits, consecutive_misses
-    outcome = str(actual or "").upper().strip()
-    if outcome not in ARMS:
-        raise ValueError("actual outcome must be B or P for arm rewards")
-    return {
-        candidate: 1.0 if candidate == outcome else -1.0
-        for candidate in ARMS
-    }
-
-
-def _apply_full_information_observation(
-    state: Dict[str, Any],
-    context: np.ndarray,
-    actual: str,
-    *,
-    forgetting_factor: float,
-    soft_reset: float,
-) -> Dict[str, Dict[str, Any]]:
-    """以一筆已揭曉 B/P，對兩個 Arm 做對稱且可重現的 ridge 更新。
-
-    此函式被「完整路紙 replay」與「上一局剛揭曉」共用。兩條路徑皆使用
-    outcome-only label，確保重按預測、重新部署或補輸上一局都不會得到不同
-    的模型係數。
-    """
-    outcome = str(actual or "").upper().strip()
-    if outcome not in ARMS:
-        raise ValueError("actual must be B or P")
-
-    ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
-        state.get("l2", CMAB_L2) or CMAB_L2
-    )
-    outer_context = np.outer(context, context)
-    rewards = _probability_weighted_arm_rewards(outcome, None)
-    updated: Dict[str, Dict[str, Any]] = {}
-    for arm in ARMS:
-        arm_state = dict(state["arms"][arm])
-        A = np.asarray(arm_state["A"], dtype=np.float64)
-        b = np.asarray(arm_state["b"], dtype=np.float64)
-        # 對稱化防止長期 JSON 序列化／浮點累積造成非 PSD 矩陣。
-        A = 0.5 * (A + A.T)
-        A = forgetting_factor * A + (1.0 - forgetting_factor) * ridge
-        A = (1.0 - soft_reset) * A + soft_reset * ridge
-        A += outer_context
-        b = (forgetting_factor * b) * (1.0 - soft_reset)
-        b += float(rewards[arm]) * context
-
-        previous_weighted = float(
-            arm_state.get("weighted_updates", arm_state.get("updates", 0))
-            or 0.0
-        )
-        previous_weighted_reward = float(
-            arm_state.get(
-                "weighted_reward_sum", arm_state.get("reward_sum", 0.0)
-            )
-            or 0.0
-        )
-        arm_state.update({
-            "A": (0.5 * (A + A.T)).tolist(),
-            "b": b.tolist(),
-            "updates": int(arm_state.get("updates", 0) or 0) + 1,
-            "weighted_updates": forgetting_factor * previous_weighted + 1.0,
-            "reward_sum": float(arm_state.get("reward_sum", 0.0) or 0.0)
-            + float(rewards[arm]),
-            "weighted_reward_sum": (
-                forgetting_factor * previous_weighted_reward
-                + float(rewards[arm])
-            ),
-        })
-        state["arms"][arm] = arm_state
-        updated[arm] = arm_state
-
-    information = dict(state.get("context_information") or {})
-    context_A = _as_information_matrix(information.get("A"))
-    context_A = (
-        forgetting_factor * context_A
-        + (1.0 - forgetting_factor) * ridge
-    )
-    context_A = (1.0 - soft_reset) * context_A + soft_reset * ridge
-    context_A += outer_context
-    previous_context_weighted = float(
-        information.get("weighted_updates", information.get("updates", 0))
-        or 0.0
-    )
-    information.update({
-        "A": (0.5 * (context_A + context_A.T)).tolist(),
-        "updates": int(information.get("updates", 0) or 0) + 1,
-        "weighted_updates": forgetting_factor * previous_context_weighted + 1.0,
-    })
-    state["context_information"] = information
-    state["total_updates"] = int(state.get("total_updates", 0) or 0) + 1
-    state["total_weighted_updates"] = (
-        forgetting_factor * float(
-            state.get("total_weighted_updates", state["total_updates"] - 1)
-            or 0.0
-        )
-        + 1.0
-    )
-    return updated
-
-
-def _replay_observed_history(raw_history: Sequence[str]) -> Dict[str, Any]:
-    """以 prequential 方式重建「目標局以前」可知的 cMAB 狀態。
-
-    對第 t 局的訓練 context 只使用 ``history[:t]``，target 才是第 t 局
-    的實際 B/P。這讓使用者第一次上傳含 30~60 局的大路時，模型不會仍是
-    全零冷啟動；也不會把第 t 局答案放進第 t 局特徵，杜絕時間洩漏。
-    """
-    history = list(raw_history)[-CMAB_HISTORY_REPLAY_LIMIT:]
-    state = _new_state()
-    prefix: List[str] = []
-    bp_before = 0
-    previous_context: Optional[np.ndarray] = None
-    previous_entropy = 0.0
-    replayed = 0
-
+            for a in ARMS:
+                A=np.asarray(state["arms"][a]["A"],dtype=float); b=np.asarray(state["arms"][a]["b"],dtype=float)
+                if A.shape!=(CONTEXT_DIM,CONTEXT_DIM) or b.shape!=(CONTEXT_DIM,): raise ValueError
+                m.arms[a]={"A":0.5*(A+A.T),"b":b,"updates":int(state["arms"][a].get("updates",0)),"reward_sum":float(state["arms"][a].get("reward_sum",0.0))}
+            A=np.asarray(state["context_information"]["A"],dtype=float)
+            if A.shape!=(CONTEXT_DIM,CONTEXT_DIM): raise ValueError
+            m.context_information={"A":0.5*(A+A.T),"updates":int(state["context_information"].get("updates",0))}
+            m.total_observations=int(state.get("total_observations",0)); m.observations_since_reset=int(state.get("observations_since_reset",0)); m.reset_count=int(state.get("reset_count",0))
+            m.g_plus=float(state.get("g_plus",0.0)); m.g_minus=float(state.get("g_minus",0.0)); m.last_residual=float(state.get("last_residual",0.0))
+            m.last_expected_reward=float(state.get("last_expected_reward",0.0)); m.last_observed_reward=float(state.get("last_observed_reward",0.0)); m.last_reset=dict(state.get("last_reset") or {})
+            m.applied_event_ids=[str(x) for x in list(state.get("applied_event_ids") or [])][-5000:]
+        except Exception: return cls()
+        return m
+
+
+def _safe_road(history: Sequence[str]) -> Dict[str,Any]:
+    try: return dict(build_road_context(history,initial_image_count=len(history),manual_count=0) or {})
+    except Exception: return {}
+
+
+def _replay(raw: Sequence[str]) -> tuple[CUSUMLinUCB,Dict[str,Any]]:
+    history=list(raw)[-HISTORY_REPLAY_LIMIT:]; model=CUSUMLinUCB(); prefix: List[str]=[]; bp_before=0; resets=[]; replayed=0
     for actual in history:
-        outcome = str(actual or "").upper().strip()
-        if outcome in ARMS and bp_before >= CMAB_PREQUENTIAL_WARMUP_BP:
-            # prefix 是目前目標局之前的完整 raw 時間軸；T 保留其中但不作
-            # B/P label。每個前綴獨立建 road context，不把未來格子倒灌。
-            prefix_road = build_road_context(
-                prefix,
-                initial_image_count=len(prefix),
-                manual_count=0,
-            )
-            vector = np.asarray(
-                build_context_vector(prefix, road_context=prefix_road),
-                dtype=np.float64,
-            )
-            randomness = _rolling_randomness_diagnostics(prefix)
-            phase = (
-                _phase_transition(previous_context, vector)
-                if previous_context is not None
-                else {"strength": 0.0}
-            )
-            reversal_index = FEATURE_NAMES.index("streak_break_signal")
-            forgetting_factor, diagnostics = _continuous_forgetting_factor(
-                {"permutation_entropy": previous_entropy},
-                float(vector[reversal_index]),
-                float(phase.get("strength", 0.0)),
-            )
-            reset_pressure = max(
-                0.0,
-                min(1.0, float(diagnostics["phase_component"])),
-            )
-            _apply_full_information_observation(
-                state,
-                vector,
-                outcome,
-                forgetting_factor=forgetting_factor,
-                soft_reset=CMAB_PHASE_SOFT_RESET_MAX * reset_pressure,
-            )
-            previous_context = vector
-            previous_entropy = float(
-                randomness.get("permutation_entropy", 0.0) or 0.0
-            )
-            replayed += 1
-
-        prefix.append(outcome)
-        if outcome in ARMS:
-            bp_before += 1
-
-    fingerprint = sha256("".join(history).encode("utf-8")).hexdigest()[:24]
-    state["history_replay"] = {
-        "history_fingerprint": fingerprint,
-        "raw_round_count": len(history),
-        "bp_training_samples": replayed,
-        "replayed_at": int(time.time()),
-    }
-    state["reward_semantics"] = REWARD_SEMANTICS
-    state["replay_mode"] = "prequential_history_before_target"
-    return state
+        if actual in ARMS and bp_before>=PREQUENTIAL_WARMUP_BP:
+            context=build_context_vector(prefix,road_context=_safe_road(prefix)); update=model.observe(context,actual)
+            if update.get("reset_triggered"): resets.append(dict(update.get("reset_event") or {}))
+            replayed+=1
+        prefix.append(actual); bp_before+=int(actual in ARMS)
+    return model,{"raw_round_count":len(history),"bp_training_samples":replayed,"reset_count":model.reset_count,
+                  "reset_events":resets[-20:],"history_fingerprint":sha256("".join(history).encode()).hexdigest()[:24],"mode":"prequential_cusum_dynamic_linucb"}
 
 
-def _update_bandit_impl(
-    *,
-    context: Sequence[float],
-    selected_arm: str,
-    reward: Optional[float],
-    event_id: str = "",
-    actual_outcome: str = "",
-    update_weight: float = 1.0,
-    user_id: str = "",
-    prediction_probabilities: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
-    arm = str(selected_arm or "").upper().strip()
-    actual = str(actual_outcome or "").upper().strip()
-    if arm not in ARMS:
-        raise ValueError("selected_arm must be B or P")
+def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str,Any]]=None, venue: str="", room: str="", user_id: str="", run_seed: Optional[int]=None) -> Dict[str,Any]:
+    del run_seed
+    raw=_clean(history); road=dict(road_context or {}) or _safe_road(raw); model,replay=_replay(raw)
+    context=build_context_vector(raw,road_context=road); pred=model.predict_context(context); risk=model.risk_status(context)
+    selected=pred["selected_arm"]; conditional=pred["conditional_probabilities"]; tie=_tie_prob(raw); bp=1-tie
+    probs={"B":conditional["B"]*bp,"P":conditional["P"]*bp,"T":tie}; observe=bool(risk["force_observe"]); action="O" if observe else selected
+    metrics=pred["metrics"]; shared=pred["shared_uncertainty"]
+    fingerprint=sha256(json.dumps({"history":"".join(raw),"venue":venue.upper(),"room":room,"context":context},sort_keys=True).encode()).hexdigest()[:24]
+    cusum={"g_plus":model.g_plus,"g_minus":model.g_minus,"h":model.cusum_h,"v":model.cusum_v,"last_residual":model.last_residual,
+           "last_expected_reward":model.last_expected_reward,"last_observed_reward":model.last_observed_reward,"reset_count":model.reset_count,"last_reset":model.last_reset}
+    return {"ok":True,"engine":"CUSUM_LINUCB_DYNAMIC_CONTEXTUAL_BANDIT","model_version":MODEL_VERSION,"model_core":"cusum_linucb_dynamic_reset",
+            "prediction_fingerprint":fingerprint,"road_support":road,"probabilities":probs,"bandit_learning_probabilities":probs,
+            "banker_rate":round(probs["B"]*100,2),"player_rate":round(probs["P"]*100,2),"tie_rate":round(probs["T"]*100,2),
+            "selected_arm":selected,"base_bandit_direction":selected,"recommend":action,"recommend_text":"觀望" if observe else "莊" if selected=="B" else "閒",
+            "action":action,"action_text":"觀望" if observe else "莊" if selected=="B" else "閒","internal_recommend":selected,"internal_action":selected,
+            "next_round_direction":selected,"next_round_direction_text":"莊" if selected=="B" else "閒","signal_allowed":not observe,
+            "signal_status_code":"CUSUM_POST_RESET_VACUUM_OBSERVE" if observe else "CUSUM_LINUCB_DIRECTION","direction_source":"cusum_linucb",
+            "direction_edge":abs(conditional["B"]-conditional["P"]),"confidence_score":risk["confidence_score"],"confidence":risk["confidence_score"],"quality_score":risk["confidence_score"],
+            "post_reset_vacuum_active":risk["post_reset_vacuum_active"],"force_observe":observe,"hands_since_reset":risk["observations_since_reset"],
+            "ensemble_weight_suggestion":risk["ensemble_weight_suggestion"],"bet_multiplier":risk["bet_multiplier"],"risk_control":risk,"cusum":cusum,"reset_triggered":bool(model.last_reset),
+            "uncertainty":shared["uncertainty"],"variance":shared["variance"],"variance_safe":not observe,"unknown_region_active":risk["post_reset_vacuum_active"],
+            "is_extreme_unseen":observe,"hard_brake_active":observe,"uncertainty_braking":{"active":observe,"is_extreme_unseen":observe,"variance":shared["variance"],
+            "action_space_variance":shared["variance"],"action_space_std":shared["uncertainty"],"variance_safe":not observe,"post_reset_vacuum_active":risk["post_reset_vacuum_active"],"confidence_score":risk["confidence_score"],"bet_multiplier":risk["bet_multiplier"],"observe_required":observe,"cusum":cusum},
+            "bandit_context":context,"context_vector":context,"context_feature_names":list(FEATURE_NAMES),"bandit_scores":metrics,
+            "bandit_state":{"alpha":CUSUM_ALPHA,"l2":CUSUM_L2,"forgetting_factor":CUSUM_FORGETTING_FACTOR,"context_dim":CONTEXT_DIM,"total_updates":model.total_observations,
+            "observations_since_reset":model.observations_since_reset,"reset_count":model.reset_count,"cusum_h":CUSUM_THRESHOLD_H,"cusum_v":CUSUM_DRIFT_V,
+            "vacuum_hands":CUSUM_VACUUM_HANDS,"force_observe_hands":CUSUM_FORCE_OBSERVE_HANDS,"history_replay":replay,"state_file":str(CMAB_STATE_FILE)},
+            "adaptive_ensemble":{"active":False,"suggested_share":risk["ensemble_weight_suggestion"],"reason":"predictor.py performs final fusion"},
+            "venue":venue,"room":room,"user_id":user_id,"input_required":False,"probability_semantics":"normalized_model_score_not_guaranteed_outcome_probability"}
 
-    if reward is None:
-        return {
-            "updated": False,
-            "reason": "tie_or_skipped_reward",
-            "selected_arm": arm,
-            "actual_outcome": actual,
-        }
 
-    x = _coerce_context_vector(context)
-    context_hash = _context_fingerprint(x)
-    if not math.isfinite(float(reward)):
-        raise ValueError("reward must be finite")
-    reward_value = max(-2.0, min(1.0, float(reward)))
-    requested_weight_value = float(update_weight)
-    if not math.isfinite(requested_weight_value):
-        raise ValueError("update_weight must be finite")
-    requested_weight = max(0.25, min(12.0, requested_weight_value))
-    event_key = str(event_id or "").strip()
+def _uid(user_id: str) -> str: return sha256((str(user_id or "").strip() or "__anonymous__").encode()).hexdigest()[:24]
 
+def _read_store() -> Dict[str,Any]:
+    try:
+        d=json.loads(CMAB_STATE_FILE.read_text(encoding="utf-8"))
+        if d.get("schema_version")==STATE_SCHEMA_VERSION and isinstance(d.get("users"),dict): return d
+    except Exception: pass
+    return {"schema_version":STATE_SCHEMA_VERSION,"version":MODEL_VERSION,"context_dim":CONTEXT_DIM,"users":{}}
+
+def _write_store(d: Mapping[str,Any]) -> None:
+    x=dict(d); x.update(schema_version=STATE_SCHEMA_VERSION,version=MODEL_VERSION,context_dim=CONTEXT_DIM,updated_at=int(time.time()))
+    tmp=CMAB_STATE_FILE.with_suffix(CMAB_STATE_FILE.suffix+".tmp"); tmp.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding="utf-8"); tmp.replace(CMAB_STATE_FILE)
+
+
+def update_bandit(*, context: Sequence[float], selected_arm: str, reward: Optional[float], event_id: str="", actual_outcome: str="", update_weight: float=1.0,
+                  user_id: str="", prediction_probabilities: Optional[Mapping[str,Any]]=None) -> Dict[str,Any]:
+    del update_weight,prediction_probabilities
+    arm=str(selected_arm).upper(); event=str(event_id or "")
+    if arm not in ARMS: raise ValueError("selected_arm must be B or P")
     with _LOCK:
-        state_store = _read_state_unlocked()
-        uid_key, state = _get_user_state_unlocked(
-            state_store,
-            user_id,
-            create=True,
-        )
-        applied = list(
-            state.get("applied_event_ids") or []
-        )
-        if event_key and event_key in applied:
-            return {
-                "updated": False,
-                "reason": "duplicate_event",
-                "event_id": event_key,
-                "total_updates": int(
-                    state.get("total_updates", 0) or 0
-                ),
-            }
-
-        last_risk = dict(state.get("last_prediction_risk") or {})
-        prediction_context_matches = bool(
-            str(last_risk.get("context_hash") or "") == context_hash
-        )
-        same_high_variance_context = bool(
-            last_risk.get(
-                "is_extreme_unseen",
-                last_risk.get("unknown_region_active", False),
-            )
-            and prediction_context_matches
-        )
-        # V1.5：無論呼叫端傳入多少權重，一律只視為一筆觀測。
-        # 這能防止單局隨機結果以 4～5 筆證據灌入 posterior。
-        observation_weight = 1.0
-
-        # 百家樂揭曉 B/P 後，兩個 Arm 的反事實 reward 都已知：
-        # B 開出即 B=1/P=0，P 開出則相反。舊版只更新「被選 Arm」，
-        # 會引入 action-selection bias 並浪費一半監督訊號。
-        # 有完整結果時同時更新兩 Arm；舊呼叫未提供 actual 時仍相容
-        # selected-arm-only 更新。每個 Arm 仍固定 w=1，沒有 Few-shot。
-        full_information_update = actual in ARMS
-        previous_hits = int(state.get("consecutive_hits", 0) or 0)
-        previous_misses = int(state.get("consecutive_misses", 0) or 0)
-        direction_correct = bool(full_information_update and arm == actual)
-        consecutive_hits = previous_hits + 1 if direction_correct else 0
-        consecutive_misses = previous_misses + 1 if full_information_update and not direction_correct else 0
-        arm_rewards = (
-            _probability_weighted_arm_rewards(
-                actual,
-                prediction_probabilities,
-                selected_arm=arm,
-                consecutive_hits=consecutive_hits,
-                consecutive_misses=consecutive_misses,
-            )
-            if full_information_update
-            else {arm: reward_value}
-        )
-        feature_index = {
-            name: index for index, name in enumerate(FEATURE_NAMES)
-        }
-        reversal_signal = abs(
-            float(x[feature_index["streak_break_signal"]])
-        )
-        phase = _phase_transition(
-            last_risk.get("previous_context_vector", []), x
-        ) if prediction_context_matches else {
-            "euclidean_distance": 0.0,
-            "cosine_distance": 0.0,
-            "focused_change": 0.0,
-            "strength": 0.0,
-        }
-        forgetting_factor, forgetting_diagnostics = (
-            _continuous_forgetting_factor(
-                last_risk if prediction_context_matches else {},
-                reversal_signal,
-                float(phase["strength"]),
-            )
-        )
-        # 非平穩更新：lambda 已由排列熵、斷龍與相變連續決定。除原本的
-        # phase reset 外，極端混沌亦施加較小的 ridge 回拉，等價於：
-        # A <- lambda*A + (1-lambda)*ridge*I，再保留新觀測 xx^T。
-        # 混沌 reset 僅取 instability 的 35%，避免單局高熵直接抹除矩陣。
-        regime_reset_pressure = max(
-            float(phase["strength"]),
-            0.35 * float(forgetting_diagnostics["instability"]),
-        )
-        soft_reset = float(
-            CMAB_PHASE_SOFT_RESET_MAX * regime_reset_pressure
-        )
-        updated_arm_states: Dict[str, Dict[str, Any]] = {}
-        outer_context = np.outer(x, x)
-        for candidate, candidate_reward in arm_rewards.items():
-            candidate_state = dict(state["arms"][candidate])
-            previous_updates = int(candidate_state.get("updates", 0) or 0)
-            previous_weighted_updates = float(
-                candidate_state.get("weighted_updates", previous_updates)
-                or 0.0
-            )
-            previous_reward_sum = float(
-                candidate_state.get("reward_sum", 0.0) or 0.0
-            )
-            previous_weighted_reward_sum = float(
-                candidate_state.get(
-                    "weighted_reward_sum", previous_reward_sum
-                )
-                or 0.0
-            )
-            candidate_A = np.asarray(
-                candidate_state["A"], dtype=np.float64
-            )
-            candidate_b = np.asarray(
-                candidate_state["b"], dtype=np.float64
-            )
-            ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
-                state.get("l2", CMAB_L2) or CMAB_L2
-            )
-            candidate_A = (
-                forgetting_factor * candidate_A
-                + (1.0 - forgetting_factor) * ridge
-            )
-            candidate_b *= forgetting_factor
-            # A 向 ridge prior 局部回拉：等價於降低舊樣本有效樣本數、
-            # 擴大 x^T A^-1 x 方差，讓相變後的新觀測更快主導 theta。
-            candidate_A = (1.0 - soft_reset) * candidate_A + soft_reset * ridge
-            candidate_b *= 1.0 - soft_reset
-            candidate_A += observation_weight * outer_context
-            candidate_b += (
-                observation_weight * float(candidate_reward) * x
-            )
-            candidate_state["A"] = candidate_A.tolist()
-            candidate_state["b"] = candidate_b.tolist()
-            candidate_state["updates"] = previous_updates + 1
-            candidate_state["weighted_updates"] = (
-                forgetting_factor * previous_weighted_updates
-                + observation_weight
-            )
-            candidate_state["reward_sum"] = (
-                previous_reward_sum + float(candidate_reward)
-            )
-            candidate_state["weighted_reward_sum"] = (
-                forgetting_factor * previous_weighted_reward_sum
-                + observation_weight * float(candidate_reward)
-            )
-            state["arms"][candidate] = candidate_state
-            updated_arm_states[candidate] = candidate_state
-
-        arm_state = updated_arm_states[arm]
-
-        # 共享 context matrix 不看 reward，也不分 Arm；每筆已揭曉 B/P
-        # 都代表這個特徵區間多了一次真實觀測。
-        context_information = dict(state.get("context_information") or {})
-        context_A = _as_information_matrix(context_information.get("A"))
-        context_ridge = np.eye(CONTEXT_DIM, dtype=np.float64) * float(
-            state.get("l2", CMAB_L2) or CMAB_L2
-        )
-        context_A = (
-            forgetting_factor * context_A
-            + (1.0 - forgetting_factor) * context_ridge
-        )
-        context_A = (1.0 - soft_reset) * context_A + soft_reset * context_ridge
-        context_A += observation_weight * np.outer(x, x)
-        context_information["A"] = (
-            0.5 * (context_A + context_A.T)
-        ).tolist()
-        context_information["updates"] = (
-            int(context_information.get("updates", 0) or 0) + 1
-        )
-        context_information["weighted_updates"] = forgetting_factor * float(
-            context_information.get(
-                "weighted_updates",
-                context_information["updates"] - 1,
-            )
-            or 0.0
-        ) + observation_weight
-        state["context_information"] = context_information
-        state["total_updates"] = (
-            int(state.get("total_updates", 0) or 0)
-            + 1
-        )
-        state["total_weighted_updates"] = forgetting_factor * float(
-            state.get(
-                "total_weighted_updates",
-                state["total_updates"] - 1,
-            )
-            or 0.0
-        ) + observation_weight
-
-        if full_information_update:
-            recent_correctness = list(
-                state.get("recent_direction_correctness") or []
-            )
-            recent_correctness.append(1 if direction_correct else 0)
-            state["recent_direction_correctness"] = recent_correctness[
-                -CMAB_RECENT_ACCURACY_WINDOW:
-            ]
-            state["consecutive_hits"] = consecutive_hits
-            state["consecutive_misses"] = consecutive_misses
-
-        if event_key:
-            applied.append(event_key)
-            state["applied_event_ids"] = applied[
-                -CMAB_MAX_EVENT_IDS:
-            ]
-
-        state["pending_ood_contexts"] = []
-
-        state["last_update"] = {
-            "event_id": event_key,
-            "selected_arm": arm,
-            "actual_outcome": actual,
-            "reward": reward_value,
-            "full_information_update": bool(full_information_update),
-            "updated_arms": list(updated_arm_states),
-            "arm_rewards": dict(arm_rewards),
-            "prediction_probabilities": dict(
-                _conditional_bp_probabilities(prediction_probabilities)
-            ),
-            "reward_strategy": "outcome_only_full_information",
-            "forgetting_factor": float(forgetting_factor),
-            "reversal_signal": float(reversal_signal),
-            "reversal_decay_applied": bool(
-                forgetting_diagnostics["reversal_pressure"] > 0.0
-            ),
-            "continuous_forgetting": dict(forgetting_diagnostics),
-            "phase_transition": dict(phase),
-            "regime_reset_pressure": regime_reset_pressure,
-            "soft_reset_strength": soft_reset,
-            "direction_correct": direction_correct,
-            "consecutive_hits": consecutive_hits,
-            "consecutive_misses": consecutive_misses,
-            "requested_weight": requested_weight,
-            "applied_weight": observation_weight,
-            "few_shot_boost_applied": False,
-            "few_shot_boost_disabled": True,
-            "same_high_variance_context": bool(
-                same_high_variance_context
-            ),
-            "matched_pending_ood_context": False,
-            "context_hash": context_hash,
-            "updated_at": int(time.time()),
-        }
-        state["updated_at"] = int(time.time())
-        state_store["users"][uid_key] = state
-        _write_state_unlocked(state_store)
-
-    return {
-        "updated": True,
-        "event_id": event_key,
-        "selected_arm": arm,
-        "actual_outcome": actual,
-        "reward": reward_value,
-        "full_information_update": bool(full_information_update),
-        "updated_arms": list(updated_arm_states),
-        "arm_rewards": dict(arm_rewards),
-        "prediction_probabilities": dict(
-            _conditional_bp_probabilities(prediction_probabilities)
-        ),
-        "reward_strategy": "outcome_only_full_information",
-        "forgetting_factor": float(forgetting_factor),
-        "reversal_signal": float(reversal_signal),
-        "reversal_decay_applied": bool(
-            forgetting_diagnostics["reversal_pressure"] > 0.0
-        ),
-        "continuous_forgetting": dict(forgetting_diagnostics),
-        "phase_transition": dict(phase),
-        "regime_reset_pressure": regime_reset_pressure,
-        "soft_reset_strength": soft_reset,
-        "direction_correct": direction_correct,
-        "consecutive_hits": consecutive_hits,
-        "consecutive_misses": consecutive_misses,
-        "requested_update_weight": requested_weight,
-        "update_weight": observation_weight,
-        "few_shot_boost_applied": False,
-        "few_shot_boost_disabled": True,
-        "reversal_forgetting_factor": float(
-            CMAB_REVERSAL_FORGETTING_FACTOR
-        ),
-        "boost_reason": "disabled_to_prevent_random_noise_overfitting",
-        "arm_updates": int(arm_state["updates"]),
-        "arm_weighted_updates": float(
-            arm_state["weighted_updates"]
-        ),
-        "per_arm_updates": {
-            candidate: int(updated_arm_states[candidate]["updates"])
-            for candidate in updated_arm_states
-        },
-        "total_updates": int(
-            state["total_updates"]
-        ),
-        "total_weighted_updates": float(
-            state["total_weighted_updates"]
-        ),
-        "shared_context_updates": int(
-            context_information["updates"]
-        ),
-        "shared_context_weighted_updates": float(
-            context_information["weighted_updates"]
-        ),
-    }
+        store=_read_store(); key=_uid(user_id); model=CUSUMLinUCB.from_state(dict(store["users"].get(key) or {}))
+        if event and event in model.applied_event_ids: return {"updated":False,"reason":"duplicate_event","event_id":event}
+        actual=str(actual_outcome).upper()
+        if actual in ARMS: result=model.observe(context,actual,selected_arm=arm)
+        elif reward is not None and math.isfinite(float(reward)): result=model.observe_reward(context,selected_arm=arm,reward=float(reward))
+        else: return {"updated":False,"reason":"tie_or_skipped_reward","event_id":event}
+        if event: model.applied_event_ids=(model.applied_event_ids+[event])[-5000:]
+        store["users"][key]=model.to_state(); _write_store(store)
+    return {**result,"event_id":event,"model_version":MODEL_VERSION,"reset_count":model.reset_count,"hands_since_reset":model.observations_since_reset}
 
 
-def _get_bandit_summary_impl(
-    user_id: str = "",
-) -> Dict[str, Any]:
-    with _LOCK:
-        state_store = _read_state_unlocked()
-        _, state = _get_user_state_unlocked(
-            state_store,
-            user_id,
-            create=False,
-        )
-        baseline = _baseline_summary(state)
-
-    return {
-        "version": state.get(
-            "version",
-            MODEL_VERSION,
-        ),
-        "context_dim": CONTEXT_DIM,
-        "feature_names": list(FEATURE_NAMES),
-        "total_updates": int(
-            state.get("total_updates", 0) or 0
-        ),
-        "total_weighted_updates": float(
-            state.get(
-                "total_weighted_updates",
-                state.get("total_updates", 0),
-            )
-            or 0.0
-        ),
-        "unknown_std_threshold": float(
-            CMAB_UNKNOWN_STD_THRESHOLD
-        ),
-        "dynamic_uncertainty_threshold": {
-            "unit": "variance",
-            "ready": bool(
-                baseline["dynamic_ready"]
-            ),
-            "current_threshold": float(
-                baseline["threshold"]
-            ),
-            "historical_mean": float(
-                baseline["mean"]
-            ),
-            "historical_std": float(
-                baseline["std"]
-            ),
-            "sample_count": int(
-                baseline["sample_count"]
-            ),
-            "sigma_multiplier": float(
-                CMAB_UNCERTAINTY_SIGMA
-            ),
-        },
-        "unknown_update_multiplier": float(
-            CMAB_UNKNOWN_UPDATE_MULTIPLIER
-        ),
-        "few_shot_boost_disabled": True,
-        "forgetting_factor": float(CMAB_FORGETTING_FACTOR),
-        "reversal_forgetting_factor": float(
-            CMAB_REVERSAL_FORGETTING_FACTOR
-        ),
-        "reward_strategy": "outcome_only_full_information",
-        "permutation_entropy": {
-            "window": CMAB_PERMUTATION_WINDOW,
-            "order": CMAB_PERMUTATION_ORDER,
-            "threshold": CMAB_PERMUTATION_ENTROPY_THRESHOLD,
-            "extreme_gate": (
-                "variance_above_mean_plus_1.3_std_AND_entropy_above_0.95"
-            ),
-        },
-        "short_term_buffer": list(
-            state.get("short_term_buffer") or []
-        )[-3:],
-        "last_prediction_risk": dict(
-            state.get("last_prediction_risk") or {}
-        ),
-        "shared_context_information": {
-            "updates": int(
-                dict(state.get("context_information") or {}).get(
-                    "updates", 0
-                )
-                or 0
-            ),
-            "weighted_updates": float(
-                dict(state.get("context_information") or {}).get(
-                    "weighted_updates",
-                    dict(state.get("context_information") or {}).get(
-                        "updates", 0
-                    ),
-                )
-                or 0.0
-            ),
-        },
-        "pending_ood_context_count": len(
-            list(state.get("pending_ood_contexts") or [])
-        ),
-        "arms": {
-            arm: {
-                "updates": int(
-                    state["arms"][arm].get(
-                        "updates",
-                        0,
-                    )
-                    or 0
-                ),
-                "weighted_updates": float(
-                    state["arms"][arm].get(
-                        "weighted_updates",
-                        state["arms"][arm].get(
-                            "updates",
-                            0,
-                        ),
-                    )
-                    or 0.0
-                ),
-                "reward_sum": float(
-                    state["arms"][arm].get(
-                        "reward_sum",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                "weighted_reward_sum": float(
-                    state["arms"][arm].get(
-                        "weighted_reward_sum",
-                        state["arms"][arm].get(
-                            "reward_sum",
-                            0.0,
-                        ),
-                    )
-                    or 0.0
-                ),
-            }
-            for arm in ARMS
-        },
-        "state_file": str(CMAB_STATE_FILE),
-    }
-
-
-# ---------------------------------------------------------------------------
-# 決策策略 LinUCB（與既有 B/P 牌路 cMAB 分離）
-# ---------------------------------------------------------------------------
-# 既有 ``ARMS = ("B", "P")`` 的 ContextualBanditEngine 仍完整保留，供
-# 牌路診斷與原始 B/P 傾向使用。以下三個 Arm 不選莊／閒；它們只選擇要以
-# 何種保守程度使用已通過精確牌組 EV 閘門的訊號。這樣不會讓路圖資料把
-# 抽水後為負的物理 EV 偽裝成可以下注的方向。
-DECISION_STRATEGY_ARMS = (
-    "math_only",
-    "ev_road_blend",
-    "conservative",
-)
-DECISION_STRATEGY_CONTEXT_DIM = 34
-DECISION_STRATEGY_ALPHA = 0.42
-DECISION_STRATEGY_L2 = 1.50
-DECISION_STRATEGY_MAX_EVENT_IDS = 5000
-DECISION_STRATEGY_VERSION = "DECISION-STRATEGY-LINUCB-V2-ROAD-STATE"
-
-
-def _resolve_strategy_state_file() -> Path:
-    """策略 Bandit 使用獨立狀態，絕不污染既有 B/P cMAB 的 A/b。"""
-    configured = Path("/var/data/decision_strategy_bandit_state_v2.json")
-    candidates = [
-        configured,
-        BASE_DIR / "data" / "decision_strategy_bandit_state_v2.json",
-        Path("/tmp/bgs_decision_strategy_bandit_state_v2.json"),
-    ]
-    for candidate in candidates:
-        try:
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            probe = candidate.parent / f".strategy_write_test_{time.time_ns()}"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError("No writable decision-strategy state path is available")
-
-
-DECISION_STRATEGY_STATE_FILE = _resolve_strategy_state_file()
-
-
-def _strategy_clip(value: Any, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    try:
-        return max(minimum, min(maximum, float(value)))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _strategy_side(value: Any) -> str:
-    side = str(value or "").upper().strip()
-    return side if side in ARMS else ""
-
-
-def _strategy_road_direction(road_context: Mapping[str, Any], history: Sequence[str]) -> str:
-    """只抽取現成牌路 Context 的診斷方向，絕不把它當物理機率。"""
-    try:
-        probability = float(road_context.get("planning_probability", 0.5) or 0.5)
-    except (TypeError, ValueError):
-        probability = 0.5
-    if probability != 0.5:
-        return "B" if probability > 0.5 else "P"
-    bp = [value for value in history if value in ARMS]
-    direction, length = _streak(bp)
-    if length >= 3:
-        return direction
-    return bp[-1] if bp else ""
-
-
-def _strategy_number(value: Any, default: float = 0.0) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return number if math.isfinite(number) else default
-
-
-def _strategy_full_road(road_context: Mapping[str, Any]) -> Dict[str, Any]:
-    """讀取 road_model 已算好的完整路紙，不重跑模型也不直接碰影像。"""
-    planning = road_context.get("full_road_analysis")
-    if isinstance(planning, Mapping):
-        return dict(planning)
-    models = road_context.get("models")
-    model = models.get("full_road") if isinstance(models, Mapping) else None
-    return dict(model) if isinstance(model, Mapping) else {}
-
-
-def _strategy_jump_dragon_score(run_lengths: Sequence[Any]) -> float:
-    """跳跳龍：短 run 與長 run 在最近欄位交替出現的程度。"""
-    values = [max(0, int(value)) for value in list(run_lengths or [])[-6:]]
-    if len(values) < 4:
-        return 0.0
-    marks = [1 if value <= 1 else 0 for value in values]
-    switches = sum(left != right for left, right in zip(marks, marks[1:]))
-    alternation = switches / max(1, len(marks) - 1)
-    has_short = any(value <= 1 for value in values)
-    has_long = any(value >= 3 for value in values)
-    return _strategy_clip(alternation * (1.0 if has_short and has_long else 0.0))
-
-
-def _strategy_derived_recent(planning: Mapping[str, Any], name: str) -> float:
-    stats = dict(planning.get("derived_stats") or {}).get(name)
-    if not isinstance(stats, Mapping):
-        return 0.5
-    return _strategy_clip(stats.get("recent_continuation", 0.5), 0.0, 1.0)
-
-
-def _strategy_road_pattern_state(
-    history: Sequence[str], road_context: Mapping[str, Any]
-) -> Dict[str, Any]:
-    """將 full_road_pattern_model 的結構結果轉成有限、可學習的狀態。
-
-    這裡只讀取 ``road_model.build_road_context`` 事先建出的 full-road
-    walk-forward 狀態，不將固定「見龍追龍」規則直接寫成下注指令。
-    """
-    planning = _strategy_full_road(road_context)
-    regime = dict(road_context.get("regime") or {})
-    bp = [value for value in history if value in ARMS]
-    run_lengths = list(planning.get("run_lengths") or [])
-    if not run_lengths:
-        _, fallback_run = _streak(bp)
-        run_lengths = [fallback_run] if fallback_run else []
-    current_run = max(0, int(planning.get("current_run", run_lengths[-1] if run_lengths else 0) or 0))
-    alternating_tail = _strategy_clip(_transition_rate(bp, 6))
-    single_jump_score = abs(_single_jump_onset(bp))
-    jump_dragon_score = _strategy_jump_dragon_score(run_lengths)
-    continuation = _strategy_clip(planning.get("continuation_probability", 0.5), 0.0, 1.0)
-
-    # 只用作 Context 的狀態標籤；策略 Arm 仍必須通過 exact EV gate。
-    if current_run >= 4 and continuation >= 0.52:
-        label = "long_dragon"
-    elif single_jump_score >= 0.99:
-        label = "single_jump"
-    elif jump_dragon_score >= 0.55:
-        label = "jump_dragon"
-    elif alternating_tail >= 0.68:
-        label = "high_alternation"
-    else:
-        label = "mixed"
-    labels = ("long_dragon", "single_jump", "jump_dragon", "high_alternation", "mixed")
-    return {
-        "label": label,
-        "one_hot": [1.0 if label == candidate else 0.0 for candidate in labels],
-        "current_run": current_run,
-        "continuation_probability": continuation,
-        "alternation_rate": _strategy_clip(
-            planning.get("alternation_rate", regime.get("alternation_rate", 0.5)),
-            0.0,
-            1.0,
-        ),
-        "early_alternation_rate": _strategy_clip(planning.get("early_alternation_rate", 0.5), 0.0, 1.0),
-        "late_alternation_rate": _strategy_clip(planning.get("late_alternation_rate", 0.5), 0.0, 1.0),
-        "equal_foot_rate": _strategy_clip(planning.get("equal_foot_rate", 0.0), 0.0, 1.0),
-        "recent_equal_foot_rate": _strategy_clip(planning.get("recent_equal_foot_rate", 0.0), 0.0, 1.0),
-        "run_variance": _strategy_clip(_strategy_number(planning.get("run_variance")) / 8.0),
-        "run_histogram": list(planning.get("run_histogram") or [0.0, 0.0, 0.0, 0.0])[:4],
-        "single_jump_score": single_jump_score,
-        "jump_dragon_score": jump_dragon_score,
-        "big_eye_recent_continuation": _strategy_derived_recent(planning, "big_eye"),
-        "small_road_recent_continuation": _strategy_derived_recent(planning, "small_road"),
-        "cockroach_recent_continuation": _strategy_derived_recent(planning, "cockroach_road"),
-        "planning_reliability": _strategy_clip(planning.get("reliability", 0.0)),
-        "planning_edge": _strategy_clip(planning.get("edge", 0.0)),
-        "neighbor_similarity": _strategy_clip(planning.get("mean_neighbor_similarity", 0.0)),
-        "support": _strategy_clip(_strategy_number(planning.get("support")) / 14.0),
-        "grid_coverage": _strategy_clip(_strategy_number(planning.get("grid_cell_count")) / 80.0),
-    }
-
-
-def build_decision_strategy_context(
-    history: Iterable[Any],
-    *,
-    road_context: Optional[Mapping[str, Any]] = None,
-    physical_signal: Optional[Mapping[str, Any]] = None,
-) -> List[float]:
-    """建立固定 34 維「策略選擇」Context。
-
-    前 5 維是可信牌靴／EV 狀態；其餘維度直接擷取
-    ``road_detector -> road_model -> full_road_pattern_model`` 已建立的完整
-    路紙結構：龍長、單跳、跳跳龍、交替率、齊腳率、下三路延續度、相似
-    歷史支持度與圖格覆蓋率。這些是策略選擇特徵，不能單獨產生下注方向。
-    """
-    raw = _clean_history(history)
-    bp = [value for value in raw if value in ARMS]
-    road = dict(road_context or {})
-    physical = dict(physical_signal or {})
-    counts = physical.get("remaining_counts")
-    exact_counts = (
-        isinstance(counts, Sequence)
-        and not isinstance(counts, (str, bytes))
-        and len(counts) == 10
-        and bool(physical.get("available"))
-    )
-    remaining_cards = sum(int(value) for value in counts) if exact_counts else 0
-    decks = max(1, min(16, int(physical.get("decks", 8) or 8)))
-    total_cards = decks * 52
-    selected_ev = _strategy_clip(
-        physical.get("selected_expected_return", 0.0), -0.08, 0.08
-    )
-    physical_direction = _strategy_side(
-        physical.get("action") or physical.get("selected_side_by_ev")
-    )
-    road_direction = _strategy_road_direction(road, bp)
-    pattern_state = _strategy_road_pattern_state(bp, road)
-    planning = _strategy_full_road(road)
-    consensus = _strategy_clip(road.get("derived_road_consensus", 0.0))
-    # build_road_context 版本不同時，此欄可能在 full_road_analysis 之下；
-    # 缺失時回到 0，不猜測不存在的下三路資料。
-    if consensus == 0.0:
-        full_road_payload = road.get("full_road_analysis")
-        if isinstance(full_road_payload, Mapping):
-            consensus = _strategy_clip(
-                full_road_payload.get("derived_consensus", 0.0)
-            )
-    if consensus == 0.0:
-        consensus = _strategy_clip((
-            _derived_road_saturation(road, "big_eye")
-            + _derived_road_saturation(road, "small_road")
-            + _derived_road_saturation(road, "cockroach_road")
-        ) / 3.0)
-    histogram = list(pattern_state.get("run_histogram") or [])
-    histogram = (histogram + [0.0] * 4)[:4]
-    alternation_phase = _strategy_clip(
-        (
-            float(pattern_state["late_alternation_rate"])
-            - float(pattern_state["early_alternation_rate"])
-            + 1.0
-        ) / 2.0
-    )
-    planning_maturity = _strategy_clip(
-        _strategy_number(planning.get("sample_count")) / 80.0
-    )
-    agreement = 1.0 if physical_direction and physical_direction == road_direction else 0.0
-    vector = [
-        1.0,
-        1.0 if exact_counts else 0.0,
-        _strategy_clip((selected_ev + 0.08) / 0.16),
-        _strategy_clip(remaining_cards / max(1, total_cards)),
-        _strategy_clip(1.0 - remaining_cards / max(1, total_cards)),
-        planning_maturity,
-        _strategy_clip(float(pattern_state["current_run"]) / 8.0),
-        float(pattern_state["continuation_probability"]),
-        float(pattern_state["planning_reliability"]),
-        float(pattern_state["planning_edge"]),
-        float(pattern_state["alternation_rate"]),
-        alternation_phase,
-        float(pattern_state["equal_foot_rate"]),
-        float(pattern_state["recent_equal_foot_rate"]),
-        float(pattern_state["run_variance"]),
-        *[_strategy_clip(value) for value in histogram],
-        float(pattern_state["single_jump_score"]),
-        float(pattern_state["jump_dragon_score"]),
-        float(pattern_state["big_eye_recent_continuation"]),
-        float(pattern_state["small_road_recent_continuation"]),
-        float(pattern_state["cockroach_recent_continuation"]),
-        consensus,
-        float(pattern_state["neighbor_similarity"]),
-        float(pattern_state["support"]),
-        float(pattern_state["grid_coverage"]),
-        agreement,
-        *list(pattern_state["one_hot"]),
-    ]
-    if len(vector) != DECISION_STRATEGY_CONTEXT_DIM:
-        raise RuntimeError("decision strategy context dimension mismatch")
-    return [round(float(value), 10) for value in vector]
-
-
-def _new_strategy_arm_state() -> Dict[str, Any]:
-    return {
-        "A": (np.eye(DECISION_STRATEGY_CONTEXT_DIM) * DECISION_STRATEGY_L2).tolist(),
-        "b": np.zeros(DECISION_STRATEGY_CONTEXT_DIM, dtype=np.float64).tolist(),
-        "updates": 0,
-        "reward_sum": 0.0,
-    }
-
-
-def _new_strategy_user_state() -> Dict[str, Any]:
-    return {
-        "version": DECISION_STRATEGY_VERSION,
-        "arms": {arm: _new_strategy_arm_state() for arm in DECISION_STRATEGY_ARMS},
-        "applied_event_ids": [],
-        "total_updates": 0,
-        "updated_at": 0,
-    }
-
-
-def _read_strategy_state_unlocked() -> Dict[str, Any]:
-    try:
-        payload = json.loads(DECISION_STRATEGY_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        payload = {}
-    users = payload.get("users") if isinstance(payload, Mapping) else None
-    return {"schema_version": DECISION_STRATEGY_VERSION, "users": dict(users or {})}
-
-
-def _write_strategy_state_unlocked(payload: Mapping[str, Any]) -> None:
-    temporary = DECISION_STRATEGY_STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    temporary.replace(DECISION_STRATEGY_STATE_FILE)
-
-
-def _strategy_scope_key(user_id: str, venue: str, room: str) -> str:
-    raw = "|".join((str(user_id or "__anonymous__"), str(venue or "").upper().strip(), str(room or "").strip()))
-    return sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
-def _strategy_user_state(store: Dict[str, Any], scope: str) -> Dict[str, Any]:
-    raw = store["users"].get(scope)
-    if not isinstance(raw, Mapping):
-        state = _new_strategy_user_state()
-    else:
-        state = dict(raw)
-        state["version"] = DECISION_STRATEGY_VERSION
-        arms = dict(state.get("arms") or {})
-        for arm in DECISION_STRATEGY_ARMS:
-            candidate = arms.get(arm)
-            if not isinstance(candidate, Mapping):
-                arms[arm] = _new_strategy_arm_state()
-        state["arms"] = arms
-        state["applied_event_ids"] = list(state.get("applied_event_ids") or [])[-DECISION_STRATEGY_MAX_EVENT_IDS:]
-    store["users"][scope] = state
-    return state
-
-
-def _strategy_solve(matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
-    """對稱化與遞增 ridge jitter，避免長期線上更新數值失穩。"""
-    symmetric = 0.5 * (matrix + matrix.T)
-    identity = np.eye(symmetric.shape[0], dtype=np.float64)
-    for jitter in (1e-9, 1e-7, 1e-5, 1e-3):
-        try:
-            return np.linalg.solve(symmetric + jitter * identity, vector)
-        except np.linalg.LinAlgError:
-            continue
-    return np.linalg.pinv(symmetric + 1e-3 * identity) @ vector
-
-
-def _strategy_arm_score(arm_state: Mapping[str, Any], context: np.ndarray) -> Dict[str, float]:
-    try:
-        matrix = np.asarray(arm_state.get("A"), dtype=np.float64)
-        target = np.asarray(arm_state.get("b"), dtype=np.float64)
-        if matrix.shape != (DECISION_STRATEGY_CONTEXT_DIM, DECISION_STRATEGY_CONTEXT_DIM):
-            raise ValueError("invalid A")
-        if target.shape != (DECISION_STRATEGY_CONTEXT_DIM,):
-            raise ValueError("invalid b")
-    except (TypeError, ValueError):
-        default = _new_strategy_arm_state()
-        matrix = np.asarray(default["A"], dtype=np.float64)
-        target = np.asarray(default["b"], dtype=np.float64)
-    theta = _strategy_solve(matrix, target)
-    precision_context = _strategy_solve(matrix, context)
-    variance = max(0.0, float(context @ precision_context))
-    mean = float(theta @ context)
-    ucb = float(mean + DECISION_STRATEGY_ALPHA * math.sqrt(variance))
-    return {"mean_reward": mean, "uncertainty": math.sqrt(variance), "ucb_score": ucb}
-
-
-def _strategy_profile(arm: str) -> Dict[str, Any]:
-    profiles = {
-        "math_only": {
-            "label": "純精確 EV",
-            "physical_weight": 1.0,
-            "road_weight": 0.0,
-            "minimum_ev_multiplier": 1.0,
-            "kelly_multiplier": 1.0,
-        },
-        "ev_road_blend": {
-            "label": "EV 主導＋牌路確認",
-            "physical_weight": 0.90,
-            "road_weight": 0.10,
-            "minimum_ev_multiplier": 1.0,
-            "kelly_multiplier": 1.0,
-        },
-        "conservative": {
-            "label": "保守精確 EV",
-            "physical_weight": 1.0,
-            "road_weight": 0.0,
-            "minimum_ev_multiplier": 1.75,
-            "kelly_multiplier": 0.50,
-        },
-    }
-    return dict(profiles.get(arm, profiles["math_only"]))
-
-
-def select_decision_strategy(
-    history: Iterable[Any],
-    *,
-    road_context: Optional[Mapping[str, Any]] = None,
-    physical_signal: Optional[Mapping[str, Any]] = None,
-    venue: str = "",
-    room: str = "",
-    user_id: str = "",
-) -> Dict[str, Any]:
-    """以 LinUCB 選擇「如何使用物理 EV」，非 B/P 方向選擇器。"""
-    physical = dict(physical_signal or {})
-    context = build_decision_strategy_context(
-        history, road_context=road_context, physical_signal=physical
-    )
-    exact_eligible = bool(context[1])
-    scope = _strategy_scope_key(user_id, venue, room)
-    with _LOCK:
-        store = _read_strategy_state_unlocked()
-        state = _strategy_user_state(store, scope)
-        scores = {
-            arm: _strategy_arm_score(state["arms"][arm], np.asarray(context, dtype=np.float64))
-            for arm in DECISION_STRATEGY_ARMS
-        }
-
-    # 冷啟動中分數同分時固定先走 math_only，避免未學習資料時牌路策略
-    # 被偶然排序選中。沒有可信 exact count 時仍回傳可觀測的選擇資訊，
-    # 但 validated layer 會保留 No Bet。
-    priority = {"math_only": 2, "ev_road_blend": 1, "conservative": 0}
-    selected_arm = max(DECISION_STRATEGY_ARMS, key=lambda arm: (scores[arm]["ucb_score"], priority[arm]))
-    return {
-        "version": DECISION_STRATEGY_VERSION,
-        "selected_arm": selected_arm,
-        "profile": _strategy_profile(selected_arm),
-        "eligible_exact_composition": exact_eligible,
-        "context": context,
-        "context_feature_names": [
-            "bias", "trusted_exact_counts", "normalized_physical_ev",
-            "remaining_card_ratio", "shoe_progress", "full_road_maturity",
-            "current_run_length", "continuation_probability",
-            "full_road_reliability", "full_road_edge", "alternation_rate",
-            "alternation_phase_shift", "equal_foot_rate",
-            "recent_equal_foot_rate", "run_variance",
-            "run_length_1_share", "run_length_2_share", "run_length_3_share",
-            "run_length_4plus_share", "single_jump_score", "jump_dragon_score",
-            "big_eye_recent_continuation", "small_road_recent_continuation",
-            "cockroach_road_recent_continuation", "derived_road_consensus",
-            "nearest_state_similarity", "full_road_support", "detected_grid_coverage",
-            "physical_road_agreement", "state_long_dragon", "state_single_jump",
-            "state_jump_dragon", "state_high_alternation", "state_mixed",
-        ],
-        "road_pattern_state": _strategy_road_pattern_state(
-            _clean_history(history), dict(road_context or {})
-        ),
-        "scores": scores,
-        "scope": scope,
-        "state_file": str(DECISION_STRATEGY_STATE_FILE),
-        "reason": (
-            "策略 Arm 以歷史風險調整後實際損益的 LinUCB 上界選出；"
-            "牌路不具單獨下注權。"
-        ),
-    }
-
-
-def update_decision_strategy(
-    *,
-    context: Sequence[float],
-    selected_arm: str,
-    actual_profit: float,
-    bankroll: float,
-    event_id: str = "",
-    venue: str = "",
-    room: str = "",
-    user_id: str = "",
-) -> Dict[str, Any]:
-    """用實際 Kelly 損益更新被採用策略的後驗。
-
-    為使不同本金可比較，內部 reward = actual_profit / (bankroll × 2%) 並
-    截斷於 [-1, 1]；原始損益仍完整記錄在績效檔。這是風險單位標準化，
-    不是把輸贏偷換為命中率。
-    """
-    arm = str(selected_arm or "").strip()
-    if arm not in DECISION_STRATEGY_ARMS:
-        return {"updated": False, "reason": "invalid_strategy_arm"}
-    x = np.asarray(list(context or []), dtype=np.float64)
-    if x.shape != (DECISION_STRATEGY_CONTEXT_DIM,) or not np.all(np.isfinite(x)):
-        return {"updated": False, "reason": "invalid_strategy_context"}
-    raw_profit = float(actual_profit or 0.0)
-    risk_unit = max(1.0, float(bankroll or 0.0) * 0.02)
-    reward = max(-1.0, min(1.0, raw_profit / risk_unit))
-    scope = _strategy_scope_key(user_id, venue, room)
-    event_key = str(event_id or "").strip()
-    with _LOCK:
-        store = _read_strategy_state_unlocked()
-        state = _strategy_user_state(store, scope)
-        applied = list(state.get("applied_event_ids") or [])
-        if event_key and event_key in applied:
-            return {"updated": False, "reason": "duplicate_event", "event_id": event_key}
-        arm_state = dict(state["arms"][arm])
-        try:
-            matrix = np.asarray(arm_state["A"], dtype=np.float64)
-            target = np.asarray(arm_state["b"], dtype=np.float64)
-            if matrix.shape != (DECISION_STRATEGY_CONTEXT_DIM, DECISION_STRATEGY_CONTEXT_DIM):
-                raise ValueError
-            if target.shape != (DECISION_STRATEGY_CONTEXT_DIM,):
-                raise ValueError
-        except (KeyError, TypeError, ValueError):
-            defaults = _new_strategy_arm_state()
-            matrix = np.asarray(defaults["A"], dtype=np.float64)
-            target = np.asarray(defaults["b"], dtype=np.float64)
-        # Ridge prior 加上一筆真實策略回報，並顯式對稱化避免累積浮點誤差。
-        matrix = 0.5 * (matrix + matrix.T) + np.outer(x, x)
-        target = target + reward * x
-        arm_state["A"] = matrix.tolist()
-        arm_state["b"] = target.tolist()
-        arm_state["updates"] = int(arm_state.get("updates", 0) or 0) + 1
-        arm_state["reward_sum"] = float(arm_state.get("reward_sum", 0.0) or 0.0) + reward
-        state["arms"][arm] = arm_state
-        state["total_updates"] = int(state.get("total_updates", 0) or 0) + 1
-        state["updated_at"] = int(time.time())
-        if event_key:
-            applied.append(event_key)
-            state["applied_event_ids"] = applied[-DECISION_STRATEGY_MAX_EVENT_IDS:]
-        store["users"][scope] = state
-        _write_strategy_state_unlocked(store)
-    return {
-        "updated": True,
-        "event_id": event_key,
-        "selected_arm": arm,
-        "actual_profit": raw_profit,
-        "risk_unit": risk_unit,
-        "normalized_reward": reward,
-        "arm_updates": int(arm_state["updates"]),
-        "total_updates": int(state["total_updates"]),
-    }
+def get_bandit_summary(user_id: str="") -> Dict[str,Any]:
+    with _LOCK: model=CUSUMLinUCB.from_state(dict(_read_store()["users"].get(_uid(user_id)) or {}))
+    return {"version":MODEL_VERSION,"context_dim":CONTEXT_DIM,"feature_names":list(FEATURE_NAMES),"total_updates":model.total_observations,
+            "observations_since_reset":model.observations_since_reset,"reset_count":model.reset_count,
+            "cusum":{"g_plus":model.g_plus,"g_minus":model.g_minus,"h":model.cusum_h,"v":model.cusum_v,"last_residual":model.last_residual,"last_reset":model.last_reset},
+            "arms":{a:{"updates":model.arms[a]["updates"],"reward_sum":model.arms[a]["reward_sum"]} for a in ARMS},"state_file":str(CMAB_STATE_FILE)}
 
 
 class ContextualBanditEngine:
-    """BGS LinUCB 核心類別；公開函式由此類別提供相容包裝。"""
-
-    def predict(
-        self,
-        history: Iterable[Any],
-        *,
-        road_context: Optional[Mapping[str, Any]] = None,
-        venue: str = "",
-        room: str = "",
-        user_id: str = "",
-        run_seed: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        return _predict_bandit_impl(
-            history,
-            road_context=road_context,
-            venue=venue,
-            room=room,
-            user_id=user_id,
-            run_seed=run_seed,
-        )
-
-    def update(
-        self,
-        *,
-        context: Sequence[float],
-        selected_arm: str,
-        reward: Optional[float],
-        event_id: str = "",
-        actual_outcome: str = "",
-        update_weight: float = 1.0,
-        user_id: str = "",
-        prediction_probabilities: Optional[Mapping[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        return _update_bandit_impl(
-            context=context,
-            selected_arm=selected_arm,
-            reward=reward,
-            event_id=event_id,
-            actual_outcome=actual_outcome,
-            update_weight=update_weight,
-            user_id=user_id,
-            prediction_probabilities=prediction_probabilities,
-        )
-
-    def summary(self, user_id: str = "") -> Dict[str, Any]:
-        return _get_bandit_summary_impl(user_id=user_id)
+    def predict(self, history: Iterable[Any], **kwargs: Any) -> Dict[str,Any]: return predict_bandit(history,**kwargs)
+    def update(self, **kwargs: Any) -> Dict[str,Any]: return update_bandit(**kwargs)
+    def summary(self, user_id: str="") -> Dict[str,Any]: return get_bandit_summary(user_id)
+    def reset_model(self, user_id: str="", reason: str="manual_reset") -> Dict[str,Any]:
+        with _LOCK:
+            store=_read_store(); key=_uid(user_id); m=CUSUMLinUCB.from_state(dict(store["users"].get(key) or {})); event=m.reset_model(reason=reason)
+            store["users"][key]=m.to_state(); _write_store(store); return event
 
 
+# Compatibility shims retained for older imports; current predictor does not use them.
+DECISION_STRATEGY_ARMS=("math_only","ev_road_blend","conservative"); DECISION_STRATEGY_CONTEXT_DIM=34
+
+def build_decision_strategy_context(history: Iterable[Any], **kwargs: Any) -> List[float]:
+    del kwargs; return [1.0,min(1.0,len(_clean(history))/80.0)]+[0.0]*(DECISION_STRATEGY_CONTEXT_DIM-2)
+
+def select_decision_strategy(history: Iterable[Any], **kwargs: Any) -> Dict[str,Any]:
+    return {"version":"DECISION-STRATEGY-COMPAT-CUSUM-V1","selected_arm":"conservative","profile":{"kelly_multiplier":0.5},
+            "context":build_decision_strategy_context(history),"eligible_exact_composition":False,"reason":"compatibility only"}
+
+def update_decision_strategy(**kwargs: Any) -> Dict[str,Any]: return {"updated":False,"reason":"legacy_strategy_disabled","event_id":str(kwargs.get("event_id") or "")}
 class DecisionStrategyBanditEngine:
-    """策略層 LinUCB 包裝；保留主 B/P Engine 的對外相容性。"""
+    def select(self, history: Iterable[Any], **kwargs: Any) -> Dict[str,Any]: return select_decision_strategy(history,**kwargs)
+    def update(self, **kwargs: Any) -> Dict[str,Any]: return update_decision_strategy(**kwargs)
 
-    def select(
-        self,
-        history: Iterable[Any],
-        *,
-        road_context: Optional[Mapping[str, Any]] = None,
-        physical_signal: Optional[Mapping[str, Any]] = None,
-        venue: str = "",
-        room: str = "",
-        user_id: str = "",
-    ) -> Dict[str, Any]:
-        return select_decision_strategy(
-            history,
-            road_context=road_context,
-            physical_signal=physical_signal,
-            venue=venue,
-            room=room,
-            user_id=user_id,
-        )
-
-    def update(
-        self,
-        *,
-        context: Sequence[float],
-        selected_arm: str,
-        actual_profit: float,
-        bankroll: float,
-        event_id: str = "",
-        venue: str = "",
-        room: str = "",
-        user_id: str = "",
-    ) -> Dict[str, Any]:
-        return update_decision_strategy(
-            context=context,
-            selected_arm=selected_arm,
-            actual_profit=actual_profit,
-            bankroll=bankroll,
-            event_id=event_id,
-            venue=venue,
-            room=room,
-            user_id=user_id,
-        )
-
-
-_DEFAULT_ENGINE = ContextualBanditEngine()
-
-
-def predict_bandit(
-    history: Iterable[Any],
-    *,
-    road_context: Optional[Mapping[str, Any]] = None,
-    venue: str = "",
-    room: str = "",
-    user_id: str = "",
-    run_seed: Optional[int] = None,
-) -> Dict[str, Any]:
-    """既有 predictor.py 相容入口。"""
-    return _DEFAULT_ENGINE.predict(
-        history,
-        road_context=road_context,
-        venue=venue,
-        room=room,
-        user_id=user_id,
-        run_seed=run_seed,
-    )
-
-
-def update_bandit(
-    *,
-    context: Sequence[float],
-    selected_arm: str,
-    reward: Optional[float],
-    event_id: str = "",
-    actual_outcome: str = "",
-    update_weight: float = 1.0,
-    user_id: str = "",
-    prediction_probabilities: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
-    """既有 performance_tracker.py 相容入口。"""
-    return _DEFAULT_ENGINE.update(
-        context=context,
-        selected_arm=selected_arm,
-        reward=reward,
-        event_id=event_id,
-        actual_outcome=actual_outcome,
-        update_weight=update_weight,
-        user_id=user_id,
-        prediction_probabilities=prediction_probabilities,
-    )
-
-
-def get_bandit_summary(user_id: str = "") -> Dict[str, Any]:
-    return _DEFAULT_ENGINE.summary(user_id=user_id)
-
-
-__all__ = [
-    "ARMS",
-    "CONTEXT_DIM",
-    "ContextualBanditEngine",
-    "DecisionStrategyBanditEngine",
-    "DECISION_STRATEGY_ARMS",
-    "DECISION_STRATEGY_CONTEXT_DIM",
-    "FEATURE_NAMES",
-    "MODEL_VERSION",
-    "build_decision_strategy_context",
-    "build_context_vector",
-    "get_bandit_summary",
-    "predict_bandit",
-    "select_decision_strategy",
-    "update_decision_strategy",
-    "update_bandit",
-]
+__all__=["ARMS","MODEL_VERSION","FEATURE_NAMES","CONTEXT_DIM","CUSUM_ALPHA","CUSUM_L2","CUSUM_FORGETTING_FACTOR","CUSUM_DRIFT_V","CUSUM_THRESHOLD_H",
+         "CUSUM_MIN_OBSERVATIONS","CUSUM_VACUUM_HANDS","CUSUM_FORCE_OBSERVE_HANDS","CUSUMLinUCB","ContextualBanditEngine","DecisionStrategyBanditEngine",
+         "DECISION_STRATEGY_ARMS","DECISION_STRATEGY_CONTEXT_DIM","build_context_vector","build_decision_strategy_context","predict_bandit","update_bandit",
+         "get_bandit_summary","select_decision_strategy","update_decision_strategy"]
