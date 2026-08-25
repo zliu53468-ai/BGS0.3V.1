@@ -1,8 +1,8 @@
 """牌路主導的自適應集成。
 
 決策順序固定為：Full Road Pattern Model 建立完整路圖與牌路專家 →
-Adaptive Ensemble 整合牌路專家 → Contextual Bandit 僅以小權重提供
-上下文輔助。這裡不混入算牌、EV、粒子或外部模型，並永遠維持 B/P。
+Adaptive Ensemble 整合牌路專家並輸出正式方向 → Contextual Bandit 只保留
+影子方向與線上學習。這裡不混入算牌、EV、粒子或外部模型，並永遠維持 B/P。
 
 輸出的 B/P 是方向分數，不是未來開出機率或勝率保證。
 """
@@ -15,6 +15,9 @@ from performance_tracker import get_performance_summary
 
 
 OUTCOMES = ("B", "P", "T")
+# 新的正式融合／影子比較使用獨立版本標籤。舊版績效不會再影響這一版的
+# component Brier 權重，避免部署後看似「又回到舊模型」。
+ADAPTIVE_MODEL_VARIANT = "V34.2_ADAPTIVE_ROAD_PRIMARY_UCB_SHADOW"
 # 方向架構參數固定在程式內，避免 Render 遺留的 ADAPTIVE_* 環境變數讓
 # 同一張截圖在不同部署得到不同結果。
 ADAPTIVE_ENABLED = True
@@ -33,15 +36,18 @@ ADAPTIVE_PLURALITY_STRENGTH = 0.12
 ADAPTIVE_LOGIT_CAP = 2.20
 ADAPTIVE_SHOE_MIN_SAMPLES = 12
 
-# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。cMAB 是
-# 輔助訊號，最多佔總融合權重 12%，不再把它當作主輸出。
+# Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。V34.2 起，
+# cMAB 不再參與正式融合；它只保留自己的原始方向，供同一筆預測的影子
+# 比對與線上學習使用。
 ROAD_PRIMARY_COMPONENTS = (
     "structural_regime", "full_road", "short", "mid", "long", "pattern", "analogue",
 )
 FULL_ROAD_PRIMARY_MULTIPLIER = 1.40
 STRUCTURAL_REGIME_PRIMARY_MULTIPLIER = 2.20
 STRUCTURAL_RECENCY_REDUCTION = 0.55
-CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.12
+# 保留常數名稱只為讀取舊診斷資料相容；正式融合固定為 0%，不可被 UCB
+# 翻轉。這不是 Render 可覆寫的環境變數。
+CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE = 0.0
 
 # V34.1 穩定性微調：同一牌靴剛好連中幾次時，不讓短期成績把某個成員
 # 放大到 1.30 倍。12 手以上才採用，且權重只允許在 0.92～1.08 間小幅
@@ -293,6 +299,47 @@ def _current_shoe_performance_factor(
     )
 
 
+def _road_primary_fallback(
+    prediction: Mapping[str, Any],
+    components: Mapping[str, Mapping[str, float]],
+) -> Dict[str, Any]:
+    """純牌路候選不足時的最後 B/P 決定，不讀取 cMAB 方向。
+
+    正常情況下 ``full_road``、結構規律與其他牌路專家都會有候選列。只有
+    新鞋初期、OCR 輸入很短或所有專家暫時 inactive 時才會進入此分支。
+    此時仍優先讀 Full Road 的原始機率；完全沒有牌路資訊才給中性 B 作為
+    產品強制 B/P 契約的固定冷啟動值。UCB 只會被標記為影子，不可接管。
+    """
+    for name in (
+        "full_road", "structural_regime", "long", "mid", "short",
+        "pattern", "analogue",
+    ):
+        values = components.get(name)
+        if not isinstance(values, Mapping):
+            continue
+        banker = _conditional_banker(values)
+        return {
+            "direction": "B" if banker >= 0.5 else "P",
+            "banker_probability": float(banker),
+            "source": f"road_component_{name}_fallback",
+        }
+
+    road = prediction.get("road_support")
+    road_data = dict(road) if isinstance(road, Mapping) else {}
+    direction = str(road_data.get("direction") or "").upper().strip()
+    if direction in {"B", "P"}:
+        return {
+            "direction": direction,
+            "banker_probability": 0.51 if direction == "B" else 0.49,
+            "source": "road_context_direction_fallback",
+        }
+    return {
+        "direction": "B",
+        "banker_probability": 0.50,
+        "source": "empty_road_neutral_bp_fallback",
+    }
+
+
 def _fusion_candidates(
     prediction: Mapping[str, Any],
     base: Mapping[str, float],
@@ -301,12 +348,14 @@ def _fusion_candidates(
     component_sample_counts: Mapping[str, Any],
     shoe_direction_performance: Mapping[str, Any],
     base_confidence: float,
+    *,
+    include_contextual_bandit: bool = False,
 ) -> list[Dict[str, Any]]:
-    """建立「牌路主、cMAB 輔」的融合候選。
+    """建立純牌路融合候選。
 
     Full Road Pattern Model 的完整歷史結論與五個既有路子專家是唯一主要
-    成員。LinUCB 的輸出不再和它們同權競爭，只在主要路子已存在時以最多
-    12% 的權重協助處理 context 新穎度與模型衝突。
+    成員。正式呼叫固定不加入 LinUCB；參數僅保留給離線舊版比對，不能從
+    正式預測入口啟用。
     """
     road = prediction.get("road_support")
     road_data = dict(road) if isinstance(road, Mapping) else {}
@@ -445,7 +494,7 @@ def _fusion_candidates(
     bandit_direction = (
         "B" if bandit_logit > 0.0 else "P" if bandit_logit < 0.0 else ""
     )
-    if primary_weight > 1e-12:
+    if include_contextual_bandit and primary_weight > 1e-12:
         # aux / (primary + aux) <= max_share，因此 cMAB 永遠是輔助，
         # 而不是把長龍或跳路重新平均成單純機率。
         auxiliary_weight = primary_weight * (
@@ -470,7 +519,7 @@ def _fusion_candidates(
             "current_shoe_performance_used": False,
             "role": "contextual_auxiliary",
         })
-    else:
+    elif include_contextual_bandit:
         # 路紙剛開始或 ROI 沒有可用路子成員時，仍強制輸出 B/P；這是唯一
         # 允許 cMAB 直接當方向來源的冷啟動例外。
         rows.append({
@@ -596,37 +645,52 @@ def _apply_plurality_decision(
     candidates = _fusion_candidates(
         result, base, components, historical_scores,
         component_sample_counts, shoe_direction_performance,
-        base_confidence,
+        base_confidence, include_contextual_bandit=False,
     )
     fusion = _plurality_logit_fusion(candidates)
     result["pre_adaptive_probabilities"] = dict(base)
     base_action = str(result.get("action") or "O").upper().strip()
+    road_fallback = _road_primary_fallback(result, components)
+    road_fallback_direction = str(road_fallback["direction"])
+    road_fallback_banker = float(road_fallback["banker_probability"])
+
+    # UCB 保留為同一手的影子候選，讓績效紀錄器可以和正式 Adaptive
+    # 方向做公平比較；這些欄位絕不參與以下 B/P 的選擇或權重。
+    ucb_shadow_direction = str(
+        result.get("selected_arm")
+        or result.get("base_bandit_direction")
+        or base_action
+        or "B"
+    ).upper().strip()
+    if ucb_shadow_direction not in {"B", "P"}:
+        ucb_shadow_direction = "B"
+    ucb_shadow_banker = _conditional_banker(base)
     combined_logit = float(fusion.get("combined_logit", 0.0) or 0.0)
     exact_tie = not fusion or abs(combined_logit) <= 1e-12
-    tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
+    road_tie_values = [
+        max(0.0, float(dict(components.get(str(row["name"])) or {}).get("T", 0.0) or 0.0))
+        for row in candidates
+        if isinstance(components.get(str(row["name"])), Mapping)
+    ]
+    tie_probability = max(
+        0.0,
+        min(0.30, sum(road_tie_values) / len(road_tie_values))
+    ) if road_tie_values else 0.0
     bp_mass = 1.0 - tie_probability
-    # 如果牌路專家完全抵消，才退回 cMAB 的輔助方向；不輸出 O，也不把
-    # 50/50 假裝成一個新的牌路規則。
+    # 牌路專家完全抵消時仍強制 B/P，但回到 Full Road 優先的牌路 fallback；
+    # 不能退回 cMAB，否則 UCB 又會在冷啟動或衝突局偷偷接管正式方向。
     conditional_banker = (
-        _conditional_banker(base)
+        road_fallback_banker
         if exact_tie
         else float(
-            fusion.get("conditional_banker", _conditional_banker(base))
-            or _conditional_banker(base)
+            fusion.get("conditional_banker", road_fallback_banker)
+            or road_fallback_banker
         )
     )
     banker = bp_mass * conditional_banker
     player = bp_mass * (1.0 - conditional_banker)
-    fallback_direction = str(
-        result.get("selected_arm")
-        or result.get("base_bandit_direction")
-        or result.get("recommend")
-        or "B"
-    ).upper().strip()
-    if fallback_direction not in {"B", "P"}:
-        fallback_direction = "B"
     direction = (
-        fallback_direction
+        road_fallback_direction
         if exact_tie
         else "B" if combined_logit > 0.0 else "P"
     )
@@ -648,7 +712,10 @@ def _apply_plurality_decision(
             "依可靠度、support 與已結算表現破局。"
         )
     elif exact_tie:
-        reason = "牌路專家完全抵消，依 Contextual Bandit 輔助方向強制輸出 B/P。"
+        reason = (
+            "牌路專家暫時完全抵消，依 Full Road 優先的牌路 fallback "
+            f"（{road_fallback['source']}）強制輸出 B/P；UCB 僅留作影子比較。"
+        )
     else:
         reason = (
             "以 reliability／Brier 權重進行 logit pooling，"
@@ -674,10 +741,18 @@ def _apply_plurality_decision(
         "signal_reason": reason,
         "internal_signal_reason": reason,
         "direction_source": (
-            "contextual_bandit_cold_start_fallback"
+            "adaptive_road_fallback"
             if exact_tie
-            else "road_primary_adaptive_ensemble"
+            else "adaptive_ensemble_road_primary"
         ),
+        "adaptive_only_direction": direction,
+        "adaptive_only_probabilities": {
+            "B": float(banker), "P": float(player), "T": float(tie_probability),
+        },
+        "ucb_shadow_direction": ucb_shadow_direction,
+        "ucb_shadow_banker_probability": float(ucb_shadow_banker),
+        "ucb_shadow_agrees": bool(ucb_shadow_direction == direction),
+        "ucb_influenced_final_direction": False,
         "direction_edge": float(edge),
         "direction_edge_percent": round(edge * 100.0, 4),
         "ensemble_confidence": float(confidence),
@@ -693,7 +768,7 @@ def _apply_plurality_decision(
         result["component_champion"] = tiebreaker
     result["adaptive_ensemble"] = {
         "active": True,
-        "mode": "road_primary_adaptive_ensemble",
+        "mode": "adaptive_ensemble_road_primary_ucb_shadow",
         "circuit_breaker_active": False,
         "hard_brake_active": False,
         "is_extreme_unseen": False,
@@ -718,7 +793,14 @@ def _apply_plurality_decision(
         "final_action": direction,
         "bet_multiplier": 1.0,
         "road_primary": True,
-        "contextual_bandit_role": "auxiliary_max_12_percent",
+        "contextual_bandit_role": "shadow_only_no_final_weight",
+        "adaptive_only_direction": direction,
+        "ucb_shadow": {
+            "direction": ucb_shadow_direction,
+            "conditional_banker_probability": float(ucb_shadow_banker),
+            "agrees_with_adaptive": bool(ucb_shadow_direction == direction),
+            "can_change_final_direction": False,
+        },
         "fallback_required": False,
         "probability_semantics": result["probability_semantics"],
         "reason": reason,
@@ -745,7 +827,12 @@ def adapt_prediction(
     )
     result.setdefault("raw_probabilities", dict(base))
     components = _components(result)
-    summary = get_performance_summary(venue=venue, room=room, limit=5000)
+    summary = get_performance_summary(
+        venue=venue,
+        room=room,
+        model_variant=ADAPTIVE_MODEL_VARIANT,
+        limit=5000,
+    )
     sample_count = int(summary.get("sample_count", 0) or 0)
     historical_scores = dict(summary.get("component_brier_scores") or {})
     component_sample_counts = dict(
@@ -756,6 +843,7 @@ def adapt_prediction(
             venue=venue,
             room=room,
             shoe_id=shoe_id,
+            model_variant=ADAPTIVE_MODEL_VARIANT,
             limit=500,
         )
         if str(shoe_id or "").strip()
@@ -768,17 +856,28 @@ def adapt_prediction(
     base_confidence = _base_confidence(result, base)
 
     if extreme_unseen:
-        # 保留極端未知診斷，但產品契約要求每局皆輸出 B/P。因此極端區間
-        # 不再改成 O；改由 cMAB 原始 Arm 作為明確的輔助 fallback。
+        # 保留極端未知診斷，但產品契約要求每局皆輸出 B/P。V34.2 的正式
+        # fallback 仍必須來自牌路：UCB 原始 Arm 只寫入影子欄位，不能在
+        # 混沌局反而取得最終方向控制權。
         learning_arm = str(result.get("selected_arm") or "").upper().strip()
         if learning_arm not in {"B", "P"}:
             learning_arm = "B" if float(base.get("B", 0.5)) >= float(base.get("P", 0.5)) else "P"
+        road_fallback = _road_primary_fallback(result, components)
+        road_direction = str(road_fallback["direction"])
+        road_banker = float(road_fallback["banker_probability"])
         result["pre_hard_brake_probabilities"] = dict(base)
         result["pre_hard_brake_recommend"] = str(
             result.get("recommend") or learning_arm
         )
-        tie_probability = max(0.0, min(0.30, float(base.get("T", 0.0))))
-        conditional_banker = _conditional_banker(base)
+        road_tie_values = [
+            max(0.0, float(dict(values).get("T", 0.0) or 0.0))
+            for values in components.values() if isinstance(values, Mapping)
+        ]
+        tie_probability = max(
+            0.0,
+            min(0.30, sum(road_tie_values) / len(road_tie_values))
+        ) if road_tie_values else 0.0
+        conditional_banker = road_banker
         neutral_bp = 1.0 - tie_probability
         result["probabilities"] = {
             "B": neutral_bp * conditional_banker,
@@ -788,23 +887,31 @@ def adapt_prediction(
         result["banker_rate"] = round(result["probabilities"]["B"] * 100.0, 2)
         result["player_rate"] = round(result["probabilities"]["P"] * 100.0, 2)
         result["tie_rate"] = round(tie_probability * 100.0, 2)
-        result["recommend"] = learning_arm
-        result["recommend_text"] = "莊" if learning_arm == "B" else "閒"
-        result["action"] = learning_arm
+        result["recommend"] = road_direction
+        result["recommend_text"] = "莊" if road_direction == "B" else "閒"
+        result["action"] = road_direction
         result["action_text"] = result["recommend_text"]
-        result["internal_recommend"] = learning_arm
-        result["internal_action"] = learning_arm
-        result["next_round_direction"] = learning_arm
+        result["internal_recommend"] = road_direction
+        result["internal_action"] = road_direction
+        result["next_round_direction"] = road_direction
         result["next_round_direction_text"] = result["recommend_text"]
         result["signal_allowed"] = True
-        result["signal_status_code"] = "CHAOS_FORCED_BANDIT_AUXILIARY"
-        result["signal_status_text"] = "統計混沌：cMAB 輔助方向已啟用"
+        result["signal_status_code"] = "CHAOS_ADAPTIVE_ROAD_FALLBACK"
+        result["signal_status_text"] = "統計混沌：Adaptive 牌路 fallback 已啟用"
         result["signal_reason"] = (
-            "牌路模型回報極端未知區間；保留診斷標記，但依產品設定"
-            "由 Contextual Bandit 輔助方向強制輸出 B/P。"
+            "牌路模型回報極端未知區間；保留診斷標記，但正式方向仍由"
+            f"牌路 fallback（{road_fallback['source']}）輸出，UCB 僅做影子比較。"
         )
         result["internal_signal_reason"] = result["signal_reason"]
-        result["direction_source"] = "contextual_bandit_chaos_fallback"
+        result["direction_source"] = "adaptive_road_chaos_fallback"
+        result["adaptive_only_direction"] = road_direction
+        result["adaptive_only_probabilities"] = dict(result["probabilities"])
+        result["ucb_shadow_direction"] = learning_arm
+        result["ucb_shadow_banker_probability"] = float(
+            _conditional_banker(base)
+        )
+        result["ucb_shadow_agrees"] = bool(learning_arm == road_direction)
+        result["ucb_influenced_final_direction"] = False
         result["ensemble_confidence"] = min(0.45, base_confidence)
         result["confidence"] = min(0.45, base_confidence)
         result["quality_score"] = min(0.45, base_confidence)
@@ -819,15 +926,15 @@ def adapt_prediction(
         result["is_extreme_unseen"] = True
         result["adaptive_ensemble"] = {
             "active": True,
-            "mode": "statistical_chaos_forced_bandit_auxiliary",
+            "mode": "statistical_chaos_adaptive_road_ucb_shadow",
             "circuit_breaker_active": False,
             "hard_brake_active": False,
             "sample_count": sample_count,
             "minimum_samples_bypassed_for_safety": True,
             "is_extreme_unseen": True,
             "variance": float(result.get("variance", 0.0) or 0.0),
-            "bandit_weight_before": CONTEXTUAL_BANDIT_AUXILIARY_MAX_SHARE,
-            "bandit_weight_after": 1.0,
+            "bandit_weight_before": 0.0,
+            "bandit_weight_after": 0.0,
             "weight_reduction_ratio": 0.0,
             "weight_reduction_percent": 0.0,
             "alternative_model_weight": 0.0,
@@ -836,11 +943,20 @@ def adapt_prediction(
             "fallback_required": True,
             "shadow_backtest_required": True,
             "overall_confidence": min(0.45, base_confidence),
-            "final_action": learning_arm,
+            "final_action": road_direction,
             "bet_multiplier": 1.0,
-            "road_primary": False,
-            "contextual_bandit_role": "forced_cold_or_chaos_fallback",
-            "reason": "極端未知區間保留診斷，並強制使用 cMAB 輔助方向",
+            "road_primary": True,
+            "contextual_bandit_role": "shadow_only_no_final_weight",
+            "adaptive_only_direction": road_direction,
+            "ucb_shadow": {
+                "direction": learning_arm,
+                "conditional_banker_probability": float(
+                    _conditional_banker(base)
+                ),
+                "agrees_with_adaptive": bool(learning_arm == road_direction),
+                "can_change_final_direction": False,
+            },
+            "reason": "極端未知區間保留診斷，正式方向仍由 Adaptive 牌路 fallback 輸出",
         }
         return result
 
