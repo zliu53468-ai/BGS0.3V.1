@@ -8,14 +8,19 @@ from __future__ import annotations
 
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
+import math
 import secrets
 
 from adaptive_ensemble import adapt_prediction
 from contextual_bandit import MODEL_VERSION as CUSUM_MODEL_VERSION, predict_bandit
 from road_model import build_road_context
 
-ADAPTIVE_MODEL_VARIANT = "V35.0_ROAD_ADAPTIVE_PLUS_CUSUM_LINUCB_NO_OBSERVE"
+ADAPTIVE_MODEL_VARIANT = "V35.0_ROAD_ADAPTIVE_PLUS_CUSUM_LINUCB_MARKOV_CROSS_RESONANCE"
 MAX_CUSUM_ENSEMBLE_WEIGHT = 0.45
+MARKOV_RESONANCE_THRESHOLD = 0.53
+MARKOV_COUNTER_THRESHOLD = 0.55
+MARKOV_FUSION_ALPHA = 0.62
+MARKOV_LOCAL_FALLBACK_WINDOW = 36
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
@@ -138,6 +143,335 @@ def _safe_confidence(result: Mapping[str, Any], default: float = 0.5) -> float:
         if value > 0.0:
             return max(0.0, min(1.0, value))
     return max(0.0, min(1.0, default))
+
+
+class DualChannelMarkovFusion:
+    """Independent fusion-side Markov analyzer; does not update LinUCB/CUSUM state.
+
+    Global channel uses the whole B/P shoe. Local channel consumes the regime-aware
+    Markov state emitted by contextual_bandit.py (which is reset by CUSUM). Both
+    channels calculate first- and full second-order transitions with Laplace smoothing.
+    """
+
+    def __init__(self, *, alpha: float = 1.0, support_prior: float = 5.0) -> None:
+        self.alpha = max(1e-9, float(alpha))
+        self.support_prior = max(1e-9, float(support_prior))
+
+    @staticmethod
+    def _bp(values: Iterable[Any]) -> List[str]:
+        out: List[str] = []
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value in (0, 1):
+                out.append("B" if value == 1 else "P")
+                continue
+            text = str(value or "").upper().strip()
+            if text in {"B", "P"}:
+                out.append(text)
+        return out
+
+    def _pair(self, banker_count: int, player_count: int) -> Dict[str, float]:
+        support = int(banker_count + player_count)
+        denominator = support + 2.0 * self.alpha
+        p_b = (float(banker_count) + self.alpha) / denominator
+        p_p = (float(player_count) + self.alpha) / denominator
+        reliability = support / (support + self.support_prior)
+        return {
+            "B": float(p_b),
+            "P": float(p_p),
+            "support": support,
+            "reliability": float(reliability),
+        }
+
+    def _conditional(self, sequence: List[str], context: str) -> Dict[str, float]:
+        order = len(context)
+        banker_count = 0
+        player_count = 0
+        if order > 0:
+            for i in range(order, len(sequence)):
+                if "".join(sequence[i-order:i]) != context:
+                    continue
+                if sequence[i] == "B":
+                    banker_count += 1
+                else:
+                    player_count += 1
+        result = self._pair(banker_count, player_count)
+        result["context"] = context
+        result["order"] = order
+        return result
+
+    def channel(self, values: Iterable[Any]) -> Dict[str, Any]:
+        sequence = self._bp(values)
+        state1 = sequence[-1] if sequence else ""
+        state2 = "".join(sequence[-2:]) if len(sequence) >= 2 else ""
+        first = self._conditional(sequence, state1) if state1 else self._pair(0, 0)
+        if state1 == "":
+            first.update({"context": "", "order": 1})
+        second = self._conditional(sequence, state2) if state2 else self._pair(0, 0)
+        if state2 == "":
+            second.update({"context": "", "order": 2})
+
+        # Support-aware backoff. Second order is preferred only when the exact active
+        # state has actually occurred enough times; otherwise first order anchors it.
+        second_weight = float(second.get("reliability", 0.0))
+        active_b = (
+            second_weight * float(second["B"])
+            + (1.0 - second_weight) * float(first["B"])
+        )
+        active_b = max(1e-6, min(1.0 - 1e-6, active_b))
+        active_reliability = 1.0 - (
+            (1.0 - float(first.get("reliability", 0.0)))
+            * (1.0 - float(second.get("reliability", 0.0)))
+        )
+        return {
+            "sample_count": len(sequence),
+            "state_order1": state1,
+            "state_order2": state2,
+            "first_order": first,
+            "second_order": second,
+            "active_probability": {"B": active_b, "P": 1.0 - active_b},
+            "active_direction": "B" if active_b >= 0.5 else "P",
+            "reliability": float(active_reliability),
+        }
+
+    @staticmethod
+    def _logit(probability: float) -> float:
+        p = max(1e-6, min(1.0 - 1e-6, float(probability)))
+        return math.log(p / (1.0 - p))
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value >= 0.0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+
+    def analyze(
+        self,
+        history: Iterable[Any],
+        bandit_prediction: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        global_channel = self.channel(history)
+        markov_state = bandit_prediction.get("markov_state")
+        local_values: List[Any] = []
+        if isinstance(markov_state, Mapping):
+            candidate = markov_state.get("values")
+            if isinstance(candidate, list):
+                local_values = list(candidate)
+        if not local_values:
+            local_values = self._bp(history)[-MARKOV_LOCAL_FALLBACK_WINDOW:]
+        local_channel = self.channel(local_values)
+
+        global_b = float(global_channel["active_probability"]["B"])
+        local_b = float(local_channel["active_probability"]["B"])
+        global_rel = float(global_channel.get("reliability", 0.0))
+        local_rel = float(local_channel.get("reliability", 0.0))
+
+        # Geometric/Bayesian-style odds pooling. Global remains the stable anchor;
+        # local receives more weight as the post-CUSUM regime accumulates evidence.
+        global_weight = 0.50 + 0.20 * global_rel
+        local_weight = 0.50 + 0.35 * local_rel
+        weight_total = max(1e-9, global_weight + local_weight)
+        pooled_logit = (
+            global_weight * self._logit(global_b)
+            + local_weight * self._logit(local_b)
+        ) / weight_total
+        fused_b = self._sigmoid(pooled_logit)
+        return {
+            "global": global_channel,
+            "local": local_channel,
+            "fused_probability": {"B": fused_b, "P": 1.0 - fused_b},
+            "direction": "B" if fused_b >= 0.5 else "P",
+            "weights": {
+                "global": global_weight / weight_total,
+                "local": local_weight / weight_total,
+            },
+        }
+
+
+_MARKOV_FUSION = DualChannelMarkovFusion()
+
+
+def _apply_cross_resonance(
+    fused_prediction: Mapping[str, Any],
+    adaptive_prediction: Mapping[str, Any],
+    bandit_prediction: Mapping[str, Any],
+    history: Iterable[Any],
+) -> Dict[str, Any]:
+    """Calibrate the existing Adaptive+CUSUM output with dual-channel Markov evidence."""
+    result = dict(fused_prediction or {})
+    adaptive = dict(adaptive_prediction or {})
+    base_probs = _normalize_probabilities(result.get("probabilities"))
+    road_probs = _normalize_probabilities(
+        adaptive.get("adaptive_only_probabilities")
+        if isinstance(adaptive.get("adaptive_only_probabilities"), Mapping)
+        else adaptive.get("probabilities")
+    )
+    base_b = _conditional_banker(base_probs)
+    road_b = _conditional_banker(road_probs)
+    road_direction = "B" if road_b >= 0.5 else "P"
+    road_side_probability = road_b if road_direction == "B" else 1.0 - road_b
+
+    markov = _MARKOV_FUSION.analyze(history, bandit_prediction)
+    global_b = float(markov["global"]["active_probability"]["B"])
+    local_b = float(markov["local"]["active_probability"]["B"])
+    markov_b = float(markov["fused_probability"]["B"])
+    global_side = global_b if road_direction == "B" else 1.0 - global_b
+    local_side = local_b if road_direction == "B" else 1.0 - local_b
+    markov_side = markov_b if road_direction == "B" else 1.0 - markov_b
+    opposite = "P" if road_direction == "B" else "B"
+    global_opp = 1.0 - global_side
+    local_opp = 1.0 - local_side
+
+    dual_confirm = (
+        global_side >= MARKOV_RESONANCE_THRESHOLD
+        and local_side >= MARKOV_RESONANCE_THRESHOLD
+    )
+    strong_counter = (
+        global_opp >= MARKOV_COUNTER_THRESHOLD
+        and local_opp >= MARKOV_COUNTER_THRESHOLD
+        and min(
+            float(markov["global"].get("reliability", 0.0)),
+            float(markov["local"].get("reliability", 0.0)),
+        ) >= 0.20
+    )
+    near_random = (
+        abs(global_b - 0.5) < 0.03
+        and abs(local_b - 0.5) < 0.03
+    )
+
+    alpha = MARKOV_FUSION_ALPHA
+    base_confidence = _safe_confidence(result, 0.5)
+    original_bet = max(0.0, min(1.0, float(result.get("bet_multiplier", 1.0) or 0.0)))
+
+    if dual_confirm:
+        road_markov_b = alpha * road_b + (1.0 - alpha) * markov_b
+        final_b = 0.72 * road_markov_b + 0.28 * base_b
+        classification = "TRUE_PATTERN_RESONANCE"
+        confidence = min(
+            0.90,
+            max(base_confidence, 0.54 + 0.80 * abs(final_b - 0.5)),
+        )
+        bet_multiplier = min(1.0, original_bet * (0.95 + 0.10 * confidence))
+        reason = "Road 與全局/局部 Markov 同向且皆通過 53% 共鳴門檻。"
+    elif strong_counter:
+        # Two independent Markov channels both reject the road pattern. Allow a
+        # controlled counter-direction override instead of blindly following graphics.
+        final_b = 0.32 * base_b + 0.68 * markov_b
+        classification = "FALSE_PATTERN_COUNTER_SIGNAL"
+        confidence = min(0.76, 0.52 + 0.75 * abs(final_b - 0.5))
+        bet_multiplier = min(original_bet, max(0.30, original_bet * 0.72))
+        reason = f"Road 偏 {road_direction}，但全局/局部 Markov 同時強烈偏 {opposite}。"
+    elif near_random:
+        # Markov carries no useful confirmation; shrink the apparent road edge.
+        final_b = 0.5 + 0.52 * (base_b - 0.5)
+        classification = "RANDOM_NOISE_LOW_CONFIDENCE"
+        confidence = min(0.52, base_confidence * 0.72)
+        bet_multiplier = min(original_bet, original_bet * 0.50)
+        reason = "Markov 接近 50/50，Road 圖形缺乏統計共鳴，降低信心。"
+    else:
+        # Mixed evidence: retain the original fusion direction tendency but compress
+        # the edge and let Markov contribute only as a weak calibrator.
+        final_b = 0.5 + 0.38 * (base_b - 0.5) + 0.18 * (markov_b - 0.5)
+        classification = "MIXED_OR_FALSE_PATTERN"
+        confidence = min(0.54, base_confidence * 0.78)
+        bet_multiplier = min(original_bet, original_bet * 0.58)
+        reason = "Road 與雙通道 Markov 未形成雙重確認，視為混合/假規律區。"
+
+    final_b = max(1e-6, min(1.0 - 1e-6, final_b))
+    final_direction = "B" if final_b > 0.5 else "P" if final_b < 0.5 else road_direction
+    tie_probability = max(0.0, min(0.30, base_probs["T"]))
+    bp_mass = 1.0 - tie_probability
+    banker_probability = bp_mass * final_b
+    player_probability = bp_mass * (1.0 - final_b)
+    final_text = "莊" if final_direction == "B" else "閒"
+
+    road_predict = {
+        "direction": road_direction,
+        "banker_probability": road_b,
+        "player_probability": 1.0 - road_b,
+        "selected_probability": road_side_probability,
+    }
+    markov_predict = {
+        **markov,
+        "road_direction_probability": {
+            "global": global_side,
+            "local": local_side,
+            "fused": markov_side,
+        },
+        "threshold": MARKOV_RESONANCE_THRESHOLD,
+    }
+    fusion_decision = {
+        "classification": classification,
+        "direction": final_direction,
+        "banker_probability": final_b,
+        "player_probability": 1.0 - final_b,
+        "alpha_road": alpha,
+        "reason": reason,
+    }
+
+    result.update({
+        "model_variant": ADAPTIVE_MODEL_VARIANT,
+        "decision_pipeline": "full_road_adaptive_cusum_then_dual_markov_cross_resonance",
+        "probabilities": {
+            "B": float(banker_probability),
+            "P": float(player_probability),
+            "T": float(tie_probability),
+        },
+        "banker_rate": round(banker_probability * 100.0, 2),
+        "player_rate": round(player_probability * 100.0, 2),
+        "tie_rate": round(tie_probability * 100.0, 2),
+        "recommend": final_direction,
+        "recommend_text": final_text,
+        "action": final_direction,
+        "action_text": final_text,
+        "internal_recommend": final_direction,
+        "internal_action": final_direction,
+        "next_round_direction": final_direction,
+        "next_round_direction_text": final_text,
+        "confidence": float(confidence),
+        "ensemble_confidence": float(confidence),
+        "quality_score": float(confidence),
+        "confidence_label": (
+            "較高" if confidence >= 0.72 else
+            "中等" if confidence >= 0.55 else "偏低"
+        ),
+        "bet_multiplier": float(bet_multiplier),
+        "direction_edge": float(abs(2.0 * final_b - 1.0)),
+        "direction_edge_percent": round(abs(2.0 * final_b - 1.0) * 100.0, 4),
+        "direction_source": "road_markov_cross_resonance_fusion",
+        "signal_status_code": "ROAD_MARKOV_CROSS_RESONANCE",
+        "signal_status_text": "Road + Dual Markov Cross-Resonance",
+        "signal_reason": reason,
+        "internal_signal_reason": classification,
+        "road_predict": road_predict,
+        "markov_predict": markov_predict,
+        "fusion_decision": fusion_decision,
+        "cross_resonance": {
+            "active": True,
+            "classification": classification,
+            "dual_confirm": dual_confirm,
+            "strong_counter": strong_counter,
+            "near_random": near_random,
+            "road_predict": road_predict,
+            "markov_predict": markov_predict,
+            "fusion_decision": fusion_decision,
+            "confidence": float(confidence),
+            "bet_multiplier": float(bet_multiplier),
+        },
+    })
+    adaptive_ensemble = dict(result.get("adaptive_ensemble") or {})
+    adaptive_ensemble.update({
+        "mode": "adaptive_road_plus_cusum_plus_dual_markov_cross_resonance",
+        "overall_confidence": float(confidence),
+        "bet_multiplier": float(bet_multiplier),
+        "final_action": final_direction,
+        "cross_resonance_classification": classification,
+    })
+    result["adaptive_ensemble"] = adaptive_ensemble
+    return result
 
 
 def _fuse_adaptive_and_cusum(
@@ -415,6 +749,7 @@ def predict(
         run_seed=run_seed,
     )
     result = _fuse_adaptive_and_cusum(adaptive, bandit)
+    result = _apply_cross_resonance(result, adaptive, bandit, cleaned)
 
     model_fingerprint = str(result.get("prediction_fingerprint") or "").strip()
     bandit_fingerprint = str(bandit.get("prediction_fingerprint") or "").strip()
