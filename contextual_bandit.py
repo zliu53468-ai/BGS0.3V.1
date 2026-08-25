@@ -1,10 +1,12 @@
-"""CUSUM-LinUCB core for BGS with regime-aware Markov transition features.
+"""CUSUM-LinUCB core for BGS with stabilized regime-aware Markov features.
 
-The original 21-dimensional road context is preserved exactly and eight Laplace-
-smoothed Markov transition probabilities are appended, producing a 29-dimensional
-context. CUSUM/LinUCB/Fusion behavior is unchanged. Markov history is maintained in
-a bounded B/P-only sliding window and is reset together with the LinUCB matrices when
-CUSUM detects a regime change. Formal output always remains B/P (no Observe action).
+The original 21-dimensional road context is preserved exactly. The Markov block stays
+8-dimensional, but redundant complementary probabilities are converted into four
+reliability-weighted directional edges plus four support/reliability features. This
+keeps the total context at 29 dimensions while reducing small-sample noise and direct
+collinearity with the bias feature. Raw Laplace-smoothed transition probabilities are
+still exposed for diagnostics. CUSUM/LinUCB/Fusion behavior is unchanged, and formal
+output always remains B/P (no Observe action).
 """
 from __future__ import annotations
 
@@ -20,8 +22,8 @@ import numpy as np
 from road_model import build_road_context
 
 ARMS = ("B", "P")
-MODEL_VERSION = "CUSUM-LINUCB-V1.1-MARKOV29-DYNAMIC-RESET-NO-OBSERVE"
-STATE_SCHEMA_VERSION = "CUSUM-LINUCB-STATE-V2-MARKOV29"
+MODEL_VERSION = "CUSUM-LINUCB-V1.2-MARKOV29-STABILIZED-DYNAMIC-RESET-NO-OBSERVE"
+STATE_SCHEMA_VERSION = "CUSUM-LINUCB-STATE-V3-MARKOV29-STABILIZED"
 
 ROAD_FEATURE_NAMES = (
     "bias", "history_maturity", "global_banker_balance", "recent3_banker_balance",
@@ -31,11 +33,17 @@ ROAD_FEATURE_NAMES = (
     "road_recent_balance", "road_confidence", "road_agreement", "big_eye_saturation",
     "small_road_saturation", "cockroach_road_saturation", "derived_road_consensus",
 )
-MARKOV_FEATURE_NAMES = (
+MARKOV_PROBABILITY_NAMES = (
     "markov_p_b_given_b", "markov_p_p_given_b",
     "markov_p_b_given_p", "markov_p_p_given_p",
     "markov_p_b_given_bb", "markov_p_b_given_pp",
     "markov_p_p_given_bb", "markov_p_p_given_pp",
+)
+MARKOV_FEATURE_NAMES = (
+    "markov_edge_after_b", "markov_edge_after_p",
+    "markov_edge_after_bb", "markov_edge_after_pp",
+    "markov_support_after_b", "markov_support_after_p",
+    "markov_support_after_bb", "markov_support_after_pp",
 )
 FEATURE_NAMES = ROAD_FEATURE_NAMES + MARKOV_FEATURE_NAMES
 CONTEXT_DIM = len(FEATURE_NAMES)
@@ -53,6 +61,10 @@ PREQUENTIAL_WARMUP_BP = 6
 HISTORY_REPLAY_LIMIT = 120
 MARKOV_ALPHA = 1.0
 MARKOV_WINDOW_SIZE = 36
+# Effective transition support needed before a Markov edge approaches full strength.
+# This is deliberately modest: early/post-reset samples are damped, while a mature
+# 36-hand window still retains most of its directional information.
+MARKOV_SUPPORT_PRIOR = 6.0
 TIE_PRIOR = 0.095156
 TIE_PRIOR_STRENGTH = 40.0
 _LOCK = RLock()
@@ -98,18 +110,28 @@ def _clean(values: Iterable[Any]) -> List[str]:
 
 
 class MarkovFeatureExtractor:
-    """B/P-only first/second-order transition features with Laplace smoothing.
+    """B/P-only first/second-order transition features with stability weighting.
 
-    Internally B is encoded as 1 and P as 0. The state is intentionally small and
-    bounded. ``reset()`` is called whenever CUSUM resets so transition counts from an
-    old regime cannot leak into the new regime.
+    Raw transition probabilities still use Laplace smoothing. For the LinUCB context,
+    each transition is represented as a centered directional edge in [-1, 1] multiplied
+    by sample reliability, plus the corresponding reliability itself. This removes the
+    exact probability-complement redundancy from the model input while keeping eight
+    Markov dimensions. ``reset()`` remains synchronized with CUSUM regime resets.
     """
 
     FEATURE_NAMES = MARKOV_FEATURE_NAMES
+    PROBABILITY_NAMES = MARKOV_PROBABILITY_NAMES
 
-    def __init__(self, *, alpha: float = MARKOV_ALPHA, window_size: int = MARKOV_WINDOW_SIZE) -> None:
+    def __init__(
+        self,
+        *,
+        alpha: float = MARKOV_ALPHA,
+        window_size: int = MARKOV_WINDOW_SIZE,
+        support_prior: float = MARKOV_SUPPORT_PRIOR,
+    ) -> None:
         self.alpha = max(1e-9, float(alpha))
         self.window_size = max(3, int(window_size))
+        self.support_prior = max(1e-9, float(support_prior))
         self._values: List[int] = []
 
     @staticmethod
@@ -145,10 +167,13 @@ class MarkovFeatureExtractor:
             (float(negative) + self.alpha) / denominator,
         )
 
-    def extract_features(self) -> List[float]:
+    def _reliability(self, support: int) -> float:
+        n = max(0.0, float(support))
+        return n / (n + self.support_prior)
+
+    def _transition_stats(self) -> Dict[str, Any]:
         values = list(self._values)
 
-        # First order: next outcome conditional on previous B/P.
         bb = bp = pb = pp = 0
         for previous, current in zip(values, values[1:]):
             if previous == 1 and current == 1:
@@ -160,10 +185,6 @@ class MarkovFeatureExtractor:
             else:
                 pp += 1
 
-        p_b_given_b, p_p_given_b = self._smoothed_pair(bb, bp)
-        p_b_given_p, p_p_given_p = self._smoothed_pair(pb, pp)
-
-        # Second order requested by the model: only homogeneous contexts BB and PP.
         b_after_bb = p_after_bb = b_after_pp = p_after_pp = 0
         for first, second, current in zip(values, values[1:], values[2:]):
             if first == 1 and second == 1:
@@ -177,11 +198,18 @@ class MarkovFeatureExtractor:
                 else:
                     p_after_pp += 1
 
+        p_b_given_b, p_p_given_b = self._smoothed_pair(bb, bp)
+        p_b_given_p, p_p_given_p = self._smoothed_pair(pb, pp)
         p_b_given_bb, p_p_given_bb = self._smoothed_pair(b_after_bb, p_after_bb)
         p_b_given_pp, p_p_given_pp = self._smoothed_pair(b_after_pp, p_after_pp)
 
-        # Exact order required by the integration contract.
-        return [
+        supports = {
+            "after_b": bb + bp,
+            "after_p": pb + pp,
+            "after_bb": b_after_bb + p_after_bb,
+            "after_pp": b_after_pp + p_after_pp,
+        }
+        probabilities = [
             p_b_given_b,
             p_p_given_b,
             p_b_given_p,
@@ -191,14 +219,44 @@ class MarkovFeatureExtractor:
             p_p_given_bb,
             p_p_given_pp,
         ]
+        return {"probabilities": probabilities, "supports": supports}
+
+    def extract_probabilities(self) -> List[float]:
+        """Raw Laplace-smoothed probabilities, retained for diagnostics only."""
+        return list(self._transition_stats()["probabilities"])
+
+    def extract_features(self) -> List[float]:
+        """Eight model-ready Markov features: 4 weighted edges + 4 reliabilities."""
+        stats = self._transition_stats()
+        probabilities = list(stats["probabilities"])
+        supports = dict(stats["supports"])
+
+        rel_b = self._reliability(supports["after_b"])
+        rel_p = self._reliability(supports["after_p"])
+        rel_bb = self._reliability(supports["after_bb"])
+        rel_pp = self._reliability(supports["after_pp"])
+
+        # Positive edge means B is favored in that transition context; negative means P.
+        # With zero supporting transitions, reliability=0 so an unobserved context is a
+        # true neutral 0 rather than four artificial 0.5 values entering LinUCB.
+        edge_b = (2.0 * probabilities[0] - 1.0) * rel_b
+        edge_p = (2.0 * probabilities[2] - 1.0) * rel_p
+        edge_bb = (2.0 * probabilities[4] - 1.0) * rel_bb
+        edge_pp = (2.0 * probabilities[5] - 1.0) * rel_pp
+
+        return [edge_b, edge_p, edge_bb, edge_pp, rel_b, rel_p, rel_bb, rel_pp]
 
     def feature_dict(self) -> Dict[str, float]:
         return dict(zip(self.FEATURE_NAMES, self.extract_features()))
+
+    def probability_dict(self) -> Dict[str, float]:
+        return dict(zip(self.PROBABILITY_NAMES, self.extract_probabilities()))
 
     def to_state(self) -> Dict[str, Any]:
         return {
             "alpha": self.alpha,
             "window_size": self.window_size,
+            "support_prior": self.support_prior,
             "values": list(self._values),
             "sample_count": len(self._values),
         }
@@ -208,6 +266,7 @@ class MarkovFeatureExtractor:
         extractor = cls(
             alpha=state.get("alpha", MARKOV_ALPHA),
             window_size=state.get("window_size", MARKOV_WINDOW_SIZE),
+            support_prior=state.get("support_prior", MARKOV_SUPPORT_PRIOR),
         )
         try:
             extractor.extend(list(state.get("values") or []))
@@ -222,8 +281,13 @@ class MarkovFeatureExtractor:
         *,
         alpha: float = MARKOV_ALPHA,
         window_size: int = MARKOV_WINDOW_SIZE,
+        support_prior: float = MARKOV_SUPPORT_PRIOR,
     ) -> "MarkovFeatureExtractor":
-        extractor = cls(alpha=alpha, window_size=window_size)
+        extractor = cls(
+            alpha=alpha,
+            window_size=window_size,
+            support_prior=support_prior,
+        )
         extractor.extend(values)
         return extractor
 
@@ -325,8 +389,8 @@ def build_context_vector(
         markov_values = [float(value) for value in markov_features]
     if len(markov_values) != len(MARKOV_FEATURE_NAMES):
         raise ValueError("markov_features must contain exactly 8 values")
-    if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in markov_values):
-        raise ValueError("markov_features must be finite probabilities in [0, 1]")
+    if not all(math.isfinite(value) and -1.0 <= value <= 1.0 for value in markov_values):
+        raise ValueError("markov_features must be finite values in [-1, 1]")
 
     values = road_values + markov_values
     if len(values) != CONTEXT_DIM:
@@ -610,7 +674,7 @@ def _replay(raw: Sequence[str]) -> tuple[CUSUMLinUCB,Dict[str,Any]]:
         bp_before+=int(actual in ARMS)
     return model,{"raw_round_count":len(history),"bp_training_samples":replayed,"reset_count":model.reset_count,
                   "reset_events":resets[-20:],"history_fingerprint":sha256("".join(history).encode()).hexdigest()[:24],
-                  "mode":"prequential_cusum_dynamic_linucb_markov29","markov_window_size":model.markov_extractor.window_size,
+                  "mode":"prequential_cusum_dynamic_linucb_markov29_stabilized","markov_window_size":model.markov_extractor.window_size,
                   "markov_sample_count":len(model.markov_extractor.to_state()["values"])}
 
 
@@ -620,6 +684,7 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
     road=dict(road_context or {}) or _safe_road(raw)
     model,replay=_replay(raw)
     markov_values=model.markov_extractor.extract_features()
+    markov_probabilities=model.markov_extractor.probability_dict()
     context=build_context_vector(raw,road_context=road,markov_features=markov_values)
     pred=model.predict_context(context)
     risk=model.risk_status(context)
@@ -634,7 +699,7 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
     fingerprint=sha256(json.dumps({"history":"".join(raw),"venue":venue.upper(),"room":room,"context":context},sort_keys=True).encode()).hexdigest()[:24]
     cusum={"g_plus":model.g_plus,"g_minus":model.g_minus,"h":model.cusum_h,"v":model.cusum_v,"last_residual":model.last_residual,
            "last_expected_reward":model.last_expected_reward,"last_observed_reward":model.last_observed_reward,"reset_count":model.reset_count,"last_reset":model.last_reset}
-    return {"ok":True,"engine":"CUSUM_LINUCB_DYNAMIC_CONTEXTUAL_BANDIT","model_version":MODEL_VERSION,"model_core":"cusum_linucb_markov29_dynamic_reset_no_observe",
+    return {"ok":True,"engine":"CUSUM_LINUCB_DYNAMIC_CONTEXTUAL_BANDIT","model_version":MODEL_VERSION,"model_core":"cusum_linucb_markov29_stabilized_dynamic_reset_no_observe",
             "prediction_fingerprint":fingerprint,"road_support":road,"probabilities":probs,"bandit_learning_probabilities":probs,
             "banker_rate":round(probs["B"]*100,2),"player_rate":round(probs["P"]*100,2),"tie_rate":round(probs["T"]*100,2),
             "selected_arm":selected,"base_bandit_direction":selected,"recommend":action,"recommend_text":"莊" if selected=="B" else "閒",
@@ -647,12 +712,12 @@ def predict_bandit(history: Iterable[Any], *, road_context: Optional[Mapping[str
             "uncertainty":shared["uncertainty"],"variance":shared["variance"],"variance_safe":True,"unknown_region_active":risk["post_reset_vacuum_active"],
             "is_extreme_unseen":False,"hard_brake_active":False,"uncertainty_braking":{"active":False,"is_extreme_unseen":False,"variance":shared["variance"],
             "action_space_variance":shared["variance"],"action_space_std":shared["uncertainty"],"variance_safe":True,"post_reset_vacuum_active":risk["post_reset_vacuum_active"],"confidence_score":risk["confidence_score"],"bet_multiplier":risk["bet_multiplier"],"observe_required":False,"cusum":cusum},
-            "markov_features":dict(zip(MARKOV_FEATURE_NAMES,markov_values)),"markov_state":model.markov_extractor.to_state(),
+            "markov_features":dict(zip(MARKOV_FEATURE_NAMES,markov_values)),"markov_probabilities":markov_probabilities,"markov_state":model.markov_extractor.to_state(),
             "bandit_context":context,"context_vector":context,"context_feature_names":list(FEATURE_NAMES),"bandit_scores":metrics,
             "bandit_state":{"alpha":CUSUM_ALPHA,"l2":CUSUM_L2,"forgetting_factor":CUSUM_FORGETTING_FACTOR,"context_dim":CONTEXT_DIM,"total_updates":model.total_observations,
             "observations_since_reset":model.observations_since_reset,"reset_count":model.reset_count,"cusum_h":CUSUM_THRESHOLD_H,"cusum_v":CUSUM_DRIFT_V,
             "vacuum_hands":CUSUM_VACUUM_HANDS,"force_observe_hands":CUSUM_FORCE_OBSERVE_HANDS,"history_replay":replay,"state_file":str(CMAB_STATE_FILE),
-            "markov_alpha":MARKOV_ALPHA,"markov_window_size":MARKOV_WINDOW_SIZE},
+            "markov_alpha":MARKOV_ALPHA,"markov_window_size":MARKOV_WINDOW_SIZE,"markov_support_prior":MARKOV_SUPPORT_PRIOR},
             "adaptive_ensemble":{"active":False,"suggested_share":risk["ensemble_weight_suggestion"],"reason":"predictor.py performs final fusion"},
             "venue":venue,"room":room,"user_id":user_id,"input_required":False,"probability_semantics":"normalized_model_score_not_guaranteed_outcome_probability"}
 
@@ -711,7 +776,8 @@ def get_bandit_summary(user_id: str="") -> Dict[str,Any]:
         model=CUSUMLinUCB.from_state(dict(_read_store()["users"].get(_uid(user_id)) or {}))
     return {"version":MODEL_VERSION,"context_dim":CONTEXT_DIM,"feature_names":list(FEATURE_NAMES),"total_updates":model.total_observations,
             "observations_since_reset":model.observations_since_reset,"reset_count":model.reset_count,
-            "markov_features":model.markov_extractor.feature_dict(),"markov_state":model.markov_extractor.to_state(),
+            "markov_features":model.markov_extractor.feature_dict(),"markov_probabilities":model.markov_extractor.probability_dict(),
+            "markov_state":model.markov_extractor.to_state(),
             "cusum":{"g_plus":model.g_plus,"g_minus":model.g_minus,"h":model.cusum_h,"v":model.cusum_v,"last_residual":model.last_residual,"last_reset":model.last_reset},
             "arms":{a:{"updates":model.arms[a]["updates"],"reward_sum":model.arms[a]["reward_sum"]} for a in ARMS},"state_file":str(CMAB_STATE_FILE)}
 
@@ -759,7 +825,7 @@ class DecisionStrategyBanditEngine:
         return update_decision_strategy(**kwargs)
 
 
-__all__=["ARMS","MODEL_VERSION","ROAD_FEATURE_NAMES","MARKOV_FEATURE_NAMES","FEATURE_NAMES","CONTEXT_DIM","MARKOV_ALPHA","MARKOV_WINDOW_SIZE",
+__all__=["ARMS","MODEL_VERSION","ROAD_FEATURE_NAMES","MARKOV_PROBABILITY_NAMES","MARKOV_FEATURE_NAMES","FEATURE_NAMES","CONTEXT_DIM","MARKOV_ALPHA","MARKOV_WINDOW_SIZE","MARKOV_SUPPORT_PRIOR",
          "CUSUM_ALPHA","CUSUM_L2","CUSUM_FORGETTING_FACTOR","CUSUM_DRIFT_V","CUSUM_THRESHOLD_H","CUSUM_MIN_OBSERVATIONS","CUSUM_VACUUM_HANDS",
          "CUSUM_FORCE_OBSERVE_HANDS","MarkovFeatureExtractor","CUSUMLinUCB","ContextualBanditEngine","DecisionStrategyBanditEngine",
          "DECISION_STRATEGY_ARMS","DECISION_STRATEGY_CONTEXT_DIM","build_context_vector","build_decision_strategy_context","predict_bandit","update_bandit",
