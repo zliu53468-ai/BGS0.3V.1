@@ -11,9 +11,8 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 import math
 
-from performance_tracker import get_performance_summary
-
-
+# 正式融合不匯入、不讀取 prediction_performance_v3.json；避免過去按鈕
+# 回報的預測對錯改寫當前截圖的路子專家權重。
 OUTCOMES = ("B", "P", "T")
 # 新的正式融合／影子比較使用獨立版本標籤。舊版績效不會再影響這一版的
 # component Brier 權重，避免部署後看似「又回到舊模型」。
@@ -35,6 +34,15 @@ ADAPTIVE_FUSION_TEMPERATURE = 0.80
 ADAPTIVE_PLURALITY_STRENGTH = 0.12
 ADAPTIVE_LOGIT_CAP = 2.20
 ADAPTIVE_SHOE_MIN_SAMPLES = 12
+
+# 正式方向只依「這一次截圖可辨識出的完整 B/P/T 牌路」與 Full Road
+# 各路子專家的當前結構輸出決定。不得因為先前按鈕回報的命中／失誤，
+# 改變本次融合權重。這個常數故意寫死在程式內，Render 的舊環境變數
+# 不能重新開啟它。
+#
+# 注意：performance_tracker 仍可保存稽核紀錄，Contextual Bandit 仍可做
+# 影子學習比較；兩者都不會改變 Adaptive 的正式 B/P 方向。
+FORMAL_ONLINE_PERFORMANCE_WEIGHTING = False
 
 # Adaptive 的正式成員只允許 Full Road 與既有五個路子專家。V34.2 起，
 # cMAB 不再參與正式融合；它只保留自己的原始方向，供同一筆預測的影子
@@ -708,8 +716,8 @@ def _apply_plurality_decision(
     tiebreaker = dict(fusion.get("tiebreaker") or {})
     if tiebreaker:
         reason = (
-            f"加權意見完全抵消，改由證據品質最高的 {tiebreaker['name']} "
-            "依可靠度、support 與已結算表現破局。"
+            f"加權意見完全抵消，改由本次牌路證據最高的 {tiebreaker['name']} "
+            "依當前可靠度、support 與方向差破局；不讀取過往命中資料。"
         )
     elif exact_tie:
         reason = (
@@ -718,8 +726,8 @@ def _apply_plurality_decision(
         )
     else:
         reason = (
-            "以 reliability／Brier 權重進行 logit pooling，"
-            "再以 plurality evidence 放大非零方向優勢。"
+            "以本次截圖牌路的 reliability、support 與方向差進行 logit pooling，"
+            "再以 plurality evidence 放大非零方向優勢；不讀取過往命中資料。"
         )
 
     result.update({
@@ -793,6 +801,8 @@ def _apply_plurality_decision(
         "final_action": direction,
         "bet_multiplier": 1.0,
         "road_primary": True,
+        "current_screen_only": True,
+        "online_performance_weighting_enabled": False,
         "contextual_bandit_role": "shadow_only_no_final_weight",
         "adaptive_only_direction": direction,
         "ucb_shadow": {
@@ -827,31 +837,24 @@ def adapt_prediction(
     )
     result.setdefault("raw_probabilities", dict(base))
     components = _components(result)
-    summary = get_performance_summary(
-        venue=venue,
-        room=room,
-        model_variant=ADAPTIVE_MODEL_VARIANT,
-        limit=5000,
+    # 正式融合不再讀取 prediction_performance_v3.json。之前每次按下
+    # 莊／閒結果後，這份檔案的歷史 Brier 與同鞋命中率會調整路子專家
+    # 權重，導致同一張完整牌路會因為「前幾次預測剛好對或錯」而改方向。
+    #
+    # 現在只取本次 road_support 的牌路樣本數做信心顯示；它不會用來加減
+    # 任一模型權重。空字典會使 _fusion_candidates 中的兩個歷史加權分支
+    # 永遠保持中性（historical/current_shoe_performance_used=False）。
+    road_data = result.get("road_support")
+    if not isinstance(road_data, Mapping):
+        road_data = {}
+    screen_road_sample_count = max(
+        0, int(road_data.get("sample_count", 0) or 0)
     )
-    sample_count = int(summary.get("sample_count", 0) or 0)
-    historical_scores = dict(summary.get("component_brier_scores") or {})
-    component_sample_counts = dict(
-        summary.get("component_sample_counts") or {}
-    )
-    shoe_summary = (
-        get_performance_summary(
-            venue=venue,
-            room=room,
-            shoe_id=shoe_id,
-            model_variant=ADAPTIVE_MODEL_VARIANT,
-            limit=500,
-        )
-        if str(shoe_id or "").strip()
-        else {}
-    )
-    shoe_direction_performance = dict(
-        shoe_summary.get("component_direction_performance") or {}
-    )
+    sample_count = screen_road_sample_count
+    historical_scores: Dict[str, Any] = {}
+    component_sample_counts: Dict[str, Any] = {}
+    shoe_summary: Dict[str, Any] = {}
+    shoe_direction_performance: Dict[str, Any] = {}
     extreme_unseen = _is_extreme_unseen(result)
     base_confidence = _base_confidence(result, base)
 
@@ -946,6 +949,8 @@ def adapt_prediction(
             "final_action": road_direction,
             "bet_multiplier": 1.0,
             "road_primary": True,
+            "current_screen_only": True,
+            "online_performance_weighting_enabled": False,
             "contextual_bandit_role": "shadow_only_no_final_weight",
             "adaptive_only_direction": road_direction,
             "ucb_shadow": {
