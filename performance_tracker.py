@@ -17,8 +17,7 @@ import math
 import secrets
 import time
 
-from contextual_bandit import update_bandit, update_decision_strategy
-from shoe_composition import BANKER_COMMISSION, MAX_BET_FRACTION
+from contextual_bandit import update_bandit
 
 BASE_DIR = Path(__file__).resolve().parent
 _LOCK = RLock()
@@ -70,22 +69,6 @@ def _normalize_probabilities(values: Mapping[str, Any]) -> Dict[str, float]:
     raw = {key: max(1e-12, float(values.get(key, 0.0) or 0.0)) for key in _OUTCOMES}
     total = sum(raw.values()) or 1.0
     return {key: raw[key] / total for key in _OUTCOMES}
-
-
-def _strategy_actual_profit(record: Mapping[str, Any], actual: str) -> float:
-    """依預測當時已鎖定的 Kelly 注碼計算真實單位損益。
-
-    和局對莊／閒注為 push；沒有通過物理閘門的 O 不會虛構一筆輸贏。
-    """
-    action = str(record.get("action") or record.get("recommend") or "O").upper()
-    if action not in {"B", "P"} or actual not in {"B", "P"}:
-        return 0.0
-    bankroll = max(0.0, float(record.get("bankroll", 0.0) or 0.0))
-    kelly = max(0.0, min(float(MAX_BET_FRACTION), float(record.get("kelly_fraction", 0.0) or 0.0)))
-    stake = bankroll * kelly
-    if actual != action:
-        return -stake
-    return stake * (1.0 - float(BANKER_COMMISSION)) if action == "B" else stake
 
 
 def _prune_guards_unlocked(data: Dict[str, Any]) -> None:
@@ -177,6 +160,7 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "venue": str(venue or "").upper().strip(),
         "room": str(room or "").strip(),
         "model_version": str(prediction.get("model_version") or prediction.get("engine") or ""),
+        "model_variant": str(prediction.get("model_variant") or "").strip(),
         "shoe_id": str(prediction.get("shoe_id") or ""),
         "bandit_learning_user_id": str(
             prediction.get("bandit_learning_user_id") or ""
@@ -193,6 +177,25 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "recommend": str(prediction.get("recommend") or selected_arm).upper(),
         "action": str(prediction.get("action") or selected_arm).upper(),
         "selected_arm": selected_arm,
+        # V34.2：正式方向與 UCB 影子方向同一時間寫入 pending。下局結果
+        # 出現後才一起結算，避免用已知答案回頭替模型加分。
+        "adaptive_only_direction": str(
+            prediction.get("adaptive_only_direction")
+            or prediction.get("action")
+            or prediction.get("recommend")
+            or ""
+        ).upper().strip(),
+        "ucb_shadow_direction": str(
+            prediction.get("ucb_shadow_direction")
+            or prediction.get("selected_arm")
+            or ""
+        ).upper().strip(),
+        "shadow_comparison_eligible": bool(
+            str(prediction.get("adaptive_only_direction") or "").upper().strip()
+            in {"B", "P"}
+            and str(prediction.get("ucb_shadow_direction") or "").upper().strip()
+            in {"B", "P"}
+        ),
         "context_vector": list(prediction.get("bandit_context") or prediction.get("context_vector") or []),
         "context_feature_names": list(prediction.get("context_feature_names") or []),
         "timeline_alignment": dict(
@@ -205,31 +208,6 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         ),
         "decision_validation": dict(
             prediction.get("decision_validation") or {}
-        ),
-        # 策略 Bandit 的 Context 與 Arm 和 B/P 診斷 cMAB 分開保存；前者
-        # 以實際 Kelly 損益更新，後者仍可保留既有牌路方向的研究紀錄。
-        "decision_strategy_arm": str(
-            dict(prediction.get("decision_strategy_bandit") or {}).get(
-                "selected_arm", prediction.get("decision_strategy", "")
-            )
-            or ""
-        ),
-        "decision_strategy_context": list(
-            dict(prediction.get("decision_strategy_bandit") or {}).get(
-                "context", []
-            )
-            or []
-        ),
-        "decision_strategy_selection": dict(
-            prediction.get("decision_strategy_bandit") or {}
-        ),
-        "bankroll": max(0.0, float(prediction.get("bankroll", 0.0) or 0.0)),
-        "kelly_fraction": max(0.0, float(prediction.get("kelly_fraction", 0.0) or 0.0)),
-        "recommended_bet_percentage": max(
-            0.0, float(prediction.get("recommended_bet_percentage", 0.0) or 0.0)
-        ),
-        "selected_expected_return": float(
-            prediction.get("selected_expected_return", 0.0) or 0.0
         ),
         "component_probabilities": dict(
             prediction.get("component_probabilities")
@@ -247,8 +225,6 @@ def record_prediction(user_id: str, prediction: Mapping[str, Any], *, venue: str
         "actual_outcome": "",
         "reward": None,
         "bandit_update": {},
-        "strategy_bandit_update": {},
-        "actual_profit": None,
     }
     with _LOCK:
         data = _read_unlocked()
@@ -350,32 +326,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
         else:
             bandit_update = {"updated": False, "reason": "missing_context_or_arm", "actual_outcome": actual}
 
-        strategy_arm = str(target.get("decision_strategy_arm") or "").strip()
-        strategy_context = list(target.get("decision_strategy_context") or [])
-        actual_profit = _strategy_actual_profit(target, actual)
-        if strategy_arm and strategy_context:
-            strategy_bandit_update = update_decision_strategy(
-                context=strategy_context,
-                selected_arm=strategy_arm,
-                actual_profit=actual_profit,
-                bankroll=float(target.get("bankroll", 0.0) or 0.0),
-                event_id=str(target.get("prediction_id") or ""),
-                venue=str(target.get("venue") or venue or ""),
-                room=str(target.get("room") or room or ""),
-                user_id=str(target.get("bandit_learning_user_id") or user_id),
-            )
-        else:
-            strategy_bandit_update = {
-                "updated": False,
-                "reason": "missing_strategy_context_or_arm",
-            }
-
         target["actual_outcome"] = actual
         target["resolved_at"] = _now()
         target["reward"] = reward
         target["bandit_update"] = bandit_update
-        target["strategy_bandit_update"] = strategy_bandit_update
-        target["actual_profit"] = actual_profit
         target["bp_timeline_advanced"] = actual in {"B", "P"}
         target["tie_skipped_for_structural_learning"] = actual == "T"
         target["applied_update_weight"] = (
@@ -406,6 +360,28 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
             if actual in {"B", "P"} and selected_arm in {"B", "P"}
             else None
         )
+        adaptive_only_direction = str(
+            target.get("adaptive_only_direction") or public_action
+        ).upper().strip()
+        ucb_shadow_direction = str(
+            target.get("ucb_shadow_direction") or selected_arm
+        ).upper().strip()
+        target["adaptive_only_correct"] = (
+            adaptive_only_direction == actual
+            if actual in {"B", "P"} and adaptive_only_direction in {"B", "P"}
+            else None
+        )
+        target["ucb_shadow_correct"] = (
+            ucb_shadow_direction == actual
+            if actual in {"B", "P"} and ucb_shadow_direction in {"B", "P"}
+            else None
+        )
+        target["adaptive_ucb_agree"] = (
+            adaptive_only_direction == ucb_shadow_direction
+            if adaptive_only_direction in {"B", "P"}
+            and ucb_shadow_direction in {"B", "P"}
+            else None
+        )
         target["no_bet"] = public_action == "O"
         if not pending_id or pending_id == str(target.get("prediction_id") or ""):
             data["pending"].pop(uid, None)
@@ -420,9 +396,10 @@ def resolve_latest_prediction(user_id: str, actual_outcome: str, *, venue: str =
 
 
 def get_resolved_records(*, venue: str = "", room: str = "", shoe_id: str = "",
-                         limit: int = 5000) -> List[Dict[str, Any]]:
+                         model_variant: str = "", limit: int = 5000) -> List[Dict[str, Any]]:
     venue_key, room_key = str(venue or "").upper().strip(), str(room or "").strip()
     shoe_key = str(shoe_id or "").strip()
+    variant_key = str(model_variant or "").strip()
     with _LOCK:
         records = list(_read_unlocked().get("records") or [])
     result: List[Dict[str, Any]] = []
@@ -434,6 +411,8 @@ def get_resolved_records(*, venue: str = "", room: str = "", shoe_id: str = "",
         if room_key and str(record.get("room") or "") != room_key:
             continue
         if shoe_key and str(record.get("shoe_id") or "") != shoe_key:
+            continue
+        if variant_key and str(record.get("model_variant") or "") != variant_key:
             continue
         result.append(dict(record))
         if len(result) >= max(1, int(limit)):
@@ -457,6 +436,12 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     component_brier_values: Dict[str, List[float]] = {}
     component_direction_counts: Dict[str, List[int]] = {}
     source_direction_counts: Dict[str, List[int]] = {}
+    shadow_adaptive_counts = [0, 0]
+    shadow_ucb_counts = [0, 0]
+    shadow_agreement_count = 0
+    shadow_disagreement_count = 0
+    shadow_adaptive_wins_when_different = 0
+    shadow_ucb_wins_when_different = 0
     for record in valid:
         actual = str(record.get("actual_outcome") or "").upper()
         counts[actual] += 1
@@ -489,6 +474,30 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             source_values = source_direction_counts.setdefault(source, [0, 0])
             source_values[0] += int(public_action == actual)
             source_values[1] += 1
+        # 只統計新模式建立的 paired prediction；舊紀錄沒有同時保存兩個
+        # 預測，不能拿來冒充 Adaptive vs UCB 的公平比較樣本。
+        if bool(record.get("shadow_comparison_eligible")) and actual in {"B", "P"}:
+            adaptive_direction = str(
+                record.get("adaptive_only_direction") or ""
+            ).upper().strip()
+            ucb_direction = str(
+                record.get("ucb_shadow_direction") or ""
+            ).upper().strip()
+            if adaptive_direction in {"B", "P"} and ucb_direction in {"B", "P"}:
+                shadow_adaptive_counts[0] += int(adaptive_direction == actual)
+                shadow_adaptive_counts[1] += 1
+                shadow_ucb_counts[0] += int(ucb_direction == actual)
+                shadow_ucb_counts[1] += 1
+                if adaptive_direction == ucb_direction:
+                    shadow_agreement_count += 1
+                else:
+                    shadow_disagreement_count += 1
+                    shadow_adaptive_wins_when_different += int(
+                        adaptive_direction == actual
+                    )
+                    shadow_ucb_wins_when_different += int(
+                        ucb_direction == actual
+                    )
         if record.get("learning_arm_correct") is not None:
             learning_decided += 1
             learning_correct += int(bool(record.get("learning_arm_correct")))
@@ -559,17 +568,38 @@ def summarize_records(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             name: _direction_performance(values[0], values[1])
             for name, values in source_direction_counts.items()
         },
+        "adaptive_ucb_shadow_comparison": {
+            "eligible_bp_sample_count": int(shadow_adaptive_counts[1]),
+            "adaptive_ensemble_road_primary": _direction_performance(
+                shadow_adaptive_counts[0], shadow_adaptive_counts[1]
+            ),
+            "contextual_bandit_shadow": _direction_performance(
+                shadow_ucb_counts[0], shadow_ucb_counts[1]
+            ),
+            "agreement_count": int(shadow_agreement_count),
+            "disagreement_count": int(shadow_disagreement_count),
+            "adaptive_wins_when_different": int(
+                shadow_adaptive_wins_when_different
+            ),
+            "ucb_wins_when_different": int(shadow_ucb_wins_when_different),
+            "comparison_rule": (
+                "只結算預測建立後的下一個實際 B/P；T 不計勝負，舊紀錄不混入。"
+            ),
+        },
         "model": "CMAB-LINUCB-V1",
     }
 
 
 def get_performance_summary(*, venue: str = "", room: str = "", shoe_id: str = "",
-                            limit: int = 5000) -> Dict[str, Any]:
-    return summarize_records(
+                            model_variant: str = "", limit: int = 5000) -> Dict[str, Any]:
+    summary = summarize_records(
         get_resolved_records(
-            venue=venue, room=room, shoe_id=shoe_id, limit=limit
+            venue=venue, room=room, shoe_id=shoe_id,
+            model_variant=model_variant, limit=limit,
         )
     )
+    summary["model_variant_filter"] = str(model_variant or "").strip()
+    return summary
 
 
 __all__ = ["get_performance_summary", "get_resolved_records", "record_prediction",
