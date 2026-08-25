@@ -1,9 +1,9 @@
 """BGS 純牌路統一預測入口。
 
 正式圖片／真人桌預測使用完整 B/P/T 歷史與牌路上下文。Full Road、結構
-規律與其他牌路專家先由 Adaptive Ensemble 融合，該結果是唯一正式 B/P
-方向。此版本完全不呼叫、讀取或更新 LinUCB／Contextual Bandit；不使用
-算牌、EV 或觀望方向。
+規律與其他牌路專家是 Adaptive Ensemble 的主要方向來源；CUSUM-LinUCB
+只在重置冷卻及暖機結束後，以明確上限作為輔助專家。全程不使用算牌、EV
+或觀望方向。
 """
 from __future__ import annotations
 
@@ -14,15 +14,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
 from adaptive_ensemble import adapt_prediction
+from contextual_bandit import predict_bandit
 from road_model import build_road_context
 
 # 僅用於本版績效資料隔離；刻意不從 adaptive_ensemble 匯入，避免部署時若
 # 其他舊模組也載入 predictor 而造成循環 import。
-ADAPTIVE_MODEL_VARIANT = "V34.3_SCREEN_ROAD_ADAPTIVE_NO_UCB"
+ADAPTIVE_MODEL_VARIANT = "V35_CUSUM_LINUCB_GATED_ROAD_ADAPTIVE"
 
 DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
-    "replacement": "FULL_ROAD_ADAPTIVE_V34.3",
+    "replacement": "FULL_ROAD_ADAPTIVE_CUSUM_GATED_V35",
     "note": "舊粒子／有限牌組驗證層已從主要預測流程移除",
 }
 
@@ -741,19 +742,63 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     if not isinstance(road.get("models"), Mapping):
         road = build_road_context(cleaned, seed=run_seed)
 
-    # 第二層：只把 Full Road 的本次截圖輸出交給 Adaptive Ensemble。
-    # 不建立 cMAB Context、不載入 state、也不產生任何 UCB 方向。
+    # 第二層：CUSUM-LinUCB 以「同一張截圖已辨識出的完整牌路」建立 24 維
+    # Context。它不讀取 OCR 圖片本身、不使用牌面/EV，且其輸出不會直接
+    # 覆寫正式方向；Adaptive Ensemble 會在後面決定它是否可取得受限席位。
+    bandit_learning_user_id = _bandit_learning_scope(
+        user_id=str(user_id or ""), venue=venue, room=room,
+    )
+    bandit_result = predict_bandit(
+        cleaned,
+        road_context=road,
+        venue=venue,
+        room=room,
+        user_id=bandit_learning_user_id,
+        run_seed=run_seed,
+    )
+
+    # Full Road 繼續是主概率種子，避免 CUSUM 在重置／冷啟動時以 50/50
+    # 覆蓋完整路圖。只有下列 CUSUM 專家欄位會傳入 Adaptive 的受限調度器。
     result = _road_seed_prediction(road, cleaned)
     result["road_support"] = dict(road)
     result["component_probabilities"] = dict(
         road.get("component_probabilities") or {}
     )
+    result.update({
+        "model_version": "FULL_ROAD_ADAPTIVE_CUSUM_V35",
+        "cusum_model_version": str(bandit_result.get("model_version") or ""),
+        "selected_arm": str(bandit_result.get("selected_arm") or ""),
+        "base_bandit_direction": str(
+            bandit_result.get("base_bandit_direction")
+            or bandit_result.get("selected_arm")
+            or ""
+        ),
+        "bandit_context": list(bandit_result.get("bandit_context") or []),
+        "context_vector": list(bandit_result.get("context_vector") or []),
+        "context_feature_names": list(
+            bandit_result.get("context_feature_names") or []
+        ),
+        "bandit_scores": dict(bandit_result.get("bandit_scores") or {}),
+        "bandit_learning_probabilities": dict(
+            bandit_result.get("pre_braking_probabilities")
+            or bandit_result.get("probabilities")
+            or {}
+        ),
+        "cusum": dict(bandit_result.get("cusum") or {}),
+        "reset_risk": dict(bandit_result.get("reset_risk") or {}),
+        "post_reset_exploration": bool(
+            bandit_result.get("post_reset_exploration", False)
+        ),
+        "bandit_confidence_score": float(
+            bandit_result.get("confidence_score", 0.0) or 0.0
+        ),
+        "contextual_bandit_enabled": True,
+        "contextual_bandit_update_enabled": True,
+    })
     result["decision_pipeline"] = (
-        "full_road_pattern_to_adaptive_ensemble_screen_only"
+        "full_road_pattern_to_cusum_linu_cb_to_gated_adaptive_ensemble"
     )
     result["model_variant"] = ADAPTIVE_MODEL_VARIANT
-    result["contextual_bandit_enabled"] = False
-    result["contextual_bandit_update_enabled"] = False
     result = adapt_prediction(
         result,
         venue=venue,
@@ -762,7 +807,8 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     )
 
     # 產品契約：不論路圖樣本、模型衝突或混沌診斷，都對外強制一致輸出 B/P。
-    # final_direction 只會來自 Adaptive 的純牌路輸出或 Full Road fallback。
+    # 最終方向只會來自「Full Road 主導的 Adaptive 融合」或 Full Road fallback；
+    # CUSUM-LinUCB 最多提供 Adaptive 中受限的輔助 logit 證據。
     final_direction = str(
         result.get("adaptive_only_direction") or ""
     ).upper().strip()
@@ -779,9 +825,8 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     result.update({
         "forced_bp_direction": True,
         "adaptive_only_direction": final_direction,
-        "ucb_influenced_final_direction": False,
-        "contextual_bandit_enabled": False,
-        "contextual_bandit_update_enabled": False,
+        "contextual_bandit_enabled": True,
+        "contextual_bandit_update_enabled": True,
         "road_direction": road_direction,
         "road_prior": {
             "direction": road_direction,
@@ -797,8 +842,8 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "internal_recommend": final_direction,
         "internal_action": final_direction,
         "signal_allowed": True,
-        "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_DIRECTION",
-        "signal_status_text": "全路圖 → Adaptive Ensemble 正式方向（UCB 已關閉）",
+        "signal_status_code": "ROAD_PRIMARY_ADAPTIVE_CUSUM_GATED_DIRECTION",
+        "signal_status_text": "全路圖 → Adaptive Ensemble 正式方向（CUSUM-LinUCB 受限輔助）",
     })
     model_fingerprint = str(
         result.get("prediction_fingerprint") or ""
@@ -814,11 +859,11 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
     ).hexdigest()[:24]
     result.update({
         "shoe_id": str(shoe_id or ""),
-        "bandit_learning_user_id": "",
-        "bandit_scope_mode": "disabled",
-        "bandit_shoe_isolated": True,
+        "bandit_learning_user_id": bandit_learning_user_id,
+        "bandit_scope_mode": "user_venue_room_cusum_dynamic",
+        "bandit_shoe_isolated": False,
         "shoe_event_isolated": True,
-        "composition_quality": "not_applicable_road_only",
+        "composition_quality": "not_applicable_road_cusum_only",
         "remaining_counts_source": "not_used",
         "shoe_context_ignored": bool(shoe_context),
         "road_quality_ok": bool(road.get(
@@ -830,7 +875,7 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
 
 
 def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None) -> Dict[str, Any]:
-    """保留舊虛擬牌靴介面，方向同樣走純牌路 Adaptive。"""
+    """保留舊虛擬牌靴介面，方向走牌路主導的受控 CUSUM 融合。"""
     # 虛擬牌靴僅供舊相容入口使用；真人圖片預測不載入粒子／算牌模組，
     # 避免其環境參數或初始化副作用混入正式純牌路路徑。
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
@@ -868,8 +913,8 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     )
     prediction.update({
         "ok": True,
-        "mode": "virtual_shoe_road_adaptive_compatibility",
-        "model_version": "FULL_ROAD_ADAPTIVE_V34.3-VIRTUAL-COMPAT",
+        "mode": "virtual_shoe_road_adaptive_cusum_compatibility",
+        "model_version": "FULL_ROAD_ADAPTIVE_CUSUM_V35-VIRTUAL-COMPAT",
         "virtual_hand": hand_data,
         "virtual_outcome": actual,
         "virtual_outcome_text": hand_data["outcome_text"],
@@ -885,8 +930,8 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
         "remaining_counts_after": counts_from_shoe(remaining_shoe),
         "round_number": int(session.get("hand_number", 0) or 0) + 1,
         "warmup_rounds": int(session.get("warmup_rounds", 0) or 0),
-        "bandit_learning_applied": False,
-        "disclaimer": "虛擬相容模式方向由 Full Road 與 Adaptive Ensemble 產生；不使用 UCB。",
+        "bandit_learning_applied": True,
+        "disclaimer": "虛擬相容模式由 Full Road 主導，CUSUM-LinUCB 僅在穩定後受限輔助。",
     })
     return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
