@@ -1,8 +1,7 @@
-"""Screenshot adapter for the direct Road + Markov predictor.
+"""Screenshot adapter for the three-way Markov + shoe-depth predictor.
 
-The screen pipeline recognizes the chronological B/P/T road first. This adapter then
-builds the 21D road feature block and sends it to the direct 8D Markov primary model.
-Performance tracking remains audit-only and never feeds predictions back into a bandit.
+The image pipeline preserves chronological B/P/T outcomes. No tie is filtered before
+prediction. Performance tracking remains audit-only and does not update model weights.
 """
 from __future__ import annotations
 
@@ -54,7 +53,7 @@ def predict_from_screenshot(
     combined_raw = initial_raw + manual_raw if (initial_raw or manual_raw) else supplied_raw
     if not combined_raw:
         combined_raw = _clean_raw(sequence)
-    cleaned = _clean_bp(combined_raw)
+    cleaned_bp = _clean_bp(combined_raw)
 
     if run_seed is None:
         seed_payload = "|".join((
@@ -70,8 +69,6 @@ def predict_from_screenshot(
     else:
         seed = int(run_seed) & 0xFFFFFFFF
 
-    # road_context from screen_pipeline is detector metadata. Rebuild the predictive
-    # road representation here so the model always receives the same canonical 21D.
     scan_context = dict(road_context or {})
     context = build_road_context(
         combined_raw,
@@ -84,8 +81,6 @@ def predict_from_screenshot(
         context["scan_metadata"] = scan_context
 
     metadata = dict(screen_metadata or {})
-
-    # Resolve only when caller explicitly says a NEW actual result arrived.
     latest_actual = str(latest_actual_outcome or "").upper().strip()
     latest_actual_is_new = latest_actual in {"B", "P", "T"}
     previous_resolution = None
@@ -103,11 +98,13 @@ def predict_from_screenshot(
             prediction_id=str(previous_prediction_id or ""),
         )
 
-    # These arguments remain in the public API for backward compatibility only.
     prior_counts_ignored = bool(prior_counts)
     observed_cards_ignored = bool(observed_cards)
-    shoe_context_ignored = bool(shoe_context)
 
+    # Preserve bankroll from the app session for MoneyManagementModel. Exact card
+    # counts may remain present for legacy APIs, but round-count ShoeDepthEstimator
+    # does not treat them as physical composition evidence.
+    model_shoe_context = dict(shoe_context or {})
     result = predict(
         history=combined_raw,
         venue=venue,
@@ -115,22 +112,25 @@ def predict_from_screenshot(
         shoe_id=shoe_id,
         user_id=user_id,
         run_seed=seed,
-        shoe_context=None,
+        shoe_context=model_shoe_context,
         road_context=context,
     )
     result.update({
-        "screen_pipeline_version": "ROAD-MARKOV-DIRECT-SCREEN-V1",
-        "mode": "screen_road_markov_direct",
+        "screen_pipeline_version": "THREEWAY-MARKOV-SHOE-DEPTH-SCREEN-V2",
+        "mode": "screen_threeway_markov_shoe_depth",
         "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
         "estimated_remaining_counts": [],
-        "composition_source": "not_used",
-        "composition_quality": "not_applicable_road_markov",
-        "exact_remaining_counts_supplied": False,
+        "composition_source": "round_count_depth_estimator",
+        "composition_quality": "maturity_estimate_not_exact_card_composition",
+        "exact_remaining_counts_supplied": bool(
+            isinstance(model_shoe_context.get("remaining_counts"), (list, tuple))
+            and len(model_shoe_context.get("remaining_counts") or []) == 10
+        ),
         "prior_counts_ignored": prior_counts_ignored,
         "observed_cards_ignored": observed_cards_ignored,
-        "shoe_context_ignored": shoe_context_ignored,
-        "road_sequence_length": len(cleaned),
+        "shoe_context_ignored": False,
+        "road_sequence_length": len(cleaned_bp),
         "raw_outcome_length": len(combined_raw),
         "initial_image_count": len(initial_raw),
         "manual_round_count": len(manual_raw),
@@ -151,9 +151,9 @@ def predict_from_screenshot(
         "deterministic_feature_seed": True,
     })
     result["road_fusion"] = {
-        "applied": True,
-        "mode": "markov_primary_road_calibration",
-        "reason": "圖片辨識後建立 21D 牌路特徵，再由 8D Markov 主模型直接給下一局 B/P。",
+        "applied": False,
+        "mode": "diagnostic_only",
+        "reason": "圖片保留完整 B/P/T；正式方向由三元 Markov 後驗 B/P 機率直接決定。",
     }
 
     if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id:
@@ -168,7 +168,7 @@ def predict_from_screenshot(
                 "manual_round_count": len(manual_raw),
                 "combined_round_count": len(combined_raw),
                 "shoe_id": str(shoe_id or ""),
-                "prediction_pipeline": "road21_markov8_direct",
+                "prediction_pipeline": "threeway_markov_shoe_depth_v2",
             },
         )
         result["performance_tracking"] = True
