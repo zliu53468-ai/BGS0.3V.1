@@ -2,7 +2,6 @@
 
 V4 keeps B/P/T fully modeled and upgrades V3 with:
 - Bayesian context-tree backoff over orders 1..6,
-- support maturity gates before higher-order contexts can participate,
 - short/long dual-memory models,
 - probabilistic road-regime scoring,
 - short-vs-long change-point detection,
@@ -20,7 +19,7 @@ import math
 
 from shoe_depth_estimator import ShoeDepthEstimator
 
-MODEL_VERSION = "THREEWAY-ADAPTIVE-CONTEXT-MARKOV-V4.1-MATURITY-GATE-CANDIDATE"
+MODEL_VERSION = "THREEWAY-ADAPTIVE-CONTEXT-MARKOV-V4-CANDIDATE"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 
@@ -35,7 +34,6 @@ CHANGE_LONG_WINDOW = 36
 
 _ORDER_SUPPORT_SCALE = {1: 2.5, 2: 3.5, 3: 5.0, 4: 7.0, 5: 10.0, 6: 14.0}
 _ORDER_ALPHA_CAP = {1: 0.78, 2: 0.70, 3: 0.62, 4: 0.54, 5: 0.44, 6: 0.34}
-_ORDER_MIN_SUPPORT = {1: 2.0, 2: 3.0, 3: 4.0, 4: 6.0, 5: 9.0, 6: 12.0}
 _ROAD_SUPPORT_SCALE = {"road_coarse": 5.0, "road_full": 8.0}
 _ROAD_ALPHA_CAP = {"road_coarse": 0.34, "road_full": 0.26}
 
@@ -372,36 +370,16 @@ def _context_tree(sequence: list[str], table: Mapping[str, Mapping[str, float]],
             continue
         counts = dict(table.get(key, {"B": 0.0, "P": 0.0, "T": 0.0}))
         support = _support(counts)
-        minimum_support = float(_ORDER_MIN_SUPPORT[order])
-        maturity_gate_open = bool(support >= minimum_support)
-        posterior = _posterior_with_parent(
-            counts,
-            probability,
-            prior_strength + 0.8 * (order - 1),
-        )
-        if maturity_gate_open:
-            reliability = _reliability(support, _ORDER_SUPPORT_SCALE[order])
-            alpha = _ORDER_ALPHA_CAP[order] * reliability
-            probability = _blend(probability, posterior, alpha)
-        else:
-            reliability = 0.0
-            alpha = 0.0
+        reliability = _reliability(support, _ORDER_SUPPORT_SCALE[order])
+        posterior = _posterior_with_parent(counts, probability, prior_strength + 0.8 * (order - 1))
+        alpha = _ORDER_ALPHA_CAP[order] * reliability
+        probability = _blend(probability, posterior, alpha)
         score = alpha * max(0.25, support)
         if score > dominant_score:
             dominant_name, dominant_score, dominant_counts = name, score, dict(counts)
         if alpha > 0.0:
             votes.append((_direction_vote(posterior), alpha))
-        details[name] = {
-            "key": key,
-            "support": support,
-            "minimum_support": minimum_support,
-            "support_deficit": max(0.0, minimum_support - support),
-            "maturity_gate_open": maturity_gate_open,
-            "reliability": reliability,
-            "alpha": alpha,
-            "probabilities": posterior,
-            "counts": counts,
-        }
+        details[name] = {"key": key, "support": support, "reliability": reliability, "alpha": alpha, "probabilities": posterior, "counts": counts}
 
     for name in ("road_coarse", "road_full"):
         key = contexts.get(name)
@@ -428,16 +406,6 @@ def _context_tree(sequence: list[str], table: Mapping[str, Mapping[str, float]],
         p_weight = sum(weight for vote, weight in votes if vote == "P")
         agreement = max(b_weight, p_weight) / vote_total
     max_support = max((float(x["support"]) for x in details.values()), default=0.0)
-    active_orders = [
-        order
-        for order in range(1, MAX_ORDER + 1)
-        if bool(dict(details.get(f"order_{order}") or {}).get("maturity_gate_open"))
-    ]
-    blocked_orders = [
-        order
-        for order in range(1, MAX_ORDER + 1)
-        if f"order_{order}" in details and order not in active_orders
-    ]
     return probability, {
         "contexts": details,
         "dominant_context": dominant_name,
@@ -445,9 +413,6 @@ def _context_tree(sequence: list[str], table: Mapping[str, Mapping[str, float]],
         "multi_order_agreement": float(agreement),
         "support_strength": float(_reliability(max_support, 8.0)),
         "max_context_support": float(max_support),
-        "maturity_gate_thresholds": dict(_ORDER_MIN_SUPPORT),
-        "active_orders": active_orders,
-        "blocked_orders": blocked_orders,
     }
 
 
@@ -537,7 +502,7 @@ def update_and_predict_engine(history: Iterable[Any], *, decay: float = DECAY, p
     dominant_counts = dict(dominant_tree["dominant_counts"])
     effective_support = _support(dominant_counts)
     hierarchy = {
-        "mode": "dual_memory_bayesian_context_tree_with_maturity_gate",
+        "mode": "dual_memory_bayesian_context_tree",
         "short": short_tree,
         "long": long_tree,
         "short_memory_weight": float(short_weight),
@@ -547,7 +512,6 @@ def update_and_predict_engine(history: Iterable[Any], *, decay: float = DECAY, p
         "memory_agreement": float(memory_agreement),
         "dominant_context": str(dominant_tree["dominant_context"]),
         "dominant_counts": dominant_counts,
-        "maturity_gate_thresholds": dict(_ORDER_MIN_SUPPORT),
     }
 
     return {
@@ -570,7 +534,6 @@ def update_and_predict_engine(history: Iterable[Any], *, decay: float = DECAY, p
         "prior": dict(PHYSICAL_PRIOR),
         "prior_strength": prior_strength,
         "max_order": MAX_ORDER,
-        "order_min_support": dict(_ORDER_MIN_SUPPORT),
         "short_memory_window": SHORT_MEMORY_WINDOW,
         "long_memory_window": LONG_MEMORY_WINDOW,
         "short_memory_weight": float(short_weight),
@@ -599,7 +562,7 @@ def update_and_predict_engine(history: Iterable[Any], *, decay: float = DECAY, p
         "multi_order_agreement": float(agreement),
         "support_strength": float(support_strength),
         "dominant_context": str(dominant_tree["dominant_context"]),
-        "confidence_semantics": "entropy_epistemic_change_memory_maturity_gate_weight_not_guaranteed_win_probability",
+        "confidence_semantics": "entropy_epistemic_change_memory_weight_not_guaranteed_win_probability",
     }
 
 
