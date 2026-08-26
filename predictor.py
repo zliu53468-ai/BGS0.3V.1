@@ -1,9 +1,9 @@
-"""BGS predictor: image road parsing -> three-way Markov -> B/P + risk sizing.
+"""BGS predictor: image road parsing -> three-way Markov -> B/P + mandatory sizing.
 
 The formal direction is selected directly from the three-way Markov B/P posterior.
-T is retained in the Markov state/probability model and affects entropy/risk sizing.
+T is retained in the Markov state/probability model and affects entropy/risk diagnostics.
 Road analysis remains available for diagnostics, but it does not override the Markov
-direction.
+direction. Every formal B/P prediction carries a 5%-30% bankroll sizing ratio.
 """
 from __future__ import annotations
 
@@ -129,15 +129,14 @@ def predict(
     p_p = float(probabilities["P"])
     p_t = float(probabilities["T"])
     bp_edge = abs(p_b - p_p)
-    bet_allowed = bool(money["bet_allowed"])
 
     return {
         "ok": True,
         "engine": "THREEWAY_MARKOV_SHOE_DEPTH",
         "model_version": MODEL_VERSION,
-        "model_variant": "THREEWAY_STATE_DECAY_BAYES_ENTROPY_SHOE_DEPTH",
+        "model_variant": "THREEWAY_STATE_DECAY_BAYES_ENTROPY_SHOE_DEPTH_ALWAYS_BET",
         "model_core": "threeway_markov_primary",
-        "decision_pipeline": "image_scan_to_threeway_state_to_markov_to_entropy_shoe_depth_to_kelly",
+        "decision_pipeline": "image_scan_to_threeway_state_to_markov_to_entropy_shoe_depth_to_mandatory_5_30_sizing",
         "prediction_fingerprint": fingerprint,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "raw_direction_probabilities": {"B": p_b, "P": p_p},
@@ -155,22 +154,16 @@ def predict(
         "direction": direction,
         "direction_text": text,
         "signal_allowed": True,
-        "risk_gate_open": bet_allowed,
-        "signal_status_code": (
-            "MARKOV_DIRECTION_BET_ALLOWED" if bet_allowed
-            else "MARKOV_DIRECTION_NO_BET"
-        ),
-        "signal_status_text": (
-            "Markov 方向成立，可依風控比例配置"
-            if bet_allowed
-            else "Markov 仍提供方向，但風控判定不下注"
-        ),
+        "risk_gate_open": True,
+        "mandatory_bet": True,
+        "signal_status_code": "MARKOV_DIRECTION_MANDATORY_BET",
+        "signal_status_text": "Markov 方向成立，每局依 5%-30% 動態比例配置",
         "signal_reason": (
             f"state={markov['state_key'] or 'START'}；"
             f"H={markov['entropy_bits']:.4f} bits；"
             f"shoe_progress={markov['shoe_progress']:.3f}；"
             f"final_weight={confidence:.3f}；"
-            f"money_gate={money['reason']}。"
+            f"sizing={money['reason']}。"
         ),
         "direction_source": "threeway_markov_primary",
         "confidence": confidence,
