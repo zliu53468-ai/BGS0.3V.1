@@ -1,13 +1,15 @@
-"""Variable-order road-state three-way Markov predictor for BGS.
+"""Support-aware variable-order three-way Markov predictor for BGS.
 
-B, P and T remain fully modeled.  The predictor combines:
-- variable-order raw B/P/T contexts (orders 1..4),
-- B/P road run-length state with nested coarse/full fallback,
-- regime detection (DRAGON / CHOP / DOUBLE_CHOP / MIXED / TRANSITION),
-- regime-adaptive exponential decay,
-- Bayesian smoothing and support-aware hierarchical blending.
+V3.2 keeps the stable V3 road/regime design and adds:
+- explicit order-1..4 transition counters,
+- support-threshold backoff (K=4, alpha=0.75),
+- 12-hand entropy change-point detection,
+- regime-aware adaptive forgetting with 4-6 hand refocus,
+- Bayesian/Dirichlet smoothing,
+- nested road coarse/full auxiliary state without double counting.
 
-The model is still history-based and does not imply deterministic baccarat patterns.
+This is a stochastic history model. It does not imply deterministic baccarat
+patterns or guaranteed future outcomes.
 """
 from __future__ import annotations
 
@@ -17,17 +19,20 @@ import math
 
 from shoe_depth_estimator import ShoeDepthEstimator
 
-MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-ROAD-STATE-V3.1-NESTED-ROAD-CANDIDATE"
+MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-SUPPORT-BACKOFF-V3.2-QUANT-CANDIDATE"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 
-DECAY = 0.95
-BAYES_PRIOR_STRENGTH = 6.0
-MAX_ENTROPY = math.log2(3.0)
 MAX_ORDER = 4
+SUPPORT_THRESHOLD = 4
+BACKOFF_ALPHA = 0.75
+BAYES_PRIOR_STRENGTH = 6.0
+DECAY = 0.95  # legacy name: this is retention lambda, not decay intensity.
+MAX_ENTROPY = math.log2(3.0)
+ENTROPY_WINDOW = 12
+ENTROPY_SPIKE_THRESHOLD = 0.22
+RECENT_FOCUS_WINDOW = 6
 
-_ORDER_SUPPORT_SCALE = {1: 3.0, 2: 4.5, 3: 6.5, 4: 9.0}
-_ORDER_ALPHA_CAP = {1: 0.72, 2: 0.64, 3: 0.54, 4: 0.44}
 _ROAD_SUPPORT_SCALE = {"road_coarse": 5.0, "road_full": 8.0}
 _ROAD_ALPHA_CAP = {"road_coarse": 0.34, "road_full": 0.26}
 _ROAD_FULL_MIN_RELIABILITY = 0.50
@@ -35,6 +40,14 @@ _ROAD_FULL_MIN_RELIABILITY = 0.50
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(value)))
+
+
+def _normalize(values: Mapping[str, float]) -> Dict[str, float]:
+    raw = {outcome: max(1e-12, float(values.get(outcome, 0.0) or 0.0)) for outcome in OUTCOMES}
+    total = sum(raw.values())
+    if total <= 1e-12:
+        return dict(PHYSICAL_PRIOR)
+    return {outcome: raw[outcome] / total for outcome in OUTCOMES}
 
 
 def _clean_threeway(values: Iterable[Any]) -> list[str]:
@@ -64,15 +77,13 @@ def _bp_runs(sequence: Iterable[str]) -> list[tuple[str, int]]:
     if not bp:
         return []
     runs: list[tuple[str, int]] = []
-    side = bp[0]
-    length = 1
+    side, length = bp[0], 1
     for value in bp[1:]:
         if value == side:
             length += 1
         else:
             runs.append((side, length))
-            side = value
-            length = 1
+            side, length = value, 1
     runs.append((side, length))
     return runs
 
@@ -94,6 +105,20 @@ def _alternation_ratio(sequence: Iterable[str], window: int = 10) -> float:
         return 0.0
     changes = sum(1 for left, right in zip(bp, bp[1:]) if left != right)
     return changes / max(1, len(bp) - 1)
+
+
+def _window_entropy(sequence: Iterable[str], window: int = ENTROPY_WINDOW) -> float:
+    values = list(sequence)[-max(1, int(window)):]
+    if not values:
+        return MAX_ENTROPY
+    counts = {outcome: values.count(outcome) for outcome in OUTCOMES}
+    total = float(len(values))
+    entropy = 0.0
+    for outcome in OUTCOMES:
+        p = counts[outcome] / total
+        if p > 0.0:
+            entropy -= p * math.log2(p)
+    return float(entropy)
 
 
 def _base_regime(sequence: Iterable[str]) -> str:
@@ -120,8 +145,7 @@ def _base_regime(sequence: Iterable[str]) -> str:
     double_evidence = recent_completed[-3:]
     if len(double_evidence) >= 2:
         near_two = sum(1 for length in double_evidence if length == 2)
-        building = current_length in {1, 2}
-        if near_two >= 2 and building:
+        if near_two >= 2 and current_length in {1, 2}:
             return "DOUBLE_CHOP"
 
     return "MIXED"
@@ -131,21 +155,33 @@ def _detect_regime(sequence: Iterable[str]) -> Dict[str, Any]:
     values = list(sequence)
     bp = _clean_bp(values)
     runs = _bp_runs(bp)
+
     current_base = _base_regime(values)
     previous_base = _base_regime(values[:-3]) if len(values) >= 7 else "MIXED"
 
-    break_from_dragon = (
-        len(runs) >= 2
-        and runs[-2][1] >= 4
-        and runs[-1][1] == 1
+    entropy_current = _window_entropy(values, ENTROPY_WINDOW)
+    if len(values) >= ENTROPY_WINDOW * 2:
+        previous_window = values[-ENTROPY_WINDOW * 2:-ENTROPY_WINDOW]
+        entropy_previous = _window_entropy(previous_window, ENTROPY_WINDOW)
+    else:
+        entropy_previous = entropy_current
+    entropy_delta = entropy_current - entropy_previous
+    entropy_spike = bool(
+        len(values) >= ENTROPY_WINDOW * 2
+        and entropy_delta >= ENTROPY_SPIKE_THRESHOLD
     )
-    break_from_chop = (
-        previous_base == "CHOP"
-        and runs
-        and runs[-1][1] >= 2
+
+    break_from_dragon = bool(
+        len(runs) >= 2 and runs[-2][1] >= 4 and runs[-1][1] == 1
     )
+
+    previous_chop = _base_regime(values[:-1]) == "CHOP" if len(values) >= 5 else False
+    break_from_chop = bool(
+        previous_chop and runs and runs[-1][1] >= 2
+    )
+
     current_run_length = runs[-1][1] if runs else 0
-    regime_changed = (
+    regime_changed = bool(
         len(values) >= 7
         and previous_base != current_base
         and (
@@ -155,12 +191,14 @@ def _detect_regime(sequence: Iterable[str]) -> Dict[str, Any]:
         )
     )
 
-    transition = bool(break_from_dragon or break_from_chop or regime_changed)
+    pattern_break = bool(break_from_dragon or break_from_chop or regime_changed)
+    change_point = bool(entropy_spike or pattern_break)
+    transition = change_point
     regime = "TRANSITION" if transition else current_base
 
     recent_runs = [length for _, length in runs[-5:]]
     if regime == "TRANSITION":
-        stability = 0.25
+        stability = 0.20
     elif regime == "MIXED":
         stability = 0.45
     elif len(recent_runs) >= 3:
@@ -173,44 +211,60 @@ def _detect_regime(sequence: Iterable[str]) -> Dict[str, Any]:
         "base_regime": current_base,
         "previous_regime": previous_base,
         "transition": transition,
+        "change_point": change_point,
+        "pattern_break": pattern_break,
+        "entropy_window": ENTROPY_WINDOW,
+        "entropy_current": float(entropy_current),
+        "entropy_previous": float(entropy_previous),
+        "entropy_delta": float(entropy_delta),
+        "entropy_spike": entropy_spike,
+        "entropy_spike_threshold": float(ENTROPY_SPIKE_THRESHOLD),
         "stability": float(stability),
         "alternation_ratio": float(_alternation_ratio(values, window=10)),
         "recent_run_lengths": recent_runs,
-        "current_run_length": int(runs[-1][1]) if runs else 0,
+        "current_run_length": int(current_run_length),
         "previous_run_length": int(runs[-2][1]) if len(runs) >= 2 else 0,
+        "break_from_dragon": break_from_dragon,
+        "break_from_chop": break_from_chop,
+        "regime_changed": regime_changed,
+        "focus_window": int(RECENT_FOCUS_WINDOW if change_point else 0),
     }
 
 
-def _adaptive_decay(sequence: Iterable[str], base_decay: float) -> float:
-    profile = _detect_regime(sequence)
-    base = _clip(base_decay, 0.80, 0.995)
-    regime = profile["regime"]
+def _adaptive_retention_lambda(
+    sequence: Iterable[str],
+    base_lambda: float = DECAY,
+) -> float:
+    """Return retention lambda used by w(age)=lambda**age.
 
-    if regime == "TRANSITION":
-        return _clip(base - 0.08, 0.82, 0.94)
-    if regime == "DRAGON":
-        return _clip(base + 0.03, 0.90, 0.985)
-    if regime in {"CHOP", "DOUBLE_CHOP"}:
-        return _clip(base + 0.02, 0.90, 0.98)
-    return _clip(base, 0.86, 0.97)
+    The user-facing "decay intensity" is delta = 1-lambda.
+    Therefore a change point *raises decay intensity* by lowering lambda.
+    """
+    profile = _detect_regime(sequence)
+    base = _clip(base_lambda, 0.70, 0.995)
+
+    if profile["change_point"]:
+        return 0.72
+    if profile["regime"] == "DRAGON":
+        return _clip(base + 0.025, 0.90, 0.98)
+    if profile["regime"] in {"CHOP", "DOUBLE_CHOP"}:
+        return _clip(base + 0.015, 0.89, 0.975)
+    if profile["regime"] == "MIXED":
+        return _clip(base - 0.015, 0.86, 0.96)
+    return _clip(base - 0.05, 0.78, 0.94)
 
 
 def _density_state(sequence: list[str]) -> Dict[str, Any]:
     recent5 = sequence[-5:]
     banker_count = recent5.count("B")
     player_count = recent5.count("P")
-    density_delta = banker_count - player_count
-    if density_delta >= 2:
-        density = "High"
-    elif density_delta <= -2:
-        density = "Low"
-    else:
-        density = "Medium"
+    delta = banker_count - player_count
+    density = "High" if delta >= 2 else "Low" if delta <= -2 else "Medium"
     return {
         "recent5": recent5,
         "banker_count_recent5": banker_count,
         "player_count_recent5": player_count,
-        "density_delta": density_delta,
+        "density_delta": delta,
         "density": density,
     }
 
@@ -224,7 +278,6 @@ def _road_state(sequence: list[str]) -> Dict[str, Any]:
     current_length = runs[-1][1] if runs else 0
     previous_length = runs[-2][1] if len(runs) >= 2 else 0
     previous2_length = runs[-3][1] if len(runs) >= 3 else 0
-    previous_side = runs[-2][0] if len(runs) >= 2 else ""
 
     current_bucket = _run_bucket(current_length) if current_length else "0"
     previous_bucket = _run_bucket(previous_length) if previous_length else "0"
@@ -240,12 +293,10 @@ def _road_state(sequence: list[str]) -> Dict[str, Any]:
         f"prev={previous_bucket}|prev2={previous2_bucket}|"
         f"reg={regime['regime']}|density={density['density']}|tie={tie_trigger}"
     )
-
     return {
         "current_side": current_side,
         "current_run_length": int(current_length),
         "current_run_bucket": current_bucket,
-        "previous_side": previous_side,
         "previous_run_length": int(previous_length),
         "previous_run_bucket": previous_bucket,
         "previous2_run_length": int(previous2_length),
@@ -261,17 +312,13 @@ def encode_threeway_state(history: Iterable[Any]) -> Dict[str, Any]:
     sequence = _clean_threeway(history)
     density = _density_state(sequence)
     road = _road_state(sequence)
-    direction_context = "".join(sequence[-2:]) if len(sequence) >= 2 else "".join(sequence)
     recent3 = sequence[-3:]
-    tie_trigger = "HasTie" if "T" in recent3 else "NoTie"
-
-    key = road["full_key"] if sequence else ""
     return {
         "ready": len(sequence) >= 2,
-        "direction_context": direction_context,
+        "direction_context": "".join(sequence[-2:]) if sequence else "",
         "density": density["density"],
-        "tie_trigger": tie_trigger,
-        "key": key,
+        "tie_trigger": "HasTie" if "T" in recent3 else "NoTie",
+        "key": road["full_key"] if sequence else "",
         "recent5": density["recent5"],
         "recent3": recent3,
         "banker_count_recent5": density["banker_count_recent5"],
@@ -293,6 +340,9 @@ def encode_threeway_state(history: Iterable[Any]) -> Dict[str, Any]:
         "regime_stability": road["regime"]["stability"],
         "alternation_ratio": road["regime"]["alternation_ratio"],
         "recent_run_lengths": road["regime"]["recent_run_lengths"],
+        "change_point": road["regime"]["change_point"],
+        "entropy_current": road["regime"]["entropy_current"],
+        "entropy_delta": road["regime"]["entropy_delta"],
     }
 
 
@@ -308,50 +358,69 @@ def _context_keys(sequence: list[str]) -> Dict[str, str]:
     return keys
 
 
-def _decay_all(
-    transitions: Dict[str, Dict[str, float]],
-    decay: float,
-) -> None:
-    for counts in transitions.values():
-        for outcome in OUTCOMES:
-            counts[outcome] *= decay
+def _new_counts() -> Dict[str, float]:
+    return {"B": 0.0, "P": 0.0, "T": 0.0}
 
 
-def _build_decayed_transition_table(
+def _build_transition_tables(
     sequence: list[str],
     *,
-    base_decay: float,
-) -> Dict[str, Dict[str, float]]:
-    transitions: Dict[str, Dict[str, float]] = defaultdict(
-        lambda: {"B": 0.0, "P": 0.0, "T": 0.0}
+    retention_lambda: float,
+) -> tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    """Build decayed and raw transition counters for all 1..4 orders.
+
+    For a transition with age a:
+        effective_count = lambda ** a
+    Raw support remains the literal number of observations and is used for the
+    K=4 backoff gate.
+    """
+    weighted: Dict[str, Dict[str, float]] = defaultdict(_new_counts)
+    raw: Dict[str, Dict[str, float]] = defaultdict(_new_counts)
+    n = len(sequence)
+
+    for index in range(1, n):
+        prefix = sequence[:index]
+        age = max(0, n - 1 - index)
+        weight = float(retention_lambda ** age)
+        outcome = sequence[index]
+        for key in _context_keys(prefix).values():
+            weighted[key][outcome] += weight
+            raw[key][outcome] += 1.0
+
+    return (
+        {key: dict(value) for key, value in weighted.items()},
+        {key: dict(value) for key, value in raw.items()},
     )
 
-    # Leakage-safe: every context for outcome i is encoded only from outcomes < i.
-    for index in range(1, len(sequence)):
-        prefix = sequence[:index]
-        step_decay = _adaptive_decay(prefix, base_decay)
-        _decay_all(transitions, step_decay)
-        for key in _context_keys(prefix).values():
-            transitions[key][sequence[index]] += 1.0
 
-    return {key: dict(value) for key, value in transitions.items()}
+def _support(counts: Mapping[str, float]) -> float:
+    return sum(float(counts.get(outcome, 0.0) or 0.0) for outcome in OUTCOMES)
+
+
+def _reliability(support: float, scale: float) -> float:
+    value = max(0.0, float(support))
+    return value / (value + max(1e-9, float(scale)))
 
 
 def _posterior_probabilities(
     counts: Mapping[str, float],
     *,
     prior_strength: float,
+    parent_prior: Mapping[str, float] | None = None,
 ) -> Dict[str, float]:
-    denominator = (
-        sum(float(counts.get(outcome, 0.0) or 0.0) for outcome in OUTCOMES)
-        + prior_strength
-    )
-    if denominator <= 0.0:
-        return dict(PHYSICAL_PRIOR)
+    """Dirichlet/Bayesian smoothing.
+
+    P(y|c) = (N(c,y) + beta * pi_y) / (N(c) + beta)
+    where pi is either the physical baccarat prior or a supplied parent prior.
+    """
+    prior = _normalize(parent_prior or PHYSICAL_PRIOR)
+    denominator = _support(counts) + prior_strength
+    if denominator <= 1e-12:
+        return dict(prior)
     return {
         outcome: (
             float(counts.get(outcome, 0.0) or 0.0)
-            + prior_strength * PHYSICAL_PRIOR[outcome]
+            + prior_strength * prior[outcome]
         ) / denominator
         for outcome in OUTCOMES
     }
@@ -368,186 +437,234 @@ def _blend(
         + weight * float(overlay[outcome])
         for outcome in OUTCOMES
     }
-    total = sum(mixed.values())
-    if total <= 1e-12:
-        return dict(PHYSICAL_PRIOR)
-    return {outcome: mixed[outcome] / total for outcome in OUTCOMES}
-
-
-def _support(counts: Mapping[str, float]) -> float:
-    return sum(float(counts.get(outcome, 0.0) or 0.0) for outcome in OUTCOMES)
-
-
-def _reliability(support: float, scale: float) -> float:
-    value = max(0.0, float(support))
-    denominator = value + max(1e-9, float(scale))
-    return value / denominator
+    return _normalize(mixed)
 
 
 def _direction_vote(probabilities: Mapping[str, float]) -> str:
     return "B" if float(probabilities["B"]) >= float(probabilities["P"]) else "P"
 
 
-def _hierarchical_probabilities(
+def _support_aware_markov(
     sequence: list[str],
-    transition_table: Mapping[str, Mapping[str, float]],
+    weighted_table: Mapping[str, Mapping[str, float]],
+    raw_table: Mapping[str, Mapping[str, float]],
     *,
     prior_strength: float,
 ) -> tuple[Dict[str, float], Dict[str, Any]]:
-    contexts = _context_keys(sequence)
-    blended = dict(PHYSICAL_PRIOR)
-    details: Dict[str, Any] = {}
-    weighted_votes: list[tuple[str, float]] = []
-    dominant_name = "physical_prior"
-    dominant_score = 0.0
-    dominant_counts = {"B": 0.0, "P": 0.0, "T": 0.0}
+    """Strict variable-order backoff.
 
-    for order in range(1, MAX_ORDER + 1):
+    Start from the highest available order N. If raw support < K, transfer the
+    decision to N-1 and multiply confidence by alpha=0.75 for every backoff step.
+
+        backoff_penalty = alpha ** (# failed higher-order gates)
+
+    The selected lower-order posterior is then shrunk toward the physical prior
+    by that penalty, preventing sparse contexts from looking overconfident.
+    """
+    contexts = _context_keys(sequence)
+    highest = min(MAX_ORDER, len(sequence))
+    details: Dict[str, Any] = {}
+    selected_order = 0
+    selected_name = "physical_prior"
+    selected_counts = _new_counts()
+    selected_posterior = dict(PHYSICAL_PRIOR)
+    penalty = 1.0
+    backoff_steps = 0
+
+    for order in range(highest, 0, -1):
         name = f"order_{order}"
         key = contexts.get(name)
         if not key:
             continue
-        counts = dict(transition_table.get(key, {"B": 0.0, "P": 0.0, "T": 0.0}))
-        support = _support(counts)
-        posterior = _posterior_probabilities(counts, prior_strength=prior_strength)
-        reliability = _reliability(support, _ORDER_SUPPORT_SCALE[order])
-        alpha = _ORDER_ALPHA_CAP[order] * reliability
-        blended = _blend(blended, posterior, alpha)
 
-        score = alpha * max(0.25, support)
-        if score > dominant_score:
-            dominant_name = name
-            dominant_score = score
-            dominant_counts = dict(counts)
-        if alpha > 0.0:
-            weighted_votes.append((_direction_vote(posterior), alpha))
+        weighted_counts = dict(weighted_table.get(key, _new_counts()))
+        raw_counts = dict(raw_table.get(key, _new_counts()))
+        raw_support = _support(raw_counts)
+        effective_support = _support(weighted_counts)
+        posterior = _posterior_probabilities(
+            weighted_counts,
+            prior_strength=prior_strength,
+        )
+        qualifies = bool(raw_support >= SUPPORT_THRESHOLD)
 
         details[name] = {
             "key": key,
-            "support": float(support),
-            "reliability": float(reliability),
-            "alpha": float(alpha),
-            "probabilities": dict(posterior),
-            "counts": dict(counts),
+            "raw_support": float(raw_support),
+            "effective_support": float(effective_support),
+            "support_threshold": int(SUPPORT_THRESHOLD),
+            "qualifies": qualifies,
+            "posterior": dict(posterior),
+            "counts": weighted_counts,
         }
 
-    # road_full is a refinement of road_coarse, so they must not both influence
-    # the same decision.  Use full only once it has enough support; otherwise
-    # back off to coarse.  Both candidates remain visible in diagnostics.
-    road_candidates: Dict[str, Dict[str, Any]] = {}
+        if qualifies:
+            selected_order = order
+            selected_name = name
+            selected_counts = weighted_counts
+            selected_posterior = posterior
+            break
+
+        # Only an actual N -> N-1 transfer consumes one backoff penalty.
+        # Order-1 has no lower order, so a sparse O1 is handled as the final
+        # fallback without inventing a fourth backoff step.
+        if order > 1:
+            penalty *= BACKOFF_ALPHA
+            backoff_steps += 1
+
+    if selected_order == 0:
+        # No order reached K. Use order-1 if it exists; the accumulated penalty
+        # records the uncertainty created by all failed gates.
+        key = contexts.get("order_1")
+        if key:
+            selected_order = 1
+            selected_name = "order_1"
+            selected_counts = dict(weighted_table.get(key, _new_counts()))
+            selected_posterior = _posterior_probabilities(
+                selected_counts,
+                prior_strength=prior_strength,
+            )
+        else:
+            penalty = 0.0
+
+    probability = _blend(PHYSICAL_PRIOR, selected_posterior, penalty)
+
+    # Diagnostics for all lower orders not visited above.
+    for order in range(1, highest + 1):
+        name = f"order_{order}"
+        if name in details:
+            continue
+        key = contexts.get(name)
+        if not key:
+            continue
+        weighted_counts = dict(weighted_table.get(key, _new_counts()))
+        raw_counts = dict(raw_table.get(key, _new_counts()))
+        raw_support = _support(raw_counts)
+        details[name] = {
+            "key": key,
+            "raw_support": float(raw_support),
+            "effective_support": float(_support(weighted_counts)),
+            "support_threshold": int(SUPPORT_THRESHOLD),
+            "qualifies": bool(raw_support >= SUPPORT_THRESHOLD),
+            "posterior": _posterior_probabilities(
+                weighted_counts,
+                prior_strength=prior_strength,
+            ),
+            "counts": weighted_counts,
+        }
+
+    votes: list[tuple[str, float]] = []
+    for order in range(1, highest + 1):
+        item = details.get(f"order_{order}")
+        if not item:
+            continue
+        raw_support = float(item["raw_support"])
+        reliability = _reliability(raw_support, SUPPORT_THRESHOLD)
+        votes.append((_direction_vote(item["posterior"]), reliability))
+
+    vote_total = sum(weight for _, weight in votes)
+    if vote_total <= 1e-12:
+        agreement = 0.5
+    else:
+        b_weight = sum(weight for vote, weight in votes if vote == "B")
+        p_weight = sum(weight for vote, weight in votes if vote == "P")
+        agreement = max(b_weight, p_weight) / vote_total
+
+    return probability, {
+        "mode": "strict_support_aware_variable_order_backoff",
+        "support_threshold": int(SUPPORT_THRESHOLD),
+        "backoff_alpha": float(BACKOFF_ALPHA),
+        "highest_available_order": int(highest),
+        "selected_order": int(selected_order),
+        "selected_context": selected_name,
+        "backoff_steps": int(backoff_steps),
+        "backoff_penalty": float(penalty),
+        "contexts": details,
+        "selected_counts": dict(selected_counts),
+        "selected_posterior": dict(selected_posterior),
+        "multi_order_agreement": float(agreement),
+    }
+
+
+def _apply_nested_road(
+    sequence: list[str],
+    base_probability: Mapping[str, float],
+    weighted_table: Mapping[str, Mapping[str, float]],
+    raw_table: Mapping[str, Mapping[str, float]],
+    *,
+    prior_strength: float,
+) -> tuple[Dict[str, float], Dict[str, Any]]:
+    contexts = _context_keys(sequence)
+    candidates: Dict[str, Dict[str, Any]] = {}
+
     for name in ("road_coarse", "road_full"):
         key = contexts.get(name)
         if not key:
             continue
-        counts = dict(transition_table.get(key, {"B": 0.0, "P": 0.0, "T": 0.0}))
-        support = _support(counts)
-        posterior = _posterior_probabilities(counts, prior_strength=prior_strength)
-        reliability = _reliability(support, _ROAD_SUPPORT_SCALE[name])
-        raw_alpha = _ROAD_ALPHA_CAP[name] * reliability
-        road_candidates[name] = {
-            "key": key,
-            "support": float(support),
-            "reliability": float(reliability),
-            "raw_alpha": float(raw_alpha),
-            "probabilities": dict(posterior),
-            "counts": dict(counts),
-        }
-
-    full_candidate = road_candidates.get("road_full")
-    coarse_candidate = road_candidates.get("road_coarse")
-    full_ready = bool(
-        full_candidate
-        and float(full_candidate["reliability"]) >= _ROAD_FULL_MIN_RELIABILITY
-    )
-    if full_ready:
-        selected_road_name = "road_full"
-    elif coarse_candidate:
-        selected_road_name = "road_coarse"
-    elif full_candidate:
-        selected_road_name = "road_full"
-    else:
-        selected_road_name = ""
-
-    for name, candidate in road_candidates.items():
-        applied = bool(name == selected_road_name)
-        alpha = float(candidate["raw_alpha"]) if applied else 0.0
-        details[name] = {
-            "key": str(candidate["key"]),
-            "support": float(candidate["support"]),
-            "reliability": float(candidate["reliability"]),
-            "raw_alpha": float(candidate["raw_alpha"]),
-            "alpha": float(alpha),
-            "applied": applied,
-            "probabilities": dict(candidate["probabilities"]),
-            "counts": dict(candidate["counts"]),
-        }
-
-    if selected_road_name:
-        selected = road_candidates[selected_road_name]
-        selected_alpha = float(selected["raw_alpha"])
-        blended = _blend(blended, selected["probabilities"], selected_alpha)
-        selected_support = float(selected["support"])
-        score = selected_alpha * max(0.25, selected_support)
-        if score > dominant_score:
-            dominant_name = selected_road_name
-            dominant_score = score
-            dominant_counts = dict(selected["counts"])
-        if selected_alpha > 0.0:
-            weighted_votes.append(
-                (_direction_vote(selected["probabilities"]), selected_alpha)
-            )
-
-    vote_total = sum(weight for _, weight in weighted_votes)
-    if vote_total <= 1e-12:
-        agreement = 0.5
-    else:
-        banker_weight = sum(weight for vote, weight in weighted_votes if vote == "B")
-        player_weight = sum(weight for vote, weight in weighted_votes if vote == "P")
-        agreement = max(banker_weight, player_weight) / vote_total
-
-    support_values = [
-        float(item["support"])
-        for name, item in details.items()
-        if isinstance(item, Mapping)
-        and (
-            not str(name).startswith("road_")
-            or bool(item.get("applied", False))
+        weighted_counts = dict(weighted_table.get(key, _new_counts()))
+        raw_counts = dict(raw_table.get(key, _new_counts()))
+        raw_support = _support(raw_counts)
+        effective_support = _support(weighted_counts)
+        posterior = _posterior_probabilities(
+            weighted_counts,
+            prior_strength=prior_strength,
+            parent_prior=base_probability,
         )
-    ]
-    max_support = max(support_values, default=0.0)
-    support_strength = _reliability(max_support, 8.0)
+        reliability = _reliability(effective_support, _ROAD_SUPPORT_SCALE[name])
+        candidates[name] = {
+            "key": key,
+            "raw_support": float(raw_support),
+            "effective_support": float(effective_support),
+            "posterior": posterior,
+            "reliability": float(reliability),
+            "raw_alpha": float(_ROAD_ALPHA_CAP[name] * reliability),
+            "counts": weighted_counts,
+        }
 
-    diagnostics = {
+    full = candidates.get("road_full")
+    coarse = candidates.get("road_coarse")
+    full_ready = bool(
+        full
+        and float(full["raw_support"]) >= SUPPORT_THRESHOLD
+        and float(full["reliability"]) >= _ROAD_FULL_MIN_RELIABILITY
+    )
+    selected_name = (
+        "road_full" if full_ready
+        else "road_coarse" if coarse
+        else "road_full" if full
+        else ""
+    )
+
+    probability = dict(base_probability)
+    selected_alpha = 0.0
+    if selected_name:
+        selected = candidates[selected_name]
+        selected_alpha = float(selected["raw_alpha"])
+        probability = _blend(probability, selected["posterior"], selected_alpha)
+
+    details: Dict[str, Any] = {}
+    for name, item in candidates.items():
+        details[name] = {
+            **item,
+            "applied": bool(name == selected_name),
+            "alpha": float(item["raw_alpha"]) if name == selected_name else 0.0,
+        }
+
+    return probability, {
+        "mode": "nested_full_else_coarse",
+        "selected_context": selected_name,
+        "selected_alpha": float(selected_alpha),
+        "full_min_reliability": float(_ROAD_FULL_MIN_RELIABILITY),
+        "double_count_prevented": True,
         "contexts": details,
-        "dominant_context": dominant_name,
-        "dominant_counts": dominant_counts,
-        "multi_order_agreement": float(agreement),
-        "support_strength": float(support_strength),
-        "max_context_support": float(max_support),
-        "road_selection": {
-            "mode": "nested_full_else_coarse",
-            "selected_context": selected_road_name,
-            "full_min_reliability": float(_ROAD_FULL_MIN_RELIABILITY),
-            "full_reliability": (
-                float(full_candidate["reliability"])
-                if full_candidate else 0.0
-            ),
-            "coarse_reliability": (
-                float(coarse_candidate["reliability"])
-                if coarse_candidate else 0.0
-            ),
-            "double_count_prevented": True,
-        },
     }
-    return blended, diagnostics
 
 
 def _entropy(probabilities: Mapping[str, float]) -> float:
-    total = 0.0
+    value = 0.0
     for outcome in OUTCOMES:
         p = max(1e-15, min(1.0, float(probabilities[outcome])))
-        total -= p * math.log2(p)
-    return total
+        value -= p * math.log2(p)
+    return float(value)
 
 
 def update_and_predict_engine(
@@ -557,86 +674,143 @@ def update_and_predict_engine(
     prior_strength: float = BAYES_PRIOR_STRENGTH,
 ) -> Dict[str, Any]:
     sequence = _clean_threeway(history)
-    base_decay = _clip(float(decay), 0.80, 0.995)
     prior_strength = max(1e-9, float(prior_strength))
     shoe = ShoeDepthEstimator().estimate(sequence)
     current_state = encode_threeway_state(sequence)
     regime_profile = _detect_regime(sequence)
-    current_decay = _adaptive_decay(sequence, base_decay)
-    transition_table = _build_decayed_transition_table(
-        sequence,
-        base_decay=base_decay,
+
+    retention_lambda = _adaptive_retention_lambda(sequence, float(decay))
+    decay_intensity = 1.0 - retention_lambda
+
+    # On a change point, deliberately rebuild only from the last 6 hands.
+    # This is the requested "forget old history and refocus recent 4-6 hands".
+    if regime_profile["change_point"]:
+        training_sequence = sequence[-RECENT_FOCUS_WINDOW:]
+        focus_applied = True
+    else:
+        training_sequence = sequence
+        focus_applied = False
+
+    weighted_table, raw_table = _build_transition_tables(
+        training_sequence,
+        retention_lambda=retention_lambda,
     )
 
-    probabilities, hierarchy = _hierarchical_probabilities(
+    markov_probability, backoff = _support_aware_markov(
         sequence,
-        transition_table,
+        weighted_table,
+        raw_table,
+        prior_strength=prior_strength,
+    )
+    probabilities, road_selection = _apply_nested_road(
+        sequence,
+        markov_probability,
+        weighted_table,
+        raw_table,
         prior_strength=prior_strength,
     )
 
-    entropy = _entropy(probabilities)
-    entropy_weight = _clip(1.0 - entropy / MAX_ENTROPY)
-    agreement = float(hierarchy["multi_order_agreement"])
-    support_strength = float(hierarchy["support_strength"])
+    entropy_bits = _entropy(probabilities)
+    entropy_weight = _clip(1.0 - entropy_bits / MAX_ENTROPY)
+    agreement = float(backoff["multi_order_agreement"])
+    selected_order = int(backoff["selected_order"])
+    selected_raw_support = 0.0
+    selected_item = dict(backoff["contexts"].get(f"order_{selected_order}") or {})
+    if selected_item:
+        selected_raw_support = float(selected_item.get("raw_support", 0.0) or 0.0)
+    support_strength = _reliability(selected_raw_support, SUPPORT_THRESHOLD)
     regime_stability = float(regime_profile["stability"])
+    backoff_penalty = float(backoff["backoff_penalty"])
 
-    # Entropy remains the primary confidence source. Support, multi-order
-    # agreement and regime stability prevent sparse high-order states from
-    # looking artificially certain.
     evidence_quality = _clip(
-        0.55
+        0.35
         + 0.20 * agreement
-        + 0.15 * support_strength
-        + 0.10 * regime_stability
+        + 0.20 * support_strength
+        + 0.15 * regime_stability
+        + 0.10 * backoff_penalty
     )
     base_weight = _clip(entropy_weight * evidence_quality)
-    final_weight = _clip(base_weight * float(shoe.shoe_progress))
+
+    # Maturity only calibrates confidence; it never creates deterministic certainty.
+    maturity = max(0.15, float(shoe.shoe_progress))
+    final_weight = _clip(base_weight * maturity)
 
     direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
-    dominant_counts = dict(hierarchy["dominant_counts"])
-    effective_support = _support(dominant_counts)
-    tie_risk_active = probabilities["T"] > 0.15
+    selected_counts = dict(backoff["selected_counts"])
+    effective_support = _support(selected_counts)
+
+    hierarchy = {
+        "mode": "support_aware_backoff_plus_nested_road",
+        "markov_backoff": backoff,
+        "road_selection": road_selection,
+        "dominant_context": str(backoff["selected_context"]),
+        "dominant_counts": selected_counts,
+        "multi_order_agreement": float(agreement),
+        "support_strength": float(support_strength),
+        "max_context_support": float(
+            max(
+                [
+                    float(item.get("raw_support", 0.0) or 0.0)
+                    for item in backoff["contexts"].values()
+                ]
+                or [0.0]
+            )
+        ),
+    }
 
     return {
         "model_version": MODEL_VERSION,
-        "engine": "THREEWAY_VARIABLE_ORDER_ROAD_STATE_MARKOV",
+        "engine": "THREEWAY_VARIABLE_ORDER_SUPPORT_BACKOFF_MARKOV",
         "history": sequence,
         "sample_count": len(sequence),
         "state": current_state,
         "state_key": current_state["key"],
-        "decay": float(current_decay),
-        "base_decay": float(base_decay),
-        "adaptive_decay": float(current_decay),
+        "decay": float(retention_lambda),
+        "base_decay": float(decay),
+        "adaptive_decay": float(retention_lambda),
+        "retention_lambda": float(retention_lambda),
+        "decay_intensity": float(decay_intensity),
+        "focus_applied": bool(focus_applied),
+        "focus_window": int(RECENT_FOCUS_WINDOW if focus_applied else 0),
+        "training_sample_count": int(len(training_sequence)),
         "regime": str(regime_profile["regime"]),
         "regime_profile": dict(regime_profile),
         "prior": dict(PHYSICAL_PRIOR),
-        "prior_strength": prior_strength,
-        "max_order": MAX_ORDER,
+        "prior_strength": float(prior_strength),
+        "max_order": int(MAX_ORDER),
+        "support_threshold": int(SUPPORT_THRESHOLD),
+        "backoff_alpha": float(BACKOFF_ALPHA),
+        "selected_order": int(selected_order),
+        "backoff_steps": int(backoff["backoff_steps"]),
+        "backoff_penalty": float(backoff_penalty),
         "transition_counts": {
-            outcome: float(dominant_counts.get(outcome, 0.0) or 0.0)
+            outcome: float(selected_counts.get(outcome, 0.0) or 0.0)
             for outcome in OUTCOMES
         },
         "effective_support": float(effective_support),
-        "state_count": len(transition_table),
+        "state_count": int(len(weighted_table)),
         "probabilities": {
             outcome: float(probabilities[outcome]) for outcome in OUTCOMES
         },
+        "markov_probabilities_before_road": {
+            outcome: float(markov_probability[outcome]) for outcome in OUTCOMES
+        },
         "direction": direction,
-        "entropy_bits": float(entropy),
+        "entropy_bits": float(entropy_bits),
         "max_entropy_bits": float(MAX_ENTROPY),
         "entropy_weight": float(entropy_weight),
         "base_weight": float(base_weight),
         "shoe_progress": float(shoe.shoe_progress),
         "final_weight": float(final_weight),
         "shoe_depth": shoe.as_dict(),
-        "tie_risk_active": bool(tie_risk_active),
+        "tie_risk_active": bool(probabilities["T"] > 0.15),
         "tie_risk_threshold": 0.15,
-        "hierarchical_backoff": dict(hierarchy),
+        "hierarchical_backoff": hierarchy,
         "multi_order_agreement": float(agreement),
         "support_strength": float(support_strength),
-        "dominant_context": str(hierarchy["dominant_context"]),
+        "dominant_context": str(backoff["selected_context"]),
         "confidence_semantics": (
-            "entropy_support_agreement_regime_weight_not_guaranteed_win_probability"
+            "entropy_support_backoff_regime_maturity_weight_not_win_probability"
         ),
     }
 
@@ -657,6 +831,9 @@ __all__ = [
     "DECAY",
     "BAYES_PRIOR_STRENGTH",
     "MAX_ORDER",
+    "SUPPORT_THRESHOLD",
+    "BACKOFF_ALPHA",
+    "ENTROPY_WINDOW",
     "encode_threeway_state",
     "update_and_predict_engine",
     "predict_markov",
