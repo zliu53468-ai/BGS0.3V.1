@@ -1,8 +1,9 @@
 """Money management for the three-way Markov predictor.
 
-Tie is modeled as a push for B/P wagers. Kelly is computed on B/P resolved mass,
-then multiplied by entropy/shoe-depth confidence. A high predicted tie rate reduces
-exposure but never creates a tie wager.
+Every B/P prediction is sized to a mandatory 5%-30% bankroll range.
+Kelly is computed on B/P resolved mass, then scaled by the existing
+entropy/shoe-depth final_weight. T remains a modeled push outcome and
+is exposed as a risk diagnostic, but it no longer creates a no-bet gate.
 """
 from __future__ import annotations
 
@@ -10,8 +11,6 @@ from typing import Any, Mapping
 import math
 
 HIGH_TIE_THRESHOLD = 0.15
-HIGH_TIE_BET_MULTIPLIER = 0.65
-MIN_FINAL_WEIGHT = 0.15
 MIN_BET_RATIO = 0.05
 MAX_BET_RATIO = 0.30
 
@@ -63,54 +62,46 @@ class MoneyManagementModel:
         bankroll = max(0.0, float(bankroll or 0.0))
         p_tie = _clip(probabilities.get("T", 0.0))
 
-        kelly = self.kelly_fraction(
+        raw_kelly = self.kelly_fraction(
             side=direction,
             probabilities=probabilities,
         )
-        pre_tie_adjusted_ratio = kelly * final_weight
-        tie_risk_active = p_tie > HIGH_TIE_THRESHOLD
-        tie_multiplier = (
-            HIGH_TIE_BET_MULTIPLIER if tie_risk_active else 1.0
+        # Required sequence: max(0, Kelly) -> multiply final_weight -> hard clamp.
+        base_ratio = max(0.0, float(raw_kelly))
+        adjusted_ratio = base_ratio * final_weight
+
+        # Mandatory every-hand sizing: no observation/no-bet veto remains.
+        final_bet_ratio = max(
+            MIN_BET_RATIO,
+            min(adjusted_ratio, MAX_BET_RATIO),
         )
-        adjusted_ratio = pre_tie_adjusted_ratio * tie_multiplier
+        bet_amount = bankroll * final_bet_ratio
+        tie_risk_active = p_tie > HIGH_TIE_THRESHOLD
 
-        if adjusted_ratio <= 0.0 or final_weight < MIN_FINAL_WEIGHT:
-            final_bet_ratio = 0.0
-            bet_allowed = False
-            if final_weight < MIN_FINAL_WEIGHT:
-                reason = "entropy_or_shoe_maturity_gate"
-            else:
-                reason = "kelly_non_positive"
+        if adjusted_ratio <= MIN_BET_RATIO:
+            reason = "mandatory_defensive_floor_5pct"
+        elif adjusted_ratio >= MAX_BET_RATIO:
+            reason = "mandatory_aggressive_cap_30pct"
         else:
-            final_bet_ratio = max(
-                MIN_BET_RATIO,
-                min(adjusted_ratio, MAX_BET_RATIO),
-            )
-            bet_allowed = True
-            reason = (
-                "kelly_entropy_shoe_depth_with_high_tie_reduction"
-                if tie_risk_active
-                else "kelly_entropy_shoe_depth"
-            )
+            reason = "kelly_entropy_shoe_depth_dynamic"
 
-        bet_amount = bankroll * final_bet_ratio if bet_allowed else 0.0
         return {
             "direction": direction,
             "bankroll": bankroll,
-            "kelly_fraction": float(kelly),
+            "kelly_fraction": float(raw_kelly),
+            "base_ratio": float(base_ratio),
             "final_weight": float(final_weight),
-            "pre_tie_adjusted_ratio": float(pre_tie_adjusted_ratio),
+            "pre_tie_adjusted_ratio": float(adjusted_ratio),
             "tie_probability": float(p_tie),
             "tie_risk_active": bool(tie_risk_active),
             "tie_risk_threshold": float(HIGH_TIE_THRESHOLD),
-            "tie_bet_multiplier": float(tie_multiplier),
             "adjusted_ratio": float(adjusted_ratio),
             "final_bet_ratio": float(final_bet_ratio),
             "bet_percentage": float(final_bet_ratio * 100.0),
             "bet_amount": float(bet_amount),
-            "bet_allowed": bool(bet_allowed),
+            "bet_allowed": True,
+            "mandatory_bet": True,
             "reason": reason,
-            "min_final_weight": float(MIN_FINAL_WEIGHT),
             "min_bet_ratio": float(MIN_BET_RATIO),
             "max_bet_ratio": float(MAX_BET_RATIO),
         }
@@ -119,8 +110,6 @@ class MoneyManagementModel:
 __all__ = [
     "MoneyManagementModel",
     "HIGH_TIE_THRESHOLD",
-    "HIGH_TIE_BET_MULTIPLIER",
-    "MIN_FINAL_WEIGHT",
     "MIN_BET_RATIO",
     "MAX_BET_RATIO",
 ]
