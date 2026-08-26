@@ -1,11 +1,9 @@
-"""BGS direct predictor: image road analysis -> Markov -> B/P.
+"""BGS predictor: image road parsing -> three-way Markov -> B/P + risk sizing.
 
-Only two predictive layers remain:
-1. road_model.py converts recognized road history into the original 21 road features;
-2. markov_model.py is the primary next-hand B/P predictor using the original 8 Markov
-   probabilities, with only a small road calibration.
-
-There is no Adaptive Ensemble, Stacking, LinUCB, CUSUM, or cross-resonance layer.
+The formal direction is selected directly from the three-way Markov B/P posterior.
+T is retained in the Markov state/probability model and affects entropy/risk sizing.
+Road analysis remains available for diagnostics, but it does not override the Markov
+direction.
 """
 from __future__ import annotations
 
@@ -13,8 +11,9 @@ from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 import secrets
 
-from markov_model import MODEL_VERSION, predict_markov
-from road_model import build_road_context
+from markov_model import MODEL_VERSION, update_and_predict_engine
+from money_management import MoneyManagementModel, MAX_BET_RATIO
+from road_model import ROAD_FEATURE_NAMES, build_road_context
 
 
 def _normalize_outcome_history(values: Iterable[Any]) -> List[str]:
@@ -35,11 +34,32 @@ def _normalize_outcome_history(values: Iterable[Any]) -> List[str]:
     return result[-2000:]
 
 
-def _tie_probability(history: List[str]) -> float:
-    prior = 0.095156
-    strength = 40.0
-    p = (history.count("T") + prior * strength) / (len(history) + strength)
-    return max(0.04, min(0.18, float(p)))
+def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
+    try:
+        banker = max(0.0, min(1.0, float(road.get("banker_probability", 0.5) or 0.5)))
+    except (TypeError, ValueError):
+        banker = 0.5
+    try:
+        player = max(0.0, min(1.0, float(road.get("player_probability", 1.0 - banker) or 0.0)))
+    except (TypeError, ValueError):
+        player = 1.0 - banker
+    total = banker + player
+    if total <= 1e-12:
+        banker, player = 0.5, 0.5
+    else:
+        banker, player = banker / total, player / total
+    try:
+        confidence = max(0.0, min(1.0, float(road.get("confidence_score", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return {
+        "direction": "B" if banker >= player else "P",
+        "banker_probability": float(banker),
+        "player_probability": float(player),
+        "confidence": float(confidence),
+        "decision_weight": 0.0,
+        "diagnostic_only": True,
+    }
 
 
 def predict(
@@ -52,7 +72,7 @@ def predict(
     shoe_context: Optional[Mapping[str, Any]] = None,
     road_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    del user_id, run_seed, shoe_context
+    del user_id, run_seed
     if history is None:
         history_values: List[Any] = []
     elif isinstance(history, str):
@@ -66,7 +86,7 @@ def predict(
     supplied_road = dict(road_context or {})
     if (
         isinstance(supplied_road.get("road_features"), list)
-        and len(supplied_road.get("road_features") or []) == 21
+        and len(supplied_road.get("road_features") or []) == len(ROAD_FEATURE_NAMES)
     ):
         road = supplied_road
     else:
@@ -79,18 +99,22 @@ def predict(
         if supplied_road:
             road["scan_metadata"] = supplied_road
 
-    markov = predict_markov(cleaned, road_context=road)
-    conditional_b = float(markov["banker_probability"])
-    conditional_p = float(markov["player_probability"])
+    markov = update_and_predict_engine(cleaned)
+    probabilities = dict(markov["probabilities"])
     direction = str(markov["direction"])
-    confidence = float(markov["confidence"])
-
-    tie = _tie_probability(cleaned)
-    bp_mass = 1.0 - tie
-    banker_probability = bp_mass * conditional_b
-    player_probability = bp_mass * conditional_p
+    confidence = float(markov["final_weight"])
     text = "莊" if direction == "B" else "閒"
 
+    context = dict(shoe_context or {})
+    bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
+    money = MoneyManagementModel().allocate(
+        direction=direction,
+        probabilities=probabilities,
+        final_weight=confidence,
+        bankroll=bankroll,
+    )
+
+    road_predict = _road_diagnostic(road)
     fingerprint = sha256(
         "|".join((
             "".join(cleaned),
@@ -101,26 +125,25 @@ def predict(
         )).encode("utf-8")
     ).hexdigest()[:24]
 
+    p_b = float(probabilities["B"])
+    p_p = float(probabilities["P"])
+    p_t = float(probabilities["T"])
+    bp_edge = abs(p_b - p_p)
+    bet_allowed = bool(money["bet_allowed"])
+
     return {
         "ok": True,
-        "engine": "ROAD_MARKOV_DIRECT",
+        "engine": "THREEWAY_MARKOV_SHOE_DEPTH",
         "model_version": MODEL_VERSION,
-        "model_variant": "ROAD_21D_PLUS_MARKOV_8D_DIRECT",
-        "model_core": "markov_primary_road_calibration",
-        "decision_pipeline": "image_scan_to_road21_to_markov8_to_direct_bp",
+        "model_variant": "THREEWAY_STATE_DECAY_BAYES_ENTROPY_SHOE_DEPTH",
+        "model_core": "threeway_markov_primary",
+        "decision_pipeline": "image_scan_to_threeway_state_to_markov_to_entropy_shoe_depth_to_kelly",
         "prediction_fingerprint": fingerprint,
-        "probabilities": {
-            "B": float(banker_probability),
-            "P": float(player_probability),
-            "T": float(tie),
-        },
-        "raw_direction_probabilities": {
-            "B": conditional_b,
-            "P": conditional_p,
-        },
-        "banker_rate": round(banker_probability * 100.0, 2),
-        "player_rate": round(player_probability * 100.0, 2),
-        "tie_rate": round(tie * 100.0, 2),
+        "probabilities": {"B": p_b, "P": p_p, "T": p_t},
+        "raw_direction_probabilities": {"B": p_b, "P": p_p},
+        "banker_rate": round(p_b * 100.0, 2),
+        "player_rate": round(p_p * 100.0, 2),
+        "tie_rate": round(p_t * 100.0, 2),
         "recommend": direction,
         "recommend_text": text,
         "action": direction,
@@ -132,46 +155,91 @@ def predict(
         "direction": direction,
         "direction_text": text,
         "signal_allowed": True,
-        "signal_status_code": "DIRECT_MARKOV_DIRECTION",
-        "signal_status_text": "Markov 主模型直接預測",
-        "signal_reason": (
-            f"Markov state={markov['markov_predict']['state'] or '-'}；"
-            f"Markov 權重={markov['fusion']['markov_weight']:.3f}；"
-            f"Road 校準權重={markov['fusion']['road_weight']:.3f}。"
+        "risk_gate_open": bet_allowed,
+        "signal_status_code": (
+            "MARKOV_DIRECTION_BET_ALLOWED" if bet_allowed
+            else "MARKOV_DIRECTION_NO_BET"
         ),
-        "direction_source": "markov_primary_road_calibrated",
+        "signal_status_text": (
+            "Markov 方向成立，可依風控比例配置"
+            if bet_allowed
+            else "Markov 仍提供方向，但風控判定不下注"
+        ),
+        "signal_reason": (
+            f"state={markov['state_key'] or 'START'}；"
+            f"H={markov['entropy_bits']:.4f} bits；"
+            f"shoe_progress={markov['shoe_progress']:.3f}；"
+            f"final_weight={confidence:.3f}；"
+            f"money_gate={money['reason']}。"
+        ),
+        "direction_source": "threeway_markov_primary",
         "confidence": confidence,
         "ensemble_confidence": confidence,
         "quality_score": confidence,
         "confidence_label": (
-            "較高" if confidence >= 0.68 else
-            "中等" if confidence >= 0.50 else "偏低"
+            "較高" if confidence >= 0.40 else
+            "中等" if confidence >= 0.22 else "偏低"
         ),
-        "bet_multiplier": min(1.0, max(0.35, 0.35 + 0.65 * confidence)),
-        "direction_edge": float(markov["edge"]),
-        "direction_edge_percent": round(float(markov["edge"]) * 100.0, 4),
-        "road_predict": dict(markov["road_predict"]),
-        "markov_predict": dict(markov["markov_predict"]),
-        "markov_features": dict(markov["markov_features"]),
-        "markov_state": dict(markov["markov_state"]),
-        "road_markov_weights": dict(markov["fusion"]),
+        "entropy_bits": float(markov["entropy_bits"]),
+        "entropy_base_weight": float(markov["base_weight"]),
+        "shoe_progress": float(markov["shoe_progress"]),
+        "shoe_depth_estimate": dict(markov["shoe_depth"]),
+        "tie_risk_active": bool(markov["tie_risk_active"]),
+        "direction_edge": float(bp_edge),
+        "direction_edge_percent": round(bp_edge * 100.0, 4),
+        "markov_predict": {
+            "direction": direction,
+            "probabilities": {"B": p_b, "P": p_p, "T": p_t},
+            "state": dict(markov["state"]),
+            "state_key": str(markov["state_key"]),
+            "transition_counts": dict(markov["transition_counts"]),
+            "effective_support": float(markov["effective_support"]),
+            "entropy_bits": float(markov["entropy_bits"]),
+            "base_weight": float(markov["base_weight"]),
+            "final_weight": confidence,
+            "decay": float(markov["decay"]),
+            "prior": dict(markov["prior"]),
+            "prior_strength": float(markov["prior_strength"]),
+        },
+        "markov_state": {
+            "state_key": str(markov["state_key"]),
+            "direction_context": str(markov["state"].get("direction_context") or ""),
+            "density": str(markov["state"].get("density") or "Medium"),
+            "tie_trigger": str(markov["state"].get("tie_trigger") or "NoTie"),
+            "sample_count": int(markov["sample_count"]),
+            "effective_support": float(markov["effective_support"]),
+            "state_count": int(markov["state_count"]),
+        },
+        "road_predict": road_predict,
         "road_support": road,
+        "road_fusion": {
+            "applied": False,
+            "mode": "diagnostic_only",
+            "reason": "正式方向完全由三元 Markov B/P 後驗概率決定，Road 不覆寫方向。",
+        },
         "component_probabilities": {
-            "road": {
-                "B": float(markov["road_predict"]["banker_probability"]),
-                "P": float(markov["road_predict"]["player_probability"]),
-                "T": 0.0,
-            },
-            "markov": {
-                "B": float(markov["markov_predict"]["banker_probability"]),
-                "P": float(markov["markov_predict"]["player_probability"]),
+            "markov": {"B": p_b, "P": p_p, "T": p_t},
+            "road_diagnostic": {
+                "B": float(road_predict["banker_probability"]),
+                "P": float(road_predict["player_probability"]),
                 "T": 0.0,
             },
         },
-        "context_vector": list(markov["context_vector"]),
-        "bandit_context": list(markov["context_vector"]),
-        "context_feature_names": list(markov["context_feature_names"]),
-        "context_dim": int(markov["context_dim"]),
+        "money_management": dict(money),
+        "kelly_fraction": float(money["kelly_fraction"]),
+        "pre_tie_adjusted_ratio": float(money["pre_tie_adjusted_ratio"]),
+        "adjusted_ratio": float(money["adjusted_ratio"]),
+        "final_bet_ratio": float(money["final_bet_ratio"]),
+        "bet_percentage": float(money["bet_percentage"]),
+        "suggested_bet_amount": float(money["bet_amount"]),
+        "bet_multiplier": (
+            min(1.0, float(money["final_bet_ratio"]) / MAX_BET_RATIO)
+            if MAX_BET_RATIO > 0.0 else 0.0
+        ),
+        "context_vector": list(road.get("road_features") or []),
+        "bandit_context": [],
+        "context_feature_names": list(ROAD_FEATURE_NAMES),
+        "context_dim": len(list(road.get("road_features") or [])),
         "contextual_bandit_enabled": False,
         "contextual_bandit_update_enabled": False,
         "cusum_linucb_enabled": False,
@@ -182,7 +250,7 @@ def predict(
         "venue": str(venue or ""),
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
-        "probability_semantics": "model_direction_score_not_guaranteed_outcome_probability",
+        "probability_semantics": "bayesian_threeway_model_probability_not_guaranteed_outcome",
     }
 
 
@@ -204,6 +272,7 @@ def run_virtual_round(
         room=str(session.get("room") or ""),
         shoe_id=str(session.get("shoe_id") or ""),
         run_seed=seed,
+        shoe_context={"bankroll": float(session.get("bankroll", 0.0) or 0.0)},
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
@@ -215,7 +284,7 @@ def run_virtual_round(
     )
     prediction.update({
         "ok": True,
-        "mode": "virtual_shoe_road_markov_compatibility",
+        "mode": "virtual_shoe_threeway_markov_compatibility",
         "virtual_hand": hand_data,
         "virtual_outcome": actual,
         "virtual_outcome_text": hand_data["outcome_text"],
@@ -230,7 +299,7 @@ def run_virtual_round(
         "remaining_counts_after": counts_from_shoe(remaining_shoe),
         "round_number": int(session.get("hand_number", 0) or 0) + 1,
         "bandit_learning_applied": False,
-        "disclaimer": "虛擬相容模式方向使用 Road + Markov Direct。",
+        "disclaimer": "虛擬相容模式方向使用 Three-way Markov + Shoe Depth。",
     })
     return {
         "prediction": prediction,
