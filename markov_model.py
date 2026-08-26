@@ -2,7 +2,7 @@
 
 B, P and T remain fully modeled.  The predictor combines:
 - variable-order raw B/P/T contexts (orders 1..4),
-- B/P road run-length state with coarse/full hierarchical backoff,
+- B/P road run-length state with nested coarse/full fallback,
 - regime detection (DRAGON / CHOP / DOUBLE_CHOP / MIXED / TRANSITION),
 - regime-adaptive exponential decay,
 - Bayesian smoothing and support-aware hierarchical blending.
@@ -17,7 +17,7 @@ import math
 
 from shoe_depth_estimator import ShoeDepthEstimator
 
-MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-ROAD-STATE-V3-CANDIDATE"
+MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-ROAD-STATE-V3.1-NESTED-ROAD-CANDIDATE"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 
@@ -30,6 +30,7 @@ _ORDER_SUPPORT_SCALE = {1: 3.0, 2: 4.5, 3: 6.5, 4: 9.0}
 _ORDER_ALPHA_CAP = {1: 0.72, 2: 0.64, 3: 0.54, 4: 0.44}
 _ROAD_SUPPORT_SCALE = {"road_coarse": 5.0, "road_full": 8.0}
 _ROAD_ALPHA_CAP = {"road_coarse": 0.34, "road_full": 0.26}
+_ROAD_FULL_MIN_RELIABILITY = 0.50
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -430,6 +431,10 @@ def _hierarchical_probabilities(
             "counts": dict(counts),
         }
 
+    # road_full is a refinement of road_coarse, so they must not both influence
+    # the same decision.  Use full only once it has enough support; otherwise
+    # back off to coarse.  Both candidates remain visible in diagnostics.
+    road_candidates: Dict[str, Dict[str, Any]] = {}
     for name in ("road_coarse", "road_full"):
         key = contexts.get(name)
         if not key:
@@ -438,25 +443,59 @@ def _hierarchical_probabilities(
         support = _support(counts)
         posterior = _posterior_probabilities(counts, prior_strength=prior_strength)
         reliability = _reliability(support, _ROAD_SUPPORT_SCALE[name])
-        alpha = _ROAD_ALPHA_CAP[name] * reliability
-        blended = _blend(blended, posterior, alpha)
-
-        score = alpha * max(0.25, support)
-        if score > dominant_score:
-            dominant_name = name
-            dominant_score = score
-            dominant_counts = dict(counts)
-        if alpha > 0.0:
-            weighted_votes.append((_direction_vote(posterior), alpha))
-
-        details[name] = {
+        raw_alpha = _ROAD_ALPHA_CAP[name] * reliability
+        road_candidates[name] = {
             "key": key,
             "support": float(support),
             "reliability": float(reliability),
-            "alpha": float(alpha),
+            "raw_alpha": float(raw_alpha),
             "probabilities": dict(posterior),
             "counts": dict(counts),
         }
+
+    full_candidate = road_candidates.get("road_full")
+    coarse_candidate = road_candidates.get("road_coarse")
+    full_ready = bool(
+        full_candidate
+        and float(full_candidate["reliability"]) >= _ROAD_FULL_MIN_RELIABILITY
+    )
+    if full_ready:
+        selected_road_name = "road_full"
+    elif coarse_candidate:
+        selected_road_name = "road_coarse"
+    elif full_candidate:
+        selected_road_name = "road_full"
+    else:
+        selected_road_name = ""
+
+    for name, candidate in road_candidates.items():
+        applied = bool(name == selected_road_name)
+        alpha = float(candidate["raw_alpha"]) if applied else 0.0
+        details[name] = {
+            "key": str(candidate["key"]),
+            "support": float(candidate["support"]),
+            "reliability": float(candidate["reliability"]),
+            "raw_alpha": float(candidate["raw_alpha"]),
+            "alpha": float(alpha),
+            "applied": applied,
+            "probabilities": dict(candidate["probabilities"]),
+            "counts": dict(candidate["counts"]),
+        }
+
+    if selected_road_name:
+        selected = road_candidates[selected_road_name]
+        selected_alpha = float(selected["raw_alpha"])
+        blended = _blend(blended, selected["probabilities"], selected_alpha)
+        selected_support = float(selected["support"])
+        score = selected_alpha * max(0.25, selected_support)
+        if score > dominant_score:
+            dominant_name = selected_road_name
+            dominant_score = score
+            dominant_counts = dict(selected["counts"])
+        if selected_alpha > 0.0:
+            weighted_votes.append(
+                (_direction_vote(selected["probabilities"]), selected_alpha)
+            )
 
     vote_total = sum(weight for _, weight in weighted_votes)
     if vote_total <= 1e-12:
@@ -468,8 +507,12 @@ def _hierarchical_probabilities(
 
     support_values = [
         float(item["support"])
-        for item in details.values()
+        for name, item in details.items()
         if isinstance(item, Mapping)
+        and (
+            not str(name).startswith("road_")
+            or bool(item.get("applied", False))
+        )
     ]
     max_support = max(support_values, default=0.0)
     support_strength = _reliability(max_support, 8.0)
@@ -481,6 +524,20 @@ def _hierarchical_probabilities(
         "multi_order_agreement": float(agreement),
         "support_strength": float(support_strength),
         "max_context_support": float(max_support),
+        "road_selection": {
+            "mode": "nested_full_else_coarse",
+            "selected_context": selected_road_name,
+            "full_min_reliability": float(_ROAD_FULL_MIN_RELIABILITY),
+            "full_reliability": (
+                float(full_candidate["reliability"])
+                if full_candidate else 0.0
+            ),
+            "coarse_reliability": (
+                float(coarse_candidate["reliability"])
+                if coarse_candidate else 0.0
+            ),
+            "double_count_prevented": True,
+        },
     }
     return blended, diagnostics
 
