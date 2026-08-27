@@ -2,13 +2,14 @@
 
 BaccaratQuantEngine combines:
 1) support-aware variable-order B/P/T Markov prior,
-2) tempered Bayesian shoe likelihood,
-3) bounded derived-road Markov likelihood,
-4) positive-Edge-only bankroll sizing.
+2) remaining-card-aware Pattern Survival calibration,
+3) tempered Bayesian shoe likelihood,
+4) bounded derived-road Markov likelihood,
+5) positive-Edge-only bankroll sizing.
 
-Derived roads are deterministic transforms of the Big Road, so their likelihood
-power is externally capped by road_model/derived_road_markov to avoid treating
-correlated information as independent evidence.
+Pattern Survival is a calibration score, not a baccarat win probability.  It can
+only reduce unsupported historical-pattern influence; it never creates a new
+B/P signal from remaining-card depth by itself.
 """
 from __future__ import annotations
 
@@ -16,6 +17,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from markov_model import update_and_predict_engine
 from money_management import MoneyManagementModel
+from pattern_survival import (
+    calculate_pattern_survival,
+    calibrate_markov_probabilities,
+)
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -37,7 +42,7 @@ def _normalize(
 
 
 class BaccaratQuantEngine:
-    """Dynamic predictor with Bayesian shoe + derived-road likelihood fusion."""
+    """Dynamic predictor with pattern calibration + Bayesian likelihood fusion."""
 
     def __init__(self) -> None:
         self.money = MoneyManagementModel()
@@ -188,12 +193,13 @@ class BaccaratQuantEngine:
     ) -> tuple[dict[str, float], dict[str, Any]]:
         """Sequential tempered-Bayes fusion.
 
-        Final posterior is proportional to:
-            P_M(y|history) * L_shoe(y)^w_shoe * L_road(y)^w_road
+        The supplied Markov prior may already be Pattern-Survival calibrated:
 
-        B/P-only likelihoods preserve Tie mass. w_road is deliberately small
-        because the derived roads contain no new random observation beyond the
-        same Big Road history.
+            P_final(y) proportional to
+                P_M_cal(y) * L_shoe(y)^w_shoe * L_road(y)^w_road
+
+        B/P-only likelihoods preserve Tie mass.  w_road remains deliberately
+        small because all derived roads come from the same Big Road history.
         """
         prior = _normalize(
             {
@@ -216,7 +222,7 @@ class BaccaratQuantEngine:
         )
 
         return final, {
-            "method": "sequential_tempered_bayes_markov_shoe_derived_road",
+            "method": "pattern_calibrated_sequential_tempered_bayes",
             "markov_prior": prior,
             "shoe": shoe_detail,
             "road": road_detail,
@@ -236,6 +242,7 @@ class BaccaratQuantEngine:
         shoe_reliability: float = 1.0,
         road_probs: Mapping[str, Any] | Sequence[float] | None = None,
         road_reliability: float = 0.0,
+        remaining_card_state: Mapping[str, Any] | None = None,
         bankroll: float = 0.0,
     ) -> dict[str, Any]:
         markov = update_and_predict_engine(history)
@@ -259,26 +266,62 @@ class BaccaratQuantEngine:
                 # Auxiliary road failure must not break Markov + shoe output.
                 road_analysis = {}
 
-        final_probs, fusion = self.bayesian_fuse(
+        pattern_survival = calculate_pattern_survival(
+            markov,
+            road_analysis,
+            remaining_card_state,
+        )
+        survival_score = float(pattern_survival.get("score", 0.0) or 0.0)
+        calibrated_markov_probs = calibrate_markov_probabilities(
             markov_probs,
+            survival_score,
+        )
+
+        # Derived-road evidence is deterministic from the same Big Road, so the
+        # same survival score can only reduce its already-capped likelihood power.
+        raw_road_reliability = _clip(float(road_reliability or 0.0))
+        effective_road_reliability = _clip(
+            raw_road_reliability * survival_score
+        )
+
+        final_probs, fusion = self.bayesian_fuse(
+            calibrated_markov_probs,
             shoe_probs,
             shoe_reliability=shoe_reliability,
             road_probs=road_probs,
-            road_reliability=road_reliability,
+            road_reliability=effective_road_reliability,
         )
 
         direction = "B" if final_probs["B"] >= final_probs["P"] else "P"
+
+        # Pattern calibration never increases the original Markov confidence.
+        # The 0.35 floor keeps the money layer compatible when shoe evidence is
+        # useful even while the historical pattern itself is weak.
+        pattern_calibrated_weight = _clip(
+            float(markov["final_weight"]) * (0.35 + 0.65 * survival_score)
+        )
         money = self.money.allocate(
             direction=direction,
             probabilities=final_probs,
-            final_weight=float(markov["final_weight"]),
+            final_weight=pattern_calibrated_weight,
             bankroll=float(bankroll or 0.0),
         )
+
+        fusion.update({
+            "pattern_survival": pattern_survival,
+            "raw_markov_prior": dict(markov_probs),
+            "pattern_calibrated_markov_prior": dict(calibrated_markov_probs),
+            "raw_road_reliability": float(raw_road_reliability),
+            "pattern_calibrated_road_reliability": float(
+                effective_road_reliability
+            ),
+        })
 
         return {
             "direction": direction,
             "direction_text": "莊" if direction == "B" else "閒",
             "markov_probs": markov_probs,
+            "pattern_calibrated_markov_probs": calibrated_markov_probs,
             "final_probs": final_probs,
             "final_probability": float(final_probs[direction]),
             "bet_allowed": bool(money["bet_allowed"]),
@@ -288,6 +331,9 @@ class BaccaratQuantEngine:
             "edge_percent": float(money["edge_percent"]),
             "money_management": money,
             "markov": markov,
+            "pattern_survival": pattern_survival,
+            "pattern_calibrated_final_weight": float(pattern_calibrated_weight),
+            "remaining_card_state": dict(remaining_card_state or {}),
             "fusion": fusion,
             "road_analysis": road_analysis,
         }
@@ -299,11 +345,19 @@ if __name__ == "__main__":
         "BBPBPTBPPB",
         shoe_probs=[0.506, 0.494],
         shoe_reliability=1.0,
+        remaining_card_state={
+            "available": True,
+            "mean_remaining_cards": 365.0,
+            "shoe_stage": "DEVELOPING",
+            "shoe_stage_factor": 0.75,
+            "reliability": 0.55,
+        },
         bankroll=10000,
     )
     print({
         "prediction_direction": example["direction"],
         "final_probs": example["final_probs"],
+        "pattern_survival": example["pattern_survival"],
         "dynamic_bet_percentage": example["bet_percentage"],
         "edge_percent": example["edge_percent"],
         "bet_allowed": example["bet_allowed"],
