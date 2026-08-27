@@ -1,11 +1,16 @@
 """Remaining-card state and pattern-survival calibration for BGS.
 
-This module does not predict hidden card identities.  It converts the existing
+This module does not predict hidden card identities. It converts the existing
 probabilistic-shoe posterior into a coarse shoe-stage estimate and uses that
 maturity information only to calibrate how strongly the historical road/Markov
 pattern is allowed to influence the next-hand posterior.
 
 Pattern Survival is NOT a baccarat win probability.
+
+Direction calibration deliberately separates two concepts:
+- PHYSICAL_PRIOR: baccarat's natural B/P/T base rates, retained for shoe/EV math.
+- DIRECTION_NEUTRAL_PRIOR: equal B/P mass with the same Tie mass, used when a
+  historical direction signal is weak so Banker does not receive a free vote.
 """
 from __future__ import annotations
 
@@ -39,9 +44,61 @@ def _normalize_threeway(values: Mapping[str, Any]) -> dict[str, float]:
     return {outcome: raw[outcome] / total for outcome in OUTCOMES}
 
 
+def _neutral_prior_with_tie(tie_probability: float) -> dict[str, float]:
+    """Return an equal B/P direction baseline while preserving Tie mass."""
+    tie = _clip(float(tie_probability), 0.0, 0.999999)
+    resolved_mass = max(1e-12, 1.0 - tie)
+    half = resolved_mass / 2.0
+    return {"B": half, "P": half, "T": tie}
+
+
+def neutralize_physical_banker_bias(
+    probabilities: Mapping[str, Any],
+) -> dict[str, float]:
+    """Convert a physical-prior-smoothed posterior into pure B/P direction evidence.
+
+    The Markov model is intentionally smoothed with baccarat's physical prior.
+    That is useful statistically, but if its output is used directly for a B/P
+    recommendation the natural Banker base-rate advantage becomes a permanent
+    hidden vote for B.
+
+    We remove only that baseline in conditional B/P odds:
+
+        E_B = P_model(B | resolved) / P_phys(B | resolved)
+        E_P = P_model(P | resolved) / P_phys(P | resolved)
+
+        P_dir(B | resolved) = E_B / (E_B + E_P)
+
+    Tie mass is preserved. Therefore an input equal to PHYSICAL_PRIOR becomes an
+    exactly neutral B/P direction signal, while genuine deviations from the
+    physical baseline remain directional evidence.
+    """
+    raw = _normalize_threeway(probabilities)
+    bp_mass = raw["B"] + raw["P"]
+    if bp_mass <= 1e-12:
+        return _neutral_prior_with_tie(raw["T"])
+
+    physical_bp_mass = PHYSICAL_PRIOR["B"] + PHYSICAL_PRIOR["P"]
+    physical_b = PHYSICAL_PRIOR["B"] / physical_bp_mass
+    physical_p = PHYSICAL_PRIOR["P"] / physical_bp_mass
+    model_b = raw["B"] / bp_mass
+    model_p = raw["P"] / bp_mass
+
+    evidence_b = max(1e-12, model_b / max(1e-12, physical_b))
+    evidence_p = max(1e-12, model_p / max(1e-12, physical_p))
+    evidence_total = evidence_b + evidence_p
+    direction_b = evidence_b / evidence_total
+    direction_p = evidence_p / evidence_total
+
+    return _normalize_threeway({
+        "B": bp_mass * direction_b,
+        "P": bp_mass * direction_p,
+        "T": raw["T"],
+    })
+
+
 def _shoe_stage(remaining_ratio: float) -> str:
     ratio = _clip(remaining_ratio)
-    # 8-deck reference: about 350 / 280 / 200 cards correspond to these cuts.
     if ratio >= 0.84:
         return "OPENING"
     if ratio >= 0.67:
@@ -56,18 +113,6 @@ def build_remaining_card_state(
     *,
     decks: int = 8,
 ) -> dict[str, Any]:
-    """Summarize the existing particle shoe as a remaining-card state.
-
-    The point estimate is the particle posterior mean already produced by
-    ``probabilistic_shoe_estimator``.  The interval is deliberately described as
-    a *plausible interval*, not an exact Bayesian credible interval:
-
-    - with an applied screen-depth likelihood, use the post-constraint particle
-      total standard deviation when available;
-    - otherwise use the physically possible 4..6 cards-per-completed-hand
-      envelope (plus the same small display/burn tolerance used by the shoe
-      estimator).
-    """
     posterior = dict(shoe_posterior or {})
     decks = max(1, min(16, int(decks or 8)))
     start_cards = 52 * decks
@@ -103,7 +148,6 @@ def build_remaining_card_state(
             std_cards = 0.0
         if std_cards <= 0.5:
             std_cards = max(1.0, (physical_max - physical_min) / math.sqrt(12.0))
-        # Approximate central 90% interval for display/calibration only.
         interval_low = max(physical_min, mean_remaining - 1.645 * std_cards)
         interval_high = min(physical_max, mean_remaining + 1.645 * std_cards)
         interval_source = "depth_conditioned_particle_total_approx90"
@@ -157,18 +201,6 @@ def calculate_pattern_survival(
     road_analysis: Mapping[str, Any] | None,
     remaining_card_state: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Return a 0..1 calibration score for the currently detected pattern.
-
-    S_raw = 0.20*support + 0.20*multi_order_agreement
-          + 0.18*regime_stability + 0.15*recent_pattern
-          + 0.10*entropy_stability + 0.10*derived_road_support
-          + 0.07*remaining_card_reliability
-
-    S = clip(S_raw * shoe_stage_factor * change_point_factor)
-
-    A change point or explicit pattern break sets ``change_point_factor=0.25``.
-    Remaining-card depth affects maturity only; it cannot create a B/P direction.
-    """
     road = dict(road_analysis or {})
     remaining = dict(remaining_card_state or {})
     profile = dict(markov.get("regime_profile") or {})
@@ -280,25 +312,28 @@ def calibrate_markov_probabilities(
     markov_probs: Mapping[str, Any],
     survival_score: float,
 ) -> dict[str, float]:
-    """Shrink Markov pattern deviation toward baccarat physical prior.
+    """Return a Banker-neutral direction posterior for Markov evidence.
 
-    P_cal(y) = normalize((1-S) * P_physical(y) + S * P_markov(y)).
+    P_dir_cal(y) = (1-S) * P_neutral(y) + S * P_dir_signal(y)
 
-    Low survival therefore removes an unsupported pattern signal instead of
-    automatically betting the opposite side.
+    Low Pattern Survival now returns B/P toward equality, not toward the natural
+    Banker base-rate advantage. Tie mass is preserved.
     """
     s = _clip(survival_score)
-    raw = _normalize_threeway(markov_probs)
+    directional = neutralize_physical_banker_bias(markov_probs)
+    neutral = _neutral_prior_with_tie(directional["T"])
     calibrated = {
-        outcome: (1.0 - s) * PHYSICAL_PRIOR[outcome] + s * raw[outcome]
+        outcome: (1.0 - s) * neutral[outcome] + s * directional[outcome]
         for outcome in OUTCOMES
     }
     return _normalize_threeway(calibrated)
 
 
 __all__ = [
+    "PHYSICAL_PRIOR",
     "SHOE_STAGE_FACTORS",
     "build_remaining_card_state",
     "calculate_pattern_survival",
     "calibrate_markov_probabilities",
+    "neutralize_physical_banker_bias",
 ]

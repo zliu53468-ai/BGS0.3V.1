@@ -5,11 +5,12 @@ Formal direction comes from BaccaratQuantEngine:
 - adaptive entropy/regime forgetting,
 - remaining-card-aware Pattern Survival calibration,
 - standard derived-road Markov ask-road likelihood,
+- run-length structural CONTINUE/TURN hazard likelihood,
 - probabilistic shoe posterior optionally conditioned on a plausible screen depth,
 - positive-Edge-only bankroll sizing.
 
-The screen remaining-card total is only a soft particle-depth condition. It does not
-identify the actual hidden cards or guarantee the next baccarat outcome.
+The screen remaining-card total and road structure are probabilistic evidence only.
+They do not identify hidden cards or guarantee the next baccarat outcome.
 """
 from __future__ import annotations
 
@@ -148,8 +149,6 @@ def predict(
     except (TypeError, ValueError):
         depth_reliability = 0.65
 
-    # The particle shoe is conditioned first on B/P/T outcomes and then, only
-    # when physically plausible, on a soft remaining-card depth likelihood.
     shoe_posterior = estimate_probabilistic_shoe(
         cleaned,
         decks=decks,
@@ -163,8 +162,6 @@ def predict(
         decks=decks,
     )
 
-    # BaccaratQuantEngine also accepts a truly external shoe_probs source.
-    # If none is supplied, use the bounded particle posterior.
     external_shoe_probs = context.get("shoe_probs")
     if external_shoe_probs is not None:
         fusion_shoe_probs = external_shoe_probs
@@ -197,6 +194,7 @@ def predict(
     )
     pattern_survival = dict(quant.get("pattern_survival") or {})
     survival_score = float(pattern_survival.get("score", 0.0) or 0.0)
+    hazard_analysis = dict(quant.get("run_length_hazard") or {})
     shoe_stage = str(remaining_card_state.get("shoe_stage") or "UNKNOWN")
     markov_direction = str(markov["direction"])
     probabilities = dict(quant["final_probs"])
@@ -211,7 +209,9 @@ def predict(
     quant_road = dict(quant.get("road_analysis") or {})
 
     road_predict = _road_diagnostic(road)
-    system_model_version = f"{MODEL_VERSION}+{SHOE_POSTERIOR_MODEL_VERSION}+PATTERN-SURVIVAL+QUANT"
+    system_model_version = (
+        f"{MODEL_VERSION}+{SHOE_POSTERIOR_MODEL_VERSION}+PATTERN-SURVIVAL+RUN-HAZARD+QUANT"
+    )
     fingerprint = sha256(
         "|".join((
             "".join(cleaned),
@@ -230,8 +230,11 @@ def predict(
     tie_risk_active = bool(money.get("tie_risk_active", p_t > 0.15))
     shoe_weight = float(fusion.get("shoe_reliability", shoe_reliability) or 0.0)
     road_weight = float(fusion.get("road_reliability", 0.0) or 0.0)
+    hazard_weight = float(fusion.get("hazard_reliability", 0.0) or 0.0)
     road_fusion_detail = dict(fusion.get("road") or {})
+    hazard_fusion_detail = dict(fusion.get("hazard") or {})
     road_fusion_applied = bool(road_fusion_detail.get("applied", False))
+    hazard_fusion_applied = bool(hazard_fusion_detail.get("applied", False))
 
     if bet_allowed:
         signal_status_code = "POSITIVE_EDGE_DYNAMIC_BET"
@@ -245,18 +248,18 @@ def predict(
 
     return {
         "ok": True,
-        "engine": "BACCARAT_QUANT_MARKOV_PATTERN_SURVIVAL_ROAD_DEPTH_SHOE",
+        "engine": "BACCARAT_QUANT_MARKOV_PATTERN_SURVIVAL_ROAD_RUN_HAZARD_DEPTH_SHOE",
         "model_version": MODEL_VERSION,
         "shoe_posterior_model_version": SHOE_POSTERIOR_MODEL_VERSION,
         "system_model_version": system_model_version,
         "model_variant": (
             "SUPPORT_BACKOFF_MARKOV_PLUS_REMAINING_CARD_PATTERN_SURVIVAL_"
-            "PLUS_DERIVED_ROAD_PLUS_DEPTH_SHOE_EDGE_GATED"
+            "PLUS_DERIVED_ROAD_PLUS_RUN_LENGTH_HAZARD_PLUS_DEPTH_SHOE_EDGE_GATED"
         ),
         "model_core": "baccarat_quant_engine",
         "decision_pipeline": (
             "image_scan_to_support_backoff_markov_to_remaining_card_stage_"
-            "to_pattern_survival_calibration_plus_standard_derived_road_"
+            "to_pattern_survival_plus_standard_derived_road_plus_run_length_hazard_"
             "to_depth_conditioned_probabilistic_shoe_to_bayesian_fusion_"
             "to_positive_edge_capital_sizing"
         ),
@@ -291,6 +294,8 @@ def predict(
             f"shoe_stage={shoe_stage}；"
             f"pattern_survival={survival_score:.3f}；"
             f"remaining≈{float(remaining_card_state.get('mean_remaining_cards', 0.0) or 0.0):.1f}；"
+            f"hazard_turn={float(hazard_analysis.get('turn_probability', 0.5) or 0.5):.3f}；"
+            f"hazard_w={hazard_weight:.3f}；"
             f"shoe_source={shoe_source}；"
             f"shoe_w={shoe_weight:.3f}；"
             f"depth={bool(depth_constraint.get('applied', False))}；"
@@ -299,7 +304,7 @@ def predict(
             f"sizing={money['reason']}。"
         ),
         "direction_source": (
-            "pattern_survival_calibrated_markov_prior_plus_shoe_and_derived_road_likelihoods"
+            "pattern_calibrated_markov_plus_shoe_plus_derived_road_plus_run_length_hazard"
         ),
         "confidence": confidence,
         "raw_markov_confidence": raw_markov_confidence,
@@ -329,6 +334,8 @@ def predict(
         "shoe_stage": shoe_stage,
         "pattern_survival": pattern_survival,
         "pattern_survival_score": survival_score,
+        "run_length_hazard": hazard_analysis,
+        "run_length_hazard_weight": hazard_weight,
         "probabilistic_shoe_estimate": dict(shoe_posterior),
         "tie_risk_active": tie_risk_active,
         "direction_edge": edge,
@@ -411,20 +418,21 @@ def predict(
             "markov_prior_weight": 1.0,
             "probabilistic_shoe_likelihood_power": float(shoe_weight),
             "derived_road_likelihood_power": float(road_weight),
-            # Compatibility fields; Bayesian fusion weights are likelihood powers.
+            "run_length_hazard_likelihood_power": float(hazard_weight),
             "markov_weight": 1.0,
             "probabilistic_shoe_weight": float(shoe_weight),
             "max_probabilistic_shoe_weight": float(MAX_SHOE_FUSION_WEIGHT),
             "shoe_source": shoe_source,
             "depth_constraint_applied": bool(depth_constraint.get("applied", False)),
             "road_applied": road_fusion_applied,
+            "hazard_applied": hazard_fusion_applied,
             "method": str(
                 fusion.get("method")
-                or "pattern_calibrated_sequential_tempered_bayes"
+                or "pattern_calibrated_sequential_tempered_bayes_with_run_hazard"
             ),
             "semantics": (
                 "posterior_proportional_to_pattern_calibrated_markov_prior_"
-                "times_shoe_likelihood_power_times_derived_road_likelihood_power"
+                "times_shoe_times_derived_road_times_run_length_hazard_likelihoods"
             ),
         },
         "markov_state": {
@@ -463,6 +471,24 @@ def predict(
                 else "下三路樣本尚未成熟、規律存活度過低或沒有可用問路 likelihood。"
             ),
         },
+        "run_length_hazard_fusion": {
+            "applied": hazard_fusion_applied,
+            "reliability": float(hazard_weight),
+            "raw_reliability": float(fusion.get("raw_hazard_reliability", hazard_weight) or 0.0),
+            "likelihood": hazard_fusion_detail.get("likelihood"),
+            "continue_probability": float(
+                hazard_analysis.get("continue_probability", 0.5) or 0.5
+            ),
+            "turn_probability": float(
+                hazard_analysis.get("turn_probability", 0.5) or 0.5
+            ),
+            "selected_context": str(hazard_analysis.get("selected_context") or ""),
+            "support": float(hazard_analysis.get("support", 0.0) or 0.0),
+            "reason": (
+                "柱高模型依已完成大路柱學習 CONTINUE/TURN hazard；只以封頂 likelihood power "
+                "參與融合，不把樓梯路、長龍等名稱寫死成必然規則。"
+            ),
+        },
         "component_probabilities": {
             "markov_raw": {
                 "B": float(markov_probabilities["B"]),
@@ -482,6 +508,9 @@ def predict(
             "derived_road_likelihood": dict(
                 road_fusion_detail.get("likelihood") or {}
             ),
+            "run_length_hazard_likelihood": dict(
+                hazard_fusion_detail.get("likelihood") or {}
+            ),
             "fused": {"B": p_b, "P": p_p, "T": p_t},
             "road_diagnostic": {
                 "B": float(road_predict["banker_probability"]),
@@ -496,6 +525,7 @@ def predict(
         "final_bet_ratio": float(money["final_bet_ratio"]),
         "bet_percentage": float(money["bet_percentage"]),
         "suggested_bet_amount": float(money["bet_amount"]),
+        "bet_amount": float(money["bet_amount"]),
         "bet_multiplier": (
             min(1.0, float(money["final_bet_ratio"]) / MAX_BET_RATIO)
             if MAX_BET_RATIO > 0.0 else 0.0
@@ -515,9 +545,9 @@ def predict(
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
         "probability_semantics": (
-            "remaining_card_stage_pattern_survival_calibrated_support_backoff_markov_"
-            "times_tempered_depth_conditioned_shoe_times_bounded_derived_road_"
-            "likelihood_not_guaranteed_outcome"
+            "remaining_card_pattern_calibrated_support_backoff_markov_times_"
+            "depth_conditioned_shoe_times_bounded_derived_road_times_bounded_"
+            "run_length_hazard_likelihood_not_guaranteed_outcome"
         ),
     }
 
@@ -577,8 +607,9 @@ def run_virtual_round(
         "round_number": int(session.get("hand_number", 0) or 0) + 1,
         "bandit_learning_applied": False,
         "disclaimer": (
-            "虛擬相容模式方向使用 Support-aware Markov + Remaining-card Pattern Survival + "
-            "Derived-road Markov + depth-conditioned probabilistic shoe；資金配置需 Edge > 0。"
+            "虛擬相容模式使用 Support-aware Markov + Remaining-card Pattern Survival + "
+            "Derived-road Markov + Run-Length Hazard + depth-conditioned probabilistic shoe；"
+            "資金配置需 Edge > 0。"
         ),
     })
     return {
