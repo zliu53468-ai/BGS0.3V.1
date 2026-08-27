@@ -1,13 +1,14 @@
-"""BGS predictor: image road parsing -> Quant Markov + Bayesian shoe fusion.
+"""BGS predictor: image road parsing -> Quant Markov + road + shoe posterior.
 
-Formal direction now comes from BaccaratQuantEngine:
+Formal direction comes from BaccaratQuantEngine:
 - support-aware variable-order Markov (1..4),
 - adaptive entropy/regime forgetting,
-- Bayesian shoe likelihood fusion,
+- standard derived-road Markov ask-road likelihood,
+- probabilistic shoe posterior optionally conditioned on a plausible screen depth,
 - positive-Edge-only bankroll sizing.
 
-Road analysis remains diagnostic only. The probabilistic shoe estimator remains a
-weak secondary source because B/P/T-only history cannot reconstruct exact cards.
+The screen remaining-card total is only a soft particle-depth condition. It does not
+identify the actual hidden cards or guarantee the next baccarat outcome.
 """
 from __future__ import annotations
 
@@ -120,10 +121,41 @@ def predict(
     context = dict(shoe_context or {})
     bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
 
-    # Always compute the B/P/T-conditioned shoe posterior for diagnostics and
-    # as the default likelihood source.
-    shoe_posterior = estimate_probabilistic_shoe(cleaned)
+    try:
+        decks = max(1, min(16, int(context.get("decks", 8) or 8)))
+    except (TypeError, ValueError):
+        decks = 8
+
+    target_remaining_cards: Optional[int]
+    try:
+        raw_target = context.get("remaining_cards")
+        target_remaining_cards = (
+            int(raw_target) if raw_target is not None and int(raw_target) > 0 else None
+        )
+    except (TypeError, ValueError):
+        target_remaining_cards = None
+
+    try:
+        depth_reliability = max(
+            0.0,
+            min(
+                1.0,
+                float(context.get("remaining_cards_reliability", 0.65) or 0.0),
+            ),
+        )
+    except (TypeError, ValueError):
+        depth_reliability = 0.65
+
+    # The particle shoe is conditioned first on B/P/T outcomes and then, only
+    # when physically plausible, on a soft remaining-card depth likelihood.
+    shoe_posterior = estimate_probabilistic_shoe(
+        cleaned,
+        decks=decks,
+        target_remaining_cards=target_remaining_cards,
+        depth_reliability=depth_reliability,
+    )
     shoe_probabilities = dict(shoe_posterior["probabilities"])
+    depth_constraint = dict(shoe_posterior.get("depth_constraint") or {})
 
     # BaccaratQuantEngine also accepts a truly external shoe_probs source.
     # If none is supplied, use the bounded particle posterior.
@@ -138,7 +170,11 @@ def predict(
     else:
         fusion_shoe_probs = shoe_probabilities
         shoe_reliability = float(shoe_posterior.get("fusion_weight", 0.0) or 0.0)
-        shoe_source = "probabilistic_shoe_particle_v2"
+        shoe_source = (
+            "probabilistic_shoe_particle_v3_depth_conditioned"
+            if depth_constraint.get("applied")
+            else "probabilistic_shoe_particle_v3_outcome_conditioned"
+        )
 
     quant = _QUANT_ENGINE.predict(
         cleaned,
@@ -156,6 +192,7 @@ def predict(
     text = "莊" if direction == "B" else "閒"
     money = dict(quant["money_management"])
     fusion = dict(quant["fusion"])
+    quant_road = dict(quant.get("road_analysis") or {})
 
     road_predict = _road_diagnostic(road)
     system_model_version = f"{MODEL_VERSION}+{SHOE_POSTERIOR_MODEL_VERSION}+QUANT"
@@ -176,6 +213,9 @@ def predict(
     bet_allowed = bool(money.get("bet_allowed", False))
     tie_risk_active = bool(money.get("tie_risk_active", p_t > 0.15))
     shoe_weight = float(fusion.get("shoe_reliability", shoe_reliability) or 0.0)
+    road_weight = float(fusion.get("road_reliability", 0.0) or 0.0)
+    road_fusion_detail = dict(fusion.get("road") or {})
+    road_fusion_applied = bool(road_fusion_detail.get("applied", False))
 
     if bet_allowed:
         signal_status_code = "POSITIVE_EDGE_DYNAMIC_BET"
@@ -189,14 +229,17 @@ def predict(
 
     return {
         "ok": True,
-        "engine": "BACCARAT_QUANT_MARKOV_BAYES_SHOE",
+        "engine": "BACCARAT_QUANT_MARKOV_ROAD_DEPTH_SHOE",
         "model_version": MODEL_VERSION,
         "shoe_posterior_model_version": SHOE_POSTERIOR_MODEL_VERSION,
         "system_model_version": system_model_version,
-        "model_variant": "SUPPORT_BACKOFF_MARKOV_PLUS_BAYES_SHOE_EDGE_GATED",
+        "model_variant": (
+            "SUPPORT_BACKOFF_MARKOV_PLUS_DERIVED_ROAD_PLUS_DEPTH_SHOE_EDGE_GATED"
+        ),
         "model_core": "baccarat_quant_engine",
         "decision_pipeline": (
-            "image_scan_to_support_backoff_markov_to_bayesian_shoe_fusion"
+            "image_scan_to_support_backoff_markov_plus_standard_derived_road"
+            "_to_depth_conditioned_probabilistic_shoe_to_bayesian_fusion"
             "_to_positive_edge_capital_sizing"
         ),
         "prediction_fingerprint": fingerprint,
@@ -229,10 +272,14 @@ def predict(
             f"change={bool(markov.get('regime_profile', {}).get('change_point', False))}；"
             f"shoe_source={shoe_source}；"
             f"shoe_w={shoe_weight:.3f}；"
+            f"depth={bool(depth_constraint.get('applied', False))}；"
+            f"road_w={road_weight:.3f}；"
             f"edge={edge:.4f}；"
             f"sizing={money['reason']}。"
         ),
-        "direction_source": "baccarat_quant_engine_markov_prior_plus_shoe_likelihood",
+        "direction_source": (
+            "baccarat_quant_engine_markov_prior_plus_shoe_and_derived_road_likelihoods"
+        ),
         "confidence": confidence,
         "ensemble_confidence": confidence,
         "quality_score": confidence,
@@ -293,6 +340,11 @@ def predict(
             "particle_count": int(shoe_posterior["particle_count"]),
             "reliability": float(shoe_posterior["reliability"]),
             "fusion_weight": float(shoe_weight),
+            "target_remaining_cards": shoe_posterior.get("target_remaining_cards"),
+            "depth_constraint_applied": bool(
+                shoe_posterior.get("depth_constraint_applied", False)
+            ),
+            "depth_constraint": depth_constraint,
             "shoe_tendency": dict(shoe_posterior.get("shoe_tendency") or {}),
             "inference_semantics": str(shoe_posterior["inference_semantics"]),
         },
@@ -301,13 +353,22 @@ def predict(
             "probabilities": {"B": p_b, "P": p_p, "T": p_t},
             "markov_prior_weight": 1.0,
             "probabilistic_shoe_likelihood_power": float(shoe_weight),
-            # Compatibility fields; Bayesian fusion weights are not convex shares.
+            "derived_road_likelihood_power": float(road_weight),
+            # Compatibility fields; Bayesian fusion weights are likelihood powers.
             "markov_weight": 1.0,
             "probabilistic_shoe_weight": float(shoe_weight),
             "max_probabilistic_shoe_weight": float(MAX_SHOE_FUSION_WEIGHT),
             "shoe_source": shoe_source,
-            "method": str(fusion.get("method") or "tempered_bayesian_posterior"),
-            "semantics": "posterior_proportional_to_markov_prior_times_shoe_likelihood_power",
+            "depth_constraint_applied": bool(depth_constraint.get("applied", False)),
+            "road_applied": road_fusion_applied,
+            "method": str(
+                fusion.get("method")
+                or "sequential_tempered_bayes_markov_shoe_derived_road"
+            ),
+            "semantics": (
+                "posterior_proportional_to_markov_prior_times_shoe_likelihood_power"
+                "_times_derived_road_likelihood_power"
+            ),
         },
         "markov_state": {
             "state_key": str(markov["state_key"]),
@@ -324,12 +385,21 @@ def predict(
         },
         "road_predict": road_predict,
         "road_support": road,
+        "derived_road_analysis": quant_road,
         "road_fusion": {
-            "applied": False,
-            "mode": "diagnostic_only_external_road",
+            "applied": road_fusion_applied,
+            "mode": (
+                "bounded_standard_derived_road_markov_likelihood"
+                if road_fusion_applied
+                else "derived_road_not_mature_or_unavailable"
+            ),
+            "reliability": float(road_weight),
+            "likelihood": road_fusion_detail.get("likelihood"),
             "reason": (
-                "外部 Road Model 只保留診斷；V3 Markov 內部仍使用去重後的 "
-                "nested road-state context。"
+                "標準下三路由完整大路重建；以封頂權重的 R/U Markov 問路 likelihood "
+                "參與 Quant Engine，避免與主 Markov 重複計算。"
+                if road_fusion_applied
+                else "下三路樣本尚未成熟或沒有產生可用問路 likelihood。"
             ),
         },
         "component_probabilities": {
@@ -343,6 +413,9 @@ def predict(
                 "P": float(shoe_probabilities["P"]),
                 "T": float(shoe_probabilities["T"]),
             },
+            "derived_road_likelihood": dict(
+                road_fusion_detail.get("likelihood") or {}
+            ),
             "fused": {"B": p_b, "P": p_p, "T": p_t},
             "road_diagnostic": {
                 "B": float(road_predict["banker_probability"]),
@@ -376,8 +449,8 @@ def predict(
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
         "probability_semantics": (
-            "support_backoff_markov_prior_times_tempered_shoe_likelihood"
-            "_not_guaranteed_outcome"
+            "support_backoff_markov_prior_times_tempered_depth_conditioned_shoe"
+            "_times_bounded_derived_road_likelihood_not_guaranteed_outcome"
         ),
     }
 
@@ -403,7 +476,11 @@ def run_virtual_round(
         room=str(session.get("room") or ""),
         shoe_id=str(session.get("shoe_id") or ""),
         run_seed=seed,
-        shoe_context={"bankroll": float(session.get("bankroll", 0.0) or 0.0)},
+        shoe_context={
+            "bankroll": float(session.get("bankroll", 0.0) or 0.0),
+            "remaining_cards": len(hidden_shoe),
+            "remaining_cards_reliability": 1.0,
+        },
     )
 
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
@@ -433,8 +510,8 @@ def run_virtual_round(
         "round_number": int(session.get("hand_number", 0) or 0) + 1,
         "bandit_learning_applied": False,
         "disclaimer": (
-            "虛擬相容模式方向使用 Support-aware Markov + Bayesian shoe fusion；"
-            "資金配置需 Edge > 0。"
+            "虛擬相容模式方向使用 Support-aware Markov + Derived-road Markov + "
+            "depth-conditioned probabilistic shoe；資金配置需 Edge > 0。"
         ),
     })
     return {

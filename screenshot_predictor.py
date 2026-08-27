@@ -1,7 +1,9 @@
-"""Screenshot adapter for the three-way Markov + shoe-depth predictor.
+"""Screenshot adapter for the BGS quant predictor.
 
-The image pipeline preserves chronological B/P/T outcomes. No tie is filtered before
-prediction. Performance tracking remains audit-only and does not update model weights.
+The image pipeline preserves chronological B/P/T outcomes and now forwards a
+plausible screenshot/session remaining-card total into the probabilistic shoe
+posterior as a *soft depth constraint*. The total card count never becomes an
+exact composition claim.
 """
 from __future__ import annotations
 
@@ -101,10 +103,40 @@ def predict_from_screenshot(
     prior_counts_ignored = bool(prior_counts)
     observed_cards_ignored = bool(observed_cards)
 
-    # Preserve bankroll from the app session for MoneyManagementModel. Exact card
-    # counts may remain present for legacy APIs, but round-count ShoeDepthEstimator
-    # does not treat them as physical composition evidence.
     model_shoe_context = dict(shoe_context or {})
+
+    # Priority 1: explicitly verified remaining point-counts. We still pass only
+    # their total to this depth channel; exact composition remains a separate
+    # evidence type and is never fabricated from a screenshot.
+    exact_counts = model_shoe_context.get("remaining_counts")
+    if isinstance(exact_counts, (list, tuple)) and len(exact_counts) == 10:
+        try:
+            exact_total = sum(max(0, int(value)) for value in exact_counts)
+        except (TypeError, ValueError):
+            exact_total = 0
+        if exact_total > 0:
+            model_shoe_context["remaining_cards"] = int(exact_total)
+            model_shoe_context["remaining_cards_reliability"] = 1.0
+            model_shoe_context["remaining_cards_source"] = (
+                "user_exact_remaining_counts_total"
+            )
+
+    # Priority 2: screenshot/session total. The particle estimator itself performs
+    # a 4..6-cards-per-round physical plausibility check, so a stale/default 416
+    # after many observed rounds is automatically rejected.
+    if "remaining_cards" not in model_shoe_context:
+        try:
+            screen_remaining = int(remaining_cards or 0)
+        except (TypeError, ValueError):
+            screen_remaining = 0
+        if screen_remaining > 0:
+            model_shoe_context["remaining_cards"] = screen_remaining
+            model_shoe_context.setdefault("remaining_cards_reliability", 0.65)
+            model_shoe_context.setdefault(
+                "remaining_cards_source",
+                "screenshot_or_session_total_soft_depth",
+            )
+
     result = predict(
         history=combined_raw,
         venue=venue,
@@ -115,14 +147,32 @@ def predict_from_screenshot(
         shoe_context=model_shoe_context,
         road_context=context,
     )
+
+    shoe_estimate = dict(result.get("probabilistic_shoe_estimate") or {})
+    depth_constraint = dict(shoe_estimate.get("depth_constraint") or {})
     result.update({
-        "screen_pipeline_version": "THREEWAY-MARKOV-SHOE-DEPTH-SCREEN-V2",
-        "mode": "screen_threeway_markov_shoe_depth",
+        "screen_pipeline_version": "THREEWAY-MARKOV-SHOE-DEPTH-SCREEN-V3",
+        "mode": "screen_quant_markov_depth_conditioned_shoe",
         "shoe_id": str(shoe_id or ""),
         "screen_remaining_cards": int(remaining_cards or 0),
-        "estimated_remaining_counts": [],
-        "composition_source": "round_count_depth_estimator",
-        "composition_quality": "maturity_estimate_not_exact_card_composition",
+        "estimated_remaining_counts": list(
+            shoe_estimate.get("expected_remaining_counts") or []
+        ),
+        "composition_source": (
+            "outcome_conditioned_particle_posterior_plus_soft_screen_depth"
+            if depth_constraint.get("applied")
+            else "outcome_conditioned_particle_posterior"
+        ),
+        "composition_quality": (
+            "probabilistic_not_exact_card_composition"
+        ),
+        "screen_depth_constraint_applied": bool(
+            depth_constraint.get("applied", False)
+        ),
+        "screen_depth_constraint": depth_constraint,
+        "remaining_cards_source": str(
+            model_shoe_context.get("remaining_cards_source") or ""
+        ),
         "exact_remaining_counts_supplied": bool(
             isinstance(model_shoe_context.get("remaining_counts"), (list, tuple))
             and len(model_shoe_context.get("remaining_counts") or []) == 10
@@ -150,11 +200,6 @@ def predict_from_screenshot(
         "learning_update_triggered_by_new_actual": latest_actual_is_new,
         "deterministic_feature_seed": True,
     })
-    result["road_fusion"] = {
-        "applied": False,
-        "mode": "diagnostic_only",
-        "reason": "圖片保留完整 B/P/T；正式方向由三元 Markov 後驗 B/P 機率直接決定。",
-    }
 
     if PERFORMANCE_TRACKING_ENABLED and record_for_learning and user_id:
         result["prediction_id"] = record_prediction(
@@ -168,7 +213,9 @@ def predict_from_screenshot(
                 "manual_round_count": len(manual_raw),
                 "combined_round_count": len(combined_raw),
                 "shoe_id": str(shoe_id or ""),
-                "prediction_pipeline": "threeway_markov_shoe_depth_v2",
+                "prediction_pipeline": (
+                    "support_markov_derived_road_depth_conditioned_shoe_v3"
+                ),
             },
         )
         result["performance_tracking"] = True
