@@ -1,18 +1,13 @@
-"""Outcome-conditioned probabilistic shoe estimator V2.
+"""Outcome- and depth-conditioned probabilistic baccarat shoe estimator V3.
 
-This module does not claim to reconstruct the exact hidden shoe from B/P/T alone.
-It maintains a bounded particle posterior over plausible remaining point-count
-compositions and estimates the next-hand distribution by forward simulation.
+The model does NOT reconstruct the real hidden shoe from a Big-Road screenshot.
+It maintains particles over plausible remaining point-value compositions, conditions
+them on the observed B/P/T history, and can additionally apply a *soft* total-card
+(depth) likelihood when a screenshot/session supplies a plausible remaining-card
+estimate.
 
-V2 upgrades the next-hand "shoe tendency" judgement with:
-- more particles / likelihood draws,
-- per-particle next-hand B/P estimates,
-- direction consensus and posterior stability,
-- reliability shrinkage driven by ESS + consensus + stability,
-- explicit BANKER_LEAN / PLAYER_LEAN / BALANCED diagnostics.
-
-The tendency is a posterior-composition signal, not evidence that road patterns
-cause future baccarat outcomes.
+The total remaining-card count constrains how many 4/5/6-card hands the simulated
+history could have consumed. It does not reveal the identities of the remaining cards.
 """
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ import math
 import random
 import statistics
 
-MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V2-TENDENCY"
+MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-CONDITIONED"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 DECKS = 8
@@ -36,6 +31,14 @@ MAX_FUSION_WEIGHT = 0.30
 LIKELIHOOD_PRIOR_STRENGTH = 2.5
 NEXT_PRIOR_STRENGTH = 12.0
 TENDENCY_MARGIN_THRESHOLD = 0.018
+
+# A baccarat hand consumes 4, 5 or 6 cards. Screenshot/session depth is treated
+# as a soft observation because OCR, burn-card handling and manual 5-card decrements
+# can make the displayed total approximate rather than exact.
+DEPTH_DEFAULT_RELIABILITY = 0.65
+DEPTH_MIN_SIGMA_CARDS = 2.5
+DEPTH_MAX_SIGMA_CARDS = 10.0
+DEPTH_PLAUSIBILITY_MARGIN_CARDS = 12
 
 
 def _clean_threeway(values: Iterable[Any]) -> list[str]:
@@ -58,7 +61,6 @@ def _clean_threeway(values: Iterable[Any]) -> list[str]:
 
 def _fresh_counts(decks: int = DECKS) -> list[int]:
     decks = max(1, min(16, int(decks)))
-    # Point-value composition: 0 contains 10/J/Q/K => 16 cards/deck.
     return [16 * decks] + [4 * decks] * 9
 
 
@@ -169,17 +171,146 @@ def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(value)))
 
 
+def _particle_total_stats(particles: Sequence[Sequence[int]]) -> tuple[float, float]:
+    totals = [float(sum(int(x) for x in particle)) for particle in particles]
+    if not totals:
+        return 0.0, 0.0
+    return float(sum(totals) / len(totals)), float(
+        statistics.pstdev(totals) if len(totals) > 1 else 0.0
+    )
+
+
+def _apply_soft_depth_constraint(
+    particles: list[list[int]],
+    *,
+    target_remaining_cards: int | None,
+    conditioned_rounds: int,
+    start_cards: int,
+    reliability: float,
+    rng: random.Random,
+) -> tuple[list[list[int]], Dict[str, Any]]:
+    """Softly condition particles on a remaining-card total.
+
+    L_depth(particle) = exp(-0.5 * ((R_particle - R_screen) / sigma)^2)
+
+    We reject obviously impossible/default totals before weighting. Each completed
+    baccarat hand consumes 4..6 cards; a small margin covers burn-card/display
+    approximation without pretending the screenshot reveals exact card identities.
+    """
+    requested = target_remaining_cards is not None
+    base: Dict[str, Any] = {
+        "requested": bool(requested),
+        "applied": False,
+        "target_remaining_cards": (
+            int(target_remaining_cards) if target_remaining_cards is not None else None
+        ),
+        "reliability": float(_clip(reliability)),
+        "reason": "not_requested",
+    }
+    if not particles or target_remaining_cards is None:
+        return particles, base
+
+    try:
+        target = int(target_remaining_cards)
+    except (TypeError, ValueError):
+        base["reason"] = "invalid_target"
+        return particles, base
+
+    if target <= 0 or target > int(start_cards):
+        base["reason"] = "target_out_of_shoe_range"
+        return particles, base
+
+    rounds = max(0, int(conditioned_rounds))
+    rel = _clip(reliability)
+    if rel <= 0.0:
+        base["reason"] = "zero_reliability"
+        return particles, base
+
+    if rounds <= 0:
+        if target != int(start_cards):
+            base["reason"] = "no_rounds_but_depth_not_full_shoe"
+            return particles, base
+        base.update({
+            "reason": "full_shoe_no_conditioning_needed",
+            "plausible_min_remaining": int(start_cards),
+            "plausible_max_remaining": int(start_cards),
+        })
+        return particles, base
+
+    margin = int(DEPTH_PLAUSIBILITY_MARGIN_CARDS)
+    plausible_min = max(0, int(start_cards) - 6 * rounds - margin)
+    plausible_max = min(
+        int(start_cards),
+        int(start_cards) - 4 * rounds + max(4, margin // 3),
+    )
+    base.update({
+        "plausible_min_remaining": int(plausible_min),
+        "plausible_max_remaining": int(plausible_max),
+    })
+    if target < plausible_min or target > plausible_max:
+        base["reason"] = "inconsistent_with_observed_round_count"
+        return particles, base
+
+    before_mean, before_std = _particle_total_stats(particles)
+    sigma = DEPTH_MAX_SIGMA_CARDS - (
+        DEPTH_MAX_SIGMA_CARDS - DEPTH_MIN_SIGMA_CARDS
+    ) * rel
+    sigma = max(DEPTH_MIN_SIGMA_CARDS, float(sigma))
+
+    weights: list[float] = []
+    for particle in particles:
+        remaining = float(sum(particle))
+        z = (remaining - target) / sigma
+        gaussian = math.exp(-0.5 * z * z)
+        weight = max(1e-12, gaussian ** max(0.05, rel))
+        weights.append(weight)
+
+    weight_total = sum(weights)
+    if weight_total <= 1e-12:
+        base["reason"] = "depth_weights_underflow"
+        return particles, base
+
+    normalized = [weight / weight_total for weight in weights]
+    ess = 1.0 / sum(weight * weight for weight in normalized)
+    ess_ratio = min(1.0, ess / len(particles))
+    constrained = _systematic_resample(particles, weights, rng)
+    after_mean, after_std = _particle_total_stats(constrained)
+
+    consistency = math.exp(
+        -0.5 * ((before_mean - float(target)) / max(sigma, 1e-9)) ** 2
+    )
+    base.update({
+        "applied": True,
+        "reason": "soft_gaussian_depth_likelihood",
+        "sigma_cards": float(sigma),
+        "pre_constraint_mean_remaining": float(before_mean),
+        "pre_constraint_std_remaining": float(before_std),
+        "post_constraint_mean_remaining": float(after_mean),
+        "post_constraint_std_remaining": float(after_std),
+        "post_constraint_error_cards": float(after_mean - target),
+        "depth_ess_ratio": float(ess_ratio),
+        "pre_constraint_consistency": float(_clip(consistency)),
+        "semantics": "soft_total_card_depth_condition_not_exact_remaining_composition",
+    })
+    return constrained, base
+
+
 def estimate_probabilistic_shoe(
     history: Iterable[Any],
     *,
     decks: int = DECKS,
     particle_count: int = PARTICLE_COUNT,
+    target_remaining_cards: int | None = None,
+    depth_reliability: float = DEPTH_DEFAULT_RELIABILITY,
 ) -> Dict[str, Any]:
     full_sequence = _clean_threeway(history)
     sequence = full_sequence[-MAX_CONDITIONING_ROUNDS:]
     particle_count = max(24, min(160, int(particle_count)))
     decks = max(1, min(16, int(decks)))
+    start_cards = 52 * decks
 
+    # Keep the base outcome-conditioned particle population deterministic for a
+    # given history. A rejected depth estimate must not change the RNG path.
     seed_material = (
         f"{MODEL_VERSION}|{decks}|{particle_count}|{''.join(sequence)}"
     ).encode("utf-8")
@@ -211,8 +342,6 @@ def estimate_probabilistic_shoe(
             if valid_draws <= 0:
                 continue
 
-            # Smoothed likelihood:
-            # L(y|particle) = (matches + beta*pi_y)/(draws + beta)
             prior_mass = LIKELIHOOD_PRIOR_STRENGTH * PHYSICAL_PRIOR[observed]
             likelihood = (
                 len(candidate_matches) + prior_mass
@@ -253,6 +382,15 @@ def estimate_probabilistic_shoe(
         particles = _systematic_resample(advanced, weights, rng)
         conditioned_rounds += 1
 
+    particles, depth_constraint = _apply_soft_depth_constraint(
+        particles,
+        target_remaining_cards=target_remaining_cards,
+        conditioned_rounds=conditioned_rounds,
+        start_cards=start_cards,
+        reliability=depth_reliability,
+        rng=rng,
+    )
+
     aggregate_next = {outcome: 0 for outcome in OUTCOMES}
     total_next_draws = 0
     particle_bp_probs: list[float] = []
@@ -271,14 +409,13 @@ def estimate_probabilistic_shoe(
 
         local_bp = local["B"] + local["P"]
         if local_bp > 0:
-            p_b_resolved = local["B"] / local_bp
-            particle_bp_probs.append(float(p_b_resolved))
-            particle_directions.append("B" if p_b_resolved >= 0.5 else "P")
+            p_b_local = local["B"] / local_bp
+            particle_bp_probs.append(float(p_b_local))
+            particle_directions.append("B" if p_b_local >= 0.5 else "P")
 
     if total_next_draws <= 0:
         probabilities = dict(PHYSICAL_PRIOR)
     else:
-        # Dirichlet shrinkage around the physical baccarat prior.
         probabilities = {
             outcome: (
                 aggregate_next[outcome]
@@ -306,8 +443,7 @@ def estimate_probabilistic_shoe(
         std_counts = [0.0] * 10
 
     expected_remaining_cards = float(sum(expected_counts))
-    start_cards = float(52 * decks)
-    expected_cards_used = max(0.0, start_cards - expected_remaining_cards)
+    expected_cards_used = max(0.0, float(start_cards) - expected_remaining_cards)
     mean_cards_per_round = (
         expected_cards_used / conditioned_rounds
         if conditioned_rounds > 0 else 0.0
@@ -351,18 +487,33 @@ def estimate_probabilistic_shoe(
     ess_factor = 0.60 + 0.40 * mean_ess_ratio
     consensus_factor = 0.70 + 0.30 * consensus
     stability_factor = 0.60 + 0.40 * stability
+
+    if depth_constraint.get("applied"):
+        depth_consistency = float(
+            depth_constraint.get("pre_constraint_consistency", 1.0) or 0.0
+        )
+        depth_factor = 0.75 + 0.25 * _clip(depth_consistency)
+    else:
+        depth_factor = 1.0
+
     reliability = min(
         MAX_FUSION_WEIGHT,
         MAX_FUSION_WEIGHT
         * history_factor
         * ess_factor
         * consensus_factor
-        * stability_factor,
+        * stability_factor
+        * depth_factor,
     )
     fusion_weight = float(reliability)
 
     entropy_bits = _entropy(probabilities)
     direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
+    inference_semantics = (
+        "outcome_and_soft_depth_conditioned_particle_posterior_not_exact_remaining_cards"
+        if depth_constraint.get("applied")
+        else "outcome_conditioned_particle_posterior_not_exact_remaining_cards"
+    )
 
     return {
         "model_version": MODEL_VERSION,
@@ -391,6 +542,11 @@ def estimate_probabilistic_shoe(
         "reliability": float(reliability),
         "fusion_weight": fusion_weight,
         "max_fusion_weight": float(MAX_FUSION_WEIGHT),
+        "target_remaining_cards": (
+            int(target_remaining_cards) if target_remaining_cards is not None else None
+        ),
+        "depth_constraint_applied": bool(depth_constraint.get("applied", False)),
+        "depth_constraint": depth_constraint,
         "shoe_tendency": {
             "label": tendency,
             "bp_margin": float(bp_margin),
@@ -399,18 +555,15 @@ def estimate_probabilistic_shoe(
             "particle_bp_std": float(bp_std),
             "posterior_stability": float(stability),
             "strength": float(tendency_strength),
-            "semantics": (
-                "posterior_composition_tendency_not_road_pattern_causality"
-            ),
+            "semantics": "posterior_composition_tendency_not_road_pattern_causality",
         },
-        "inference_semantics": (
-            "outcome_conditioned_particle_posterior_not_exact_remaining_cards"
-        ),
+        "inference_semantics": inference_semantics,
     }
 
 
 __all__ = [
     "MODEL_VERSION",
     "MAX_FUSION_WEIGHT",
+    "DEPTH_DEFAULT_RELIABILITY",
     "estimate_probabilistic_shoe",
 ]
