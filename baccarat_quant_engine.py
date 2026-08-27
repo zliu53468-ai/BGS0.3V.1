@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
+from bankroll_display_bridge import install_legacy_app_bankroll_adapter
 from markov_model import update_and_predict_engine
 from money_management import MoneyManagementModel
 from pattern_survival import (
@@ -261,12 +262,14 @@ class BaccaratQuantEngine:
         remaining_card_state: Mapping[str, Any] | None = None,
         bankroll: float = 0.0,
     ) -> dict[str, Any]:
+        # app.py still contains the historical exact-count/Kelly display adapter.
+        # Install the compatibility adapter only at runtime, after app import is
+        # complete, so unrelated LINE/OCR code remains untouched.
+        install_legacy_app_bankroll_adapter()
+
         markov = update_and_predict_engine(history)
         markov_probs = dict(markov["probabilities"])
 
-        # If no explicit road likelihood is provided, rebuild the canonical
-        # derived roads from the same history and activate the bounded ask-road
-        # Markov channel automatically.
         road_analysis: dict[str, Any] = {}
         if road_probs is None:
             try:
@@ -292,18 +295,11 @@ class BaccaratQuantEngine:
             survival_score,
         )
 
-        # Derived-road evidence is deterministic from the same Big Road, so the
-        # survival gate may only reduce its already-capped likelihood power.
         raw_road_reliability = _clip(float(road_reliability or 0.0))
         effective_road_reliability = _clip(
             raw_road_reliability * survival_score
         )
 
-        # Run-length Hazard explicitly models CONTINUE vs TURN for the current
-        # column. It keeps its own support/backoff reliability and is capped at
-        # 15%. We only apply a shoe-stage maturity gate; we do not multiply it by
-        # Pattern Survival because a valid TURN signal can occur exactly when the
-        # old pattern is breaking.
         hazard_analysis = analyze_run_length_hazard(history)
         hazard_probs = dict(hazard_analysis.get("likelihood") or {})
         raw_hazard_reliability = _clip(
@@ -328,10 +324,6 @@ class BaccaratQuantEngine:
         )
 
         direction = "B" if final_probs["B"] >= final_probs["P"] else "P"
-
-        # Pattern calibration never increases original Markov confidence. Hazard
-        # is an evidence channel in the final posterior; it does not inflate this
-        # money-management confidence scalar.
         pattern_calibrated_weight = _clip(
             float(markov["final_weight"]) * (0.35 + 0.65 * survival_score)
         )
