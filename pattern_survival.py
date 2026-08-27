@@ -1,21 +1,25 @@
 """Remaining-card state and pattern-survival calibration for BGS.
 
 This module does not predict hidden card identities. It converts the existing
-probabilistic-shoe posterior into a coarse shoe-stage estimate and uses that
-maturity information only to calibrate how strongly the historical road/Markov
-pattern is allowed to influence the next-hand posterior.
+probabilistic-shoe posterior into a coarse shoe-stage estimate and calibrates how
+strongly historical road/Markov structure may influence the next-hand posterior.
 
 Pattern Survival is NOT a baccarat win probability.
 
-Direction calibration deliberately separates two concepts:
-- PHYSICAL_PRIOR: baccarat's natural B/P/T base rates, retained for shoe/EV math.
-- DIRECTION_NEUTRAL_PRIOR: equal B/P mass with the same Tie mass, used when a
-  historical direction signal is weak so Banker does not receive a free vote.
+Direction calibration separates:
+- PHYSICAL_PRIOR: natural baccarat B/P/T base rates for shoe/EV math.
+- an equal-B/P directional baseline for weak historical signals.
+
+The optional hidden-regime layer is HSMM-inspired and duration-aware, but it is
+not claimed to be an offline-trained HSMM because the repository has no in-repo
+multi-shoe road-sequence training set. It may only reduce pattern confidence.
 """
 from __future__ import annotations
 
 from typing import Any, Mapping
 import math
+
+from hsmm_regime import analyze_hidden_regime
 
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 OUTCOMES = ("B", "P", "T")
@@ -45,7 +49,6 @@ def _normalize_threeway(values: Mapping[str, Any]) -> dict[str, float]:
 
 
 def _neutral_prior_with_tie(tie_probability: float) -> dict[str, float]:
-    """Return an equal B/P direction baseline while preserving Tie mass."""
     tie = _clip(float(tie_probability), 0.0, 0.999999)
     resolved_mass = max(1e-12, 1.0 - tie)
     half = resolved_mass / 2.0
@@ -55,24 +58,7 @@ def _neutral_prior_with_tie(tie_probability: float) -> dict[str, float]:
 def neutralize_physical_banker_bias(
     probabilities: Mapping[str, Any],
 ) -> dict[str, float]:
-    """Convert a physical-prior-smoothed posterior into pure B/P direction evidence.
-
-    The Markov model is intentionally smoothed with baccarat's physical prior.
-    That is useful statistically, but if its output is used directly for a B/P
-    recommendation the natural Banker base-rate advantage becomes a permanent
-    hidden vote for B.
-
-    We remove only that baseline in conditional B/P odds:
-
-        E_B = P_model(B | resolved) / P_phys(B | resolved)
-        E_P = P_model(P | resolved) / P_phys(P | resolved)
-
-        P_dir(B | resolved) = E_B / (E_B + E_P)
-
-    Tie mass is preserved. Therefore an input equal to PHYSICAL_PRIOR becomes an
-    exactly neutral B/P direction signal, while genuine deviations from the
-    physical baseline remain directional evidence.
-    """
+    """Convert physical-prior-smoothed probabilities into pure B/P evidence."""
     raw = _normalize_threeway(probabilities)
     bp_mass = raw["B"] + raw["P"]
     if bp_mass <= 1e-12:
@@ -147,12 +133,18 @@ def build_remaining_card_state(
         except (TypeError, ValueError):
             std_cards = 0.0
         if std_cards <= 0.5:
-            std_cards = max(1.0, (physical_max - physical_min) / math.sqrt(12.0))
+            std_cards = max(
+                1.0,
+                (physical_max - physical_min) / math.sqrt(12.0),
+            )
         interval_low = max(physical_min, mean_remaining - 1.645 * std_cards)
         interval_high = min(physical_max, mean_remaining + 1.645 * std_cards)
         interval_source = "depth_conditioned_particle_total_approx90"
     else:
-        std_cards = max(1.0, (physical_max - physical_min) / math.sqrt(12.0))
+        std_cards = max(
+            1.0,
+            (physical_max - physical_min) / math.sqrt(12.0),
+        )
         interval_low = physical_min
         interval_high = physical_max
         interval_source = "physical_4_to_6_cards_per_round_envelope"
@@ -160,10 +152,14 @@ def build_remaining_card_state(
     remaining_ratio = _clip(mean_remaining / max(1.0, float(start_cards)))
     stage = _shoe_stage(remaining_ratio)
 
-    mean_ess_ratio = _clip(float(posterior.get("mean_ess_ratio", 0.0) or 0.0))
+    mean_ess_ratio = _clip(
+        float(posterior.get("mean_ess_ratio", 0.0) or 0.0)
+    )
     history_factor = min(1.0, rounds / 24.0)
     interval_width = max(0.0, interval_high - interval_low)
-    concentration = _clip(1.0 - interval_width / max(1.0, 0.20 * start_cards))
+    concentration = _clip(
+        1.0 - interval_width / max(1.0, 0.20 * start_cards)
+    )
     depth_factor = 1.0 if depth_applied else 0.78
     reliability = _clip(
         history_factor
@@ -201,6 +197,11 @@ def calculate_pattern_survival(
     road_analysis: Mapping[str, Any] | None,
     remaining_card_state: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
+    """Return a 0..1 confidence gate for currently observed road structure.
+
+    The hidden-regime factor is one-way: it may only reduce the pre-existing
+    Pattern Survival score. It never creates a B/P direction.
+    """
     road = dict(road_analysis or {})
     remaining = dict(remaining_card_state or {})
     profile = dict(markov.get("regime_profile") or {})
@@ -208,18 +209,30 @@ def calculate_pattern_survival(
     regime = str(profile.get("regime") or markov.get("regime") or "MIXED")
     base_regime = str(profile.get("base_regime") or regime)
     support = _clip(float(markov.get("support_strength", 0.0) or 0.0))
-    agreement = _clip(float(markov.get("multi_order_agreement", 0.5) or 0.5))
-    regime_stability = _clip(float(profile.get("stability", 0.45) or 0.0))
+    agreement = _clip(
+        float(markov.get("multi_order_agreement", 0.5) or 0.5)
+    )
+    regime_stability = _clip(
+        float(profile.get("stability", 0.45) or 0.0)
+    )
 
     entropy_delta = float(profile.get("entropy_delta", 0.0) or 0.0)
-    entropy_stability = _clip(1.0 - max(0.0, entropy_delta) / 0.50)
+    entropy_stability = _clip(
+        1.0 - max(0.0, entropy_delta) / 0.50
+    )
 
-    current_run = max(0, int(profile.get("current_run_length", 0) or 0))
-    alternation = _clip(float(profile.get("alternation_ratio", 0.0) or 0.0))
+    current_run = max(
+        0,
+        int(profile.get("current_run_length", 0) or 0),
+    )
+    alternation = _clip(
+        float(profile.get("alternation_ratio", 0.0) or 0.0)
+    )
     recent_runs = [
         max(0, int(value))
         for value in list(profile.get("recent_run_lengths") or [])
     ]
+
     if base_regime == "DRAGON":
         recent_pattern = _clip(current_run / 6.0)
     elif base_regime == "CHOP":
@@ -254,14 +267,21 @@ def calculate_pattern_survival(
     derived_consensus = _clip(
         abs(float(road.get("derived_road_consensus", 0.0) or 0.0))
     )
-    derived_component = _clip(0.70 * road_support + 0.30 * derived_consensus)
+    derived_component = _clip(
+        0.70 * road_support + 0.30 * derived_consensus
+    )
 
     remaining_reliability = _clip(
         float(remaining.get("reliability", 0.0) or 0.0)
     )
-    stage = str(remaining.get("shoe_stage") or "UNKNOWN").upper()
+    stage = str(
+        remaining.get("shoe_stage") or "UNKNOWN"
+    ).upper()
     stage_factor = float(
-        remaining.get("shoe_stage_factor", SHOE_STAGE_FACTORS.get(stage, 0.70))
+        remaining.get(
+            "shoe_stage_factor",
+            SHOE_STAGE_FACTORS.get(stage, 0.70),
+        )
         or SHOE_STAGE_FACTORS.get(stage, 0.70)
     )
     stage_factor = _clip(stage_factor)
@@ -269,7 +289,9 @@ def calculate_pattern_survival(
     change_point = bool(profile.get("change_point", False))
     pattern_break = bool(profile.get("pattern_break", False))
     change_factor = 0.25 if (
-        change_point or pattern_break or regime == "TRANSITION"
+        change_point
+        or pattern_break
+        or regime == "TRANSITION"
     ) else 1.0
 
     raw_score = _clip(
@@ -281,11 +303,21 @@ def calculate_pattern_survival(
         + 0.10 * derived_component
         + 0.07 * remaining_reliability
     )
-    score = _clip(raw_score * stage_factor * change_factor)
+
+    hidden_regime = analyze_hidden_regime(markov)
+    hidden_factor = _clip(
+        float(hidden_regime.get("pattern_factor", 1.0) or 1.0)
+    )
+
+    pre_hidden_score = _clip(
+        raw_score * stage_factor * change_factor
+    )
+    score = _clip(pre_hidden_score * hidden_factor)
 
     return {
         "score": float(score),
         "raw_score": float(raw_score),
+        "pre_hidden_regime_score": float(pre_hidden_score),
         "pattern": regime,
         "base_pattern": base_regime,
         "shoe_stage": stage,
@@ -293,6 +325,8 @@ def calculate_pattern_survival(
         "change_point": change_point,
         "pattern_break": pattern_break,
         "change_point_factor": float(change_factor),
+        "hidden_regime": hidden_regime,
+        "hidden_regime_factor": float(hidden_factor),
         "components": {
             "support": float(support),
             "multi_order_agreement": float(agreement),
@@ -301,9 +335,11 @@ def calculate_pattern_survival(
             "entropy_stability": float(entropy_stability),
             "derived_road_support": float(derived_component),
             "remaining_card_reliability": float(remaining_reliability),
+            "hidden_regime_factor": float(hidden_factor),
         },
         "semantics": (
-            "pattern_survival_calibration_score_not_next_hand_win_probability"
+            "pattern_survival_with_duration_aware_hidden_regime_downweight_"
+            "not_next_hand_win_probability"
         ),
     }
 
@@ -314,16 +350,17 @@ def calibrate_markov_probabilities(
 ) -> dict[str, float]:
     """Return a Banker-neutral direction posterior for Markov evidence.
 
-    P_dir_cal(y) = (1-S) * P_neutral(y) + S * P_dir_signal(y)
-
-    Low Pattern Survival now returns B/P toward equality, not toward the natural
-    Banker base-rate advantage. Tie mass is preserved.
+    Low Pattern Survival returns B/P toward equality, not toward Banker's natural
+    base-rate advantage. Tie mass is preserved.
     """
     s = _clip(survival_score)
     directional = neutralize_physical_banker_bias(markov_probs)
     neutral = _neutral_prior_with_tie(directional["T"])
     calibrated = {
-        outcome: (1.0 - s) * neutral[outcome] + s * directional[outcome]
+        outcome: (
+            (1.0 - s) * neutral[outcome]
+            + s * directional[outcome]
+        )
         for outcome in OUTCOMES
     }
     return _normalize_threeway(calibrated)
