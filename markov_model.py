@@ -1,11 +1,10 @@
 """Support-aware variable-order three-way Markov predictor for BGS.
 
-V3.3 keeps the stable V3 road/regime design and adds:
+V3.2 keeps the stable V3 road/regime design and adds:
 - explicit order-1..4 transition counters,
 - support-threshold backoff (K=4, alpha=0.75),
 - 12-hand entropy change-point detection,
-- regime-aware adaptive forgetting with soft recent refocus,
-- direction-neutral recent-density state buckets,
+- regime-aware adaptive forgetting with 4-6 hand refocus,
 - Bayesian/Dirichlet smoothing,
 - nested road coarse/full auxiliary state without double counting.
 
@@ -20,7 +19,7 @@ import math
 
 from shoe_depth_estimator import ShoeDepthEstimator
 
-MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-SUPPORT-BACKOFF-V3.3-MOMENTUM-DEBIAS"
+MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-SUPPORT-BACKOFF-V3.2-QUANT-CANDIDATE"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 
@@ -260,23 +259,13 @@ def _density_state(sequence: list[str]) -> Dict[str, Any]:
     banker_count = recent5.count("B")
     player_count = recent5.count("P")
     delta = banker_count - player_count
-    imbalance = abs(delta)
-    if imbalance >= 3:
-        density = "STRONG_IMBALANCE"
-    elif imbalance >= 2:
-        density = "MODERATE_IMBALANCE"
-    else:
-        density = "BALANCED"
-    dominant_side = "B" if delta > 0 else "P" if delta < 0 else ""
+    density = "High" if delta >= 2 else "Low" if delta <= -2 else "Medium"
     return {
         "recent5": recent5,
         "banker_count_recent5": banker_count,
         "player_count_recent5": player_count,
         "density_delta": delta,
-        "density_abs_delta": int(imbalance),
-        "dominant_side_recent5": dominant_side,
         "density": density,
-        "density_semantics": "direction_neutral_recent5_imbalance_bucket",
     }
 
 
@@ -328,7 +317,6 @@ def encode_threeway_state(history: Iterable[Any]) -> Dict[str, Any]:
         "ready": len(sequence) >= 2,
         "direction_context": "".join(sequence[-2:]) if sequence else "",
         "density": density["density"],
-        "density_semantics": density["density_semantics"],
         "tie_trigger": "HasTie" if "T" in recent3 else "NoTie",
         "key": road["full_key"] if sequence else "",
         "recent5": density["recent5"],
@@ -336,8 +324,6 @@ def encode_threeway_state(history: Iterable[Any]) -> Dict[str, Any]:
         "banker_count_recent5": density["banker_count_recent5"],
         "player_count_recent5": density["player_count_recent5"],
         "density_delta": density["density_delta"],
-        "density_abs_delta": density["density_abs_delta"],
-        "dominant_side_recent5": density["dominant_side_recent5"],
         "current_side": road["current_side"],
         "current_run_length": road["current_run_length"],
         "current_run_bucket": road["current_run_bucket"],
@@ -696,15 +682,14 @@ def update_and_predict_engine(
     retention_lambda = _adaptive_retention_lambda(sequence, float(decay))
     decay_intensity = 1.0 - retention_lambda
 
-    # A change point no longer discards the old shoe and trains on only six hands.
-    # The existing lambda=0.72 change-point decay already gives the most recent
-    # observations much more weight while keeping older transitions as weak context.
-    training_sequence = sequence
-    focus_applied = bool(regime_profile["change_point"])
-    focus_mode = (
-        "soft_recent_refocus_full_history"
-        if focus_applied else "normal_full_history"
-    )
+    # On a change point, deliberately rebuild only from the last 6 hands.
+    # This is the requested "forget old history and refocus recent 4-6 hands".
+    if regime_profile["change_point"]:
+        training_sequence = sequence[-RECENT_FOCUS_WINDOW:]
+        focus_applied = True
+    else:
+        training_sequence = sequence
+        focus_applied = False
 
     weighted_table, raw_table = _build_transition_tables(
         training_sequence,
@@ -786,9 +771,7 @@ def update_and_predict_engine(
         "retention_lambda": float(retention_lambda),
         "decay_intensity": float(decay_intensity),
         "focus_applied": bool(focus_applied),
-        "focus_mode": focus_mode,
         "focus_window": int(RECENT_FOCUS_WINDOW if focus_applied else 0),
-        "focus_history_preserved": True,
         "training_sample_count": int(len(training_sequence)),
         "regime": str(regime_profile["regime"]),
         "regime_profile": dict(regime_profile),
