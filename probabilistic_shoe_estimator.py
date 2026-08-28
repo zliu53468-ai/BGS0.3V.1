@@ -6,6 +6,11 @@ them on the observed B/P/T history, and can additionally apply a *soft* total-ca
 (depth) likelihood when a screenshot/session supplies a plausible remaining-card
 estimate.
 
+After particle conditioning, the posterior may be conservatively calibrated against
+the repository's 5M remaining-shoe state database.  That database contains only
+composition/depth statistics; it is not a road-pattern or sequence model and its
+influence is strictly capped inside the Shoe channel.
+
 The total remaining-card count constrains how many 4/5/6-card hands the simulated
 history could have consumed. It does not reveal the identities of the remaining cards.
 """
@@ -17,7 +22,9 @@ import math
 import random
 import statistics
 
-MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-CONDITIONED"
+from shoe_state_db_calibrator import calibrate_particle_shoe_with_database
+
+MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-5M-DB-CALIBRATED"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 DECKS = 8
@@ -452,6 +459,16 @@ def estimate_probabilistic_shoe(
         sum(ess_ratios) / len(ess_ratios) if ess_ratios else 1.0
     )
 
+    particle_probabilities = dict(probabilities)
+    probabilities, database_calibration = calibrate_particle_shoe_with_database(
+        particle_probabilities=particle_probabilities,
+        particles=particles,
+        decks=decks,
+        conditioned_rounds=conditioned_rounds,
+        mean_ess_ratio=mean_ess_ratio,
+        depth_constraint=depth_constraint,
+    )
+
     bp_mass = probabilities["B"] + probabilities["P"]
     if bp_mass > 1e-12:
         p_b_resolved = probabilities["B"] / bp_mass
@@ -509,10 +526,15 @@ def estimate_probabilistic_shoe(
 
     entropy_bits = _entropy(probabilities)
     direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
-    inference_semantics = (
+    base_semantics = (
         "outcome_and_soft_depth_conditioned_particle_posterior_not_exact_remaining_cards"
         if depth_constraint.get("applied")
         else "outcome_conditioned_particle_posterior_not_exact_remaining_cards"
+    )
+    inference_semantics = (
+        base_semantics + "_plus_bounded_5m_remaining_shoe_state_calibration"
+        if database_calibration.get("applied")
+        else base_semantics
     )
 
     return {
@@ -520,6 +542,8 @@ def estimate_probabilistic_shoe(
         "available": bool(conditioned_rounds > 0 and particles),
         "direction": direction,
         "probabilities": probabilities,
+        "particle_probabilities_before_database": particle_probabilities,
+        "database_calibration": database_calibration,
         "bp_conditional_probabilities": {
             "B": float(p_b_resolved),
             "P": float(p_p_resolved),
