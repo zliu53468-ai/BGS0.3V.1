@@ -1,9 +1,13 @@
 """Screenshot adapter for the BGS quant predictor.
 
-The image pipeline preserves chronological B/P/T outcomes and now forwards a
-plausible screenshot/session remaining-card total into the probabilistic shoe
-posterior as a *soft depth constraint*. The total card count never becomes an
-exact composition claim.
+The image pipeline preserves chronological B/P/T outcomes. For the LINE/screenshot
+workflow, remaining-card depth is re-estimated from the full observed history on every
+analysis instead of trusting a rolling session total such as "previous remaining - 5".
+A user-supplied exact remaining point-count vector remains authoritative.
+
+This keeps the PR32 Shoe diagnostics (current remaining-card posterior and next-hand
+4/5/6-card consumption distribution) while preventing guessed per-round card usage from
+feeding back into the next Shoe posterior.
 """
 from __future__ import annotations
 
@@ -105,6 +109,23 @@ def predict_from_screenshot(
 
     model_shoe_context = dict(shoe_context or {})
 
+    # The normal LINE/screenshot workflow always carries initial_image_history
+    # and/or manual_outcome_history. In that mode the Shoe depth must be rebuilt
+    # from the complete B/P/T history on every button press. A legacy rolling
+    # screen/session total (for example previous remaining - 5) is diagnostic
+    # only and must not become a soft depth constraint.
+    history_reestimate_mode = bool(
+        initial_raw
+        or manual_raw
+        or metadata.get("manual_update")
+        or metadata.get("history_reestimate_mode")
+    )
+
+    try:
+        legacy_screen_remaining = int(remaining_cards or 0)
+    except (TypeError, ValueError):
+        legacy_screen_remaining = 0
+
     # Priority 1: explicitly verified remaining point-counts. We still pass only
     # their total to this depth channel; exact composition remains a separate
     # evidence type and is never fabricated from a screenshot.
@@ -121,21 +142,21 @@ def predict_from_screenshot(
                 "user_exact_remaining_counts_total"
             )
 
-    # Priority 2: screenshot/session total. The particle estimator itself performs
-    # a 4..6-cards-per-round physical plausibility check, so a stale/default 416
-    # after many observed rounds is automatically rejected.
-    if "remaining_cards" not in model_shoe_context:
-        try:
-            screen_remaining = int(remaining_cards or 0)
-        except (TypeError, ValueError):
-            screen_remaining = 0
-        if screen_remaining > 0:
-            model_shoe_context["remaining_cards"] = screen_remaining
-            model_shoe_context.setdefault("remaining_cards_reliability", 0.65)
-            model_shoe_context.setdefault(
-                "remaining_cards_source",
-                "screenshot_or_session_total_soft_depth",
-            )
+    # Priority 2 (compatibility only): callers outside the normal screenshot
+    # history flow may still explicitly supply a total as soft depth evidence.
+    # The LINE/screenshot flow intentionally skips this branch so every press
+    # re-estimates depth from the full current history.
+    if (
+        "remaining_cards" not in model_shoe_context
+        and not history_reestimate_mode
+        and legacy_screen_remaining > 0
+    ):
+        model_shoe_context["remaining_cards"] = legacy_screen_remaining
+        model_shoe_context.setdefault("remaining_cards_reliability", 0.65)
+        model_shoe_context.setdefault(
+            "remaining_cards_source",
+            "explicit_screen_total_soft_depth",
+        )
 
     result = predict(
         history=combined_raw,
@@ -150,16 +171,56 @@ def predict_from_screenshot(
 
     shoe_estimate = dict(result.get("probabilistic_shoe_estimate") or {})
     depth_constraint = dict(shoe_estimate.get("depth_constraint") or {})
+    next_hand_draw_profile = dict(shoe_estimate.get("next_hand_draw_profile") or {})
+
+    try:
+        posterior_remaining = int(round(float(
+            result.get("estimated_remaining_cards")
+            or shoe_estimate.get("expected_remaining_cards")
+            or 0.0
+        )))
+    except (TypeError, ValueError):
+        posterior_remaining = 0
+
+    exact_remaining_supplied = bool(
+        isinstance(model_shoe_context.get("remaining_counts"), (list, tuple))
+        and len(model_shoe_context.get("remaining_counts") or []) == 10
+    )
+    if exact_remaining_supplied:
+        remaining_source = "user_exact_remaining_counts_total"
+    elif history_reestimate_mode:
+        remaining_source = "full_history_particle_posterior"
+    else:
+        remaining_source = str(
+            model_shoe_context.get("remaining_cards_source") or ""
+        )
+
+    reported_remaining = (
+        posterior_remaining
+        if history_reestimate_mode and posterior_remaining > 0
+        else legacy_screen_remaining
+    )
+
     result.update({
-        "screen_pipeline_version": "THREEWAY-MARKOV-SHOE-DEPTH-SCREEN-V3",
-        "mode": "screen_quant_markov_depth_conditioned_shoe",
+        "screen_pipeline_version": "THREEWAY-MARKOV-SHOE-HISTORY-DEPTH-SCREEN-V4",
+        "mode": (
+            "screen_quant_markov_history_reestimated_shoe"
+            if history_reestimate_mode
+            else "screen_quant_markov_depth_conditioned_shoe"
+        ),
         "shoe_id": str(shoe_id or ""),
-        "screen_remaining_cards": int(remaining_cards or 0),
+        "screen_remaining_cards": int(reported_remaining),
+        "legacy_screen_remaining_cards_input": int(legacy_screen_remaining),
+        "history_reestimated_remaining_cards": bool(history_reestimate_mode),
+        "history_depth_semantics": (
+            "full_current_bpt_history_recomputed_each_analysis_not_rolling_fixed_decrement"
+        ),
         "estimated_remaining_counts": list(
             shoe_estimate.get("expected_remaining_counts") or []
         ),
+        "next_hand_draw_profile": next_hand_draw_profile,
         "composition_source": (
-            "outcome_conditioned_particle_posterior_plus_soft_screen_depth"
+            "outcome_conditioned_particle_posterior_plus_verified_depth"
             if depth_constraint.get("applied")
             else "outcome_conditioned_particle_posterior"
         ),
@@ -170,12 +231,10 @@ def predict_from_screenshot(
             depth_constraint.get("applied", False)
         ),
         "screen_depth_constraint": depth_constraint,
-        "remaining_cards_source": str(
-            model_shoe_context.get("remaining_cards_source") or ""
-        ),
-        "exact_remaining_counts_supplied": bool(
-            isinstance(model_shoe_context.get("remaining_counts"), (list, tuple))
-            and len(model_shoe_context.get("remaining_counts") or []) == 10
+        "remaining_cards_source": remaining_source,
+        "exact_remaining_counts_supplied": exact_remaining_supplied,
+        "legacy_screen_remaining_ignored_for_shoe": bool(
+            history_reestimate_mode and not exact_remaining_supplied
         ),
         "prior_counts_ignored": prior_counts_ignored,
         "observed_cards_ignored": observed_cards_ignored,
@@ -213,8 +272,11 @@ def predict_from_screenshot(
                 "manual_round_count": len(manual_raw),
                 "combined_round_count": len(combined_raw),
                 "shoe_id": str(shoe_id or ""),
+                "history_reestimated_remaining_cards": bool(history_reestimate_mode),
                 "prediction_pipeline": (
-                    "support_markov_derived_road_depth_conditioned_shoe_v3"
+                    "support_markov_derived_road_history_reestimated_shoe_v4"
+                    if history_reestimate_mode
+                    else "support_markov_derived_road_depth_conditioned_shoe_v3"
                 ),
             },
         )
