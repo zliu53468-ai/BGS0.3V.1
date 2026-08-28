@@ -9,9 +9,11 @@ estimate.
 The total remaining-card count constrains how many 4/5/6-card hands the simulated
 history could have consumed. It does not reveal the identities of the remaining cards.
 
-The same next-hand simulations now retain their 4/5/6-card consumption and remaining-
-card totals as diagnostics. These diagnostics describe uncertainty in shoe depth only;
-they do not add a separate directional vote and do not alter the existing B/P/T fusion.
+The same next-hand simulations retain their 4/5/6-card consumption and remaining-card
+totals as diagnostics. The strengthened Shoe layer also scales the default particle
+population with shoe depth, tracks cumulative consumption uncertainty across observed
+rounds, and can only down-weight Shoe fusion when the particle direction is unstable.
+It never increases the existing maximum Shoe fusion weight.
 """
 from __future__ import annotations
 
@@ -24,11 +26,16 @@ import statistics
 # Keep MODEL_VERSION stable because it is part of the deterministic RNG seed.
 MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-CONDITIONED"
 DRAW_DIAGNOSTICS_VERSION = "SHOE-DRAW-DIAGNOSTICS-V1"
+SHOE_STRENGTHENING_VERSION = "SHOE-ADAPTIVE-PARTICLE-PATH-UNCERTAINTY-V1"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 DECKS = 8
 
 PARTICLE_COUNT = 64
+ADAPTIVE_PARTICLE_MID = 96
+ADAPTIVE_PARTICLE_HIGH = 128
+ADAPTIVE_PARTICLE_MID_ROUNDS = 24
+ADAPTIVE_PARTICLE_HIGH_ROUNDS = 48
 LIKELIHOOD_DRAWS = 6
 NEXT_HAND_DRAWS_PER_PARTICLE = 12
 MAX_REJECTION_DRAWS = 64
@@ -244,6 +251,46 @@ def _shoe_phase(start_cards: int, expected_remaining_cards: float) -> Dict[str, 
     }
 
 
+def _select_adaptive_particle_count(
+    requested_count: int,
+    sequence_length: int,
+) -> tuple[int, Dict[str, Any]]:
+    """Increase default particle resolution as 4/5/6-card path ambiguity grows.
+
+    A non-default explicit particle count remains an override for compatibility.
+    The adaptive tiers only apply when the caller uses the historical default of 64.
+    """
+    requested = max(24, min(160, int(requested_count)))
+    if requested != PARTICLE_COUNT:
+        return requested, {
+            "adaptive": False,
+            "requested_count": int(requested),
+            "effective_count": int(requested),
+            "reason": "explicit_particle_count_override",
+        }
+
+    rounds = max(0, int(sequence_length))
+    if rounds >= ADAPTIVE_PARTICLE_HIGH_ROUNDS:
+        effective = ADAPTIVE_PARTICLE_HIGH
+        reason = "deep_shoe_more_consumption_paths"
+    elif rounds >= ADAPTIVE_PARTICLE_MID_ROUNDS:
+        effective = ADAPTIVE_PARTICLE_MID
+        reason = "mid_shoe_more_consumption_paths"
+    else:
+        effective = PARTICLE_COUNT
+        reason = "early_shoe_default_resolution"
+
+    return effective, {
+        "adaptive": True,
+        "requested_count": int(requested),
+        "effective_count": int(effective),
+        "mid_round_threshold": int(ADAPTIVE_PARTICLE_MID_ROUNDS),
+        "high_round_threshold": int(ADAPTIVE_PARTICLE_HIGH_ROUNDS),
+        "reason": reason,
+        "semantics": "resolution_scaling_only_not_directional_evidence",
+    }
+
+
 def _apply_soft_depth_constraint(
     particles: list[list[int]],
     *,
@@ -369,12 +416,14 @@ def estimate_probabilistic_shoe(
 ) -> Dict[str, Any]:
     full_sequence = _clean_threeway(history)
     sequence = full_sequence[-MAX_CONDITIONING_ROUNDS:]
-    particle_count = max(24, min(160, int(particle_count)))
+    particle_count, adaptive_particle_profile = _select_adaptive_particle_count(
+        particle_count,
+        len(sequence),
+    )
     decks = max(1, min(16, int(decks)))
     start_cards = 52 * decks
 
-    # Keep the base outcome-conditioned particle population deterministic for a
-    # given history. A rejected depth estimate must not change the RNG path.
+    # Deterministic for a given history and effective particle resolution.
     seed_material = (
         f"{MODEL_VERSION}|{decks}|{particle_count}|{''.join(sequence)}"
     ).encode("utf-8")
@@ -385,6 +434,8 @@ def estimate_probabilistic_shoe(
     ess_ratios: list[float] = []
     conditioned_rounds = 0
     rejection_fallbacks = 0
+    consumption_path_widths: list[float] = []
+    consumption_path_expected_used: list[float] = []
 
     for observed in sequence:
         advanced: list[list[int]] = []
@@ -445,6 +496,19 @@ def estimate_probabilistic_shoe(
         ess_ratios.append(min(1.0, ess / len(advanced)))
         particles = _systematic_resample(advanced, weights, rng)
         conditioned_rounds += 1
+
+        round_remaining_totals = [
+            float(sum(int(x) for x in particle)) for particle in particles
+        ]
+        round_remaining_interval = _card_interval(round_remaining_totals)
+        consumption_path_widths.append(
+            float(round_remaining_interval.get("width_p90_p10", 0.0) or 0.0)
+        )
+        if round_remaining_totals:
+            mean_remaining = sum(round_remaining_totals) / len(round_remaining_totals)
+            consumption_path_expected_used.append(
+                max(0.0, float(start_cards) - float(mean_remaining))
+            )
 
     particles, depth_constraint = _apply_soft_depth_constraint(
         particles,
@@ -528,6 +592,12 @@ def estimate_probabilistic_shoe(
     remaining_cards_interval = _card_interval(remaining_totals)
     remaining_cards_interval["semantics"] = (
         "posterior_particle_interval_not_exact_remaining_card_count"
+    )
+    used_cards_interval = _card_interval(
+        [max(0.0, float(start_cards) - value) for value in remaining_totals]
+    )
+    used_cards_interval["semantics"] = (
+        "posterior_cumulative_consumption_interval_not_exact_cards_used"
     )
 
     total_card_count_samples = sum(next_hand_card_counts.values())
@@ -615,7 +685,7 @@ def estimate_probabilistic_shoe(
     else:
         depth_factor = 1.0
 
-    reliability = min(
+    pre_gate_reliability = min(
         MAX_FUSION_WEIGHT,
         MAX_FUSION_WEIGHT
         * history_factor
@@ -624,19 +694,76 @@ def estimate_probabilistic_shoe(
         * stability_factor
         * depth_factor,
     )
+
+    path_width = float(remaining_cards_interval.get("width_p90_p10", 0.0) or 0.0)
+    maximum_consumption_spread = max(4.0, 2.0 * max(1, conditioned_rounds))
+    path_uncertainty_ratio = _clip(path_width / maximum_consumption_spread)
+    path_precision = 1.0 - path_uncertainty_ratio
+    agreement_strength = _clip((consensus - 0.50) / 0.20)
+    stability_strength = _clip((stability - 0.20) / 0.65)
+    uncertainty_gate = _clip(
+        agreement_strength
+        * (0.55 + 0.45 * stability_strength)
+        * (0.75 + 0.25 * path_precision)
+    )
+
+    reliability = min(
+        MAX_FUSION_WEIGHT,
+        max(0.0, pre_gate_reliability * uncertainty_gate),
+    )
     fusion_weight = float(reliability)
+
+    recent_path_widths = consumption_path_widths[-12:]
+    consumption_path_profile = {
+        "tracked_rounds": int(len(consumption_path_widths)),
+        "cumulative_cards_used_interval": used_cards_interval,
+        "current_remaining_cards_interval": remaining_cards_interval,
+        "mean_interval_width": float(
+            statistics.mean(consumption_path_widths)
+            if consumption_path_widths else 0.0
+        ),
+        "max_interval_width": float(
+            max(consumption_path_widths) if consumption_path_widths else 0.0
+        ),
+        "recent_mean_interval_width": float(
+            statistics.mean(recent_path_widths) if recent_path_widths else 0.0
+        ),
+        "latest_expected_cards_used": float(
+            consumption_path_expected_used[-1]
+            if consumption_path_expected_used else expected_cards_used
+        ),
+        "path_uncertainty_ratio": float(path_uncertainty_ratio),
+        "path_precision": float(path_precision),
+        "semantics": (
+            "posterior_4_5_6_card_consumption_path_uncertainty_not_exact_card_tracking"
+        ),
+    }
+    shoe_uncertainty_gate = {
+        "applied": True,
+        "gate": float(uncertainty_gate),
+        "pre_gate_reliability": float(pre_gate_reliability),
+        "post_gate_reliability": float(reliability),
+        "direction_consensus": float(consensus),
+        "agreement_strength": float(agreement_strength),
+        "posterior_stability": float(stability),
+        "stability_strength": float(stability_strength),
+        "path_precision": float(path_precision),
+        "only_downweights": True,
+        "semantics": "uncertain_shoe_evidence_is_suppressed_not_amplified",
+    }
 
     entropy_bits = _entropy(probabilities)
     direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
     inference_semantics = (
-        "outcome_and_soft_depth_conditioned_particle_posterior_not_exact_remaining_cards"
+        "outcome_and_soft_depth_conditioned_adaptive_particle_posterior_with_uncertainty_gate"
         if depth_constraint.get("applied")
-        else "outcome_conditioned_particle_posterior_not_exact_remaining_cards"
+        else "outcome_conditioned_adaptive_particle_posterior_with_uncertainty_gate"
     )
 
     return {
         "model_version": MODEL_VERSION,
         "draw_diagnostics_version": DRAW_DIAGNOSTICS_VERSION,
+        "shoe_strengthening_version": SHOE_STRENGTHENING_VERSION,
         "available": bool(conditioned_rounds > 0 and particles),
         "direction": direction,
         "probabilities": probabilities,
@@ -648,6 +775,7 @@ def estimate_probabilistic_shoe(
         "conditioned_rounds": int(conditioned_rounds),
         "history_truncated": len(full_sequence) > len(sequence),
         "particle_count": int(len(particles)),
+        "adaptive_particle_profile": adaptive_particle_profile,
         "likelihood_draws_per_particle": int(LIKELIHOOD_DRAWS),
         "next_hand_draws_per_particle": int(NEXT_HAND_DRAWS_PER_PARTICLE),
         "expected_remaining_counts": [float(x) for x in expected_counts],
@@ -657,12 +785,15 @@ def estimate_probabilistic_shoe(
         "expected_remaining_decks": expected_remaining_cards / 52.0,
         "expected_cards_used": expected_cards_used,
         "mean_cards_per_conditioned_round": float(mean_cards_per_round),
+        "consumption_path_profile": consumption_path_profile,
         "next_hand_draw_profile": next_hand_draw_profile,
         "next_remaining_cards_interval": next_remaining_cards_interval,
         "shoe_phase": phase,
         "mean_ess_ratio": float(mean_ess_ratio),
         "rejection_fallbacks": int(rejection_fallbacks),
         "entropy_bits": float(entropy_bits),
+        "pre_uncertainty_gate_reliability": float(pre_gate_reliability),
+        "shoe_uncertainty_gate": shoe_uncertainty_gate,
         "reliability": float(reliability),
         "fusion_weight": fusion_weight,
         "max_fusion_weight": float(MAX_FUSION_WEIGHT),
@@ -688,6 +819,7 @@ def estimate_probabilistic_shoe(
 __all__ = [
     "MODEL_VERSION",
     "DRAW_DIAGNOSTICS_VERSION",
+    "SHOE_STRENGTHENING_VERSION",
     "MAX_FUSION_WEIGHT",
     "DEPTH_DEFAULT_RELIABILITY",
     "estimate_probabilistic_shoe",
