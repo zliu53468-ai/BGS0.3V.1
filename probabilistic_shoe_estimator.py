@@ -21,7 +21,9 @@ import math
 import random
 import statistics
 
-MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3.1-DEPTH-DRAW-COUNT-DIAGNOSTICS"
+# Keep MODEL_VERSION stable because it is part of the deterministic RNG seed.
+MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-CONDITIONED"
+DRAW_DIAGNOSTICS_VERSION = "SHOE-DRAW-DIAGNOSTICS-V1"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 DECKS = 8
@@ -204,7 +206,7 @@ def _quantile(values: Sequence[float], quantile: float) -> float:
     )
 
 
-def _card_interval(values: Sequence[float]) -> Dict[str, float]:
+def _card_interval(values: Sequence[float]) -> Dict[str, Any]:
     if not values:
         return {"p10": 0.0, "p50": 0.0, "p90": 0.0, "width_p90_p10": 0.0}
     p10 = _quantile(values, 0.10)
@@ -634,6 +636,7 @@ def estimate_probabilistic_shoe(
 
     return {
         "model_version": MODEL_VERSION,
+        "draw_diagnostics_version": DRAW_DIAGNOSTICS_VERSION,
         "available": bool(conditioned_rounds > 0 and particles),
         "direction": direction,
         "probabilities": probabilities,
@@ -684,6 +687,7 @@ def estimate_probabilistic_shoe(
 
 __all__ = [
     "MODEL_VERSION",
+    "DRAW_DIAGNOSTICS_VERSION",
     "MAX_FUSION_WEIGHT",
     "DEPTH_DEFAULT_RELIABILITY",
     "estimate_probabilistic_shoe",
