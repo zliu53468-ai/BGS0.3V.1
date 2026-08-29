@@ -6,9 +6,13 @@ resolved B/P posterior clears the break-even threshold after commission.
 If Edge <= 0:
     bet_ratio = 0
 
-If Edge > 0:
+If Edge > 0 and expected EV clears the active minimum-EV gate:
     target_ratio = Edge * volatility_adjustment
     final_ratio = clip(target_ratio, 5%, 30%)
+
+The optional ``minimum_expected_ev`` argument is a policy-controlled safety gate.
+Its default is 0.0, preserving the legacy positive-Edge behavior. Dynamic policy
+may temporarily raise it (for example, immediately after a long-streak break).
 
 The full Kelly fraction is retained as a diagnostic/risk ceiling reference.
 """
@@ -128,10 +132,12 @@ class MoneyManagementModel:
         probabilities: Mapping[str, Any],
         final_weight: float,
         bankroll: float = 0.0,
+        minimum_expected_ev: float = 0.0,
     ) -> dict[str, Any]:
         direction = str(direction or "").upper().strip()
         final_weight = _clip(final_weight)
         bankroll = max(0.0, float(bankroll or 0.0))
+        minimum_expected_ev = max(0.0, float(minimum_expected_ev or 0.0))
         p_tie = _clip(probabilities.get("T", 0.0))
 
         p_win_resolved, _, _ = self._resolved_probability(
@@ -152,16 +158,34 @@ class MoneyManagementModel:
             final_weight=final_weight,
         )
 
+        payout = BANKER_NET_PAYOUT if direction == "B" else PLAYER_NET_PAYOUT
+        expected_value_per_unit = (
+            payout * p_win_resolved - (1.0 - p_win_resolved)
+            if direction in {"B", "P"} else 0.0
+        )
+        expected_ev_pass = bool(
+            direction in {"B", "P"}
+            and expected_value_per_unit >= minimum_expected_ev
+        )
+
         # Requested capital rule:
         #   target bankroll fraction = Edge * volatility_adjustment.
         edge_target_ratio = max(0.0, edge) * volatility_adjustment
 
         # Keep Kelly as a diagnostic. The requested 5%-30% floor/cap applies
-        # only after the Edge gate has opened.
-        if edge <= 0.0 or direction not in {"B", "P"}:
+        # only after both the Edge gate and the active expected-EV gate open.
+        if direction not in {"B", "P"}:
+            final_bet_ratio = 0.0
+            bet_allowed = False
+            reason = "invalid_direction_no_bet"
+        elif edge <= 0.0:
             final_bet_ratio = 0.0
             bet_allowed = False
             reason = "negative_or_zero_edge_no_bet"
+        elif not expected_ev_pass:
+            final_bet_ratio = 0.0
+            bet_allowed = False
+            reason = "below_minimum_expected_ev_no_bet"
         else:
             final_bet_ratio = max(
                 MIN_BET_RATIO,
@@ -177,11 +201,6 @@ class MoneyManagementModel:
 
         bet_amount = bankroll * final_bet_ratio
         tie_risk_active = p_tie > HIGH_TIE_THRESHOLD
-        payout = BANKER_NET_PAYOUT if direction == "B" else PLAYER_NET_PAYOUT
-        expected_value_per_unit = (
-            payout * p_win_resolved - (1.0 - p_win_resolved)
-            if direction in {"B", "P"} else 0.0
-        )
 
         return {
             "direction": direction,
@@ -191,6 +210,8 @@ class MoneyManagementModel:
             "edge": float(edge),
             "edge_percent": float(edge * 100.0),
             "expected_value_per_unit": float(expected_value_per_unit),
+            "minimum_expected_ev": float(minimum_expected_ev),
+            "expected_ev_pass": bool(expected_ev_pass),
             "kelly_fraction": float(raw_kelly),
             "volatility_adjustment": float(volatility_adjustment),
             "edge_target_ratio": float(edge_target_ratio),
