@@ -1,26 +1,19 @@
-"""BGS 動態預測決策政策層。
+"""BGS dynamic prediction policy.
 
-本模組不改寫任何既有預測模型，只負責在模型完成各自分析後，依指定規則
-動態調整證據權重與投注決策：
+This layer keeps the existing Markov / HSMM / Derived Road / Hazard / Shoe
+implementations intact and changes only the early-shoe decision policy:
 
-1. Shoe Progress Weight
-   - <= 20 局：降低 Shoe 物理證據權重，讓牌路證據相對優先。
-   - 21~40 局：維持原始融合權重。
-   - > 40 局：提高 Shoe 物理證據權重，降低牌路家族的最終信心。
-2. Skip Gate
-   - 最終 B/P resolved confidence < 55% 時輸出 SKIP。
-3. +EV Gate
-   - 只有經濟 posterior 的勝率 × 含本金總回報倍率 > 1 才允許下注。
-4. HSMM / Entropy Penalty
-   - Regime transition / posterior uncertainty / entropy 偏高時，只降低牌路家族信心。
-5. Online Performance Feedback
-   - 追蹤同一使用者最近 5 個已結算 B/P 方向；若最近連錯 >= 2 局，
-     將牌路家族信心乘以 0.5。
+- Hands 1..30: Global Prior Smoothing
+    Final_P = (1-alpha) * P_global + alpha * P_local
+    alpha = current_hand / 30
+- Hands 1..30: no 55% confidence SKIP gate; the selected B/P side only needs
+  resolved confidence >= 50%, while the physical minimum expected value is
+  fixed at 0.002 (0.2%).
+- Hands 1..25: B/P-conditional logit Temperature Scaling with T=0.7 after
+  final fusion/global-prior smoothing. Tie mass is preserved.
 
-重要：
-- 不修改 Markov、HSMM、Derived Road、Hazard、Shoe 的模型輸出。
-- 不建立追莊、反莊、追閒、反閒的硬規則。
-- direction 仍保留 B/P；是否實際出手由 decision=B/P/SKIP 控制。
+The existing shoe-progress weighting, HSMM/entropy confidence calibration and
+recent-user feedback remain policy inputs. They do not become direct B/P votes.
 """
 from __future__ import annotations
 
@@ -29,28 +22,36 @@ from threading import local
 from typing import Any, Iterable, Mapping, Sequence
 import math
 
+from markov_model import (
+    GLOBAL_PRIOR_PROBABILITIES,
+    GLOBAL_PRIOR_SMOOTH_MAX_ROUNDS,
+    blend_with_global_prior,
+)
 from money_management import BANKER_NET_PAYOUT, PLAYER_NET_PAYOUT
 from pattern_survival import PHYSICAL_PRIOR
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "DYNAMIC-SHOE-SKIP-EV-ONLINE-V1"
+POLICY_VERSION = "DYNAMIC-GLOBAL-PRIOR-EARLY-ACTIVE-V2"
 
 EARLY_SHOE_MAX_ROUNDS = 20
 LATE_SHOE_MIN_ROUNDS = 41
 MIN_DIRECTION_CONFIDENCE = 0.55
+EARLY_MIN_DIRECTION_CONFIDENCE = 0.50
+PHYSICAL_MIN_EV = 0.002
+EARLY_ACTIVE_MAX_ROUNDS = 30
+TEMPERATURE_SCALING_MAX_ROUNDS = 25
+EARLY_TEMPERATURE = 0.70
+
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
 ONLINE_CONFIDENCE_DECAY = 0.50
 
-# 使用者指定的局數動態方向：前期降低物理證據，中後期提高物理證據。
 EARLY_SHOE_WEIGHT_FACTOR = 0.50
 MID_SHOE_WEIGHT_FACTOR = 1.00
 LATE_SHOE_WEIGHT_FACTOR = 1.50
 EARLY_ROAD_WEIGHT_FACTOR = 1.00
 MID_ROAD_WEIGHT_FACTOR = 1.00
 LATE_ROAD_WEIGHT_FACTOR = 0.70
-
-# 內建 particle Shoe 原始上限為 0.30；晚期允許動態提高至 0.45。
 DYNAMIC_INTERNAL_SHOE_RELIABILITY_CAP = 0.45
 
 _TLS = local()
@@ -79,9 +80,8 @@ def _normalize(values: Mapping[str, Any]) -> dict[str, float]:
 
 
 def _bp_direction(probabilities: Mapping[str, Any]) -> str:
-    b = float(probabilities.get("B", 0.0) or 0.0)
-    p = float(probabilities.get("P", 0.0) or 0.0)
-    return "B" if b >= p else "P"
+    probs = _normalize(probabilities)
+    return "B" if probs["B"] >= probs["P"] else "P"
 
 
 def _resolved_probability(probabilities: Mapping[str, Any], side: str) -> float:
@@ -104,7 +104,6 @@ def _blend_probabilities(
     target: Mapping[str, Any],
     factor: float,
 ) -> dict[str, float]:
-    """factor=0 回到 base；factor=1 完整保留 target。"""
     w = _clip(factor)
     left = _normalize(base)
     right = _normalize(target)
@@ -125,6 +124,63 @@ def _history_round_count(history: str | Iterable[Any]) -> int:
             for item in history
         )
     return 0
+
+
+def _temperature_scale_bp(
+    probabilities: Mapping[str, Any],
+    temperature: float,
+) -> dict[str, float]:
+    """Temperature-scale resolved B/P odds while preserving Tie mass."""
+    probs = _normalize(probabilities)
+    t = max(1e-6, float(temperature))
+    bp_mass = probs["B"] + probs["P"]
+    if bp_mass <= 1e-12 or abs(t - 1.0) <= 1e-12:
+        return probs
+
+    p_b = _clip(probs["B"] / bp_mass, 1e-9, 1.0 - 1e-9)
+    p_p = 1.0 - p_b
+    exponent = 1.0 / t
+    score_b = p_b ** exponent
+    score_p = p_p ** exponent
+    score_total = score_b + score_p
+    if score_total <= 1e-12:
+        return probs
+
+    scaled_b = score_b / score_total
+    return _normalize({
+        "B": bp_mass * scaled_b,
+        "P": bp_mass * (1.0 - scaled_b),
+        "T": probs["T"],
+    })
+
+
+def _apply_early_probability_policy(
+    probabilities: Mapping[str, Any],
+    *,
+    rounds: int,
+    history: str | Iterable[Any],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Global-prior smoothing followed by T=0.7 scaling in hands 1..25."""
+    local = _normalize(probabilities)
+    smoothed, global_diag = blend_with_global_prior(
+        local,
+        rounds,
+        history=history,
+    )
+    temperature_applied = bool(0 < rounds <= TEMPERATURE_SCALING_MAX_ROUNDS)
+    final = (
+        _temperature_scale_bp(smoothed, EARLY_TEMPERATURE)
+        if temperature_applied
+        else dict(smoothed)
+    )
+    return final, {
+        "global_prior": global_diag,
+        "temperature_applied": temperature_applied,
+        "temperature": float(EARLY_TEMPERATURE if temperature_applied else 1.0),
+        "temperature_max_rounds": int(TEMPERATURE_SCALING_MAX_ROUNDS),
+        "before_temperature": dict(smoothed),
+        "after_temperature": dict(final),
+    }
 
 
 def shoe_progress_policy(rounds: int) -> dict[str, Any]:
@@ -163,7 +219,6 @@ def recent_user_direction_feedback(
     *,
     limit: int = ONLINE_WINDOW,
 ) -> dict[str, Any]:
-    """讀取同一使用者最近已結算方向，只做信心衰減，不反向學習。"""
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -207,7 +262,7 @@ def recent_user_direction_feedback(
 
     correct = sum(int(item["correct"]) for item in recent)
     consecutive_losses = 0
-    for item in recent:  # recent 是由最新往舊排列
+    for item in recent:
         if item["correct"]:
             break
         consecutive_losses += 1
@@ -229,11 +284,9 @@ def recent_user_direction_feedback(
 
 
 def _entropy_regime_penalty(result: Mapping[str, Any]) -> dict[str, Any]:
-    """HSMM 轉換/不確定性高且 entropy 高時，單向降低牌路可信度。"""
     markov = dict(result.get("markov") or {})
     pattern = dict(result.get("pattern_survival") or {})
     hidden = dict(pattern.get("hidden_regime") or {})
-
     try:
         entropy_bits = float(markov.get("entropy_bits", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -246,7 +299,6 @@ def _entropy_regime_penalty(result: Mapping[str, Any]) -> dict[str, Any]:
         float(hidden.get("posterior_concentration", 0.0) or 0.0)
     )
     uncertainty = max(transition_probability, 1.0 - concentration)
-
     penalty = _clip(1.0 - 0.50 * entropy_norm * uncertainty, 0.50, 1.0)
     return {
         "factor": float(penalty),
@@ -262,7 +314,6 @@ def _effective_shoe_reliability(raw: float, progress: Mapping[str, Any]) -> floa
     original = _clip(raw)
     factor = float(progress.get("shoe_weight_factor", 1.0) or 1.0)
     adjusted = original * factor
-    # 一般 particle shoe 原始上限 <= 0.30；晚期最多提高至 0.45。
     if original <= 0.3000001:
         return _clip(adjusted, 0.0, DYNAMIC_INTERNAL_SHOE_RELIABILITY_CAP)
     return _clip(adjusted)
@@ -272,49 +323,68 @@ def _decision_gate(
     direction_probs: Mapping[str, Any],
     economic_probs: Mapping[str, Any],
     direction: str,
+    *,
+    rounds: int,
 ) -> dict[str, Any]:
     side = str(direction or "").upper().strip()
+    early_active = bool(0 < rounds <= EARLY_ACTIVE_MAX_ROUNDS)
+    minimum_confidence = (
+        EARLY_MIN_DIRECTION_CONFIDENCE if early_active else MIN_DIRECTION_CONFIDENCE
+    )
+    min_ev = PHYSICAL_MIN_EV if early_active else 0.0
+
     if side not in {"B", "P"}:
         return {
             "decision": "SKIP",
             "allowed": False,
             "reason": "skip_unresolved_direction",
             "resolved_confidence": 0.5,
-            "minimum_confidence": MIN_DIRECTION_CONFIDENCE,
-            "ev_product": 0.0,
+            "minimum_confidence": float(minimum_confidence),
+            "physical_min_ev": float(min_ev),
+            "expected_net_ev": 0.0,
             "ev_pass": False,
+            "early_active_policy": early_active,
         }
 
     resolved_confidence = _resolved_probability(direction_probs, side)
     economic_probability = _resolved_probability(economic_probs, side)
     net_payout = BANKER_NET_PAYOUT if side == "B" else PLAYER_NET_PAYOUT
     gross_return_multiplier = 1.0 + net_payout
-    ev_product = economic_probability * gross_return_multiplier
+    expected_net_ev = economic_probability * gross_return_multiplier - 1.0
+    ev_product = 1.0 + expected_net_ev
 
-    confidence_pass = resolved_confidence >= MIN_DIRECTION_CONFIDENCE
-    ev_pass = ev_product > 1.0
+    confidence_pass = resolved_confidence >= minimum_confidence
+    ev_pass = expected_net_ev >= min_ev
     allowed = bool(confidence_pass and ev_pass)
     if not confidence_pass:
         reason = "skip_low_direction_confidence"
     elif not ev_pass:
-        reason = "skip_nonpositive_expected_value"
+        reason = "skip_below_physical_min_ev"
     else:
-        reason = "direction_confidence_and_positive_ev_pass"
+        reason = "early_active_direction_and_ev_pass" if early_active else "direction_confidence_and_positive_ev_pass"
 
     return {
         "decision": side if allowed else "SKIP",
         "allowed": allowed,
         "reason": reason,
         "direction": side,
+        "rounds": int(rounds),
+        "early_active_policy": early_active,
         "resolved_confidence": float(resolved_confidence),
-        "minimum_confidence": float(MIN_DIRECTION_CONFIDENCE),
+        "minimum_confidence": float(minimum_confidence),
         "confidence_pass": bool(confidence_pass),
         "economic_resolved_probability": float(economic_probability),
         "net_payout": float(net_payout),
         "gross_return_multiplier": float(gross_return_multiplier),
         "ev_product": float(ev_product),
+        "expected_net_ev": float(expected_net_ev),
+        "physical_min_ev": float(min_ev),
         "ev_pass": bool(ev_pass),
-        "rule": "resolved_confidence>=0.55_and_probability_times_gross_return>1",
+        "rule": (
+            "hands_1_30_confidence>=0.50_and_expected_net_ev>=0.002"
+            if early_active
+            else "resolved_confidence>=0.55_and_expected_net_ev>=0"
+        ),
     }
 
 
@@ -353,16 +423,12 @@ def _install_engine_wrapper() -> None:
         bankroll: float = 0.0,
     ) -> dict[str, Any]:
         remaining = dict(remaining_card_state or {})
-        rounds = max(
-            0,
-            int(remaining.get("conditioned_rounds", 0) or 0),
-        )
+        rounds = max(0, int(remaining.get("conditioned_rounds", 0) or 0))
         if rounds <= 0:
             rounds = _history_round_count(history)
         progress = shoe_progress_policy(rounds)
         effective_shoe_reliability = _effective_shoe_reliability(
-            float(shoe_reliability or 0.0),
-            progress,
+            float(shoe_reliability or 0.0), progress
         )
 
         raw_result = original_predict(
@@ -396,9 +462,7 @@ def _install_engine_wrapper() -> None:
             float(progress.get("road_weight_factor", 1.0) or 1.0)
         )
         road_confidence_factor = _clip(
-            road_progress_factor
-            * float(entropy_penalty["factor"])
-            * online_factor
+            road_progress_factor * float(entropy_penalty["factor"]) * online_factor
         )
 
         raw_road_family = dict(
@@ -410,15 +474,18 @@ def _install_engine_wrapper() -> None:
         )
         neutral_road = _neutral_with_same_tie(raw_road_family)
         adjusted_road_family = _blend_probabilities(
-            neutral_road,
-            raw_road_family,
-            road_confidence_factor,
+            neutral_road, raw_road_family, road_confidence_factor
         )
 
-        direction_probs, policy_direction_fusion = self.bayesian_fuse(
+        local_direction_probs, policy_direction_fusion = self.bayesian_fuse(
             adjusted_road_family,
             shoe_probs,
             shoe_reliability=effective_shoe_reliability,
+        )
+        direction_probs, early_direction_policy = _apply_early_probability_policy(
+            local_direction_probs,
+            rounds=rounds,
+            history=history,
         )
         direction = _bp_direction(direction_probs)
 
@@ -430,14 +497,17 @@ def _install_engine_wrapper() -> None:
             or PHYSICAL_PRIOR
         )
         adjusted_economic_road = _blend_probabilities(
-            PHYSICAL_PRIOR,
-            raw_economic_road,
-            road_confidence_factor,
+            PHYSICAL_PRIOR, raw_economic_road, road_confidence_factor
         )
-        economic_probs, policy_economic_fusion = self.bayesian_fuse(
+        local_economic_probs, policy_economic_fusion = self.bayesian_fuse(
             adjusted_economic_road,
             shoe_probs,
             shoe_reliability=effective_shoe_reliability,
+        )
+        economic_probs, early_economic_policy = _apply_early_probability_policy(
+            local_economic_probs,
+            rounds=rounds,
+            history=history,
         )
 
         base_weight = _clip(
@@ -455,7 +525,12 @@ def _install_engine_wrapper() -> None:
             final_weight=effective_weight,
             bankroll=float(bankroll or 0.0),
         )
-        gate = _decision_gate(direction_probs, economic_probs, direction)
+        gate = _decision_gate(
+            direction_probs,
+            economic_probs,
+            direction,
+            rounds=rounds,
+        )
         if not bool(gate["allowed"]):
             money = _zero_money_for_skip(money, str(gate["reason"]))
 
@@ -482,6 +557,7 @@ def _install_engine_wrapper() -> None:
         diagnostics = {
             "version": POLICY_VERSION,
             "shoe_progress": progress,
+            "rounds": int(rounds),
             "raw_shoe_reliability": float(_clip(shoe_reliability)),
             "effective_shoe_reliability": float(effective_shoe_reliability),
             "entropy_penalty": entropy_penalty,
@@ -490,10 +566,18 @@ def _install_engine_wrapper() -> None:
             "road_confidence_factor": float(road_confidence_factor),
             "raw_road_family_probs": _normalize(raw_road_family),
             "adjusted_road_family_probs": dict(adjusted_road_family),
+            "local_direction_probs_before_global_prior": dict(local_direction_probs),
+            "early_direction_policy": early_direction_policy,
+            "local_economic_probs_before_global_prior": dict(local_economic_probs),
+            "early_economic_policy": early_economic_policy,
+            "global_prior_probabilities": dict(GLOBAL_PRIOR_PROBABILITIES),
+            "global_prior_max_rounds": int(GLOBAL_PRIOR_SMOOTH_MAX_ROUNDS),
+            "physical_min_ev_early": float(PHYSICAL_MIN_EV),
             "decision_gate": gate,
             "models_modified": False,
             "policy_semantics": (
-                "dynamic_weight_and_skip_policy_only_models_remain_unchanged"
+                "early_global_prior_smoothing_then_temperature_scaling_"
+                "with_active_0p2pct_ev_gate_models_unchanged"
             ),
         }
         money["dynamic_policy"] = diagnostics
@@ -512,7 +596,7 @@ def _install_engine_wrapper() -> None:
             "direction_text": "莊" if direction == "B" else "閒",
             "direction_margin": float(direction_probs["B"] - direction_probs["P"]),
             "direction_selection": {
-                "source": "dynamic_policy_final_posterior",
+                "source": "dynamic_policy_global_prior_final_posterior",
                 "margin": float(direction_probs["B"] - direction_probs["P"]),
             },
             "road_family_probs_before_dynamic_policy": _normalize(raw_road_family),
@@ -597,6 +681,11 @@ def _install_predictor_wrapper() -> None:
 
         if decision == "SKIP":
             reason = str(gate.get("reason") or money.get("reason") or "skip_policy_gate")
+            minimum_confidence = float(
+                gate.get("minimum_confidence", MIN_DIRECTION_CONFIDENCE)
+                or MIN_DIRECTION_CONFIDENCE
+            )
+            min_ev = float(gate.get("physical_min_ev", 0.0) or 0.0)
             result.update({
                 "recommend": "SKIP",
                 "recommend_text": "觀望",
@@ -614,15 +703,15 @@ def _install_predictor_wrapper() -> None:
                 "signal_status_code": (
                     "SKIP_LOW_CONFIDENCE"
                     if reason == "skip_low_direction_confidence"
-                    else "SKIP_NONPOSITIVE_EV"
-                    if reason == "skip_nonpositive_expected_value"
+                    else "SKIP_BELOW_PHYSICAL_MIN_EV"
+                    if reason == "skip_below_physical_min_ev"
                     else "SKIP_POLICY_GATE"
                 ),
                 "signal_status_text": (
-                    "觀望：最終 B/P 信心未達 55%"
+                    f"觀望：最終 B/P 信心未達 {minimum_confidence * 100:.1f}%"
                     if reason == "skip_low_direction_confidence"
-                    else "觀望：目前未通過正期望值 (+EV) 條件"
-                    if reason == "skip_nonpositive_expected_value"
+                    else f"觀望：預期淨 EV 未達 {min_ev * 100:.2f}%"
+                    if reason == "skip_below_physical_min_ev"
                     else "觀望：目前決策條件不足"
                 ),
             })
@@ -645,7 +734,6 @@ def _install_predictor_wrapper() -> None:
 
 
 def install_dynamic_prediction_policy() -> bool:
-    """在 app 載入前安裝一次；不更動既有函式參數名稱。"""
     global _INSTALLED
     if _INSTALLED:
         return True
@@ -658,6 +746,11 @@ def install_dynamic_prediction_policy() -> bool:
 __all__ = [
     "POLICY_VERSION",
     "MIN_DIRECTION_CONFIDENCE",
+    "EARLY_MIN_DIRECTION_CONFIDENCE",
+    "PHYSICAL_MIN_EV",
+    "EARLY_ACTIVE_MAX_ROUNDS",
+    "TEMPERATURE_SCALING_MAX_ROUNDS",
+    "EARLY_TEMPERATURE",
     "shoe_progress_policy",
     "recent_user_direction_feedback",
     "install_dynamic_prediction_policy",
