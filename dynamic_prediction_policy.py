@@ -1,17 +1,13 @@
-"""Road-only dynamic prediction policy for BGS.
+"""Road-only short-shoe prediction policy for BGS.
 
-This module deliberately keeps the public installation hook and helper names used
-by the runtime, but the decision model is now based only on the Big Road B/P
-sequence.  Exact card composition, OCR output format and transport interfaces are
-not required by this policy.
+Public helper names and return fields are preserved for the existing runtime.
+The formal decision uses only the OCR-derived chronological Big Road B/P history.
+Exact remaining-card counts are not required.
 
-Core policy:
-- variable-order Markov chain (orders 1..4),
-- exponential time decay so recent transitions dominate,
-- deterministic replay of a penalty/observe state,
-- after two consecutive directional misses, force O for at least three resolved
-  B/P rounds while continuing to make virtual forecasts and update the chain,
-- resume only after the recent virtual hit rate is calibrated again.
+The model keeps only the latest 12 resolved B/P rounds so older road history
+cannot dominate a 55-70 round online shoe.  Within that micro window it combines
+a first-order transition estimate with the current same/switch regime, allowing
+single-jump and long-run structures to change direction quickly.
 """
 from __future__ import annotations
 
@@ -21,23 +17,26 @@ import math
 
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "ROAD-ONLY-DECAY-MARKOV-PENALTY-V1"
+POLICY_VERSION = "ROAD-ONLY-SHORT-SHOE-W12-V1"
 
 OUTCOMES = ("B", "P")
-MARKOV_MAX_ORDER = 4
+WINDOW_SIZE = 12
+MARKOV_MAX_ORDER = 1
 MARKOV_DECAY = 0.93
-MARKOV_PRIOR_STRENGTH = 0.75
-MARKOV_MIN_EFFECTIVE_SUPPORT = 1.25
+MARKOV_PRIOR_STRENGTH = 0.50
+MARKOV_MIN_EFFECTIVE_SUPPORT = 0.0
 MIN_HISTORY_FOR_SCORING = 4
 
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
 
+# Compatibility constants retained.  The historical replay penalty no longer
+# has authority to force O; the short sliding window is the adaptation mechanism.
 PENALTY_CONSECUTIVE_MISSES = 2
-PENALTY_MIN_OBSERVE_ROUNDS = 3
-RECOVERY_WINDOW = 3
-RECOVERY_MIN_HITS = 2
-RECOVERY_CONFIDENCE = 0.56
+PENALTY_MIN_OBSERVE_ROUNDS = 0
+RECOVERY_WINDOW = 0
+RECOVERY_MIN_HITS = 0
+RECOVERY_CONFIDENCE = 0.50
 
 EARLY_SHOE_MAX_ROUNDS = 20
 LATE_SHOE_MIN_ROUNDS = 41
@@ -62,7 +61,7 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
-    """Return only chronological B/P outcomes; ties and non-outcomes are ignored."""
+    """Return chronological B/P outcomes; ties and non-outcomes are ignored."""
     if history is None:
         return []
     if isinstance(history, str):
@@ -97,7 +96,10 @@ def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
     return cleaned[-2000:]
 
 
-def _global_decayed_counts(sequence: Sequence[str], decay: float) -> dict[str, float]:
+def _weighted_outcome_counts(
+    sequence: Sequence[str],
+    decay: float,
+) -> dict[str, float]:
     counts = {
         "B": float(MARKOV_PRIOR_STRENGTH),
         "P": float(MARKOV_PRIOR_STRENGTH),
@@ -109,30 +111,194 @@ def _global_decayed_counts(sequence: Sequence[str], decay: float) -> dict[str, f
     return counts
 
 
-def _context_decayed_counts(
+def _transition_counts_for_last(
     sequence: Sequence[str],
-    *,
-    order: int,
     decay: float,
 ) -> tuple[dict[str, float], float, str]:
     counts = {
         "B": float(MARKOV_PRIOR_STRENGTH),
         "P": float(MARKOV_PRIOR_STRENGTH),
     }
-    n = len(sequence)
-    if order <= 0 or n <= order:
-        return counts, 0.0, ""
+    if len(sequence) < 2:
+        return counts, 0.0, sequence[-1] if sequence else ""
 
-    context = tuple(sequence[-order:])
+    state = sequence[-1]
     support = 0.0
-    for index in range(order, n):
-        if tuple(sequence[index - order:index]) != context:
+    n = len(sequence)
+    for index in range(1, n):
+        if sequence[index - 1] != state:
             continue
         age = max(0, n - 1 - index)
         weight = decay ** age
         counts[sequence[index]] += weight
         support += weight
-    return counts, float(support), "".join(context)
+    return counts, float(support), state
+
+
+def _same_switch_probabilities(
+    sequence: Sequence[str],
+    decay: float,
+) -> tuple[float, float, float, float]:
+    """Return P(same), P(switch), raw same support and raw switch support."""
+    same = float(MARKOV_PRIOR_STRENGTH)
+    switch = float(MARKOV_PRIOR_STRENGTH)
+    raw_same = 0.0
+    raw_switch = 0.0
+    n = len(sequence)
+    for index in range(1, n):
+        age = max(0, n - 1 - index)
+        weight = decay ** age
+        if sequence[index] == sequence[index - 1]:
+            same += weight
+            raw_same += weight
+        else:
+            switch += weight
+            raw_switch += weight
+    total = same + switch
+    if total <= 1e-12:
+        return 0.5, 0.5, raw_same, raw_switch
+    return same / total, switch / total, raw_same, raw_switch
+
+
+class ShortShoePredictor:
+    """Micro sliding-window B/P predictor with a hard 12-round memory limit."""
+
+    def __init__(self, window_size: int = WINDOW_SIZE, decay: float = MARKOV_DECAY):
+        self.window_size = max(4, int(window_size or WINDOW_SIZE))
+        self.decay = _clip(decay, 0.50, 1.0)
+
+    def predict(self, history: str | Iterable[Any] | None) -> dict[str, Any]:
+        full_sequence = normalize_big_road(history)
+        sequence = full_sequence[-self.window_size:]
+        n = len(sequence)
+
+        global_counts = _weighted_outcome_counts(sequence, self.decay)
+        global_total = sum(global_counts.values()) or 1.0
+        global_probs = {
+            "B": global_counts["B"] / global_total,
+            "P": global_counts["P"] / global_total,
+        }
+
+        if n == 0:
+            probabilities = {"B": 0.5, "P": 0.5}
+            transition_counts = {
+                "B": float(MARKOV_PRIOR_STRENGTH),
+                "P": float(MARKOV_PRIOR_STRENGTH),
+            }
+            support = 0.0
+            state_key = ""
+            same_prob = 0.5
+            switch_prob = 0.5
+            raw_same = 0.0
+            raw_switch = 0.0
+        elif n == 1:
+            probabilities = dict(global_probs)
+            transition_counts = {
+                "B": float(MARKOV_PRIOR_STRENGTH),
+                "P": float(MARKOV_PRIOR_STRENGTH),
+            }
+            support = 0.0
+            state_key = sequence[-1]
+            same_prob = 0.5
+            switch_prob = 0.5
+            raw_same = 0.0
+            raw_switch = 0.0
+        else:
+            transition_counts, support, state_key = _transition_counts_for_last(
+                sequence,
+                self.decay,
+            )
+            transition_total = sum(transition_counts.values()) or 1.0
+            transition_probs = {
+                "B": transition_counts["B"] / transition_total,
+                "P": transition_counts["P"] / transition_total,
+            }
+
+            same_prob, switch_prob, raw_same, raw_switch = _same_switch_probabilities(
+                sequence,
+                self.decay,
+            )
+            last = sequence[-1]
+            opposite = "P" if last == "B" else "B"
+            regime_probs = {
+                last: same_prob,
+                opposite: switch_prob,
+            }
+
+            # Current-state transitions get the larger vote; the same/switch
+            # regime makes single-jump or dragon changes react within this window.
+            context_weight = min(0.70, 0.45 + 0.08 * min(3.0, support))
+            regime_weight = 1.0 - context_weight
+            probabilities = {
+                side: (
+                    context_weight * transition_probs[side]
+                    + regime_weight * regime_probs[side]
+                )
+                for side in OUTCOMES
+            }
+
+        total = probabilities["B"] + probabilities["P"]
+        if total <= 1e-12:
+            probabilities = {"B": 0.5, "P": 0.5}
+        else:
+            probabilities = {
+                "B": probabilities["B"] / total,
+                "P": probabilities["P"] / total,
+            }
+
+        direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
+        confidence_prob = float(max(probabilities["B"], probabilities["P"]))
+        margin = float(abs(probabilities["B"] - probabilities["P"]))
+
+        return {
+            "model": "short_shoe_sliding_window_markov",
+            "version": POLICY_VERSION,
+            "window_size": int(self.window_size),
+            "window_sequence": "".join(sequence),
+            "window_rounds": len(sequence),
+            "history_rounds": len(full_sequence),
+            "sequence_length": len(full_sequence),
+            "decay": float(self.decay),
+            "max_order": 1,
+            "selected_order": 1 if n >= 2 else 0,
+            "state_key": state_key,
+            "effective_support": float(support),
+            "transition_counts": {
+                "B": float(transition_counts["B"]),
+                "P": float(transition_counts["P"]),
+            },
+            "global_counts": {
+                "B": float(global_counts["B"]),
+                "P": float(global_counts["P"]),
+            },
+            "global_probabilities": dict(global_probs),
+            "probabilities": {
+                "B": float(probabilities["B"]),
+                "P": float(probabilities["P"]),
+                "T": 0.0,
+            },
+            "direction": direction,
+            "confidence": confidence_prob,
+            "confidence_prob": confidence_prob,
+            "margin": margin,
+            "same_probability": float(same_prob),
+            "switch_probability": float(switch_prob),
+            "same_support": float(raw_same),
+            "switch_support": float(raw_switch),
+            "order_diagnostics": [
+                {
+                    "order": 1 if n >= 2 else 0,
+                    "context": state_key,
+                    "effective_support": float(support),
+                    "counts": dict(transition_counts),
+                    "probabilities": {
+                        "B": float(probabilities["B"]),
+                        "P": float(probabilities["P"]),
+                    },
+                    "window_size": int(self.window_size),
+                }
+            ],
+        }
 
 
 def decayed_markov_forecast(
@@ -141,212 +307,50 @@ def decayed_markov_forecast(
     decay: float = MARKOV_DECAY,
     max_order: int = MARKOV_MAX_ORDER,
 ) -> dict[str, Any]:
-    """Forecast the next B/P result from a time-decayed variable-order Markov chain."""
-    sequence = normalize_big_road(history)
-    decay = _clip(decay, 0.50, 0.999)
-    max_order = max(1, min(8, int(max_order or MARKOV_MAX_ORDER)))
-
-    global_counts = _global_decayed_counts(sequence, decay)
-    global_total = sum(global_counts.values()) or 1.0
-    global_probs = {
-        "B": global_counts["B"] / global_total,
-        "P": global_counts["P"] / global_total,
-    }
-
-    selected_order = 0
-    selected_context = ""
-    selected_support = 0.0
-    selected_counts = dict(global_counts)
-    selected_probs = dict(global_probs)
-    order_diagnostics: list[dict[str, Any]] = []
-
-    highest = min(max_order, max(1, len(sequence) - 1))
-    for order in range(highest, 0, -1):
-        counts, support, context = _context_decayed_counts(
-            sequence,
-            order=order,
-            decay=decay,
-        )
-        total = sum(counts.values()) or 1.0
-        probabilities = {
-            "B": counts["B"] / total,
-            "P": counts["P"] / total,
-        }
-        order_diagnostics.append({
-            "order": order,
-            "context": context,
-            "effective_support": float(support),
-            "counts": dict(counts),
-            "probabilities": dict(probabilities),
-        })
-        if support >= MARKOV_MIN_EFFECTIVE_SUPPORT:
-            selected_order = order
-            selected_context = context
-            selected_support = support
-            selected_counts = counts
-            selected_probs = probabilities
-            break
-
-    if selected_order == 0:
-        counts, support, context = _context_decayed_counts(
-            sequence,
-            order=1,
-            decay=decay,
-        )
-        if len(sequence) >= 2:
-            total = sum(counts.values()) or 1.0
-            one_step = {
-                "B": counts["B"] / total,
-                "P": counts["P"] / total,
-            }
-            blend = _clip(support / max(MARKOV_MIN_EFFECTIVE_SUPPORT, 1e-9))
-            selected_probs = {
-                side: blend * one_step[side] + (1.0 - blend) * global_probs[side]
-                for side in OUTCOMES
-            }
-            selected_order = 1
-            selected_context = context
-            selected_support = support
-            selected_counts = counts
-
-    total_prob = selected_probs["B"] + selected_probs["P"]
-    if total_prob <= 1e-12:
-        selected_probs = {"B": 0.5, "P": 0.5}
-    else:
-        selected_probs = {
-            "B": selected_probs["B"] / total_prob,
-            "P": selected_probs["P"] / total_prob,
-        }
-
-    direction = "B" if selected_probs["B"] >= selected_probs["P"] else "P"
-    confidence = float(max(selected_probs.values()))
-    margin = float(abs(selected_probs["B"] - selected_probs["P"]))
-
-    return {
-        "model": "time_decay_variable_order_markov",
-        "version": POLICY_VERSION,
-        "sequence_length": len(sequence),
-        "decay": float(decay),
-        "max_order": int(max_order),
-        "selected_order": int(selected_order),
-        "state_key": selected_context,
-        "effective_support": float(selected_support),
-        "transition_counts": {
-            "B": float(selected_counts["B"]),
-            "P": float(selected_counts["P"]),
-        },
-        "global_counts": {
-            "B": float(global_counts["B"]),
-            "P": float(global_counts["P"]),
-        },
-        "global_probabilities": dict(global_probs),
-        "probabilities": {
-            "B": float(selected_probs["B"]),
-            "P": float(selected_probs["P"]),
-            "T": 0.0,
-        },
-        "direction": direction,
-        "confidence": confidence,
-        "margin": margin,
-        "order_diagnostics": order_diagnostics,
-    }
+    """Compatibility entrypoint backed by the 12-round ShortShoePredictor."""
+    del max_order
+    return ShortShoePredictor(window_size=WINDOW_SIZE, decay=decay).predict(history)
 
 
 def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
-    """Replay model forecasts to derive the current deterministic observe state."""
-    consecutive_misses = 0
-    observe_remaining = 0
-    recovery_pending = False
-    virtual_results: list[bool] = []
-    official_scored = 0
-    official_hits = 0
-    triggers = 0
-    last_virtual_confidence = 0.5
-
-    for index in range(MIN_HISTORY_FOR_SCORING, len(sequence)):
-        prefix = sequence[:index]
-        actual = sequence[index]
-        forecast = decayed_markov_forecast(prefix)
-        predicted = str(forecast["direction"])
-        correct = predicted == actual
-        last_virtual_confidence = float(forecast["confidence"])
-
-        if observe_remaining > 0 or recovery_pending:
-            virtual_results.append(bool(correct))
-            if observe_remaining > 0:
-                observe_remaining -= 1
-
-            if observe_remaining <= 0:
-                window = virtual_results[-RECOVERY_WINDOW:]
-                hits = sum(1 for item in window if item)
-                calibrated = (
-                    len(window) >= RECOVERY_WINDOW
-                    and hits >= RECOVERY_MIN_HITS
-                )
-                if calibrated:
-                    recovery_pending = False
-                    consecutive_misses = 0
-                else:
-                    recovery_pending = True
-            continue
-
-        official_scored += 1
-        if correct:
-            official_hits += 1
-            consecutive_misses = 0
-        else:
-            consecutive_misses += 1
-            if consecutive_misses >= PENALTY_CONSECUTIVE_MISSES:
-                triggers += 1
-                observe_remaining = PENALTY_MIN_OBSERVE_ROUNDS
-                recovery_pending = False
-                virtual_results = []
-                consecutive_misses = 0
-
-    recent_virtual = virtual_results[-RECOVERY_WINDOW:]
-    recent_virtual_hits = sum(1 for item in recent_virtual if item)
-    active = observe_remaining > 0 or recovery_pending
+    """Compatibility payload only; sliding-window adaptation replaces replay O."""
+    del sequence
     return {
-        "active": bool(active),
-        "force_observe": bool(active),
-        "observe_remaining": int(observe_remaining),
-        "recovery_pending": bool(recovery_pending),
-        "consecutive_misses": int(consecutive_misses),
-        "trigger_count": int(triggers),
-        "official_scored": int(official_scored),
-        "official_hits": int(official_hits),
-        "official_accuracy": float(official_hits / max(1, official_scored)),
-        "virtual_sample_count": len(virtual_results),
-        "recent_virtual_sample_count": len(recent_virtual),
-        "recent_virtual_hits": int(recent_virtual_hits),
-        "recent_virtual_accuracy": float(
-            recent_virtual_hits / max(1, len(recent_virtual))
-        ),
-        "minimum_observe_rounds": int(PENALTY_MIN_OBSERVE_ROUNDS),
-        "recovery_window": int(RECOVERY_WINDOW),
-        "recovery_min_hits": int(RECOVERY_MIN_HITS),
-        "recovery_confidence": float(RECOVERY_CONFIDENCE),
-        "semantics": (
-            "two_consecutive_misses_then_minimum_three_virtual_rounds_"
-            "and_recover_only_after_virtual_hit_rate_recalibrates"
-        ),
+        "active": False,
+        "force_observe": False,
+        "observe_remaining": 0,
+        "recovery_pending": False,
+        "consecutive_misses": 0,
+        "trigger_count": 0,
+        "official_scored": 0,
+        "official_hits": 0,
+        "official_accuracy": 0.0,
+        "virtual_sample_count": 0,
+        "recent_virtual_sample_count": 0,
+        "recent_virtual_hits": 0,
+        "recent_virtual_accuracy": 0.0,
+        "minimum_observe_rounds": 0,
+        "recovery_window": 0,
+        "recovery_min_hits": 0,
+        "recovery_confidence": 0.50,
+        "semantics": "disabled_short_shoe_sliding_window_handles_regime_change",
     }
 
 
 def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """Return road-only next-round probabilities plus penalty-observe state."""
+    """Return short-window road-only next-round probabilities."""
     sequence = normalize_big_road(history)
     forecast = decayed_markov_forecast(sequence)
     penalty = _replay_penalty_state(sequence)
     direction = str(forecast["direction"])
-    action = "O" if penalty["active"] else direction
     return {
         **forecast,
-        "action": action,
-        "action_text": "觀望" if action == "O" else ("莊" if action == "B" else "閒"),
+        "action": direction,
+        "action_text": "莊" if direction == "B" else "閒",
         "latent_direction": direction,
+        "confidence_prob": float(forecast["confidence_prob"]),
         "penalty_observe": penalty,
-        "big_road_sequence": "".join(sequence),
+        "big_road_sequence": str(forecast.get("window_sequence") or ""),
     }
 
 
@@ -373,7 +377,7 @@ def recent_user_direction_feedback(
     *,
     limit: int = ONLINE_WINDOW,
 ) -> dict[str, Any]:
-    """Compatibility diagnostic only; it does not vote on the next direction."""
+    """Compatibility diagnostic only; it never gates the short-window forecast."""
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -424,21 +428,15 @@ def recent_user_direction_feedback(
         "correct_count": int(correct),
         "accuracy": float(correct / max(1, len(recent))),
         "consecutive_losses": int(consecutive_losses),
-        "triggered": bool(
-            consecutive_losses >= ONLINE_CONSECUTIVE_LOSS_TRIGGER
-        ),
+        "triggered": False,
         "window": int(ONLINE_WINDOW),
         "loss_trigger": int(ONLINE_CONSECUTIVE_LOSS_TRIGGER),
-        "semantics": "diagnostic_only_road_model_replay_controls_penalty_state",
+        "semantics": "diagnostic_only_no_observe_gate",
     }
 
 
 def install_dynamic_prediction_policy() -> bool:
-    """Compatibility installation hook used by runtime_app.
-
-    The predictor imports and calls :func:`road_only_policy` directly, so no
-    monkey-patching of OCR, screenshot, transport or quant-engine code is needed.
-    """
+    """Compatibility installation hook used by runtime_app."""
     global _INSTALLED
     _INSTALLED = True
     return True
@@ -446,6 +444,7 @@ def install_dynamic_prediction_policy() -> bool:
 
 __all__ = [
     "POLICY_VERSION",
+    "WINDOW_SIZE",
     "MARKOV_MAX_ORDER",
     "MARKOV_DECAY",
     "MIN_DIRECTION_CONFIDENCE",
@@ -454,6 +453,7 @@ __all__ = [
     "EARLY_ACTIVE_MAX_ROUNDS",
     "TEMPERATURE_SCALING_MAX_ROUNDS",
     "EARLY_TEMPERATURE",
+    "ShortShoePredictor",
     "normalize_big_road",
     "decayed_markov_forecast",
     "road_only_policy",
