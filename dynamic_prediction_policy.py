@@ -188,8 +188,6 @@ def decayed_markov_forecast(
             break
 
     if selected_order == 0:
-        # Sparse context: blend the one-step context (when available) with the
-        # recent global base rate instead of returning an uninformative 50/50.
         counts, support, context = _context_decayed_counts(
             sequence,
             order=1,
@@ -284,7 +282,7 @@ def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
                 calibrated = (
                     len(window) >= RECOVERY_WINDOW
                     and hits >= RECOVERY_MIN_HITS
-                ) or last_virtual_confidence >= RECOVERY_CONFIDENCE
+                )
                 if calibrated:
                     recovery_pending = False
                     consecutive_misses = 0
@@ -330,7 +328,7 @@ def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
         "recovery_confidence": float(RECOVERY_CONFIDENCE),
         "semantics": (
             "two_consecutive_misses_then_minimum_three_virtual_rounds_"
-            "and_recover_after_virtual_accuracy_or_confidence_recalibrates"
+            "and_recover_only_after_virtual_hit_rate_recalibrates"
         ),
     }
 
