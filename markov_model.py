@@ -1,12 +1,14 @@
 """Support-aware variable-order three-way Markov predictor for BGS.
 
-V3.2 keeps the stable V3 road/regime design and adds:
-- explicit order-1..4 transition counters,
-- support-threshold backoff (K=4, alpha=0.75),
-- 12-hand entropy change-point detection,
-- regime-aware adaptive forgetting with 4-6 hand refocus,
-- Bayesian/Dirichlet smoothing,
-- nested road coarse/full auxiliary state without double counting.
+V3.3 keeps the stable V3.2 road/regime design and replaces hard single-order
+backoff with a conservative hierarchical blend across order-1..4 contexts:
+- every available order contributes according to raw/effective support,
+- higher-order specificity is rewarded only modestly,
+- posterior entropy slightly calibrates each order's contribution,
+- cross-order direction disagreement shrinks the aggregate toward the prior,
+- sparse high-order contexts can contribute but cannot abruptly take control,
+- nested road coarse/full auxiliary state remains single-selected to avoid
+  double counting.
 
 This is a stochastic history model. It does not imply deterministic baccarat
 patterns or guaranteed future outcomes.
@@ -19,19 +21,26 @@ import math
 
 from shoe_depth_estimator import ShoeDepthEstimator
 
-MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-SUPPORT-BACKOFF-V3.2-QUANT-CANDIDATE"
+MODEL_VERSION = "THREEWAY-VARIABLE-ORDER-MULTIORDER-BLEND-V3.3-QUANT-CANDIDATE"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 
 MAX_ORDER = 4
 SUPPORT_THRESHOLD = 4
-BACKOFF_ALPHA = 0.75
+BACKOFF_ALPHA = 0.75  # legacy compatibility diagnostic; no hard backoff in V3.3.
 BAYES_PRIOR_STRENGTH = 6.0
 DECAY = 0.95  # legacy name: this is retention lambda, not decay intensity.
 MAX_ENTROPY = math.log2(3.0)
 ENTROPY_WINDOW = 12
 ENTROPY_SPIKE_THRESHOLD = 0.22
 RECENT_FOCUS_WINDOW = 6
+
+# Multi-order blend calibration. These values only control how the Markov
+# hierarchy combines its own correlated order-1..4 contexts; they do not add a
+# new model or a new fusion channel.
+_ORDER_SPECIFICITY_STEP = 0.08
+_ORDER_ENTROPY_FLOOR = 0.75
+_ORDER_AGREEMENT_SHRINK_FLOOR = 0.65
 
 _ROAD_SUPPORT_SCALE = {"road_coarse": 5.0, "road_full": 8.0}
 _ROAD_ALPHA_CAP = {"road_coarse": 0.34, "road_full": 0.26}
@@ -371,8 +380,8 @@ def _build_transition_tables(
 
     For a transition with age a:
         effective_count = lambda ** a
-    Raw support remains the literal number of observations and is used for the
-    K=4 backoff gate.
+    Raw support remains the literal number of observations and is retained for
+    compatibility diagnostics and blend reliability calibration.
     """
     weighted: Dict[str, Dict[str, float]] = defaultdict(_new_counts)
     raw: Dict[str, Dict[str, float]] = defaultdict(_new_counts)
@@ -444,6 +453,14 @@ def _direction_vote(probabilities: Mapping[str, float]) -> str:
     return "B" if float(probabilities["B"]) >= float(probabilities["P"]) else "P"
 
 
+def _entropy(probabilities: Mapping[str, float]) -> float:
+    value = 0.0
+    for outcome in OUTCOMES:
+        p = max(1e-15, min(1.0, float(probabilities[outcome])))
+        value -= p * math.log2(p)
+    return float(value)
+
+
 def _support_aware_markov(
     sequence: list[str],
     weighted_table: Mapping[str, Mapping[str, float]],
@@ -451,27 +468,25 @@ def _support_aware_markov(
     *,
     prior_strength: float,
 ) -> tuple[Dict[str, float], Dict[str, Any]]:
-    """Strict variable-order backoff.
+    """Blend all available order-1..4 contexts instead of hard backoff.
 
-    Start from the highest available order N. If raw support < K, transfer the
-    decision to N-1 and multiply confidence by alpha=0.75 for every backoff step.
+    Each order receives a conservative raw weight from:
+      sqrt(raw_support_reliability * effective_support_reliability)
+      * modest order-specificity factor
+      * modest posterior-certainty factor
 
-        backoff_penalty = alpha ** (# failed higher-order gates)
-
-    The selected lower-order posterior is then shrunk toward the physical prior
-    by that penalty, preventing sparse contexts from looking overconfident.
+    The per-order weights are normalized before averaging, so nested orders are
+    not treated as independent additive votes. The resulting aggregate is then
+    shrunk toward the physical prior using the strongest available support and
+    cross-order B/P agreement. This keeps sparse high orders informative without
+    allowing a single low-support context to abruptly replace lower-order evidence.
     """
     contexts = _context_keys(sequence)
     highest = min(MAX_ORDER, len(sequence))
     details: Dict[str, Any] = {}
-    selected_order = 0
-    selected_name = "physical_prior"
-    selected_counts = _new_counts()
-    selected_posterior = dict(PHYSICAL_PRIOR)
-    penalty = 1.0
-    backoff_steps = 0
+    raw_order_weights: Dict[str, float] = {}
 
-    for order in range(highest, 0, -1):
+    for order in range(1, highest + 1):
         name = f"order_{order}"
         key = contexts.get(name)
         if not key:
@@ -485,103 +500,156 @@ def _support_aware_markov(
             weighted_counts,
             prior_strength=prior_strength,
         )
-        qualifies = bool(raw_support >= SUPPORT_THRESHOLD)
 
+        raw_support_reliability = _reliability(raw_support, SUPPORT_THRESHOLD)
+        effective_support_reliability = _reliability(
+            effective_support,
+            SUPPORT_THRESHOLD,
+        )
+        support_score = math.sqrt(
+            max(0.0, raw_support_reliability * effective_support_reliability)
+        )
+        posterior_certainty = _clip(1.0 - _entropy(posterior) / MAX_ENTROPY)
+        entropy_factor = _ORDER_ENTROPY_FLOOR + (
+            1.0 - _ORDER_ENTROPY_FLOOR
+        ) * posterior_certainty
+        specificity_factor = 1.0 + _ORDER_SPECIFICITY_STEP * (order - 1)
+        raw_weight = support_score * entropy_factor * specificity_factor
+
+        raw_order_weights[name] = float(raw_weight)
         details[name] = {
             "key": key,
             "raw_support": float(raw_support),
             "effective_support": float(effective_support),
             "support_threshold": int(SUPPORT_THRESHOLD),
-            "qualifies": qualifies,
+            "qualifies": bool(raw_support >= SUPPORT_THRESHOLD),
             "posterior": dict(posterior),
             "counts": weighted_counts,
+            "raw_support_reliability": float(raw_support_reliability),
+            "effective_support_reliability": float(effective_support_reliability),
+            "support_score": float(support_score),
+            "posterior_entropy_bits": float(_entropy(posterior)),
+            "posterior_certainty": float(posterior_certainty),
+            "entropy_factor": float(entropy_factor),
+            "specificity_factor": float(specificity_factor),
+            "raw_blend_weight": float(raw_weight),
         }
 
-        if qualifies:
-            selected_order = order
-            selected_name = name
-            selected_counts = weighted_counts
-            selected_posterior = posterior
-            break
+    weight_total = sum(raw_order_weights.values())
+    if weight_total > 1e-12:
+        normalized_weights = {
+            name: float(weight / weight_total)
+            for name, weight in raw_order_weights.items()
+        }
+    else:
+        normalized_weights = {name: 0.0 for name in raw_order_weights}
 
-        # Only an actual N -> N-1 transfer consumes one backoff penalty.
-        # Order-1 has no lower order, so a sparse O1 is handled as the final
-        # fallback without inventing a fourth backoff step.
-        if order > 1:
-            penalty *= BACKOFF_ALPHA
-            backoff_steps += 1
+    for name, item in details.items():
+        item["blend_weight"] = float(normalized_weights.get(name, 0.0))
 
-    if selected_order == 0:
-        # No order reached K. Use order-1 if it exists; the accumulated penalty
-        # records the uncertainty created by all failed gates.
-        key = contexts.get("order_1")
-        if key:
-            selected_order = 1
-            selected_name = "order_1"
-            selected_counts = dict(weighted_table.get(key, _new_counts()))
-            selected_posterior = _posterior_probabilities(
-                selected_counts,
-                prior_strength=prior_strength,
+    if weight_total <= 1e-12:
+        aggregate = dict(PHYSICAL_PRIOR)
+    else:
+        aggregate = _normalize({
+            outcome: sum(
+                normalized_weights.get(name, 0.0)
+                * float(item["posterior"][outcome])
+                for name, item in details.items()
             )
-        else:
-            penalty = 0.0
+            for outcome in OUTCOMES
+        })
 
-    probability = _blend(PHYSICAL_PRIOR, selected_posterior, penalty)
-
-    # Diagnostics for all lower orders not visited above.
-    for order in range(1, highest + 1):
-        name = f"order_{order}"
-        if name in details:
-            continue
-        key = contexts.get(name)
-        if not key:
-            continue
-        weighted_counts = dict(weighted_table.get(key, _new_counts()))
-        raw_counts = dict(raw_table.get(key, _new_counts()))
-        raw_support = _support(raw_counts)
-        details[name] = {
-            "key": key,
-            "raw_support": float(raw_support),
-            "effective_support": float(_support(weighted_counts)),
-            "support_threshold": int(SUPPORT_THRESHOLD),
-            "qualifies": bool(raw_support >= SUPPORT_THRESHOLD),
-            "posterior": _posterior_probabilities(
-                weighted_counts,
-                prior_strength=prior_strength,
-            ),
-            "counts": weighted_counts,
-        }
-
-    votes: list[tuple[str, float]] = []
-    for order in range(1, highest + 1):
-        item = details.get(f"order_{order}")
-        if not item:
-            continue
-        raw_support = float(item["raw_support"])
-        reliability = _reliability(raw_support, SUPPORT_THRESHOLD)
-        votes.append((_direction_vote(item["posterior"]), reliability))
-
-    vote_total = sum(weight for _, weight in votes)
+    b_weight = sum(
+        raw_order_weights.get(name, 0.0)
+        for name, item in details.items()
+        if _direction_vote(item["posterior"]) == "B"
+    )
+    p_weight = sum(
+        raw_order_weights.get(name, 0.0)
+        for name, item in details.items()
+        if _direction_vote(item["posterior"]) == "P"
+    )
+    vote_total = b_weight + p_weight
     if vote_total <= 1e-12:
         agreement = 0.5
     else:
-        b_weight = sum(weight for vote, weight in votes if vote == "B")
-        p_weight = sum(weight for vote, weight in votes if vote == "P")
         agreement = max(b_weight, p_weight) / vote_total
 
+    max_raw_support = max(
+        [float(item["raw_support"]) for item in details.values()] or [0.0]
+    )
+    max_effective_support = max(
+        [float(item["effective_support"]) for item in details.values()] or [0.0]
+    )
+    raw_strength = _reliability(max_raw_support, SUPPORT_THRESHOLD)
+    effective_strength = _reliability(
+        max_effective_support,
+        SUPPORT_THRESHOLD,
+    )
+    support_strength = math.sqrt(max(0.0, raw_strength * effective_strength))
+    agreement_factor = _ORDER_AGREEMENT_SHRINK_FLOOR + (
+        1.0 - _ORDER_AGREEMENT_SHRINK_FLOOR
+    ) * agreement
+    hierarchical_evidence_strength = _clip(support_strength * agreement_factor)
+    probability = _blend(
+        PHYSICAL_PRIOR,
+        aggregate,
+        hierarchical_evidence_strength,
+    )
+
+    if normalized_weights:
+        selected_name = max(
+            normalized_weights,
+            key=lambda name: (
+                normalized_weights[name],
+                int(name.rsplit("_", 1)[-1]),
+            ),
+        )
+        selected_order = int(selected_name.rsplit("_", 1)[-1])
+        selected_item = details[selected_name]
+        selected_counts = dict(selected_item["counts"])
+        selected_posterior = dict(selected_item["posterior"])
+    else:
+        selected_name = "physical_prior"
+        selected_order = 0
+        selected_counts = _new_counts()
+        selected_posterior = dict(PHYSICAL_PRIOR)
+
+    # Compatibility fields are retained for downstream diagnostics. V3.3 does
+    # not execute hard N->N-1 backoff; backoff_penalty now represents the
+    # conservative hierarchical evidence-strength shrinkage applied to the
+    # multi-order aggregate.
+    backoff_steps = 0
+    backoff_penalty = float(hierarchical_evidence_strength)
+
     return probability, {
-        "mode": "strict_support_aware_variable_order_backoff",
+        "mode": "support_entropy_weighted_multi_order_blend",
         "support_threshold": int(SUPPORT_THRESHOLD),
         "backoff_alpha": float(BACKOFF_ALPHA),
+        "backoff_alpha_legacy_only": True,
         "highest_available_order": int(highest),
         "selected_order": int(selected_order),
         "selected_context": selected_name,
         "backoff_steps": int(backoff_steps),
-        "backoff_penalty": float(penalty),
+        "backoff_penalty": float(backoff_penalty),
         "contexts": details,
         "selected_counts": dict(selected_counts),
         "selected_posterior": dict(selected_posterior),
         "multi_order_agreement": float(agreement),
+        "order_weights": {
+            name: float(weight) for name, weight in normalized_weights.items()
+        },
+        "aggregate_posterior": {
+            outcome: float(aggregate[outcome]) for outcome in OUTCOMES
+        },
+        "hierarchical_evidence_strength": float(hierarchical_evidence_strength),
+        "max_raw_support": float(max_raw_support),
+        "max_effective_support": float(max_effective_support),
+        "agreement_factor": float(agreement_factor),
+        "semantics": (
+            "normalized_correlated_order_blend_then_prior_shrink_"
+            "not_independent_vote_summing"
+        ),
     }
 
 
@@ -659,14 +727,6 @@ def _apply_nested_road(
     }
 
 
-def _entropy(probabilities: Mapping[str, float]) -> float:
-    value = 0.0
-    for outcome in OUTCOMES:
-        p = max(1e-15, min(1.0, float(probabilities[outcome])))
-        value -= p * math.log2(p)
-    return float(value)
-
-
 def update_and_predict_engine(
     history: Iterable[Any],
     *,
@@ -682,8 +742,7 @@ def update_and_predict_engine(
     retention_lambda = _adaptive_retention_lambda(sequence, float(decay))
     decay_intensity = 1.0 - retention_lambda
 
-    # On a change point, deliberately rebuild only from the last 6 hands.
-    # This is the requested "forget old history and refocus recent 4-6 hands".
+    # Keep the existing V3.2 change-point refocus behavior unchanged in this PR.
     if regime_profile["change_point"]:
         training_sequence = sequence[-RECENT_FOCUS_WINDOW:]
         focus_applied = True
@@ -718,7 +777,14 @@ def update_and_predict_engine(
     selected_item = dict(backoff["contexts"].get(f"order_{selected_order}") or {})
     if selected_item:
         selected_raw_support = float(selected_item.get("raw_support", 0.0) or 0.0)
-    support_strength = _reliability(selected_raw_support, SUPPORT_THRESHOLD)
+    support_strength = float(
+        backoff.get(
+            "hierarchical_evidence_strength",
+            _reliability(selected_raw_support, SUPPORT_THRESHOLD),
+        )
+        or 0.0
+    )
+    support_strength = _clip(support_strength)
     regime_stability = float(regime_profile["stability"])
     backoff_penalty = float(backoff["backoff_penalty"])
 
@@ -740,13 +806,19 @@ def update_and_predict_engine(
     effective_support = _support(selected_counts)
 
     hierarchy = {
-        "mode": "support_aware_backoff_plus_nested_road",
+        "mode": "support_weighted_multiorder_blend_plus_nested_road",
+        # Keep the old key name for callers that already inspect this structure.
         "markov_backoff": backoff,
+        "markov_multiorder_blend": backoff,
         "road_selection": road_selection,
         "dominant_context": str(backoff["selected_context"]),
         "dominant_counts": selected_counts,
         "multi_order_agreement": float(agreement),
         "support_strength": float(support_strength),
+        "order_weights": dict(backoff.get("order_weights") or {}),
+        "hierarchical_evidence_strength": float(
+            backoff.get("hierarchical_evidence_strength", 0.0) or 0.0
+        ),
         "max_context_support": float(
             max(
                 [
@@ -760,7 +832,7 @@ def update_and_predict_engine(
 
     return {
         "model_version": MODEL_VERSION,
-        "engine": "THREEWAY_VARIABLE_ORDER_SUPPORT_BACKOFF_MARKOV",
+        "engine": "THREEWAY_VARIABLE_ORDER_MULTIORDER_BLEND_MARKOV",
         "history": sequence,
         "sample_count": len(sequence),
         "state": current_state,
@@ -809,8 +881,13 @@ def update_and_predict_engine(
         "multi_order_agreement": float(agreement),
         "support_strength": float(support_strength),
         "dominant_context": str(backoff["selected_context"]),
+        "order_weights": dict(backoff.get("order_weights") or {}),
+        "hierarchical_evidence_strength": float(
+            backoff.get("hierarchical_evidence_strength", 0.0) or 0.0
+        ),
         "confidence_semantics": (
-            "entropy_support_backoff_regime_maturity_weight_not_win_probability"
+            "entropy_support_multiorder_agreement_regime_maturity_weight_"
+            "not_win_probability"
         ),
     }
 
