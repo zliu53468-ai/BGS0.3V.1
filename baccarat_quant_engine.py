@@ -12,8 +12,16 @@ Direction and bankroll math deliberately use two related posteriors:
 - direction posterior: Banker-neutral B/P baseline, used to choose B vs P;
 - economic posterior: baccarat physical prior + the same evidence, used for Edge.
 
-This prevents baccarat's small natural Banker base-rate advantage from becoming a
-hidden recommendation vote while retaining physical probabilities for EV/sizing.
+This version also applies conservative evidence controls before fusion:
+- nested Markov orders that merely re-express the same active run are treated as
+  correlated evidence rather than independent confirmation;
+- a single latest hand may reduce confidence when it causes a large Markov swing,
+  but it is never mechanically reversed or ignored;
+- run-length Hazard is downweighted when it duplicates the same current-run
+  continuation direction already carried by Markov.
+
+These guards reduce evidence duplication. They do not create an anti-streak rule
+and do not imply deterministic baccarat patterns or guaranteed outcomes.
 """
 from __future__ import annotations
 
@@ -30,6 +38,13 @@ from pattern_survival import (
 from run_length_hazard import analyze_run_length_hazard
 
 _DIRECTION_EPSILON = 1e-12
+_LAST_HAND_MIN_HISTORY = 6
+_LAST_HAND_SHIFT_THRESHOLD = 0.10
+_LAST_HAND_MAX_PENALTY = 0.35
+_SAME_RUN_PER_NESTED_ORDER_PENALTY = 0.10
+_SAME_RUN_MARKOV_FACTOR_FLOOR = 0.70
+_HAZARD_CURRENT_RUN_CORRELATION_FACTOR = 0.55
+_HAZARD_LAST_HAND_SENSITIVITY_FACTOR = 0.75
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -48,6 +63,165 @@ def _normalize(
     if total <= 1e-12:
         return {key: 1.0 / len(keys) for key in keys}
     return {key: raw[key] / total for key in keys}
+
+
+def _clean_history_values(history: str | Iterable[Any]) -> list[str]:
+    values: Iterable[Any]
+    if isinstance(history, str):
+        values = list(history)
+    else:
+        values = history
+
+    result: list[str] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            raw = (
+                item.get("outcome")
+                or item.get("actual")
+                or item.get("actual_outcome")
+                or item.get("virtual_outcome")
+            )
+        else:
+            raw = item
+        value = str(raw or "").upper().strip()
+        if value in {"B", "P", "T"}:
+            result.append(value)
+    return result[-2000:]
+
+
+def _bp_conditional_margin(probabilities: Mapping[str, Any]) -> float:
+    b = max(0.0, float(probabilities.get("B", 0.0) or 0.0))
+    p = max(0.0, float(probabilities.get("P", 0.0) or 0.0))
+    mass = b + p
+    if mass <= 1e-12:
+        return 0.0
+    return float((b - p) / mass)
+
+
+def _bp_direction(probabilities: Mapping[str, Any]) -> str:
+    return "B" if _bp_conditional_margin(probabilities) >= 0.0 else "P"
+
+
+def _shrink_bp_toward_neutral(
+    probabilities: Mapping[str, Any],
+    factor: float,
+) -> dict[str, float]:
+    """Shrink only B/P direction strength while preserving the Tie mass."""
+    normalized = _normalize(
+        {
+            "B": float(probabilities.get("B", 0.0) or 0.0),
+            "P": float(probabilities.get("P", 0.0) or 0.0),
+            "T": float(probabilities.get("T", 0.0) or 0.0),
+        },
+        ("B", "P", "T"),
+    )
+    bp_mass = normalized["B"] + normalized["P"]
+    if bp_mass <= 1e-12:
+        return normalized
+
+    strength = _clip(factor)
+    current_b = normalized["B"] / bp_mass
+    guarded_b = 0.5 + (current_b - 0.5) * strength
+    guarded = {
+        "B": bp_mass * guarded_b,
+        "P": bp_mass * (1.0 - guarded_b),
+        "T": normalized["T"],
+    }
+    return _normalize(guarded, ("B", "P", "T"))
+
+
+def _markov_evidence_guard(
+    history: Sequence[str],
+    markov: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return multiplicative evidence factors without choosing B or P.
+
+    Same-run factor:
+      O1..O4 are nested contexts. During a run such as BBBB, O1=B, O2=BB,
+      O3=BBB and O4=BBBB are correlated descriptions of the same active run.
+      We therefore reduce directional strength as more nested same-run orders
+      become simultaneously available. This is symmetric for Banker and Player.
+
+    Last-hand factor:
+      Compare the current Markov posterior with the posterior before the latest
+      observed hand. If one additional hand creates an unusually large B/P swing
+      without an explicit structural change-point, reduce only the swing strength.
+      The latest hand remains included and no opposite-side rule is introduced.
+    """
+    state = dict(markov.get("state") or {})
+    run_length = max(0, int(state.get("current_run_length", 0) or 0))
+    order_weights = dict(markov.get("order_weights") or {})
+    positive_orders = sum(
+        1
+        for order in range(1, 5)
+        if float(order_weights.get(f"order_{order}", 0.0) or 0.0) > 1e-12
+    )
+    same_run_nested_orders = min(run_length, positive_orders)
+    same_run_factor = 1.0
+    if same_run_nested_orders >= 2:
+        same_run_factor = max(
+            _SAME_RUN_MARKOV_FACTOR_FLOOR,
+            1.0
+            - _SAME_RUN_PER_NESTED_ORDER_PENALTY
+            * (same_run_nested_orders - 1),
+        )
+
+    current_probs = dict(markov.get("probabilities") or {})
+    current_margin = _bp_conditional_margin(current_probs)
+    previous_margin = current_margin
+    shift = 0.0
+    direction_flip = False
+    last_hand_factor = 1.0
+    previous_available = False
+
+    regime_profile = dict(markov.get("regime_profile") or {})
+    structural_break = bool(
+        regime_profile.get("change_point")
+        or regime_profile.get("pattern_break")
+    )
+
+    if len(history) >= _LAST_HAND_MIN_HISTORY:
+        previous_markov = update_and_predict_engine(history[:-1])
+        previous_probs = dict(previous_markov.get("probabilities") or {})
+        previous_margin = _bp_conditional_margin(previous_probs)
+        shift = abs(current_margin - previous_margin)
+        direction_flip = bool(
+            current_margin * previous_margin < 0.0
+            and abs(current_margin) > 1e-9
+            and abs(previous_margin) > 1e-9
+        )
+        previous_available = True
+
+        if not structural_break and shift > _LAST_HAND_SHIFT_THRESHOLD:
+            excess = (shift - _LAST_HAND_SHIFT_THRESHOLD) / max(
+                1e-9,
+                0.40 - _LAST_HAND_SHIFT_THRESHOLD,
+            )
+            penalty = min(_LAST_HAND_MAX_PENALTY, max(0.0, excess) * _LAST_HAND_MAX_PENALTY)
+            if direction_flip:
+                penalty = max(penalty, 0.22)
+            last_hand_factor = max(1.0 - _LAST_HAND_MAX_PENALTY, 1.0 - penalty)
+
+    combined_factor = _clip(same_run_factor * last_hand_factor, 0.50, 1.0)
+    return {
+        "combined_factor": float(combined_factor),
+        "same_run_factor": float(same_run_factor),
+        "same_run_nested_orders": int(same_run_nested_orders),
+        "current_run_length": int(run_length),
+        "positive_order_count": int(positive_orders),
+        "last_hand_factor": float(last_hand_factor),
+        "last_hand_guard_applied": bool(last_hand_factor < 0.999999),
+        "previous_available": bool(previous_available),
+        "current_bp_margin": float(current_margin),
+        "previous_bp_margin": float(previous_margin),
+        "last_hand_margin_shift": float(shift),
+        "last_hand_direction_flip": bool(direction_flip),
+        "structural_break_exemption": bool(structural_break),
+        "semantics": (
+            "confidence_only_correlation_and_last_hand_sensitivity_guard_"
+            "never_forces_opposite_direction"
+        ),
+    }
 
 
 class BaccaratQuantEngine:
@@ -93,12 +267,7 @@ class BaccaratQuantEngine:
         cls,
         probabilities: Mapping[str, Any] | Sequence[float] | None,
     ) -> tuple[dict[str, float] | None, bool]:
-        """Convert a model posterior into evidence relative to baccarat baseline.
-
-        Three-way: L(y) = P_model(y) / P_physical(y).
-        B/P-only: divide by the physical conditional B/P probabilities.
-        A normal base-rate shoe therefore contributes no free Banker direction vote.
-        """
+        """Convert a model posterior into evidence relative to baccarat baseline."""
         probs, has_tie = cls._coerce_probs(probabilities)
         if probs is None:
             return None, False
@@ -300,14 +469,20 @@ class BaccaratQuantEngine:
     ) -> dict[str, Any]:
         install_legacy_app_bankroll_adapter()
 
-        markov = update_and_predict_engine(history)
+        history_values = _clean_history_values(history)
+        markov = update_and_predict_engine(history_values)
         markov_probs = dict(markov["probabilities"])
+        evidence_guard = _markov_evidence_guard(history_values, markov)
+        guarded_raw_markov_probs = _shrink_bp_toward_neutral(
+            markov_probs,
+            float(evidence_guard["combined_factor"]),
+        )
 
         road_analysis: dict[str, Any] = {}
         if road_probs is None:
             try:
                 from road_model import build_road_context
-                road_analysis = dict(build_road_context(history))
+                road_analysis = dict(build_road_context(history_values))
                 candidate = road_analysis.get("derived_markov_likelihood")
                 if isinstance(candidate, Mapping):
                     road_probs = candidate
@@ -317,17 +492,42 @@ class BaccaratQuantEngine:
 
         pattern_survival = calculate_pattern_survival(markov, road_analysis, remaining_card_state)
         survival_score = float(pattern_survival.get("score", 0.0) or 0.0)
-        calibrated_markov_probs = calibrate_markov_probabilities(markov_probs, survival_score)
+        calibrated_markov_probs = calibrate_markov_probabilities(
+            guarded_raw_markov_probs,
+            survival_score,
+        )
 
         raw_road_reliability = _clip(float(road_reliability or 0.0))
         effective_road_reliability = _clip(raw_road_reliability * survival_score)
 
-        hazard_analysis = analyze_run_length_hazard(history)
+        hazard_analysis = analyze_run_length_hazard(history_values)
         hazard_probs = dict(hazard_analysis.get("likelihood") or {})
         raw_hazard_reliability = _clip(float(hazard_analysis.get("reliability", 0.0) or 0.0))
         remaining_state = dict(remaining_card_state or {})
         shoe_stage_factor = _clip(float(remaining_state.get("shoe_stage_factor", 0.70) or 0.70))
-        effective_hazard_reliability = _clip(raw_hazard_reliability * shoe_stage_factor)
+
+        hazard_correlation_factor = 1.0
+        current_side = str(hazard_analysis.get("current_side") or "").upper().strip()
+        current_run_length = int(hazard_analysis.get("current_run_length", 0) or 0)
+        hazard_direction = _bp_direction(hazard_probs) if hazard_probs else ""
+        markov_direction = _bp_direction(calibrated_markov_probs)
+        duplicate_current_run_direction = bool(
+            current_run_length >= 2
+            and current_side in {"B", "P"}
+            and hazard_direction == current_side
+            and markov_direction == current_side
+        )
+        if duplicate_current_run_direction:
+            hazard_correlation_factor *= _HAZARD_CURRENT_RUN_CORRELATION_FACTOR
+        if bool(evidence_guard.get("last_hand_guard_applied")):
+            hazard_correlation_factor *= _HAZARD_LAST_HAND_SENSITIVITY_FACTOR
+        hazard_correlation_factor = _clip(hazard_correlation_factor, 0.25, 1.0)
+
+        effective_hazard_reliability = _clip(
+            raw_hazard_reliability
+            * shoe_stage_factor
+            * hazard_correlation_factor
+        )
 
         direction_probs, fusion = self.bayesian_fuse(
             calibrated_markov_probs,
@@ -347,7 +547,7 @@ class BaccaratQuantEngine:
             shoe_probs=shoe_probs,
         )
 
-        markov_evidence, _ = self._physical_evidence_ratio(markov_probs)
+        markov_evidence, _ = self._physical_evidence_ratio(guarded_raw_markov_probs)
         economic_markov_prior, economic_markov_detail = self._apply_tempered_likelihood(
             PHYSICAL_PRIOR,
             markov_evidence,
@@ -364,7 +564,9 @@ class BaccaratQuantEngine:
         )
 
         pattern_calibrated_weight = _clip(
-            float(markov["final_weight"]) * (0.35 + 0.65 * survival_score)
+            float(markov["final_weight"])
+            * float(evidence_guard["combined_factor"])
+            * (0.35 + 0.65 * survival_score)
         )
         money = self.money.allocate(
             direction=direction,
@@ -387,18 +589,22 @@ class BaccaratQuantEngine:
         fusion.update({
             "pattern_survival": pattern_survival,
             "raw_markov_prior": dict(markov_probs),
+            "guarded_raw_markov_prior": dict(guarded_raw_markov_probs),
+            "markov_evidence_guard": dict(evidence_guard),
             "pattern_calibrated_markov_prior": dict(calibrated_markov_probs),
             "raw_road_reliability": float(raw_road_reliability),
             "pattern_calibrated_road_reliability": float(effective_road_reliability),
             "run_length_hazard": hazard_analysis,
             "raw_hazard_reliability": float(raw_hazard_reliability),
+            "hazard_correlation_factor": float(hazard_correlation_factor),
+            "duplicate_current_run_direction": bool(duplicate_current_run_direction),
             "shoe_stage_calibrated_hazard_reliability": float(effective_hazard_reliability),
             "direction_selection": direction_detail,
             "economic_markov_evidence": economic_markov_detail,
             "economic_posterior": economic_probs,
             "economic_fusion": economic_fusion,
-            "direction_semantics": "banker_neutral_bp_direction_posterior_physical_prior_removed_as_free_vote",
-            "economic_semantics": "physical_baccarat_prior_plus_excess_model_evidence_for_edge_only",
+            "direction_semantics": "banker_neutral_bp_direction_posterior_with_correlated_evidence_guards",
+            "economic_semantics": "physical_baccarat_prior_plus_guarded_excess_model_evidence_for_edge_only",
         })
 
         return {
@@ -407,6 +613,8 @@ class BaccaratQuantEngine:
             "direction_margin": float(direction_probs["B"] - direction_probs["P"]),
             "direction_selection": direction_detail,
             "markov_probs": markov_probs,
+            "guarded_markov_probs": guarded_raw_markov_probs,
+            "markov_evidence_guard": evidence_guard,
             "pattern_calibrated_markov_probs": calibrated_markov_probs,
             "final_probs": direction_probs,
             "direction_probs": direction_probs,
@@ -427,6 +635,7 @@ class BaccaratQuantEngine:
             "run_length_hazard": hazard_analysis,
             "hazard_likelihood": hazard_probs,
             "hazard_reliability": float(effective_hazard_reliability),
+            "hazard_correlation_factor": float(hazard_correlation_factor),
             "fusion": fusion,
             "road_analysis": road_analysis,
         }
@@ -452,6 +661,7 @@ if __name__ == "__main__":
         "direction_probs": example["direction_probs"],
         "economic_probs": example["economic_probs"],
         "run_length_hazard": example["run_length_hazard"],
+        "markov_evidence_guard": example["markov_evidence_guard"],
         "pattern_survival": example["pattern_survival"],
         "dynamic_bet_percentage": example["bet_percentage"],
         "suggested_bet_amount": example["suggested_bet_amount"],
