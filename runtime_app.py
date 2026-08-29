@@ -1,13 +1,20 @@
-"""Runtime entrypoint that preserves the existing FastAPI app while installing
-mandatory 5%-30% three-way Markov bankroll sizing.
+"""Runtime entrypoint for the BGS LINE/FastAPI application.
 
-This avoids rewriting the large LINE/OCR application module. Route functions in
-app.py resolve `_attach_bankroll_advice` at runtime, so replacing that module global
-updates every existing image/manual prediction path.
+The runtime installs the dynamic prediction policy before loading the legacy app.
+The policy changes only evidence weighting / decision gating and leaves Markov,
+HSMM, Derived Road, Hazard and Shoe model implementations unchanged.
+
+Bankroll display now respects SKIP and +EV gating. A rejected signal never gets
+converted back into a mandatory 5%-30% bet by the legacy display adapter.
 """
 from __future__ import annotations
 
 from typing import Any, Mapping
+
+from dynamic_prediction_policy import install_dynamic_prediction_policy
+
+# 必須在 app 載入前安裝，讓 predictor / BaccaratQuantEngine 使用同一套政策。
+install_dynamic_prediction_policy()
 
 import app as legacy_app
 
@@ -18,39 +25,65 @@ def _attach_threeway_bankroll_advice(
 ) -> dict[str, Any]:
     result = dict(prediction or {})
     bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
-    ratio = max(
-        0.05,
-        min(0.30, float(result.get("final_bet_ratio", 0.05) or 0.05)),
-    )
-    amount = bankroll * ratio
-
     money = dict(result.get("money_management") or {})
-    reason_code = str(money.get("reason") or "mandatory_5_30_sizing")
 
-    if bankroll <= 0.0:
-        level = "尚未設定"
-        reason = "請先設定本次分析本金；比例仍固定輸出於 5%-30% 區間。"
-    else:
-        level = "每局必下／5%-30% 動態"
-        reason = (
-            f"final_weight={float(result.get('confidence', 0.0) or 0.0):.3f}；"
-            f"Kelly={float(result.get('kelly_fraction', 0.0) or 0.0):.4f}；"
-            f"final_ratio={ratio:.4f}；"
-            f"mode={reason_code}。"
+    action = str(
+        result.get("action")
+        or result.get("recommend")
+        or result.get("direction")
+        or ""
+    ).upper().strip()
+    core_bet_allowed = bool(
+        money.get(
+            "bet_allowed",
+            result.get("bet_allowed", result.get("signal_allowed", False)),
         )
-        if bool(result.get("tie_risk_active")):
-            reason += " 和局風險偏高已反映在三元機率與資訊熵，但不再觸發觀望。"
+    )
+    skip_active = action == "SKIP" or not core_bet_allowed
+
+    if skip_active:
+        ratio = 0.0
+        amount = 0.0
+        level = "觀望 / SKIP"
+        reason = str(
+            result.get("signal_status_text")
+            or result.get("skip_reason")
+            or money.get("reason")
+            or "目前未通過信心或 +EV 決策閘門。"
+        )
+        risk_gate_open = False
+    else:
+        ratio = max(
+            0.05,
+            min(0.30, float(result.get("final_bet_ratio", 0.05) or 0.05)),
+        )
+        amount = bankroll * ratio
+        risk_gate_open = True
+        if bankroll <= 0.0:
+            level = "尚未設定"
+            reason = "請先設定本次分析本金；方向訊號已通過動態信心與 +EV 閘門。"
+        else:
+            level = "+EV 通過／5%-30% 動態"
+            reason = (
+                f"final_weight={float(result.get('confidence', 0.0) or 0.0):.3f}；"
+                f"Kelly={float(result.get('kelly_fraction', 0.0) or 0.0):.4f}；"
+                f"final_ratio={ratio:.4f}；"
+                f"mode={str(money.get('reason') or 'positive_ev_dynamic_sizing')}。"
+            )
 
     result.update({
         "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
-        "risk_gate_open": True,
-        "mandatory_bet": True,
+        "risk_gate_open": bool(risk_gate_open),
+        "mandatory_bet": False,
         "suggested_bet_amount": float(amount),
+        "bet_amount": float(amount),
         "bet_percentage": float(ratio * 100.0),
+        "final_bet_ratio": float(ratio),
         "bet_level_text": level,
         "bet_reason": reason,
         "screen_edge": round(float(result.get("direction_edge", 0.0) or 0.0), 6),
     })
+
     if isinstance(result.get("money_management"), Mapping):
         result["money_management"] = {
             **dict(result["money_management"]),
@@ -58,8 +91,8 @@ def _attach_threeway_bankroll_advice(
             "final_bet_ratio": float(ratio),
             "bet_percentage": float(ratio * 100.0),
             "bet_amount": float(amount),
-            "bet_allowed": True,
-            "mandatory_bet": True,
+            "bet_allowed": bool(risk_gate_open),
+            "mandatory_bet": False,
         }
     return result
 
