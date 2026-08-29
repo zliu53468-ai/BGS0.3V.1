@@ -1,60 +1,53 @@
-"""BGS dynamic prediction policy.
+"""Road-only dynamic prediction policy for BGS.
 
-This layer keeps the existing Markov / HSMM / Derived Road / Hazard / Shoe
-implementations intact and changes only the early-shoe decision policy:
+This module deliberately keeps the public installation hook and helper names used
+by the runtime, but the decision model is now based only on the Big Road B/P
+sequence.  Exact card composition, OCR output format and transport interfaces are
+not required by this policy.
 
-- Hands 1..30: Global Prior Smoothing
-    Final_P = (1-alpha) * P_global + alpha * P_local
-    alpha = current_hand / 30
-- Hands 1..30: no 55% confidence SKIP gate; the selected B/P side only needs
-  resolved confidence >= 50%, while the physical minimum expected value is
-  fixed at 0.002 (0.2%).
-- Hands 1..25: B/P-conditional logit Temperature Scaling with T=0.7 after
-  final fusion/global-prior smoothing. Tie mass is preserved.
-
-The existing shoe-progress weighting, HSMM/entropy confidence calibration and
-recent-user feedback remain policy inputs. They do not become direct B/P votes.
+Core policy:
+- variable-order Markov chain (orders 1..4),
+- exponential time decay so recent transitions dominate,
+- deterministic replay of a penalty/observe state,
+- after two consecutive directional misses, force O for at least three resolved
+  B/P rounds while continuing to make virtual forecasts and update the chain,
+- resume only after the recent virtual hit rate is calibrated again.
 """
 from __future__ import annotations
 
 from hashlib import sha256
-from threading import local
 from typing import Any, Iterable, Mapping, Sequence
 import math
 
-from markov_model import (
-    GLOBAL_PRIOR_PROBABILITIES,
-    GLOBAL_PRIOR_SMOOTH_MAX_ROUNDS,
-    blend_with_global_prior,
-)
-from money_management import BANKER_NET_PAYOUT, PLAYER_NET_PAYOUT
-from pattern_survival import PHYSICAL_PRIOR
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "DYNAMIC-GLOBAL-PRIOR-EARLY-ACTIVE-V2"
+POLICY_VERSION = "ROAD-ONLY-DECAY-MARKOV-PENALTY-V1"
 
-EARLY_SHOE_MAX_ROUNDS = 20
-LATE_SHOE_MIN_ROUNDS = 41
-MIN_DIRECTION_CONFIDENCE = 0.55
-EARLY_MIN_DIRECTION_CONFIDENCE = 0.50
-PHYSICAL_MIN_EV = 0.002
-EARLY_ACTIVE_MAX_ROUNDS = 30
-TEMPERATURE_SCALING_MAX_ROUNDS = 25
-EARLY_TEMPERATURE = 0.70
+OUTCOMES = ("B", "P")
+MARKOV_MAX_ORDER = 4
+MARKOV_DECAY = 0.93
+MARKOV_PRIOR_STRENGTH = 0.75
+MARKOV_MIN_EFFECTIVE_SUPPORT = 1.25
+MIN_HISTORY_FOR_SCORING = 4
 
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
-ONLINE_CONFIDENCE_DECAY = 0.50
 
-EARLY_SHOE_WEIGHT_FACTOR = 0.50
-MID_SHOE_WEIGHT_FACTOR = 1.00
-LATE_SHOE_WEIGHT_FACTOR = 1.50
-EARLY_ROAD_WEIGHT_FACTOR = 1.00
-MID_ROAD_WEIGHT_FACTOR = 1.00
-LATE_ROAD_WEIGHT_FACTOR = 0.70
-DYNAMIC_INTERNAL_SHOE_RELIABILITY_CAP = 0.45
+PENALTY_CONSECUTIVE_MISSES = 2
+PENALTY_MIN_OBSERVE_ROUNDS = 3
+RECOVERY_WINDOW = 3
+RECOVERY_MIN_HITS = 2
+RECOVERY_CONFIDENCE = 0.56
 
-_TLS = local()
+EARLY_SHOE_MAX_ROUNDS = 20
+LATE_SHOE_MIN_ROUNDS = 41
+MIN_DIRECTION_CONFIDENCE = 0.50
+EARLY_MIN_DIRECTION_CONFIDENCE = 0.50
+PHYSICAL_MIN_EV = 0.0
+EARLY_ACTIVE_MAX_ROUNDS = 30
+TEMPERATURE_SCALING_MAX_ROUNDS = 0
+EARLY_TEMPERATURE = 1.0
+
 _INSTALLED = False
 
 
@@ -68,149 +61,312 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, number))
 
 
-def _normalize(values: Mapping[str, Any]) -> dict[str, float]:
-    raw = {
-        key: max(1e-12, float(values.get(key, 0.0) or 0.0))
-        for key in ("B", "P", "T")
-    }
-    total = sum(raw.values())
-    if total <= 1e-12:
-        return dict(PHYSICAL_PRIOR)
-    return {key: raw[key] / total for key in raw}
-
-
-def _bp_direction(probabilities: Mapping[str, Any]) -> str:
-    probs = _normalize(probabilities)
-    return "B" if probs["B"] >= probs["P"] else "P"
-
-
-def _resolved_probability(probabilities: Mapping[str, Any], side: str) -> float:
-    probs = _normalize(probabilities)
-    resolved = probs["B"] + probs["P"]
-    if resolved <= 1e-12:
-        return 0.5
-    return float(probs[side] / resolved)
-
-
-def _neutral_with_same_tie(probabilities: Mapping[str, Any]) -> dict[str, float]:
-    probs = _normalize(probabilities)
-    bp_mass = probs["B"] + probs["P"]
-    half = bp_mass / 2.0
-    return {"B": half, "P": half, "T": probs["T"]}
-
-
-def _blend_probabilities(
-    base: Mapping[str, Any],
-    target: Mapping[str, Any],
-    factor: float,
-) -> dict[str, float]:
-    w = _clip(factor)
-    left = _normalize(base)
-    right = _normalize(target)
-    return _normalize({
-        key: (1.0 - w) * left[key] + w * right[key]
-        for key in ("B", "P", "T")
-    })
-
-
-def _history_round_count(history: str | Iterable[Any]) -> int:
+def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
+    """Return only chronological B/P outcomes; ties and non-outcomes are ignored."""
+    if history is None:
+        return []
     if isinstance(history, str):
-        return sum(char.upper() in {"B", "P", "T"} for char in history)
-    if isinstance(history, Sequence):
-        return sum(
-            str(
-                item.get("outcome") if isinstance(item, Mapping) else item
-            ).upper().strip() in {"B", "P", "T"}
-            for item in history
+        compact = (
+            history.replace("|", "")
+            .replace(",", "")
+            .replace(" ", "")
+            .upper()
         )
-    return 0
+        if compact and all(char in {"B", "P", "T"} for char in compact):
+            return [char for char in compact if char in OUTCOMES][-2000:]
+        raw_items: Iterable[Any] = [
+            part for part in history.replace("|", ",").split(",") if part.strip()
+        ]
+    else:
+        raw_items = history
+
+    cleaned: list[str] = []
+    for item in raw_items:
+        if isinstance(item, Mapping):
+            raw = (
+                item.get("outcome")
+                or item.get("actual")
+                or item.get("actual_outcome")
+                or item.get("virtual_outcome")
+            )
+        else:
+            raw = item
+        value = str(raw or "").upper().strip()
+        if value in OUTCOMES:
+            cleaned.append(value)
+    return cleaned[-2000:]
 
 
-def _temperature_scale_bp(
-    probabilities: Mapping[str, Any],
-    temperature: float,
-) -> dict[str, float]:
-    """Temperature-scale resolved B/P odds while preserving Tie mass."""
-    probs = _normalize(probabilities)
-    t = max(1e-6, float(temperature))
-    bp_mass = probs["B"] + probs["P"]
-    if bp_mass <= 1e-12 or abs(t - 1.0) <= 1e-12:
-        return probs
-
-    p_b = _clip(probs["B"] / bp_mass, 1e-9, 1.0 - 1e-9)
-    p_p = 1.0 - p_b
-    exponent = 1.0 / t
-    score_b = p_b ** exponent
-    score_p = p_p ** exponent
-    score_total = score_b + score_p
-    if score_total <= 1e-12:
-        return probs
-
-    scaled_b = score_b / score_total
-    return _normalize({
-        "B": bp_mass * scaled_b,
-        "P": bp_mass * (1.0 - scaled_b),
-        "T": probs["T"],
-    })
+def _global_decayed_counts(sequence: Sequence[str], decay: float) -> dict[str, float]:
+    counts = {
+        "B": float(MARKOV_PRIOR_STRENGTH),
+        "P": float(MARKOV_PRIOR_STRENGTH),
+    }
+    n = len(sequence)
+    for index, outcome in enumerate(sequence):
+        age = max(0, n - 1 - index)
+        counts[outcome] += decay ** age
+    return counts
 
 
-def _apply_early_probability_policy(
-    probabilities: Mapping[str, Any],
+def _context_decayed_counts(
+    sequence: Sequence[str],
     *,
-    rounds: int,
-    history: str | Iterable[Any],
-) -> tuple[dict[str, float], dict[str, Any]]:
-    """Global-prior smoothing followed by T=0.7 scaling in hands 1..25."""
-    local = _normalize(probabilities)
-    smoothed, global_diag = blend_with_global_prior(
-        local,
-        rounds,
-        history=history,
-    )
-    temperature_applied = bool(0 < rounds <= TEMPERATURE_SCALING_MAX_ROUNDS)
-    final = (
-        _temperature_scale_bp(smoothed, EARLY_TEMPERATURE)
-        if temperature_applied
-        else dict(smoothed)
-    )
-    return final, {
-        "global_prior": global_diag,
-        "temperature_applied": temperature_applied,
-        "temperature": float(EARLY_TEMPERATURE if temperature_applied else 1.0),
-        "temperature_max_rounds": int(TEMPERATURE_SCALING_MAX_ROUNDS),
-        "before_temperature": dict(smoothed),
-        "after_temperature": dict(final),
+    order: int,
+    decay: float,
+) -> tuple[dict[str, float], float, str]:
+    counts = {
+        "B": float(MARKOV_PRIOR_STRENGTH),
+        "P": float(MARKOV_PRIOR_STRENGTH),
+    }
+    n = len(sequence)
+    if order <= 0 or n <= order:
+        return counts, 0.0, ""
+
+    context = tuple(sequence[-order:])
+    support = 0.0
+    for index in range(order, n):
+        if tuple(sequence[index - order:index]) != context:
+            continue
+        age = max(0, n - 1 - index)
+        weight = decay ** age
+        counts[sequence[index]] += weight
+        support += weight
+    return counts, float(support), "".join(context)
+
+
+def decayed_markov_forecast(
+    history: str | Iterable[Any] | None,
+    *,
+    decay: float = MARKOV_DECAY,
+    max_order: int = MARKOV_MAX_ORDER,
+) -> dict[str, Any]:
+    """Forecast the next B/P result from a time-decayed variable-order Markov chain."""
+    sequence = normalize_big_road(history)
+    decay = _clip(decay, 0.50, 0.999)
+    max_order = max(1, min(8, int(max_order or MARKOV_MAX_ORDER)))
+
+    global_counts = _global_decayed_counts(sequence, decay)
+    global_total = sum(global_counts.values()) or 1.0
+    global_probs = {
+        "B": global_counts["B"] / global_total,
+        "P": global_counts["P"] / global_total,
+    }
+
+    selected_order = 0
+    selected_context = ""
+    selected_support = 0.0
+    selected_counts = dict(global_counts)
+    selected_probs = dict(global_probs)
+    order_diagnostics: list[dict[str, Any]] = []
+
+    highest = min(max_order, max(1, len(sequence) - 1))
+    for order in range(highest, 0, -1):
+        counts, support, context = _context_decayed_counts(
+            sequence,
+            order=order,
+            decay=decay,
+        )
+        total = sum(counts.values()) or 1.0
+        probabilities = {
+            "B": counts["B"] / total,
+            "P": counts["P"] / total,
+        }
+        order_diagnostics.append({
+            "order": order,
+            "context": context,
+            "effective_support": float(support),
+            "counts": dict(counts),
+            "probabilities": dict(probabilities),
+        })
+        if support >= MARKOV_MIN_EFFECTIVE_SUPPORT:
+            selected_order = order
+            selected_context = context
+            selected_support = support
+            selected_counts = counts
+            selected_probs = probabilities
+            break
+
+    if selected_order == 0:
+        # Sparse context: blend the one-step context (when available) with the
+        # recent global base rate instead of returning an uninformative 50/50.
+        counts, support, context = _context_decayed_counts(
+            sequence,
+            order=1,
+            decay=decay,
+        )
+        if len(sequence) >= 2:
+            total = sum(counts.values()) or 1.0
+            one_step = {
+                "B": counts["B"] / total,
+                "P": counts["P"] / total,
+            }
+            blend = _clip(support / max(MARKOV_MIN_EFFECTIVE_SUPPORT, 1e-9))
+            selected_probs = {
+                side: blend * one_step[side] + (1.0 - blend) * global_probs[side]
+                for side in OUTCOMES
+            }
+            selected_order = 1
+            selected_context = context
+            selected_support = support
+            selected_counts = counts
+
+    total_prob = selected_probs["B"] + selected_probs["P"]
+    if total_prob <= 1e-12:
+        selected_probs = {"B": 0.5, "P": 0.5}
+    else:
+        selected_probs = {
+            "B": selected_probs["B"] / total_prob,
+            "P": selected_probs["P"] / total_prob,
+        }
+
+    direction = "B" if selected_probs["B"] >= selected_probs["P"] else "P"
+    confidence = float(max(selected_probs.values()))
+    margin = float(abs(selected_probs["B"] - selected_probs["P"]))
+
+    return {
+        "model": "time_decay_variable_order_markov",
+        "version": POLICY_VERSION,
+        "sequence_length": len(sequence),
+        "decay": float(decay),
+        "max_order": int(max_order),
+        "selected_order": int(selected_order),
+        "state_key": selected_context,
+        "effective_support": float(selected_support),
+        "transition_counts": {
+            "B": float(selected_counts["B"]),
+            "P": float(selected_counts["P"]),
+        },
+        "global_counts": {
+            "B": float(global_counts["B"]),
+            "P": float(global_counts["P"]),
+        },
+        "global_probabilities": dict(global_probs),
+        "probabilities": {
+            "B": float(selected_probs["B"]),
+            "P": float(selected_probs["P"]),
+            "T": 0.0,
+        },
+        "direction": direction,
+        "confidence": confidence,
+        "margin": margin,
+        "order_diagnostics": order_diagnostics,
+    }
+
+
+def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
+    """Replay model forecasts to derive the current deterministic observe state."""
+    consecutive_misses = 0
+    observe_remaining = 0
+    recovery_pending = False
+    virtual_results: list[bool] = []
+    official_scored = 0
+    official_hits = 0
+    triggers = 0
+    last_virtual_confidence = 0.5
+
+    for index in range(MIN_HISTORY_FOR_SCORING, len(sequence)):
+        prefix = sequence[:index]
+        actual = sequence[index]
+        forecast = decayed_markov_forecast(prefix)
+        predicted = str(forecast["direction"])
+        correct = predicted == actual
+        last_virtual_confidence = float(forecast["confidence"])
+
+        if observe_remaining > 0 or recovery_pending:
+            virtual_results.append(bool(correct))
+            if observe_remaining > 0:
+                observe_remaining -= 1
+
+            if observe_remaining <= 0:
+                window = virtual_results[-RECOVERY_WINDOW:]
+                hits = sum(1 for item in window if item)
+                calibrated = (
+                    len(window) >= RECOVERY_WINDOW
+                    and hits >= RECOVERY_MIN_HITS
+                ) or last_virtual_confidence >= RECOVERY_CONFIDENCE
+                if calibrated:
+                    recovery_pending = False
+                    consecutive_misses = 0
+                else:
+                    recovery_pending = True
+            continue
+
+        official_scored += 1
+        if correct:
+            official_hits += 1
+            consecutive_misses = 0
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= PENALTY_CONSECUTIVE_MISSES:
+                triggers += 1
+                observe_remaining = PENALTY_MIN_OBSERVE_ROUNDS
+                recovery_pending = False
+                virtual_results = []
+                consecutive_misses = 0
+
+    recent_virtual = virtual_results[-RECOVERY_WINDOW:]
+    recent_virtual_hits = sum(1 for item in recent_virtual if item)
+    active = observe_remaining > 0 or recovery_pending
+    return {
+        "active": bool(active),
+        "force_observe": bool(active),
+        "observe_remaining": int(observe_remaining),
+        "recovery_pending": bool(recovery_pending),
+        "consecutive_misses": int(consecutive_misses),
+        "trigger_count": int(triggers),
+        "official_scored": int(official_scored),
+        "official_hits": int(official_hits),
+        "official_accuracy": float(official_hits / max(1, official_scored)),
+        "virtual_sample_count": len(virtual_results),
+        "recent_virtual_sample_count": len(recent_virtual),
+        "recent_virtual_hits": int(recent_virtual_hits),
+        "recent_virtual_accuracy": float(
+            recent_virtual_hits / max(1, len(recent_virtual))
+        ),
+        "minimum_observe_rounds": int(PENALTY_MIN_OBSERVE_ROUNDS),
+        "recovery_window": int(RECOVERY_WINDOW),
+        "recovery_min_hits": int(RECOVERY_MIN_HITS),
+        "recovery_confidence": float(RECOVERY_CONFIDENCE),
+        "semantics": (
+            "two_consecutive_misses_then_minimum_three_virtual_rounds_"
+            "and_recover_after_virtual_accuracy_or_confidence_recalibrates"
+        ),
+    }
+
+
+def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
+    """Return road-only next-round probabilities plus penalty-observe state."""
+    sequence = normalize_big_road(history)
+    forecast = decayed_markov_forecast(sequence)
+    penalty = _replay_penalty_state(sequence)
+    direction = str(forecast["direction"])
+    action = "O" if penalty["active"] else direction
+    return {
+        **forecast,
+        "action": action,
+        "action_text": "觀望" if action == "O" else ("莊" if action == "B" else "閒"),
+        "latent_direction": direction,
+        "penalty_observe": penalty,
+        "big_road_sequence": "".join(sequence),
     }
 
 
 def shoe_progress_policy(rounds: int) -> dict[str, Any]:
     value = max(0, int(rounds or 0))
     if value <= 0:
-        return {
-            "rounds": 0,
-            "phase": "UNKNOWN",
-            "shoe_weight_factor": 1.0,
-            "road_weight_factor": 1.0,
-        }
-    if value <= EARLY_SHOE_MAX_ROUNDS:
-        return {
-            "rounds": value,
-            "phase": "EARLY",
-            "shoe_weight_factor": EARLY_SHOE_WEIGHT_FACTOR,
-            "road_weight_factor": EARLY_ROAD_WEIGHT_FACTOR,
-        }
-    if value < LATE_SHOE_MIN_ROUNDS:
-        return {
-            "rounds": value,
-            "phase": "MID",
-            "shoe_weight_factor": MID_SHOE_WEIGHT_FACTOR,
-            "road_weight_factor": MID_ROAD_WEIGHT_FACTOR,
-        }
+        phase = "UNKNOWN"
+    elif value <= EARLY_SHOE_MAX_ROUNDS:
+        phase = "EARLY"
+    elif value < LATE_SHOE_MIN_ROUNDS:
+        phase = "MID"
+    else:
+        phase = "LATE"
     return {
         "rounds": value,
-        "phase": "LATE",
-        "shoe_weight_factor": LATE_SHOE_WEIGHT_FACTOR,
-        "road_weight_factor": LATE_ROAD_WEIGHT_FACTOR,
+        "phase": phase,
+        "shoe_weight_factor": 0.0,
+        "road_weight_factor": 1.0,
     }
 
 
@@ -219,6 +375,7 @@ def recent_user_direction_feedback(
     *,
     limit: int = ONLINE_WINDOW,
 ) -> dict[str, Any]:
+    """Compatibility diagnostic only; it does not vote on the next direction."""
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -227,7 +384,6 @@ def recent_user_direction_feedback(
             "correct_count": 0,
             "accuracy": 0.0,
             "consecutive_losses": 0,
-            "confidence_factor": 1.0,
             "triggered": False,
         }
 
@@ -242,15 +398,13 @@ def recent_user_direction_feedback(
         if str(record.get("uid_key") or "") != uid_key:
             continue
         actual = str(record.get("actual_outcome") or "").upper().strip()
-        if actual not in {"B", "P"}:
-            continue
         predicted = str(
             record.get("adaptive_only_direction")
             or record.get("action")
             or record.get("recommend")
             or ""
         ).upper().strip()
-        if predicted not in {"B", "P"}:
+        if actual not in OUTCOMES or predicted not in OUTCOMES:
             continue
         recent.append({
             "predicted": predicted,
@@ -260,497 +414,51 @@ def recent_user_direction_feedback(
         if len(recent) >= max(1, int(limit)):
             break
 
-    correct = sum(int(item["correct"]) for item in recent)
+    correct = sum(1 for item in recent if item["correct"])
     consecutive_losses = 0
     for item in recent:
         if item["correct"]:
             break
         consecutive_losses += 1
-
-    triggered = consecutive_losses >= ONLINE_CONSECUTIVE_LOSS_TRIGGER
-    confidence_factor = ONLINE_CONFIDENCE_DECAY if triggered else 1.0
     return {
         "available": bool(recent),
         "sample_count": len(recent),
         "correct_count": int(correct),
         "accuracy": float(correct / max(1, len(recent))),
         "consecutive_losses": int(consecutive_losses),
-        "confidence_factor": float(confidence_factor),
-        "triggered": bool(triggered),
+        "triggered": bool(
+            consecutive_losses >= ONLINE_CONSECUTIVE_LOSS_TRIGGER
+        ),
         "window": int(ONLINE_WINDOW),
         "loss_trigger": int(ONLINE_CONSECUTIVE_LOSS_TRIGGER),
-        "semantics": "recent_user_direction_accuracy_confidence_decay_only_no_direction_vote",
+        "semantics": "diagnostic_only_road_model_replay_controls_penalty_state",
     }
-
-
-def _entropy_regime_penalty(result: Mapping[str, Any]) -> dict[str, Any]:
-    markov = dict(result.get("markov") or {})
-    pattern = dict(result.get("pattern_survival") or {})
-    hidden = dict(pattern.get("hidden_regime") or {})
-    try:
-        entropy_bits = float(markov.get("entropy_bits", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        entropy_bits = 0.0
-    entropy_norm = _clip(entropy_bits / max(1e-12, math.log2(3.0)))
-    transition_probability = _clip(
-        float(hidden.get("transition_probability", 0.0) or 0.0)
-    )
-    concentration = _clip(
-        float(hidden.get("posterior_concentration", 0.0) or 0.0)
-    )
-    uncertainty = max(transition_probability, 1.0 - concentration)
-    penalty = _clip(1.0 - 0.50 * entropy_norm * uncertainty, 0.50, 1.0)
-    return {
-        "factor": float(penalty),
-        "entropy_norm": float(entropy_norm),
-        "transition_probability": float(transition_probability),
-        "posterior_concentration": float(concentration),
-        "uncertainty": float(uncertainty),
-        "semantics": "entropy_x_hsmm_transition_uncertainty_one_way_confidence_penalty",
-    }
-
-
-def _effective_shoe_reliability(raw: float, progress: Mapping[str, Any]) -> float:
-    original = _clip(raw)
-    factor = float(progress.get("shoe_weight_factor", 1.0) or 1.0)
-    adjusted = original * factor
-    if original <= 0.3000001:
-        return _clip(adjusted, 0.0, DYNAMIC_INTERNAL_SHOE_RELIABILITY_CAP)
-    return _clip(adjusted)
-
-
-def _decision_gate(
-    direction_probs: Mapping[str, Any],
-    economic_probs: Mapping[str, Any],
-    direction: str,
-    *,
-    rounds: int,
-) -> dict[str, Any]:
-    side = str(direction or "").upper().strip()
-    early_active = bool(0 < rounds <= EARLY_ACTIVE_MAX_ROUNDS)
-    minimum_confidence = (
-        EARLY_MIN_DIRECTION_CONFIDENCE if early_active else MIN_DIRECTION_CONFIDENCE
-    )
-    min_ev = PHYSICAL_MIN_EV if early_active else 0.0
-
-    if side not in {"B", "P"}:
-        return {
-            "decision": "SKIP",
-            "allowed": False,
-            "reason": "skip_unresolved_direction",
-            "resolved_confidence": 0.5,
-            "minimum_confidence": float(minimum_confidence),
-            "physical_min_ev": float(min_ev),
-            "expected_net_ev": 0.0,
-            "ev_pass": False,
-            "early_active_policy": early_active,
-        }
-
-    resolved_confidence = _resolved_probability(direction_probs, side)
-    economic_probability = _resolved_probability(economic_probs, side)
-    net_payout = BANKER_NET_PAYOUT if side == "B" else PLAYER_NET_PAYOUT
-    gross_return_multiplier = 1.0 + net_payout
-    expected_net_ev = economic_probability * gross_return_multiplier - 1.0
-    ev_product = 1.0 + expected_net_ev
-
-    confidence_pass = resolved_confidence >= minimum_confidence
-    ev_pass = expected_net_ev >= min_ev
-    allowed = bool(confidence_pass and ev_pass)
-    if not confidence_pass:
-        reason = "skip_low_direction_confidence"
-    elif not ev_pass:
-        reason = "skip_below_physical_min_ev"
-    else:
-        reason = "early_active_direction_and_ev_pass" if early_active else "direction_confidence_and_positive_ev_pass"
-
-    return {
-        "decision": side if allowed else "SKIP",
-        "allowed": allowed,
-        "reason": reason,
-        "direction": side,
-        "rounds": int(rounds),
-        "early_active_policy": early_active,
-        "resolved_confidence": float(resolved_confidence),
-        "minimum_confidence": float(minimum_confidence),
-        "confidence_pass": bool(confidence_pass),
-        "economic_resolved_probability": float(economic_probability),
-        "net_payout": float(net_payout),
-        "gross_return_multiplier": float(gross_return_multiplier),
-        "ev_product": float(ev_product),
-        "expected_net_ev": float(expected_net_ev),
-        "physical_min_ev": float(min_ev),
-        "ev_pass": bool(ev_pass),
-        "rule": (
-            "hands_1_30_confidence>=0.50_and_expected_net_ev>=0.002"
-            if early_active
-            else "resolved_confidence>=0.55_and_expected_net_ev>=0"
-        ),
-    }
-
-
-def _zero_money_for_skip(money: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    result = dict(money or {})
-    result.update({
-        "bet_allowed": False,
-        "mandatory_bet": False,
-        "bet_percentage": 0.0,
-        "bet_amount": 0.0,
-        "final_bet_ratio": 0.0,
-        "adjusted_ratio": 0.0,
-        "pre_tie_adjusted_ratio": 0.0,
-        "reason": str(reason or "skip_policy_gate"),
-    })
-    return result
-
-
-def _install_engine_wrapper() -> None:
-    from baccarat_quant_engine import BaccaratQuantEngine
-
-    current = BaccaratQuantEngine.predict
-    if getattr(current, "_dynamic_policy_wrapped", False):
-        return
-    original_predict = current
-
-    def wrapped_predict(
-        self: Any,
-        history: str | Iterable[Any],
-        *,
-        shoe_probs: Mapping[str, Any] | Sequence[float] | None = None,
-        shoe_reliability: float = 1.0,
-        road_probs: Mapping[str, Any] | Sequence[float] | None = None,
-        road_reliability: float = 0.0,
-        remaining_card_state: Mapping[str, Any] | None = None,
-        bankroll: float = 0.0,
-    ) -> dict[str, Any]:
-        remaining = dict(remaining_card_state or {})
-        rounds = max(0, int(remaining.get("conditioned_rounds", 0) or 0))
-        if rounds <= 0:
-            rounds = _history_round_count(history)
-        progress = shoe_progress_policy(rounds)
-        effective_shoe_reliability = _effective_shoe_reliability(
-            float(shoe_reliability or 0.0), progress
-        )
-
-        raw_result = original_predict(
-            self,
-            history,
-            shoe_probs=shoe_probs,
-            shoe_reliability=effective_shoe_reliability,
-            road_probs=road_probs,
-            road_reliability=road_reliability,
-            remaining_card_state=remaining,
-            bankroll=bankroll,
-        )
-        result = dict(raw_result)
-
-        feedback = dict(getattr(_TLS, "feedback", {}) or {})
-        if not feedback:
-            feedback = {
-                "available": False,
-                "confidence_factor": 1.0,
-                "triggered": False,
-                "sample_count": 0,
-                "consecutive_losses": 0,
-            }
-        online_factor = _clip(
-            float(feedback.get("confidence_factor", 1.0) or 1.0),
-            ONLINE_CONFIDENCE_DECAY,
-            1.0,
-        )
-        entropy_penalty = _entropy_regime_penalty(result)
-        road_progress_factor = _clip(
-            float(progress.get("road_weight_factor", 1.0) or 1.0)
-        )
-        road_confidence_factor = _clip(
-            road_progress_factor * float(entropy_penalty["factor"]) * online_factor
-        )
-
-        raw_road_family = dict(
-            result.get("road_family_probs")
-            or dict(result.get("fusion") or {}).get("road_family_posterior")
-            or result.get("pattern_calibrated_markov_probs")
-            or result.get("markov_probs")
-            or PHYSICAL_PRIOR
-        )
-        neutral_road = _neutral_with_same_tie(raw_road_family)
-        adjusted_road_family = _blend_probabilities(
-            neutral_road, raw_road_family, road_confidence_factor
-        )
-
-        local_direction_probs, policy_direction_fusion = self.bayesian_fuse(
-            adjusted_road_family,
-            shoe_probs,
-            shoe_reliability=effective_shoe_reliability,
-        )
-        direction_probs, early_direction_policy = _apply_early_probability_policy(
-            local_direction_probs,
-            rounds=rounds,
-            history=history,
-        )
-        direction = _bp_direction(direction_probs)
-
-        fusion = dict(result.get("fusion") or {})
-        economic_road_detail = dict(fusion.get("economic_road_family") or {})
-        raw_economic_road = dict(
-            economic_road_detail.get("posterior")
-            or result.get("economic_probs")
-            or PHYSICAL_PRIOR
-        )
-        adjusted_economic_road = _blend_probabilities(
-            PHYSICAL_PRIOR, raw_economic_road, road_confidence_factor
-        )
-        local_economic_probs, policy_economic_fusion = self.bayesian_fuse(
-            adjusted_economic_road,
-            shoe_probs,
-            shoe_reliability=effective_shoe_reliability,
-        )
-        economic_probs, early_economic_policy = _apply_early_probability_policy(
-            local_economic_probs,
-            rounds=rounds,
-            history=history,
-        )
-
-        base_weight = _clip(
-            float(result.get("pattern_calibrated_final_weight", 0.0) or 0.0)
-        )
-        effective_weight = _clip(
-            base_weight
-            * float(entropy_penalty["factor"])
-            * online_factor
-            * road_progress_factor
-        )
-        money = self.money.allocate(
-            direction=direction,
-            probabilities=economic_probs,
-            final_weight=effective_weight,
-            bankroll=float(bankroll or 0.0),
-        )
-        gate = _decision_gate(
-            direction_probs,
-            economic_probs,
-            direction,
-            rounds=rounds,
-        )
-        if not bool(gate["allowed"]):
-            money = _zero_money_for_skip(money, str(gate["reason"]))
-
-        pattern_survival = dict(result.get("pattern_survival") or {})
-        original_pattern_score = _clip(
-            float(pattern_survival.get("score", 0.0) or 0.0)
-        )
-        effective_pattern_score = _clip(
-            original_pattern_score
-            * float(entropy_penalty["factor"])
-            * online_factor
-            * road_progress_factor
-        )
-        pattern_survival.update({
-            "score_before_dynamic_policy": float(original_pattern_score),
-            "score": float(effective_pattern_score),
-            "dynamic_entropy_penalty": dict(entropy_penalty),
-            "online_performance_factor": float(online_factor),
-            "online_performance_feedback": feedback,
-            "shoe_progress_road_factor": float(road_progress_factor),
-            "dynamic_policy_version": POLICY_VERSION,
-        })
-
-        diagnostics = {
-            "version": POLICY_VERSION,
-            "shoe_progress": progress,
-            "rounds": int(rounds),
-            "raw_shoe_reliability": float(_clip(shoe_reliability)),
-            "effective_shoe_reliability": float(effective_shoe_reliability),
-            "entropy_penalty": entropy_penalty,
-            "online_performance": feedback,
-            "online_performance_factor": float(online_factor),
-            "road_confidence_factor": float(road_confidence_factor),
-            "raw_road_family_probs": _normalize(raw_road_family),
-            "adjusted_road_family_probs": dict(adjusted_road_family),
-            "local_direction_probs_before_global_prior": dict(local_direction_probs),
-            "early_direction_policy": early_direction_policy,
-            "local_economic_probs_before_global_prior": dict(local_economic_probs),
-            "early_economic_policy": early_economic_policy,
-            "global_prior_probabilities": dict(GLOBAL_PRIOR_PROBABILITIES),
-            "global_prior_max_rounds": int(GLOBAL_PRIOR_SMOOTH_MAX_ROUNDS),
-            "physical_min_ev_early": float(PHYSICAL_MIN_EV),
-            "decision_gate": gate,
-            "models_modified": False,
-            "policy_semantics": (
-                "early_global_prior_smoothing_then_temperature_scaling_"
-                "with_active_0p2pct_ev_gate_models_unchanged"
-            ),
-        }
-        money["dynamic_policy"] = diagnostics
-
-        fusion.update({
-            "dynamic_policy": diagnostics,
-            "policy_direction_fusion": policy_direction_fusion,
-            "policy_economic_fusion": policy_economic_fusion,
-            "shoe_reliability_before_dynamic_policy": float(_clip(shoe_reliability)),
-            "shoe_reliability": float(effective_shoe_reliability),
-            "road_family_confidence_factor": float(road_confidence_factor),
-        })
-
-        result.update({
-            "direction": direction,
-            "direction_text": "莊" if direction == "B" else "閒",
-            "direction_margin": float(direction_probs["B"] - direction_probs["P"]),
-            "direction_selection": {
-                "source": "dynamic_policy_global_prior_final_posterior",
-                "margin": float(direction_probs["B"] - direction_probs["P"]),
-            },
-            "road_family_probs_before_dynamic_policy": _normalize(raw_road_family),
-            "road_family_probs": dict(adjusted_road_family),
-            "final_probs": dict(direction_probs),
-            "direction_probs": dict(direction_probs),
-            "economic_probs": dict(economic_probs),
-            "final_probability": float(direction_probs[direction]),
-            "economic_probability_for_direction": float(economic_probs[direction]),
-            "bet_allowed": bool(money.get("bet_allowed", False)),
-            "bet_percentage": float(money.get("bet_percentage", 0.0) or 0.0),
-            "bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
-            "suggested_bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
-            "edge": float(money.get("edge", 0.0) or 0.0),
-            "edge_percent": float(money.get("edge_percent", 0.0) or 0.0),
-            "money_management": money,
-            "pattern_survival": pattern_survival,
-            "pattern_calibrated_final_weight": float(effective_weight),
-            "fusion": fusion,
-            "decision": str(gate["decision"]),
-            "decision_text": (
-                "觀望" if gate["decision"] == "SKIP"
-                else "莊" if gate["decision"] == "B" else "閒"
-            ),
-            "skip": bool(gate["decision"] == "SKIP"),
-            "skip_reason": (
-                str(gate["reason"]) if gate["decision"] == "SKIP" else ""
-            ),
-            "decision_gate": gate,
-            "dynamic_prediction_policy": diagnostics,
-        })
-        return result
-
-    wrapped_predict._dynamic_policy_wrapped = True  # type: ignore[attr-defined]
-    BaccaratQuantEngine.predict = wrapped_predict
-
-
-def _install_predictor_wrapper() -> None:
-    import predictor as predictor_module
-
-    current = predictor_module.predict
-    if getattr(current, "_dynamic_policy_wrapped", False):
-        return
-    original_predict = current
-
-    def wrapped_predict(
-        history: Any = None,
-        venue: str = "",
-        room: str = "",
-        shoe_id: str = "",
-        user_id: str = "",
-        run_seed: int | None = None,
-        shoe_context: Mapping[str, Any] | None = None,
-        road_context: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        feedback = recent_user_direction_feedback(user_id, limit=ONLINE_WINDOW)
-        _TLS.feedback = feedback
-        try:
-            result = dict(original_predict(
-                history=history,
-                venue=venue,
-                room=room,
-                shoe_id=shoe_id,
-                user_id=user_id,
-                run_seed=run_seed,
-                shoe_context=shoe_context,
-                road_context=road_context,
-            ))
-        finally:
-            _TLS.feedback = {}
-
-        money = dict(result.get("money_management") or {})
-        policy = dict(money.get("dynamic_policy") or {})
-        gate = dict(policy.get("decision_gate") or {})
-        decision = str(gate.get("decision") or result.get("direction") or "SKIP").upper()
-        latent_direction = str(result.get("direction") or "").upper().strip()
-
-        result["adaptive_only_direction"] = latent_direction
-        result["online_performance_feedback"] = feedback
-        result["dynamic_prediction_policy"] = policy
-        result["dynamic_policy_version"] = POLICY_VERSION
-
-        if decision == "SKIP":
-            reason = str(gate.get("reason") or money.get("reason") or "skip_policy_gate")
-            minimum_confidence = float(
-                gate.get("minimum_confidence", MIN_DIRECTION_CONFIDENCE)
-                or MIN_DIRECTION_CONFIDENCE
-            )
-            min_ev = float(gate.get("physical_min_ev", 0.0) or 0.0)
-            result.update({
-                "recommend": "SKIP",
-                "recommend_text": "觀望",
-                "action": "SKIP",
-                "action_text": "觀望",
-                "signal_allowed": False,
-                "risk_gate_open": False,
-                "mandatory_bet": False,
-                "force_observe": True,
-                "bet_allowed": False,
-                "bet_percentage": 0.0,
-                "suggested_bet_amount": 0.0,
-                "bet_amount": 0.0,
-                "final_bet_ratio": 0.0,
-                "signal_status_code": (
-                    "SKIP_LOW_CONFIDENCE"
-                    if reason == "skip_low_direction_confidence"
-                    else "SKIP_BELOW_PHYSICAL_MIN_EV"
-                    if reason == "skip_below_physical_min_ev"
-                    else "SKIP_POLICY_GATE"
-                ),
-                "signal_status_text": (
-                    f"觀望：最終 B/P 信心未達 {minimum_confidence * 100:.1f}%"
-                    if reason == "skip_low_direction_confidence"
-                    else f"觀望：預期淨 EV 未達 {min_ev * 100:.2f}%"
-                    if reason == "skip_below_physical_min_ev"
-                    else "觀望：目前決策條件不足"
-                ),
-            })
-        else:
-            decision_text = "莊" if decision == "B" else "閒"
-            result.update({
-                "recommend": decision,
-                "recommend_text": decision_text,
-                "action": decision,
-                "action_text": decision_text,
-                "signal_allowed": bool(result.get("bet_allowed", False)),
-                "risk_gate_open": bool(result.get("bet_allowed", False)),
-                "mandatory_bet": False,
-                "force_observe": False,
-            })
-        return result
-
-    wrapped_predict._dynamic_policy_wrapped = True  # type: ignore[attr-defined]
-    predictor_module.predict = wrapped_predict
 
 
 def install_dynamic_prediction_policy() -> bool:
+    """Compatibility installation hook used by runtime_app.
+
+    The predictor imports and calls :func:`road_only_policy` directly, so no
+    monkey-patching of OCR, screenshot, transport or quant-engine code is needed.
+    """
     global _INSTALLED
-    if _INSTALLED:
-        return True
-    _install_engine_wrapper()
-    _install_predictor_wrapper()
     _INSTALLED = True
     return True
 
 
 __all__ = [
     "POLICY_VERSION",
+    "MARKOV_MAX_ORDER",
+    "MARKOV_DECAY",
     "MIN_DIRECTION_CONFIDENCE",
     "EARLY_MIN_DIRECTION_CONFIDENCE",
     "PHYSICAL_MIN_EV",
     "EARLY_ACTIVE_MAX_ROUNDS",
     "TEMPERATURE_SCALING_MAX_ROUNDS",
     "EARLY_TEMPERATURE",
+    "normalize_big_road",
+    "decayed_markov_forecast",
+    "road_only_policy",
     "shoe_progress_policy",
     "recent_user_direction_feedback",
     "install_dynamic_prediction_policy",
