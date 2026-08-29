@@ -1,7 +1,7 @@
 """BGS dynamic prediction policy.
 
 This layer keeps the existing Markov / HSMM / Derived Road / Hazard / Shoe
-implementations intact and changes only the early-shoe decision policy:
+implementations intact and changes only the decision policy around them:
 
 - Hands 1..30: Global Prior Smoothing
     Final_P = (1-alpha) * P_global + alpha * P_local
@@ -11,6 +11,13 @@ implementations intact and changes only the early-shoe decision policy:
   fixed at 0.002 (0.2%).
 - Hands 1..25: B/P-conditional logit Temperature Scaling with T=0.7 after
   final fusion/global-prior smoothing. Tie mass is preserved.
+- Streak diminishing returns: after a B/P run exceeds three consecutive hands,
+  each extra continuation hand reduces only the continuation-side probability.
+  The decay can shrink confidence to neutral but never manufactures a forced
+  opposite-side signal.
+- Break-point cooldown: immediately after a 4+ B/P run is broken, the next
+  decision is a mandatory observation/SKIP. Decision confidence is halved and
+  the active minimum expected-EV gate is raised to 2.0% for that one decision.
 
 The existing shoe-progress weighting, HSMM/entropy confidence calibration and
 recent-user feedback remain policy inputs. They do not become direct B/P votes.
@@ -31,7 +38,7 @@ from money_management import BANKER_NET_PAYOUT, PLAYER_NET_PAYOUT
 from pattern_survival import PHYSICAL_PRIOR
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "DYNAMIC-GLOBAL-PRIOR-EARLY-ACTIVE-V2"
+POLICY_VERSION = "DYNAMIC-GLOBAL-PRIOR-ANTI-LAG-V3"
 
 EARLY_SHOE_MAX_ROUNDS = 20
 LATE_SHOE_MIN_ROUNDS = 41
@@ -41,6 +48,13 @@ PHYSICAL_MIN_EV = 0.002
 EARLY_ACTIVE_MAX_ROUNDS = 30
 TEMPERATURE_SCALING_MAX_ROUNDS = 25
 EARLY_TEMPERATURE = 0.70
+
+STREAK_DECAY_START = 3
+STREAK_DECAY_STEP = 0.05
+STREAK_DECAY_FLOOR = 0.50
+BREAKPOINT_MIN_STREAK = 4
+BREAKPOINT_CONFIDENCE_FACTOR = 0.50
+BREAKPOINT_MIN_EV = 0.02
 
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
@@ -113,17 +127,139 @@ def _blend_probabilities(
     })
 
 
-def _history_round_count(history: str | Iterable[Any]) -> int:
+def _history_values(history: str | Iterable[Any]) -> list[str]:
     if isinstance(history, str):
-        return sum(char.upper() in {"B", "P", "T"} for char in history)
-    if isinstance(history, Sequence):
-        return sum(
-            str(
-                item.get("outcome") if isinstance(item, Mapping) else item
-            ).upper().strip() in {"B", "P", "T"}
-            for item in history
+        raw_values: Iterable[Any] = list(history)
+    elif isinstance(history, Sequence):
+        raw_values = history
+    else:
+        raw_values = list(history)
+
+    result: list[str] = []
+    for item in raw_values:
+        if isinstance(item, Mapping):
+            raw = (
+                item.get("outcome")
+                or item.get("actual")
+                or item.get("actual_outcome")
+                or item.get("virtual_outcome")
+            )
+        else:
+            raw = item
+        value = str(raw or "").upper().strip()
+        if value in {"B", "P", "T"}:
+            result.append(value)
+    return result
+
+
+def _history_round_count(history: str | Iterable[Any]) -> int:
+    return len(_history_values(history))
+
+
+def _bp_runs(history: str | Iterable[Any]) -> list[tuple[str, int]]:
+    bp = [value for value in _history_values(history) if value in {"B", "P"}]
+    runs: list[tuple[str, int]] = []
+    for value in bp:
+        if runs and runs[-1][0] == value:
+            side, count = runs[-1]
+            runs[-1] = (side, count + 1)
+        else:
+            runs.append((value, 1))
+    return runs
+
+
+def _road_run_state(history: str | Iterable[Any]) -> dict[str, Any]:
+    raw = _history_values(history)
+    runs = _bp_runs(raw)
+    current_side = runs[-1][0] if runs else ""
+    current_streak = int(runs[-1][1]) if runs else 0
+    previous_side = runs[-2][0] if len(runs) >= 2 else ""
+    previous_streak = int(runs[-2][1]) if len(runs) >= 2 else 0
+    last_raw = raw[-1] if raw else ""
+
+    # Cooldown is exactly the first decision immediately after the break hand.
+    # A later Tie does not keep re-triggering the one-hand cooldown.
+    breakpoint_active = bool(
+        len(runs) >= 2
+        and current_streak == 1
+        and previous_streak >= BREAKPOINT_MIN_STREAK
+        and last_raw in {"B", "P"}
+        and last_raw == current_side
+        and previous_side != current_side
+    )
+    return {
+        "current_side": current_side,
+        "current_streak": int(current_streak),
+        "previous_side": previous_side,
+        "previous_streak": int(previous_streak),
+        "last_raw_outcome": last_raw,
+        "breakpoint_cooldown_active": bool(breakpoint_active),
+        "breakpoint_min_streak": int(BREAKPOINT_MIN_STREAK),
+    }
+
+
+def _apply_streak_diminishing_returns(
+    probabilities: Mapping[str, Any],
+    *,
+    history: str | Iterable[Any],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Reduce over-heated continuation confidence without forcing reversal.
+
+    If the active B/P run is longer than three and the current posterior still
+    favors continuing that same side, apply:
+        decay = 1 - 0.05 * (streak - 3)
+    to the resolved continuation probability. The adjusted probability is floored
+    at 50%, so this policy can neutralize an over-heated continuation signal but
+    cannot create an artificial opposite-side prediction by itself.
+    """
+    probs = _normalize(probabilities)
+    state = _road_run_state(history)
+    side = str(state.get("current_side") or "")
+    streak = int(state.get("current_streak", 0) or 0)
+    dominant = _bp_direction(probs)
+    raw_resolved = _resolved_probability(probs, side) if side in {"B", "P"} else 0.5
+
+    applied = bool(
+        side in {"B", "P"}
+        and streak > STREAK_DECAY_START
+        and dominant == side
+    )
+    decay_factor = 1.0
+    adjusted_resolved = raw_resolved
+    adjusted = dict(probs)
+
+    if applied:
+        decay_factor = max(
+            STREAK_DECAY_FLOOR,
+            1.0 - STREAK_DECAY_STEP * (streak - STREAK_DECAY_START),
         )
-    return 0
+        adjusted_resolved = max(0.5, raw_resolved * decay_factor)
+        bp_mass = probs["B"] + probs["P"]
+        if side == "B":
+            adjusted = _normalize({
+                "B": bp_mass * adjusted_resolved,
+                "P": bp_mass * (1.0 - adjusted_resolved),
+                "T": probs["T"],
+            })
+        else:
+            adjusted = _normalize({
+                "B": bp_mass * (1.0 - adjusted_resolved),
+                "P": bp_mass * adjusted_resolved,
+                "T": probs["T"],
+            })
+
+    return adjusted, {
+        "applied": bool(applied),
+        "current_side": side,
+        "streak_count": int(streak),
+        "decay_start": int(STREAK_DECAY_START),
+        "decay_step": float(STREAK_DECAY_STEP),
+        "decay_factor": float(decay_factor),
+        "raw_resolved_continuation_probability": float(raw_resolved),
+        "adjusted_resolved_continuation_probability": float(adjusted_resolved),
+        "never_forces_opposite_side": True,
+        "semantics": "diminishing_returns_on_4plus_streak_continuation_confidence",
+    }
 
 
 def _temperature_scale_bp(
@@ -325,28 +461,40 @@ def _decision_gate(
     direction: str,
     *,
     rounds: int,
+    confidence_factor: float = 1.0,
+    min_ev_override: float | None = None,
+    breakpoint_cooldown: bool = False,
 ) -> dict[str, Any]:
     side = str(direction or "").upper().strip()
     early_active = bool(0 < rounds <= EARLY_ACTIVE_MAX_ROUNDS)
     minimum_confidence = (
         EARLY_MIN_DIRECTION_CONFIDENCE if early_active else MIN_DIRECTION_CONFIDENCE
     )
-    min_ev = PHYSICAL_MIN_EV if early_active else 0.0
+    base_min_ev = PHYSICAL_MIN_EV if early_active else 0.0
+    min_ev = max(
+        base_min_ev,
+        max(0.0, float(min_ev_override or 0.0)),
+    )
+    confidence_factor = _clip(confidence_factor)
 
     if side not in {"B", "P"}:
         return {
             "decision": "SKIP",
             "allowed": False,
             "reason": "skip_unresolved_direction",
-            "resolved_confidence": 0.5,
+            "raw_resolved_confidence": 0.5,
+            "resolved_confidence": 0.5 * confidence_factor,
+            "confidence_factor": float(confidence_factor),
             "minimum_confidence": float(minimum_confidence),
             "physical_min_ev": float(min_ev),
             "expected_net_ev": 0.0,
             "ev_pass": False,
             "early_active_policy": early_active,
+            "breakpoint_cooldown": bool(breakpoint_cooldown),
         }
 
-    resolved_confidence = _resolved_probability(direction_probs, side)
+    raw_resolved_confidence = _resolved_probability(direction_probs, side)
+    resolved_confidence = raw_resolved_confidence * confidence_factor
     economic_probability = _resolved_probability(economic_probs, side)
     net_payout = BANKER_NET_PAYOUT if side == "B" else PLAYER_NET_PAYOUT
     gross_return_multiplier = 1.0 + net_payout
@@ -355,8 +503,10 @@ def _decision_gate(
 
     confidence_pass = resolved_confidence >= minimum_confidence
     ev_pass = expected_net_ev >= min_ev
-    allowed = bool(confidence_pass and ev_pass)
-    if not confidence_pass:
+    allowed = bool(confidence_pass and ev_pass and not breakpoint_cooldown)
+    if breakpoint_cooldown:
+        reason = "skip_breakpoint_cooldown"
+    elif not confidence_pass:
         reason = "skip_low_direction_confidence"
     elif not ev_pass:
         reason = "skip_below_physical_min_ev"
@@ -370,7 +520,9 @@ def _decision_gate(
         "direction": side,
         "rounds": int(rounds),
         "early_active_policy": early_active,
+        "raw_resolved_confidence": float(raw_resolved_confidence),
         "resolved_confidence": float(resolved_confidence),
+        "confidence_factor": float(confidence_factor),
         "minimum_confidence": float(minimum_confidence),
         "confidence_pass": bool(confidence_pass),
         "economic_resolved_probability": float(economic_probability),
@@ -380,8 +532,11 @@ def _decision_gate(
         "expected_net_ev": float(expected_net_ev),
         "physical_min_ev": float(min_ev),
         "ev_pass": bool(ev_pass),
+        "breakpoint_cooldown": bool(breakpoint_cooldown),
         "rule": (
-            "hands_1_30_confidence>=0.50_and_expected_net_ev>=0.002"
+            "breakpoint_cooldown_force_skip_confidence_x0.5_min_ev_0.02"
+            if breakpoint_cooldown
+            else "hands_1_30_confidence>=0.50_and_expected_net_ev>=0.002"
             if early_active
             else "resolved_confidence>=0.55_and_expected_net_ev>=0"
         ),
@@ -422,18 +577,35 @@ def _install_engine_wrapper() -> None:
         remaining_card_state: Mapping[str, Any] | None = None,
         bankroll: float = 0.0,
     ) -> dict[str, Any]:
+        history_materialized: str | list[Any]
+        if isinstance(history, str):
+            history_materialized = history
+        elif isinstance(history, Sequence):
+            history_materialized = list(history)
+        else:
+            history_materialized = list(history)
+
         remaining = dict(remaining_card_state or {})
         rounds = max(0, int(remaining.get("conditioned_rounds", 0) or 0))
         if rounds <= 0:
-            rounds = _history_round_count(history)
+            rounds = _history_round_count(history_materialized)
         progress = shoe_progress_policy(rounds)
+        run_state = _road_run_state(history_materialized)
+        breakpoint_active = bool(run_state["breakpoint_cooldown_active"])
+        breakpoint_confidence_factor = (
+            BREAKPOINT_CONFIDENCE_FACTOR if breakpoint_active else 1.0
+        )
+        active_min_ev = BREAKPOINT_MIN_EV if breakpoint_active else (
+            PHYSICAL_MIN_EV if 0 < rounds <= EARLY_ACTIVE_MAX_ROUNDS else 0.0
+        )
+
         effective_shoe_reliability = _effective_shoe_reliability(
             float(shoe_reliability or 0.0), progress
         )
 
         raw_result = original_predict(
             self,
-            history,
+            history_materialized,
             shoe_probs=shoe_probs,
             shoe_reliability=effective_shoe_reliability,
             road_probs=road_probs,
@@ -485,7 +657,11 @@ def _install_engine_wrapper() -> None:
         direction_probs, early_direction_policy = _apply_early_probability_policy(
             local_direction_probs,
             rounds=rounds,
-            history=history,
+            history=history_materialized,
+        )
+        direction_probs, streak_direction_policy = _apply_streak_diminishing_returns(
+            direction_probs,
+            history=history_materialized,
         )
         direction = _bp_direction(direction_probs)
 
@@ -507,29 +683,41 @@ def _install_engine_wrapper() -> None:
         economic_probs, early_economic_policy = _apply_early_probability_policy(
             local_economic_probs,
             rounds=rounds,
-            history=history,
+            history=history_materialized,
+        )
+        economic_probs, streak_economic_policy = _apply_streak_diminishing_returns(
+            economic_probs,
+            history=history_materialized,
         )
 
         base_weight = _clip(
             float(result.get("pattern_calibrated_final_weight", 0.0) or 0.0)
         )
-        effective_weight = _clip(
+        effective_weight_before_breakpoint = _clip(
             base_weight
             * float(entropy_penalty["factor"])
             * online_factor
             * road_progress_factor
         )
+        effective_weight = _clip(
+            effective_weight_before_breakpoint * breakpoint_confidence_factor
+        )
+
         money = self.money.allocate(
             direction=direction,
             probabilities=economic_probs,
             final_weight=effective_weight,
             bankroll=float(bankroll or 0.0),
+            minimum_expected_ev=active_min_ev,
         )
         gate = _decision_gate(
             direction_probs,
             economic_probs,
             direction,
             rounds=rounds,
+            confidence_factor=breakpoint_confidence_factor,
+            min_ev_override=active_min_ev,
+            breakpoint_cooldown=breakpoint_active,
         )
         if not bool(gate["allowed"]):
             money = _zero_money_for_skip(money, str(gate["reason"]))
@@ -554,6 +742,19 @@ def _install_engine_wrapper() -> None:
             "dynamic_policy_version": POLICY_VERSION,
         })
 
+        breakpoint_policy = {
+            **run_state,
+            "confidence_factor": float(breakpoint_confidence_factor),
+            "active_min_ev": float(active_min_ev),
+            "forced_skip": bool(breakpoint_active),
+            "effective_weight_before_breakpoint": float(effective_weight_before_breakpoint),
+            "effective_weight_after_breakpoint": float(effective_weight),
+            "semantics": (
+                "one_decision_cooldown_after_4plus_streak_break_"
+                "confidence_halved_and_min_ev_raised_to_2pct"
+            ),
+        }
+
         diagnostics = {
             "version": POLICY_VERSION,
             "shoe_progress": progress,
@@ -568,16 +769,20 @@ def _install_engine_wrapper() -> None:
             "adjusted_road_family_probs": dict(adjusted_road_family),
             "local_direction_probs_before_global_prior": dict(local_direction_probs),
             "early_direction_policy": early_direction_policy,
+            "streak_direction_policy": streak_direction_policy,
             "local_economic_probs_before_global_prior": dict(local_economic_probs),
             "early_economic_policy": early_economic_policy,
+            "streak_economic_policy": streak_economic_policy,
+            "breakpoint_policy": breakpoint_policy,
             "global_prior_probabilities": dict(GLOBAL_PRIOR_PROBABILITIES),
             "global_prior_max_rounds": int(GLOBAL_PRIOR_SMOOTH_MAX_ROUNDS),
             "physical_min_ev_early": float(PHYSICAL_MIN_EV),
+            "breakpoint_min_ev": float(BREAKPOINT_MIN_EV),
             "decision_gate": gate,
             "models_modified": False,
             "policy_semantics": (
-                "early_global_prior_smoothing_then_temperature_scaling_"
-                "with_active_0p2pct_ev_gate_models_unchanged"
+                "global_prior_plus_temperature_then_streak_diminishing_returns_"
+                "plus_one_hand_breakpoint_cooldown_models_unchanged"
             ),
         }
         money["dynamic_policy"] = diagnostics
@@ -596,7 +801,7 @@ def _install_engine_wrapper() -> None:
             "direction_text": "莊" if direction == "B" else "閒",
             "direction_margin": float(direction_probs["B"] - direction_probs["P"]),
             "direction_selection": {
-                "source": "dynamic_policy_global_prior_final_posterior",
+                "source": "dynamic_policy_global_prior_streak_guard_final_posterior",
                 "margin": float(direction_probs["B"] - direction_probs["P"]),
             },
             "road_family_probs_before_dynamic_policy": _normalize(raw_road_family),
@@ -626,6 +831,8 @@ def _install_engine_wrapper() -> None:
                 str(gate["reason"]) if gate["decision"] == "SKIP" else ""
             ),
             "decision_gate": gate,
+            "streak_policy": streak_direction_policy,
+            "breakpoint_policy": breakpoint_policy,
             "dynamic_prediction_policy": diagnostics,
         })
         return result
@@ -701,14 +908,18 @@ def _install_predictor_wrapper() -> None:
                 "bet_amount": 0.0,
                 "final_bet_ratio": 0.0,
                 "signal_status_code": (
-                    "SKIP_LOW_CONFIDENCE"
+                    "SKIP_BREAKPOINT_COOLDOWN"
+                    if reason == "skip_breakpoint_cooldown"
+                    else "SKIP_LOW_CONFIDENCE"
                     if reason == "skip_low_direction_confidence"
                     else "SKIP_BELOW_PHYSICAL_MIN_EV"
                     if reason == "skip_below_physical_min_ev"
                     else "SKIP_POLICY_GATE"
                 ),
                 "signal_status_text": (
-                    f"觀望：最終 B/P 信心未達 {minimum_confidence * 100:.1f}%"
+                    "觀望：長龍剛斷，首局冷卻；Confidence×0.5，EV 門檻 2.0%"
+                    if reason == "skip_breakpoint_cooldown"
+                    else f"觀望：最終 B/P 信心未達 {minimum_confidence * 100:.1f}%"
                     if reason == "skip_low_direction_confidence"
                     else f"觀望：預期淨 EV 未達 {min_ev * 100:.2f}%"
                     if reason == "skip_below_physical_min_ev"
@@ -751,6 +962,11 @@ __all__ = [
     "EARLY_ACTIVE_MAX_ROUNDS",
     "TEMPERATURE_SCALING_MAX_ROUNDS",
     "EARLY_TEMPERATURE",
+    "STREAK_DECAY_START",
+    "STREAK_DECAY_STEP",
+    "BREAKPOINT_MIN_STREAK",
+    "BREAKPOINT_CONFIDENCE_FACTOR",
+    "BREAKPOINT_MIN_EV",
     "shoe_progress_policy",
     "recent_user_direction_feedback",
     "install_dynamic_prediction_policy",
