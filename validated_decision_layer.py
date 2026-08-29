@@ -1,9 +1,9 @@
-"""Validated decision layer for the road-only BGS model.
+"""Validated decision layer for the short-shoe road-only BGS model.
 
-The public functions are unchanged.  Exact remaining-card composition is no
-longer a prerequisite for a B/P decision.  The layer validates the road-model
-probability, converts it to virtual EV, and delegates sizing to
-``MoneyManagementModel`` (one-quarter Kelly).
+Public function signatures and compatibility fields are preserved.  When an
+exact physical-card EV is unavailable, the layer uses the short-window model's
+``confidence_prob`` as the predicted win probability, converts it to a virtual
+EV, and forwards the signal to ``MoneyManagementModel`` for sizing.
 """
 from __future__ import annotations
 
@@ -16,11 +16,12 @@ from money_management import (
     MIN_POSITIVE_EV,
     MoneyManagementModel,
 )
-from performance_tracker import get_performance_summary
 
 OUTCOMES = ("B", "P", "T")
 _MONEY = MoneyManagementModel()
 
+# Retained as public/configuration compatibility constants.  The short-shoe
+# confidence is no longer replaced by a long-horizon performance posterior.
 VALIDATED_COMPONENT_MIN_SAMPLES = max(
     20,
     min(
@@ -31,15 +32,15 @@ VALIDATED_COMPONENT_MIN_SAMPLES = max(
 UNVALIDATED_CONFIDENCE_CAP = max(
     0.50,
     min(
-        0.65,
-        float(os.getenv("UNVALIDATED_CONFIDENCE_CAP", "0.58") or "0.58"),
+        0.99,
+        float(os.getenv("UNVALIDATED_CONFIDENCE_CAP", "0.99") or "0.99"),
     ),
 )
 VALIDATED_CONFIDENCE_CAP = max(
-    0.52,
+    0.50,
     min(
-        0.75,
-        float(os.getenv("VALIDATED_CONFIDENCE_CAP", "0.68") or "0.68"),
+        0.99,
+        float(os.getenv("VALIDATED_CONFIDENCE_CAP", "0.99") or "0.99"),
     ),
 )
 
@@ -113,48 +114,152 @@ def _set_no_bet(result: Dict[str, Any], reason: str) -> Dict[str, Any]:
     return result
 
 
-def _calibrated_confidence(
+def _short_window_forecast(result: Mapping[str, Any]) -> Dict[str, Any]:
+    dynamic = result.get("dynamic_prediction_policy")
+    if not isinstance(dynamic, Mapping):
+        return {}
+    forecast = dynamic.get("forecast")
+    return dict(forecast) if isinstance(forecast, Mapping) else {}
+
+
+def _model_direction_and_confidence(
     result: Mapping[str, Any],
-    *,
-    venue: str,
-    room: str,
-) -> tuple[float, int, str]:
-    probabilities = _normalize(
-        result.get("probabilities")
-        if isinstance(result.get("probabilities"), Mapping)
-        else {"B": 0.5, "P": 0.5, "T": 0.0}
+) -> tuple[str, float, Dict[str, float], str]:
+    forecast = _short_window_forecast(result)
+
+    raw_probabilities: Mapping[str, Any]
+    if isinstance(forecast.get("probabilities"), Mapping):
+        raw_probabilities = dict(forecast.get("probabilities") or {})
+        source = "short_window_forecast"
+    elif isinstance(result.get("probabilities"), Mapping):
+        raw_probabilities = dict(result.get("probabilities") or {})
+        source = "prediction_probabilities"
+    elif isinstance(result.get("economic_probs"), Mapping):
+        raw_probabilities = dict(result.get("economic_probs") or {})
+        source = "economic_probabilities"
+    else:
+        raw_probabilities = {"B": 0.5, "P": 0.5, "T": 0.0}
+        source = "neutral_fallback"
+
+    probabilities = _normalize(raw_probabilities)
+    bp_mass = probabilities["B"] + probabilities["P"]
+    if bp_mass <= 1e-12:
+        probabilities = {"B": 0.5, "P": 0.5, "T": 0.0}
+    else:
+        probabilities = {
+            "B": probabilities["B"] / bp_mass,
+            "P": probabilities["P"] / bp_mass,
+            "T": 0.0,
+        }
+
+    direction = str(
+        forecast.get("direction")
+        or result.get("direction")
+        or result.get("adaptive_only_direction")
+        or result.get("action")
+        or result.get("recommend")
+        or ""
+    ).upper().strip()
+    if direction not in {"B", "P"}:
+        direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
+
+    confidence_candidates = (
+        forecast.get("confidence_prob"),
+        result.get("confidence_prob"),
+        forecast.get("confidence"),
+        result.get("confidence"),
+        probabilities.get(direction),
     )
-    resolved = probabilities["B"] + probabilities["P"]
-    raw = (
-        max(probabilities["B"], probabilities["P"]) / resolved
-        if resolved > 1e-12 else 0.5
-    )
-    source = str(result.get("direction_source") or "")
+    confidence_prob = 0.5
+    for raw in confidence_candidates:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0.5:
+            confidence_prob = max(0.5, min(0.999, value))
+            break
+
+    # Confidence is the probability of the chosen direction, so rebuild a clean
+    # B/P distribution from that value for virtual-EV and money sizing.
+    probabilities = {
+        "B": confidence_prob if direction == "B" else 1.0 - confidence_prob,
+        "P": confidence_prob if direction == "P" else 1.0 - confidence_prob,
+        "T": 0.0,
+    }
+    return direction, confidence_prob, probabilities, source
+
+
+def _physical_ev_available(result: Mapping[str, Any]) -> bool:
+    physical = result.get("physical_signal")
+    if not isinstance(physical, Mapping):
+        return False
+    action = str(physical.get("action") or "").upper().strip()
     try:
-        summary = get_performance_summary(
-            venue=str(venue or ""),
-            room=str(room or ""),
-            limit=5000,
+        ev = float(physical.get("selected_expected_return", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        ev = 0.0
+    return bool(physical.get("available") and action in {"B", "P"} and ev > 0.0)
+
+
+def _virtual_money(
+    *,
+    direction: str,
+    confidence_prob: float,
+    probabilities: Mapping[str, Any],
+    bankroll: float,
+) -> tuple[Dict[str, Any], float]:
+    """Convert model confidence to virtual EV and obtain quarter-Kelly sizing."""
+    p_win = max(0.0, min(1.0, float(confidence_prob)))
+    payout = 0.95 if direction == "B" else 1.0
+    virtual_ev = float(p_win * payout - (1.0 - p_win))
+
+    money = dict(
+        _MONEY.allocate(
+            direction=direction,
+            probabilities=probabilities,
+            final_weight=p_win,
+            bankroll=max(0.0, float(bankroll or 0.0)),
         )
-        stats = dict(
-            dict(summary.get("source_direction_performance") or {}).get(source)
-            or {}
-        )
-        samples = int(stats.get("sample_count", 0) or 0)
-        if samples >= VALIDATED_COMPONENT_MIN_SAMPLES:
-            posterior = float(stats.get("posterior_accuracy", raw) or raw)
-            return (
-                max(0.50, min(VALIDATED_CONFIDENCE_CAP, posterior)),
-                samples,
-                "validated_direction_source_posterior",
-            )
-    except Exception:
-        pass
-    return (
-        max(0.50, min(UNVALIDATED_CONFIDENCE_CAP, raw)),
-        0,
-        "road_model_probability_cap",
     )
+
+    # ``MoneyManagementModel.allocate`` retains its own minimum-EV gate for
+    # backward compatibility.  The requested fallback rule is strictly EV > 0,
+    # so for a small positive virtual EV we still use the model's quarter-Kelly
+    # calculation instead of replacing the signal with a zero bet.
+    if virtual_ev > 0.0 and not bool(money.get("bet_allowed", False)):
+        ratio = min(
+            float(MAX_BET_RATIO),
+            max(
+                0.0,
+                float(
+                    _MONEY.kelly_fraction(
+                        side=direction,
+                        probabilities=probabilities,
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+        if ratio > 0.0:
+            bankroll_value = max(0.0, float(bankroll or 0.0))
+            money.update({
+                "virtual_ev": virtual_ev,
+                "virtual_ev_percent": virtual_ev * 100.0,
+                "expected_value_per_unit": virtual_ev,
+                "kelly_fraction": ratio,
+                "final_bet_ratio": ratio,
+                "pre_tie_adjusted_ratio": ratio,
+                "adjusted_ratio": ratio,
+                "bet_percentage": ratio * 100.0,
+                "bet_amount": bankroll_value * ratio,
+                "bet_allowed": True,
+                "reason": "positive_virtual_ev_quarter_kelly_fallback",
+            })
+
+    money["virtual_ev"] = virtual_ev
+    money["virtual_ev_percent"] = virtual_ev * 100.0
+    return money, virtual_ev
 
 
 def _set_direction_distribution(
@@ -180,8 +285,10 @@ def apply_validated_decision(
     venue: str = "",
     room: str = "",
 ) -> Dict[str, Any]:
-    """Calibrate confidence without reviving an existing observe/hard-brake state."""
+    """Use short-window confidence as virtual EV when physical EV is absent."""
+    del venue, room
     result = dict(prediction or {})
+
     if _hard_brake_active(result):
         result["decision_validation"] = {
             "active": False,
@@ -190,24 +297,24 @@ def apply_validated_decision(
         }
         return result
 
-    action = str(result.get("action") or "O").upper().strip()
-    if action not in {"B", "P"}:
+    if _physical_ev_available(result):
         result["decision_validation"] = {
-            "active": False,
-            "hard_brake_preserved": False,
-            "observe_preserved": True,
-            "reason": "保留時間衰減馬可夫的觀望／校正狀態",
+            "active": True,
+            "mode": "physical_ev_preserved",
+            "exact_card_counts_required": False,
+            "virtual_ev_fallback_used": False,
         }
         return result
 
-    direction = str(result.get("direction") or action).upper().strip()
-    if direction not in {"B", "P"}:
-        direction = action
-    confidence, samples, source = _calibrated_confidence(
-        result,
-        venue=venue,
-        room=room,
+    direction, confidence_prob, probabilities, source = _model_direction_and_confidence(result)
+    bankroll = max(0.0, float(result.get("bankroll", 0.0) or 0.0))
+    money, virtual_ev = _virtual_money(
+        direction=direction,
+        confidence_prob=confidence_prob,
+        probabilities=probabilities,
+        bankroll=bankroll,
     )
+
     result.setdefault(
         "pre_validation_probabilities",
         dict(result.get("probabilities") or {}),
@@ -215,42 +322,84 @@ def apply_validated_decision(
     _set_direction_distribution(
         result,
         direction=direction,
-        confidence=confidence,
+        confidence=confidence_prob,
     )
-    result["confidence"] = confidence
-    result["ensemble_confidence"] = confidence
-    result["quality_score"] = confidence
+    result["confidence"] = confidence_prob
+    result["confidence_prob"] = confidence_prob
+    result["ensemble_confidence"] = confidence_prob
+    result["quality_score"] = confidence_prob
     result["confidence_label"] = (
-        "較高" if confidence >= 0.60
-        else "中等" if confidence >= 0.54
+        "較高" if confidence_prob >= 0.60
+        else "中等" if confidence_prob >= 0.54
         else "偏低"
     )
+
+    if virtual_ev <= 0.0 or not bool(money.get("bet_allowed", False)):
+        result["decision_validation"] = {
+            "active": True,
+            "mode": "short_window_virtual_ev_gate",
+            "direction": direction,
+            "confidence_prob": confidence_prob,
+            "virtual_ev": virtual_ev,
+            "confidence_source": source,
+            "exact_card_counts_required": False,
+            "virtual_ev_fallback_used": True,
+        }
+        return _set_no_bet(
+            result,
+            "短窗模型虛擬 EV ≤ 0，維持觀望。",
+        )
+
+    ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
+    amount = float(money.get("bet_amount", bankroll * ratio) or 0.0)
+    text = "莊" if direction == "B" else "閒"
+    result.update({
+        "action": direction,
+        "recommend": direction,
+        "internal_action": direction,
+        "internal_recommend": direction,
+        "next_round_direction": direction,
+        "action_text": text,
+        "recommend_text": text,
+        "next_round_direction_text": text,
+        "signal_allowed": True,
+        "risk_gate_open": True,
+        "mandatory_bet": False,
+        "selected_expected_return": virtual_ev,
+        "selected_expected_return_percent": virtual_ev * 100.0,
+        "kelly_fraction": ratio,
+        "kelly_percentage_applied": ratio * 100.0,
+        "recommended_bet_percentage": ratio * 100.0,
+        "bet_percentage": ratio * 100.0,
+        "final_bet_ratio": ratio,
+        "suggested_bet_amount": amount,
+        "bet_amount": amount,
+        "money_management": money,
+        "direction_source": "short_window_confidence_virtual_ev",
+        "signal_reason": (
+            f"12局短窗模型 {text} confidence={confidence_prob:.3%}；"
+            f"virtualEV={virtual_ev:.3%}；"
+            f"Kelly={ratio:.3%}。"
+        ),
+    })
+    result["reason"] = result["signal_reason"]
     result["decision_validation"] = {
         "active": True,
-        "mode": "road_model_probability_validation",
-        "direction_before": action,
-        "direction_after": direction,
+        "mode": "short_window_confidence_virtual_ev",
+        "direction": direction,
+        "confidence_prob": confidence_prob,
+        "virtual_ev": virtual_ev,
         "confidence_source": source,
-        "confidence_sample_count": samples,
-        "calibrated_confidence": confidence,
         "exact_card_counts_required": False,
+        "virtual_ev_fallback_used": True,
+        "final_kelly_ratio": ratio,
     }
     return result
 
 
 def _strategy_road_direction(result: Mapping[str, Any]) -> tuple[str, float]:
-    probabilities = _normalize(
-        result.get("probabilities")
-        if isinstance(result.get("probabilities"), Mapping)
-        else {"B": 0.5, "P": 0.5, "T": 0.0}
-    )
-    bp_mass = probabilities["B"] + probabilities["P"]
-    if bp_mass <= 1e-12:
-        return "", 0.0
-    banker = probabilities["B"] / bp_mass
-    direction = "B" if banker >= 0.5 else "P"
-    strength = abs(banker - 0.5) * 2.0
-    return direction, max(0.0, min(1.0, strength))
+    direction, confidence_prob, _, _ = _model_direction_and_confidence(result)
+    return direction, max(0.0, min(1.0, abs(confidence_prob - 0.5) * 2.0))
 
 
 def apply_strategy_decision(
@@ -259,71 +408,36 @@ def apply_strategy_decision(
     strategy_selection: Mapping[str, Any],
     bankroll: float = 0.0,
 ) -> Dict[str, Any]:
-    """Apply strategy scaling to road-model virtual EV and quarter Kelly.
-
-    Exact ``remaining_counts`` / ``observed_cards`` are intentionally not used as
-    a gate. A model probability such as P(B)=0.53 is converted to a virtual EV
-    after commission and then passed through ``MoneyManagementModel``.
-    """
+    """Apply strategy scaling to physical EV or short-window virtual EV fallback."""
     result = dict(prediction or {})
     selection = dict(strategy_selection or {})
     profile = dict(selection.get("profile") or {})
     arm = str(selection.get("selected_arm") or "math_only")
 
-    penalty = dict(
-        dict(result.get("dynamic_prediction_policy") or {}).get(
-            "penalty_observe", {}
-        )
-        or dict(result.get("decision_gate") or {}).get("penalty_observe", {})
-        or {}
-    )
-    force_observe = bool(
-        result.get("force_observe")
-        or result.get("post_reset_vacuum_active")
-        or (
-            isinstance(penalty, Mapping)
-            and penalty.get("active")
-        )
-    )
-    if force_observe:
+    if _hard_brake_active(result):
+        result["decision_strategy_bandit"] = selection
+        result["decision_strategy"] = arm
+        return _set_no_bet(result, "統計硬熔斷仍在作用，維持觀望。")
+
+    if _physical_ev_available(result):
         result["decision_strategy_bandit"] = selection
         result["decision_strategy"] = arm
         result["decision_validation"] = {
             "active": True,
-            "mode": "penalty_observe_preserved",
+            "mode": "physical_ev_preserved",
+            "selected_strategy_arm": arm,
             "exact_card_counts_required": False,
+            "virtual_ev_fallback_used": False,
         }
-        return _set_no_bet(
-            result,
-            "連錯 2 局後的懲罰觀望仍在進行；本局只做虛擬下注與轉移矩陣更新。",
-        )
+        return result
 
-    probabilities = _normalize(
-        result.get("probabilities")
-        if isinstance(result.get("probabilities"), Mapping)
-        else dict(result.get("economic_probs") or {})
-    )
-    direction = str(
-        result.get("direction")
-        or result.get("adaptive_only_direction")
-        or result.get("action")
-        or "O"
-    ).upper().strip()
-    if direction not in {"B", "P"}:
-        direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
-
-    model_confidence = max(probabilities["B"], probabilities["P"])
-    money = _MONEY.allocate(
+    direction, confidence_prob, probabilities, source = _model_direction_and_confidence(result)
+    bankroll_value = max(0.0, float(bankroll or 0.0))
+    money, virtual_ev = _virtual_money(
         direction=direction,
+        confidence_prob=confidence_prob,
         probabilities=probabilities,
-        final_weight=model_confidence,
-        bankroll=max(0.0, float(bankroll or 0.0)),
-    )
-    virtual_ev = float(money.get("virtual_ev", 0.0) or 0.0)
-    required_ev = max(
-        float(MIN_POSITIVE_EV),
-        float(MIN_POSITIVE_EV)
-        * max(0.0, float(profile.get("minimum_ev_multiplier", 1.0) or 1.0)),
+        bankroll=bankroll_value,
     )
 
     result["decision_strategy_bandit"] = selection
@@ -331,13 +445,15 @@ def apply_strategy_decision(
     result["strategy_hard_limits"] = {
         "kelly_fraction": float(KELLY_FRACTION),
         "max_bet_fraction": float(MAX_BET_RATIO),
-        "minimum_positive_ev": float(MIN_POSITIVE_EV),
+        "minimum_positive_ev": 0.0,
+        "money_management_min_positive_ev": float(MIN_POSITIVE_EV),
         "exact_card_counts_required": False,
     }
     result["model_virtual_signal"] = {
         "available": True,
-        "source": "time_decay_markov_big_road_probability",
+        "source": source,
         "action": direction,
+        "confidence_prob": confidence_prob,
         "probabilities": probabilities,
         "selected_expected_return": virtual_ev,
         "kelly_fraction": float(money.get("kelly_fraction", 0.0) or 0.0),
@@ -345,19 +461,20 @@ def apply_strategy_decision(
         "exact_card_counts_required": False,
     }
 
-    if virtual_ev < required_ev or not bool(money.get("bet_allowed", False)):
+    if virtual_ev <= 0.0 or not bool(money.get("bet_allowed", False)):
         result["decision_validation"] = {
             "active": True,
-            "mode": "road_model_virtual_ev_gate",
+            "mode": "short_window_virtual_ev_gate",
             "selected_strategy_arm": arm,
             "model_direction": direction,
+            "confidence_prob": confidence_prob,
             "model_virtual_ev": virtual_ev,
-            "required_ev": required_ev,
+            "required_ev": 0.0,
             "exact_card_counts_required": False,
         }
         return _set_no_bet(
             result,
-            "牌路模型虛擬 EV 未達本策略正期望門檻，維持觀望。",
+            "短窗模型虛擬 EV ≤ 0，維持觀望。",
         )
 
     multiplier = min(
@@ -365,21 +482,19 @@ def apply_strategy_decision(
         max(0.0, float(profile.get("kelly_multiplier", 1.0) or 1.0)),
     )
     road_direction, road_strength = _strategy_road_direction(result)
-    road_note = "純牌路模型機率直接進入 1/4 Kelly。"
+    road_note = "12局短窗 confidence 轉虛擬 EV 後進入 1/4 Kelly。"
     if arm == "conservative":
         multiplier *= 0.50
         road_note = "保守策略將 1/4 Kelly 再縮半。"
-    elif arm == "ev_road_blend":
-        if road_strength < 0.20:
-            multiplier *= 0.75
-            road_note = "牌路優勢幅度偏弱，1/4 Kelly 再縮至 75%。"
+    elif arm == "ev_road_blend" and road_strength < 0.20:
+        multiplier *= 0.75
+        road_note = "短窗方向幅度偏弱，1/4 Kelly 再縮至 75%。"
 
     base_ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
     final_ratio = min(MAX_BET_RATIO, max(0.0, base_ratio * multiplier))
     if final_ratio <= 0.0:
         return _set_no_bet(result, "策略縮放後下注比例為零，維持觀望。")
 
-    bankroll_value = max(0.0, float(bankroll or 0.0))
     amount = bankroll_value * final_ratio
     text = "莊" if direction == "B" else "閒"
     money.update({
@@ -388,6 +503,8 @@ def apply_strategy_decision(
         "bet_amount": amount,
         "bet_allowed": True,
         "strategy_multiplier": multiplier,
+        "virtual_ev": virtual_ev,
+        "virtual_ev_percent": virtual_ev * 100.0,
     })
 
     result.update({
@@ -402,7 +519,9 @@ def apply_strategy_decision(
         "signal_allowed": True,
         "risk_gate_open": True,
         "mandatory_bet": False,
-        "direction_source": "road_model_virtual_ev_quarter_kelly",
+        "direction_source": "short_window_confidence_virtual_ev_quarter_kelly",
+        "confidence": confidence_prob,
+        "confidence_prob": confidence_prob,
         "selected_expected_return": virtual_ev,
         "selected_expected_return_percent": virtual_ev * 100.0,
         "kelly_fraction": final_ratio,
@@ -420,25 +539,27 @@ def apply_strategy_decision(
             "road_strength": road_strength,
             "kelly_multiplier": multiplier,
         },
-        "strategy_required_ev": required_ev,
+        "strategy_required_ev": 0.0,
         "kelly_cap_enforced": True,
         "banker_rate": round(probabilities["B"] * 100.0, 4),
         "player_rate": round(probabilities["P"] * 100.0, 4),
-        "tie_rate": round(probabilities["T"] * 100.0, 4),
+        "tie_rate": 0.0,
         "signal_reason": (
-            f"{profile.get('label', arm)}：牌路模型虛擬 EV "
-            f"{virtual_ev:.3%}；{road_note}"
+            f"{profile.get('label', arm)}：12局短窗 confidence "
+            f"{confidence_prob:.3%}；虛擬 EV {virtual_ev:.3%}；{road_note}"
         ),
     })
     result["reason"] = result["signal_reason"]
     result["decision_validation"] = {
         "active": True,
-        "mode": "road_model_virtual_ev_quarter_kelly",
+        "mode": "short_window_confidence_virtual_ev_quarter_kelly",
         "selected_strategy_arm": arm,
         "exact_card_counts_required": False,
+        "virtual_ev_fallback_used": True,
         "model_direction": direction,
+        "confidence_prob": confidence_prob,
         "model_virtual_ev": virtual_ev,
-        "required_ev": required_ev,
+        "required_ev": 0.0,
         "quarter_kelly_multiplier": float(KELLY_FRACTION),
         "base_kelly_ratio": base_ratio,
         "final_kelly_ratio": final_ratio,
