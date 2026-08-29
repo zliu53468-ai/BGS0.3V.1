@@ -1,27 +1,22 @@
 """Unified baccarat dynamic prediction and capital-allocation engine.
 
-BaccaratQuantEngine combines:
-1) support-aware variable-order B/P/T Markov evidence,
-2) remaining-card-aware Pattern Survival calibration,
-3) physical-baseline-corrected probabilistic shoe evidence,
-4) bounded derived-road Markov likelihood,
-5) bounded run-length structural turn-hazard likelihood,
-6) positive-Edge-only bankroll sizing.
+BaccaratQuantEngine keeps the existing prediction models intact and only owns
+how their evidence is combined:
+1) Markov V3.3 supplies the primary historical-road direction posterior.
+2) Pattern Survival / HSMM calibrates how much that road structure should be trusted.
+3) Derived-Road Markov and Run-Length Hazard are auxiliary members of one
+   correlated ROAD EVIDENCE FAMILY rather than independent full-strength votes.
+4) Probabilistic Shoe remains a separate physical evidence family.
+5) Money management remains separate from direction selection.
 
-Direction and bankroll math deliberately use two related posteriors:
-- direction posterior: Banker-neutral B/P baseline, used to choose B vs P;
-- economic posterior: baccarat physical prior + the same evidence, used for Edge.
+The integrator deliberately does NOT pre-shrink Markov merely because the latest
+hand or active run exists. Weak isolated auxiliary disagreement is downweighted;
+corroborated Road/Hazard disagreement may still overturn Markov. This reduces
+both same-run double counting and noisy B/P flip-flopping without creating a
+mechanical follow-streak or anti-streak rule.
 
-This version also applies conservative evidence controls before fusion:
-- nested Markov orders that merely re-express the same active run are treated as
-  correlated evidence rather than independent confirmation;
-- a single latest hand may reduce confidence when it causes a large Markov swing,
-  but it is never mechanically reversed or ignored;
-- run-length Hazard is downweighted when it duplicates the same current-run
-  continuation direction already carried by Markov.
-
-These guards reduce evidence duplication. They do not create an anti-streak rule
-and do not imply deterministic baccarat patterns or guaranteed outcomes.
+Baccarat outcomes remain stochastic; model probabilities do not guarantee the
+next result.
 """
 from __future__ import annotations
 
@@ -38,13 +33,12 @@ from pattern_survival import (
 from run_length_hazard import analyze_run_length_hazard
 
 _DIRECTION_EPSILON = 1e-12
-_LAST_HAND_MIN_HISTORY = 6
-_LAST_HAND_SHIFT_THRESHOLD = 0.10
-_LAST_HAND_MAX_PENALTY = 0.35
-_SAME_RUN_PER_NESTED_ORDER_PENALTY = 0.10
-_SAME_RUN_MARKOV_FACTOR_FLOOR = 0.70
-_HAZARD_CURRENT_RUN_CORRELATION_FACTOR = 0.55
-_HAZARD_LAST_HAND_SENSITIVITY_FACTOR = 0.75
+
+# Derived Road and Hazard use the same B/P/T history, so their combined
+# incremental influence is bounded as one correlated evidence family.
+_ROAD_FAMILY_AUX_RELIABILITY_CAP = 0.22
+_AUX_DISAGREEMENT_FACTOR = 0.50
+_LONE_OPPOSITION_FACTOR = 0.55
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -65,167 +59,17 @@ def _normalize(
     return {key: raw[key] / total for key in keys}
 
 
-def _clean_history_values(history: str | Iterable[Any]) -> list[str]:
-    values: Iterable[Any]
-    if isinstance(history, str):
-        values = list(history)
-    else:
-        values = history
-
-    result: list[str] = []
-    for item in values:
-        if isinstance(item, Mapping):
-            raw = (
-                item.get("outcome")
-                or item.get("actual")
-                or item.get("actual_outcome")
-                or item.get("virtual_outcome")
-            )
-        else:
-            raw = item
-        value = str(raw or "").upper().strip()
-        if value in {"B", "P", "T"}:
-            result.append(value)
-    return result[-2000:]
-
-
-def _bp_conditional_margin(probabilities: Mapping[str, Any]) -> float:
-    b = max(0.0, float(probabilities.get("B", 0.0) or 0.0))
-    p = max(0.0, float(probabilities.get("P", 0.0) or 0.0))
-    mass = b + p
-    if mass <= 1e-12:
-        return 0.0
-    return float((b - p) / mass)
-
-
-def _bp_direction(probabilities: Mapping[str, Any]) -> str:
-    return "B" if _bp_conditional_margin(probabilities) >= 0.0 else "P"
-
-
-def _shrink_bp_toward_neutral(
-    probabilities: Mapping[str, Any],
-    factor: float,
-) -> dict[str, float]:
-    """Shrink only B/P direction strength while preserving the Tie mass."""
-    normalized = _normalize(
-        {
-            "B": float(probabilities.get("B", 0.0) or 0.0),
-            "P": float(probabilities.get("P", 0.0) or 0.0),
-            "T": float(probabilities.get("T", 0.0) or 0.0),
-        },
-        ("B", "P", "T"),
-    )
-    bp_mass = normalized["B"] + normalized["P"]
-    if bp_mass <= 1e-12:
-        return normalized
-
-    strength = _clip(factor)
-    current_b = normalized["B"] / bp_mass
-    guarded_b = 0.5 + (current_b - 0.5) * strength
-    guarded = {
-        "B": bp_mass * guarded_b,
-        "P": bp_mass * (1.0 - guarded_b),
-        "T": normalized["T"],
-    }
-    return _normalize(guarded, ("B", "P", "T"))
-
-
-def _markov_evidence_guard(
-    history: Sequence[str],
-    markov: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return multiplicative evidence factors without choosing B or P.
-
-    Same-run factor:
-      O1..O4 are nested contexts. During a run such as BBBB, O1=B, O2=BB,
-      O3=BBB and O4=BBBB are correlated descriptions of the same active run.
-      We therefore reduce directional strength as more nested same-run orders
-      become simultaneously available. This is symmetric for Banker and Player.
-
-    Last-hand factor:
-      Compare the current Markov posterior with the posterior before the latest
-      observed hand. If one additional hand creates an unusually large B/P swing
-      without an explicit structural change-point, reduce only the swing strength.
-      The latest hand remains included and no opposite-side rule is introduced.
-    """
-    state = dict(markov.get("state") or {})
-    run_length = max(0, int(state.get("current_run_length", 0) or 0))
-    order_weights = dict(markov.get("order_weights") or {})
-    positive_orders = sum(
-        1
-        for order in range(1, 5)
-        if float(order_weights.get(f"order_{order}", 0.0) or 0.0) > 1e-12
-    )
-    same_run_nested_orders = min(run_length, positive_orders)
-    same_run_factor = 1.0
-    if same_run_nested_orders >= 2:
-        same_run_factor = max(
-            _SAME_RUN_MARKOV_FACTOR_FLOOR,
-            1.0
-            - _SAME_RUN_PER_NESTED_ORDER_PENALTY
-            * (same_run_nested_orders - 1),
-        )
-
-    current_probs = dict(markov.get("probabilities") or {})
-    current_margin = _bp_conditional_margin(current_probs)
-    previous_margin = current_margin
-    shift = 0.0
-    direction_flip = False
-    last_hand_factor = 1.0
-    previous_available = False
-
-    regime_profile = dict(markov.get("regime_profile") or {})
-    structural_break = bool(
-        regime_profile.get("change_point")
-        or regime_profile.get("pattern_break")
-    )
-
-    if len(history) >= _LAST_HAND_MIN_HISTORY:
-        previous_markov = update_and_predict_engine(history[:-1])
-        previous_probs = dict(previous_markov.get("probabilities") or {})
-        previous_margin = _bp_conditional_margin(previous_probs)
-        shift = abs(current_margin - previous_margin)
-        direction_flip = bool(
-            current_margin * previous_margin < 0.0
-            and abs(current_margin) > 1e-9
-            and abs(previous_margin) > 1e-9
-        )
-        previous_available = True
-
-        if not structural_break and shift > _LAST_HAND_SHIFT_THRESHOLD:
-            excess = (shift - _LAST_HAND_SHIFT_THRESHOLD) / max(
-                1e-9,
-                0.40 - _LAST_HAND_SHIFT_THRESHOLD,
-            )
-            penalty = min(_LAST_HAND_MAX_PENALTY, max(0.0, excess) * _LAST_HAND_MAX_PENALTY)
-            if direction_flip:
-                penalty = max(penalty, 0.22)
-            last_hand_factor = max(1.0 - _LAST_HAND_MAX_PENALTY, 1.0 - penalty)
-
-    combined_factor = _clip(same_run_factor * last_hand_factor, 0.50, 1.0)
-    return {
-        "combined_factor": float(combined_factor),
-        "same_run_factor": float(same_run_factor),
-        "same_run_nested_orders": int(same_run_nested_orders),
-        "current_run_length": int(run_length),
-        "positive_order_count": int(positive_orders),
-        "last_hand_factor": float(last_hand_factor),
-        "last_hand_guard_applied": bool(last_hand_factor < 0.999999),
-        "previous_available": bool(previous_available),
-        "current_bp_margin": float(current_margin),
-        "previous_bp_margin": float(previous_margin),
-        "last_hand_margin_shift": float(shift),
-        "last_hand_direction_flip": bool(direction_flip),
-        "structural_break_exemption": bool(structural_break),
-        "semantics": (
-            "confidence_only_correlation_and_last_hand_sensitivity_guard_"
-            "never_forces_opposite_direction"
-        ),
-    }
+def _bp_direction(probabilities: Mapping[str, Any] | None) -> str:
+    probs = dict(probabilities or {})
+    b = float(probs.get("B", 0.0) or 0.0)
+    p = float(probs.get("P", 0.0) or 0.0)
+    if abs(b - p) <= _DIRECTION_EPSILON:
+        return ""
+    return "B" if b > p else "P"
 
 
 class BaccaratQuantEngine:
-    """Dynamic predictor with neutral direction selection and physical EV math."""
+    """Dynamic predictor with road-family integration and physical EV math."""
 
     def __init__(self) -> None:
         self.money = MoneyManagementModel()
@@ -259,7 +103,10 @@ class BaccaratQuantEngine:
                 ("B", "P", "T"),
             ), True
         if len(values) >= 2:
-            return _normalize({"B": float(values[0]), "P": float(values[1])}, ("B", "P")), False
+            return _normalize(
+                {"B": float(values[0]), "P": float(values[1])},
+                ("B", "P"),
+            ), False
         return None, False
 
     @classmethod
@@ -267,14 +114,17 @@ class BaccaratQuantEngine:
         cls,
         probabilities: Mapping[str, Any] | Sequence[float] | None,
     ) -> tuple[dict[str, float] | None, bool]:
-        """Convert a model posterior into evidence relative to baccarat baseline."""
+        """Convert a posterior into evidence relative to baccarat baseline."""
         probs, has_tie = cls._coerce_probs(probabilities)
         if probs is None:
             return None, False
 
         if has_tie:
             return {
-                outcome: max(1e-12, float(probs[outcome]) / max(1e-12, PHYSICAL_PRIOR[outcome]))
+                outcome: max(
+                    1e-12,
+                    float(probs[outcome]) / max(1e-12, PHYSICAL_PRIOR[outcome]),
+                )
                 for outcome in ("B", "P", "T")
             }, True
 
@@ -284,7 +134,10 @@ class BaccaratQuantEngine:
             "P": PHYSICAL_PRIOR["P"] / physical_bp_mass,
         }
         return {
-            side: max(1e-12, float(probs[side]) / max(1e-12, physical_bp[side]))
+            side: max(
+                1e-12,
+                float(probs[side]) / max(1e-12, physical_bp[side]),
+            )
             for side in ("B", "P")
         }, False
 
@@ -317,7 +170,8 @@ class BaccaratQuantEngine:
 
         if has_tie:
             scores = {
-                outcome: normalized_prior[outcome] * max(1e-12, float(likelihood[outcome])) ** w
+                outcome: normalized_prior[outcome]
+                * max(1e-12, float(likelihood[outcome])) ** w
                 for outcome in ("B", "P", "T")
             }
             posterior = _normalize(scores, ("B", "P", "T"))
@@ -332,18 +186,23 @@ class BaccaratQuantEngine:
                     "has_tie": False,
                     "reason": "no_resolved_bp_mass",
                 }
-            prior_bp = {"B": normalized_prior["B"] / bp_mass, "P": normalized_prior["P"] / bp_mass}
+            prior_bp = {
+                "B": normalized_prior["B"] / bp_mass,
+                "P": normalized_prior["P"] / bp_mass,
+            }
             scores = {
                 side: prior_bp[side] * max(1e-12, float(likelihood[side])) ** w
                 for side in ("B", "P")
             }
             posterior_bp = _normalize(scores, ("B", "P"))
-            posterior = {
-                "B": bp_mass * posterior_bp["B"],
-                "P": bp_mass * posterior_bp["P"],
-                "T": normalized_prior["T"],
-            }
-            posterior = _normalize(posterior, ("B", "P", "T"))
+            posterior = _normalize(
+                {
+                    "B": bp_mass * posterior_bp["B"],
+                    "P": bp_mass * posterior_bp["P"],
+                    "T": normalized_prior["T"],
+                },
+                ("B", "P", "T"),
+            )
             method = "tempered_bayes_bp_conditional_preserve_tie"
 
         return posterior, {
@@ -368,6 +227,12 @@ class BaccaratQuantEngine:
         hazard_probs: Mapping[str, Any] | Sequence[float] | None = None,
         hazard_reliability: float = 0.0,
     ) -> tuple[dict[str, float], dict[str, Any]]:
+        """Compatibility fusion helper.
+
+        In normal predict() flow, Road/Hazard are first combined as one road
+        evidence family and this helper then adds Shoe as the separate physical
+        family. Direct callers may still supply Road/Hazard here.
+        """
         prior = _normalize(
             {
                 "B": float(markov_probs.get("B", 0.0) or 0.0),
@@ -417,6 +282,114 @@ class BaccaratQuantEngine:
         }
 
     @classmethod
+    def _calibrate_road_family_reliability(
+        cls,
+        markov_probs: Mapping[str, Any],
+        road_probs: Mapping[str, Any] | Sequence[float] | None,
+        road_reliability: float,
+        hazard_probs: Mapping[str, Any] | Sequence[float] | None,
+        hazard_reliability: float,
+    ) -> tuple[float, float, dict[str, Any]]:
+        """Control correlated road evidence without altering model outputs.
+
+        - Road and Hazard disagree with each other: both are downweighted.
+        - Exactly one auxiliary channel opposes Markov: that lone opposition is
+          downweighted so weak noise cannot flip the final side by itself.
+        - Road and Hazard corroborate the same alternative side: keep their
+          relative evidence, subject only to the family reliability budget.
+        - Total auxiliary reliability is capped because all three road models
+          derive from the same chronological B/P/T sequence.
+        """
+        markov_direction = _bp_direction(markov_probs)
+        road_coerced, _ = cls._coerce_probs(road_probs)
+        hazard_coerced, _ = cls._coerce_probs(hazard_probs)
+        road_direction = _bp_direction(road_coerced)
+        hazard_direction = _bp_direction(hazard_coerced)
+
+        raw_road = _clip(road_reliability)
+        raw_hazard = _clip(hazard_reliability)
+        adjusted_road = raw_road
+        adjusted_hazard = raw_hazard
+        mode = "aligned_or_neutral"
+
+        road_active = bool(road_coerced and raw_road > 0.0 and road_direction)
+        hazard_active = bool(hazard_coerced and raw_hazard > 0.0 and hazard_direction)
+
+        if road_active and hazard_active and road_direction != hazard_direction:
+            adjusted_road *= _AUX_DISAGREEMENT_FACTOR
+            adjusted_hazard *= _AUX_DISAGREEMENT_FACTOR
+            mode = "auxiliary_conflict_downweighted"
+        elif road_active and hazard_active:
+            if markov_direction and road_direction != markov_direction:
+                mode = "corroborated_alternative_preserved"
+            else:
+                mode = "auxiliary_alignment_with_markov"
+        elif road_active and markov_direction and road_direction != markov_direction:
+            adjusted_road *= _LONE_OPPOSITION_FACTOR
+            mode = "lone_road_opposition_downweighted"
+        elif hazard_active and markov_direction and hazard_direction != markov_direction:
+            adjusted_hazard *= _LONE_OPPOSITION_FACTOR
+            mode = "lone_hazard_opposition_downweighted"
+
+        total_before_cap = adjusted_road + adjusted_hazard
+        cap_scale = 1.0
+        if total_before_cap > _ROAD_FAMILY_AUX_RELIABILITY_CAP and total_before_cap > 1e-12:
+            cap_scale = _ROAD_FAMILY_AUX_RELIABILITY_CAP / total_before_cap
+            adjusted_road *= cap_scale
+            adjusted_hazard *= cap_scale
+
+        return (
+            _clip(adjusted_road),
+            _clip(adjusted_hazard),
+            {
+                "mode": mode,
+                "markov_direction": markov_direction,
+                "road_direction": road_direction,
+                "hazard_direction": hazard_direction,
+                "raw_road_reliability": float(raw_road),
+                "raw_hazard_reliability": float(raw_hazard),
+                "adjusted_road_reliability": float(adjusted_road),
+                "adjusted_hazard_reliability": float(adjusted_hazard),
+                "aux_reliability_cap": float(_ROAD_FAMILY_AUX_RELIABILITY_CAP),
+                "cap_scale": float(cap_scale),
+                "semantics": (
+                    "correlated_road_family_reliability_control_without_"
+                    "changing_member_model_probabilities"
+                ),
+            },
+        )
+
+    @classmethod
+    def _fuse_road_family(
+        cls,
+        markov_probs: Mapping[str, Any],
+        road_probs: Mapping[str, Any] | Sequence[float] | None,
+        road_reliability: float,
+        hazard_probs: Mapping[str, Any] | Sequence[float] | None,
+        hazard_reliability: float,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        after_road, road_detail = cls._apply_tempered_likelihood(
+            markov_probs,
+            road_probs,
+            reliability=road_reliability,
+        )
+        family_posterior, hazard_detail = cls._apply_tempered_likelihood(
+            after_road,
+            hazard_probs,
+            reliability=hazard_reliability,
+        )
+        return family_posterior, {
+            "method": "markov_primary_plus_bounded_derived_road_and_hazard_family",
+            "markov_prior": dict(markov_probs),
+            "road": road_detail,
+            "hazard": hazard_detail,
+            "posterior_after_road": after_road,
+            "posterior": family_posterior,
+            "road_reliability": float(road_reliability),
+            "hazard_reliability": float(hazard_reliability),
+        }
+
+    @classmethod
     def _select_direction(
         cls,
         final_probs: Mapping[str, Any],
@@ -426,7 +399,10 @@ class BaccaratQuantEngine:
         road_probs: Mapping[str, Any] | Sequence[float] | None,
         shoe_probs: Mapping[str, Any] | Sequence[float] | None,
     ) -> tuple[str, dict[str, Any]]:
-        margin = float(final_probs.get("B", 0.0) or 0.0) - float(final_probs.get("P", 0.0) or 0.0)
+        margin = (
+            float(final_probs.get("B", 0.0) or 0.0)
+            - float(final_probs.get("P", 0.0) or 0.0)
+        )
         if margin > _DIRECTION_EPSILON:
             return "B", {"source": "final_direction_posterior", "margin": margin}
         if margin < -_DIRECTION_EPSILON:
@@ -446,9 +422,17 @@ class BaccaratQuantEngine:
                 continue
             local_margin = float(probs["B"]) - float(probs["P"])
             if local_margin > _DIRECTION_EPSILON:
-                return "B", {"source": source, "margin": margin, "tie_break_margin": local_margin}
+                return "B", {
+                    "source": source,
+                    "margin": margin,
+                    "tie_break_margin": local_margin,
+                }
             if local_margin < -_DIRECTION_EPSILON:
-                return "P", {"source": source, "margin": margin, "tie_break_margin": local_margin}
+                return "P", {
+                    "source": source,
+                    "margin": margin,
+                    "tie_break_margin": local_margin,
+                }
 
         return "B", {
             "source": "unresolved_exact_tie_compatibility",
@@ -469,74 +453,77 @@ class BaccaratQuantEngine:
     ) -> dict[str, Any]:
         install_legacy_app_bankroll_adapter()
 
-        history_values = _clean_history_values(history)
-        markov = update_and_predict_engine(history_values)
+        # Model outputs are left intact. No pre-fusion last-hand or same-run
+        # probability shrink is applied here.
+        markov = update_and_predict_engine(history)
         markov_probs = dict(markov["probabilities"])
-        evidence_guard = _markov_evidence_guard(history_values, markov)
-        guarded_raw_markov_probs = _shrink_bp_toward_neutral(
-            markov_probs,
-            float(evidence_guard["combined_factor"]),
-        )
 
         road_analysis: dict[str, Any] = {}
         if road_probs is None:
             try:
                 from road_model import build_road_context
-                road_analysis = dict(build_road_context(history_values))
+
+                road_analysis = dict(build_road_context(history))
                 candidate = road_analysis.get("derived_markov_likelihood")
                 if isinstance(candidate, Mapping):
                     road_probs = candidate
-                    road_reliability = float(road_analysis.get("derived_markov_reliability", 0.0) or 0.0)
+                    road_reliability = float(
+                        road_analysis.get("derived_markov_reliability", 0.0) or 0.0
+                    )
             except Exception:
                 road_analysis = {}
 
-        pattern_survival = calculate_pattern_survival(markov, road_analysis, remaining_card_state)
+        pattern_survival = calculate_pattern_survival(
+            markov,
+            road_analysis,
+            remaining_card_state,
+        )
         survival_score = float(pattern_survival.get("score", 0.0) or 0.0)
         calibrated_markov_probs = calibrate_markov_probabilities(
-            guarded_raw_markov_probs,
+            markov_probs,
             survival_score,
         )
 
         raw_road_reliability = _clip(float(road_reliability or 0.0))
-        effective_road_reliability = _clip(raw_road_reliability * survival_score)
+        pattern_road_reliability = _clip(raw_road_reliability * survival_score)
 
-        hazard_analysis = analyze_run_length_hazard(history_values)
+        hazard_analysis = analyze_run_length_hazard(history)
         hazard_probs = dict(hazard_analysis.get("likelihood") or {})
-        raw_hazard_reliability = _clip(float(hazard_analysis.get("reliability", 0.0) or 0.0))
+        raw_hazard_reliability = _clip(
+            float(hazard_analysis.get("reliability", 0.0) or 0.0)
+        )
         remaining_state = dict(remaining_card_state or {})
-        shoe_stage_factor = _clip(float(remaining_state.get("shoe_stage_factor", 0.70) or 0.70))
-
-        hazard_correlation_factor = 1.0
-        current_side = str(hazard_analysis.get("current_side") or "").upper().strip()
-        current_run_length = int(hazard_analysis.get("current_run_length", 0) or 0)
-        hazard_direction = _bp_direction(hazard_probs) if hazard_probs else ""
-        markov_direction = _bp_direction(calibrated_markov_probs)
-        duplicate_current_run_direction = bool(
-            current_run_length >= 2
-            and current_side in {"B", "P"}
-            and hazard_direction == current_side
-            and markov_direction == current_side
+        shoe_stage_factor = _clip(
+            float(remaining_state.get("shoe_stage_factor", 0.70) or 0.70)
         )
-        if duplicate_current_run_direction:
-            hazard_correlation_factor *= _HAZARD_CURRENT_RUN_CORRELATION_FACTOR
-        if bool(evidence_guard.get("last_hand_guard_applied")):
-            hazard_correlation_factor *= _HAZARD_LAST_HAND_SENSITIVITY_FACTOR
-        hazard_correlation_factor = _clip(hazard_correlation_factor, 0.25, 1.0)
-
-        effective_hazard_reliability = _clip(
-            raw_hazard_reliability
-            * shoe_stage_factor
-            * hazard_correlation_factor
+        stage_hazard_reliability = _clip(
+            raw_hazard_reliability * shoe_stage_factor
         )
 
-        direction_probs, fusion = self.bayesian_fuse(
+        effective_road_reliability, effective_hazard_reliability, family_control = (
+            self._calibrate_road_family_reliability(
+                calibrated_markov_probs,
+                road_probs,
+                pattern_road_reliability,
+                hazard_probs,
+                stage_hazard_reliability,
+            )
+        )
+
+        road_family_probs, road_family = self._fuse_road_family(
             calibrated_markov_probs,
+            road_probs,
+            effective_road_reliability,
+            hazard_probs,
+            effective_hazard_reliability,
+        )
+
+        # Shoe is a separate physical evidence family and is fused only after the
+        # three road-derived models have been consolidated.
+        direction_probs, fusion = self.bayesian_fuse(
+            road_family_probs,
             shoe_probs,
             shoe_reliability=shoe_reliability,
-            road_probs=road_probs,
-            road_reliability=effective_road_reliability,
-            hazard_probs=hazard_probs,
-            hazard_reliability=effective_hazard_reliability,
         )
 
         direction, direction_detail = self._select_direction(
@@ -547,26 +534,29 @@ class BaccaratQuantEngine:
             shoe_probs=shoe_probs,
         )
 
-        markov_evidence, _ = self._physical_evidence_ratio(guarded_raw_markov_probs)
+        # Economic posterior keeps the physical baccarat prior for EV/sizing but
+        # uses the same Road Family evidence controls as the direction posterior.
+        markov_evidence, _ = self._physical_evidence_ratio(markov_probs)
         economic_markov_prior, economic_markov_detail = self._apply_tempered_likelihood(
             PHYSICAL_PRIOR,
             markov_evidence,
             reliability=survival_score,
         )
-        economic_probs, economic_fusion = self.bayesian_fuse(
+        economic_road_family_probs, economic_road_family = self._fuse_road_family(
             economic_markov_prior,
+            road_probs,
+            effective_road_reliability,
+            hazard_probs,
+            effective_hazard_reliability,
+        )
+        economic_probs, economic_fusion = self.bayesian_fuse(
+            economic_road_family_probs,
             shoe_probs,
             shoe_reliability=shoe_reliability,
-            road_probs=road_probs,
-            road_reliability=effective_road_reliability,
-            hazard_probs=hazard_probs,
-            hazard_reliability=effective_hazard_reliability,
         )
 
         pattern_calibrated_weight = _clip(
-            float(markov["final_weight"])
-            * float(evidence_guard["combined_factor"])
-            * (0.35 + 0.65 * survival_score)
+            float(markov["final_weight"]) * (0.35 + 0.65 * survival_score)
         )
         money = self.money.allocate(
             direction=direction,
@@ -586,25 +576,37 @@ class BaccaratQuantEngine:
                 "reason": "unresolved_exact_direction_tie_no_bet",
             })
 
+        # Preserve legacy diagnostic keys expected by predictor.py while exposing
+        # the new explicit road-family structure.
         fusion.update({
             "pattern_survival": pattern_survival,
             "raw_markov_prior": dict(markov_probs),
-            "guarded_raw_markov_prior": dict(guarded_raw_markov_probs),
-            "markov_evidence_guard": dict(evidence_guard),
             "pattern_calibrated_markov_prior": dict(calibrated_markov_probs),
+            "road_family": road_family,
+            "road_family_control": family_control,
+            "road": dict(road_family.get("road") or {}),
+            "hazard": dict(road_family.get("hazard") or {}),
             "raw_road_reliability": float(raw_road_reliability),
-            "pattern_calibrated_road_reliability": float(effective_road_reliability),
+            "pattern_calibrated_road_reliability": float(pattern_road_reliability),
+            "road_reliability": float(effective_road_reliability),
             "run_length_hazard": hazard_analysis,
             "raw_hazard_reliability": float(raw_hazard_reliability),
-            "hazard_correlation_factor": float(hazard_correlation_factor),
-            "duplicate_current_run_direction": bool(duplicate_current_run_direction),
-            "shoe_stage_calibrated_hazard_reliability": float(effective_hazard_reliability),
+            "shoe_stage_raw_hazard_reliability": float(stage_hazard_reliability),
+            "hazard_reliability": float(effective_hazard_reliability),
+            "road_likelihood": dict(road_family.get("road") or {}).get("likelihood"),
+            "hazard_likelihood": dict(road_family.get("hazard") or {}).get("likelihood"),
+            "road_family_posterior": road_family_probs,
             "direction_selection": direction_detail,
             "economic_markov_evidence": economic_markov_detail,
+            "economic_road_family": economic_road_family,
             "economic_posterior": economic_probs,
             "economic_fusion": economic_fusion,
-            "direction_semantics": "banker_neutral_bp_direction_posterior_with_correlated_evidence_guards",
-            "economic_semantics": "physical_baccarat_prior_plus_guarded_excess_model_evidence_for_edge_only",
+            "direction_semantics": (
+                "markov_primary_road_family_then_independent_physical_shoe_evidence"
+            ),
+            "economic_semantics": (
+                "physical_baccarat_prior_plus_same_bounded_road_family_and_shoe_evidence"
+            ),
         })
 
         return {
@@ -613,9 +615,10 @@ class BaccaratQuantEngine:
             "direction_margin": float(direction_probs["B"] - direction_probs["P"]),
             "direction_selection": direction_detail,
             "markov_probs": markov_probs,
-            "guarded_markov_probs": guarded_raw_markov_probs,
-            "markov_evidence_guard": evidence_guard,
             "pattern_calibrated_markov_probs": calibrated_markov_probs,
+            "road_family_probs": road_family_probs,
+            "road_family": road_family,
+            "road_family_control": family_control,
             "final_probs": direction_probs,
             "direction_probs": direction_probs,
             "economic_probs": economic_probs,
@@ -635,7 +638,6 @@ class BaccaratQuantEngine:
             "run_length_hazard": hazard_analysis,
             "hazard_likelihood": hazard_probs,
             "hazard_reliability": float(effective_hazard_reliability),
-            "hazard_correlation_factor": float(hazard_correlation_factor),
             "fusion": fusion,
             "road_analysis": road_analysis,
         }
@@ -659,13 +661,9 @@ if __name__ == "__main__":
     print({
         "prediction_direction": example["direction"],
         "direction_probs": example["direction_probs"],
+        "road_family": example["road_family"],
         "economic_probs": example["economic_probs"],
-        "run_length_hazard": example["run_length_hazard"],
-        "markov_evidence_guard": example["markov_evidence_guard"],
         "pattern_survival": example["pattern_survival"],
-        "dynamic_bet_percentage": example["bet_percentage"],
-        "suggested_bet_amount": example["suggested_bet_amount"],
-        "edge_percent": example["edge_percent"],
         "bet_allowed": example["bet_allowed"],
     })
 

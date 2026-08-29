@@ -13,6 +13,10 @@ Direction calibration separates:
 The optional hidden-regime layer is HSMM-inspired and duration-aware, but it is
 not claimed to be an offline-trained HSMM because the repository has no in-repo
 multi-shoe road-sequence training set. It may only reduce pattern confidence.
+
+Multi-order Markov agreement is treated conservatively: agreement does not add
+an extra confidence bonus because order-1..4 contexts are nested and correlated;
+only meaningful disagreement may reduce Pattern Survival confidence.
 """
 from __future__ import annotations
 
@@ -31,6 +35,11 @@ SHOE_STAGE_FACTORS = {
     "LATE": 0.80,
     "UNKNOWN": 0.70,
 }
+
+# Markov multi-order agreement lies in [0.5, 1.0]. Agreement at or above this
+# threshold receives no bonus and no penalty. Lower values only reduce trust.
+_AGREEMENT_NO_PENALTY_THRESHOLD = 0.75
+_AGREEMENT_MAX_CONFLICT_PENALTY = 0.25
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -192,6 +201,19 @@ def build_remaining_card_state(
     }
 
 
+def _agreement_conflict_factor(agreement: float) -> float:
+    """Return 1.0 for adequate agreement; only disagreement creates a penalty."""
+    value = _clip(float(agreement), 0.5, 1.0)
+    if value >= _AGREEMENT_NO_PENALTY_THRESHOLD:
+        return 1.0
+    conflict = (
+        (_AGREEMENT_NO_PENALTY_THRESHOLD - value)
+        / max(1e-9, _AGREEMENT_NO_PENALTY_THRESHOLD - 0.5)
+    )
+    penalty = _AGREEMENT_MAX_CONFLICT_PENALTY * _clip(conflict)
+    return _clip(1.0 - penalty)
+
+
 def calculate_pattern_survival(
     markov: Mapping[str, Any],
     road_analysis: Mapping[str, Any] | None,
@@ -212,6 +234,7 @@ def calculate_pattern_survival(
     agreement = _clip(
         float(markov.get("multi_order_agreement", 0.5) or 0.5)
     )
+    agreement_factor = _agreement_conflict_factor(agreement)
     regime_stability = _clip(
         float(profile.get("stability", 0.45) or 0.0)
     )
@@ -294,15 +317,17 @@ def calculate_pattern_survival(
         or regime == "TRANSITION"
     ) else 1.0
 
-    raw_score = _clip(
-        0.20 * support
-        + 0.20 * agreement
-        + 0.18 * regime_stability
-        + 0.15 * recent_pattern
-        + 0.10 * entropy_stability
-        + 0.10 * derived_component
-        + 0.07 * remaining_reliability
+    # Base structural score intentionally excludes a positive agreement term.
+    # The weights sum to 1.0. Agreement only applies a one-way conflict penalty.
+    base_score = _clip(
+        0.25 * support
+        + 0.22 * regime_stability
+        + 0.18 * recent_pattern
+        + 0.12 * entropy_stability
+        + 0.13 * derived_component
+        + 0.10 * remaining_reliability
     )
+    raw_score = _clip(base_score * agreement_factor)
 
     hidden_regime = analyze_hidden_regime(markov)
     hidden_factor = _clip(
@@ -317,6 +342,7 @@ def calculate_pattern_survival(
     return {
         "score": float(score),
         "raw_score": float(raw_score),
+        "base_structural_score": float(base_score),
         "pre_hidden_regime_score": float(pre_hidden_score),
         "pattern": regime,
         "base_pattern": base_regime,
@@ -327,9 +353,12 @@ def calculate_pattern_survival(
         "change_point_factor": float(change_factor),
         "hidden_regime": hidden_regime,
         "hidden_regime_factor": float(hidden_factor),
+        "multi_order_agreement": float(agreement),
+        "multi_order_conflict_factor": float(agreement_factor),
         "components": {
             "support": float(support),
             "multi_order_agreement": float(agreement),
+            "multi_order_conflict_factor": float(agreement_factor),
             "regime_stability": float(regime_stability),
             "recent_pattern": float(recent_pattern),
             "entropy_stability": float(entropy_stability),
@@ -338,8 +367,8 @@ def calculate_pattern_survival(
             "hidden_regime_factor": float(hidden_factor),
         },
         "semantics": (
-            "pattern_survival_with_duration_aware_hidden_regime_downweight_"
-            "not_next_hand_win_probability"
+            "pattern_survival_with_agreement_conflict_only_and_duration_aware_"
+            "hidden_regime_downweight_not_next_hand_win_probability"
         ),
     }
 
