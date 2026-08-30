@@ -2,11 +2,12 @@
 
 Public helper names and outward fields are preserved. The original 12-round
 ShortShoePredictor remains the local model. Formal B/P probability is produced
-by a three-way ensemble:
+from Local Markov + full-shoe Global Base Probability + NumPy regression, then
+passed through an Anti-Lock + Anti-Chase Direction Controller.
 
-1. 12-round local Markov probability.
-2. Full-shoe Global Base Probability.
-3. NumPy least-squares regression signal built from the full cumulative B/P path.
+The controller has two jobs only:
+1. Global history cannot lock the decision when Local + Regression agree against it.
+2. One newly opened B/P round cannot by itself flip the formal direction.
 
 The compatibility penalty payload is retained but has no authority to force O.
 """
@@ -20,7 +21,7 @@ import numpy as np
 
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "ROAD-ONLY-W12-GLOBAL-REGRESSION-ENSEMBLE-V4"
+POLICY_VERSION = "ROAD-ONLY-W12-GLOBAL-REGRESSION-ANTI-LOCK-CHASE-V5"
 
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 12
@@ -44,9 +45,19 @@ REGRESSION_GLOBAL_STRONG_SLOPE = 0.20
 REGRESSION_LOCAL_STRONG_SLOPE = 0.35
 REGRESSION_SLOPE_SCALE = 1.25
 
-ENSEMBLE_NORMAL_WEIGHTS = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
-ENSEMBLE_TREND_WEIGHTS = (0.15, 0.425, 0.425)
+# The old trend regime allowed Global + Regression to own 85% of the vote.
+# These weights deliberately prevent full-shoe history from permanently locking
+# one side while retaining Regression as the independent turning-point signal.
+ENSEMBLE_NORMAL_WEIGHTS = (0.40, 0.20, 0.40)
+ENSEMBLE_TREND_WEIGHTS = (0.30, 0.25, 0.45)
 ENSEMBLE_REVERSAL_WEIGHTS = (0.45, 0.0, 0.55)
+ENSEMBLE_ANTI_LOCK_WEIGHTS = (0.45, 0.10, 0.45)
+
+ANTI_LOCK_MIN_COMPONENT_EDGE = 0.025
+ANTI_CHASE_FAST_COMPONENT_EDGE = 0.050
+ANTI_CHASE_PREVIOUS_WEIGHT = 0.65
+ANTI_CHASE_CURRENT_WEIGHT = 0.35
+ANTI_CHASE_DIRECTION_EPSILON = 0.0005
 
 GLOBAL_LOCAL_WEIGHT = ENSEMBLE_NORMAL_WEIGHTS[0]
 GLOBAL_TREND_WEIGHT = ENSEMBLE_NORMAL_WEIGHTS[1]
@@ -71,6 +82,10 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
     if not math.isfinite(number):
         return lo
     return max(lo, min(hi, number))
+
+
+def _side_from_probability(p_b: float) -> str:
+    return "B" if float(p_b) >= 0.5 else "P"
 
 
 def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
@@ -357,7 +372,6 @@ def _least_squares_line(
 def regression_analysis_model(
     history: str | Iterable[Any] | None,
 ) -> dict[str, Any]:
-    """Third-party global/turning-point indicator using NumPy least squares."""
     sequence = normalize_big_road(history)
     n = len(sequence)
     if n == 0:
@@ -459,31 +473,59 @@ def regression_analysis_model(
     }
 
 
-def _ensemble_weights(regression: Mapping[str, Any]) -> tuple[float, float, float, str]:
+def _normalize_weights(weights: Sequence[float]) -> tuple[float, float, float]:
+    values = [max(0.0, float(value)) for value in weights[:3]]
+    while len(values) < 3:
+        values.append(0.0)
+    total = sum(values)
+    if total <= 1e-12:
+        return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
+    return values[0] / total, values[1] / total, values[2] / total
+
+
+def _adaptive_ensemble_weights(
+    *,
+    local_p_b: float,
+    global_p_b: float,
+    regression_p_b: float,
+    regression: Mapping[str, Any],
+) -> tuple[float, float, float, str, bool]:
+    local_side = _side_from_probability(local_p_b)
+    global_side = _side_from_probability(global_p_b)
+    regression_side = _side_from_probability(regression_p_b)
+    local_edge = abs(local_p_b - 0.5)
+    regression_edge = abs(regression_p_b - 0.5)
+
+    local_regression_consensus = bool(
+        local_side == regression_side
+        and local_edge >= ANTI_LOCK_MIN_COMPONENT_EDGE
+        and regression_edge >= ANTI_LOCK_MIN_COMPONENT_EDGE
+    )
+    anti_lock = bool(
+        local_regression_consensus
+        and local_side != global_side
+    )
+
     if bool(regression.get("structural_reversal")):
-        w1, w2, w3 = ENSEMBLE_REVERSAL_WEIGHTS
+        weights = ENSEMBLE_REVERSAL_WEIGHTS
         regime = "structural_reversal"
+    elif anti_lock:
+        weights = ENSEMBLE_ANTI_LOCK_WEIGHTS
+        regime = "anti_lock_local_regression_consensus"
     elif bool(regression.get("aligned_strong_trend")):
-        w1, w2, w3 = ENSEMBLE_TREND_WEIGHTS
+        weights = ENSEMBLE_TREND_WEIGHTS
         regime = "aligned_strong_trend"
     else:
-        w1, w2, w3 = ENSEMBLE_NORMAL_WEIGHTS
+        weights = ENSEMBLE_NORMAL_WEIGHTS
         regime = "normal"
-    total = w1 + w2 + w3
-    if total <= 1e-12:
-        return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, "normal"
-    return w1 / total, w2 / total, w3 / total, regime
+
+    w1, w2, w3 = _normalize_weights(weights)
+    return w1, w2, w3, regime, anti_lock
 
 
-def global_trend_bias_correction(
-    history: str | Iterable[Any] | None,
-    local_forecast: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Three-way Local + Global + Regression ensemble with dynamic weights."""
-    sequence = normalize_big_road(history)
-    total_b, total_p, global_p_b = _full_shoe_base_probability(sequence)
-    global_p_p = 1.0 - global_p_b
-
+def _component_snapshot(sequence: Sequence[str]) -> dict[str, Any]:
+    seq = list(sequence)
+    local_forecast = decayed_markov_forecast(seq)
     local_probabilities = local_forecast.get("probabilities")
     if not isinstance(local_probabilities, Mapping):
         local_probabilities = {"B": 0.5, "P": 0.5}
@@ -495,22 +537,217 @@ def global_trend_bias_correction(
     else:
         local_p_b, local_p_p = local_p_b / local_total, local_p_p / local_total
 
-    regression = regression_analysis_model(sequence)
+    total_b, total_p, global_p_b = _full_shoe_base_probability(seq)
+    global_p_p = 1.0 - global_p_b
+    regression = regression_analysis_model(seq)
     regression_p_b = _clip(regression.get("regression_p_b", 0.5), 0.0, 1.0)
     regression_p_p = 1.0 - regression_p_b
-    w1, w2, w3, ensemble_regime = _ensemble_weights(regression)
 
-    final_p_b = w1 * local_p_b + w2 * global_p_b + w3 * regression_p_b
-    final_p_p = w1 * local_p_p + w2 * global_p_p + w3 * regression_p_p
-    final_total = final_p_b + final_p_p
-    if final_total <= 1e-12:
-        final_p_b, final_p_p = 0.5, 0.5
+    w1, w2, w3, ensemble_regime, anti_lock = _adaptive_ensemble_weights(
+        local_p_b=local_p_b,
+        global_p_b=global_p_b,
+        regression_p_b=regression_p_b,
+        regression=regression,
+    )
+
+    raw_p_b = w1 * local_p_b + w2 * global_p_b + w3 * regression_p_b
+    raw_p_p = w1 * local_p_p + w2 * global_p_p + w3 * regression_p_p
+    total = raw_p_b + raw_p_p
+    if total <= 1e-12:
+        raw_p_b, raw_p_p = 0.5, 0.5
     else:
-        final_p_b, final_p_p = final_p_b / final_total, final_p_p / final_total
+        raw_p_b, raw_p_p = raw_p_b / total, raw_p_p / total
 
-    direction = "B" if final_p_b >= final_p_p else "P"
+    return {
+        "local_forecast": local_forecast,
+        "local_p_b": float(local_p_b),
+        "local_p_p": float(local_p_p),
+        "global_p_b": float(global_p_b),
+        "global_p_p": float(global_p_p),
+        "regression_p_b": float(regression_p_b),
+        "regression_p_p": float(regression_p_p),
+        "regression_analysis": dict(regression),
+        "weights": {"local": float(w1), "global": float(w2), "regression": float(w3)},
+        "ensemble_regime": ensemble_regime,
+        "anti_lock_applied": bool(anti_lock),
+        "raw_p_b": float(raw_p_b),
+        "raw_p_p": float(raw_p_p),
+        "raw_direction": _side_from_probability(raw_p_b),
+        "total_b": int(total_b),
+        "total_p": int(total_p),
+    }
+
+
+def _anti_lock_anti_chase_controller(
+    sequence: Sequence[str],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_p_b = float(current.get("raw_p_b", 0.5) or 0.5)
+    raw_p_p = 1.0 - raw_p_b
+    raw_direction = _side_from_probability(raw_p_b)
+
+    local_p_b = float(current.get("local_p_b", 0.5) or 0.5)
+    regression_p_b = float(current.get("regression_p_b", 0.5) or 0.5)
+    global_p_b = float(current.get("global_p_b", 0.5) or 0.5)
+    local_side = _side_from_probability(local_p_b)
+    regression_side = _side_from_probability(regression_p_b)
+    global_side = _side_from_probability(global_p_b)
+    local_edge = abs(local_p_b - 0.5)
+    regression_edge = abs(regression_p_b - 0.5)
+
+    if len(sequence) < 2:
+        return {
+            "mode": "initial_no_hysteresis",
+            "raw_direction": raw_direction,
+            "previous_raw_direction": "",
+            "final_direction": raw_direction,
+            "raw_p_b": raw_p_b,
+            "final_p_b": raw_p_b,
+            "final_p_p": raw_p_p,
+            "one_step_flip": False,
+            "local_side": local_side,
+            "regression_side": regression_side,
+            "global_side": global_side,
+            "local_regression_consensus": local_side == regression_side,
+            "prior_support_count": 0,
+            "immediate_switch_allowed": False,
+            "latest_outcome": sequence[-1] if sequence else "",
+        }
+
+    previous = _component_snapshot(sequence[:-1])
+    previous_raw_p_b = float(previous.get("raw_p_b", 0.5) or 0.5)
+    previous_raw_direction = _side_from_probability(previous_raw_p_b)
+    one_step_flip = raw_direction != previous_raw_direction
+
+    previous_local_side = _side_from_probability(
+        float(previous.get("local_p_b", 0.5) or 0.5)
+    )
+    previous_regression_side = _side_from_probability(
+        float(previous.get("regression_p_b", 0.5) or 0.5)
+    )
+    prior_support_count = int(previous_local_side == raw_direction) + int(
+        previous_regression_side == raw_direction
+    )
+
+    local_regression_consensus = bool(
+        local_side == regression_side == raw_direction
+        and local_edge >= ANTI_LOCK_MIN_COMPONENT_EDGE
+        and regression_edge >= ANTI_LOCK_MIN_COMPONENT_EDGE
+    )
+    strong_local_regression_consensus = bool(
+        local_side == regression_side == raw_direction
+        and local_edge >= ANTI_CHASE_FAST_COMPONENT_EDGE
+        and regression_edge >= ANTI_CHASE_FAST_COMPONENT_EDGE
+    )
+    structural_reversal = bool(
+        (current.get("regression_analysis") or {}).get("structural_reversal")
+    )
+
+    # A fast switch needs independent confirmation.  One freshly opened result
+    # cannot flip both short-horizon components and immediately become a bet.
+    immediate_switch_allowed = bool(
+        one_step_flip
+        and strong_local_regression_consensus
+        and (structural_reversal or prior_support_count >= 1)
+    )
+
+    final_p_b = raw_p_b
+    mode = "raw_ensemble_confirmed"
+    if one_step_flip and not immediate_switch_allowed:
+        final_p_b = (
+            ANTI_CHASE_PREVIOUS_WEIGHT * previous_raw_p_b
+            + ANTI_CHASE_CURRENT_WEIGHT * raw_p_b
+        )
+        # Ensure a single new result cannot cross the formal direction boundary.
+        if previous_raw_direction == "B" and final_p_b < 0.5 + ANTI_CHASE_DIRECTION_EPSILON:
+            final_p_b = 0.5 + ANTI_CHASE_DIRECTION_EPSILON
+        elif previous_raw_direction == "P" and final_p_b > 0.5 - ANTI_CHASE_DIRECTION_EPSILON:
+            final_p_b = 0.5 - ANTI_CHASE_DIRECTION_EPSILON
+        mode = "anti_chase_one_round_hysteresis"
+    elif immediate_switch_allowed:
+        mode = "confirmed_fast_switch"
+
+    final_p_b = _clip(final_p_b, 0.001, 0.999)
+    final_p_p = 1.0 - final_p_b
+    final_direction = _side_from_probability(final_p_b)
+
+    return {
+        "mode": mode,
+        "raw_direction": raw_direction,
+        "previous_raw_direction": previous_raw_direction,
+        "final_direction": final_direction,
+        "raw_p_b": float(raw_p_b),
+        "previous_raw_p_b": float(previous_raw_p_b),
+        "final_p_b": float(final_p_b),
+        "final_p_p": float(final_p_p),
+        "one_step_flip": bool(one_step_flip),
+        "local_side": local_side,
+        "regression_side": regression_side,
+        "global_side": global_side,
+        "local_edge": float(local_edge),
+        "regression_edge": float(regression_edge),
+        "local_regression_consensus": bool(local_regression_consensus),
+        "strong_local_regression_consensus": bool(strong_local_regression_consensus),
+        "prior_support_count": int(prior_support_count),
+        "structural_reversal": bool(structural_reversal),
+        "immediate_switch_allowed": bool(immediate_switch_allowed),
+        "latest_outcome": sequence[-1] if sequence else "",
+        "previous_weight": float(ANTI_CHASE_PREVIOUS_WEIGHT),
+        "current_weight": float(ANTI_CHASE_CURRENT_WEIGHT),
+    }
+
+
+def global_trend_bias_correction(
+    history: str | Iterable[Any] | None,
+    local_forecast: Mapping[str, Any],
+) -> dict[str, Any]:
+    sequence = normalize_big_road(history)
+    current = _component_snapshot(sequence)
+
+    # Reuse the caller's local forecast exactly so the original 12-hand model is
+    # not recomputed differently from the public prediction path.
+    if isinstance(local_forecast.get("probabilities"), Mapping):
+        supplied = dict(local_forecast.get("probabilities") or {})
+        supplied_b = _clip(supplied.get("B", 0.5), 0.0, 1.0)
+        supplied_p = _clip(supplied.get("P", 0.5), 0.0, 1.0)
+        supplied_total = supplied_b + supplied_p
+        if supplied_total > 1e-12:
+            supplied_b, supplied_p = supplied_b / supplied_total, supplied_p / supplied_total
+            current["local_forecast"] = dict(local_forecast)
+            current["local_p_b"] = float(supplied_b)
+            current["local_p_p"] = float(supplied_p)
+            regression = dict(current.get("regression_analysis") or {})
+            w1, w2, w3, regime, anti_lock = _adaptive_ensemble_weights(
+                local_p_b=supplied_b,
+                global_p_b=float(current.get("global_p_b", 0.5) or 0.5),
+                regression_p_b=float(current.get("regression_p_b", 0.5) or 0.5),
+                regression=regression,
+            )
+            current["weights"] = {
+                "local": float(w1),
+                "global": float(w2),
+                "regression": float(w3),
+            }
+            current["ensemble_regime"] = regime
+            current["anti_lock_applied"] = bool(anti_lock)
+            raw_p_b = (
+                w1 * supplied_b
+                + w2 * float(current.get("global_p_b", 0.5) or 0.5)
+                + w3 * float(current.get("regression_p_b", 0.5) or 0.5)
+            )
+            current["raw_p_b"] = float(_clip(raw_p_b, 0.0, 1.0))
+            current["raw_p_p"] = float(1.0 - current["raw_p_b"])
+            current["raw_direction"] = _side_from_probability(current["raw_p_b"])
+
+    controller = _anti_lock_anti_chase_controller(sequence, current)
+    final_p_b = float(controller["final_p_b"])
+    final_p_p = float(controller["final_p_p"])
+    direction = str(controller["final_direction"])
     confidence_prob = max(final_p_b, final_p_p)
 
+    total_b = int(current.get("total_b", 0) or 0)
+    total_p = int(current.get("total_p", 0) or 0)
+    global_p_b = float(current.get("global_p_b", 0.5) or 0.5)
     if len(sequence) >= 2:
         _, _, previous_global_p_b = _full_shoe_base_probability(sequence[:-1])
     else:
@@ -523,36 +760,39 @@ def global_trend_bias_correction(
     else:
         global_shift_direction = "flat"
 
+    weights = dict(current.get("weights") or {})
+    regression = dict(current.get("regression_analysis") or {})
     return {
         "applied": True,
-        "mode": "global_local_regression_dynamic_ensemble",
-        "ensemble_regime": ensemble_regime,
-        "local_weight": float(w1),
-        "global_weight": float(w2),
-        "regression_weight": float(w3),
-        "ensemble_weights": {
-            "local": float(w1),
-            "global": float(w2),
-            "regression": float(w3),
-        },
+        "mode": "global_local_regression_anti_lock_anti_chase",
+        "ensemble_regime": str(current.get("ensemble_regime") or "normal"),
+        "local_weight": float(weights.get("local", 0.0) or 0.0),
+        "global_weight": float(weights.get("global", 0.0) or 0.0),
+        "regression_weight": float(weights.get("regression", 0.0) or 0.0),
+        "ensemble_weights": weights,
+        "anti_lock_applied": bool(current.get("anti_lock_applied", False)),
+        "direction_controller": dict(controller),
         "total_rounds": int(total_b + total_p),
-        "total_b": int(total_b),
-        "total_p": int(total_p),
-        "global_p_b": float(global_p_b),
-        "global_p_p": float(global_p_p),
+        "total_b": total_b,
+        "total_p": total_p,
+        "global_p_b": global_p_b,
+        "global_p_p": float(1.0 - global_p_b),
         "previous_global_p_b": float(previous_global_p_b),
         "global_probability_velocity_b": float(global_velocity_b),
         "global_shift_direction": global_shift_direction,
-        "local_p_b": float(local_p_b),
-        "local_p_p": float(local_p_p),
-        "regression_p_b": float(regression_p_b),
-        "regression_p_p": float(regression_p_p),
-        "regression_analysis": dict(regression),
+        "local_p_b": float(current.get("local_p_b", 0.5) or 0.5),
+        "local_p_p": float(current.get("local_p_p", 0.5) or 0.5),
+        "regression_p_b": float(current.get("regression_p_b", 0.5) or 0.5),
+        "regression_p_p": float(current.get("regression_p_p", 0.5) or 0.5),
+        "regression_analysis": regression,
+        "raw_ensemble_p_b": float(current.get("raw_p_b", 0.5) or 0.5),
+        "raw_ensemble_p_p": float(current.get("raw_p_p", 0.5) or 0.5),
+        "raw_ensemble_direction": str(current.get("raw_direction") or direction),
         "final_p_b": float(final_p_b),
         "final_p_p": float(final_p_p),
         "final_direction": direction,
         "final_confidence_prob": float(confidence_prob),
-        "formula": "Final_P(B)=w1*Local_P(B)+w2*Global_P_B+w3*Regression_P(B)",
+        "formula": "Adaptive(Local,Global,Regression) -> AntiLock -> AntiChaseDirectionController",
     }
 
 
@@ -576,7 +816,7 @@ def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
         "recovery_window": 0,
         "recovery_min_hits": 0,
         "recovery_confidence": 0.50,
-        "semantics": "disabled_regression_ensemble_no_observe_gate",
+        "semantics": "disabled_anti_lock_anti_chase_no_observe_gate",
     }
 
 
@@ -604,6 +844,7 @@ def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
         "global_trend_bias_correction": dict(correction),
         "regression_analysis": dict(correction.get("regression_analysis") or {}),
         "ensemble_weights": dict(correction.get("ensemble_weights") or {}),
+        "direction_controller": dict(correction.get("direction_controller") or {}),
     })
 
     return {
@@ -616,6 +857,7 @@ def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
         "global_trend_bias_correction": dict(correction),
         "regression_analysis": dict(correction.get("regression_analysis") or {}),
         "ensemble_weights": dict(correction.get("ensemble_weights") or {}),
+        "direction_controller": dict(correction.get("direction_controller") or {}),
         "big_road_sequence": str(local_forecast.get("window_sequence") or ""),
     }
 
@@ -696,7 +938,7 @@ def recent_user_direction_feedback(
         "triggered": False,
         "window": int(ONLINE_WINDOW),
         "loss_trigger": int(ONLINE_CONSECUTIVE_LOSS_TRIGGER),
-        "semantics": "diagnostic_only_regression_ensemble_no_observe_gate",
+        "semantics": "diagnostic_only_anti_lock_anti_chase_no_observe_gate",
     }
 
 
