@@ -1,13 +1,13 @@
 """Road-only short-shoe prediction policy for BGS.
 
-Public helper names and return fields are preserved for the existing runtime.
-The original 12-round ShortShoePredictor remains the local model.  A separate
-Global Trend Bias Correction layer fuses that local B/P probability with the
-full-shoe B/P base probability using the requested fixed weights:
+Public helper names and outward fields are preserved. The original 12-round
+ShortShoePredictor remains the local model. Formal B/P probability is produced
+by a three-way ensemble:
 
-    Final_P(B) = 0.40 * Local_P(B) + 0.60 * Global_P_B
+1. 12-round local Markov probability.
+2. Full-shoe Global Base Probability.
+3. NumPy least-squares regression signal built from the full cumulative B/P path.
 
-Ties and exact remaining-card composition are not used by the formal direction.
 The compatibility penalty payload is retained but has no authority to force O.
 """
 from __future__ import annotations
@@ -16,9 +16,11 @@ from hashlib import sha256
 from typing import Any, Iterable, Mapping, Sequence
 import math
 
+import numpy as np
+
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "ROAD-ONLY-SHORT-SHOE-W12-GLOBAL-TREND-V3"
+POLICY_VERSION = "ROAD-ONLY-W12-GLOBAL-REGRESSION-ENSEMBLE-V4"
 
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 12
@@ -31,16 +33,23 @@ MIN_HISTORY_FOR_SCORING = 4
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
 
-# Compatibility constants retained. Replay penalty never forces O.
 PENALTY_CONSECUTIVE_MISSES = 2
 PENALTY_MIN_OBSERVE_ROUNDS = 0
 RECOVERY_WINDOW = 0
 RECOVERY_MIN_HITS = 0
 RECOVERY_CONFIDENCE = 0.50
 
-# Requested Global-Local ensemble weights.
-GLOBAL_LOCAL_WEIGHT = 0.40
-GLOBAL_TREND_WEIGHT = 0.60
+REGRESSION_LOCAL_WINDOW = 8
+REGRESSION_GLOBAL_STRONG_SLOPE = 0.20
+REGRESSION_LOCAL_STRONG_SLOPE = 0.35
+REGRESSION_SLOPE_SCALE = 1.25
+
+ENSEMBLE_NORMAL_WEIGHTS = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+ENSEMBLE_TREND_WEIGHTS = (0.15, 0.425, 0.425)
+ENSEMBLE_REVERSAL_WEIGHTS = (0.45, 0.0, 0.55)
+
+GLOBAL_LOCAL_WEIGHT = ENSEMBLE_NORMAL_WEIGHTS[0]
+GLOBAL_TREND_WEIGHT = ENSEMBLE_NORMAL_WEIGHTS[1]
 
 EARLY_SHOE_MAX_ROUNDS = 20
 LATE_SHOE_MIN_ROUNDS = 41
@@ -65,7 +74,6 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
-    """Return chronological B/P outcomes; ties and non-outcomes are ignored."""
     if history is None:
         return []
     if isinstance(history, str):
@@ -143,7 +151,6 @@ def _same_switch_probabilities(
     sequence: Sequence[str],
     decay: float,
 ) -> tuple[float, float, float, float]:
-    """Return P(same), P(switch), raw same support and raw switch support."""
     same = float(MARKOV_PRIOR_STRENGTH)
     switch = float(MARKOV_PRIOR_STRENGTH)
     raw_same = 0.0
@@ -165,7 +172,7 @@ def _same_switch_probabilities(
 
 
 class ShortShoePredictor:
-    """Micro sliding-window B/P predictor with a hard 12-round memory limit."""
+    """Existing 12-round B/P local model; core math is unchanged."""
 
     def __init__(self, window_size: int = WINDOW_SIZE, decay: float = MARKOV_DECAY):
         self.window_size = max(4, int(window_size or WINDOW_SIZE))
@@ -229,7 +236,6 @@ class ShortShoePredictor:
                 opposite: switch_prob,
             }
 
-            # Existing 12-hand local core logic remains unchanged.
             context_weight = min(0.70, 0.45 + 0.08 * min(3.0, support))
             regime_weight = 1.0 - context_weight
             probabilities = {
@@ -310,7 +316,6 @@ def decayed_markov_forecast(
     decay: float = MARKOV_DECAY,
     max_order: int = MARKOV_MAX_ORDER,
 ) -> dict[str, Any]:
-    """Compatibility entrypoint backed by the unchanged 12-round local model."""
     del max_order
     return ShortShoePredictor(window_size=WINDOW_SIZE, decay=decay).predict(history)
 
@@ -323,11 +328,158 @@ def _full_shoe_base_probability(sequence: Sequence[str]) -> tuple[int, int, floa
     return total_b, total_p, global_p_b
 
 
+def _least_squares_line(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> tuple[float, float, float]:
+    n = int(x.size)
+    if n < 2 or y.size != x.size:
+        base = float(y[-1]) if y.size else 0.0
+        return 0.0, base, 0.0
+
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    centered_x = x - x_mean
+    centered_y = y - y_mean
+    denominator = float(np.dot(centered_x, centered_x))
+    if denominator <= 1e-12:
+        return 0.0, y_mean, 0.0
+
+    slope = float(np.dot(centered_x, centered_y) / denominator)
+    intercept = float(y_mean - slope * x_mean)
+    fitted = intercept + slope * x
+    ss_res = float(np.sum((y - fitted) ** 2))
+    ss_tot = float(np.sum((y - y_mean) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+    return slope, intercept, _clip(r_squared, 0.0, 1.0)
+
+
+def regression_analysis_model(
+    history: str | Iterable[Any] | None,
+) -> dict[str, Any]:
+    """Third-party global/turning-point indicator using NumPy least squares."""
+    sequence = normalize_big_road(history)
+    n = len(sequence)
+    if n == 0:
+        return {
+            "available": False,
+            "rounds": 0,
+            "encoded_path": [],
+            "cumulative_path": [],
+            "global_slope": 0.0,
+            "local_slope": 0.0,
+            "global_intercept": 0.0,
+            "local_intercept": 0.0,
+            "global_r_squared": 0.0,
+            "local_r_squared": 0.0,
+            "global_next_cumulative": 0.0,
+            "local_next_cumulative": 0.0,
+            "aligned_strong_trend": False,
+            "structural_reversal": False,
+            "regime": "normal",
+            "regression_signal_slope": 0.0,
+            "regression_p_b": 0.5,
+            "regression_p_p": 0.5,
+            "local_window": 0,
+        }
+
+    encoded = np.asarray(
+        [1.0 if value == "B" else -1.0 for value in sequence],
+        dtype=np.float64,
+    )
+    cumulative = np.cumsum(encoded)
+    x = np.arange(1, n + 1, dtype=np.float64)
+
+    global_slope, global_intercept, global_r2 = _least_squares_line(x, cumulative)
+    global_next = float(global_intercept + global_slope * (n + 1))
+
+    local_window = min(REGRESSION_LOCAL_WINDOW, n)
+    local_x = x[-local_window:]
+    local_y = cumulative[-local_window:]
+    local_slope, local_intercept, local_r2 = _least_squares_line(local_x, local_y)
+    local_next = float(local_intercept + local_slope * (n + 1))
+
+    global_strong = abs(global_slope) >= REGRESSION_GLOBAL_STRONG_SLOPE
+    local_strong = abs(local_slope) >= REGRESSION_LOCAL_STRONG_SLOPE
+    same_direction = bool(
+        abs(global_slope) > 1e-12
+        and abs(local_slope) > 1e-12
+        and global_slope * local_slope > 0.0
+    )
+    opposite_direction = bool(
+        abs(global_slope) > 1e-12
+        and abs(local_slope) > 1e-12
+        and global_slope * local_slope < 0.0
+    )
+
+    aligned_strong_trend = bool(global_strong and local_strong and same_direction)
+    structural_reversal = bool(global_strong and local_strong and opposite_direction)
+
+    if structural_reversal:
+        regime = "structural_reversal"
+        regression_signal_slope = local_slope
+    elif aligned_strong_trend:
+        regime = "aligned_strong_trend"
+        regression_signal_slope = 0.50 * global_slope + 0.50 * local_slope
+    else:
+        regime = "normal"
+        regression_signal_slope = 0.65 * global_slope + 0.35 * local_slope
+
+    regression_p_b = float(
+        0.5 + 0.5 * np.tanh(REGRESSION_SLOPE_SCALE * regression_signal_slope)
+    )
+    regression_p_b = _clip(regression_p_b, 0.001, 0.999)
+
+    return {
+        "available": True,
+        "rounds": int(n),
+        "encoded_path": [int(value) for value in encoded.tolist()],
+        "cumulative_path": [float(value) for value in cumulative.tolist()],
+        "global_slope": float(global_slope),
+        "local_slope": float(local_slope),
+        "global_intercept": float(global_intercept),
+        "local_intercept": float(local_intercept),
+        "global_r_squared": float(global_r2),
+        "local_r_squared": float(local_r2),
+        "global_next_cumulative": float(global_next),
+        "local_next_cumulative": float(local_next),
+        "global_strong": bool(global_strong),
+        "local_strong": bool(local_strong),
+        "slope_same_direction": bool(same_direction),
+        "slope_opposite_direction": bool(opposite_direction),
+        "aligned_strong_trend": bool(aligned_strong_trend),
+        "structural_reversal": bool(structural_reversal),
+        "regime": regime,
+        "regression_signal_slope": float(regression_signal_slope),
+        "regression_p_b": float(regression_p_b),
+        "regression_p_p": float(1.0 - regression_p_b),
+        "local_window": int(local_window),
+        "global_strong_threshold": float(REGRESSION_GLOBAL_STRONG_SLOPE),
+        "local_strong_threshold": float(REGRESSION_LOCAL_STRONG_SLOPE),
+    }
+
+
+def _ensemble_weights(regression: Mapping[str, Any]) -> tuple[float, float, float, str]:
+    if bool(regression.get("structural_reversal")):
+        w1, w2, w3 = ENSEMBLE_REVERSAL_WEIGHTS
+        regime = "structural_reversal"
+    elif bool(regression.get("aligned_strong_trend")):
+        w1, w2, w3 = ENSEMBLE_TREND_WEIGHTS
+        regime = "aligned_strong_trend"
+    else:
+        w1, w2, w3 = ENSEMBLE_NORMAL_WEIGHTS
+        regime = "normal"
+    total = w1 + w2 + w3
+    if total <= 1e-12:
+        return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, "normal"
+    return w1 / total, w2 / total, w3 / total, regime
+
+
 def global_trend_bias_correction(
     history: str | Iterable[Any] | None,
     local_forecast: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Fuse the 12-hand local probability with the full-shoe 60% global anchor."""
+    """Three-way Local + Global + Regression ensemble with dynamic weights."""
     sequence = normalize_big_road(history)
     total_b, total_p, global_p_b = _full_shoe_base_probability(sequence)
     global_p_p = 1.0 - global_p_b
@@ -343,14 +495,13 @@ def global_trend_bias_correction(
     else:
         local_p_b, local_p_p = local_p_b / local_total, local_p_p / local_total
 
-    final_p_b = (
-        GLOBAL_LOCAL_WEIGHT * local_p_b
-        + GLOBAL_TREND_WEIGHT * global_p_b
-    )
-    final_p_p = (
-        GLOBAL_LOCAL_WEIGHT * local_p_p
-        + GLOBAL_TREND_WEIGHT * global_p_p
-    )
+    regression = regression_analysis_model(sequence)
+    regression_p_b = _clip(regression.get("regression_p_b", 0.5), 0.0, 1.0)
+    regression_p_p = 1.0 - regression_p_b
+    w1, w2, w3, ensemble_regime = _ensemble_weights(regression)
+
+    final_p_b = w1 * local_p_b + w2 * global_p_b + w3 * regression_p_b
+    final_p_p = w1 * local_p_p + w2 * global_p_p + w3 * regression_p_p
     final_total = final_p_b + final_p_p
     if final_total <= 1e-12:
         final_p_b, final_p_p = 0.5, 0.5
@@ -374,9 +525,16 @@ def global_trend_bias_correction(
 
     return {
         "applied": True,
-        "mode": "global_local_40_60",
-        "local_weight": float(GLOBAL_LOCAL_WEIGHT),
-        "global_weight": float(GLOBAL_TREND_WEIGHT),
+        "mode": "global_local_regression_dynamic_ensemble",
+        "ensemble_regime": ensemble_regime,
+        "local_weight": float(w1),
+        "global_weight": float(w2),
+        "regression_weight": float(w3),
+        "ensemble_weights": {
+            "local": float(w1),
+            "global": float(w2),
+            "regression": float(w3),
+        },
         "total_rounds": int(total_b + total_p),
         "total_b": int(total_b),
         "total_p": int(total_p),
@@ -387,16 +545,18 @@ def global_trend_bias_correction(
         "global_shift_direction": global_shift_direction,
         "local_p_b": float(local_p_b),
         "local_p_p": float(local_p_p),
+        "regression_p_b": float(regression_p_b),
+        "regression_p_p": float(regression_p_p),
+        "regression_analysis": dict(regression),
         "final_p_b": float(final_p_b),
         "final_p_p": float(final_p_p),
         "final_direction": direction,
         "final_confidence_prob": float(confidence_prob),
-        "formula": "Final_P(B)=0.40*Local_P(B)+0.60*Global_P_B",
+        "formula": "Final_P(B)=w1*Local_P(B)+w2*Global_P_B+w3*Regression_P(B)",
     }
 
 
 def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
-    """Compatibility payload only; no replay penalty may force O."""
     del sequence
     return {
         "active": False,
@@ -416,12 +576,11 @@ def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
         "recovery_window": 0,
         "recovery_min_hits": 0,
         "recovery_confidence": 0.50,
-        "semantics": "disabled_global_trend_bias_correction_no_observe_gate",
+        "semantics": "disabled_regression_ensemble_no_observe_gate",
     }
 
 
 def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """Return the 12-hand local forecast fused with the full-shoe 60% anchor."""
     sequence = normalize_big_road(history)
     local_forecast = decayed_markov_forecast(sequence)
     correction = global_trend_bias_correction(sequence, local_forecast)
@@ -443,6 +602,8 @@ def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
         "margin": float(abs(probabilities["B"] - probabilities["P"])),
         "local_model_probabilities": dict(local_forecast.get("probabilities") or {}),
         "global_trend_bias_correction": dict(correction),
+        "regression_analysis": dict(correction.get("regression_analysis") or {}),
+        "ensemble_weights": dict(correction.get("ensemble_weights") or {}),
     })
 
     return {
@@ -453,6 +614,8 @@ def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
         "confidence_prob": confidence_prob,
         "penalty_observe": penalty,
         "global_trend_bias_correction": dict(correction),
+        "regression_analysis": dict(correction.get("regression_analysis") or {}),
+        "ensemble_weights": dict(correction.get("ensemble_weights") or {}),
         "big_road_sequence": str(local_forecast.get("window_sequence") or ""),
     }
 
@@ -480,7 +643,6 @@ def recent_user_direction_feedback(
     *,
     limit: int = ONLINE_WINDOW,
 ) -> dict[str, Any]:
-    """Compatibility diagnostic only; it never gates the global/local forecast."""
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -534,12 +696,11 @@ def recent_user_direction_feedback(
         "triggered": False,
         "window": int(ONLINE_WINDOW),
         "loss_trigger": int(ONLINE_CONSECUTIVE_LOSS_TRIGGER),
-        "semantics": "diagnostic_only_global_trend_filter_has_no_observe_gate",
+        "semantics": "diagnostic_only_regression_ensemble_no_observe_gate",
     }
 
 
 def install_dynamic_prediction_policy() -> bool:
-    """Compatibility installation hook used by runtime_app."""
     global _INSTALLED
     _INSTALLED = True
     return True
@@ -558,9 +719,13 @@ __all__ = [
     "EARLY_TEMPERATURE",
     "GLOBAL_LOCAL_WEIGHT",
     "GLOBAL_TREND_WEIGHT",
+    "REGRESSION_LOCAL_WINDOW",
+    "REGRESSION_GLOBAL_STRONG_SLOPE",
+    "REGRESSION_LOCAL_STRONG_SLOPE",
     "ShortShoePredictor",
     "normalize_big_road",
     "decayed_markov_forecast",
+    "regression_analysis_model",
     "global_trend_bias_correction",
     "road_only_policy",
     "shoe_progress_policy",
