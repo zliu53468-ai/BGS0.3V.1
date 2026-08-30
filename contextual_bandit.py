@@ -22,6 +22,11 @@ import numpy as np
 
 ARMS = ("P", "B")  # 臂 0 = Player、臂 1 = Banker
 CONTEXT_DIM = 16
+# 後四維刻意改成「轉折敏感」特徵，避免短樣本只會跟目前領先方。
+# X[12] 近期莊比例（已置中且依樣本數衰減）
+# X[13] 動量差：最近4局 vs 最近12局（正=最近更偏莊，負=最近開始往閒轉）
+# X[14] 龍長衰竭訊號：龍越長越接近可能轉折
+# X[15] 切換加速：最近切換率相對整段的偏高程度
 CONTEXT_FEATURE_NAMES = (
     "remaining_cards_ratio",
     "remaining_A_ratio",
@@ -35,10 +40,10 @@ CONTEXT_FEATURE_NAMES = (
     "remaining_9_ratio",
     "remaining_10JQK_ratio",
     "high_vs_four_ratio_delta",
-    "recent_8_banker_ratio",
-    "recent_12_banker_ratio",
-    "current_run_length_norm",
-    "recent_12_switch_rate",
+    "recent_8_banker_centered_damped",
+    "momentum_4_vs_12",
+    "streak_exhaustion_signal",
+    "switch_acceleration",
 )
 
 SHOE_DECKS = max(1, int(os.getenv("SHOE_DECKS", "8") or "8"))
@@ -52,7 +57,7 @@ ESTIMATED_CARDS_PER_ROUND = max(
 )
 PROBABILITY_MIN = 0.48
 PROBABILITY_MAX = 0.58
-STATE_VERSION = "LINUCB-2ARM-SHORTSHOE-V1"
+STATE_VERSION = "LINUCB-2ARM-SHORTSHOE-TURN-V2"
 _LOCK = RLock()
 
 
@@ -252,23 +257,46 @@ class ContextGenerator:
         high_ratio = float(rank_ratios[9])
         four_ratio = float(rank_ratios[3])
         high_vs_four = _clip(high_ratio - four_ratio, -1.5, 1.5)
-        run_norm = _clip(_run_length(raw_history) / 12.0, 0.0, 1.0)
+
+        # --- 轉折敏感的牌路輔助特徵（解決短樣本一直跟領先方）---
+        bp = [v for v in raw_history if v in {"B", "P"}]
+        n_bp = len(bp)
+        # 樣本信心：前 4 局幾乎不信近期比例，12 局後才接近滿分
+        sample_conf = _clip((n_bp - 4) / 12.0, 0.0, 1.0)
+
+        recent8 = _history_banker_ratio(raw_history, 8)
+        recent12 = _history_banker_ratio(raw_history, 12)
+        recent4 = _history_banker_ratio(raw_history, 4)
+        # 置中後再依樣本數衰減，避免靴前幾局「誰多就押誰」
+        recent8_centered_damped = (recent8 - 0.5) * sample_conf
+
+        # 動量差：最近 4 局相對最近 12 局的偏移（轉折時會先出現符號變化）
+        momentum_4_vs_12 = _clip((recent4 - recent12) * 2.0, -1.0, 1.0)
+
+        run_len = _run_length(raw_history)
+        # 龍長衰竭：從第 3 連開始累積，越長越暗示可能轉折（不是鼓勵續龍）
+        streak_exhaustion = _clip(max(0, run_len - 3) / 8.0, 0.0, 1.0)
+
+        switch12 = _switch_rate(raw_history, 12)
+        switch6 = _switch_rate(raw_history, 6)
+        # 切換加速：近期切換比稍長窗口更頻繁 → 轉折/混亂訊號
+        switch_acceleration = _clip((switch6 - switch12) * 2.0, -1.0, 1.0)
 
         vector = np.asarray(
             [
                 remaining_cards_ratio,
                 *rank_ratios.tolist(),
                 high_vs_four,
-                _history_banker_ratio(raw_history, 8),
-                _history_banker_ratio(raw_history, 12),
-                run_norm,
-                _switch_rate(raw_history, 12),
+                recent8_centered_damped,
+                momentum_4_vs_12,
+                streak_exhaustion,
+                switch_acceleration,
             ],
             dtype=np.float64,
         )
         if vector.shape != (CONTEXT_DIM,):
             raise RuntimeError(f"context dimension mismatch: {vector.shape}")
-        vector = np.nan_to_num(vector, nan=0.5, posinf=1.0, neginf=-1.0)
+        vector = np.nan_to_num(vector, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # 轉回專案慣用 0..9 剩餘張數順序，方便既有 API 診斷欄位沿用。
         estimated_zero_to_nine = [
@@ -287,8 +315,18 @@ class ContextGenerator:
                 "rank_ratios_a_to_10jqk": [float(value) for value in rank_ratios],
                 "estimated_remaining_counts_0_to_9": estimated_zero_to_nine,
                 "raw_round_count": len(raw_history),
-                "bp_round_count": sum(value in {"B", "P"} for value in raw_history),
-                "feature_priority": "remaining_shoe_first_road_auxiliary",
+                "bp_round_count": n_bp,
+                "sample_confidence": float(sample_conf),
+                "recent8_banker_ratio": float(recent8),
+                "recent12_banker_ratio": float(recent12),
+                "recent4_banker_ratio": float(recent4),
+                "momentum_4_vs_12": float(momentum_4_vs_12),
+                "run_length": int(run_len),
+                "streak_exhaustion_signal": float(streak_exhaustion),
+                "switch6": float(switch6),
+                "switch12": float(switch12),
+                "switch_acceleration": float(switch_acceleration),
+                "feature_priority": "remaining_shoe_first_turn_sensitive_road_auxiliary",
             },
         )
 
@@ -380,7 +418,13 @@ class ContextualLinUCB:
         self.alpha = max(0.0, float(alpha))
         self.generator = ContextGenerator()
 
-    def _arm_score(self, arm_state: Mapping[str, Any], x: np.ndarray) -> dict[str, float]:
+    def _arm_score(
+        self,
+        arm_state: Mapping[str, Any],
+        x: np.ndarray,
+        *,
+        alpha_scale: float = 1.0,
+    ) -> dict[str, float]:
         try:
             A = np.asarray(arm_state.get("A"), dtype=np.float64).reshape(CONTEXT_DIM, CONTEXT_DIM)
             b = np.asarray(arm_state.get("b"), dtype=np.float64).reshape(CONTEXT_DIM)
@@ -396,8 +440,15 @@ class ContextualLinUCB:
             solved_x = np.linalg.solve(A, x)
         mean = float(np.dot(x, theta))
         uncertainty = float(math.sqrt(max(0.0, np.dot(x, solved_x))))
-        score = mean + self.alpha * uncertainty
-        return {"score": score, "mean": mean, "uncertainty": uncertainty}
+        # 短樣本時略為提高探索，讓另一側比較有機會被選到，改善轉折反應
+        effective_alpha = self.alpha * max(0.5, min(1.6, float(alpha_scale)))
+        score = mean + effective_alpha * uncertainty
+        return {
+            "score": score,
+            "mean": mean,
+            "uncertainty": uncertainty,
+            "effective_alpha": float(effective_alpha),
+        }
 
     def _update_scope(
         self,
@@ -515,8 +566,21 @@ class ContextualLinUCB:
             scope = dict(scopes.get(scope_key) or _new_scope_state())
             feedback = self._apply_pending_feedback(scope, raw_history)
 
+            # 靴前 12 局樣本少：探索係數提高，降低「一直黏在目前領先方」的機率
+            n_bp = sum(1 for value in raw_history if value in {"B", "P"})
+            if n_bp < 8:
+                alpha_scale = 1.45
+            elif n_bp < 15:
+                alpha_scale = 1.25
+            else:
+                alpha_scale = 1.0
+
             scores = {
-                arm: self._arm_score(scope.get("arms", {}).get(arm, {}), x)
+                arm: self._arm_score(
+                    scope.get("arms", {}).get(arm, {}),
+                    x,
+                    alpha_scale=alpha_scale,
+                )
                 for arm in ARMS
             }
             # 相同分數時 arm 0(Player) 穩定勝出；不使用隨機數，確保同樣狀態可重現。
