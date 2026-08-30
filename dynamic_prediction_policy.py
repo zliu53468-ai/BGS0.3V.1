@@ -1,12 +1,14 @@
 """Road-only short-shoe prediction policy for BGS.
 
 Public helper names and return fields are preserved for the existing runtime.
-The formal decision uses only the OCR-derived chronological Big Road B/P history.
-Exact remaining-card counts are not required.
+The original 12-round ShortShoePredictor remains the local model.  A separate
+Global Trend Bias Correction layer fuses that local B/P probability with the
+full-shoe B/P base probability using the requested fixed weights:
 
-The existing 12-round predictor is kept unchanged.  A Bias & Momentum Adjuster
-runs outside that core and only corrects the final direction/confidence when the
-full-shoe B/P skew and short-term momentum satisfy the requested conditions.
+    Final_P(B) = 0.40 * Local_P(B) + 0.60 * Global_P_B
+
+Ties and exact remaining-card composition are not used by the formal direction.
+The compatibility penalty payload is retained but has no authority to force O.
 """
 from __future__ import annotations
 
@@ -16,7 +18,7 @@ import math
 
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "ROAD-ONLY-SHORT-SHOE-W12-BIAS-MOMENTUM-V2"
+POLICY_VERSION = "ROAD-ONLY-SHORT-SHOE-W12-GLOBAL-TREND-V3"
 
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 12
@@ -29,24 +31,16 @@ MIN_HISTORY_FOR_SCORING = 4
 ONLINE_WINDOW = 5
 ONLINE_CONSECUTIVE_LOSS_TRIGGER = 2
 
-# Compatibility constants retained.  The historical replay penalty has no
-# authority to force O; the short sliding window remains the base predictor.
+# Compatibility constants retained. Replay penalty never forces O.
 PENALTY_CONSECUTIVE_MISSES = 2
 PENALTY_MIN_OBSERVE_ROUNDS = 0
 RECOVERY_WINDOW = 0
 RECOVERY_MIN_HITS = 0
 RECOVERY_CONFIDENCE = 0.50
 
-# Bias & Momentum Adjuster constants required by the patch.
-BIAS_MIN_ROUNDS = 16
-BIAS_MIN_DELTA = 6
-MOMENTUM_WINDOW = 6
-MOMENTUM_MIN_HITS = 5
-CATCHUP_WINDOW = 4
-CATCHUP_MIN_HITS = 3
-TREND_CONFIDENCE_MULTIPLIER = 1.05
-COUNTERTREND_CONFIDENCE_MULTIPLIER = 0.90
-CATCHUP_MIN_CONFIDENCE = 0.53
+# Requested Global-Local ensemble weights.
+GLOBAL_LOCAL_WEIGHT = 0.40
+GLOBAL_TREND_WEIGHT = 0.60
 
 EARLY_SHOE_MAX_ROUNDS = 20
 LATE_SHOE_MIN_ROUNDS = 41
@@ -235,7 +229,7 @@ class ShortShoePredictor:
                 opposite: switch_prob,
             }
 
-            # Existing 12-hand core logic is intentionally unchanged.
+            # Existing 12-hand local core logic remains unchanged.
             context_weight = min(0.70, 0.45 + 0.08 * min(3.0, support))
             regime_weight = 1.0 - context_weight
             probabilities = {
@@ -316,162 +310,88 @@ def decayed_markov_forecast(
     decay: float = MARKOV_DECAY,
     max_order: int = MARKOV_MAX_ORDER,
 ) -> dict[str, Any]:
-    """Compatibility entrypoint backed by the 12-round ShortShoePredictor."""
+    """Compatibility entrypoint backed by the unchanged 12-round local model."""
     del max_order
     return ShortShoePredictor(window_size=WINDOW_SIZE, decay=decay).predict(history)
 
 
-def _trailing_run(sequence: Sequence[str], side: str) -> int:
-    run = 0
-    for outcome in reversed(sequence):
-        if outcome != side:
-            break
-        run += 1
-    return run
+def _full_shoe_base_probability(sequence: Sequence[str]) -> tuple[int, int, float]:
+    total_b = sum(1 for value in sequence if value == "B")
+    total_p = sum(1 for value in sequence if value == "P")
+    resolved = total_b + total_p
+    global_p_b = float(total_b / resolved) if resolved > 0 else 0.5
+    return total_b, total_p, global_p_b
 
 
-def bias_momentum_adjuster(
+def global_trend_bias_correction(
     history: str | Iterable[Any] | None,
-    base_forecast: Mapping[str, Any],
+    local_forecast: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Apply only the requested full-shoe skew and short-momentum corrections."""
+    """Fuse the 12-hand local probability with the full-shoe 60% global anchor."""
     sequence = normalize_big_road(history)
-    total_rounds = len(sequence)
-    banker_count = sum(1 for value in sequence if value == "B")
-    player_count = sum(1 for value in sequence if value == "P")
-    delta = abs(banker_count - player_count)
+    total_b, total_p, global_p_b = _full_shoe_base_probability(sequence)
+    global_p_p = 1.0 - global_p_b
 
-    skew_active = bool(total_rounds > 15 and delta >= BIAS_MIN_DELTA)
-    if banker_count > player_count:
-        advantage_side = "B"
-        weak_side = "P"
-    elif player_count > banker_count:
-        advantage_side = "P"
-        weak_side = "B"
+    local_probabilities = local_forecast.get("probabilities")
+    if not isinstance(local_probabilities, Mapping):
+        local_probabilities = {"B": 0.5, "P": 0.5}
+    local_p_b = _clip(local_probabilities.get("B", 0.5), 0.0, 1.0)
+    local_p_p = _clip(local_probabilities.get("P", 0.5), 0.0, 1.0)
+    local_total = local_p_b + local_p_p
+    if local_total <= 1e-12:
+        local_p_b, local_p_p = 0.5, 0.5
     else:
-        advantage_side = ""
-        weak_side = ""
+        local_p_b, local_p_p = local_p_b / local_total, local_p_p / local_total
 
-    recent6 = sequence[-MOMENTUM_WINDOW:]
-    recent6_b = sum(1 for value in recent6 if value == "B")
-    recent6_p = sum(1 for value in recent6 if value == "P")
-    if recent6_b >= MOMENTUM_MIN_HITS:
-        momentum_side = "B"
-    elif recent6_p >= MOMENTUM_MIN_HITS:
-        momentum_side = "P"
+    final_p_b = (
+        GLOBAL_LOCAL_WEIGHT * local_p_b
+        + GLOBAL_TREND_WEIGHT * global_p_b
+    )
+    final_p_p = (
+        GLOBAL_LOCAL_WEIGHT * local_p_p
+        + GLOBAL_TREND_WEIGHT * global_p_p
+    )
+    final_total = final_p_b + final_p_p
+    if final_total <= 1e-12:
+        final_p_b, final_p_p = 0.5, 0.5
     else:
-        momentum_side = ""
+        final_p_b, final_p_p = final_p_b / final_total, final_p_p / final_total
 
-    recent4 = sequence[-CATCHUP_WINDOW:]
-    weak_recent4 = (
-        sum(1 for value in recent4 if value == weak_side)
-        if weak_side in OUTCOMES
-        else 0
-    )
-    weak_trailing_run = (
-        _trailing_run(sequence, weak_side)
-        if weak_side in OUTCOMES
-        else 0
-    )
-    catchup_active = bool(
-        skew_active
-        and weak_side in OUTCOMES
-        and weak_recent4 >= CATCHUP_MIN_HITS
-        and weak_trailing_run >= CATCHUP_MIN_HITS
-    )
+    direction = "B" if final_p_b >= final_p_p else "P"
+    confidence_prob = max(final_p_b, final_p_p)
 
-    base_direction = str(base_forecast.get("direction") or "").upper().strip()
-    if base_direction not in OUTCOMES:
-        base_direction = "B"
-    try:
-        base_confidence = float(
-            base_forecast.get(
-                "confidence_prob",
-                base_forecast.get("confidence", 0.50),
-            )
-            or 0.50
-        )
-    except (TypeError, ValueError):
-        base_confidence = 0.50
-    base_confidence = _clip(base_confidence, 0.0, 0.999)
-
-    adjusted_direction = base_direction
-    adjusted_confidence = base_confidence
-    mode = "base_12_round_unchanged"
-    applied = False
-
-    # Scenario 2 has priority: the weak side is actively catching up with a
-    # consecutive 3/4 or 4/4 burst inside the latest four rounds.
-    if catchup_active:
-        adjusted_direction = weak_side
-        adjusted_confidence = max(
-            CATCHUP_MIN_CONFIDENCE,
-            base_confidence if base_direction == weak_side else CATCHUP_MIN_CONFIDENCE,
-        )
-        adjusted_confidence = _clip(adjusted_confidence, 0.50, 0.999)
-        mode = "catchup_momentum_override"
-        applied = True
-
-    # Scenario 1: full-shoe skew remains wide and the latest six-hand momentum
-    # still belongs to the already-advantaged side.
-    elif skew_active and momentum_side == advantage_side and advantage_side in OUTCOMES:
-        factor = (
-            TREND_CONFIDENCE_MULTIPLIER
-            if base_direction == advantage_side
-            else COUNTERTREND_CONFIDENCE_MULTIPLIER
-        )
-        weighted_confidence = _clip(base_confidence * factor, 0.0, 0.999)
-        if weighted_confidence < 0.50:
-            adjusted_direction = "P" if base_direction == "B" else "B"
-            adjusted_confidence = 1.0 - weighted_confidence
-        else:
-            adjusted_direction = base_direction
-            adjusted_confidence = weighted_confidence
-        adjusted_confidence = _clip(adjusted_confidence, 0.50, 0.999)
-        mode = (
-            "advantage_trend_boost"
-            if base_direction == advantage_side
-            else "weak_side_suppression"
-        )
-        applied = True
-
-    adjusted_probabilities = {
-        "B": (
-            adjusted_confidence
-            if adjusted_direction == "B"
-            else 1.0 - adjusted_confidence
-        ),
-        "P": (
-            adjusted_confidence
-            if adjusted_direction == "P"
-            else 1.0 - adjusted_confidence
-        ),
-        "T": 0.0,
-    }
+    if len(sequence) >= 2:
+        _, _, previous_global_p_b = _full_shoe_base_probability(sequence[:-1])
+    else:
+        previous_global_p_b = 0.5
+    global_velocity_b = float(global_p_b - previous_global_p_b)
+    if global_velocity_b > 1e-12:
+        global_shift_direction = "toward_B"
+    elif global_velocity_b < -1e-12:
+        global_shift_direction = "toward_P"
+    else:
+        global_shift_direction = "flat"
 
     return {
-        "applied": bool(applied),
-        "mode": mode,
-        "total_rounds": int(total_rounds),
-        "banker_count": int(banker_count),
-        "player_count": int(player_count),
-        "delta": int(delta),
-        "skew_active": bool(skew_active),
-        "advantage_side": advantage_side,
-        "weak_side": weak_side,
-        "recent6": "".join(recent6),
-        "recent6_banker_count": int(recent6_b),
-        "recent6_player_count": int(recent6_p),
-        "momentum_side": momentum_side,
-        "recent4": "".join(recent4),
-        "weak_recent4_count": int(weak_recent4),
-        "weak_trailing_run": int(weak_trailing_run),
-        "catchup_active": bool(catchup_active),
-        "base_direction": base_direction,
-        "base_confidence_prob": float(base_confidence),
-        "adjusted_direction": adjusted_direction,
-        "adjusted_confidence_prob": float(adjusted_confidence),
-        "adjusted_probabilities": dict(adjusted_probabilities),
+        "applied": True,
+        "mode": "global_local_40_60",
+        "local_weight": float(GLOBAL_LOCAL_WEIGHT),
+        "global_weight": float(GLOBAL_TREND_WEIGHT),
+        "total_rounds": int(total_b + total_p),
+        "total_b": int(total_b),
+        "total_p": int(total_p),
+        "global_p_b": float(global_p_b),
+        "global_p_p": float(global_p_p),
+        "previous_global_p_b": float(previous_global_p_b),
+        "global_probability_velocity_b": float(global_velocity_b),
+        "global_shift_direction": global_shift_direction,
+        "local_p_b": float(local_p_b),
+        "local_p_p": float(local_p_p),
+        "final_p_b": float(final_p_b),
+        "final_p_p": float(final_p_p),
+        "final_direction": direction,
+        "final_confidence_prob": float(confidence_prob),
+        "formula": "Final_P(B)=0.40*Local_P(B)+0.60*Global_P_B",
     }
 
 
@@ -496,28 +416,33 @@ def _replay_penalty_state(sequence: Sequence[str]) -> dict[str, Any]:
         "recovery_window": 0,
         "recovery_min_hits": 0,
         "recovery_confidence": 0.50,
-        "semantics": "disabled_bias_momentum_adjuster_no_observe_gate",
+        "semantics": "disabled_global_trend_bias_correction_no_observe_gate",
     }
 
 
 def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """Return 12-hand forecast after the external Bias & Momentum correction."""
+    """Return the 12-hand local forecast fused with the full-shoe 60% anchor."""
     sequence = normalize_big_road(history)
-    base_forecast = decayed_markov_forecast(sequence)
-    adjustment = bias_momentum_adjuster(sequence, base_forecast)
+    local_forecast = decayed_markov_forecast(sequence)
+    correction = global_trend_bias_correction(sequence, local_forecast)
     penalty = _replay_penalty_state(sequence)
 
-    forecast = dict(base_forecast)
-    direction = str(adjustment["adjusted_direction"])
-    confidence_prob = float(adjustment["adjusted_confidence_prob"])
-    probabilities = dict(adjustment["adjusted_probabilities"])
+    forecast = dict(local_forecast)
+    probabilities = {
+        "B": float(correction["final_p_b"]),
+        "P": float(correction["final_p_p"]),
+        "T": 0.0,
+    }
+    direction = str(correction["final_direction"])
+    confidence_prob = float(correction["final_confidence_prob"])
     forecast.update({
         "probabilities": probabilities,
         "direction": direction,
         "confidence": confidence_prob,
         "confidence_prob": confidence_prob,
         "margin": float(abs(probabilities["B"] - probabilities["P"])),
-        "bias_momentum_adjuster": dict(adjustment),
+        "local_model_probabilities": dict(local_forecast.get("probabilities") or {}),
+        "global_trend_bias_correction": dict(correction),
     })
 
     return {
@@ -527,8 +452,8 @@ def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
         "latent_direction": direction,
         "confidence_prob": confidence_prob,
         "penalty_observe": penalty,
-        "bias_momentum_adjuster": dict(adjustment),
-        "big_road_sequence": str(base_forecast.get("window_sequence") or ""),
+        "global_trend_bias_correction": dict(correction),
+        "big_road_sequence": str(local_forecast.get("window_sequence") or ""),
     }
 
 
@@ -555,7 +480,7 @@ def recent_user_direction_feedback(
     *,
     limit: int = ONLINE_WINDOW,
 ) -> dict[str, Any]:
-    """Compatibility diagnostic only; it never gates the short-window forecast."""
+    """Compatibility diagnostic only; it never gates the global/local forecast."""
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -609,7 +534,7 @@ def recent_user_direction_feedback(
         "triggered": False,
         "window": int(ONLINE_WINDOW),
         "loss_trigger": int(ONLINE_CONSECUTIVE_LOSS_TRIGGER),
-        "semantics": "diagnostic_only_no_observe_gate",
+        "semantics": "diagnostic_only_global_trend_filter_has_no_observe_gate",
     }
 
 
@@ -631,10 +556,12 @@ __all__ = [
     "EARLY_ACTIVE_MAX_ROUNDS",
     "TEMPERATURE_SCALING_MAX_ROUNDS",
     "EARLY_TEMPERATURE",
+    "GLOBAL_LOCAL_WEIGHT",
+    "GLOBAL_TREND_WEIGHT",
     "ShortShoePredictor",
     "normalize_big_road",
     "decayed_markov_forecast",
-    "bias_momentum_adjuster",
+    "global_trend_bias_correction",
     "road_only_policy",
     "shoe_progress_policy",
     "recent_user_direction_feedback",
