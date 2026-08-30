@@ -1,10 +1,9 @@
-"""Validated decision layer for the short-shoe road-only BGS model.
+"""Validated decision layer for the road-only BGS ensemble.
 
-Public function signatures and outward JSON fields are preserved.  The final B/P
-probabilities come from the 12-hand local predictor after the requested Global
-Trend Bias Correction (40% local + 60% full-shoe base probability).  The fused
-confidence is converted directly to virtual EV and passed to MoneyManagementModel.
-This layer never changes the formal B/P direction to O/observe.
+Public function signatures and outward JSON fields are preserved. Final B/P
+probabilities are produced by the three-way Local + Global + NumPy Regression
+ensemble in dynamic_prediction_policy.py, converted to virtual EV, then passed
+to MoneyManagementModel. This layer never changes the formal B/P direction to O.
 """
 from __future__ import annotations
 
@@ -23,24 +22,15 @@ _MONEY = MoneyManagementModel()
 
 VALIDATED_COMPONENT_MIN_SAMPLES = max(
     20,
-    min(
-        500,
-        int(os.getenv("VALIDATED_COMPONENT_MIN_SAMPLES", "40") or "40"),
-    ),
+    min(500, int(os.getenv("VALIDATED_COMPONENT_MIN_SAMPLES", "40") or "40")),
 )
 UNVALIDATED_CONFIDENCE_CAP = max(
     0.50,
-    min(
-        0.99,
-        float(os.getenv("UNVALIDATED_CONFIDENCE_CAP", "0.99") or "0.99"),
-    ),
+    min(0.99, float(os.getenv("UNVALIDATED_CONFIDENCE_CAP", "0.99") or "0.99")),
 )
 VALIDATED_CONFIDENCE_CAP = max(
     0.50,
-    min(
-        0.99,
-        float(os.getenv("VALIDATED_CONFIDENCE_CAP", "0.99") or "0.99"),
-    ),
+    min(0.99, float(os.getenv("VALIDATED_CONFIDENCE_CAP", "0.99") or "0.99")),
 )
 
 
@@ -79,17 +69,37 @@ def _global_trend_state(result: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(state) if isinstance(state, Mapping) else {}
 
 
+def _regression_state(result: Mapping[str, Any]) -> Dict[str, Any]:
+    correction = _global_trend_state(result)
+    state = correction.get("regression_analysis")
+    if isinstance(state, Mapping):
+        return dict(state)
+
+    forecast = _short_window_forecast(result)
+    state = forecast.get("regression_analysis")
+    if isinstance(state, Mapping):
+        return dict(state)
+
+    dynamic = result.get("dynamic_prediction_policy")
+    if isinstance(dynamic, Mapping):
+        state = dynamic.get("regression_analysis")
+        if isinstance(state, Mapping):
+            return dict(state)
+
+    state = result.get("regression_analysis")
+    return dict(state) if isinstance(state, Mapping) else {}
+
+
 def _model_direction_and_confidence(
     result: Mapping[str, Any],
 ) -> tuple[str, float, Dict[str, float], str]:
     forecast = _short_window_forecast(result)
     correction = _global_trend_state(result)
 
-    raw_probabilities: Mapping[str, Any]
     if isinstance(forecast.get("probabilities"), Mapping):
         raw_probabilities = dict(forecast.get("probabilities") or {})
         source = (
-            "global_trend_40_60_forecast"
+            "global_local_regression_ensemble"
             if correction
             else "short_window_forecast"
         )
@@ -126,17 +136,11 @@ def _model_direction_and_confidence(
     if direction not in {"B", "P"}:
         direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
 
-    # Confidence is exactly the fused probability of the chosen B/P direction.
     confidence_prob = float(probabilities[direction])
     if confidence_prob < 0.5:
         direction = "P" if direction == "B" else "B"
         confidence_prob = float(probabilities[direction])
 
-    probabilities = {
-        "B": float(probabilities["B"]),
-        "P": float(probabilities["P"]),
-        "T": 0.0,
-    }
     return direction, confidence_prob, probabilities, source
 
 
@@ -147,7 +151,6 @@ def _virtual_money(
     probabilities: Mapping[str, Any],
     bankroll: float,
 ) -> tuple[Dict[str, Any], float]:
-    """Convert fused Final_P to virtual EV and obtain quarter-Kelly sizing."""
     p_win = max(0.0, min(1.0, float(confidence_prob)))
     payout = 0.95 if direction == "B" else 1.0
     virtual_ev = float(p_win * payout - (1.0 - p_win))
@@ -161,10 +164,6 @@ def _virtual_money(
         )
     )
 
-    # Preserve the existing compatibility rule: if EV is positive but the money
-    # module's legacy minimum-EV threshold blocks sizing, use its quarter-Kelly
-    # fraction instead. Negative/zero EV is still transmitted as-is; it never
-    # changes the formal B/P prediction into O.
     if virtual_ev > 0.0 and not bool(money.get("bet_allowed", False)):
         ratio = min(
             float(MAX_BET_RATIO),
@@ -192,12 +191,12 @@ def _virtual_money(
                 "bet_percentage": ratio * 100.0,
                 "bet_amount": bankroll_value * ratio,
                 "bet_allowed": True,
-                "reason": "positive_global_trend_virtual_ev_quarter_kelly_fallback",
+                "reason": "positive_regression_ensemble_virtual_ev_quarter_kelly_fallback",
             })
 
     money["virtual_ev"] = virtual_ev
     money["virtual_ev_percent"] = virtual_ev * 100.0
-    money["global_trend_probability_input"] = p_win
+    money["ensemble_probability_input"] = p_win
     return money, virtual_ev
 
 
@@ -234,6 +233,7 @@ def _apply_direction_without_observe(
         _model_direction_and_confidence(result)
     )
     correction = _global_trend_state(result)
+    regression = _regression_state(result)
     money, virtual_ev = _virtual_money(
         direction=direction,
         confidence_prob=confidence_prob,
@@ -275,6 +275,8 @@ def _apply_direction_without_observe(
         )
 
     text = "莊" if direction == "B" else "閒"
+    weights = dict(correction.get("ensemble_weights") or {})
+    regime = str(correction.get("ensemble_regime") or "normal")
     result.update({
         "action": direction,
         "recommend": direction,
@@ -313,15 +315,17 @@ def _apply_direction_without_observe(
         "bet_allowed": bool(money.get("bet_allowed", False)),
         "money_management": money,
         "global_trend_bias_correction": correction,
+        "regression_analysis": regression,
         "bias_momentum_adjuster": {
             "applied": False,
-            "mode": "replaced_by_global_trend_bias_correction",
+            "mode": "replaced_by_global_local_regression_ensemble",
         },
-        "direction_source": "global_trend_40_60_virtual_ev",
+        "direction_source": "global_local_regression_ensemble_virtual_ev",
         "signal_reason": (
-            f"GlobalTrend40/60 {text} confidence={confidence_prob:.3%}；"
-            f"GlobalPB={float(correction.get('global_p_b', 0.5) or 0.5):.3%}；"
-            f"velocityB={float(correction.get('global_probability_velocity_b', 0.0) or 0.0):+.5f}；"
+            f"RegressionEnsemble[{regime}] {text} confidence={confidence_prob:.3%}；"
+            f"w={weights}；"
+            f"GlobalSlope={float(regression.get('global_slope', 0.0) or 0.0):+.4f}；"
+            f"LocalSlope={float(regression.get('local_slope', 0.0) or 0.0):+.4f}；"
             f"virtualEV={virtual_ev:.3%}；Kelly={ratio:.3%}。"
         ),
     })
@@ -337,15 +341,20 @@ def _apply_direction_without_observe(
         "trusted_exact_counts": False,
         "exact_card_counts_required": False,
         "global_trend_bias_correction": correction,
+        "regression_analysis": regression,
+        "ensemble_weights": weights,
     }
     result["decision_validation"] = {
         "active": True,
-        "mode": "global_trend_40_60_virtual_ev_no_observe",
+        "mode": "global_local_regression_virtual_ev_no_observe",
         "direction": direction,
         "confidence_prob": confidence_prob,
         "virtual_ev": virtual_ev,
         "confidence_source": source,
         "global_trend_bias_correction": correction,
+        "regression_analysis": regression,
+        "ensemble_regime": regime,
+        "ensemble_weights": weights,
         "exact_card_counts_required": False,
         "virtual_ev_fallback_used": True,
         "observe_gate_enabled": False,
@@ -361,7 +370,6 @@ def apply_validated_decision(
     venue: str = "",
     room: str = "",
 ) -> Dict[str, Any]:
-    """Pass fused Global/Local Final_P directly through virtual EV without O."""
     del venue, room
     result = dict(prediction or {})
     bankroll = max(0.0, float(result.get("bankroll", 0.0) or 0.0))
@@ -379,7 +387,6 @@ def apply_strategy_decision(
     strategy_selection: Mapping[str, Any],
     bankroll: float = 0.0,
 ) -> Dict[str, Any]:
-    """Apply strategy sizing without changing the fused B/P signal to O."""
     result = dict(prediction or {})
     selection = dict(strategy_selection or {})
     profile = dict(selection.get("profile") or {})
@@ -390,13 +397,13 @@ def apply_strategy_decision(
         max(0.0, float(profile.get("kelly_multiplier", 1.0) or 1.0)),
     )
     road_direction, road_strength = _strategy_road_direction(result)
-    road_note = "Global 60% + Local 40% 融合概率轉虛擬 EV 後進入 1/4 Kelly。"
+    road_note = "三方 Local/Global/Regression 融合概率轉虛擬 EV 後進入 1/4 Kelly。"
     if arm == "conservative":
         multiplier *= 0.50
-        road_note = "保守策略將融合概率的 1/4 Kelly 再縮半。"
+        road_note = "保守策略將三方融合概率的 1/4 Kelly 再縮半。"
     elif arm == "ev_road_blend" and road_strength < 0.20:
         multiplier *= 0.75
-        road_note = "融合方向幅度偏弱，1/4 Kelly 再縮至 75%。"
+        road_note = "三方融合方向幅度偏弱，1/4 Kelly 再縮至 75%。"
 
     result = _apply_direction_without_observe(
         result,
@@ -404,10 +411,14 @@ def apply_strategy_decision(
         strategy_selection=selection,
         strategy_multiplier=multiplier,
     )
+    correction = _global_trend_state(result)
+    ensemble_weights = dict(correction.get("ensemble_weights") or {})
     result["strategy_weights"] = {
         "model_probability_weight": 1.0,
-        "global_trend_weight": 0.60,
-        "local_model_weight": 0.40,
+        "local_model_weight": float(ensemble_weights.get("local", 0.0) or 0.0),
+        "global_trend_weight": float(ensemble_weights.get("global", 0.0) or 0.0),
+        "regression_weight": float(ensemble_weights.get("regression", 0.0) or 0.0),
+        "ensemble_regime": str(correction.get("ensemble_regime") or "normal"),
         "road_direction": road_direction,
         "road_strength": road_strength,
         "kelly_multiplier": multiplier,
@@ -422,7 +433,7 @@ def apply_strategy_decision(
     result["strategy_required_ev"] = 0.0
     result["kelly_cap_enforced"] = True
     result["decision_validation"].update({
-        "mode": "global_trend_40_60_virtual_ev_quarter_kelly_no_observe",
+        "mode": "global_local_regression_virtual_ev_quarter_kelly_no_observe",
         "selected_strategy_arm": arm,
         "quarter_kelly_multiplier": float(KELLY_FRACTION),
         "max_bet_fraction": float(MAX_BET_RATIO),
