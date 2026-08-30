@@ -1,8 +1,7 @@
-"""BGS predictor using only Big Road B/P sequence features.
+"""BGS 正式預測器：剩餘牌組 Context -> 兩臂 LinUCB -> Fractional Kelly。
 
-The public API is unchanged.  OCR/screenshot adapters may still pass shoe and road
-context, but the formal next-round decision is produced solely from the
-chronological Big Road B/P sequence by the time-decayed Markov policy.
+公開 predict() 參數與主要回傳欄位維持相容。OCR / screenshot / road adapter
+仍可傳入既有 context，但正式下一局方向只由新的兩臂 LinUCB 決定。
 """
 from __future__ import annotations
 
@@ -12,9 +11,10 @@ import secrets
 
 from dynamic_prediction_policy import (
     POLICY_VERSION,
+    linucb_policy,
     normalize_big_road,
     recent_user_direction_feedback,
-    road_only_policy,
+    record_online_feedback,
 )
 from money_management import MAX_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
@@ -49,28 +49,18 @@ def _history_values(history: Union[str, Iterable[Any], None]) -> List[Any]:
         compact = history.replace("|", "").replace(",", "").replace(" ", "").upper()
         if compact and all(char in OUTCOMES for char in compact):
             return list(compact)
-        return [
-            part for part in history.replace("|", ",").split(",") if part.strip()
-        ]
+        return [part for part in history.replace("|", ",").split(",") if part.strip()]
     return list(history)
 
 
 def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
+    """既有牌路模型只保留 UI/稽核診斷，不參與正式 LinUCB 方向。"""
     try:
-        banker = max(
-            0.0,
-            min(1.0, float(road.get("banker_probability", 0.5) or 0.5)),
-        )
+        banker = max(0.0, min(1.0, float(road.get("banker_probability", 0.5) or 0.5)))
     except (TypeError, ValueError):
         banker = 0.5
     try:
-        player = max(
-            0.0,
-            min(
-                1.0,
-                float(road.get("player_probability", 1.0 - banker) or 0.0),
-            ),
-        )
+        player = max(0.0, min(1.0, float(road.get("player_probability", 1.0 - banker) or 0.0)))
     except (TypeError, ValueError):
         player = 1.0 - banker
     total = banker + player
@@ -79,10 +69,7 @@ def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         banker, player = banker / total, player / total
     try:
-        confidence = max(
-            0.0,
-            min(1.0, float(road.get("confidence_score", 0.0) or 0.0)),
-        )
+        confidence = max(0.0, min(1.0, float(road.get("confidence_score", 0.0) or 0.0)))
     except (TypeError, ValueError):
         confidence = 0.0
     return {
@@ -93,21 +80,6 @@ def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
         "decision_weight": 0.0,
         "diagnostic_only": True,
     }
-
-
-def _zero_money(money: Mapping[str, Any], reason: str) -> Dict[str, Any]:
-    result = dict(money or {})
-    result.update({
-        "bet_allowed": False,
-        "mandatory_bet": False,
-        "bet_percentage": 0.0,
-        "bet_amount": 0.0,
-        "final_bet_ratio": 0.0,
-        "pre_tie_adjusted_ratio": 0.0,
-        "adjusted_ratio": 0.0,
-        "reason": str(reason),
-    })
-    return result
 
 
 def predict(
@@ -125,6 +97,7 @@ def predict(
     raw_history = _normalize_outcome_history(_history_values(history))
     big_road = normalize_big_road(raw_history)
 
+    # OCR/掃描資料只讀取既有輸出，不改動任何掃描程式；road_context 只做診斷。
     supplied_road = dict(road_context or {})
     if (
         isinstance(supplied_road.get("road_features"), list)
@@ -135,9 +108,7 @@ def predict(
         road = build_road_context(
             raw_history,
             grid_cells=list(supplied_road.get("grid_cells") or []),
-            initial_image_count=int(
-                supplied_road.get("initial_image_count", 0) or 0
-            ),
+            initial_image_count=int(supplied_road.get("initial_image_count", 0) or 0),
             manual_count=int(supplied_road.get("manual_count", 0) or 0),
         )
         if supplied_road:
@@ -146,70 +117,49 @@ def predict(
     context = dict(shoe_context or {})
     bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
 
-    policy = road_only_policy(big_road)
+    # 50～70 局短靴：正式方向由固定 16 維 Context 的兩臂 LinUCB 唯一決定。
+    # 缺精確 remaining_counts 時 ContextGenerator 會以中性牌組比例與合理剩餘張數估計補齊，
+    # 因此不會因為缺牌組欄位而中止方向輸出。
+    policy = linucb_policy(
+        raw_history,
+        shoe_context=context,
+        user_id=user_id,
+        venue=venue,
+        room=room,
+        shoe_id=shoe_id,
+    )
     probabilities = dict(policy["probabilities"])
     direction = str(policy["direction"])
-    confidence = float(policy["confidence"])
-    penalty = dict(policy.get("penalty_observe") or {})
-    penalty_active = bool(penalty.get("active", False))
+    confidence = float(policy["selected_win_probability"])
+    action = direction
+    text = "莊" if action == "B" else "閒"
+    direction_text = text
 
+    # 強制 5%～30%：每局都要有明確可執行注碼；Kelly 仍負責相對風險尺度，
+    # 最後由硬下限/上限控制實際資金暴露。
     money = _MONEY.allocate(
         direction=direction,
         probabilities=probabilities,
         final_weight=confidence,
         bankroll=bankroll,
     )
-
-    too_short = len(big_road) < 4
-    positive_virtual_ev = bool(money.get("bet_allowed", False))
-    if penalty_active:
-        action = "O"
-        observe_reason = "penalty_observe_after_two_consecutive_misses"
-        money = _zero_money(money, observe_reason)
-    elif too_short:
-        action = "O"
-        observe_reason = "insufficient_big_road_history"
-        money = _zero_money(money, observe_reason)
-    elif not positive_virtual_ev:
-        action = "O"
-        observe_reason = "model_probability_virtual_ev_not_positive"
-        money = _zero_money(money, observe_reason)
-    else:
-        action = direction
-        observe_reason = ""
-
-    text = "觀望" if action == "O" else ("莊" if action == "B" else "閒")
-    direction_text = "莊" if direction == "B" else "閒"
-    bet_allowed = bool(action in {"B", "P"} and money.get("bet_allowed", False))
-
-    if penalty_active:
-        signal_status_code = "PENALTY_OBSERVE"
-        signal_status_text = (
-            f"觀望校正：連錯 2 局後虛擬下注中；"
-            f"最少觀望剩餘 {int(penalty.get('observe_remaining', 0) or 0)} 局"
-        )
-    elif too_short:
-        signal_status_code = "ROAD_HISTORY_WARMUP"
-        signal_status_text = "觀望：大路 B/P 樣本不足 4 局"
-    elif not bet_allowed:
-        signal_status_code = "ROAD_MODEL_NO_POSITIVE_VIRTUAL_EV"
-        signal_status_text = "觀望：模型方向存在，但虛擬 EV 未達正期望門檻"
-    else:
-        signal_status_code = "ROAD_MODEL_QUARTER_KELLY"
-        signal_status_text = (
-            f"時間衰減馬可夫：{direction_text} "
-            f"{confidence:.1%}；1/4 Kelly "
-            f"{float(money.get('bet_percentage', 0.0) or 0.0):.2f}%"
-        )
+    bet_allowed = True
+    signal_status_code = "LINUCB_TWO_ARM_KELLY_5_30"
+    signal_status_text = (
+        f"兩臂 LinUCB：{direction_text} {confidence:.1%}；"
+        f"Kelly {float(money.get('bet_percentage', 5.0) or 5.0):.2f}%"
+    )
 
     fingerprint = sha256(
-        "|".join((
-            "".join(big_road),
-            str(venue or "").upper().strip(),
-            str(room or "").strip(),
-            str(shoe_id or "").strip(),
-            POLICY_VERSION,
-        )).encode("utf-8")
+        "|".join(
+            (
+                "".join(raw_history),
+                str(venue or "").upper().strip(),
+                str(room or "").strip(),
+                str(shoe_id or "").strip(),
+                POLICY_VERSION,
+            )
+        ).encode("utf-8")
     ).hexdigest()[:24]
 
     road_predict = _road_diagnostic(road)
@@ -217,104 +167,107 @@ def predict(
     p_p = float(probabilities["P"])
     p_t = float(probabilities.get("T", 0.0) or 0.0)
     feedback = recent_user_direction_feedback(user_id)
+    context_vector = list(policy.get("context_vector") or [])
+    context_feature_names = list(policy.get("context_feature_names") or [])
+    context_meta = dict(policy.get("context_metadata") or {})
+    bandit_scores = dict(policy.get("scores") or {})
+    bandit_feedback_update = dict(policy.get("feedback_update") or {})
 
     markov_predict = {
         "direction": direction,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
-        "pattern_calibrated_probabilities": {
-            "B": p_b,
-            "P": p_p,
-            "T": p_t,
-        },
+        "pattern_calibrated_probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "state": {
-            "direction_context": str(policy.get("state_key") or ""),
-            "density": "RoadOnly",
-            "tie_trigger": "Ignored",
+            "direction_context": "LINUCB",
+            "density": "CardCompositionFirst",
+            "tie_trigger": "RewardZero",
         },
-        "state_key": str(policy.get("state_key") or ""),
-        "transition_counts": dict(policy.get("transition_counts") or {}),
-        "effective_support": float(policy.get("effective_support", 0.0) or 0.0),
+        "state_key": "LINUCB",
+        "transition_counts": {},
+        "effective_support": float(sum(int((bandit_scores.get(side) or {}).get("uncertainty", 0.0) >= 0.0) for side in ("B", "P"))),
         "entropy_bits": 0.0,
         "base_weight": confidence,
         "raw_final_weight": confidence,
         "final_weight": confidence,
         "pattern_survival_score": 1.0,
-        "decay": float(policy.get("decay", 0.0) or 0.0),
-        "retention_lambda": float(policy.get("decay", 0.0) or 0.0),
-        "decay_intensity": float(1.0 - float(policy.get("decay", 0.0) or 0.0)),
-        "selected_order": int(policy.get("selected_order", 0) or 0),
+        "decay": 0.0,
+        "retention_lambda": 0.0,
+        "decay_intensity": 0.0,
+        "selected_order": 0,
         "support_threshold": 0,
-        "backoff_steps": max(
-            0,
-            int(policy.get("max_order", 0) or 0)
-            - int(policy.get("selected_order", 0) or 0),
-        ),
+        "backoff_steps": 0,
         "backoff_penalty": 1.0,
         "focus_applied": True,
         "regime_profile": {
-            "change_point": penalty_active,
-            "penalty_observe": penalty,
+            "change_point": False,
+            "bandit_feedback_update": bandit_feedback_update,
         },
-        "prior": dict(policy.get("global_probabilities") or {}),
-        "prior_strength": 0.75,
-        "order_diagnostics": list(policy.get("order_diagnostics") or []),
+        "prior": {"B": 0.5, "P": 0.5},
+        "prior_strength": float(policy.get("ridge", 1.0) or 1.0),
+        "order_diagnostics": [],
+        "bandit_scores": bandit_scores,
     }
 
     component_probabilities = {
-        "decayed_markov": {"B": p_b, "P": p_p, "T": p_t},
-        "road_only_model": {"B": p_b, "P": p_p, "T": p_t},
+        "contextual_linucb": {"B": p_b, "P": p_p, "T": p_t},
+        "road_diagnostic": {
+            "B": float(road_predict["banker_probability"]),
+            "P": float(road_predict["player_probability"]),
+            "T": 0.0,
+        },
     }
 
-    remaining_cards = context.get("remaining_cards")
-    try:
-        remaining_cards_value = int(remaining_cards or 0)
-    except (TypeError, ValueError):
-        remaining_cards_value = 0
-
-    neutral_shoe = {
+    remaining_cards_value = float(context_meta.get("remaining_cards", 0.0) or 0.0)
+    estimated_counts = list(context_meta.get("estimated_remaining_counts_0_to_9") or [])
+    supplied_remaining = bool(context.get("remaining_cards") or context.get("remaining_counts"))
+    depth_constraint = {
+        "applied": supplied_remaining,
+        "reason": (
+            "supplied_remaining_card_depth_used_in_linucb_context"
+            if supplied_remaining
+            else "remaining_depth_estimated_from_round_count"
+        ),
+        "target_remaining_cards": remaining_cards_value,
+    }
+    shoe_estimate = {
         "direction": direction,
-        "probabilities": {"B": 0.5, "P": 0.5, "T": 0.0},
-        "bp_conditional_probabilities": {"B": 0.5, "P": 0.5},
-        "expected_remaining_cards": float(remaining_cards_value),
-        "expected_remaining_decks": 0.0,
-        "expected_remaining_counts": [],
+        "probabilities": {"B": p_b, "P": p_p, "T": 0.0},
+        "bp_conditional_probabilities": {"B": p_b, "P": p_p},
+        "expected_remaining_cards": remaining_cards_value,
+        "expected_remaining_decks": remaining_cards_value / 52.0,
+        "expected_remaining_counts": estimated_counts,
         "remaining_count_std": [],
         "remaining_card_state": {
-            "available": False,
+            "available": True,
             "conditioned_rounds": len(big_road),
-            "source": "road_only_no_exact_card_dependency",
+            "source": str(context_meta.get("remaining_cards_source") or "estimated"),
         },
         "conditioned_rounds": len(big_road),
         "particle_count": 0,
-        "reliability": 0.0,
-        "fusion_weight": 0.0,
-        "target_remaining_cards": (
-            remaining_cards_value if remaining_cards_value > 0 else None
-        ),
-        "depth_constraint_applied": False,
-        "depth_constraint": {
-            "applied": False,
-            "reason": "road_only_model_does_not_use_card_depth",
+        "reliability": 1.0 if supplied_remaining else 0.5,
+        "fusion_weight": 1.0,
+        "target_remaining_cards": remaining_cards_value,
+        "depth_constraint_applied": supplied_remaining,
+        "depth_constraint": depth_constraint,
+        "shoe_tendency": {
+            "high_vs_four_ratio_delta": float(context_vector[11]) if len(context_vector) > 11 else 0.0,
         },
-        "shoe_tendency": {},
-        "inference_semantics": "diagnostic_only_not_used_for_decision",
+        "inference_semantics": "linucb_context_estimate_not_exact_next_card_probability",
     }
 
     edge = float(money.get("edge", 0.0) or 0.0)
-    final_ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
+    final_ratio = float(money.get("final_bet_ratio", 0.05) or 0.05)
+    bet_percentage = float(money.get("bet_percentage", final_ratio * 100.0) or final_ratio * 100.0)
 
     result = {
         "ok": True,
-        "engine": "BIG_ROAD_TIME_DECAY_MARKOV",
+        "engine": "CONTEXTUAL_LINUCB_TWO_ARM",
         "model_version": POLICY_VERSION,
-        "shoe_posterior_model_version": "DISABLED_FOR_FORMAL_DECISION",
+        "shoe_posterior_model_version": "CONTEXT_GENERATOR_V1",
         "system_model_version": POLICY_VERSION,
-        "model_variant": "ROAD_ONLY_VARIABLE_ORDER_DECAY_MARKOV_WITH_PENALTY_OBSERVE",
-        "model_core": "dynamic_prediction_policy",
-        "decision_pipeline": (
-            "big_road_bp_only_to_time_decay_variable_order_markov_"
-            "to_two_miss_penalty_observe_to_virtual_ev_to_quarter_kelly"
-        ),
+        "model_variant": "CARD_COMPOSITION_FIRST_16D_TWO_ARM_LINUCB_KELLY_5_30",
+        "model_core": "contextual_bandit",
+        "decision_pipeline": "remaining_shoe_context_16d_to_two_arm_linucb_to_fractional_kelly_clip_5_30",
         "prediction_fingerprint": fingerprint,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "raw_direction_probabilities": {"B": p_b, "P": p_p},
@@ -332,120 +285,100 @@ def predict(
         "direction": direction,
         "direction_text": direction_text,
         "adaptive_only_direction": direction,
-        "signal_allowed": bet_allowed,
-        "risk_gate_open": bet_allowed,
-        "mandatory_bet": False,
+        "signal_allowed": True,
+        "risk_gate_open": True,
+        "mandatory_bet": True,
         "signal_status_code": signal_status_code,
         "signal_status_text": signal_status_text,
         "signal_reason": (
-            f"BigRoadBP={len(big_road)}；"
-            f"order={int(policy.get('selected_order', 0) or 0)}；"
-            f"state={str(policy.get('state_key') or 'START')}；"
-            f"decay={float(policy.get('decay', 0.0) or 0.0):.3f}；"
-            f"P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
-            f"virtualEV={float(money.get('virtual_ev', 0.0) or 0.0):.4f}；"
-            f"penalty={penalty_active}；"
-            f"sizing={str(money.get('reason') or '')}。"
+            f"LinUCB alpha={float(policy.get('alpha', 0.5) or 0.5):.3f}；"
+            f"ridge={float(policy.get('ridge', 1.0) or 1.0):.3f}；"
+            f"Xdim={len(context_vector)}；P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
+            f"cardSource={str(context_meta.get('remaining_cards_source') or '')}；"
+            f"Kelly={bet_percentage:.2f}%；feedback={bool(bandit_feedback_update.get('updated', False))}。"
         ),
         "internal_signal_reason": "",
-        "direction_source": "time_decay_markov_big_road_bp_only",
+        "direction_source": "contextual_linucb_two_arm_card_composition_first",
         "confidence": confidence,
         "raw_markov_confidence": confidence,
         "pattern_calibrated_confidence": confidence,
         "ensemble_confidence": confidence,
         "quality_score": confidence,
-        "confidence_label": (
-            "較高" if confidence >= 0.60
-            else "中等" if confidence >= 0.54
-            else "偏低"
-        ),
+        "confidence_label": "較高" if confidence >= 0.56 else "中等" if confidence >= 0.52 else "保守",
         "entropy_bits": 0.0,
         "entropy_base_weight": confidence,
-        "shoe_progress": float(len(big_road) / 70.0),
+        "shoe_progress": float(min(1.0, len(big_road) / 70.0)),
         "shoe_depth_estimate": {
             "rounds": len(big_road),
-            "source": "big_road_count_only",
+            "remaining_cards": remaining_cards_value,
+            "source": str(context_meta.get("remaining_cards_source") or "estimated"),
         },
-        "remaining_card_state": dict(neutral_shoe["remaining_card_state"]),
-        "estimated_remaining_cards": float(remaining_cards_value),
-        "estimated_remaining_interval": {
-            "low": float(remaining_cards_value),
-            "high": float(remaining_cards_value),
-        },
-        "shoe_stage": "ROAD_ONLY",
-        "pattern_survival": {
-            "score": 1.0,
-            "mode": "not_used",
-        },
+        "remaining_card_state": dict(shoe_estimate["remaining_card_state"]),
+        "estimated_remaining_cards": remaining_cards_value,
+        "estimated_remaining_interval": {"low": remaining_cards_value, "high": remaining_cards_value},
+        "shoe_stage": "EARLY" if len(big_road) <= 20 else "MID" if len(big_road) < 41 else "LATE",
+        "pattern_survival": {"score": 1.0, "mode": "diagnostic_only"},
         "pattern_survival_score": 1.0,
         "run_length_hazard": {},
         "run_length_hazard_weight": 0.0,
-        "probabilistic_shoe_estimate": dict(neutral_shoe),
+        "probabilistic_shoe_estimate": dict(shoe_estimate),
         "tie_risk_active": False,
         "direction_edge": edge,
         "direction_edge_percent": round(edge * 100.0, 4),
-        "selected_expected_return": float(
-            money.get("virtual_ev", 0.0) or 0.0
-        ) if bet_allowed else 0.0,
-        "selected_expected_return_percent": float(
-            money.get("virtual_ev_percent", 0.0) or 0.0
-        ) if bet_allowed else 0.0,
-        "bet_allowed": bet_allowed,
+        "selected_expected_return": float(money.get("virtual_ev", 0.0) or 0.0),
+        "selected_expected_return_percent": float(money.get("virtual_ev_percent", 0.0) or 0.0),
+        "bet_allowed": True,
         "markov": dict(markov_predict),
         "markov_probs": {"B": p_b, "P": p_p, "T": p_t},
         "final_probs": {"B": p_b, "P": p_p, "T": p_t},
         "direction_probs": {"B": p_b, "P": p_p, "T": p_t},
         "economic_probs": {"B": p_b, "P": p_p, "T": p_t},
         "final_probability": float(probabilities[direction]),
-        "economic_probability_for_direction": float(probabilities[direction]),
+        "economic_probability_for_direction": float(money.get("resolved_win_probability", confidence) or confidence),
         "markov_predict": markov_predict,
-        "probabilistic_shoe_predict": dict(neutral_shoe),
+        "probabilistic_shoe_predict": dict(shoe_estimate),
         "fusion_decision": {
             "direction": direction,
             "probabilities": {"B": p_b, "P": p_p, "T": p_t},
-            "markov_prior_weight": 1.0,
-            "probabilistic_shoe_weight": 0.0,
+            "markov_prior_weight": 0.0,
+            "probabilistic_shoe_weight": 1.0,
             "derived_road_likelihood_power": 0.0,
             "run_length_hazard_likelihood_power": 0.0,
             "road_applied": False,
             "hazard_applied": False,
-            "method": "road_only_time_decay_markov",
-            "semantics": "formal_decision_uses_only_big_road_bp_sequence",
+            "method": "two_arm_contextual_linucb",
+            "semantics": "formal_direction_uses_16d_card_composition_first_context",
         },
         "fusion": {
-            "method": "road_only_time_decay_markov",
-            "shoe_reliability": 0.0,
-            "road_reliability": 1.0,
+            "method": "two_arm_contextual_linucb",
+            "shoe_reliability": 1.0 if supplied_remaining else 0.5,
+            "road_reliability": 0.25,
             "hazard_reliability": 0.0,
         },
         "markov_state": {
-            "state_key": str(policy.get("state_key") or ""),
-            "direction_context": str(policy.get("state_key") or ""),
-            "density": "RoadOnly",
-            "tie_trigger": "Ignored",
+            "state_key": "LINUCB",
+            "direction_context": "LINUCB",
+            "density": "CardCompositionFirst",
+            "tie_trigger": "RewardZero",
             "sample_count": len(big_road),
-            "effective_support": float(
-                policy.get("effective_support", 0.0) or 0.0
-            ),
-            "state_count": len(
-                list(policy.get("order_diagnostics") or [])
-            ),
-            "selected_order": int(policy.get("selected_order", 0) or 0),
-            "change_point": penalty_active,
-            "shoe_stage": "ROAD_ONLY",
+            "effective_support": int((bandit_scores.get("P") or {}).get("uncertainty", 0.0) >= 0.0) + int((bandit_scores.get("B") or {}).get("uncertainty", 0.0) >= 0.0),
+            "state_count": 2,
+            "selected_order": 0,
+            "change_point": False,
+            "shoe_stage": "SHORT_SHOE_50_70_TARGET",
             "pattern_survival_score": 1.0,
         },
         "road_predict": road_predict,
         "road_support": road,
-        "derived_road_analysis": {},
+        "derived_road_analysis": dict(policy.get("regression_analysis") or {}),
         "road_fusion": {
             "applied": False,
             "mode": "diagnostic_only",
-            "reliability": 0.0,
-            "raw_reliability": 0.0,
+            "reliability": 0.25,
+            "raw_reliability": 0.25,
             "pattern_survival_score": 1.0,
             "likelihood": None,
-            "reason": "正式方向只使用大路 B/P 時間衰減馬可夫。",
+            "reason": "牌路只作 Context 輔助；正式方向由兩臂 LinUCB 決定。",
         },
         "run_length_hazard_fusion": {
             "applied": False,
@@ -456,72 +389,68 @@ def predict(
             "turn_probability": 0.5,
             "selected_context": "",
             "support": 0.0,
-            "reason": "正式方向只使用大路 B/P 時間衰減馬可夫。",
+            "reason": "非正式方向來源。",
         },
         "component_probabilities": component_probabilities,
         "money_management": dict(money),
-        "kelly_fraction": float(money.get("kelly_fraction", 0.0) or 0.0),
-        "pre_tie_adjusted_ratio": float(
-            money.get("pre_tie_adjusted_ratio", 0.0) or 0.0
-        ),
-        "adjusted_ratio": float(money.get("adjusted_ratio", 0.0) or 0.0),
+        "kelly_fraction": float(money.get("kelly_fraction", final_ratio) or final_ratio),
+        "pre_tie_adjusted_ratio": float(money.get("pre_tie_adjusted_ratio", final_ratio) or final_ratio),
+        "adjusted_ratio": float(money.get("adjusted_ratio", final_ratio) or final_ratio),
         "final_bet_ratio": final_ratio,
-        "bet_percentage": float(money.get("bet_percentage", 0.0) or 0.0),
+        "bet_percentage": bet_percentage,
         "suggested_bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
         "bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
-        "bet_multiplier": (
-            min(1.0, final_ratio / MAX_BET_RATIO)
-            if MAX_BET_RATIO > 0.0 else 0.0
-        ),
-        "context_vector": list(road.get("road_features") or []),
-        "bandit_context": [],
-        "context_feature_names": list(ROAD_FEATURE_NAMES),
-        "context_dim": len(list(road.get("road_features") or [])),
-        "contextual_bandit_enabled": False,
-        "contextual_bandit_update_enabled": False,
+        "bet_multiplier": min(1.0, final_ratio / MAX_BET_RATIO) if MAX_BET_RATIO > 0.0 else 1.0,
+        "context_vector": context_vector,
+        "bandit_context": context_vector,
+        "context_feature_names": context_feature_names,
+        "context_dim": len(context_vector),
+        "bandit_scores": bandit_scores,
+        "bandit_selected_arm": direction,
+        "bandit_scope_key": str(policy.get("scope_key") or ""),
+        "bandit_feedback_update": bandit_feedback_update,
+        "contextual_bandit_enabled": True,
+        "contextual_bandit_update_enabled": True,
+        "linucb_enabled": True,
         "cusum_linucb_enabled": False,
-        "force_observe": bool(action == "O"),
+        "force_observe": False,
         "hard_brake_active": False,
-        "post_reset_vacuum_active": penalty_active,
+        "post_reset_vacuum_active": False,
         "input_required": False,
         "venue": str(venue or ""),
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
-        "probability_semantics": (
-            "time_decayed_big_road_bp_transition_probability_"
-            "not_exact_card_probability_and_not_guaranteed_outcome"
-        ),
+        "probability_semantics": "selected_arm_probability_clamped_for_short_shoe_48_to_58_percent",
         "dynamic_prediction_policy": {
             "version": POLICY_VERSION,
-            "road_only": True,
+            "road_only": False,
             "big_road_rounds": len(big_road),
             "forecast": dict(policy),
-            "penalty_observe": penalty,
+            "penalty_observe": {"active": False, "force_observe": False},
             "exact_card_dependency": False,
-            "shoe_probability_decision_weight": 0.0,
+            "shoe_probability_decision_weight": 1.0,
             "ocr_or_screen_flow_modified": False,
+            "formal_direction_source": "contextual_linucb_two_arm",
         },
         "dynamic_policy_version": POLICY_VERSION,
         "online_performance_feedback": feedback,
         "decision": action,
         "decision_text": text,
-        "skip": bool(action == "O"),
-        "skip_reason": observe_reason,
+        "skip": False,
+        "skip_reason": "",
         "decision_gate": {
             "decision": action,
-            "allowed": bet_allowed,
-            "reason": observe_reason or "road_model_positive_virtual_ev",
+            "allowed": True,
+            "reason": "two_arm_linucb_always_returns_explicit_direction",
             "direction": direction,
             "resolved_confidence": confidence,
-            "expected_net_ev": float(
-                money.get("virtual_ev", 0.0) or 0.0
-            ),
-            "penalty_observe": penalty_active,
+            "expected_net_ev": float(money.get("virtual_ev", 0.0) or 0.0),
+            "penalty_observe": False,
         },
         "timeline_alignment": {
             "raw_round_count": len(raw_history),
             "bp_round_count": len(big_road),
-            "ties_ignored_for_model": len(raw_history) - len(big_road),
+            "ties_ignored_for_direction_context": len(raw_history) - len(big_road),
         },
     }
     result["internal_signal_reason"] = result["signal_reason"]
@@ -532,71 +461,68 @@ def run_virtual_round(
     session: Mapping[str, Any],
     run_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Compatibility API for the existing virtual-shoe endpoint."""
+    """既有虛擬牌靴 API 相容入口，並在開牌後直接線上更新 LinUCB。"""
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
 
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
     if len(hidden_shoe) < 6:
         raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
 
-    outcome_history = _normalize_outcome_history(
-        list(session.get("round_history") or [])
-    )
-    seed = int(
-        run_seed if run_seed is not None else secrets.randbits(32)
-    ) & 0xFFFFFFFF
+    outcome_history = _normalize_outcome_history(list(session.get("round_history") or []))
+    seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     prediction = predict(
         history=outcome_history,
         venue=str(session.get("venue") or ""),
         room=str(session.get("room") or ""),
         shoe_id=str(session.get("shoe_id") or ""),
+        user_id=str(session.get("user_id") or ""),
         run_seed=seed,
         shoe_context={
             "bankroll": float(session.get("bankroll", 0.0) or 0.0),
             "remaining_cards": len(hidden_shoe),
             "remaining_cards_reliability": 1.0,
+            "remaining_cards_source": "virtual_shoe_exact_total",
         },
     )
 
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
-    predicted_side = str(prediction.get("action") or "").upper()
+    predicted_side = str(prediction.get("action") or "P").upper()
     actual = str(hand.outcome or "").upper()
     if actual == "T":
         verdict = "TIE_SKIPPED"
-    elif predicted_side in {"B", "P"}:
-        verdict = "HIT" if predicted_side == actual else "MISS"
     else:
-        verdict = "OBSERVE"
+        verdict = "HIT" if predicted_side == actual else "MISS"
 
-    prediction.update({
-        "ok": True,
-        "mode": "virtual_shoe_road_only_markov_compatibility",
-        "virtual_hand": hand_data,
-        "virtual_outcome": actual,
-        "virtual_outcome_text": hand_data["outcome_text"],
-        "verdict": verdict,
-        "verdict_text": {
-            "HIT": "命中",
-            "MISS": "未命中",
-            "TIE_SKIPPED": "和局不計",
-            "OBSERVE": "觀望／虛擬下注",
-        }[verdict],
-        "cards_consumed": int(hand.cards_used),
-        "remaining_cards_after": len(remaining_shoe),
-        "remaining_counts_after": counts_from_shoe(remaining_shoe),
-        "round_number": int(session.get("hand_number", 0) or 0) + 1,
-        "bandit_learning_applied": False,
-        "disclaimer": (
-            "正式方向只使用大路 B/P 時間衰減馬可夫；"
-            "精確牌面與剩餘牌數不參與方向預測。"
-        ),
-    })
-    return {
-        "prediction": prediction,
-        "hand": hand_data,
-        "remaining_shoe": remaining_shoe,
-    }
+    bandit_update = record_online_feedback(
+        scope_key=str(prediction.get("bandit_scope_key") or ""),
+        action=predicted_side,
+        context_vector=list(prediction.get("context_vector") or []),
+        actual_outcome=actual,
+    )
+
+    prediction.update(
+        {
+            "ok": True,
+            "mode": "virtual_shoe_two_arm_linucb",
+            "virtual_hand": hand_data,
+            "virtual_outcome": actual,
+            "virtual_outcome_text": hand_data["outcome_text"],
+            "verdict": verdict,
+            "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict],
+            "cards_consumed": int(hand.cards_used),
+            "remaining_cards_after": len(remaining_shoe),
+            "remaining_counts_after": counts_from_shoe(remaining_shoe),
+            "round_number": int(session.get("hand_number", 0) or 0) + 1,
+            "bandit_learning_applied": bool(bandit_update.get("updated", False)),
+            "bandit_update": bandit_update,
+            "disclaimer": (
+                "正式方向由剩餘牌組優先的 16 維 Contextual LinUCB 產生；"
+                "單局結果具有高變異，模型機率不代表保證獲利。"
+            ),
+        }
+    )
+    return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
 
 def parse_point_observation(value: Any) -> None:
@@ -604,8 +530,4 @@ def parse_point_observation(value: Any) -> None:
     return None
 
 
-__all__ = [
-    "parse_point_observation",
-    "predict",
-    "run_virtual_round",
-]
+__all__ = ["parse_point_observation", "predict", "run_virtual_round"]
