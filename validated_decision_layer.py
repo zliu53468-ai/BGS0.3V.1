@@ -1,10 +1,10 @@
 """Validated decision layer for the short-shoe road-only BGS model.
 
 Public function signatures and outward JSON fields are preserved.  The final B/P
-direction and confidence come from the 12-hand predictor after its external Bias
-& Momentum Adjuster.  That adjusted confidence is converted directly to virtual
-EV and passed to MoneyManagementModel.  This layer does not convert a model
-signal to O/observe.
+probabilities come from the 12-hand local predictor after the requested Global
+Trend Bias Correction (40% local + 60% full-shoe base probability).  The fused
+confidence is converted directly to virtual EV and passed to MoneyManagementModel.
+This layer never changes the formal B/P direction to O/observe.
 """
 from __future__ import annotations
 
@@ -63,19 +63,19 @@ def _short_window_forecast(result: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(forecast) if isinstance(forecast, Mapping) else {}
 
 
-def _bias_momentum_state(result: Mapping[str, Any]) -> Dict[str, Any]:
+def _global_trend_state(result: Mapping[str, Any]) -> Dict[str, Any]:
     forecast = _short_window_forecast(result)
-    state = forecast.get("bias_momentum_adjuster")
+    state = forecast.get("global_trend_bias_correction")
     if isinstance(state, Mapping):
         return dict(state)
 
     dynamic = result.get("dynamic_prediction_policy")
     if isinstance(dynamic, Mapping):
-        state = dynamic.get("bias_momentum_adjuster")
+        state = dynamic.get("global_trend_bias_correction")
         if isinstance(state, Mapping):
             return dict(state)
 
-    state = result.get("bias_momentum_adjuster")
+    state = result.get("global_trend_bias_correction")
     return dict(state) if isinstance(state, Mapping) else {}
 
 
@@ -83,14 +83,14 @@ def _model_direction_and_confidence(
     result: Mapping[str, Any],
 ) -> tuple[str, float, Dict[str, float], str]:
     forecast = _short_window_forecast(result)
-    adjustment = _bias_momentum_state(result)
+    correction = _global_trend_state(result)
 
     raw_probabilities: Mapping[str, Any]
     if isinstance(forecast.get("probabilities"), Mapping):
         raw_probabilities = dict(forecast.get("probabilities") or {})
         source = (
-            "bias_momentum_adjusted_forecast"
-            if adjustment.get("applied")
+            "global_trend_40_60_forecast"
+            if correction
             else "short_window_forecast"
         )
     elif isinstance(result.get("probabilities"), Mapping):
@@ -116,7 +116,7 @@ def _model_direction_and_confidence(
 
     direction = str(
         forecast.get("direction")
-        or adjustment.get("adjusted_direction")
+        or correction.get("final_direction")
         or result.get("direction")
         or result.get("adaptive_only_direction")
         or result.get("action")
@@ -126,27 +126,15 @@ def _model_direction_and_confidence(
     if direction not in {"B", "P"}:
         direction = "B" if probabilities["B"] >= probabilities["P"] else "P"
 
-    confidence_candidates = (
-        forecast.get("confidence_prob"),
-        adjustment.get("adjusted_confidence_prob"),
-        result.get("confidence_prob"),
-        forecast.get("confidence"),
-        result.get("confidence"),
-        probabilities.get(direction),
-    )
-    confidence_prob = 0.5
-    for raw in confidence_candidates:
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if value >= 0.5:
-            confidence_prob = max(0.5, min(0.999, value))
-            break
+    # Confidence is exactly the fused probability of the chosen B/P direction.
+    confidence_prob = float(probabilities[direction])
+    if confidence_prob < 0.5:
+        direction = "P" if direction == "B" else "B"
+        confidence_prob = float(probabilities[direction])
 
     probabilities = {
-        "B": confidence_prob if direction == "B" else 1.0 - confidence_prob,
-        "P": confidence_prob if direction == "P" else 1.0 - confidence_prob,
+        "B": float(probabilities["B"]),
+        "P": float(probabilities["P"]),
         "T": 0.0,
     }
     return direction, confidence_prob, probabilities, source
@@ -159,7 +147,7 @@ def _virtual_money(
     probabilities: Mapping[str, Any],
     bankroll: float,
 ) -> tuple[Dict[str, Any], float]:
-    """Convert adjusted model confidence to virtual EV and quarter-Kelly sizing."""
+    """Convert fused Final_P to virtual EV and obtain quarter-Kelly sizing."""
     p_win = max(0.0, min(1.0, float(confidence_prob)))
     payout = 0.95 if direction == "B" else 1.0
     virtual_ev = float(p_win * payout - (1.0 - p_win))
@@ -173,7 +161,10 @@ def _virtual_money(
         )
     )
 
-    # Keep the existing positive-EV quarter-Kelly compatibility fallback.
+    # Preserve the existing compatibility rule: if EV is positive but the money
+    # module's legacy minimum-EV threshold blocks sizing, use its quarter-Kelly
+    # fraction instead. Negative/zero EV is still transmitted as-is; it never
+    # changes the formal B/P prediction into O.
     if virtual_ev > 0.0 and not bool(money.get("bet_allowed", False)):
         ratio = min(
             float(MAX_BET_RATIO),
@@ -201,11 +192,12 @@ def _virtual_money(
                 "bet_percentage": ratio * 100.0,
                 "bet_amount": bankroll_value * ratio,
                 "bet_allowed": True,
-                "reason": "positive_virtual_ev_quarter_kelly_fallback",
+                "reason": "positive_global_trend_virtual_ev_quarter_kelly_fallback",
             })
 
     money["virtual_ev"] = virtual_ev
     money["virtual_ev_percent"] = virtual_ev * 100.0
+    money["global_trend_probability_input"] = p_win
     return money, virtual_ev
 
 
@@ -213,11 +205,15 @@ def _set_direction_distribution(
     result: Dict[str, Any],
     *,
     direction: str,
-    confidence: float,
+    probabilities: Mapping[str, Any],
 ) -> None:
-    conditional = max(0.50, min(0.999, float(confidence)))
-    banker = conditional if direction == "B" else 1.0 - conditional
-    player = 1.0 - banker
+    normalized = _normalize(probabilities)
+    bp_mass = normalized["B"] + normalized["P"]
+    if bp_mass <= 1e-12:
+        banker, player = 0.5, 0.5
+    else:
+        banker = normalized["B"] / bp_mass
+        player = normalized["P"] / bp_mass
     result["probabilities"] = {"B": banker, "P": player, "T": 0.0}
     result["economic_probs"] = {"B": banker, "P": player, "T": 0.0}
     result["banker_rate"] = round(banker * 100.0, 4)
@@ -232,11 +228,12 @@ def _apply_direction_without_observe(
     *,
     bankroll: float,
     strategy_selection: Mapping[str, Any] | None = None,
+    strategy_multiplier: float = 1.0,
 ) -> Dict[str, Any]:
     direction, confidence_prob, probabilities, source = (
         _model_direction_and_confidence(result)
     )
-    adjustment = _bias_momentum_state(result)
+    correction = _global_trend_state(result)
     money, virtual_ev = _virtual_money(
         direction=direction,
         confidence_prob=confidence_prob,
@@ -244,9 +241,21 @@ def _apply_direction_without_observe(
         bankroll=bankroll,
     )
 
-    ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
-    amount = float(money.get("bet_amount", bankroll * ratio) or 0.0)
-    text = "莊" if direction == "B" else "閒"
+    base_ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
+    ratio = min(
+        float(MAX_BET_RATIO),
+        max(0.0, base_ratio * max(0.0, min(1.0, strategy_multiplier))),
+    )
+    amount = max(0.0, float(bankroll or 0.0)) * ratio
+    money.update({
+        "final_bet_ratio": ratio,
+        "bet_percentage": ratio * 100.0,
+        "bet_amount": amount,
+        "bet_allowed": bool(money.get("bet_allowed", False) and ratio > 0.0),
+        "strategy_multiplier": max(0.0, min(1.0, strategy_multiplier)),
+        "virtual_ev": virtual_ev,
+        "virtual_ev_percent": virtual_ev * 100.0,
+    })
 
     result.setdefault(
         "pre_validation_probabilities",
@@ -255,16 +264,17 @@ def _apply_direction_without_observe(
     _set_direction_distribution(
         result,
         direction=direction,
-        confidence=confidence_prob,
+        probabilities=probabilities,
     )
 
+    selection = dict(strategy_selection or {})
     if strategy_selection is not None:
-        selection = dict(strategy_selection or {})
         result["decision_strategy_bandit"] = selection
         result["decision_strategy"] = str(
             selection.get("selected_arm") or "math_only"
         )
 
+    text = "莊" if direction == "B" else "閒"
     result.update({
         "action": direction,
         "recommend": direction,
@@ -302,30 +312,44 @@ def _apply_direction_without_observe(
         "bet_amount": amount,
         "bet_allowed": bool(money.get("bet_allowed", False)),
         "money_management": money,
-        "bias_momentum_adjuster": adjustment,
-        "direction_source": (
-            "bias_momentum_adjusted_virtual_ev"
-            if adjustment.get("applied")
-            else "short_window_confidence_virtual_ev"
-        ),
+        "global_trend_bias_correction": correction,
+        "bias_momentum_adjuster": {
+            "applied": False,
+            "mode": "replaced_by_global_trend_bias_correction",
+        },
+        "direction_source": "global_trend_40_60_virtual_ev",
         "signal_reason": (
-            f"12局短窗 {text} confidence={confidence_prob:.3%}；"
-            f"BiasMomentum={str(adjustment.get('mode') or 'base')}；"
+            f"GlobalTrend40/60 {text} confidence={confidence_prob:.3%}；"
+            f"GlobalPB={float(correction.get('global_p_b', 0.5) or 0.5):.3%}；"
+            f"velocityB={float(correction.get('global_probability_velocity_b', 0.0) or 0.0):+.5f}；"
             f"virtualEV={virtual_ev:.3%}；Kelly={ratio:.3%}。"
         ),
     })
     result["reason"] = result["signal_reason"]
+    result["model_virtual_signal"] = {
+        "available": True,
+        "source": source,
+        "action": direction,
+        "confidence_prob": confidence_prob,
+        "probabilities": probabilities,
+        "selected_expected_return": virtual_ev,
+        "kelly_fraction": ratio,
+        "trusted_exact_counts": False,
+        "exact_card_counts_required": False,
+        "global_trend_bias_correction": correction,
+    }
     result["decision_validation"] = {
         "active": True,
-        "mode": "bias_momentum_virtual_ev_no_observe",
+        "mode": "global_trend_40_60_virtual_ev_no_observe",
         "direction": direction,
         "confidence_prob": confidence_prob,
         "virtual_ev": virtual_ev,
         "confidence_source": source,
-        "bias_momentum_adjuster": adjustment,
+        "global_trend_bias_correction": correction,
         "exact_card_counts_required": False,
         "virtual_ev_fallback_used": True,
         "observe_gate_enabled": False,
+        "base_kelly_ratio": base_ratio,
         "final_kelly_ratio": ratio,
     }
     return result
@@ -337,7 +361,7 @@ def apply_validated_decision(
     venue: str = "",
     room: str = "",
 ) -> Dict[str, Any]:
-    """Always pass adjusted 12-hand B/P confidence through virtual EV."""
+    """Pass fused Global/Local Final_P directly through virtual EV without O."""
     del venue, room
     result = dict(prediction or {})
     bankroll = max(0.0, float(result.get("bankroll", 0.0) or 0.0))
@@ -355,151 +379,55 @@ def apply_strategy_decision(
     strategy_selection: Mapping[str, Any],
     bankroll: float = 0.0,
 ) -> Dict[str, Any]:
-    """Apply strategy sizing without converting the adjusted B/P signal to O."""
+    """Apply strategy sizing without changing the fused B/P signal to O."""
     result = dict(prediction or {})
     selection = dict(strategy_selection or {})
     profile = dict(selection.get("profile") or {})
     arm = str(selection.get("selected_arm") or "math_only")
-
-    direction, confidence_prob, probabilities, source = (
-        _model_direction_and_confidence(result)
-    )
-    adjustment = _bias_momentum_state(result)
-    bankroll_value = max(0.0, float(bankroll or 0.0))
-    money, virtual_ev = _virtual_money(
-        direction=direction,
-        confidence_prob=confidence_prob,
-        probabilities=probabilities,
-        bankroll=bankroll_value,
-    )
 
     multiplier = min(
         1.0,
         max(0.0, float(profile.get("kelly_multiplier", 1.0) or 1.0)),
     )
     road_direction, road_strength = _strategy_road_direction(result)
-    road_note = "Bias/Momentum 校正勝率轉虛擬 EV 後進入 1/4 Kelly。"
+    road_note = "Global 60% + Local 40% 融合概率轉虛擬 EV 後進入 1/4 Kelly。"
     if arm == "conservative":
         multiplier *= 0.50
-        road_note = "保守策略將 1/4 Kelly 再縮半。"
+        road_note = "保守策略將融合概率的 1/4 Kelly 再縮半。"
     elif arm == "ev_road_blend" and road_strength < 0.20:
         multiplier *= 0.75
-        road_note = "短窗方向幅度偏弱，1/4 Kelly 再縮至 75%。"
+        road_note = "融合方向幅度偏弱，1/4 Kelly 再縮至 75%。"
 
-    base_ratio = float(money.get("final_bet_ratio", 0.0) or 0.0)
-    final_ratio = min(MAX_BET_RATIO, max(0.0, base_ratio * multiplier))
-    amount = bankroll_value * final_ratio
-    text = "莊" if direction == "B" else "閒"
-
-    money.update({
-        "final_bet_ratio": final_ratio,
-        "bet_percentage": final_ratio * 100.0,
-        "bet_amount": amount,
-        "bet_allowed": bool(
-            money.get("bet_allowed", False) and final_ratio > 0.0
-        ),
-        "strategy_multiplier": multiplier,
-        "virtual_ev": virtual_ev,
-        "virtual_ev_percent": virtual_ev * 100.0,
-    })
-
-    _set_direction_distribution(
+    result = _apply_direction_without_observe(
         result,
-        direction=direction,
-        confidence=confidence_prob,
+        bankroll=max(0.0, float(bankroll or 0.0)),
+        strategy_selection=selection,
+        strategy_multiplier=multiplier,
     )
-    result.update({
-        "action": direction,
-        "recommend": direction,
-        "internal_action": direction,
-        "internal_recommend": direction,
-        "next_round_direction": direction,
-        "action_text": text,
-        "recommend_text": text,
-        "next_round_direction_text": text,
-        "decision": direction,
-        "decision_text": text,
-        "skip": False,
-        "skip_reason": "",
-        "force_observe": False,
-        "signal_allowed": True,
-        "risk_gate_open": True,
-        "mandatory_bet": False,
-        "direction_source": (
-            "bias_momentum_adjusted_virtual_ev_quarter_kelly"
-            if adjustment.get("applied")
-            else "short_window_confidence_virtual_ev_quarter_kelly"
-        ),
-        "confidence": confidence_prob,
-        "confidence_prob": confidence_prob,
-        "selected_expected_return": virtual_ev,
-        "selected_expected_return_percent": virtual_ev * 100.0,
-        "kelly_fraction": final_ratio,
-        "kelly_percentage_applied": final_ratio * 100.0,
-        "recommended_bet_percentage": final_ratio * 100.0,
-        "bet_percentage": final_ratio * 100.0,
-        "final_bet_ratio": final_ratio,
-        "suggested_bet_amount": amount,
-        "bet_amount": amount,
-        "bet_allowed": bool(money.get("bet_allowed", False)),
-        "bankroll": bankroll_value,
-        "money_management": money,
-        "bias_momentum_adjuster": adjustment,
-        "decision_strategy_bandit": selection,
-        "decision_strategy": arm,
-        "strategy_weights": {
-            "model_probability_weight": 1.0,
-            "road_direction": road_direction,
-            "road_strength": road_strength,
-            "kelly_multiplier": multiplier,
-        },
-        "strategy_hard_limits": {
-            "kelly_fraction": float(KELLY_FRACTION),
-            "max_bet_fraction": float(MAX_BET_RATIO),
-            "minimum_positive_ev": 0.0,
-            "money_management_min_positive_ev": float(MIN_POSITIVE_EV),
-            "exact_card_counts_required": False,
-        },
-        "strategy_required_ev": 0.0,
-        "kelly_cap_enforced": True,
-        "signal_reason": (
-            f"{profile.get('label', arm)}：{text} confidence "
-            f"{confidence_prob:.3%}；BiasMomentum="
-            f"{str(adjustment.get('mode') or 'base')}；"
-            f"虛擬 EV {virtual_ev:.3%}；{road_note}"
-        ),
-    })
-    result["reason"] = result["signal_reason"]
-    result["model_virtual_signal"] = {
-        "available": True,
-        "source": source,
-        "action": direction,
-        "confidence_prob": confidence_prob,
-        "probabilities": probabilities,
-        "selected_expected_return": virtual_ev,
-        "kelly_fraction": final_ratio,
-        "trusted_exact_counts": False,
-        "exact_card_counts_required": False,
-        "bias_momentum_adjuster": adjustment,
+    result["strategy_weights"] = {
+        "model_probability_weight": 1.0,
+        "global_trend_weight": 0.60,
+        "local_model_weight": 0.40,
+        "road_direction": road_direction,
+        "road_strength": road_strength,
+        "kelly_multiplier": multiplier,
     }
-    result["decision_validation"] = {
-        "active": True,
-        "mode": "bias_momentum_virtual_ev_quarter_kelly_no_observe",
-        "selected_strategy_arm": arm,
+    result["strategy_hard_limits"] = {
+        "kelly_fraction": float(KELLY_FRACTION),
+        "max_bet_fraction": float(MAX_BET_RATIO),
+        "minimum_positive_ev": 0.0,
+        "money_management_min_positive_ev": float(MIN_POSITIVE_EV),
         "exact_card_counts_required": False,
-        "virtual_ev_fallback_used": True,
-        "model_direction": direction,
-        "confidence_prob": confidence_prob,
-        "model_virtual_ev": virtual_ev,
-        "required_ev": 0.0,
+    }
+    result["strategy_required_ev"] = 0.0
+    result["kelly_cap_enforced"] = True
+    result["decision_validation"].update({
+        "mode": "global_trend_40_60_virtual_ev_quarter_kelly_no_observe",
+        "selected_strategy_arm": arm,
         "quarter_kelly_multiplier": float(KELLY_FRACTION),
-        "base_kelly_ratio": base_ratio,
-        "final_kelly_ratio": final_ratio,
         "max_bet_fraction": float(MAX_BET_RATIO),
         "road_note": road_note,
-        "bias_momentum_adjuster": adjustment,
-        "observe_gate_enabled": False,
-    }
+    })
     return result
 
 
