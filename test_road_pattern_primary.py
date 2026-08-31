@@ -1,10 +1,17 @@
-"""Regression tests for the Road-Pattern Probability V2 production core."""
+"""Regression tests for V1 Big-Road + human derived-road final candidate."""
 from __future__ import annotations
 
 import unittest
 
 from predictor import predict
-from road_pattern_core import forecast_road_pattern, normalize_bp
+from road_pattern_core import (
+    COMPONENT_WEIGHTS,
+    V1_VERSION,
+    forecast_road_pattern,
+    fuse_v1_with_derived,
+    normalize_bp,
+)
+from road_pattern_v1_core import forecast_road_pattern as forecast_v1_only
 
 
 def _swap_bp(history: str) -> str:
@@ -14,6 +21,29 @@ def _swap_bp(history: str) -> str:
 class RoadPatternCoreTests(unittest.TestCase):
     def test_ties_are_skipped_from_formal_sequence(self) -> None:
         self.assertEqual(normalize_bp("BTPPTBT"), ["B", "P", "P", "B"])
+
+    def test_v1_core_is_restored_exactly_before_derived_fusion(self) -> None:
+        history = "BPBPBBPPBPBBPBPBBPPBP"
+        base = forecast_v1_only(history)
+        wrapped = forecast_road_pattern(history)
+        self.assertEqual(wrapped["v1_version"], V1_VERSION)
+        self.assertEqual(wrapped["v1_model_id"], "ROAD-PATTERN-PRIMARY-V1")
+        self.assertEqual(wrapped["v1_probabilities"], base["probabilities"])
+        self.assertEqual(
+            set(wrapped["components"]),
+            {"multi_window", "pattern_replay", "ngram", "pattern_survival"},
+        )
+        self.assertEqual(
+            COMPONENT_WEIGHTS,
+            {
+                "multi_window": 0.30,
+                "pattern_replay": 0.30,
+                "ngram": 0.25,
+                "pattern_survival": 0.15,
+            },
+        )
+        self.assertNotIn("probabilistic_turning", wrapped["components"])
+        self.assertNotIn("change_point_probability", wrapped)
 
     def test_orientation_mirror_swaps_probability(self) -> None:
         history = "BPBPBBPPBPBBPBPBBPPBP"
@@ -30,97 +60,53 @@ class RoadPatternCoreTests(unittest.TestCase):
             float(right["probabilities"]["B"]),
             places=12,
         )
-        self.assertAlmostEqual(
-            float(left["change_point_probability"]),
-            float(right["change_point_probability"]),
-            places=12,
+
+    def test_derived_signal_is_capped_auxiliary(self) -> None:
+        result = forecast_road_pattern("BPBPBBPPBPBBPBPBBPPBPBPBBP")
+        fusion = result["derived_ask_road_fusion"]
+        self.assertLessEqual(fusion["derived_reliability"], 0.18)
+        self.assertLessEqual(fusion["derived_effective_weight"], 0.18)
+        self.assertEqual(result["derived_direction_authority"], "capped_auxiliary_only")
+        self.assertEqual(
+            result["direction_authority"],
+            "road_pattern_v1_plus_human_derived_ask_road",
         )
 
-    def test_formal_components_exist_and_sum_to_bp(self) -> None:
-        result = forecast_road_pattern("BPBPBPBBPPBPBPBBPPBP")
-        self.assertIn(result["direction"], {"B", "P"})
-        self.assertAlmostEqual(
-            result["probabilities"]["B"] + result["probabilities"]["P"],
-            1.0,
-            places=12,
-        )
-        self.assertEqual(
-            set(result["components"]),
+    def test_strong_v1_cannot_be_overpowered_by_opposite_derived_signal(self) -> None:
+        fusion = fuse_v1_with_derived(
+            0.58,
             {
-                "multi_window",
-                "pattern_replay",
-                "ngram",
-                "pattern_survival",
-                "probabilistic_turning",
+                "likelihood": {"B": 0.25, "P": 0.75},
+                "reliability": 0.18,
+                "active_road_count": 3,
             },
         )
-        self.assertEqual(
-            result["fusion_method"],
-            "reliability_weighted_log_odds_dynamic_turning",
-        )
-        self.assertEqual(result["shoe_direction_weight"], 0.0)
-        self.assertEqual(result["lstm_direction_weight"], 0.0)
-        self.assertEqual(result["linucb_direction_weight"], 0.0)
+        self.assertGreater(fusion["final_p_b"], 0.5)
+        self.assertFalse(fusion["direction_override"])
 
-    def test_single_jump_is_detected_as_pattern_not_forced_global_rule(self) -> None:
+    def test_weak_v1_can_be_corrected_by_mature_opposite_derived_signal(self) -> None:
+        fusion = fuse_v1_with_derived(
+            0.505,
+            {
+                "likelihood": {"B": 0.25, "P": 0.75},
+                "reliability": 0.18,
+                "active_road_count": 3,
+            },
+        )
+        self.assertLess(fusion["final_p_b"], 0.5)
+        self.assertTrue(fusion["direction_override"])
+
+    def test_single_jump_v1_pattern_remains_available(self) -> None:
         result = forecast_road_pattern("BPBPBPBP")
         survival = result["components"]["pattern_survival"]
         self.assertEqual(survival["pattern"], "SINGLE_JUMP")
         self.assertEqual(survival["desired_relation"], "SWITCH")
-        self.assertGreater(survival["reliability"], 0.0)
-        self.assertIn("bayesian_run_survival", survival)
 
-    def test_long_run_can_remain_same_side_when_evidence_supports_it(self) -> None:
+    def test_long_run_can_remain_same_side(self) -> None:
         result = forecast_road_pattern("BBBBBBBB")
         self.assertEqual(result["direction"], "B")
         self.assertGreaterEqual(result["probabilities"]["B"], 0.5)
         self.assertNotIn("forced", result["semantics"].lower())
-
-    def test_change_point_probability_rises_on_recent_regime_shift(self) -> None:
-        stable = forecast_road_pattern("BP" * 12)
-        shifted = forecast_road_pattern(("BP" * 9) + "BBBBBB")
-        self.assertGreater(
-            shifted["change_point_probability"],
-            stable["change_point_probability"],
-        )
-        self.assertGreater(
-            shifted["turning_pressure"],
-            stable["turning_pressure"],
-        )
-
-    def test_dynamic_windows_become_more_recent_when_turn_pressure_rises(self) -> None:
-        stable = forecast_road_pattern("BP" * 12)
-        shifted = forecast_road_pattern(("BP" * 9) + "BBBBBB")
-        stable_weights = stable["dynamic_window_weights"]
-        shifted_weights = shifted["dynamic_window_weights"]
-        self.assertGreater(float(shifted_weights["6"]), float(stable_weights["6"]))
-        self.assertGreater(float(shifted_weights["10"]), float(stable_weights["10"]))
-        self.assertLess(float(shifted_weights["24"]), float(stable_weights["24"]))
-
-    def test_turning_layer_is_probability_not_hard_reversal_rule(self) -> None:
-        result = forecast_road_pattern("BBBBBBBB")
-        turning = result["turning_layer"]
-        self.assertGreaterEqual(turning["turn_probability"], 0.0)
-        self.assertLessEqual(turning["turn_probability"], 1.0)
-        self.assertGreaterEqual(turning["continue_probability"], 0.0)
-        self.assertLessEqual(turning["continue_probability"], 1.0)
-        self.assertAlmostEqual(
-            turning["turn_probability"] + turning["continue_probability"],
-            1.0,
-            places=12,
-        )
-        self.assertEqual(result["direction"], "B")
-
-    def test_dynamic_component_weights_sum_to_one(self) -> None:
-        result = forecast_road_pattern(("BP" * 9) + "BBBBBB")
-        self.assertAlmostEqual(
-            sum(float(v) for v in result["dynamic_component_weights"].values()),
-            1.0,
-            places=12,
-        )
-        turning_weight = float(result["dynamic_component_weights"]["probabilistic_turning"])
-        self.assertGreaterEqual(turning_weight, 0.05)
-        self.assertLessEqual(turning_weight, 0.20)
 
 
 class PredictorRoadPrimaryContractTests(unittest.TestCase):
@@ -133,7 +119,7 @@ class PredictorRoadPrimaryContractTests(unittest.TestCase):
         self.assertGreaterEqual(result["bet_percentage"], 5.0)
         self.assertLessEqual(result["bet_percentage"], 30.0)
 
-    def test_predictor_uses_road_pattern_as_only_formal_direction(self) -> None:
+    def test_predictor_uses_v1_plus_derived_road_core(self) -> None:
         result = predict(
             history="BPBPBBPPBPBPBBPPBPBP",
             venue="DG",
@@ -151,8 +137,10 @@ class PredictorRoadPrimaryContractTests(unittest.TestCase):
         self.assertEqual(result["fallback_markov_direction_weight"], 0.0)
         self.assertFalse(result["shoe_context_used_for_formal_direction"])
         self.assertFalse(result["lstm_enabled"])
-        self.assertTrue(result["dynamic_prediction_policy"]["road_primary"])
-        self.assertIn("probabilistic_turning", result["road_pattern_model"]["components"])
+        road_pattern = result["road_pattern_model"]
+        self.assertEqual(road_pattern["v1_model_id"], "ROAD-PATTERN-PRIMARY-V1")
+        self.assertIn("derived_ask_road", road_pattern)
+        self.assertNotIn("probabilistic_turning", road_pattern["components"])
 
     def test_exact_shoe_composition_cannot_change_direction(self) -> None:
         history = "BPBPBBPPBPBPBBPPBPBP"
