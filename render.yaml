@@ -6,9 +6,9 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn runtime_app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # Production deploy stays manual so a partially verified GitHub change cannot
-    # replace a healthy service. Deploy the merged main commit after CI passes.
-    autoDeploy: false
+    # Production follows main automatically. Single-Brain LinUCB V5 is the
+    # active decision core; OCR / screenshot recognition remain unchanged.
+    autoDeploy: true
     disk:
       name: bgs-runtime-data
       mountPath: /var/data
@@ -17,7 +17,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.11
       - key: BGS_BUILD_LABEL
-        value: road-pattern-primary-v1
+        value: linucb-single-brain-v5
       - key: BGS_TARGET_HANDS_MIN
         value: "50"
       - key: BGS_TARGET_HANDS_MAX
