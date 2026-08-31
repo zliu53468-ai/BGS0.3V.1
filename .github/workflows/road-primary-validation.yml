@@ -1,0 +1,55 @@
+name: Road Primary production validation
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install core test dependency
+        run: python -m pip install 'numpy>=1.26,<2.4'
+      - name: Compile prediction core
+        run: >-
+          python -m py_compile
+          road_pattern_core.py
+          dynamic_prediction_policy.py
+          predictor.py
+          road_model.py
+          road_forecaster.py
+          pattern_survival.py
+          shoe_depth_estimator.py
+          money_management.py
+          shoe_composition.py
+      - name: Run Road-Primary regressions
+        run: >-
+          python -m unittest -v
+          test_road_pattern_primary.py
+          test_formal_shoe_decision.py
+          test_shoe_constants.py
+          test_shoe_composition.py
+      - name: Verify no TensorFlow production dependency
+        run: |
+          ! grep -qi 'tensorflow' requirements.txt || (echo 'TensorFlow still present in production requirements' && exit 1)
+          ! grep -q 'LSTM_ROAD_' render.yaml || (echo 'LSTM production env still present' && exit 1)
+      - name: Verify OCR and screenshot sources unchanged from pre-migration commit
+        run: |
+          base=f022116ceee4b0569d5b1859810b6c2f3ca4fa1f
+          changed="$(git diff --name-only $base...HEAD)"
+          echo "$changed"
+          for file in room_ocr.py baccarat_vision.py screen_pipeline.py screenshot_predictor.py road_detector.py; do
+            if echo "$changed" | grep -Fxq "$file"; then
+              echo "Forbidden OCR/screen change: $file"
+              exit 1
+            fi
+          done
+      - name: Check whitespace
+        run: git diff --check f022116ceee4b0569d5b1859810b6c2f3ca4fa1f...HEAD
