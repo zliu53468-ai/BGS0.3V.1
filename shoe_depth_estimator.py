@@ -1,16 +1,28 @@
-"""Shoe depth estimator based on observed B/P/T round count.
+"""Round-count baccarat shoe depth estimator.
 
-This is a maturity / risk-control estimate only. It does not reconstruct the exact
-remaining card composition.
+This module is strictly the *estimated* path used when exact remaining point
+counts or observed card faces are unavailable. It never fabricates
+``remaining_counts`` and never claims exact composition.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
-TOTAL_CARDS = 416.0
-AVERAGE_CARDS_PER_HAND = 4.89
-REFERENCE_HANDS = 70.0
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    BURN_CARDS,
+    REFERENCE_HANDS,
+    SHOE_DECKS,
+    TOTAL_SHOE_CARDS,
+    estimate_cards_used,
+    estimate_remaining_cards,
+    total_cards_for_decks,
+)
+
+# Compatibility aliases. Values are authoritative imports from shoe_constants;
+# there is no independent definition in this module.
+TOTAL_CARDS = TOTAL_SHOE_CARDS
 
 
 def _clean_threeway(values: Iterable[Any]) -> list[str]:
@@ -38,18 +50,29 @@ class ShoeDepthEstimate:
     raw_remaining_cards: float
     remaining_cards: float
     shoe_progress: float
+    shoe_decks: int
+    total_cards: float
+    average_cards_per_hand: float
+    burn_cards: int
+    reference_hands: float
 
-    def as_dict(self) -> dict[str, float | int | str]:
+    def as_dict(self) -> dict[str, float | int | str | bool]:
         return {
             "hand_count": int(self.hand_count),
             "estimated_cards_used": float(self.estimated_cards_used),
             "raw_remaining_cards": float(self.raw_remaining_cards),
             "remaining_cards": float(self.remaining_cards),
+            "remaining_cards_source": "round_count_estimate",
             "shoe_progress": float(self.shoe_progress),
-            "cards_per_hand_assumption": float(AVERAGE_CARDS_PER_HAND),
-            "starting_cards_assumption": float(TOTAL_CARDS),
-            "reference_hands": float(REFERENCE_HANDS),
-            "semantics": "round_count_maturity_estimate_not_exact_card_composition",
+            "average_cards_per_hand": float(self.average_cards_per_hand),
+            "cards_per_hand_assumption": float(self.average_cards_per_hand),
+            "shoe_decks": int(self.shoe_decks),
+            "starting_cards_assumption": float(self.total_cards),
+            "burn_cards": int(self.burn_cards),
+            "reference_hands": float(self.reference_hands),
+            "reference_hands_semantics": "product_maturity_reference_not_cut_card_position",
+            "exact_composition": False,
+            "semantics": "round_count_maturity_depth_estimate_not_exact_card_composition",
         }
 
 
@@ -57,19 +80,40 @@ class ShoeDepthEstimator:
     def __init__(
         self,
         *,
-        total_cards: float = TOTAL_CARDS,
+        total_cards: float | None = None,
         average_cards_per_hand: float = AVERAGE_CARDS_PER_HAND,
         reference_hands: float = REFERENCE_HANDS,
+        burn_cards: int = BURN_CARDS,
+        shoe_decks: int = SHOE_DECKS,
     ) -> None:
-        self.total_cards = max(1.0, float(total_cards))
+        self.shoe_decks = max(1, min(16, int(shoe_decks)))
+        authoritative_total = float(total_cards_for_decks(self.shoe_decks))
+        self.total_cards = (
+            authoritative_total
+            if total_cards is None
+            else max(1.0, float(total_cards))
+        )
         self.average_cards_per_hand = max(0.01, float(average_cards_per_hand))
         self.reference_hands = max(1.0, float(reference_hands))
+        self.burn_cards = max(0, int(burn_cards))
 
     def estimate(self, history: Iterable[Any]) -> ShoeDepthEstimate:
         hand_count = len(_clean_threeway(history))
-        used = hand_count * self.average_cards_per_hand
+        used = estimate_cards_used(
+            hand_count,
+            average_cards_per_hand=self.average_cards_per_hand,
+            burn_cards=self.burn_cards,
+        )
         raw_remaining = self.total_cards - used
-        remaining = max(0.0, raw_remaining)
+        if self.total_cards == float(total_cards_for_decks(self.shoe_decks)):
+            remaining = estimate_remaining_cards(
+                hand_count,
+                decks=self.shoe_decks,
+                average_cards_per_hand=self.average_cards_per_hand,
+                burn_cards=self.burn_cards,
+            )
+        else:
+            remaining = max(0.0, raw_remaining)
         progress = min(1.0, max(0.0, hand_count / self.reference_hands))
         return ShoeDepthEstimate(
             hand_count=hand_count,
@@ -77,13 +121,20 @@ class ShoeDepthEstimator:
             raw_remaining_cards=raw_remaining,
             remaining_cards=remaining,
             shoe_progress=progress,
+            shoe_decks=self.shoe_decks,
+            total_cards=self.total_cards,
+            average_cards_per_hand=self.average_cards_per_hand,
+            burn_cards=self.burn_cards,
+            reference_hands=self.reference_hands,
         )
 
 
 __all__ = [
     "TOTAL_CARDS",
     "AVERAGE_CARDS_PER_HAND",
+    "BURN_CARDS",
     "REFERENCE_HANDS",
+    "SHOE_DECKS",
     "ShoeDepthEstimate",
     "ShoeDepthEstimator",
 ]
