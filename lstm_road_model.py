@@ -1,22 +1,18 @@
-"""Production LSTM + exact-shoe + cut-depth fusion for baccarat B/P.
+"""Production LSTM + fresh exact-shoe + cut-depth fusion for baccarat B/P.
 
-Design goals
-------------
-* 50-70 hand baccarat shoe.
-* Big-Road resolved B/P sequence is learned by a compact LSTM.
-* Exact remaining shoe composition contributes a physical non-replacement B/P
-  logit inside the same final fusion decision.
-* Cut-card depth has no artificial B/P sign.  It changes how much the fusion
-  trusts the sequence branch versus exact composition as the shoe approaches
-  the configured cut point.
-* Ties are skipped for sequence learning.
-* No Markov/LinUCB/HSMM/hazard model is required for formal direction.
-* The model is safe on cold start: zero-initialized neural head, balanced replay,
-  PAD masking, prefix-reset protection, and bounded logits prevent one-sided
-  lock-in from a handful of early results.
+The formal direction is produced by one symmetric LSTM/shoe fusion. Legacy
+road/Markov/LinUCB/HSMM/hazard models do not participate here.
 
-This cannot guarantee profitable baccarat prediction.  The implementation is
-intended to be stable, inspectable, and deployable with short-shoe data.
+Anti-stick rules:
+* no hand-written recent-side/persistence term has formal direction weight;
+* training is B/P-symmetry augmented instead of skipping one-class windows;
+* inference projects the neural output through a B/P-swapped paired pass, which
+  removes learned class bias while retaining sequence-pattern evidence;
+* exact remaining composition loses direction authority immediately when the
+  B/P/T history advances but the supplied composition does not change;
+* cut depth changes the relative LSTM/shoe trust but never invents a B/P sign.
+
+This is a probabilistic model and cannot guarantee profitable baccarat results.
 """
 from __future__ import annotations
 
@@ -39,38 +35,39 @@ from shoe_depth_estimator import (
     build_shoe_depth_features,
 )
 
-MODEL_ID = "LSTM-SHOE-CUT-FUSION-V2"
+MODEL_ID = "LSTM-SHOE-CUT-FUSION-V3-ANTI-STICK"
 PAD_TOKEN = 0
 B_TOKEN = 1
 P_TOKEN = 2
 VOCAB_SIZE = 3
 WINDOW_SIZE = max(18, min(32, int(os.getenv("LSTM_ROAD_WINDOW", "24") or "24")))
-MIN_HISTORY = max(14, min(20, int(os.getenv("LSTM_ROAD_MIN_HISTORY", "16") or "16")))
-MIN_CONTEXT = max(4, min(10, int(os.getenv("LSTM_ROAD_MIN_CONTEXT", "6") or "6")))
-MIN_ONLINE_SAMPLES = max(8, int(os.getenv("LSTM_ROAD_MIN_ONLINE_SAMPLES", "10") or "10"))
+MIN_HISTORY = max(8, min(16, int(os.getenv("LSTM_ROAD_MIN_HISTORY", "10") or "10")))
+MIN_CONTEXT = max(3, min(8, int(os.getenv("LSTM_ROAD_MIN_CONTEXT", "5") or "5")))
+MIN_ONLINE_SAMPLES = max(4, min(16, int(os.getenv("LSTM_ROAD_MIN_ONLINE_SAMPLES", "5") or "5")))
 FULL_MATURITY_ROUNDS = max(
-    MIN_HISTORY + 8,
-    min(50, int(os.getenv("LSTM_ROAD_FULL_MATURITY", "36") or "36")),
+    MIN_HISTORY + 10,
+    min(50, int(os.getenv("LSTM_ROAD_FULL_MATURITY", "32") or "32")),
 )
 REPLAY_WINDOW = max(20, min(56, int(os.getenv("LSTM_ROAD_REPLAY_WINDOW", "36") or "36")))
 ONLINE_LEARNING_RATE = max(
     1e-6,
-    min(2e-3, float(os.getenv("LSTM_ROAD_ONLINE_LR", "0.00015") or "0.00015")),
+    min(1e-3, float(os.getenv("LSTM_ROAD_ONLINE_LR", "0.00010") or "0.00010")),
 )
 L2_REGULARIZATION = max(
     0.0,
-    min(1e-2, float(os.getenv("LSTM_ROAD_L2", "0.0002") or "0.0002")),
+    min(1e-2, float(os.getenv("LSTM_ROAD_L2", "0.00025") or "0.00025")),
+)
+RECENCY_DECAY = max(
+    0.90,
+    min(0.999, float(os.getenv("LSTM_ROAD_RECENCY_DECAY", "0.97") or "0.97")),
 )
 BOOTSTRAP_EPOCHS = max(1, min(3, int(os.getenv("LSTM_ROAD_BOOTSTRAP_EPOCHS", "2") or "2")))
 ONLINE_EPOCHS = 1
 MAX_SCOPE_MODELS = max(4, min(128, int(os.getenv("LSTM_ROAD_MAX_SCOPES", "32") or "32")))
-MAX_NEURAL_LOGIT = 0.70
-MAX_SHOE_DEVIATION_LOGIT = 0.55
-MAX_STRUCTURE_LOGIT = 0.28
-MAX_FINAL_LOGIT = 0.50
+MAX_NEURAL_LOGIT = 0.62
+MAX_SHOE_DEVIATION_LOGIT = 0.48
+MAX_FINAL_LOGIT = 0.45
 
-# Resolve the standard baccarat physical prior over B/P only.  This is tiny and
-# prevents an arbitrary Player tie-break when every other signal is neutral.
 _BASE_B = float(STANDARD_EIGHT_DECK_BASELINE["B"])
 _BASE_P = float(STANDARD_EIGHT_DECK_BASELINE["P"])
 _BASE_RESOLVED_B = _BASE_B / (_BASE_B + _BASE_P)
@@ -102,18 +99,13 @@ def _sigmoid(logit: float) -> float:
     return 1.0 / (1.0 + math.exp(-value))
 
 
-def normalize_bp(history: str | Iterable[Any] | None) -> list[str]:
+def normalize_bpt(history: str | Iterable[Any] | None) -> list[str]:
     if history is None:
         return []
     if isinstance(history, str):
-        compact = (
-            history.replace("|", "")
-            .replace(",", "")
-            .replace(" ", "")
-            .upper()
-        )
+        compact = history.replace("|", "").replace(",", "").replace(" ", "").upper()
         if compact and all(char in {"B", "P", "T"} for char in compact):
-            return [char for char in compact if char in {"B", "P"}][-2000:]
+            return list(compact[-2000:])
         items: Iterable[Any] = [
             part for part in history.replace("|", ",").split(",") if part.strip()
         ]
@@ -131,23 +123,32 @@ def normalize_bp(history: str | Iterable[Any] | None) -> list[str]:
         else:
             raw = item
         value = str(raw or "").upper().strip()
-        if value in {"B", "P"}:
+        if value in {"B", "P", "T"}:
             result.append(value)
     return result[-2000:]
+
+
+def normalize_bp(history: str | Iterable[Any] | None) -> list[str]:
+    return [value for value in normalize_bpt(history) if value in {"B", "P"}]
 
 
 def _token(side: str) -> int:
     return B_TOKEN if str(side).upper() == "B" else P_TOKEN
 
 
-def _encode_window(
-    sequence: Sequence[str],
-    window_size: int = WINDOW_SIZE,
-) -> np.ndarray:
+def _encode_window(sequence: Sequence[str], window_size: int = WINDOW_SIZE) -> np.ndarray:
     width = max(8, int(window_size))
     tokens = [_token(side) for side in sequence[-width:]]
     padded = [PAD_TOKEN] * max(0, width - len(tokens)) + tokens
     return np.asarray(padded[-width:], dtype=np.int32)
+
+
+def _swap_bp_tokens(values: np.ndarray) -> np.ndarray:
+    data = np.asarray(values, dtype=np.int32).copy()
+    swapped = data.copy()
+    swapped[data == B_TOKEN] = P_TOKEN
+    swapped[data == P_TOKEN] = B_TOKEN
+    return swapped
 
 
 def _training_examples(
@@ -173,36 +174,57 @@ def _training_examples(
     return np.stack(xs).astype(np.int32), np.asarray(ys, dtype=np.int32)
 
 
-def _balanced_sample_weights(labels: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    labels = np.asarray(labels, dtype=np.int32)
-    if labels.size == 0:
-        return np.empty((0,), dtype=np.float32), {
-            "b_samples": 0,
-            "p_samples": 0,
-            "balanced": False,
-        }
-    b_count = int(np.sum(labels == 0))
-    p_count = int(np.sum(labels == 1))
-    if b_count <= 0 or p_count <= 0:
-        return np.ones(labels.shape, dtype=np.float32), {
-            "b_samples": b_count,
-            "p_samples": p_count,
-            "balanced": False,
-        }
-    total = float(labels.size)
-    b_weight = _clip(total / (2.0 * b_count), 0.55, 2.20)
-    p_weight = _clip(total / (2.0 * p_count), 0.55, 2.20)
-    weights = np.where(labels == 0, b_weight, p_weight).astype(np.float32)
-    return weights, {
-        "b_samples": b_count,
-        "p_samples": p_count,
-        "b_sample_weight": float(b_weight),
-        "p_sample_weight": float(p_weight),
-        "balanced": True,
-    }
+def _symmetry_augmented_replay(
+    x_real: np.ndarray,
+    y_real: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Mirror every sample so a one-sided opening cannot create class bias."""
+    x = np.asarray(x_real, dtype=np.int32)
+    y = np.asarray(y_real, dtype=np.int32)
+    if y.size == 0:
+        return (
+            x,
+            y,
+            np.empty((0,), dtype=np.float32),
+            {
+                "real_samples": 0,
+                "augmented_samples": 0,
+                "real_b_samples": 0,
+                "real_p_samples": 0,
+                "symmetry_augmented": False,
+            },
+        )
+
+    x_swap = _swap_bp_tokens(x)
+    y_swap = 1 - y
+    ages = np.arange(len(y) - 1, -1, -1, dtype=np.float64)
+    recency = np.power(float(RECENCY_DECAY), ages).astype(np.float32)
+    x_aug = np.concatenate((x, x_swap), axis=0)
+    y_aug = np.concatenate((y, y_swap), axis=0)
+    w_aug = np.concatenate((recency, recency), axis=0)
+    mean = float(np.mean(w_aug)) if w_aug.size else 1.0
+    if mean > 1e-12:
+        w_aug = w_aug / mean
+
+    return (
+        x_aug,
+        y_aug,
+        w_aug.astype(np.float32),
+        {
+            "real_samples": int(len(y)),
+            "augmented_samples": int(len(y_aug)),
+            "real_b_samples": int(np.sum(y == 0)),
+            "real_p_samples": int(np.sum(y == 1)),
+            "augmented_b_samples": int(np.sum(y_aug == 0)),
+            "augmented_p_samples": int(np.sum(y_aug == 1)),
+            "symmetry_augmented": True,
+            "recency_decay": float(RECENCY_DECAY),
+        },
+    )
 
 
 def sequence_features(history: str | Iterable[Any] | None) -> dict[str, float | int | str]:
+    """Diagnostics only; handcrafted road structure has zero formal vote."""
     seq = normalize_bp(history)
     if not seq:
         return {
@@ -213,6 +235,7 @@ def sequence_features(history: str | Iterable[Any] | None) -> dict[str, float | 
             "recent_p_ratio": 0.5,
             "last_side": "",
             "structure_logit": 0.0,
+            "formal_structure_weight": 0.0,
         }
     current = seq[-1]
     run = 1
@@ -224,17 +247,6 @@ def sequence_features(history: str | Iterable[Any] | None) -> dict[str, float | 
     switches = sum(left != right for left, right in zip(recent, recent[1:]))
     switch_rate = switches / max(1, len(recent) - 1)
     b_ratio = sum(side == "B" for side in recent) / max(1, len(recent))
-    side_sign = 1.0 if current == "B" else -1.0
-    imbalance = 2.0 * (b_ratio - 0.5)
-    persistence = side_sign * (1.0 - 2.0 * switch_rate)
-    run_term = side_sign * min(1.0, run / 5.0)
-    structure_logit = max(
-        -MAX_STRUCTURE_LOGIT,
-        min(
-            MAX_STRUCTURE_LOGIT,
-            0.16 * imbalance + 0.08 * persistence + 0.05 * run_term,
-        ),
-    )
     return {
         "rounds": len(seq),
         "current_run_length": int(run),
@@ -242,7 +254,8 @@ def sequence_features(history: str | Iterable[Any] | None) -> dict[str, float | 
         "recent_b_ratio": float(b_ratio),
         "recent_p_ratio": float(1.0 - b_ratio),
         "last_side": current,
-        "structure_logit": float(structure_logit),
+        "structure_logit": 0.0,
+        "formal_structure_weight": 0.0,
     }
 
 
@@ -271,7 +284,7 @@ def tensorflow_status() -> dict[str, Any]:
 
 
 def _shoe_fusion_state(
-    history: Sequence[str],
+    depth_history: Sequence[str],
     shoe_context: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     context = dict(shoe_context or {})
@@ -296,12 +309,14 @@ def _shoe_fusion_state(
         if supplied_remaining is not None and supplied_remaining >= 0.0:
             remaining = supplied_remaining
             reliability = _clip(context.get("remaining_cards_reliability", 0.70))
-            depth_source = str(context.get("remaining_cards_source") or "supplied_remaining_cards")
+            depth_source = str(
+                context.get("remaining_cards_source") or "supplied_remaining_cards"
+            )
         else:
             estimate = ShoeDepthEstimator(
                 shoe_decks=decks,
                 cut_card_remaining_cards=cut_override,
-            ).estimate(history).as_dict()
+            ).estimate(depth_history).as_dict()
             remaining = float(estimate["remaining_cards"])
             reliability = _clip(estimate.get("remaining_cards_reliability", 0.60))
             depth_source = "round_count_estimate"
@@ -311,7 +326,7 @@ def _shoe_fusion_state(
         shoe_decks=decks,
         reliability=reliability,
         source=depth_source,
-        hand_count=len(history),
+        hand_count=len(depth_history),
         cut_card_remaining_cards=cut_override,
     )
 
@@ -319,6 +334,12 @@ def _shoe_fusion_state(
     shoe_probability_b = None
     shoe_probability_p = None
     shoe_direction = None
+    exact_counts = list(exact.get("remaining_counts") or []) if exact_available else []
+    exact_signature = (
+        sha256(",".join(str(int(value)) for value in exact_counts).encode("utf-8")).hexdigest()[:20]
+        if len(exact_counts) == 10
+        else ""
+    )
     if exact_available:
         probabilities = dict(exact.get("probabilities") or {})
         p_b = max(1e-9, float(probabilities.get("B", 0.0) or 0.0))
@@ -337,7 +358,13 @@ def _shoe_fusion_state(
 
     return {
         "exact_composition_available": exact_available,
+        "exact_composition_fresh": exact_available,
+        "exact_composition_direction_authority": exact_available,
         "exact_composition_source": str(exact.get("source") or "none"),
+        "exact_composition_signature": exact_signature,
+        "stale_exact_composition": False,
+        "stale_exact_reason": "",
+        "shoe_decks": int(decks),
         "remaining_cards": float(remaining),
         "remaining_ratio": float(depth["remaining_ratio"]),
         "penetration": float(depth["penetration"]),
@@ -354,13 +381,14 @@ def _shoe_fusion_state(
         "shoe_resolved_probability_p": shoe_probability_p,
         "shoe_direction": shoe_direction,
         "shoe_logit_deviation": float(shoe_logit),
+        "raw_shoe_logit_deviation": float(shoe_logit),
         "shoe_analysis": exact,
         "depth_feature_source": depth_source,
     }
 
 
 class LSTMRoadModel:
-    """Per-shoe compact LSTM with deterministic physical late fusion."""
+    """Per-shoe compact LSTM with fresh exact-shoe late fusion."""
 
     def __init__(
         self,
@@ -372,7 +400,7 @@ class LSTMRoadModel:
     ) -> None:
         self.scope_key = str(scope_key or "GLOBAL")
         self.window_size = max(18, min(32, int(window_size)))
-        self.min_history = max(14, min(20, int(min_history)))
+        self.min_history = max(8, min(16, int(min_history)))
         self.weight_path = str(
             weight_path or os.getenv("LSTM_ROAD_MODEL_PATH", "") or ""
         ).strip()
@@ -387,12 +415,11 @@ class LSTMRoadModel:
         self._reset_count = 0
         self._last_reset_reason = "initial"
         self._training_balance: dict[str, Any] = {}
+        self._exact_signature = ""
+        self._exact_signature_round_count = -1
 
     def _seed(self) -> int:
-        return int(
-            sha256(self.scope_key.encode("utf-8")).hexdigest()[:8],
-            16,
-        ) & 0x7FFFFFFF
+        return int(sha256(self.scope_key.encode("utf-8")).hexdigest()[:8], 16) & 0x7FFFFFFF
 
     def _build_model(self):
         tf = _tensorflow()
@@ -400,13 +427,7 @@ class LSTMRoadModel:
             return None
         seed = self._seed()
         keras = tf.keras
-        inputs = keras.Input(
-            shape=(self.window_size,),
-            dtype="int32",
-            name="bp_window",
-        )
-        # PAD=0 is masked, so early 16-24 hand windows do not teach the model
-        # that padding is a real baccarat state.
+        inputs = keras.Input(shape=(self.window_size,), dtype="int32", name="bp_window")
         x = keras.layers.Embedding(
             input_dim=VOCAB_SIZE,
             output_dim=6,
@@ -416,7 +437,7 @@ class LSTMRoadModel:
         )(inputs)
         x = keras.layers.LSTM(
             20,
-            dropout=0.12,
+            dropout=0.10,
             recurrent_dropout=0.0,
             kernel_initializer=keras.initializers.GlorotUniform(seed=seed + 1),
             recurrent_initializer=keras.initializers.Orthogonal(seed=seed + 2),
@@ -430,8 +451,6 @@ class LSTMRoadModel:
             kernel_initializer=keras.initializers.GlorotUniform(seed=seed + 3),
             name="road_dense",
         )(x)
-        # Zero head is intentional: an untrained new shoe starts at 50/50
-        # instead of inheriting a random B/P bias from initialization.
         outputs = keras.layers.Dense(
             2,
             activation="softmax",
@@ -439,7 +458,7 @@ class LSTMRoadModel:
             bias_initializer="zeros",
             name="bp_softmax",
         )(x)
-        model = keras.Model(inputs=inputs, outputs=outputs, name="bgs_lstm_shoe_cut")
+        model = keras.Model(inputs=inputs, outputs=outputs, name="bgs_lstm_shoe_cut_anti_stick")
         model.compile(
             optimizer=keras.optimizers.Adam(
                 learning_rate=ONLINE_LEARNING_RATE,
@@ -475,6 +494,8 @@ class LSTMRoadModel:
         self._online_updates = 0
         self._last_sequence = []
         self._training_balance = {}
+        self._exact_signature = ""
+        self._exact_signature_round_count = -1
         self._reset_count += 1
         self._last_reset_reason = str(reason)
 
@@ -482,52 +503,103 @@ class LSTMRoadModel:
         current = list(sequence)
         previous = list(self._last_sequence)
         if previous:
-            same_prefix = (
-                len(current) >= len(previous)
-                and current[: len(previous)] == previous
-            )
+            same_prefix = len(current) >= len(previous) and current[: len(previous)] == previous
             same_exact = current == previous
             if not same_exact and not same_prefix:
                 self._reset_for_history("history_prefix_changed_or_new_shoe")
         self._last_sequence = current
 
+    def _validate_exact_freshness(
+        self,
+        shoe: Mapping[str, Any],
+        *,
+        depth_history: Sequence[str],
+    ) -> dict[str, Any]:
+        state = dict(shoe)
+        if not bool(state.get("exact_composition_available")):
+            state["exact_composition_fresh"] = False
+            state["exact_composition_direction_authority"] = False
+            return state
+
+        signature = str(state.get("exact_composition_signature") or "")
+        round_count = len(depth_history)
+        if not signature:
+            fresh = False
+            stale_reason = "exact_counts_signature_missing"
+        elif not self._exact_signature or signature != self._exact_signature:
+            self._exact_signature = signature
+            self._exact_signature_round_count = round_count
+            fresh = True
+            stale_reason = ""
+        elif round_count <= self._exact_signature_round_count:
+            fresh = True
+            stale_reason = ""
+        else:
+            fresh = False
+            stale_reason = "unchanged_exact_counts_after_history_advanced"
+
+        state["exact_composition_fresh"] = bool(fresh)
+        state["exact_composition_direction_authority"] = bool(fresh)
+        state["stale_exact_composition"] = not bool(fresh)
+        state["stale_exact_reason"] = stale_reason
+        if fresh:
+            return state
+
+        state["shoe_logit_deviation"] = 0.0
+        decks = int(state.get("shoe_decks", SHOE_DECKS) or SHOE_DECKS)
+        estimate = ShoeDepthEstimator(
+            shoe_decks=decks,
+            cut_card_remaining_cards=state.get("cut_card_remaining_cards"),
+        ).estimate(depth_history).as_dict()
+        state.update(
+            {
+                "remaining_cards": float(estimate["remaining_cards"]),
+                "remaining_ratio": float(estimate["remaining_ratio"]),
+                "penetration": float(estimate["penetration"]),
+                "shoe_stage": str(estimate["shoe_stage"]),
+                "remaining_cards_reliability": float(
+                    estimate.get("remaining_cards_reliability", 0.60)
+                ),
+                "cut_card_remaining_cards": float(estimate["cut_card_remaining_cards"]),
+                "cut_progress": float(estimate["cut_progress"]),
+                "cut_proximity": float(estimate["cut_progress"]),
+                "cards_until_cut": float(estimate["cards_until_cut"]),
+                "estimated_hands_until_cut": float(estimate["estimated_hands_until_cut"]),
+                "depth_feature_source": "round_count_estimate_after_stale_exact",
+            }
+        )
+        return state
+
     def _fit_replay(self, sequence: Sequence[str], *, epochs: int) -> bool:
         model = self._ensure_model()
         if model is None:
             return False
-        x_train, y_train = _training_examples(
+        x_real, y_real = _training_examples(
             sequence,
             window_size=self.window_size,
             min_context=MIN_CONTEXT,
             replay_window=REPLAY_WINDOW,
         )
-        if len(y_train) < MIN_ONLINE_SAMPLES:
+        if len(y_real) < MIN_ONLINE_SAMPLES:
             self._training_balance = {
-                "sample_count": int(len(y_train)),
-                "balanced": False,
+                "real_samples": int(len(y_real)),
+                "augmented_samples": 0,
+                "symmetry_augmented": False,
                 "reason": "insufficient_samples",
             }
             return False
-        sample_weights, balance = _balanced_sample_weights(y_train)
-        self._training_balance = {
-            **balance,
-            "sample_count": int(len(y_train)),
-        }
-        # Do not fit a one-class replay window.  This is the key anti-lock rule:
-        # a short Player-heavy opening cannot train the whole network into P.
-        if not bool(balance.get("balanced")):
-            self._training_balance["reason"] = "single_class_replay_skipped"
-            return False
+        x_train, y_train, sample_weights, balance = _symmetry_augmented_replay(x_real, y_real)
+        self._training_balance = {**balance, "reason": "symmetry_augmented_replay"}
         model.fit(
             x_train,
             y_train,
             sample_weight=sample_weights,
             epochs=max(1, int(epochs)),
-            batch_size=min(8, len(y_train)),
+            batch_size=min(16, len(y_train)),
             shuffle=False,
             verbose=0,
         )
-        self._online_updates += int(len(y_train))
+        self._online_updates += int(len(y_real))
         self._trained_rounds = len(sequence)
         return True
 
@@ -552,11 +624,7 @@ class LSTMRoadModel:
         if n >= self.min_history and not self._bootstrap_done:
             trained = self._fit_replay(sequence, epochs=BOOTSTRAP_EPOCHS)
             self._bootstrap_done = bool(trained or self._pretrained_loaded)
-        elif (
-            allow_online_update
-            and self._bootstrap_done
-            and n > self._trained_rounds
-        ):
+        elif allow_online_update and self._bootstrap_done and n > self._trained_rounds:
             self._fit_replay(sequence, epochs=ONLINE_EPOCHS)
 
         if not self._bootstrap_done:
@@ -567,24 +635,26 @@ class LSTMRoadModel:
                 "logit": 0.0,
                 "maturity": 0.0,
                 "reason": (
-                    "cold_start_balanced_replay_not_ready"
+                    "cold_start_symmetry_replay_not_ready"
                     if n < self.min_history
-                    else "balanced_replay_not_ready"
+                    else "symmetry_replay_not_ready"
                 ),
             }
 
-        raw = model(
-            _encode_window(sequence, self.window_size)[None, :],
-            training=False,
-        ).numpy()[0]
-        p_b = _clip(raw[0], 1e-6, 1.0 - 1e-6)
-        p_p = _clip(raw[1], 1e-6, 1.0 - 1e-6)
-        total = p_b + p_p
-        p_b, p_p = p_b / total, p_p / total
+        encoded = _encode_window(sequence, self.window_size)
+        raw = model(encoded[None, :], training=False).numpy()[0]
+        swapped = model(_swap_bp_tokens(encoded)[None, :], training=False).numpy()[0]
+        raw_b = _clip(raw[0], 1e-6, 1.0 - 1e-6)
+        swapped_b = _clip(swapped[0], 1e-6, 1.0 - 1e-6)
+        raw_logit = _safe_logit(raw_b)
+        swapped_logit = _safe_logit(swapped_b)
+        symmetric_logit_raw = 0.5 * (raw_logit - swapped_logit)
         neural_logit = max(
             -MAX_NEURAL_LOGIT,
-            min(MAX_NEURAL_LOGIT, _safe_logit(p_b)),
+            min(MAX_NEURAL_LOGIT, symmetric_logit_raw),
         )
+        p_b = _sigmoid(neural_logit)
+        p_p = 1.0 - p_b
         maturity = _clip(
             (n - self.min_history + 1)
             / max(1.0, float(FULL_MATURITY_ROUNDS - self.min_history + 1))
@@ -595,9 +665,14 @@ class LSTMRoadModel:
             "available": True,
             "probability_b": float(p_b),
             "probability_p": float(p_p),
+            "raw_probability_b": float(raw_b),
+            "swapped_probability_b": float(swapped_b),
+            "raw_logit": float(raw_logit),
+            "swapped_logit": float(swapped_logit),
+            "symmetry_projected_logit": float(neural_logit),
             "logit": float(neural_logit),
             "maturity": float(maturity),
-            "reason": "balanced_online_lstm_available",
+            "reason": "symmetry_augmented_online_lstm_available",
         }
 
     def predict(
@@ -607,41 +682,40 @@ class LSTMRoadModel:
         shoe_context: Mapping[str, Any] | None = None,
         allow_online_update: bool = True,
     ) -> dict[str, Any]:
-        sequence = normalize_bp(history)
+        depth_history = normalize_bpt(history)
+        sequence = [value for value in depth_history if value in {"B", "P"}]
         features = sequence_features(sequence)
-        shoe = _shoe_fusion_state(sequence, shoe_context)
+        shoe_raw = _shoe_fusion_state(depth_history, shoe_context)
 
         with self._lock:
             self._ensure_history_alignment(sequence)
-            neural = self._neural_state(
-                sequence,
-                allow_online_update=allow_online_update,
-            )
+            shoe = self._validate_exact_freshness(shoe_raw, depth_history=depth_history)
+            neural = self._neural_state(sequence, allow_online_update=allow_online_update)
 
         maturity = float(neural.get("maturity", 0.0) or 0.0)
         cut = _clip(shoe.get("cut_progress", 0.0))
-        exact_available = bool(shoe.get("exact_composition_available"))
+        exact_fresh = bool(shoe.get("exact_composition_direction_authority"))
         neural_logit = float(neural.get("logit", 0.0) or 0.0)
-        shoe_logit = float(shoe.get("shoe_logit_deviation", 0.0) or 0.0)
-        structure_logit = float(features.get("structure_logit", 0.0) or 0.0)
-
-        # As the configured cut point approaches, sequence pattern weight tapers
-        # while exact composition receives a modestly larger role.  Cut depth
-        # itself never has a positive/negative B/P sign.
-        lstm_weight = maturity * (0.95 - 0.25 * cut)
-        shoe_weight = (
-            (0.50 + 0.25 * cut)
-            * float(shoe.get("remaining_cards_reliability", 0.0) or 0.0)
-            if exact_available
+        shoe_logit = (
+            float(shoe.get("shoe_logit_deviation", 0.0) or 0.0)
+            if exact_fresh
             else 0.0
         )
-        structure_weight = 0.08 + 0.52 * (1.0 - maturity)
+
+        lstm_weight = maturity * (0.90 - 0.15 * cut)
+        shoe_weight = (
+            (0.30 + 0.20 * cut)
+            * float(shoe.get("remaining_cards_reliability", 0.0) or 0.0)
+            if exact_fresh
+            else 0.0
+        )
+        structure_weight = 0.0
+        structure_logit = 0.0
 
         fused_logit_unclipped = (
             BASE_RESOLVED_LOGIT
             + lstm_weight * neural_logit
             + shoe_weight * shoe_logit
-            + structure_weight * structure_logit
         )
         fused_logit = max(
             -MAX_FINAL_LOGIT,
@@ -663,6 +737,7 @@ class LSTMRoadModel:
             "min_history": self.min_history,
             "full_maturity_rounds": int(FULL_MATURITY_ROUNDS),
             "sequence_length": len(sequence),
+            "raw_round_count": len(depth_history),
             "pretrained_loaded": bool(self._pretrained_loaded),
             "online_updates": int(self._online_updates),
             "trained_rounds": int(self._trained_rounds),
@@ -678,21 +753,27 @@ class LSTMRoadModel:
                 "structure_logit": float(structure_logit),
                 "lstm_weight": float(lstm_weight),
                 "shoe_weight": float(shoe_weight),
-                "structure_weight": float(structure_weight),
+                "structure_weight": 0.0,
                 "cut_progress": float(cut),
+                "exact_composition_fresh": bool(exact_fresh),
+                "stale_exact_composition": bool(
+                    shoe.get("stale_exact_composition", False)
+                ),
                 "fused_logit_unclipped": float(fused_logit_unclipped),
                 "fused_logit": float(fused_logit),
                 "direction": direction,
-                "direction_authority": "single_lstm_shoe_cut_fusion",
+                "direction_authority": (
+                    "single_symmetric_lstm_plus_fresh_shoe_cut_fusion"
+                ),
             },
             "training_balance": dict(self._training_balance),
             "reset_count": int(self._reset_count),
             "last_reset_reason": self._last_reset_reason,
             "tensorflow": tensorflow_status(),
             "reason": (
-                "lstm_plus_exact_shoe_plus_cut_fusion"
+                "symmetric_lstm_plus_fresh_exact_shoe_cut_fusion"
                 if bool(neural.get("available"))
-                else "cold_start_shoe_cut_structural_fusion_until_lstm_matures"
+                else "cold_start_fresh_shoe_plus_physical_prior_until_lstm_ready"
             ),
             "formal_direction_source": "lstm_road_model",
             "fallback_required": False,
@@ -702,8 +783,8 @@ class LSTMRoadModel:
             },
             "default_cut_card_remaining_cards": int(DEFAULT_CUT_CARD_REMAINING),
             "semantics": (
-                "single_BP_decision_from_balanced_masked_LSTM_plus_exact_nonreplacement_"
-                "shoe_logit_with_50_70_hand_cut_depth_weighting"
+                "single_BP_decision_from_BP_symmetric_masked_LSTM_plus_fresh_exact_"
+                "nonreplacement_shoe_logit_with_50_70_cut_weighting"
             ),
         }
 
@@ -753,7 +834,9 @@ __all__ = [
     "REPLAY_WINDOW",
     "ONLINE_LEARNING_RATE",
     "L2_REGULARIZATION",
+    "RECENCY_DECAY",
     "BASE_RESOLVED_LOGIT",
+    "normalize_bpt",
     "normalize_bp",
     "sequence_features",
     "tensorflow_status",
