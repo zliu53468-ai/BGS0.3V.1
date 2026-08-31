@@ -1,11 +1,12 @@
-"""BGS prediction compatibility layer for the production LSTM-shoe-cut core.
+"""Compatibility policy layer for the Road-Primary production core.
 
-Formal direction has exactly one owner: ``lstm_road_model.predict_lstm_road``.
-That model fuses Big-Road LSTM sequence evidence, exact remaining shoe
-composition (when available), and 50-70 hand cut-card depth weighting.
+Formal B/P direction has one owner: ``road_pattern_core.forecast_road_pattern``.
+The road core combines multi-window behaviour, orientation-invariant pattern
+replay, relation n-grams and pattern survival. Shoe/cut information is not used
+to choose B/P here.
 
-Legacy Markov / LinUCB / road forecaster helpers remain import-compatible and
-are diagnostic only.  They cannot override the formal B/P direction.
+Legacy LinUCB, time-decay Markov and the old LSTM policy name remain available
+for API/import compatibility, but their formal direction weight is zero.
 """
 from __future__ import annotations
 
@@ -24,18 +25,18 @@ from contextual_bandit import (
     predict_bandit,
     update_bandit,
 )
-from lstm_road_model import (
-    MODEL_ID as LSTM_MODEL_ID,
-    MIN_HISTORY as LSTM_MIN_HISTORY,
-    WINDOW_SIZE as LSTM_WINDOW_SIZE,
-    predict_lstm_road,
-)
 from performance_tracker import get_resolved_records
 from road_forecaster import VERSION as FORECASTER_VERSION
+from road_pattern_core import (
+    MODEL_ID as ROAD_PATTERN_MODEL_ID,
+    VERSION as ROAD_PATTERN_VERSION,
+    forecast_road_pattern,
+    normalize_bp,
+)
 
-POLICY_VERSION = f"LSTM-SHOE-CUT-PRODUCTION-V2|{FORECASTER_VERSION}"
+POLICY_VERSION = f"ROAD-PRIMARY-PATTERN-V1|{ROAD_PATTERN_VERSION}|{FORECASTER_VERSION}"
 OUTCOMES = ("B", "P")
-WINDOW_SIZE = LSTM_WINDOW_SIZE
+WINDOW_SIZE = 24
 MARKOV_MAX_ORDER = 1
 MARKOV_DECAY = 0.93
 MIN_DIRECTION_CONFIDENCE = 0.48
@@ -65,43 +66,10 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def normalize_big_road(history: str | Iterable[Any] | None) -> list[str]:
-    if history is None:
-        return []
-    if isinstance(history, str):
-        compact = (
-            history.replace("|", "")
-            .replace(",", "")
-            .replace(" ", "")
-            .upper()
-        )
-        if compact and all(char in {"B", "P", "T"} for char in compact):
-            return [char for char in compact if char in OUTCOMES][-2000:]
-        raw_items: Iterable[Any] = [
-            part for part in history.replace("|", ",").split(",") if part.strip()
-        ]
-    else:
-        raw_items = history
-    cleaned: list[str] = []
-    for item in raw_items:
-        if isinstance(item, Mapping):
-            raw = (
-                item.get("outcome")
-                or item.get("actual")
-                or item.get("actual_outcome")
-                or item.get("virtual_outcome")
-            )
-        else:
-            raw = item
-        value = str(raw or "").upper().strip()
-        if value in OUTCOMES:
-            cleaned.append(value)
-    return cleaned[-2000:]
+    return normalize_bp(history)
 
 
-def _least_squares_line(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> tuple[float, float, float]:
+def _least_squares_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
     n = int(x.size)
     if n < 2 or y.size != x.size:
         base = float(y[-1]) if y.size else 0.0
@@ -121,9 +89,7 @@ def _least_squares_line(
     return slope, intercept, _clip(r2)
 
 
-def regression_analysis_model(
-    history: str | Iterable[Any] | None,
-) -> dict[str, Any]:
+def regression_analysis_model(history: str | Iterable[Any] | None) -> dict[str, Any]:
     """Legacy cumulative-slope diagnostic; never owns formal direction."""
     sequence = normalize_big_road(history)
     n = len(sequence)
@@ -140,18 +106,12 @@ def regression_analysis_model(
             "regression_p_p": 0.5,
             "diagnostic_only": True,
         }
-    encoded = np.asarray(
-        [1.0 if side == "B" else -1.0 for side in sequence],
-        dtype=np.float64,
-    )
+    encoded = np.asarray([1.0 if side == "B" else -1.0 for side in sequence], dtype=np.float64)
     cumulative = np.cumsum(encoded)
     x = np.arange(1, n + 1, dtype=np.float64)
     global_slope, global_intercept, global_r2 = _least_squares_line(x, cumulative)
     local_window = min(REGRESSION_LOCAL_WINDOW, n)
-    local_slope, local_intercept, local_r2 = _least_squares_line(
-        x[-local_window:],
-        cumulative[-local_window:],
-    )
+    local_slope, local_intercept, local_r2 = _least_squares_line(x[-local_window:], cumulative[-local_window:])
     diagnostic_slope = 0.15 * global_slope + 0.15 * local_slope
     p_b = _clip(0.5 + 0.5 * math.tanh(diagnostic_slope), 0.01, 0.99)
     return {
@@ -176,7 +136,7 @@ def time_decay_markov_fallback(
     *,
     decay: float = MARKOV_DECAY,
 ) -> dict[str, Any]:
-    """Legacy diagnostic only.  It is no longer a formal fallback."""
+    """Compatibility Markov diagnostic. It has zero formal direction weight."""
     sequence = normalize_big_road(history)
     decay = _clip(decay, 0.50, 0.999)
     context = sequence[-1] if sequence else None
@@ -190,11 +150,6 @@ def time_decay_markov_fallback(
             global_counts[right] += weight
             if context is not None and left == context:
                 context_counts[right] += weight
-    if sequence:
-        newest_index = len(sequence) - 1
-        for index, side in enumerate(sequence):
-            age = newest_index - index
-            global_counts[side] += 0.20 * (decay ** age)
     context_support = sum(context_counts.values())
     global_support = sum(global_counts.values())
     alpha = 1.25
@@ -203,27 +158,16 @@ def time_decay_markov_fallback(
         for side in OUTCOMES
     }
     global_p = {
-        side: (
-            (global_counts[side] + alpha) / (global_support + 2.0 * alpha)
-            if global_support > 0.0
-            else 0.5
-        )
+        side: ((global_counts[side] + alpha) / (global_support + 2.0 * alpha) if global_support > 0 else 0.5)
         for side in OUTCOMES
     }
-    specificity = (
-        context_support / (context_support + 3.0)
-        if context_support > 0.0
-        else 0.0
-    )
+    specificity = context_support / (context_support + 3.0) if context_support > 0 else 0.0
     p_b = specificity * context_p["B"] + (1.0 - specificity) * global_p["B"]
     p_p = specificity * context_p["P"] + (1.0 - specificity) * global_p["P"]
     total = p_b + p_p
-    if total <= 1e-12:
-        p_b = p_p = 0.5
-    else:
-        p_b, p_p = p_b / total, p_p / total
+    p_b, p_p = (0.5, 0.5) if total <= 1e-12 else (p_b / total, p_p / total)
     direction = "B" if p_b >= p_p else "P"
-    confidence = p_b if direction == "B" else p_p
+    confidence = max(p_b, p_p)
     return {
         "available": True,
         "model_id": "TIME-DECAY-MARKOV-ORDER1-DIAGNOSTIC",
@@ -238,14 +182,12 @@ def time_decay_markov_fallback(
         "global_counts": global_counts,
         "context_support": float(context_support),
         "global_support": float(global_support),
-        "context_specificity": float(specificity),
         "decay": float(decay),
         "selected_order": 1 if context is not None else 0,
         "history_rounds": len(sequence),
-        "fallback_only": False,
         "diagnostic_only": True,
         "formal_direction_weight": 0.0,
-        "semantics": "legacy_time_decay_markov_diagnostic_only",
+        "semantics": "legacy_markov_diagnostic_only_road_pattern_core_is_formal",
     }
 
 
@@ -258,13 +200,8 @@ def linucb_policy(
     room: str = "",
     shoe_id: str = "",
 ) -> dict[str, Any]:
-    """Legacy contextual road stack retained for diagnostics and feedback only."""
-    scope_key = make_scope_key(
-        user_id=user_id,
-        venue=venue,
-        room=room,
-        shoe_id=shoe_id,
-    )
+    """Legacy contextual stack retained for diagnostics/settlement only."""
+    scope_key = make_scope_key(user_id=user_id, venue=venue, room=room, shoe_id=shoe_id)
     result = predict_bandit(
         history=history,
         shoe_context=dict(shoe_context or {}),
@@ -277,27 +214,12 @@ def linucb_policy(
             "action_text": "莊" if result["direction"] == "B" else "閒",
             "latent_direction": str(result["direction"]),
             "confidence_prob": float(result["selected_win_probability"]),
-            "margin": abs(
-                float(result["probabilities"]["B"])
-                - float(result["probabilities"]["P"])
-            ),
+            "margin": abs(float(result["probabilities"]["B"]) - float(result["probabilities"]["P"])),
             "regression_analysis": regression,
-            "penalty_observe": {
-                "active": False,
-                "force_observe": False,
-                "observe_remaining": 0,
-                "semantics": "two_arm_only_no_third_arm",
-            },
+            "penalty_observe": {"active": False, "force_observe": False, "observe_remaining": 0},
             "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]),
             "state_key": "LINUCB_DIAGNOSTIC",
-            "transition_counts": {},
-            "effective_support": float(result["road_forecaster"]["effective_support"]),
-            "decay": 0.0,
-            "selected_order": 0,
-            "max_order": 0,
-            "order_diagnostics": [],
-            "global_probabilities": {"B": 0.5, "P": 0.5},
-            "policy_source": "road_forecaster_diagnostic",
+            "policy_source": "linucb_diagnostic",
             "diagnostic_only": True,
             "formal_direction_weight": 0.0,
         }
@@ -305,7 +227,7 @@ def linucb_policy(
     return result
 
 
-def lstm_primary_policy(
+def road_only_policy(
     history: str | Iterable[Any] | None,
     *,
     shoe_context: Mapping[str, Any] | None = None,
@@ -313,15 +235,9 @@ def lstm_primary_policy(
     venue: str = "",
     room: str = "",
     shoe_id: str = "",
-    allow_online_update: bool = True,
 ) -> dict[str, Any]:
-    """Sole formal policy: LSTM + exact shoe + cut-card fusion."""
-    scope_key = make_scope_key(
-        user_id=user_id,
-        venue=venue,
-        room=room,
-        shoe_id=shoe_id,
-    )
+    """Formal policy: road sequence only. Shoe data is ignored for B/P."""
+    scope_key = make_scope_key(user_id=user_id, venue=venue, room=room, shoe_id=shoe_id)
     diagnostic = linucb_policy(
         history,
         shoe_context=shoe_context,
@@ -330,27 +246,17 @@ def lstm_primary_policy(
         room=room,
         shoe_id=shoe_id,
     )
-    legacy_markov = time_decay_markov_fallback(history)
-    lstm = predict_lstm_road(
-        history,
-        scope_key=scope_key,
-        shoe_context=dict(shoe_context or {}),
-        allow_online_update=allow_online_update,
-    )
-
-    raw_probabilities = dict(lstm.get("probabilities") or {})
-    p_b = _clip(raw_probabilities.get("B", 0.5))
-    p_p = _clip(raw_probabilities.get("P", 0.5))
+    markov = time_decay_markov_fallback(history)
+    road_pattern = forecast_road_pattern(history)
+    probabilities = dict(road_pattern.get("probabilities") or {"B": 0.5, "P": 0.5, "T": 0.0})
+    p_b = _clip(probabilities.get("B", 0.5))
+    p_p = _clip(probabilities.get("P", 0.5))
     total = p_b + p_p
-    if total <= 1e-12:
-        p_b = p_p = 0.5
-    else:
-        p_b, p_p = p_b / total, p_p / total
-    direction = str(lstm.get("direction") or "").upper().strip()
+    p_b, p_p = (0.5, 0.5) if total <= 1e-12 else (p_b / total, p_p / total)
+    direction = str(road_pattern.get("direction") or "B").upper().strip()
     if direction not in OUTCOMES:
         direction = "B" if p_b >= p_p else "P"
     confidence = p_b if direction == "B" else p_p
-    formal_source = "lstm_road_model"
 
     result = dict(diagnostic)
     result.update(
@@ -366,56 +272,77 @@ def lstm_primary_policy(
             "confidence_prob": float(confidence),
             "margin": abs(float(p_b) - float(p_p)),
             "scope_key": scope_key,
-            "formal_direction_source": formal_source,
-            "policy_source": formal_source,
-            "lstm_primary": True,
-            "lstm_shoe_cut_fusion": True,
-            "lstm_model_id": LSTM_MODEL_ID,
-            "lstm_min_history": int(LSTM_MIN_HISTORY),
-            "lstm": dict(lstm),
-            # Retained because predictor/API historically exposes this block.
-            # It has no formal direction weight in V2.
-            "fallback_markov": dict(legacy_markov),
+            "formal_direction_source": "road_pattern_core",
+            "policy_source": "road_pattern_core",
+            "road_primary": True,
+            "road_pattern_model_id": ROAD_PATTERN_MODEL_ID,
+            "road_pattern": dict(road_pattern),
+            "fallback_markov": dict(markov),
             "fallback_active": False,
             "fallback_reason": "",
             "road_forecaster_diagnostic": {
                 "direction": str(diagnostic.get("direction") or ""),
                 "probabilities": dict(diagnostic.get("probabilities") or {}),
-                "selected_win_probability": float(
-                    diagnostic.get("selected_win_probability", 0.5) or 0.5
-                ),
+                "selected_win_probability": float(diagnostic.get("selected_win_probability", 0.5) or 0.5),
             },
-            "selection_reason": "single_lstm_shoe_cut_fusion",
-            "state_key": "LSTM_SHOE_CUT_FUSION",
+            "selection_reason": "road_multiwindow_pattern_replay_ngram_survival",
+            "state_key": "ROAD_PATTERN_PRIMARY",
             "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]),
             "diagnostic_only": False,
             "formal_direction_weight": 1.0,
+            "lstm_primary": False,
+            "lstm_shoe_cut_fusion": False,
+            "lstm": {
+                "available": False,
+                "diagnostic_only": True,
+                "formal_direction_weight": 0.0,
+                "reason": "disabled_formal_core_is_road_pattern",
+            },
+            "shoe_direction_weight": 0.0,
+            "card_composition_direction_weight": 0.0,
+            "lstm_direction_weight": 0.0,
+            "linucb_direction_weight": 0.0,
         }
     )
     return result
 
 
-class ShortShoePredictor:
-    """Legacy class name mapped to the formal LSTM-shoe-cut policy."""
+def lstm_primary_policy(
+    history: str | Iterable[Any] | None,
+    *,
+    shoe_context: Mapping[str, Any] | None = None,
+    user_id: str = "",
+    venue: str = "",
+    room: str = "",
+    shoe_id: str = "",
+    allow_online_update: bool = True,
+) -> dict[str, Any]:
+    """Compatibility alias. Formal behaviour is Road-Primary, not LSTM."""
+    del allow_online_update
+    return road_only_policy(
+        history,
+        shoe_context=shoe_context,
+        user_id=user_id,
+        venue=venue,
+        room=room,
+        shoe_id=shoe_id,
+    )
 
-    def __init__(
-        self,
-        window_size: int = WINDOW_SIZE,
-        decay: float = MARKOV_DECAY,
-    ) -> None:
+
+class ShortShoePredictor:
+    """Compatibility class mapped to the road-pattern formal policy."""
+
+    def __init__(self, window_size: int = WINDOW_SIZE, decay: float = MARKOV_DECAY) -> None:
         self.window_size = max(4, int(window_size or WINDOW_SIZE))
         self.decay = float(decay)
 
     def predict(self, history: str | Iterable[Any] | None) -> dict[str, Any]:
-        result = lstm_primary_policy(history)
+        result = road_only_policy(history)
         result["window_size"] = self.window_size
-        result["window_rounds"] = min(
-            len(normalize_big_road(history)),
-            self.window_size,
-        )
+        result["window_rounds"] = min(len(normalize_big_road(history)), self.window_size)
         result["history_rounds"] = len(normalize_big_road(history))
         result["sequence_length"] = len(normalize_big_road(history))
-        result["model"] = "short_shoe_lstm_shoe_cut_compatibility"
+        result["model"] = "short_shoe_road_pattern_primary"
         return result
 
 
@@ -434,24 +361,20 @@ def global_trend_bias_correction(
     local_forecast: Mapping[str, Any],
 ) -> dict[str, Any]:
     del local_forecast
-    policy = lstm_primary_policy(history)
+    policy = road_only_policy(history)
     p_b = float(policy["probabilities"]["B"])
     p_p = float(policy["probabilities"]["P"])
     return {
         "applied": True,
-        "mode": "lstm_shoe_cut_formal_compatibility",
-        "ensemble_regime": "lstm_shoe_cut_fusion",
+        "mode": "road_pattern_primary_compatibility",
+        "ensemble_regime": "road_pattern_primary",
         "local_weight": 0.0,
         "global_weight": 0.0,
         "regression_weight": 0.0,
-        "ensemble_weights": {
-            "lstm_shoe_cut": 1.0,
-            "time_decay_markov": 0.0,
-            "road_forecaster": 0.0,
-        },
+        "ensemble_weights": {"road_pattern_core": 1.0, "time_decay_markov": 0.0, "linucb": 0.0},
         "anti_lock_applied": True,
         "direction_controller": {
-            "mode": "single_lstm_shoe_cut_fusion",
+            "mode": "road_pattern_core",
             "final_direction": policy["direction"],
             "final_p_b": p_b,
             "final_p_p": p_p,
@@ -463,13 +386,6 @@ def global_trend_bias_correction(
         "global_p_p": 0.5,
         "local_p_b": p_b,
         "local_p_p": p_p,
-        "regression_p_b": float(
-            policy["regression_analysis"].get("regression_p_b", 0.5)
-        ),
-        "regression_p_p": float(
-            policy["regression_analysis"].get("regression_p_p", 0.5)
-        ),
-        "regression_analysis": dict(policy["regression_analysis"]),
         "raw_ensemble_p_b": p_b,
         "raw_ensemble_p_p": p_p,
         "raw_ensemble_direction": policy["direction"],
@@ -477,28 +393,8 @@ def global_trend_bias_correction(
         "final_p_p": p_p,
         "final_direction": policy["direction"],
         "final_confidence_prob": float(policy["selected_win_probability"]),
-        "formula": "balanced_masked_LSTM + exact_shoe_logit + cut_depth_weighting",
+        "formula": "road_multiwindow + pattern_replay + relation_ngram + pattern_survival",
     }
-
-
-def road_only_policy(
-    history: str | Iterable[Any] | None,
-    *,
-    shoe_context: Mapping[str, Any] | None = None,
-    user_id: str = "",
-    venue: str = "",
-    room: str = "",
-    shoe_id: str = "",
-) -> dict[str, Any]:
-    """Compatibility name; behavior is the formal LSTM-shoe-cut fusion."""
-    return lstm_primary_policy(
-        history,
-        shoe_context=shoe_context,
-        user_id=user_id,
-        venue=venue,
-        room=room,
-        shoe_id=shoe_id,
-    )
 
 
 def shoe_progress_policy(rounds: int) -> dict[str, Any]:
@@ -507,17 +403,13 @@ def shoe_progress_policy(rounds: int) -> dict[str, Any]:
     return {
         "rounds": value,
         "phase": phase,
-        "shoe_weight_factor": 1.0,
-        "road_weight_factor": 0.0,
-        "formal_model": "lstm_shoe_cut_fusion",
+        "shoe_weight_factor": 0.0,
+        "road_weight_factor": 1.0,
+        "formal_model": "road_pattern_core",
     }
 
 
-def recent_user_direction_feedback(
-    user_id: str,
-    *,
-    limit: int = ONLINE_WINDOW,
-) -> dict[str, Any]:
+def recent_user_direction_feedback(user_id: str, *, limit: int = ONLINE_WINDOW) -> dict[str, Any]:
     raw_user = str(user_id or "")
     if not raw_user:
         return {
@@ -538,9 +430,7 @@ def recent_user_direction_feedback(
         if str(record.get("uid_key") or "") != uid_key:
             continue
         actual = str(record.get("actual_outcome") or "").upper().strip()
-        predicted = str(
-            record.get("action") or record.get("recommend") or ""
-        ).upper().strip()
+        predicted = str(record.get("action") or record.get("recommend") or "").upper().strip()
         if actual not in OUTCOMES or predicted not in OUTCOMES:
             continue
         recent.append({"correct": predicted == actual})
@@ -561,7 +451,7 @@ def recent_user_direction_feedback(
         "triggered": False,
         "window": ONLINE_WINDOW,
         "loss_trigger": ONLINE_CONSECUTIVE_LOSS_TRIGGER,
-        "semantics": "diagnostic_feedback_only_formal_direction_is_lstm_shoe_cut",
+        "semantics": "diagnostic_feedback_only_formal_direction_is_road_pattern_core",
     }
 
 
@@ -572,7 +462,7 @@ def record_online_feedback(
     context_vector: Sequence[float],
     actual_outcome: str,
 ) -> dict[str, Any]:
-    """Preserve bandit settlement API; it cannot alter formal direction."""
+    """Preserve bandit settlement API; updates never alter formal road direction."""
     return update_bandit(
         scope_key=scope_key,
         action=action,
