@@ -1,0 +1,54 @@
+name: Validate final app shoe depth consistency
+
+on:
+  push:
+    branches:
+      - fix/unified-shoe-consumption
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-test:
+    if: ${{ !contains(github.event.head_commit.message, '[app-shoe-depth-final]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install focused test dependency
+        run: python -m pip install "numpy>=1.26,<2.4"
+
+      - name: Apply final app consistency patch
+        run: python tools/fix_app_shoe_depth.py
+
+      - name: Compile
+        run: python -m py_compile app.py predictor.py contextual_bandit.py probabilistic_shoe_estimator.py shoe_composition.py shoe_depth_estimator.py shoe_constants.py
+
+      - name: Run regressions
+        run: python -m unittest -v test_shoe_constants test_shoe_composition test_formal_shoe_decision
+
+      - name: Assert exact round-count formula wiring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('app.py').read_text(encoding='utf-8')
+          assert 'max(\n            6,\n            int(round(estimate_remaining_cards' not in text
+          assert 'session.get("exact_remaining_decks", 8)' not in text
+          print('app.py round-count formula and shared deck default verified')
+          PY
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Commit app fix
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git commit -m "Align app depth estimate with max-zero formula [app-shoe-depth-final]"
+          git push origin HEAD:fix/unified-shoe-consumption
