@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from dynamic_prediction_policy import install_dynamic_prediction_policy
+from shoe_constants import SHOE_DECKS
 
 # 必須在 app 載入前安裝，讓 predictor 使用同一套政策。
 install_dynamic_prediction_policy()
@@ -55,7 +56,7 @@ def _formal_shoe_context(session: Mapping[str, Any]) -> dict[str, Any]:
         context.update(
             {
                 "remaining_counts": list(counts),
-                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "decks": int(session.get("exact_remaining_decks", SHOE_DECKS) or SHOE_DECKS),
                 "source": "remaining_counts",
             }
         )
@@ -67,7 +68,7 @@ def _formal_shoe_context(session: Mapping[str, Any]) -> dict[str, Any]:
         context.update(
             {
                 "observed_cards": list(observed),
-                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "decks": int(session.get("exact_remaining_decks", SHOE_DECKS) or SHOE_DECKS),
                 "source": "observed_cards",
             }
         )

@@ -16,11 +16,10 @@ from particle_filter_points import (
     create_virtual_shoe,
     deal_ordered_hand,
 )
-from shoe_composition import (
-    DECKS as PHYSICAL_SHOE_DECKS,
-    parse_card_value,
-    remaining_counts_from_observed,
-)
+from shoe_composition import parse_card_value, remaining_counts_from_observed
+from shoe_constants import SHOE_DECKS, total_cards_for_decks
+
+PHYSICAL_SHOE_DECKS = SHOE_DECKS
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,7 +51,7 @@ def _resolve_session_data_file() -> Path:
 
 
 SESSION_DATA_FILE = _resolve_session_data_file()
-PF_DECKS = max(1, min(16, int(os.getenv("PF_DECKS", "8") or "8")))
+PF_DECKS = SHOE_DECKS  # compatibility alias; one authoritative shoe deck count
 TRIAL_MINUTES = max(0, int(os.getenv("TRIAL_MINUTES", "30") or "30"))
 ACTIVATION_CODES = {
     item.strip()
@@ -99,7 +98,7 @@ def _fresh_stats() -> Dict[str, int]:
 def _new_cut_card(decks: int = PF_DECKS) -> int:
     # Leave roughly 60-85 cards behind in an eight-deck shoe. Scale for other
     # deck counts while keeping at least one full hand safely available.
-    total_cards = 52 * max(1, decks)
+    total_cards = total_cards_for_decks(decks)
     low = max(18, int(total_cards * 0.14))
     high = max(low + 1, int(total_cards * 0.21))
     return low + secrets.randbelow(max(1, high - low + 1))

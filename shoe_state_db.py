@@ -15,6 +15,8 @@ import threading
 
 import numpy as np
 
+from shoe_constants import SHOE_DECKS, total_cards_for_decks
+
 DEFAULT_BASELINE = np.asarray([0.458838, 0.4461478, 0.0950142], dtype=float)
 DEFAULT_DRAW = np.asarray([0.3785964, 0.1858848, 0.1179186, 0.3176002], dtype=float)
 
@@ -48,10 +50,10 @@ def _composition_bucket(actual: int, total: int, baseline_ratio: float) -> int:
     return 4
 
 
-def state_key_from_counts(counts: np.ndarray, decks: int = 8) -> tuple[int, int, int, int, int]:
+def state_key_from_counts(counts: np.ndarray, decks: int = SHOE_DECKS) -> tuple[int, int, int, int, int]:
     counts = np.asarray(counts, dtype=int)
     total = int(counts.sum())
-    removed = 52 * decks - total
+    removed = total_cards_for_decks(decks) - total
     depth = min(7, max(0, removed // max(1, 6 * decks)))
     zero = int(counts[0])
     low = int(counts[1:4].sum())

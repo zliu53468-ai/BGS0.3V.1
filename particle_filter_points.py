@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import random
 import secrets
 
+from shoe_constants import SHOE_DECKS, fresh_point_counts
+
 DEFAULT_BASELINE = (0.458597, 0.446247, 0.095156)
 OUTCOME_NAMES = ("B", "P", "T")
 PATH_NAMES = ("none", "player_only", "banker_only", "both")
@@ -20,7 +22,7 @@ DB_HOLDOUT: Dict[str, Any] = {
     "status": "removed",
     "replacement": "THREEWAY-HDMARKOV-SHOE-DEPTH-V2",
 }
-DECKS = 8
+DECKS = SHOE_DECKS  # compatibility alias
 
 
 def baccarat_total(cards: Iterable[int]) -> int:
@@ -28,8 +30,7 @@ def baccarat_total(cards: Iterable[int]) -> int:
 
 
 def fresh_counts(decks: int = DECKS) -> List[int]:
-    count = max(1, min(16, int(decks)))
-    return [16 * count] + [4 * count] * 9
+    return fresh_point_counts(decks)
 
 
 def counts_from_shoe(shoe: Sequence[int]) -> List[int]:
