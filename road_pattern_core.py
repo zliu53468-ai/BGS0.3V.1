@@ -1,44 +1,66 @@
-"""Road-primary baccarat B/P forecasting for 50-70 hand shoes.
+"""Road-primary baccarat B/P forecasting with probabilistic turning analysis.
 
-The formal direction is derived only from the observed Big-Road B/P sequence.
-No shoe composition, cut-card position, LSTM, LinUCB, HSMM or hazard signal can
-vote on B/P here.
+Formal B/P direction is derived only from the observed Big-Road B/P sequence.
+Shoe composition, cut-card position, LSTM, LinUCB, HSMM and hazard models have
+zero formal direction authority.
 
-The model deliberately uses orientation-invariant evidence: historical patterns
-are expressed as SAME/SWITCH relationships, so swapping every B and P in a shoe
-swaps the forecast instead of creating a fixed Player/Banker prior.
+V2 keeps the inspectable road-pattern stack and adds a probabilistic turning
+layer designed for short 50-70 hand shoes:
 
-Components
-----------
-1. Multi-window transition behaviour over the latest 6/10/16/24 resolved hands.
-2. Pattern replay: match recent SAME/SWITCH signatures against earlier prefixes.
-3. N-gram backoff, orders 2-5, with recency decay and support shrinkage.
-4. Pattern survival for alternating/double/dragon-like run structures.
+1. Multi-window SAME/SWITCH behaviour over 6/10/16/24 resolved hands.
+2. Orientation-invariant historical Pattern Replay.
+3. Orientation-invariant relation N-grams, orders 2-5.
+4. Pattern survival for single-jump, double-jump and dragon-like runs.
+5. Probabilistic turning analysis:
+   - Bayesian run survival,
+   - multi-scale disagreement,
+   - pattern-break probability,
+   - light change-point probability.
+
+When change pressure rises, the system shifts weight toward 6/10-hand evidence
+and the turning layer while reducing stale 16/24-hand and replay influence.
+Final component fusion is reliability-weighted log-odds rather than a raw
+probability average. There is no forced follow-last and no forced alternation.
 
 This is an inspectable sequence model, not evidence that baccarat is
 predictable or profitable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 import math
 
-MODEL_ID = "ROAD-PATTERN-PRIMARY-V1"
-VERSION = "ROAD-PATTERN-50-70-V1"
+MODEL_ID = "ROAD-PATTERN-PROBABILITY-V2"
+VERSION = "ROAD-PATTERN-PROBABILITY-50-70-V2"
 OUTCOMES = ("B", "P")
-WINDOW_WEIGHTS = {6: 0.32, 10: 0.28, 16: 0.23, 24: 0.17}
-COMPONENT_WEIGHTS = {
-    "multi_window": 0.30,
+
+STABLE_WINDOW_WEIGHTS = {6: 0.20, 10: 0.25, 16: 0.27, 24: 0.28}
+TURN_WINDOW_WEIGHTS = {6: 0.40, 10: 0.30, 16: 0.20, 24: 0.10}
+WINDOW_WEIGHTS = dict(STABLE_WINDOW_WEIGHTS)
+
+STABLE_COMPONENT_WEIGHTS = {
+    "multi_window": 0.25,
     "pattern_replay": 0.30,
     "ngram": 0.25,
     "pattern_survival": 0.15,
+    "probabilistic_turning": 0.05,
 }
+TURN_COMPONENT_WEIGHTS = {
+    "multi_window": 0.30,
+    "pattern_replay": 0.20,
+    "ngram": 0.20,
+    "pattern_survival": 0.10,
+    "probabilistic_turning": 0.20,
+}
+COMPONENT_WEIGHTS = dict(STABLE_COMPONENT_WEIGHTS)
+
 NGRAM_ORDERS = (2, 3, 4, 5)
 REPLAY_LENGTHS = (3, 4, 5, 6, 8)
 RECENCY_DECAY = 0.965
 MAX_DIRECTION_EDGE = 0.13
 MIN_COMPONENT_RELIABILITY = 0.02
+RUN_PRIOR_ALPHA = 2.5
+RUN_PRIOR_BETA = 2.5
 
 
 def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -49,6 +71,34 @@ def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
     if not math.isfinite(number):
         return lo
     return max(lo, min(hi, number))
+
+
+def _sigmoid(value: float) -> float:
+    value = max(-20.0, min(20.0, float(value)))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _logit(probability: float) -> float:
+    p = _clip(probability, 1e-6, 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
+def _blend_weight_maps(
+    stable: Mapping[int | str, float],
+    turning: Mapping[int | str, float],
+    pressure: float,
+) -> dict[int | str, float]:
+    t = _clip(pressure)
+    keys = set(stable) | set(turning)
+    blended = {
+        key: (1.0 - t) * float(stable.get(key, 0.0))
+        + t * float(turning.get(key, 0.0))
+        for key in keys
+    }
+    total = sum(max(0.0, value) for value in blended.values())
+    if total <= 1e-12:
+        return {key: 0.0 for key in blended}
+    return {key: max(0.0, value) / total for key, value in blended.items()}
 
 
 def normalize_bp(history: str | Iterable[Any] | None) -> list[str]:
@@ -80,10 +130,6 @@ def normalize_bp(history: str | Iterable[Any] | None) -> list[str]:
         if value in OUTCOMES:
             result.append(value)
     return result[-500:]
-
-
-def _opposite(side: str) -> str:
-    return "P" if side == "B" else "B"
 
 
 def _runs(sequence: Sequence[str]) -> list[tuple[str, int]]:
@@ -130,7 +176,32 @@ def _weighted_same_probability(
     return (same / total if total > 1e-12 else 0.5), support
 
 
-def _multi_window_component(sequence: Sequence[str]) -> dict[str, Any]:
+def _window_same_stats(sequence: Sequence[str]) -> dict[int, dict[str, Any]]:
+    stats: dict[int, dict[str, Any]] = {}
+    for size in STABLE_WINDOW_WEIGHTS:
+        values = list(sequence[-size:])
+        transitions = list(zip(values, values[1:]))
+        support = len(transitions)
+        same_count = sum(left == right for left, right in transitions)
+        p_same = (same_count + 2.0) / (support + 4.0) if support else 0.5
+        reliability = _support_reliability(
+            support, half_saturation=max(3.0, size * 0.45)
+        )
+        stats[size] = {
+            "p_same": float(p_same),
+            "p_switch": float(1.0 - p_same),
+            "support": int(support),
+            "reliability": float(reliability),
+        }
+    return stats
+
+
+def _multi_window_component(
+    sequence: Sequence[str],
+    *,
+    turn_pressure: float = 0.0,
+    stats: Mapping[int, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     if len(sequence) < 2:
         return {
             "p_b": 0.5,
@@ -138,44 +209,46 @@ def _multi_window_component(sequence: Sequence[str]) -> dict[str, Any]:
             "reliability": 0.0,
             "support": 0.0,
             "windows": {},
+            "dynamic_window_weights": dict(STABLE_WINDOW_WEIGHTS),
         }
     last = sequence[-1]
+    window_stats = dict(stats or _window_same_stats(sequence))
+    dynamic = _blend_weight_maps(
+        STABLE_WINDOW_WEIGHTS, TURN_WINDOW_WEIGHTS, turn_pressure
+    )
     numerator = 0.0
     denominator = 0.0
-    diagnostics: dict[str, Any] = {}
     total_support = 0.0
-    for size, base_weight in WINDOW_WEIGHTS.items():
-        values = list(sequence[-size:])
-        transitions = list(zip(values, values[1:]))
-        same_count = sum(left == right for left, right in transitions)
-        switch_count = len(transitions) - same_count
-        support = len(transitions)
-        p_same = (same_count + 2.0) / (support + 4.0) if support else 0.5
-        reliability = _support_reliability(support, half_saturation=max(3.0, size * 0.45))
+    diagnostics: dict[str, Any] = {}
+    for size in STABLE_WINDOW_WEIGHTS:
+        item = dict(window_stats.get(size) or {})
+        p_same = _clip(item.get("p_same", 0.5))
+        reliability = _clip(item.get("reliability", 0.0))
+        support = int(item.get("support", 0) or 0)
         p_b = _same_probability_to_b(last, p_same)
+        base_weight = float(dynamic.get(size, 0.0))
         weight = base_weight * reliability
         numerator += weight * (p_b - 0.5)
         denominator += weight
         total_support += support * base_weight
         diagnostics[str(size)] = {
-            "p_same": float(p_same),
-            "p_switch": float(1.0 - p_same),
+            **item,
             "p_b": float(p_b),
             "p_p": float(1.0 - p_b),
-            "support": int(support),
-            "reliability": float(reliability),
             "base_weight": float(base_weight),
         }
     edge = numerator / denominator if denominator > 1e-12 else 0.0
     p_b = _clip(0.5 + edge, 0.38, 0.62)
-    reliability = _clip(denominator / max(1e-12, sum(WINDOW_WEIGHTS.values())))
+    reliability = _clip(denominator)
     return {
         "p_b": float(p_b),
         "p_p": float(1.0 - p_b),
         "reliability": float(reliability),
         "support": float(total_support),
         "windows": diagnostics,
-        "semantics": "recent_same_switch_rates_6_10_16_24_orientation_invariant",
+        "turn_pressure": float(_clip(turn_pressure)),
+        "dynamic_window_weights": {str(k): float(v) for k, v in dynamic.items()},
+        "semantics": "dynamic_6_10_16_24_same_switch_rates_orientation_invariant",
     }
 
 
@@ -199,7 +272,6 @@ def _pattern_replay_component(sequence: Sequence[str]) -> dict[str, Any]:
             continue
         target_signature = _relation_signature(sequence[-length:])
         observations: list[tuple[bool, float]] = []
-        # start+length must be < n so a historical next outcome exists.
         for start in range(0, n - length):
             window = sequence[start : start + length]
             if _relation_signature(window) != target_signature:
@@ -209,9 +281,10 @@ def _pattern_replay_component(sequence: Sequence[str]) -> dict[str, Any]:
             age = (n - 1) - (start + length)
             observations.append((is_same, RECENCY_DECAY ** max(0, age)))
         p_same, support = _weighted_same_probability(observations, prior_strength=3.0)
-        reliability = _support_reliability(support, half_saturation=3.5 + 0.4 * length)
+        reliability = _support_reliability(
+            support, half_saturation=3.5 + 0.4 * length
+        )
         p_b = _same_probability_to_b(last, p_same)
-        # Longer signatures are more specific, but only when they have support.
         specificity = 0.55 + 0.45 * (length / max(REPLAY_LENGTHS))
         weight = specificity * reliability
         numerator += weight * (p_b - 0.5)
@@ -227,7 +300,9 @@ def _pattern_replay_component(sequence: Sequence[str]) -> dict[str, Any]:
         }
     edge = numerator / denominator if denominator > 1e-12 else 0.0
     p_b = _clip(0.5 + edge, 0.37, 0.63)
-    reliability = _clip(denominator / max(1.0, len(REPLAY_LENGTHS) * 0.65))
+    reliability = _clip(
+        denominator / max(1.0, len(REPLAY_LENGTHS) * 0.65)
+    )
     return {
         "p_b": float(p_b),
         "p_p": float(1.0 - p_b),
@@ -253,12 +328,8 @@ def _ngram_component(sequence: Sequence[str]) -> dict[str, Any]:
     total_support = 0.0
     details: dict[str, Any] = {}
     for order in NGRAM_ORDERS:
-        context_len = order - 1
-        if n <= context_len:
+        if n <= order - 1:
             continue
-        target_signature = _relation_signature(sequence[-order:]) if order > 1 else ()
-        # For order k, compare the last k-1 SAME/SWITCH relations to prior
-        # contexts, then ask whether the next result stays with the context tail.
         current_context = sequence[-order:]
         current_rel = _relation_signature(current_context)
         observations: list[tuple[bool, float]] = []
@@ -273,12 +344,14 @@ def _ngram_component(sequence: Sequence[str]) -> dict[str, Any]:
         p_same, support = _weighted_same_probability(observations, prior_strength=3.5)
         reliability = _support_reliability(support, half_saturation=4.0 + order)
         p_b = _same_probability_to_b(sequence[-1], p_same)
-        order_weight = (0.70 + 0.30 * order / max(NGRAM_ORDERS)) * reliability
+        order_weight = (
+            0.70 + 0.30 * order / max(NGRAM_ORDERS)
+        ) * reliability
         numerator += order_weight * (p_b - 0.5)
         denominator += order_weight
         total_support += support
         details[str(order)] = {
-            "relation_context": "".join("S" if value else "X" for value in target_signature),
+            "relation_context": "".join("S" if value else "X" for value in current_rel),
             "p_same": float(p_same),
             "p_switch": float(1.0 - p_same),
             "p_b": float(p_b),
@@ -287,7 +360,9 @@ def _ngram_component(sequence: Sequence[str]) -> dict[str, Any]:
         }
     edge = numerator / denominator if denominator > 1e-12 else 0.0
     p_b = _clip(0.5 + edge, 0.38, 0.62)
-    reliability = _clip(denominator / max(1.0, len(NGRAM_ORDERS) * 0.75))
+    reliability = _clip(
+        denominator / max(1.0, len(NGRAM_ORDERS) * 0.75)
+    )
     return {
         "p_b": float(p_b),
         "p_p": float(1.0 - p_b),
@@ -303,14 +378,38 @@ def _completed_run_lengths(sequence: Sequence[str]) -> list[int]:
     return [length for _, length in runs[:-1]] if len(runs) > 1 else []
 
 
-def _empirical_run_survival(sequence: Sequence[str], current_length: int) -> tuple[float, int]:
+def _bayesian_run_survival(
+    sequence: Sequence[str], current_length: int
+) -> dict[str, Any]:
     lengths = _completed_run_lengths(sequence)
     eligible = [length for length in lengths if length >= current_length]
-    if not eligible:
-        return 0.5, 0
     survived = sum(length > current_length for length in eligible)
-    # Beta(2,2) shrinkage keeps tiny in-shoe samples weak.
-    return (survived + 2.0) / (len(eligible) + 4.0), len(eligible)
+    failed = len(eligible) - survived
+    alpha = RUN_PRIOR_ALPHA + survived
+    beta = RUN_PRIOR_BETA + failed
+    total = alpha + beta
+    mean = alpha / total if total > 0 else 0.5
+    variance = (
+        alpha * beta / (total * total * (total + 1.0))
+        if total > 0
+        else 0.05
+    )
+    sd = math.sqrt(max(0.0, variance))
+    reliability = _support_reliability(len(eligible), half_saturation=4.0)
+    return {
+        "continue_probability": float(mean),
+        "turn_probability": float(1.0 - mean),
+        "support": int(len(eligible)),
+        "survived": int(survived),
+        "failed": int(failed),
+        "posterior_alpha": float(alpha),
+        "posterior_beta": float(beta),
+        "posterior_sd": float(sd),
+        "credible_low_approx": float(_clip(mean - 1.64 * sd)),
+        "credible_high_approx": float(_clip(mean + 1.64 * sd)),
+        "reliability": float(reliability),
+        "semantics": "beta_binomial_run_survival_shrunk_to_neutral_on_low_support",
+    }
 
 
 def _pattern_survival_component(sequence: Sequence[str]) -> dict[str, Any]:
@@ -330,11 +429,15 @@ def _pattern_survival_component(sequence: Sequence[str]) -> dict[str, Any]:
     desired_same: bool | None = None
     base_strength = 0.0
 
-    if len(recent_lengths) >= 4 and all(length == 1 for length in recent_lengths[-4:]):
+    if len(recent_lengths) >= 4 and all(
+        length == 1 for length in recent_lengths[-4:]
+    ):
         pattern = "SINGLE_JUMP"
         desired_same = False
         base_strength = 0.70
-    elif len(recent_lengths) >= 4 and all(length == 2 for length in recent_lengths[-4:-1]):
+    elif len(recent_lengths) >= 4 and all(
+        length == 2 for length in recent_lengths[-4:-1]
+    ):
         pattern = "DOUBLE_JUMP"
         desired_same = current_run < 2
         base_strength = 0.62
@@ -343,21 +446,36 @@ def _pattern_survival_component(sequence: Sequence[str]) -> dict[str, Any]:
         desired_same = True
         base_strength = 0.52
 
-    empirical_same, support = _empirical_run_survival(sequence, current_run)
-    support_reliability = _support_reliability(support, half_saturation=4.0)
+    bayes_run = _bayesian_run_survival(sequence, current_run)
+    empirical_same = float(bayes_run["continue_probability"])
+    support = int(bayes_run["support"])
+    support_reliability = float(bayes_run["reliability"])
 
     if desired_same is None:
         p_same = empirical_same
         reliability = 0.35 * support_reliability
     else:
         rule_same = 0.62 if desired_same else 0.38
-        # Pattern rules are a weak prior; in-shoe empirical survival takes over
-        # only as support accumulates.
         empirical_weight = 0.55 * support_reliability
-        p_same = (1.0 - empirical_weight) * rule_same + empirical_weight * empirical_same
-        reliability = _clip(base_strength * (0.45 + 0.55 * support_reliability))
+        p_same = (
+            (1.0 - empirical_weight) * rule_same
+            + empirical_weight * empirical_same
+        )
+        reliability = _clip(
+            base_strength * (0.45 + 0.55 * support_reliability)
+        )
 
     p_b = _same_probability_to_b(last_side, p_same)
+    desired_probability = (
+        p_same
+        if desired_same is True
+        else 1.0 - p_same
+        if desired_same is False
+        else 0.5
+    )
+    pattern_break_probability = (
+        1.0 - desired_probability if desired_same is not None else 0.5
+    )
     return {
         "p_b": float(_clip(p_b, 0.38, 0.62)),
         "p_p": float(1.0 - _clip(p_b, 0.38, 0.62)),
@@ -366,35 +484,244 @@ def _pattern_survival_component(sequence: Sequence[str]) -> dict[str, Any]:
         "pattern": pattern,
         "current_run_length": int(current_run),
         "desired_relation": (
-            "SAME" if desired_same is True else "SWITCH" if desired_same is False else "EMPIRICAL"
+            "SAME"
+            if desired_same is True
+            else "SWITCH"
+            if desired_same is False
+            else "EMPIRICAL"
         ),
         "survival_probability": float(p_same),
         "empirical_run_survival": float(empirical_same),
-        "semantics": "weak_pattern_prior_blended_with_in_shoe_run_survival",
+        "pattern_break_probability": float(pattern_break_probability),
+        "bayesian_run_survival": bayes_run,
+        "semantics": "weak_pattern_prior_blended_with_bayesian_in_shoe_run_survival",
     }
 
 
-def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    sequence = normalize_bp(history)
-    components = {
-        "multi_window": _multi_window_component(sequence),
-        "pattern_replay": _pattern_replay_component(sequence),
-        "ngram": _ngram_component(sequence),
-        "pattern_survival": _pattern_survival_component(sequence),
-    }
-
+def _weighted_window_rate(
+    stats: Mapping[int, Mapping[str, Any]], sizes: Sequence[int]
+) -> tuple[float, float]:
     numerator = 0.0
     denominator = 0.0
+    for size in sizes:
+        item = stats.get(size) or {}
+        reliability = _clip(item.get("reliability", 0.0))
+        p_same = _clip(item.get("p_same", 0.5))
+        numerator += reliability * p_same
+        denominator += reliability
+    return (
+        numerator / denominator if denominator > 1e-12 else 0.5,
+        _clip(denominator / max(1.0, float(len(sizes)))),
+    )
+
+
+def _relation_change_probability(sequence: Sequence[str]) -> dict[str, Any]:
+    relations = list(_relation_signature(sequence))
+    if len(relations) < 5:
+        return {
+            "probability": 0.0,
+            "short_same_rate": 0.5,
+            "baseline_same_rate": 0.5,
+            "absolute_delta": 0.0,
+            "z_like": 0.0,
+            "support_maturity": 0.0,
+        }
+
+    short = relations[-min(6, len(relations)) :]
+    baseline = relations[: -len(short)]
+    if len(baseline) > 18:
+        baseline = baseline[-18:]
+
+    short_same = (sum(short) + 2.0) / (len(short) + 4.0)
+    if baseline:
+        base_same = (sum(baseline) + 2.0) / (len(baseline) + 4.0)
+    else:
+        base_same = 0.5
+
+    delta = abs(short_same - base_same)
+    pooled = _clip((short_same + base_same) / 2.0, 0.05, 0.95)
+    se = math.sqrt(
+        pooled
+        * (1.0 - pooled)
+        * (1.0 / max(1, len(short)) + 1.0 / max(1, len(baseline)))
+    )
+    z_like = delta / max(0.08, se)
+    delta_score = _sigmoid((delta - 0.16) * 12.0)
+    z_score = _sigmoid((z_like - 1.35) * 2.0)
+    support_maturity = _clip(len(relations) / 18.0)
+    probability = _clip(
+        (0.55 * delta_score + 0.45 * z_score) * support_maturity
+    )
+    return {
+        "probability": float(probability),
+        "short_same_rate": float(short_same),
+        "baseline_same_rate": float(base_same),
+        "absolute_delta": float(delta),
+        "z_like": float(z_like),
+        "delta_score": float(delta_score),
+        "z_score": float(z_score),
+        "support_maturity": float(support_maturity),
+        "short_support": len(short),
+        "baseline_support": len(baseline),
+        "semantics": "light_change_point_on_recent_vs_prior_same_switch_rate",
+    }
+
+
+def _probabilistic_turning_component(
+    sequence: Sequence[str],
+    *,
+    window_stats: Mapping[int, Mapping[str, Any]],
+    survival: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not sequence:
+        return {
+            "p_b": 0.5,
+            "p_p": 0.5,
+            "p_same": 0.5,
+            "continue_probability": 0.5,
+            "turn_probability": 0.5,
+            "change_probability": 0.0,
+            "turning_pressure": 0.0,
+            "reliability": 0.0,
+            "support": 0,
+            "regime": "COLD_START",
+        }
+
+    runs = _runs(sequence)
+    current_run = runs[-1][1]
+    bayes_run = _bayesian_run_survival(sequence, current_run)
+    short_same, short_rel = _weighted_window_rate(window_stats, (6, 10))
+    long_same, long_rel = _weighted_window_rate(window_stats, (16, 24))
+    disagreement_raw = abs(short_same - long_same)
+    disagreement = _clip(disagreement_raw / 0.22)
+
+    change = _relation_change_probability(sequence)
+    change_probability = float(change["probability"])
+
+    survival_p_same = _clip(survival.get("survival_probability", 0.5))
+    survival_rel = _clip(survival.get("reliability", 0.0))
+    pattern = str(survival.get("pattern") or "GENERIC")
+    pattern_break = _clip(survival.get("pattern_break_probability", 0.5))
+    pattern_break_signal = (
+        pattern_break * survival_rel if pattern != "GENERIC" else 0.0
+    )
+
+    run_p_same = _clip(bayes_run.get("continue_probability", 0.5))
+    run_rel = _clip(bayes_run.get("reliability", 0.0))
+
+    w_short = 0.30 + 0.45 * change_probability
+    w_run = 0.35 * (0.35 + 0.65 * run_rel)
+    w_survival = 0.25 * (0.35 + 0.65 * survival_rel)
+    w_neutral = 0.10
+    denom = w_short + w_run + w_survival + w_neutral
+    p_same = (
+        w_short * short_same
+        + w_run * run_p_same
+        + w_survival * survival_p_same
+        + w_neutral * 0.5
+    ) / max(1e-12, denom)
+
+    support_maturity = _clip(max(0, len(sequence) - 2) / 18.0)
+    p_same = 0.5 + (p_same - 0.5) * (0.35 + 0.65 * support_maturity)
+    p_same = _clip(p_same, 0.36, 0.64)
+
+    turning_pressure = _clip(
+        0.45 * change_probability
+        + 0.30 * disagreement
+        + 0.25 * pattern_break_signal
+    )
+    reliability = _clip(
+        support_maturity
+        * (
+            0.25
+            + 0.30 * max(short_rel, long_rel)
+            + 0.25 * max(run_rel, survival_rel)
+            + 0.20 * turning_pressure
+        )
+    )
+
+    p_b = _same_probability_to_b(sequence[-1], p_same)
+    regime = (
+        "TRANSITION"
+        if turning_pressure >= 0.60
+        else "WATCH"
+        if turning_pressure >= 0.30
+        else "STABLE"
+    )
+    return {
+        "p_b": float(_clip(p_b, 0.36, 0.64)),
+        "p_p": float(1.0 - _clip(p_b, 0.36, 0.64)),
+        "p_same": float(p_same),
+        "continue_probability": float(p_same),
+        "turn_probability": float(1.0 - p_same),
+        "change_probability": float(change_probability),
+        "turning_pressure": float(turning_pressure),
+        "reliability": float(reliability),
+        "support": int(max(0, len(sequence) - 1)),
+        "regime": regime,
+        "current_run_length": int(current_run),
+        "bayesian_run_survival": bayes_run,
+        "multi_scale": {
+            "short_same_probability": float(short_same),
+            "long_same_probability": float(long_same),
+            "short_reliability": float(short_rel),
+            "long_reliability": float(long_rel),
+            "absolute_disagreement": float(disagreement_raw),
+            "disagreement_score": float(disagreement),
+        },
+        "pattern_break": {
+            "pattern": pattern,
+            "probability": float(pattern_break),
+            "reliability": float(survival_rel),
+            "pressure_contribution": float(pattern_break_signal),
+        },
+        "change_point": change,
+        "semantics": "bayesian_turn_probability_plus_multiscale_disagreement_and_change_point",
+    }
+
+
+def forecast_road_pattern(
+    history: str | Iterable[Any] | None,
+) -> dict[str, Any]:
+    sequence = normalize_bp(history)
+
+    window_stats = _window_same_stats(sequence)
+    replay = _pattern_replay_component(sequence)
+    ngram = _ngram_component(sequence)
+    survival = _pattern_survival_component(sequence)
+    turning = _probabilistic_turning_component(
+        sequence, window_stats=window_stats, survival=survival
+    )
+    turn_pressure = _clip(turning.get("turning_pressure", 0.0))
+    multi_window = _multi_window_component(
+        sequence, turn_pressure=turn_pressure, stats=window_stats
+    )
+
+    components = {
+        "multi_window": multi_window,
+        "pattern_replay": replay,
+        "ngram": ngram,
+        "pattern_survival": survival,
+        "probabilistic_turning": turning,
+    }
+    dynamic_component_weights = _blend_weight_maps(
+        STABLE_COMPONENT_WEIGHTS, TURN_COMPONENT_WEIGHTS, turn_pressure
+    )
+
+    logit_numerator = 0.0
+    denominator = 0.0
     used: dict[str, Any] = {}
-    for name, base_weight in COMPONENT_WEIGHTS.items():
-        component = components[name]
+    for name, component in components.items():
+        base_weight = float(dynamic_component_weights.get(name, 0.0))
         reliability = _clip(component.get("reliability", 0.0))
-        if reliability < MIN_COMPONENT_RELIABILITY:
-            effective = 0.0
-        else:
-            effective = base_weight * reliability
-        p_b = _clip(component.get("p_b", 0.5))
-        numerator += effective * (p_b - 0.5)
+        effective = (
+            base_weight * reliability
+            if reliability >= MIN_COMPONENT_RELIABILITY
+            else 0.0
+        )
+        p_b = _clip(component.get("p_b", 0.5), 0.34, 0.66)
+        component_logit = _logit(p_b)
+        logit_numerator += effective * component_logit
         denominator += effective
         used[name] = {
             "base_weight": float(base_weight),
@@ -402,14 +729,19 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             "effective_weight": float(effective),
             "p_b": float(p_b),
             "p_p": float(1.0 - p_b),
+            "logit": float(component_logit),
         }
 
-    raw_edge = numerator / denominator if denominator > 1e-12 else 0.0
-    # Overall support maturity prevents the first few hands from producing a
-    # large edge. There is no forced follow-last or forced alternation.
+    raw_logit = logit_numerator / denominator if denominator > 1e-12 else 0.0
+    raw_probability_b = _sigmoid(raw_logit)
+    raw_edge = raw_probability_b - 0.5
+
     maturity = _clip(len(sequence) / 20.0)
-    final_edge = max(-MAX_DIRECTION_EDGE, min(MAX_DIRECTION_EDGE, raw_edge * (0.35 + 0.65 * maturity)))
-    p_b = _clip(0.5 + final_edge, 0.37, 0.63)
+    maturity_factor = 0.35 + 0.65 * maturity
+    final_logit = raw_logit * maturity_factor
+    max_logit = abs(_logit(0.5 + MAX_DIRECTION_EDGE))
+    final_logit = max(-max_logit, min(max_logit, final_logit))
+    p_b = _clip(_sigmoid(final_logit), 0.37, 0.63)
     p_p = 1.0 - p_b
     direction = "B" if p_b >= p_p else "P"
     confidence = max(p_b, p_p)
@@ -430,21 +762,43 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
         "big_road_sequence": "".join(sequence[-24:]),
         "current_run_length": int(current_run),
         "maturity": float(maturity),
+        "maturity_factor": float(maturity_factor),
         "raw_edge": float(raw_edge),
-        "final_edge": float(final_edge),
+        "final_edge": float(p_b - 0.5),
+        "raw_logit": float(raw_logit),
+        "final_logit": float(final_logit),
         "effective_weight_sum": float(denominator),
         "components": components,
         "component_weights": used,
-        "pattern": str(components["pattern_survival"].get("pattern") or "GENERIC"),
-        "pattern_survival_score": float(
-            components["pattern_survival"].get("survival_probability", 0.5) or 0.5
+        "dynamic_component_weights": {
+            str(k): float(v) for k, v in dynamic_component_weights.items()
+        },
+        "dynamic_window_weights": dict(
+            multi_window.get("dynamic_window_weights") or {}
         ),
-        "direction_authority": "road_pattern_core_only",
+        "turning_layer": turning,
+        "turning_pressure": float(turn_pressure),
+        "change_point_probability": float(
+            turning.get("change_probability", 0.0) or 0.0
+        ),
+        "continue_probability": float(
+            turning.get("continue_probability", 0.5) or 0.5
+        ),
+        "turn_probability": float(
+            turning.get("turn_probability", 0.5) or 0.5
+        ),
+        "regime": str(turning.get("regime") or "STABLE"),
+        "pattern": str(survival.get("pattern") or "GENERIC"),
+        "pattern_survival_score": float(
+            survival.get("survival_probability", 0.5) or 0.5
+        ),
+        "fusion_method": "reliability_weighted_log_odds_dynamic_turning",
+        "direction_authority": "road_pattern_probability_core_only",
         "shoe_direction_weight": 0.0,
         "lstm_direction_weight": 0.0,
         "linucb_direction_weight": 0.0,
         "hazard_direction_weight": 0.0,
-        "semantics": "road_only_multiwindow_pattern_replay_ngram_pattern_survival",
+        "semantics": "road_only_dynamic_multiwindow_replay_ngram_survival_probabilistic_turning",
     }
 
 
@@ -452,7 +806,11 @@ __all__ = [
     "MODEL_ID",
     "VERSION",
     "WINDOW_WEIGHTS",
+    "STABLE_WINDOW_WEIGHTS",
+    "TURN_WINDOW_WEIGHTS",
     "COMPONENT_WEIGHTS",
+    "STABLE_COMPONENT_WEIGHTS",
+    "TURN_COMPONENT_WEIGHTS",
     "NGRAM_ORDERS",
     "REPLAY_LENGTHS",
     "normalize_bp",
