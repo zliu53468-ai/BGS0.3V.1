@@ -1,0 +1,107 @@
+name: Final Calibration Validation
+
+on:
+  push:
+    branches:
+      - feature/final-calibrated-road-model
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install core dependency
+        run: python -m pip install 'numpy>=1.26,<2.4'
+      - name: Compile production and calibration core
+        run: >-
+          python -m py_compile
+          road_pattern_v1_core.py
+          road_anti_echo.py
+          road_backtest.py
+          road_pattern_core.py
+          road_regime_gate.py
+          run_length_hazard.py
+          derived_road_markov.py
+          derived_road_geometry.py
+          road_model.py
+          dynamic_prediction_policy.py
+          predictor.py
+      - name: Run full regression suite
+        run: >-
+          python -m unittest -v
+          test_road_pattern_primary.py
+          test_human_derived_road.py
+          test_derived_road_geometry.py
+          test_road_regime_gate.py
+          test_final_calibration.py
+          test_formal_shoe_decision.py
+          test_shoe_constants.py
+          test_shoe_composition.py
+      - name: Verify exact V1 core remains unchanged
+        run: |
+          test "$(git rev-parse HEAD:road_pattern_v1_core.py)" = "$(git rev-parse origin/main:road_pattern_v1_core.py)"
+      - name: Run no-edge bias benchmark
+        run: |
+          python - <<'PY'
+          import json, random
+          from road_backtest import evaluate_shoes
+          from road_pattern_v1_core import forecast_road_pattern as v1
+          from road_pattern_core import forecast_road_pattern as final
+
+          rng = random.Random(20260901)
+          # B/P conditional probabilities derived from the repository's 5M
+          # aggregate baseline after excluding ties. This benchmark deliberately
+          # has no sequence signal; it is a bias detector, not an accuracy claim.
+          p_b = 0.458838 / (0.458838 + 0.4461478)
+          shoes = []
+          for _ in range(120):
+              shoes.append(['B' if rng.random() < p_b else 'P' for _ in range(60)])
+
+          raw = evaluate_shoes(shoes, v1, min_history_bp=6)
+          calibrated = evaluate_shoes(shoes, final, min_history_bp=6)
+          print('RAW_V1', json.dumps({k: raw[k] for k in [
+              'sample_count','accuracy','follow_last_prediction_rate','actual_same_rate','last_hand_echo_gap','fresh_switch_accuracy'
+          ]}, sort_keys=True))
+          print('FINAL', json.dumps({k: calibrated[k] for k in [
+              'sample_count','accuracy','follow_last_prediction_rate','actual_same_rate','last_hand_echo_gap','fresh_switch_accuracy'
+          ]}, sort_keys=True))
+          # The final model must not create materially more last-hand echo than V1.
+          assert calibrated['last_hand_echo_gap'] <= raw['last_hand_echo_gap'] + 0.02
+          # An IID control must not be advertised as a magical high-win-rate edge.
+          assert calibrated['accuracy'] < 0.55
+          PY
+      - name: Verify calibration caps and public contract
+        run: |
+          python - <<'PY'
+          from road_anti_echo import MAX_CONTEXT_RESIDUAL_WEIGHT, MAX_ECHO_SHRINK
+          from road_pattern_core import forecast_road_pattern
+          assert MAX_ECHO_SHRINK <= 0.72
+          assert MAX_CONTEXT_RESIDUAL_WEIGHT <= 0.10
+          r = forecast_road_pattern('BBBBBBP')
+          assert 'anti_echo_calibration' in r
+          assert r['v1_model_id'] == 'ROAD-PATTERN-PRIMARY-V1'
+          assert set(r['components']) == {'multi_window','pattern_replay','ngram','pattern_survival'}
+          assert r['derived_direction_weight'] <= 0.18
+          assert r['regime_direction_weight'] <= 0.12
+          assert r['direction'] in {'B','P'}
+          print(r['v1_probabilities'])
+          print(r['post_anti_echo_v1_probabilities'])
+          print(r['anti_echo_calibration'])
+          PY
+      - name: Verify protected OCR and screenshot sources untouched
+        run: |
+          changed="$(git diff --name-only origin/main...HEAD)"
+          echo "$changed"
+          for file in room_ocr.py baccarat_vision.py screen_pipeline.py screenshot_predictor.py road_detector.py; do
+            if echo "$changed" | grep -Fxq "$file"; then
+              echo "Forbidden OCR/screen change: $file"
+              exit 1
+            fi
+          done
+      - name: Check whitespace
+        run: git diff --check origin/main...HEAD
