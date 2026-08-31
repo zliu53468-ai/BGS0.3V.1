@@ -1,0 +1,54 @@
+name: Apply exact shoe first formal policy
+
+on:
+  push:
+    branches:
+      - fix/exact-shoe-first-formal-policy
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: ${{ !contains(github.event.head_commit.message, '[exact-shoe-first-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install focused test dependency
+        run: python -m pip install 'numpy>=1.26,<2.4'
+
+      - name: Apply exact-shoe-first patch
+        run: python tools/apply_exact_shoe_first_policy.py
+
+      - name: Compile changed Python modules
+        run: |
+          python -m py_compile \
+            predictor.py \
+            dynamic_prediction_policy.py \
+            shoe_composition.py \
+            test_formal_shoe_decision.py
+
+      - name: Run focused regression tests
+        run: |
+          python -m unittest -v \
+            test_shoe_constants \
+            test_shoe_composition \
+            test_formal_shoe_decision
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Commit patched sources
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add predictor.py dynamic_prediction_policy.py shoe_composition.py test_formal_shoe_decision.py
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git commit -m "Route formal decisions through exact shoe before road fallback [exact-shoe-first-applied]"
+          git push origin HEAD:fix/exact-shoe-first-formal-policy
