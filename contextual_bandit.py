@@ -14,13 +14,15 @@ import math
 
 import contextual_bandit_base_v5 as _base
 
-# Re-export the stable V5 public surface.
+# Re-export the stable V5 public surface plus compatibility symbols used by the
+# existing regression suite and any external integrations that imported them.
 for _name in getattr(_base, "__all__", []):
     globals()[_name] = getattr(_base, _name)
 
 ARMS = _base.ARMS
 CONTEXT_DIM = _base.CONTEXT_DIM
 CONTEXT_FEATURE_NAMES = _base.CONTEXT_FEATURE_NAMES
+ContextSnapshot = _base.ContextSnapshot
 ContextGenerator = _base.ContextGenerator
 ContextualLinUCB = _base.ContextualLinUCB
 ESTIMATED_CARDS_PER_ROUND = _base.ESTIMATED_CARDS_PER_ROUND
@@ -38,9 +40,42 @@ ROAD_PRIOR_SCORE_WEIGHT = _base.ROAD_PRIOR_SCORE_WEIGHT
 STATE_VERSION = _base.STATE_VERSION
 make_scope_key = _base.make_scope_key
 
+# Compatibility hook aliases. Regression tests patch these names on this module;
+# _sync_base_hooks propagates those patches into the stable implementation module.
+build_standard_derived_roads = _base.build_standard_derived_roads
+analyze_run_length_hazard = _base.analyze_run_length_hazard
+analyze_hidden_regime = _base.analyze_hidden_regime
+update_and_predict_engine = _base.update_and_predict_engine
+estimate_probabilistic_shoe = _base.estimate_probabilistic_shoe
+fresh_counts = _base.fresh_counts
+analyze_shoe_composition = _base.analyze_shoe_composition
+_read_state = _base._read_state
+_write_state = _base._write_state
+
+_ORIGINAL_CONTEXT_BUILD = ContextGenerator.build
 _ORIGINAL_UPDATE_SCOPE = ContextualLinUCB._update_scope
 _ORIGINAL_APPLY_PENDING = ContextualLinUCB._apply_pending
 _ORIGINAL_PREDICT = ContextualLinUCB.predict
+
+
+def _sync_base_hooks() -> None:
+    for name in (
+        "build_standard_derived_roads",
+        "analyze_run_length_hazard",
+        "analyze_hidden_regime",
+        "update_and_predict_engine",
+        "estimate_probabilistic_shoe",
+        "fresh_counts",
+        "analyze_shoe_composition",
+        "_read_state",
+        "_write_state",
+    ):
+        setattr(_base, name, globals()[name])
+
+
+def _context_build_synced(self, history, shoe_context=None):
+    _sync_base_hooks()
+    return _ORIGINAL_CONTEXT_BUILD(self, history, shoe_context)
 
 
 def _tie_freeze_result(*, action: str, actual_outcome: str, reason: str = "TIE_FREEZE_BRAIN") -> dict[str, Any]:
@@ -140,6 +175,7 @@ def _predict_with_exploit_means(
     shoe_context,
     scope_key: str,
 ) -> dict[str, Any]:
+    _sync_base_hooks()
     result = _ORIGINAL_PREDICT(
         self,
         history=deepcopy(history),
@@ -165,6 +201,7 @@ def _predict_with_exploit_means(
 
 # Patch the stable implementation in its defining module. Existing V5 functions
 # resolve these methods dynamically, so the public API remains unchanged.
+ContextGenerator.build = _context_build_synced
 ContextualLinUCB._update_scope = _update_scope_tie_freeze
 ContextualLinUCB._apply_pending = _apply_pending_tie_freeze
 ContextualLinUCB.predict = _predict_with_exploit_means
@@ -172,4 +209,4 @@ ContextualLinUCB.predict = _predict_with_exploit_means
 predict_bandit = _base.predict_bandit
 update_bandit = _base.update_bandit
 
-__all__ = list(getattr(_base, "__all__", []))
+__all__ = list(dict.fromkeys(list(getattr(_base, "__all__", [])) + ["ContextSnapshot"]))
