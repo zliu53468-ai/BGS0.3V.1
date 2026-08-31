@@ -1,16 +1,16 @@
-"""BGS production predictor: one LSTM + shoe + cut-card fusion core.
+"""BGS production predictor: Road-Primary B/P core for 50-70 hand shoes.
 
-Formal B/P direction is produced once by ``lstm_primary_policy``.  The fused
-model combines:
+Formal direction is produced only by the Big-Road sequence model in
+``road_pattern_core`` through ``road_only_policy``. The core combines:
 
-1. masked, class-balanced Big-Road LSTM sequence evidence;
-2. exact non-replacement remaining-shoe B/P evidence when exact composition is
-   available;
-3. continuous cut-card depth weighting tuned for a 50-70 hand shoe.
+* 6/10/16/24-hand multi-window SAME/SWITCH behaviour;
+* orientation-invariant historical pattern replay;
+* relation n-grams, orders 2-5;
+* pattern-survival / run-lifecycle evidence.
 
-Legacy road/Markov/LinUCB data is retained only for API diagnostics.  Hazard,
-HSMM and pattern-survival are no longer part of the formal prediction path.
-OCR, screenshot recognition and road detection are untouched.
+Shoe depth, remaining ratio and cut-card position only shrink confidence and
+therefore Kelly sizing. Exact remaining composition is diagnostic only and can
+never flip B/P. OCR, screenshot recognition and road detection are untouched.
 """
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ import secrets
 
 from dynamic_prediction_policy import (
     POLICY_VERSION,
-    lstm_primary_policy,
     normalize_big_road,
     recent_user_direction_feedback,
     record_online_feedback,
+    road_only_policy,
 )
 from money_management import MAX_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
@@ -59,19 +59,10 @@ def _history_values(history: Union[str, Iterable[Any], None]) -> List[Any]:
     if history is None:
         return []
     if isinstance(history, str):
-        compact = (
-            history.replace("|", "")
-            .replace(",", "")
-            .replace(" ", "")
-            .upper()
-        )
+        compact = history.replace("|", "").replace(",", "").replace(" ", "").upper()
         if compact and all(char in OUTCOMES for char in compact):
             return list(compact)
-        return [
-            part
-            for part in history.replace("|", ",").split(",")
-            if part.strip()
-        ]
+        return [part for part in history.replace("|", ",").split(",") if part.strip()]
     return list(history)
 
 
@@ -97,10 +88,7 @@ def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
     banker = _clip(road.get("banker_probability", 0.5))
     player = _clip(road.get("player_probability", 1.0 - banker))
     total = banker + player
-    if total <= 1e-12:
-        banker, player = 0.5, 0.5
-    else:
-        banker, player = banker / total, player / total
+    banker, player = (0.5, 0.5) if total <= 1e-12 else (banker / total, player / total)
     confidence = _clip(road.get("confidence_score", 0.0))
     return {
         "direction": "B" if banker >= player else "P",
@@ -112,10 +100,7 @@ def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _shoe_source(
-    context: Mapping[str, Any],
-    analysis: Mapping[str, Any],
-) -> str:
+def _shoe_source(context: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
     if not bool(analysis.get("available")):
         return "none"
     counts = context.get("remaining_counts")
@@ -128,16 +113,26 @@ def _shoe_source(
     return source if source in {"remaining_counts", "observed_cards"} else "none"
 
 
-def _resolved_confidence(
-    probabilities: Mapping[str, Any],
+def _calibrate_road_confidence(
+    *,
     direction: str,
-) -> float:
-    p_b = max(0.0, float(probabilities.get("B", 0.0) or 0.0))
-    p_p = max(0.0, float(probabilities.get("P", 0.0) or 0.0))
+    raw_probabilities: Mapping[str, Any],
+    shoe_confidence_factor: float,
+) -> tuple[dict[str, float], float, float]:
+    p_b = _clip(raw_probabilities.get("B", 0.5))
+    p_p = _clip(raw_probabilities.get("P", 0.5))
     total = p_b + p_p
-    if total <= 1e-12:
-        return 0.5
-    return float((p_b if direction == "B" else p_p) / total)
+    p_b, p_p = (0.5, 0.5) if total <= 1e-12 else (p_b / total, p_p / total)
+    side = "B" if str(direction).upper() == "B" else "P"
+    raw_confidence = p_b if side == "B" else p_p
+    factor = _clip(shoe_confidence_factor, 0.85, 1.0)
+    calibrated_confidence = _clip(0.5 + (raw_confidence - 0.5) * factor, 0.5, 0.75)
+    probabilities = {
+        "B": calibrated_confidence if side == "B" else 1.0 - calibrated_confidence,
+        "P": calibrated_confidence if side == "P" else 1.0 - calibrated_confidence,
+        "T": 0.0,
+    }
+    return probabilities, float(raw_confidence), float(calibrated_confidence)
 
 
 def predict(
@@ -151,7 +146,6 @@ def predict(
     road_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     del run_seed
-
     raw_history = _normalize_outcome_history(_history_values(history))
     big_road = normalize_big_road(raw_history)
     context = dict(shoe_context or {})
@@ -182,13 +176,11 @@ def predict(
         if supplied_road:
             road["scan_metadata"] = supplied_road
 
-    # Exact shoe analysis is retained as a transparent physical diagnostic.  The
-    # same exact probabilities are already consumed inside the fused LSTM model.
     shoe = dict(analyze_shoe_composition(context))
     shoe_available = bool(shoe.get("available"))
     composition_source = _shoe_source(context, shoe)
 
-    policy = lstm_primary_policy(
+    policy = road_only_policy(
         raw_history,
         shoe_context=context,
         user_id=user_id,
@@ -196,27 +188,22 @@ def predict(
         room=room,
         shoe_id=shoe_id,
     )
-    lstm_model = dict(policy.get("lstm") or {})
-    lstm_fusion = dict(lstm_model.get("fusion") or {})
-    shoe_fusion = dict(lstm_model.get("shoe_fusion") or {})
-    neural = dict(lstm_model.get("neural") or {})
-
+    road_pattern = dict(policy.get("road_pattern") or {})
     direction = str(policy.get("direction") or "B").upper().strip()
     if direction not in {"B", "P"}:
         direction = "B"
-    probabilities = dict(policy.get("probabilities") or {})
-    p_b = _clip(probabilities.get("B", 0.5))
-    p_p = _clip(probabilities.get("P", 0.5))
-    total = p_b + p_p
-    if total <= 1e-12:
-        p_b = p_p = 0.5
-    else:
-        p_b, p_p = p_b / total, p_p / total
-    probabilities = {"B": float(p_b), "P": float(p_p), "T": 0.0}
-    confidence = _resolved_confidence(probabilities, direction)
-    raw_confidence = confidence
-    formal_source = "lstm_road_model"
+
+    raw_probabilities = dict(policy.get("probabilities") or {"B": 0.5, "P": 0.5, "T": 0.0})
+    shoe_factor = float(depth.get("shoe_confidence_factor", 1.0) or 1.0)
+    probabilities, raw_confidence, confidence = _calibrate_road_confidence(
+        direction=direction,
+        raw_probabilities=raw_probabilities,
+        shoe_confidence_factor=shoe_factor,
+    )
+    p_b = float(probabilities["B"])
+    p_p = float(probabilities["P"])
     text = "莊" if direction == "B" else "閒"
+    formal_source = "road_pattern_core"
 
     money = _MONEY.allocate(
         direction=direction,
@@ -225,53 +212,18 @@ def predict(
         bankroll=bankroll,
     )
     final_ratio = float(money.get("final_bet_ratio", 0.05) or 0.05)
-    bet_percentage = float(
-        money.get("bet_percentage", final_ratio * 100.0)
-        or final_ratio * 100.0
-    )
+    bet_percentage = float(money.get("bet_percentage", final_ratio * 100.0) or final_ratio * 100.0)
 
-    remaining_cards = float(
-        shoe_fusion.get("remaining_cards", depth.get("remaining_cards", 0.0)) or 0.0
-    )
-    remaining_source = str(
-        shoe_fusion.get("depth_feature_source")
-        or depth.get("remaining_cards_source")
-        or "round_count_estimate"
-    )
-    remaining_ratio = float(
-        shoe_fusion.get("remaining_ratio", depth.get("remaining_ratio", 1.0)) or 0.0
-    )
-    penetration = float(
-        shoe_fusion.get("penetration", depth.get("penetration", 0.0)) or 0.0
-    )
-    shoe_stage = str(
-        shoe_fusion.get("shoe_stage", depth.get("shoe_stage", "UNKNOWN"))
-        or "UNKNOWN"
-    )
-    cut_progress = float(
-        shoe_fusion.get("cut_progress", depth.get("cut_progress", 0.0)) or 0.0
-    )
-    cut_remaining = float(
-        shoe_fusion.get(
-            "cut_card_remaining_cards",
-            depth.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING),
-        )
-        or DEFAULT_CUT_CARD_REMAINING
-    )
+    remaining_cards = float(depth.get("remaining_cards", 0.0) or 0.0)
+    remaining_source = str(depth.get("remaining_cards_source") or "round_count_estimate")
+    remaining_ratio = float(depth.get("remaining_ratio", 1.0) or 0.0)
+    penetration = float(depth.get("penetration", 0.0) or 0.0)
+    shoe_stage = str(depth.get("shoe_stage", "UNKNOWN") or "UNKNOWN")
+    cut_progress = float(depth.get("cut_progress", 0.0) or 0.0)
+    cut_remaining = float(depth.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING) or DEFAULT_CUT_CARD_REMAINING)
     exact_counts = list(shoe.get("remaining_counts") or []) if shoe_available else []
-    shoe_reliability = float(
-        shoe_fusion.get("remaining_cards_reliability", 0.0) or 0.0
-    )
 
-    lstm_weight = float(lstm_fusion.get("lstm_weight", 0.0) or 0.0)
-    shoe_direction_weight = float(lstm_fusion.get("shoe_weight", 0.0) or 0.0)
-    structure_weight = float(lstm_fusion.get("structure_weight", 0.0) or 0.0)
-    exact_shoe_used_for_direction = bool(
-        shoe_fusion.get("exact_composition_available", False)
-        and shoe_direction_weight > 0.0
-    )
-
-    fallback_markov = dict(policy.get("fallback_markov") or {})
+    markov_predict = dict(policy.get("fallback_markov") or {})
     road_diag = _road_diagnostic(road)
     road_forecaster_diag = dict(policy.get("road_forecaster_diagnostic") or {})
     road_forecaster = dict(policy.get("road_forecaster") or {})
@@ -295,97 +247,24 @@ def predict(
                 str(room).strip(),
                 str(shoe_id).strip(),
                 POLICY_VERSION,
-                composition_source,
                 f"cut={cut_remaining:.2f}",
             )
         ).encode("utf-8")
     ).hexdigest()[:24]
 
-    context_meta = dict(policy.get("context_metadata") or {})
-    context_meta.update(
-        {
-            "formal_direction_source": formal_source,
-            "primary_model": "LSTM_SHOE_CUT_FUSION",
-            "shoe_context_used_for_formal_direction": True,
-            "exact_shoe_composition_used_for_direction": exact_shoe_used_for_direction,
-            "card_composition_direction_weight": shoe_direction_weight,
-            "lstm_direction_weight": lstm_weight,
-            "structure_direction_weight": structure_weight,
-            "fallback_markov_direction_weight": 0.0,
-            "road_context_direction_weight": 0.0,
-            "road_direction_weight": 0.0,
-            "card_composition_source": composition_source,
-            "remaining_counts_source": composition_source,
-            "remaining_cards": remaining_cards,
-            "remaining_cards_source": remaining_source,
-            "remaining_ratio": remaining_ratio,
-            "penetration": penetration,
-            "shoe_stage": shoe_stage,
-            "cut_card_remaining_cards": cut_remaining,
-            "cut_progress": cut_progress,
-            "target_hands_min": int(TARGET_HANDS_MIN),
-            "target_hands_max": int(TARGET_HANDS_MAX),
-            "estimated_remaining_counts_0_to_9": exact_counts,
-        }
-    )
-    policy.update(
-        {
-            "context_metadata": context_meta,
-            "direction": direction,
-            "selected_arm": direction,
-            "action": direction,
-            "action_text": text,
-            "latent_direction": direction,
-            "probabilities": probabilities,
-            "selected_win_probability": confidence,
-            "confidence": confidence,
-            "confidence_prob": confidence,
-            "selection_reason": "single_lstm_shoe_cut_fusion",
-            "formal_context_source": "big_road_plus_shoe_plus_cut_depth",
-            "road_context_direction_weight": 0.0,
-            "road_direction_weight": 0.0,
-            "card_composition_direction_weight": shoe_direction_weight,
-            "shoe_context_used_for_formal_direction": True,
-        }
-    )
-
-    markov_predict = {
-        **fallback_markov,
-        "direction": str(fallback_markov.get("direction") or ""),
-        "probabilities": dict(
-            fallback_markov.get("probabilities")
-            or {"B": 0.5, "P": 0.5, "T": 0.0}
-        ),
-        "diagnostic_only": True,
-        "formal_direction_weight": 0.0,
-        "state_key": "MARKOV_DIAGNOSTIC_ONLY",
-    }
-
+    survival_component = dict((road_pattern.get("components") or {}).get("pattern_survival") or {})
     component_probabilities = {
-        "lstm_shoe_cut_fusion": probabilities,
-        "lstm_neural_branch": {
-            "B": float(neural.get("probability_b", 0.5) or 0.5),
-            "P": float(neural.get("probability_p", 0.5) or 0.5),
-            "T": 0.0,
-        },
-        "time_decay_markov_diagnostic": dict(
-            fallback_markov.get("probabilities")
-            or {"B": 0.5, "P": 0.5, "T": 0.0}
-        ),
-        "road_forecaster_diagnostic": dict(
-            road_forecaster_diag.get("probabilities")
-            or {"B": 0.5, "P": 0.5, "T": 0.0}
-        ),
-        "road_diagnostic": {
-            "B": road_diag["banker_probability"],
-            "P": road_diag["player_probability"],
-            "T": 0.0,
-        },
+        "road_pattern_primary": dict(raw_probabilities),
+        "road_pattern_after_shoe_confidence": dict(probabilities),
+        "multi_window": dict((road_pattern.get("components") or {}).get("multi_window") or {}),
+        "pattern_replay": dict((road_pattern.get("components") or {}).get("pattern_replay") or {}),
+        "ngram": dict((road_pattern.get("components") or {}).get("ngram") or {}),
+        "pattern_survival": survival_component,
+        "time_decay_markov_diagnostic": dict(markov_predict.get("probabilities") or {"B": 0.5, "P": 0.5, "T": 0.0}),
+        "road_diagnostic": {"B": road_diag["banker_probability"], "P": road_diag["player_probability"], "T": 0.0},
     }
     if shoe_available:
-        component_probabilities["exact_shoe_nonreplacement"] = dict(
-            shoe.get("probabilities") or {}
-        )
+        component_probabilities["exact_shoe_diagnostic_only"] = dict(shoe.get("probabilities") or {})
 
     remaining_state = {
         "available": True,
@@ -395,75 +274,80 @@ def predict(
         "remaining_ratio": remaining_ratio,
         "penetration": penetration,
         "shoe_stage": shoe_stage,
+        "shoe_stage_factor": shoe_factor,
         "cut_card_remaining_cards": cut_remaining,
         "cut_progress": cut_progress,
         "cut_proximity": cut_progress,
-        "cards_until_cut": float(shoe_fusion.get("cards_until_cut", 0.0) or 0.0),
-        "estimated_hands_until_cut": float(
-            shoe_fusion.get("estimated_hands_until_cut", 0.0) or 0.0
-        ),
-        "reliability": shoe_reliability,
+        "cards_until_cut": float(depth.get("cards_until_cut", 0.0) or 0.0),
+        "estimated_hands_until_cut": float(depth.get("estimated_hands_until_cut", 0.0) or 0.0),
+        "reliability": float(depth.get("remaining_cards_reliability", 0.0) or 0.0),
         "exact_composition": shoe_available,
         "source": remaining_source,
-        "direction_authority": "through_lstm_shoe_cut_fusion",
-        "semantics": "physical_shoe_and_cut_features_inside_single_formal_fusion",
+        "direction_authority": False,
+        "semantics": "shoe_depth_and_cut_confidence_only_never_BP_direction",
     }
 
     shoe_estimate = {
-        "direction": str(shoe_fusion.get("shoe_direction") or "") or None,
-        "probabilities": dict(
-            shoe.get("probabilities")
-            or {"B": 0.5, "P": 0.5, "T": 0.0}
-        ),
+        "direction": None,
+        "probabilities": dict(shoe.get("probabilities") or {"B": 0.5, "P": 0.5, "T": 0.0}),
         "expected_remaining_cards": remaining_cards,
         "expected_remaining_decks": remaining_cards / float(CARDS_PER_DECK),
         "expected_remaining_counts": exact_counts,
         "remaining_card_state": remaining_state,
         "conditioned_rounds": len(raw_history),
-        "reliability": shoe_reliability,
-        "fusion_weight": shoe_direction_weight,
+        "reliability": float(depth.get("remaining_cards_reliability", 0.0) or 0.0),
+        "fusion_weight": 0.0,
         "depth_constraint_applied": True,
-        "depth_constraint": {
-            "applied": True,
-            "target_remaining_cards": remaining_cards,
-            "source": remaining_source,
+        "source": composition_source,
+        "expected_returns": shoe_returns,
+        "direction_authority": False,
+        "inference_semantics": "shoe_is_diagnostic_and_confidence_only_road_owns_BP",
+    }
+
+    pattern_name = str(road_pattern.get("pattern") or survival_component.get("pattern") or "GENERIC")
+    survival_score = float(road_pattern.get("pattern_survival_score", 0.5) or 0.5)
+    signal_code = "ROAD_PATTERN_PRIMARY_KELLY_5_30"
+    signal_reason = (
+        f"Primary=RoadPattern；pattern={pattern_name}；raw={raw_confidence:.3f}；"
+        f"shoeFactor={shoe_factor:.3f}；final={confidence:.3f}；"
+        f"P(B)={p_b:.3f}；P(P)={p_p:.3f}；Kelly={bet_percentage:.2f}%。"
+    )
+
+    context_meta = dict(policy.get("context_metadata") or {})
+    context_meta.update(
+        {
+            "formal_direction_source": formal_source,
+            "primary_model": "ROAD_PATTERN_CORE",
+            "road_direction_weight": 1.0,
+            "road_context_direction_weight": 1.0,
+            "shoe_context_used_for_formal_direction": False,
+            "exact_shoe_composition_used_for_direction": False,
+            "card_composition_direction_weight": 0.0,
+            "lstm_direction_weight": 0.0,
+            "fallback_markov_direction_weight": 0.0,
+            "remaining_cards": remaining_cards,
             "remaining_ratio": remaining_ratio,
             "penetration": penetration,
             "shoe_stage": shoe_stage,
-            "cut_card_remaining_cards": cut_remaining,
             "cut_progress": cut_progress,
-            "direction_authority": "weighted_inside_lstm_fusion",
-        },
-        "source": composition_source,
-        "expected_returns": shoe_returns,
-        "inference_semantics": "exact_shoe_direction_if_available_plus_cut_depth_weighted_in_lstm_fusion",
-    }
-
-    signal_code = "LSTM_SHOE_CUT_TWO_ARM_KELLY_5_30"
-    signal_reason = (
-        f"Primary=LSTM+Shoe+Cut；LSTMw={lstm_weight:.3f}；"
-        f"Shoew={shoe_direction_weight:.3f}；Structw={structure_weight:.3f}；"
-        f"cut={cut_progress:.3f}；P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
-        f"Kelly={bet_percentage:.2f}%。"
+            "target_hands_min": int(TARGET_HANDS_MIN),
+            "target_hands_max": int(TARGET_HANDS_MAX),
+        }
     )
 
     result: Dict[str, Any] = {
         "ok": True,
-        "engine": "LSTM_SHOE_CUT_FUSION_BP",
+        "engine": "ROAD_PATTERN_PRIMARY_BP",
         "model_version": POLICY_VERSION,
         "system_model_version": POLICY_VERSION,
-        "shoe_posterior_model_version": (
-            "EXACT_NON_REPLACEMENT_IN_FUSION_V2"
-            if shoe_available
-            else "CUT_DEPTH_WITHOUT_EXACT_COMPOSITION_V2"
-        ),
-        "model_variant": "BALANCED_MASKED_LSTM_EXACT_SHOE_CUT_50_70_KELLY_5_30",
-        "model_core": "lstm_shoe_cut_fusion",
-        "primary_model": "LSTM_SHOE_CUT_FUSION",
-        "decision_pipeline": "big_road_BP_to_balanced_masked_LSTM_plus_exact_shoe_logit_plus_50_70_cut_weight_to_BP_to_kelly",
+        "shoe_posterior_model_version": "SHOE_DEPTH_CONFIDENCE_ONLY_V1",
+        "model_variant": "ROAD_MULTIWINDOW_PATTERN_REPLAY_NGRAM_SURVIVAL_50_70_KELLY_5_30",
+        "model_core": "road_pattern_core",
+        "primary_model": "ROAD_PATTERN_CORE",
+        "decision_pipeline": "big_road_BP_to_multiwindow_pattern_replay_ngram_survival_to_shoe_depth_confidence_to_kelly",
         "prediction_fingerprint": fingerprint,
         "probabilities": probabilities,
-        "raw_direction_probabilities": {"B": p_b, "P": p_p},
+        "raw_direction_probabilities": dict(raw_probabilities),
         "banker_rate": round(p_b * 100.0, 2),
         "player_rate": round(p_p * 100.0, 2),
         "tie_rate": 0.0,
@@ -487,14 +371,14 @@ def predict(
         "internal_signal_reason": signal_reason,
         "direction_source": formal_source,
         "formal_direction_source": formal_source,
-        "shoe_context_used_for_formal_direction": True,
-        "exact_shoe_composition_used_for_direction": exact_shoe_used_for_direction,
-        "card_composition_direction_weight": shoe_direction_weight,
-        "lstm_direction_weight": lstm_weight,
-        "structure_direction_weight": structure_weight,
+        "road_direction_weight": 1.0,
+        "road_context_direction_weight": 1.0,
+        "shoe_context_used_for_formal_direction": False,
+        "exact_shoe_composition_used_for_direction": False,
+        "card_composition_direction_weight": 0.0,
+        "lstm_direction_weight": 0.0,
+        "structure_direction_weight": 0.0,
         "fallback_markov_direction_weight": 0.0,
-        "road_context_direction_weight": 0.0,
-        "road_direction_weight": 0.0,
         "card_composition_source": composition_source,
         "remaining_counts_source": composition_source,
         "remaining_cards_source": remaining_source,
@@ -512,68 +396,39 @@ def predict(
         "player_expected_return": player_ev,
         "banker_ev": banker_ev,
         "player_ev": player_ev,
-        "shoe_composition": {
-            **shoe,
-            "formal_direction_authority": exact_shoe_used_for_direction,
-            "direction_weight_inside_fusion": shoe_direction_weight,
-        },
+        "shoe_composition": {**shoe, "formal_direction_authority": False, "direction_weight_inside_fusion": 0.0},
         "confidence": confidence,
-        "raw_lstm_confidence": float(
-            max(
-                float(neural.get("probability_b", 0.5) or 0.5),
-                float(neural.get("probability_p", 0.5) or 0.5),
-            )
-        ),
+        "raw_lstm_confidence": 0.5,
         "raw_model_confidence": raw_confidence,
-        "raw_markov_confidence": float(
-            fallback_markov.get("selected_win_probability", 0.5) or 0.5
-        ),
+        "raw_markov_confidence": float(markov_predict.get("selected_win_probability", 0.5) or 0.5),
         "pattern_calibrated_confidence": confidence,
         "ensemble_confidence": confidence,
         "quality_score": confidence,
-        "confidence_label": (
-            "較高" if confidence >= 0.56 else "中等" if confidence >= 0.52 else "保守"
-        ),
+        "confidence_label": "較高" if confidence >= 0.56 else "中等" if confidence >= 0.52 else "保守",
         "confidence_calibration": {
-            "applied": False,
-            "reason": "formal_probability_already_calibrated_inside_single_lstm_shoe_cut_fusion",
+            "applied": bool(shoe_factor < 0.999999),
+            "raw_confidence": raw_confidence,
+            "shoe_stage_factor": shoe_factor,
+            "final_confidence": confidence,
             "direction_override": False,
+            "semantics": "shrink_road_margin_only_never_flip_direction",
         },
-        "transition_calibration": {
-            "applied": False,
-            "disabled": True,
-            "formal_direction_weight": 0.0,
-        },
+        "transition_calibration": {"applied": False, "disabled": True, "formal_direction_weight": 0.0},
         "entropy_bits": 0.0,
         "entropy_base_weight": confidence,
-        "shoe_progress": float(depth["shoe_progress"]),
-        "shoe_depth_estimate": {
-            **depth,
-            "rounds": len(raw_history),
-            "remaining_cards": remaining_cards,
-            "remaining_cards_source": remaining_source,
-            "source": remaining_source,
-            "exact_composition": shoe_available,
-            "remaining_ratio": remaining_ratio,
-            "penetration": penetration,
-            "shoe_stage": shoe_stage,
-            "cut_card_remaining_cards": cut_remaining,
-            "cut_progress": cut_progress,
-            "direction_authority": "weighting_inside_lstm_fusion",
-        },
+        "shoe_progress": float(depth.get("shoe_progress", 0.0) or 0.0),
+        "shoe_depth_estimate": {**depth, "rounds": len(raw_history), "direction_authority": False},
         "remaining_card_state": remaining_state,
         "estimated_remaining_cards": remaining_cards,
-        "estimated_remaining_interval": {
-            "low": remaining_cards,
-            "high": remaining_cards,
-        },
+        "estimated_remaining_interval": {"low": remaining_cards, "high": remaining_cards},
         "shoe_stage": shoe_stage,
         "pattern_survival": {
-            "score": 1.0,
-            "mode": "disabled_formal_core",
+            **survival_component,
+            "score": survival_score,
+            "mode": "formal_road_component",
             "direction_override": False,
         },
-        "pattern_survival_score": 1.0,
+        "pattern_survival_score": survival_score,
         "run_length_hazard": {},
         "run_length_hazard_weight": 0.0,
         "probabilistic_shoe_estimate": shoe_estimate,
@@ -583,43 +438,33 @@ def predict(
         "selected_expected_return": selected_ev,
         "selected_expected_return_percent": selected_ev * 100.0,
         "bet_allowed": True,
-        "markov": markov_predict,
-        "markov_probs": dict(
-            fallback_markov.get("probabilities")
-            or {"B": 0.5, "P": 0.5, "T": 0.0}
-        ),
+        "markov": {**markov_predict, "diagnostic_only": True, "formal_direction_weight": 0.0},
+        "markov_probs": dict(markov_predict.get("probabilities") or {"B": 0.5, "P": 0.5, "T": 0.0}),
         "final_probs": probabilities,
         "direction_probs": probabilities,
         "economic_probs": probabilities,
         "final_probability": probabilities[direction],
-        "economic_probability_for_direction": float(
-            money.get("resolved_win_probability", confidence) or confidence
-        ),
+        "economic_probability_for_direction": float(money.get("resolved_win_probability", confidence) or confidence),
         "markov_predict": markov_predict,
         "probabilistic_shoe_predict": shoe_estimate,
         "fusion_decision": {
             "direction": direction,
             "probabilities": probabilities,
-            "lstm_weight": lstm_weight,
-            "shoe_composition_weight": shoe_direction_weight,
-            "structure_weight": structure_weight,
-            "cut_progress": cut_progress,
+            "road_pattern_weight": 1.0,
+            "shoe_composition_weight": 0.0,
+            "lstm_weight": 0.0,
             "fallback_markov_weight": 0.0,
-            "markov_prior_weight": 0.0,
-            "road_forecaster_weight": 0.0,
-            "run_length_hazard_likelihood_power": 0.0,
-            "road_applied": False,
+            "road_applied": True,
             "hazard_applied": False,
-            "method": "single_lstm_shoe_cut_fusion",
-            "semantics": "one_fused_logit_owns_direction",
-            "details": lstm_fusion,
+            "method": "road_pattern_core",
+            "semantics": "road_only_direction_shoe_cut_confidence_only",
+            "details": dict(road_pattern.get("component_weights") or {}),
         },
         "fusion": {
-            "method": "lstm_shoe_cut_fusion",
-            "shoe_reliability": shoe_reliability,
-            "road_reliability": 0.0,
+            "method": "road_pattern_primary",
+            "road_reliability": float(road_pattern.get("effective_weight_sum", 0.0) or 0.0),
             "hazard_reliability": 0.0,
-            "lstm_reliability": float(neural.get("maturity", 0.0) or 0.0),
+            "lstm_reliability": 0.0,
             "cut_progress": cut_progress,
         },
         "markov_state": {
@@ -628,26 +473,33 @@ def predict(
             "density": "unused_for_formal_direction",
             "tie_trigger": "TiesSkipped",
             "sample_count": len(big_road),
-            "effective_support": float(
-                fallback_markov.get("context_support", 0.0) or 0.0
-            ),
+            "effective_support": float(markov_predict.get("context_support", 0.0) or 0.0),
             "state_count": 2,
-            "selected_order": int(fallback_markov.get("selected_order", 1) or 1),
+            "selected_order": int(markov_predict.get("selected_order", 1) or 1),
             "change_point": False,
             "shoe_stage": shoe_stage,
-            "pattern_survival_score": 1.0,
+            "pattern_survival_score": survival_score,
         },
-        "road_predict": road_diag,
+        "road_predict": {
+            "direction": direction,
+            "banker_probability": float(raw_probabilities.get("B", 0.5) or 0.5),
+            "player_probability": float(raw_probabilities.get("P", 0.5) or 0.5),
+            "confidence": raw_confidence,
+            "decision_weight": 1.0,
+            "diagnostic_only": False,
+            "model_id": road_pattern.get("model_id"),
+        },
         "road_support": road,
+        "road_pattern_model": road_pattern,
         "derived_road_analysis": dict(policy.get("regression_analysis") or {}),
         "road_fusion": {
-            "applied": False,
-            "mode": "diagnostic_only",
-            "reliability": 0.0,
-            "raw_reliability": 0.0,
-            "pattern_survival_score": 1.0,
-            "likelihood": None,
-            "reason": "formal direction is owned by LSTM+shoe+cut fusion",
+            "applied": True,
+            "mode": "formal_road_pattern_primary",
+            "reliability": float(road_pattern.get("effective_weight_sum", 0.0) or 0.0),
+            "raw_reliability": float(road_pattern.get("effective_weight_sum", 0.0) or 0.0),
+            "pattern_survival_score": survival_score,
+            "likelihood": dict(raw_probabilities),
+            "reason": "formal direction is owned by road_pattern_core",
         },
         "run_length_hazard_fusion": {
             "applied": False,
@@ -660,24 +512,18 @@ def predict(
             "support": 0.0,
             "confidence_factor": 1.0,
             "direction_override": False,
-            "reason": "disabled in production LSTM-shoe-cut core",
+            "reason": "disabled_formal_core_is_road_pattern",
         },
         "component_probabilities": component_probabilities,
         "money_management": money,
         "kelly_fraction": float(money.get("kelly_fraction", final_ratio) or final_ratio),
-        "pre_tie_adjusted_ratio": float(
-            money.get("pre_tie_adjusted_ratio", final_ratio) or final_ratio
-        ),
+        "pre_tie_adjusted_ratio": float(money.get("pre_tie_adjusted_ratio", final_ratio) or final_ratio),
         "adjusted_ratio": float(money.get("adjusted_ratio", final_ratio) or final_ratio),
         "final_bet_ratio": final_ratio,
         "bet_percentage": bet_percentage,
         "suggested_bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
         "bet_amount": float(money.get("bet_amount", 0.0) or 0.0),
-        "bet_multiplier": (
-            min(1.0, final_ratio / MAX_BET_RATIO)
-            if MAX_BET_RATIO > 0.0
-            else 1.0
-        ),
+        "bet_multiplier": min(1.0, final_ratio / MAX_BET_RATIO) if MAX_BET_RATIO > 0.0 else 1.0,
         "context_vector": context_vector,
         "bandit_context": context_vector,
         "context_feature_names": feature_names,
@@ -692,12 +538,12 @@ def predict(
         "linucb_diagnostic_only": True,
         "linucb_direction_weight": 0.0,
         "road_forecaster": road_forecaster,
-        "lstm_enabled": True,
-        "lstm_primary": True,
-        "lstm_shoe_cut_fusion": True,
-        "lstm_model": lstm_model,
+        "lstm_enabled": False,
+        "lstm_primary": False,
+        "lstm_shoe_cut_fusion": False,
+        "lstm_model": {"available": False, "formal_direction_weight": 0.0, "reason": "disabled_formal_core_is_road_pattern"},
         "lstm_fallback_active": False,
-        "lstm_fallback_reason": "",
+        "lstm_fallback_reason": "disabled",
         "cusum_linucb_enabled": False,
         "force_observe": False,
         "hard_brake_active": False,
@@ -706,22 +552,22 @@ def predict(
         "venue": str(venue or ""),
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
-        "probability_semantics": "resolved_BP_probability_from_single_lstm_shoe_cut_fusion",
+        "probability_semantics": "resolved_BP_probability_from_road_pattern_core_then_shoe_depth_margin_shrink",
         "dynamic_prediction_policy": {
             "version": POLICY_VERSION,
-            "lstm_primary": True,
-            "lstm_shoe_cut_fusion": True,
+            "road_primary": True,
+            "lstm_primary": False,
             "fallback_active": False,
             "big_road_rounds": len(big_road),
             "forecast": policy,
             "penalty_observe": {"active": False, "force_observe": False},
             "exact_card_dependency": False,
-            "exact_card_used_when_available": exact_shoe_used_for_direction,
-            "shoe_probability_decision_weight": shoe_direction_weight,
+            "exact_card_used_when_available": False,
+            "shoe_probability_decision_weight": 0.0,
             "ocr_or_screen_flow_modified": False,
             "formal_direction_source": formal_source,
             "card_composition_source": composition_source,
-            "shoe_direction_authority": "inside_single_fusion",
+            "shoe_direction_authority": False,
             "cut_progress": cut_progress,
         },
         "dynamic_policy_version": POLICY_VERSION,
@@ -733,7 +579,7 @@ def predict(
         "decision_gate": {
             "decision": direction,
             "allowed": True,
-            "reason": "single_lstm_shoe_cut_fusion_always_returns_BP",
+            "reason": "road_pattern_core_always_returns_BP",
             "direction": direction,
             "resolved_confidence": confidence,
             "expected_net_ev": selected_ev,
@@ -744,24 +590,20 @@ def predict(
             "bp_round_count": len(big_road),
             "ties_ignored_for_direction_context": len(raw_history) - len(big_road),
         },
+        "context_metadata": context_meta,
     }
     return result
 
 
-def run_virtual_round(
-    session: Mapping[str, Any],
-    run_seed: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Predict with exact hidden-shoe composition, then reveal one virtual hand."""
+def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None) -> Dict[str, Any]:
+    """Predict from road history, then reveal one virtual hand."""
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
 
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
     if len(hidden_shoe) < 6:
         raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
     history = _normalize_outcome_history(list(session.get("round_history") or []))
-    seed = int(
-        run_seed if run_seed is not None else secrets.randbits(32)
-    ) & 0xFFFFFFFF
+    seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     prediction = predict(
         history=history,
         venue=str(session.get("venue") or ""),
@@ -774,23 +616,16 @@ def run_virtual_round(
             "remaining_cards": len(hidden_shoe),
             "remaining_counts": counts_from_shoe(hidden_shoe),
             "remaining_cards_reliability": 1.0,
-            "remaining_cards_source": "virtual_shoe_exact_counts",
+            "remaining_cards_source": "virtual_shoe_exact_counts_diagnostic_only",
             "source": "remaining_counts",
-            "cut_card_remaining_cards": float(
-                session.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING)
-                or DEFAULT_CUT_CARD_REMAINING
-            ),
+            "cut_card_remaining_cards": float(session.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING) or DEFAULT_CUT_CARD_REMAINING),
         },
     )
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe)
     hand_data = hand.as_dict()
     predicted = str(prediction.get("action") or "B").upper()
     actual = str(hand.outcome or "").upper()
-    verdict = (
-        "TIE_SKIPPED"
-        if actual == "T"
-        else ("HIT" if predicted == actual else "MISS")
-    )
+    verdict = "TIE_SKIPPED" if actual == "T" else ("HIT" if predicted == actual else "MISS")
     update = record_online_feedback(
         scope_key=str(prediction.get("bandit_scope_key") or ""),
         action=predicted,
@@ -800,16 +635,12 @@ def run_virtual_round(
     prediction.update(
         {
             "ok": True,
-            "mode": "virtual_shoe_lstm_shoe_cut_fusion",
+            "mode": "virtual_shoe_road_pattern_primary",
             "virtual_hand": hand_data,
             "virtual_outcome": actual,
             "virtual_outcome_text": hand_data["outcome_text"],
             "verdict": verdict,
-            "verdict_text": {
-                "HIT": "命中",
-                "MISS": "未命中",
-                "TIE_SKIPPED": "和局不計",
-            }[verdict],
+            "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict],
             "cards_consumed": int(hand.cards_used),
             "remaining_cards_after": len(remaining_shoe),
             "remaining_counts_after": counts_from_shoe(remaining_shoe),
@@ -817,17 +648,13 @@ def run_virtual_round(
             "bandit_learning_applied": bool(update.get("updated", False)),
             "bandit_update": update,
             "disclaimer": (
-                "正式方向由單一 LSTM+精確牌靴+50-70 局切牌深度融合產生；"
-                "Markov/LinUCB/hazard/HSMM 不參與正式方向。"
-                "單局結果具有高變異，模型機率不代表保證獲利。"
+                "正式方向僅由大路 Road-Pattern 模型產生；牌靴與切牌只調整信心與注碼。"
+                "LSTM/LinUCB/Markov/hazard/HSMM 不參與正式方向。單局結果具有高變異，"
+                "模型機率不代表保證獲利。"
             ),
         }
     )
-    return {
-        "prediction": prediction,
-        "hand": hand_data,
-        "remaining_shoe": remaining_shoe,
-    }
+    return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
 
 def parse_point_observation(value: Any) -> None:
