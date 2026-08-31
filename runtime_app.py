@@ -1,13 +1,14 @@
 """Runtime entrypoint for the BGS LINE/FastAPI application.
 
 The runtime installs the dynamic policy before loading the legacy app, then
-keeps the formal predictor contract intact at the UI bankroll bridge:
+keeps the formal predictor contract intact at the UI boundary:
 - formal action is always B/P;
+- shoe evidence priority is remaining_counts > observed_cards > none;
 - exact shoe EV owns direction when exact composition is available;
 - road forecaster is the fallback when it is not;
 - the core fractional-Kelly ratio is preserved inside the 5%..30% product band.
 
-OCR, screenshot upload, LINE transport and UI layout remain unchanged.
+OCR, screenshot recognition, LINE transport and UI layout remain unchanged.
 """
 from __future__ import annotations
 
@@ -42,6 +43,37 @@ def _formal_bp_action(result: Mapping[str, Any]) -> str:
     return "B" if banker >= player else "P"
 
 
+def _formal_shoe_context(session: Mapping[str, Any]) -> dict[str, Any]:
+    """Read verified shoe evidence from Session using the formal priority order."""
+    context: dict[str, Any] = {
+        "bankroll": max(0.0, float(session.get("bankroll", 0.0) or 0.0)),
+    }
+
+    # Priority 1: explicitly supplied remaining point counts (0..9).
+    counts = session.get("exact_remaining_counts")
+    if isinstance(counts, list) and len(counts) == 10:
+        context.update(
+            {
+                "remaining_counts": list(counts),
+                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "source": "remaining_counts",
+            }
+        )
+        return context
+
+    # Priority 2: actual observed card values saved by /api/shoe/cards.
+    observed = session.get("observed_cards")
+    if isinstance(observed, list) and observed:
+        context.update(
+            {
+                "observed_cards": list(observed),
+                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "source": "observed_cards",
+            }
+        )
+    return context
+
+
 def _attach_formal_bankroll_advice(
     prediction: Mapping[str, Any],
     session: Mapping[str, Any],
@@ -64,6 +96,7 @@ def _attach_formal_bankroll_advice(
         core_ratio = MIN_FORMAL_BET_RATIO
     ratio = max(MIN_FORMAL_BET_RATIO, min(MAX_FORMAL_BET_RATIO, core_ratio))
     amount = bankroll * ratio
+    text = "莊" if action == "B" else "閒"
 
     result.update(
         {
@@ -71,10 +104,10 @@ def _attach_formal_bankroll_advice(
             "recommend": action,
             "next_round_direction": action,
             "direction": action,
-            "action_text": "莊" if action == "B" else "閒",
-            "recommend_text": "莊" if action == "B" else "閒",
-            "next_round_direction_text": "莊" if action == "B" else "閒",
-            "direction_text": "莊" if action == "B" else "閒",
+            "action_text": text,
+            "recommend_text": text,
+            "next_round_direction_text": text,
+            "direction_text": text,
             "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
             "risk_gate_open": True,
             "signal_allowed": True,
@@ -117,6 +150,9 @@ def _attach_formal_bankroll_advice(
     return result
 
 
+# app.py still contains legacy compatibility helpers. Override only these two
+# runtime seams instead of modifying OCR/screenshot/LINE code in the large file.
+legacy_app._exact_shoe_context = _formal_shoe_context
 legacy_app._attach_bankroll_advice = _attach_formal_bankroll_advice
 app = legacy_app.app
 
