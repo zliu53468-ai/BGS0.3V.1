@@ -209,7 +209,7 @@ def _state_posterior(
     entropy = -sum(p * math.log(p) for p in posterior.values() if p > 1e-15)
     concentration = _clip(1.0 - entropy / math.log(len(STATE_NAMES)))
     history_factor = _clip(len(sequence) / 24.0)
-    reliability = _clip(history_factor * (0.30 + 0.70 * concentration))
+    hidden_regime_reliability = _clip(history_factor * (0.30 + 0.70 * concentration))
     dominant_state = max(posterior, key=posterior.get)
     transition_probability = _clip(posterior["S2_TRANSITION"] + 0.40 * posterior["S3_NOISE"])
     stable_probability = _clip(posterior["S0_PERSISTENT"] + posterior["S1_ALTERNATING"])
@@ -218,7 +218,7 @@ def _state_posterior(
         "state_posterior": {name: float(posterior[name]) for name in STATE_NAMES},
         "dominant_state": dominant_state,
         "posterior_concentration": float(concentration),
-        "reliability": float(reliability),
+        "hidden_regime_reliability": float(hidden_regime_reliability),
         "transition_probability": float(transition_probability),
         "stable_probability": float(stable_probability),
         "transition_pressure": float(transition_pressure),
@@ -242,7 +242,11 @@ def analyze_road_regime_gate(
     derived_analysis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a capped hazard-direction signal gated by hidden-regime evidence."""
-    values = [str(value).upper().strip() for value in sequence if str(value).upper().strip() in {"B", "P"}]
+    values = [
+        str(value).upper().strip()
+        for value in sequence
+        if str(value).upper().strip() in {"B", "P"}
+    ]
     derived = dict(derived_analysis or {})
     hazard = dict(analyze_run_length_hazard(values))
     regime = _state_posterior(sequence=values, hazard=hazard, derived=derived)
@@ -252,7 +256,7 @@ def analyze_road_regime_gate(
     hazard_separation = abs(hazard_p_b - 0.5) * 2.0
     hazard_rel = _clip(hazard.get("reliability", 0.0), 0.0, MAX_HAZARD_RELIABILITY)
     hazard_support_ratio = _clip(hazard_rel / max(1e-9, MAX_HAZARD_RELIABILITY))
-    regime_rel = _clip(regime.get("reliability", 0.0))
+    regime_rel = _clip(regime.get("hidden_regime_reliability", 0.0))
     posterior = dict(regime.get("state_posterior") or {})
     persistent = _clip(posterior.get("S0_PERSISTENT", 0.0))
     alternating = _clip(posterior.get("S1_ALTERNATING", 0.0))
@@ -264,11 +268,7 @@ def analyze_road_regime_gate(
         (hazard_p_b >= 0.5 and current_side == "B")
         or (hazard_p_b < 0.5 and current_side == "P")
     )
-    state_alignment = (
-        persistent
-        if hazard_prefers_continue
-        else _clip(alternating + 0.72 * transition)
-    )
+    state_alignment = persistent if hazard_prefers_continue else _clip(alternating + 0.72 * transition)
     state_alignment = _clip(0.35 + 0.65 * state_alignment)
 
     derived_likelihood = dict(derived.get("likelihood") or {})
@@ -284,9 +284,9 @@ def analyze_road_regime_gate(
     noise_factor = _clip(1.0 - 0.55 * noise, 0.55, 1.0)
     history_factor = _clip(len(values) / 20.0)
     if len(values) < MIN_REGIME_HISTORY or not bool(hazard.get("available")):
-        reliability = 0.0
+        formal_reliability = 0.0
     else:
-        reliability = (
+        formal_reliability = (
             MAX_REGIME_DIRECTION_WEIGHT
             * history_factor
             * hazard_support_ratio
@@ -296,13 +296,18 @@ def analyze_road_regime_gate(
             * cross_factor
             * noise_factor
         )
-        reliability = _clip(reliability, 0.0, MAX_REGIME_DIRECTION_WEIGHT)
+        formal_reliability = _clip(
+            formal_reliability,
+            0.0,
+            MAX_REGIME_DIRECTION_WEIGHT,
+        )
 
     return {
+        **regime,
         "model_version": MODEL_VERSION,
-        "available": bool(reliability > 0.0),
+        "available": bool(formal_reliability > 0.0),
         "likelihood": {"B": float(hazard_p_b), "P": float(1.0 - hazard_p_b)},
-        "reliability": float(reliability),
+        "reliability": float(formal_reliability),
         "max_reliability": float(MAX_REGIME_DIRECTION_WEIGHT),
         "hazard": hazard,
         "hazard_reliability": float(hazard_rel),
@@ -317,7 +322,6 @@ def analyze_road_regime_gate(
             "agrees_with_hazard": bool(derived_agrees),
             "cross_factor": float(cross_factor),
         },
-        **regime,
         "parameter_source": "conservative_duration_aware_profiles_plus_empirical_run_hazard_no_offline_multishoe_fit",
         "direction_authority": "capped_residual_only",
         "semantics": "hazard_supplies_continue_turn_direction_hsmm_hidden_regime_only_gates_reliability",
