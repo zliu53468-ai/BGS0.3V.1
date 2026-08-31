@@ -1,4 +1,4 @@
-name: Apply unified shoe configuration patch
+name: Finalize unified shoe configuration
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  patch-and-test:
-    if: ${{ !contains(github.event.head_commit.message, '[shoe-config-applied]') }}
+  finalize-and-test:
+    if: ${{ !contains(github.event.head_commit.message, '[shoe-config-finalized]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,13 +20,10 @@ jobs:
       - name: Install focused test dependency
         run: python -m pip install "numpy>=1.26,<2.4"
 
-      - name: Prepare patcher
-        run: python tools/prepare_unified_shoe_patcher.py
+      - name: Finalize depth semantics
+        run: python tools/finalize_unified_shoe_patch.py
 
-      - name: Apply deterministic patch
-        run: python tools/apply_unified_shoe_patch.py
-
-      - name: Compile changed Python modules
+      - name: Compile affected Python modules
         run: |
           python -m py_compile \
             shoe_constants.py \
@@ -50,30 +47,53 @@ jobs:
             test_shoe_composition \
             test_formal_shoe_decision
 
+      - name: Audit authoritative constants
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+          production = [
+              p for p in root.glob('*.py')
+              if not p.name.startswith('test_')
+          ]
+          forbidden_literals = ('4.89', '4.8')
+          for p in production:
+              text = p.read_text(encoding='utf-8')
+              for literal in forbidden_literals:
+                  if literal in text:
+                      raise SystemExit(f'{p}: stale average-cards literal {literal}')
+
+          authoritative = {
+              'SHOE_DECKS': [],
+              'AVERAGE_CARDS_PER_HAND': [],
+              'REFERENCE_HANDS': [],
+              'BURN_CARDS': [],
+          }
+          for p in production:
+              text = p.read_text(encoding='utf-8')
+              for name in authoritative:
+                  if re.search(rf'^\s*{name}\s*=', text, flags=re.MULTILINE):
+                      authoritative[name].append(p.name)
+          for name, files in authoritative.items():
+              if files != ['shoe_constants.py']:
+                  raise SystemExit(f'{name}: expected only shoe_constants.py, got {files}')
+
+          print('Authoritative shoe constants audit passed:', authoritative)
+          PY
+
       - name: Check diff whitespace
         run: git diff --check
 
-      - name: Commit patched sources
+      - name: Commit finalized source changes
         run: |
           if git diff --quiet; then
-            echo "No patch changes to commit."
+            echo "No final source changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            shoe_constants.py \
-            shoe_depth_estimator.py \
-            shoe_composition.py \
-            contextual_bandit.py \
-            predictor.py \
-            probabilistic_shoe_estimator.py \
-            particle_filter_points.py \
-            store.py \
-            virtual_shoe.py \
-            shoe_state_db.py \
-            runtime_app.py \
-            app.py \
-            test_shoe_constants.py
-          git commit -m "Unify shoe consumption constants and depth semantics [shoe-config-applied]"
+          git add contextual_bandit.py probabilistic_shoe_estimator.py
+          git commit -m "Finalize round-count depth semantics [shoe-config-finalized]"
           git push origin HEAD:fix/unified-shoe-consumption
