@@ -1,0 +1,137 @@
+name: Apply transition smoothing patch
+
+on:
+  push:
+    branches:
+      - fix/transition-hazard-shoe-confidence
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[transition-smoothing-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/transition-hazard-shoe-confidence
+          fetch-depth: 0
+
+      - name: Materialize exact three-file patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import gzip
+
+          for name in ('run_length_hazard.py', 'hsmm_regime.py', 'pattern_survival.py'):
+              payload = Path('.transition_patch') / f'{name}.gz'
+              with gzip.open(payload, 'rb') as src:
+                  Path(name).write_bytes(src.read())
+          PY
+
+      - name: Compile and targeted transition validation
+        shell: bash
+        run: |
+          python -m py_compile run_length_hazard.py hsmm_regime.py pattern_survival.py
+          python - <<'PY'
+          from run_length_hazard import analyze_run_length_hazard
+          from hsmm_regime import analyze_hidden_regime
+          from pattern_survival import calculate_pattern_survival
+
+          def history_from_runs(completed, current):
+              out = []
+              side = 'B'
+              for length in completed:
+                  out.extend([side] * length)
+                  side = 'P' if side == 'B' else 'B'
+              out.extend([side] * current)
+              return ''.join(out)
+
+          # 8/6/9/8 critical-region progression: no abrupt flip-flop.
+          probs = []
+          for current in range(4, 11):
+              result = analyze_run_length_hazard(history_from_runs([8, 6, 9, 8], current))
+              probs.append(float(result['turn_probability']))
+              assert result['turn_probability'] == result['smoothed_turn_probability']
+              assert 0.0 <= result['critical_proximity'] <= 1.0
+              assert 0.0 <= result['transition_stability'] <= 1.0
+          deltas = [b - a for a, b in zip(probs, probs[1:])]
+          assert all(delta >= -1e-9 for delta in deltas), probs
+          assert max(abs(delta) for delta in deltas) <= 0.06, deltas
+          assert sum((a - 0.5) * (b - 0.5) < 0 for a, b in zip(probs, probs[1:])) <= 1
+
+          history = history_from_runs([8, 6, 9, 8], 9)
+          markov = {
+              'sample_count': 40,
+              'entropy_bits': 1.15,
+              'state': {'recent5': list(history[-5:])},
+              'regime_profile': {
+                  'alternation_ratio': 0.45,
+                  'current_run_length': 9,
+                  'recent_run_lengths': [8, 6, 9, 8, 9],
+                  'change_point': True,
+                  'pattern_break': True,
+                  'regime': 'TRANSITION',
+                  'base_regime': 'DRAGON',
+                  'stability': 0.20,
+                  'entropy_delta': 0.20,
+              },
+              'support_strength': 0.72,
+              'multi_order_agreement': 0.74,
+              'history': history,
+          }
+          hsmm = analyze_hidden_regime(markov)
+          assert 0.55 <= hsmm['pattern_factor'] <= 1.0
+          assert 0.70 <= hsmm['hazard_factor'] <= 1.0
+          assert 0.0 <= hsmm['transition_stability'] <= 1.0
+
+          road = {
+              'derived_markov_reliability': 0.12,
+              'derived_road_consensus': 0.35,
+              'derived_road_markov': {'max_reliability': 0.18},
+          }
+          mature = calculate_pattern_survival(
+              markov, road,
+              {'shoe_stage': 'MATURE', 'shoe_stage_factor': 1.0, 'reliability': 0.85},
+          )
+          late = calculate_pattern_survival(
+              markov, road,
+              {'shoe_stage': 'LATE', 'shoe_stage_factor': 0.80, 'reliability': 0.85},
+          )
+          assert 0.55 <= mature['change_point_factor'] <= 0.70
+          assert late['transition_shoe_factor'] < mature['transition_shoe_factor']
+          assert late['score'] < mature['score']
+          assert 'run_length_turn_pressure' in mature
+
+          stable_markov = dict(markov)
+          stable_markov['regime_profile'] = dict(
+              markov['regime_profile'],
+              change_point=False,
+              pattern_break=False,
+              regime='DRAGON',
+              stability=0.80,
+              current_run_length=8,
+          )
+          stable = calculate_pattern_survival(
+              stable_markov, road,
+              {'shoe_stage': 'MATURE', 'shoe_stage_factor': 1.0, 'reliability': 0.85},
+          )
+          assert stable['change_point_factor'] == 1.0
+          assert stable['transition_shoe_factor'] == 1.0
+          assert stable['retained_hazard_component'] == 0.0
+          print('targeted transition validation: OK')
+          PY
+          git diff --check
+
+      - name: Commit only the requested production files
+        shell: bash
+        run: |
+          rm -rf .transition_patch
+          rm -f .github/workflows/apply-transition-smoothing.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Smooth transition hazard and shoe-stage confidence [transition-smoothing-applied]"
+          git push origin HEAD:fix/transition-hazard-shoe-confidence
