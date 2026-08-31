@@ -1,20 +1,13 @@
 """Fresh-switch calibration for the Road V1 probability.
 
-The V1 core deliberately models SAME/SWITCH relationships.  A subtle failure
-mode appears immediately after a long run breaks: a high SAME rate learned from
-the *old* run can be re-anchored to the one newly observed opposite result.  That
-looks like "see Banker -> Banker / see Player -> Player" even though no explicit
-follow-last rule exists.
+V1 models SAME/SWITCH relationships. Immediately after a long run breaks, SAME
+inertia learned from the old run can be re-anchored to the single newly observed
+opposite result. This module removes that last-hand echo without installing a
+mechanical reversal rule.
 
-This module does not predict the opposite side by rule.  It only:
-1. detects a fresh switch (current run length == 1 after a prior run >= 2);
-2. shrinks inherited last-side momentum toward 50/50 when there is little
-   in-shoe evidence for what usually happens after a comparable switch;
-3. optionally applies a very small context residual when the same shoe contains
-   enough completed, comparable fresh-switch examples.
-
-The original V1 result is preserved in diagnostics and this layer is orientation
-symmetric under B<->P mirroring.
+Only a fresh switch is eligible: current run length == 1 after a prior run >= 2.
+The exact V1 output is preserved for diagnostics; this layer sits after V1 and is
+orientation symmetric under B<->P mirroring.
 """
 from __future__ import annotations
 
@@ -23,6 +16,7 @@ import math
 
 MODEL_VERSION = "FRESH-SWITCH-ANTI-ECHO-V1"
 MIN_PREVIOUS_RUN = 2
+MIN_CONTEXT_CASES = 2
 CONTEXT_SUPPORT_THRESHOLD = 2.0
 MAX_ECHO_SHRINK = 0.72
 MAX_CONTEXT_RESIDUAL_WEIGHT = 0.10
@@ -57,13 +51,13 @@ def _clean(sequence: Sequence[Any]) -> list[str]:
 
 
 def _runs(sequence: Sequence[str]) -> list[tuple[str, int]]:
-    runs: list[tuple[str, int]] = []
+    result: list[tuple[str, int]] = []
     for side in sequence:
-        if runs and runs[-1][0] == side:
-            runs[-1] = (side, runs[-1][1] + 1)
+        if result and result[-1][0] == side:
+            result[-1] = (side, result[-1][1] + 1)
         else:
-            runs.append((side, 1))
-    return runs
+            result.append((side, 1))
+    return result
 
 
 def _length_bucket(length: int) -> str:
@@ -75,53 +69,71 @@ def _length_bucket(length: int) -> str:
     return "4+"
 
 
-def _fresh_switch_context(sequence: Sequence[str], previous_run_length: int) -> dict[str, Any]:
+def _fresh_switch_context(
+    sequence: Sequence[str],
+    previous_run_length: int,
+) -> dict[str, Any]:
     """Estimate whether a newly switched side gets a second hand in this shoe.
 
-    A completed new run of length >=2 means NEW_CONTINUE; length ==1 means the
-    table immediately returned to the previous side.  Exact previous-run-length
-    buckets are preferred; low support backs off to all historical switches with
-    a reliability penalty.  Beta(2,2) shrinkage keeps tiny samples weak.
+    Maturity is decided by *case count*, not recency-decayed effective support.
+    Recency decay is used only for probability/reliability strength. This avoids
+    incorrectly backing off when two genuine comparable cases have decayed to an
+    effective weight slightly below 2.0.
     """
     runs = _runs(sequence)
     if len(runs) < 3:
         return {
             "p_new_continue": 0.5,
+            "p_old_return": 0.5,
             "support": 0.0,
+            "case_count": 0,
             "exact_support": 0.0,
+            "exact_case_count": 0,
             "reliability": 0.0,
             "context_tier": "none",
         }
 
-    # Exclude the current unfinished fresh run. Historical new runs are indexes
-    # 1 .. len(runs)-2, because their final length is already known.
     target_bucket = _length_bucket(previous_run_length)
     exact: list[tuple[bool, float]] = []
     global_obs: list[tuple[bool, float]] = []
     last_historical_index = len(runs) - 2
+
+    # Exclude the current unfinished run. For each completed historical run,
+    # final length >=2 means the newly switched side continued at least once.
     for index in range(1, len(runs) - 1):
         prior_length = int(runs[index - 1][1])
         new_length = int(runs[index][1])
         continued = new_length >= 2
         age = max(0, last_historical_index - index)
         weight = 0.94 ** age
-        global_obs.append((continued, weight))
+        observation = (continued, weight)
+        global_obs.append(observation)
         if _length_bucket(prior_length) == target_bucket:
-            exact.append((continued, weight))
+            exact.append(observation)
 
     exact_support = sum(weight for _, weight in exact)
-    if exact_support >= CONTEXT_SUPPORT_THRESHOLD:
+    exact_case_count = len(exact)
+    if exact_case_count >= MIN_CONTEXT_CASES:
         selected = exact
         context_tier = "matched_previous_run_bucket"
         backoff_factor = 1.0
-    else:
+    elif len(global_obs) >= MIN_CONTEXT_CASES:
         selected = global_obs
-        context_tier = "global_fresh_switch_backoff" if selected else "none"
-        backoff_factor = 0.62 if selected else 0.0
+        context_tier = "global_fresh_switch_backoff"
+        backoff_factor = 0.62
+    else:
+        selected = []
+        context_tier = "none"
+        backoff_factor = 0.0
 
     support = sum(weight for _, weight in selected)
+    case_count = len(selected)
     continued_weight = sum(weight for continued, weight in selected if continued)
-    p_continue = (continued_weight + 2.0) / (support + 4.0) if support > 0.0 else 0.5
+    p_continue = (
+        (continued_weight + 2.0) / (support + 4.0)
+        if support > 0.0
+        else 0.5
+    )
     support_reliability = support / (support + 4.0) if support > 0.0 else 0.0
     separation = abs(p_continue - 0.5) * 2.0
     reliability = _clip(
@@ -133,7 +145,10 @@ def _fresh_switch_context(sequence: Sequence[str], previous_run_length: int) -> 
         "p_new_continue": float(p_continue),
         "p_old_return": float(1.0 - p_continue),
         "support": float(support),
+        "case_count": int(case_count),
         "exact_support": float(exact_support),
+        "exact_case_count": int(exact_case_count),
+        "minimum_context_cases": int(MIN_CONTEXT_CASES),
         "reliability": float(reliability),
         "context_tier": context_tier,
         "target_previous_run_bucket": target_bucket,
@@ -147,7 +162,7 @@ def calibrate_fresh_switch(
     *,
     v1_components: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Remove inherited last-hand echo without installing an opposite-side rule."""
+    """Shrink inherited last-side echo; never impose an automatic reversal."""
     values = _clean(sequence)
     base_p_b = _clip(banker_probability, 0.37, 0.63)
     runs = _runs(values)
@@ -185,7 +200,11 @@ def calibrate_fresh_switch(
             "final_p_p": float(1.0 - base_p_b),
             "echo_shrink": 0.0,
             "context_residual_weight": 0.0,
-            "reason": "not_fresh_switch" if not fresh_switch else "base_not_chasing_new_side",
+            "reason": (
+                "not_fresh_switch"
+                if not fresh_switch
+                else "base_not_chasing_new_side"
+            ),
         }
 
     context = _fresh_switch_context(values, previous_run)
@@ -193,16 +212,14 @@ def calibrate_fresh_switch(
     p_new_continue = _clip(context.get("p_new_continue", 0.5), 0.20, 0.80)
     context_separation = abs(p_new_continue - 0.5) * 2.0
 
-    # The longer the run that just broke, and the stronger V1 is already leaning
-    # toward the single new result, the more suspicious the inherited echo is.
     previous_run_strength = _clip((previous_run - 1) / 4.0)
     base_current_edge = _clip((base_p_current - 0.5) / 0.13)
     inherited_echo_strength = previous_run_strength * base_current_edge
 
-    # Reliable same-shoe context that genuinely supports the new side should
-    # preserve more of the V1 edge. Without such context, shrink toward neutral.
     contextual_continue_support = (
-        context_rel * context_separation if p_new_continue >= 0.5 else 0.0
+        context_rel * context_separation
+        if p_new_continue >= 0.5
+        else 0.0
     )
     echo_shrink = _clip(
         MAX_ECHO_SHRINK
@@ -214,22 +231,27 @@ def calibrate_fresh_switch(
     shrunk_logit = _logit(base_p_b) * (1.0 - echo_shrink)
     shrunk_p_b = _clip(_sigmoid(shrunk_logit), 0.37, 0.63)
 
-    # Context may add a small residual either toward NEW_CONTINUE or OLD_RETURN.
-    # It can only be meaningful with actual same-shoe support and remains capped.
     context_weight = 0.0
     final_logit = _logit(shrunk_p_b)
-    if float(context.get("support", 0.0) or 0.0) >= CONTEXT_SUPPORT_THRESHOLD:
+    if int(context.get("case_count", 0) or 0) >= MIN_CONTEXT_CASES:
         context_weight = min(
             MAX_CONTEXT_RESIDUAL_WEIGHT,
             MAX_CONTEXT_RESIDUAL_WEIGHT * context_rel * context_separation,
         )
-        context_p_b = p_new_continue if current_side == "B" else 1.0 - p_new_continue
+        context_p_b = (
+            p_new_continue
+            if current_side == "B"
+            else 1.0 - p_new_continue
+        )
         final_logit += context_weight * _logit(context_p_b)
 
     final_p_b = _clip(_sigmoid(final_logit), 0.37, 0.63)
-    # Anti-echo is a calibrator, not a reversal rule. A flip is permitted only
-    # when the original V1 result was already very close to neutral.
-    if (base_p_b >= 0.5) != (final_p_b >= 0.5) and abs(base_p_b - 0.5) >= 0.025:
+    # This is calibration, not an anti-follow betting rule. Material V1 edges
+    # cannot be forced to the opposite side solely by Anti-Echo.
+    if (
+        (base_p_b >= 0.5) != (final_p_b >= 0.5)
+        and abs(base_p_b - 0.5) >= 0.025
+    ):
         final_p_b = 0.500001 if base_p_b >= 0.5 else 0.499999
 
     components = dict(v1_components or {})
@@ -253,7 +275,9 @@ def calibrate_fresh_switch(
         "v1_component_snapshot": {
             name: {
                 "p_b": float(dict(item).get("p_b", 0.5) or 0.5),
-                "reliability": float(dict(item).get("reliability", 0.0) or 0.0),
+                "reliability": float(
+                    dict(item).get("reliability", 0.0) or 0.0
+                ),
             }
             for name, item in components.items()
             if isinstance(item, Mapping)
@@ -269,6 +293,7 @@ def calibrate_fresh_switch(
 __all__ = [
     "MODEL_VERSION",
     "MIN_PREVIOUS_RUN",
+    "MIN_CONTEXT_CASES",
     "CONTEXT_SUPPORT_THRESHOLD",
     "MAX_ECHO_SHRINK",
     "MAX_CONTEXT_RESIDUAL_WEIGHT",
