@@ -17,21 +17,23 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.11
       - key: BGS_BUILD_LABEL
-        value: lstm-shoe-cut-production-v2
+        value: lstm-shoe-cut-anti-stick-v3
       - key: LSTM_ROAD_WINDOW
         value: "24"
       - key: LSTM_ROAD_MIN_HISTORY
-        value: "16"
-      - key: LSTM_ROAD_FULL_MATURITY
-        value: "36"
-      - key: LSTM_ROAD_MIN_CONTEXT
-        value: "6"
-      - key: LSTM_ROAD_MIN_ONLINE_SAMPLES
         value: "10"
+      - key: LSTM_ROAD_FULL_MATURITY
+        value: "32"
+      - key: LSTM_ROAD_MIN_CONTEXT
+        value: "5"
+      - key: LSTM_ROAD_MIN_ONLINE_SAMPLES
+        value: "5"
       - key: LSTM_ROAD_REPLAY_WINDOW
         value: "36"
       - key: LSTM_ROAD_ONLINE_LR
-        value: "0.00015"
+        value: "0.00010"
+      - key: LSTM_ROAD_RECENCY_DECAY
+        value: "0.97"
       - key: BGS_TARGET_HANDS_MIN
         value: "50"
       - key: BGS_TARGET_HANDS_MAX
