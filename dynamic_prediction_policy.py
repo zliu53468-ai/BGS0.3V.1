@@ -276,10 +276,29 @@ def global_trend_bias_correction(
     }
 
 
-def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """保留舊入口名稱與簽名；呼叫正式下一手 forecaster。"""
-    return linucb_policy(history, shoe_context={})
+def road_only_policy(
+    history: str | Iterable[Any] | None,
+    *,
+    shoe_context: Mapping[str, Any] | None = None,
+    user_id: str = "",
+    venue: str = "",
+    room: str = "",
+    shoe_id: str = "",
+) -> dict[str, Any]:
+    """無精確牌組時的 B/P fallback 相容入口。
 
+    `shoe_context` 只作 depth/metadata 相容並完整往下傳，不會在此被清成 `{}`。
+    本函式不做 shoe-composition EV，因此不能覆蓋 predictor 的 exact-shoe-first
+    正式路徑。
+    """
+    return linucb_policy(
+        history,
+        shoe_context=shoe_context,
+        user_id=user_id,
+        venue=venue,
+        room=room,
+        shoe_id=shoe_id,
+    )
 
 def shoe_progress_policy(rounds: int) -> dict[str, Any]:
     value = max(0, int(rounds or 0))

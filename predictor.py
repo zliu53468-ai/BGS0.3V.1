@@ -14,6 +14,7 @@ from dynamic_prediction_policy import (
     POLICY_VERSION,
     linucb_policy,
     normalize_big_road,
+    road_only_policy,
     recent_user_direction_feedback,
     record_online_feedback,
 )
@@ -157,20 +158,9 @@ def predict(
     context = dict(shoe_context or {})
     bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
 
-    # Road path is always evaluated so diagnostics/online feedback/public interfaces
-    # remain compatible. Exact shoe composition, when available, owns formal direction.
-    policy = linucb_policy(
-        raw_history,
-        shoe_context=context,
-        user_id=user_id,
-        venue=venue,
-        room=room,
-        shoe_id=shoe_id,
-    )
-    road_probabilities = dict(policy["probabilities"])
-    road_direction = str(policy["direction"])
-    road_confidence = float(policy["selected_win_probability"])
-
+    # Formal routing is intentionally shoe-first. Exact card composition is
+    # validated before any road fallback is allowed to own the public B/P decision.
+    # The road model may still run after an exact shoe decision for diagnostics only.
     shoe_analysis = dict(analyze_shoe_composition(context))
     shoe_available = bool(shoe_analysis.get("available"))
     composition_source = _shoe_source(context, shoe_analysis)
@@ -184,7 +174,7 @@ def predict(
         # mathematically better B/P side. Low/negative edge is handled by Kelly floor.
         direction = "B" if b_ev >= p_ev else "P"
         confidence = _resolved_confidence(probabilities, direction)
-        formal_source = "shoe_composition_ev_argmax"
+        formal_source = "exact_shoe_ev"
         card_weight = 1.0
         road_weight = 0.0
         selected_physical_ev = b_ev if direction == "B" else p_ev
@@ -192,11 +182,38 @@ def predict(
         shoe_analysis["action_text"] = "莊" if direction == "B" else "閒"
         shoe_analysis["formal_direction"] = direction
         shoe_analysis["formal_no_observe_arm"] = True
+
+        # Compatibility/feedback diagnostics only. The caller's complete
+        # shoe_context is forwarded and cannot change the already-selected shoe EV side.
+        policy = linucb_policy(
+            raw_history,
+            shoe_context=context,
+            user_id=user_id,
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+        )
+        road_probabilities = dict(policy["probabilities"])
+        road_direction = str(policy["direction"])
+        road_confidence = float(policy["selected_win_probability"])
     else:
+        # Missing or invalid exact composition is non-fatal. Only here may the
+        # road fallback own the formal B/P direction.
+        policy = road_only_policy(
+            raw_history,
+            shoe_context=context,
+            user_id=user_id,
+            venue=venue,
+            room=room,
+            shoe_id=shoe_id,
+        )
+        road_probabilities = dict(policy["probabilities"])
+        road_direction = str(policy["direction"])
+        road_confidence = float(policy["selected_win_probability"])
         probabilities = dict(road_probabilities)
         direction = road_direction if road_direction in {"B", "P"} else "B"
         confidence = road_confidence
-        formal_source = "road_forecaster_probability_argmax"
+        formal_source = "road_forecaster"
         card_weight = 0.0
         road_weight = 1.0
         selected_physical_ev = None
@@ -268,6 +285,7 @@ def predict(
             "shoe_context_used_for_formal_direction": shoe_available,
             "card_composition_direction_weight": card_weight,
             "road_context_direction_weight": road_weight,
+            "road_direction_weight": road_weight,
             "card_composition_source": composition_source,
             "remaining_counts_source": composition_source,
             "remaining_cards": remaining_cards_value,
@@ -300,6 +318,7 @@ def predict(
         composition_source if shoe_available else "screenshot_big_road_plus_manual_history"
     )
     policy["road_context_direction_weight"] = road_weight
+    policy["road_direction_weight"] = road_weight
     policy["card_composition_direction_weight"] = card_weight
     policy["shoe_context_used_for_formal_direction"] = shoe_available
 
@@ -478,6 +497,7 @@ def predict(
         "shoe_context_used_for_formal_direction": shoe_available,
         "card_composition_direction_weight": card_weight,
         "road_context_direction_weight": road_weight,
+        "road_direction_weight": road_weight,
         "card_composition_source": composition_source,
         "remaining_counts_source": composition_source,
         "remaining_cards_source": remaining_cards_source,
