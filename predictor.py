@@ -1,7 +1,7 @@
-"""BGS 正式預測器：剩餘牌組 Context -> 兩臂 LinUCB -> Fractional Kelly。
+"""BGS 正式預測器：已揭曉 B/P 歷史 -> 因果式 road_forecaster -> Kelly。
 
 公開 predict() 參數與主要回傳欄位維持相容。OCR / screenshot / road adapter
-仍可傳入既有 context，但正式下一局方向只由新的兩臂 LinUCB 決定。
+仍可傳入既有 context，但正式下一局方向只由 forecaster 機率 argmax 決定。
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def _history_values(history: Union[str, Iterable[Any], None]) -> List[Any]:
 
 
 def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
-    """既有牌路模型只保留 UI/稽核診斷，不參與正式 LinUCB 方向。"""
+    """既有牌路模型只保留 UI/稽核診斷，不參與正式 forecaster 方向。"""
     try:
         banker = max(0.0, min(1.0, float(road.get("banker_probability", 0.5) or 0.5)))
     except (TypeError, ValueError):
@@ -117,9 +117,8 @@ def predict(
     context = dict(shoe_context or {})
     bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
 
-    # 50～70 局短靴：正式方向由固定 16 維 Context 的兩臂 LinUCB 唯一決定。
-    # 缺精確 remaining_counts 時 ContextGenerator 會以中性牌組比例與合理剩餘張數估計補齊，
-    # 因此不會因為缺牌組欄位而中止方向輸出。
+    # 保留 linucb_policy 呼叫介面；其正式來源已切換為逐手訓練的 forecaster。
+    # 只使用已揭曉大路 B/P。牌組欄位、OCR 診斷及事後斜率不能覆蓋方向。
     policy = linucb_policy(
         raw_history,
         shoe_context=context,
@@ -146,7 +145,7 @@ def predict(
     bet_allowed = True
     signal_status_code = "LINUCB_TWO_ARM_KELLY_5_30"
     signal_status_text = (
-        f"兩臂 LinUCB：{direction_text} {confidence:.1%}；"
+        f"下一手模型：{direction_text} {confidence:.1%}；"
         f"Kelly {float(money.get('bet_percentage', 5.0) or 5.0):.2f}%"
     )
 
@@ -209,6 +208,8 @@ def predict(
     }
 
     component_probabilities = {
+        "road_forecaster": {"B": p_b, "P": p_p, "T": p_t},
+        # Legacy alias retained; these are forecaster probabilities, not UCB output.
         "contextual_linucb": {"B": p_b, "P": p_p, "T": p_t},
         "road_diagnostic": {
             "B": float(road_predict["banker_probability"]),
@@ -245,7 +246,7 @@ def predict(
         "conditioned_rounds": len(big_road),
         "particle_count": 0,
         "reliability": 1.0 if supplied_remaining else 0.5,
-        "fusion_weight": 1.0,
+        "fusion_weight": 0.0,
         "target_remaining_cards": remaining_cards_value,
         "depth_constraint_applied": supplied_remaining,
         "depth_constraint": depth_constraint,
@@ -261,13 +262,13 @@ def predict(
 
     result = {
         "ok": True,
-        "engine": "CONTEXTUAL_LINUCB_TWO_ARM",
+        "engine": "CAUSAL_ROAD_FORECASTER_BP",
         "model_version": POLICY_VERSION,
         "shoe_posterior_model_version": "CONTEXT_GENERATOR_V1",
         "system_model_version": POLICY_VERSION,
-        "model_variant": "CARD_COMPOSITION_FIRST_16D_TWO_ARM_LINUCB_KELLY_5_30",
-        "model_core": "contextual_bandit",
-        "decision_pipeline": "remaining_shoe_context_16d_to_two_arm_linucb_to_fractional_kelly_clip_5_30",
+        "model_variant": "ONLINE_L2_LOGISTIC_ROAD_FORECASTER_KELLY_5_30",
+        "model_core": "road_forecaster",
+        "decision_pipeline": "observed_BP_prefix_to_causal_logistic_argmax_to_existing_kelly",
         "prediction_fingerprint": fingerprint,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "raw_direction_probabilities": {"B": p_b, "P": p_p},
@@ -291,14 +292,13 @@ def predict(
         "signal_status_code": signal_status_code,
         "signal_status_text": signal_status_text,
         "signal_reason": (
-            f"LinUCB alpha={float(policy.get('alpha', 0.5) or 0.5):.3f}；"
-            f"ridge={float(policy.get('ridge', 1.0) or 1.0):.3f}；"
-            f"Xdim={len(context_vector)}；P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
-            f"cardSource={str(context_meta.get('remaining_cards_source') or '')}；"
+            f"Forecaster={str(policy.get('road_forecaster', {}).get('model_id', ''))}；"
+            f"support={float(policy.get('effective_support', 0.0)):.0f}；"
+            f"P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
             f"Kelly={bet_percentage:.2f}%；feedback={bool(bandit_feedback_update.get('updated', False))}。"
         ),
         "internal_signal_reason": "",
-        "direction_source": "contextual_linucb_two_arm_card_composition_first",
+        "direction_source": "road_forecaster_probability_argmax",
         "confidence": confidence,
         "raw_markov_confidence": confidence,
         "pattern_calibrated_confidence": confidence,
@@ -341,16 +341,17 @@ def predict(
             "direction": direction,
             "probabilities": {"B": p_b, "P": p_p, "T": p_t},
             "markov_prior_weight": 0.0,
-            "probabilistic_shoe_weight": 1.0,
+            "probabilistic_shoe_weight": 0.0,
+            "road_forecaster_weight": 1.0,
             "derived_road_likelihood_power": 0.0,
             "run_length_hazard_likelihood_power": 0.0,
             "road_applied": False,
             "hazard_applied": False,
-            "method": "two_arm_contextual_linucb",
-            "semantics": "formal_direction_uses_16d_card_composition_first_context",
+            "method": "road_forecaster_probability_argmax",
+            "semantics": "formal_direction_uses_only_causal_BP_prefix_features",
         },
         "fusion": {
-            "method": "two_arm_contextual_linucb",
+            "method": "road_forecaster_probability_argmax",
             "shoe_reliability": 1.0 if supplied_remaining else 0.5,
             "road_reliability": 0.25,
             "hazard_reliability": 0.0,
@@ -378,7 +379,7 @@ def predict(
             "raw_reliability": 0.25,
             "pattern_survival_score": 1.0,
             "likelihood": None,
-            "reason": "牌路只作 Context 輔助；正式方向由兩臂 LinUCB 決定。",
+            "reason": "本區事後牌路診斷不參與方向；正式方向由逐手訓練 forecaster 決定。",
         },
         "run_length_hazard_fusion": {
             "applied": False,
@@ -412,6 +413,9 @@ def predict(
         "contextual_bandit_enabled": True,
         "contextual_bandit_update_enabled": True,
         "linucb_enabled": True,
+        "linucb_diagnostic_only": True,
+        "linucb_direction_weight": 0.0,
+        "road_forecaster": dict(policy["road_forecaster"]),
         "cusum_linucb_enabled": False,
         "force_observe": False,
         "hard_brake_active": False,
@@ -420,17 +424,17 @@ def predict(
         "venue": str(venue or ""),
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
-        "probability_semantics": "selected_arm_probability_clamped_for_short_shoe_48_to_58_percent",
+        "probability_semantics": "causal_online_logistic_next_resolved_BP_probability",
         "dynamic_prediction_policy": {
             "version": POLICY_VERSION,
-            "road_only": False,
+            "road_only": True,
             "big_road_rounds": len(big_road),
             "forecast": dict(policy),
             "penalty_observe": {"active": False, "force_observe": False},
             "exact_card_dependency": False,
-            "shoe_probability_decision_weight": 1.0,
+            "shoe_probability_decision_weight": 0.0,
             "ocr_or_screen_flow_modified": False,
-            "formal_direction_source": "contextual_linucb_two_arm",
+            "formal_direction_source": "road_forecaster",
         },
         "dynamic_policy_version": POLICY_VERSION,
         "online_performance_feedback": feedback,
@@ -441,7 +445,7 @@ def predict(
         "decision_gate": {
             "decision": action,
             "allowed": True,
-            "reason": "two_arm_linucb_always_returns_explicit_direction",
+            "reason": "road_forecaster_argmax_always_returns_BP",
             "direction": direction,
             "resolved_confidence": confidence,
             "expected_net_ev": float(money.get("virtual_ev", 0.0) or 0.0),
@@ -461,7 +465,7 @@ def run_virtual_round(
     session: Mapping[str, Any],
     run_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """既有虛擬牌靴 API 相容入口，並在開牌後直接線上更新 LinUCB。"""
+    """先由 forecaster 預測，再開牌；LinUCB 診斷回饋與既有回傳介面保留。"""
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
 
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
@@ -504,7 +508,7 @@ def run_virtual_round(
     prediction.update(
         {
             "ok": True,
-            "mode": "virtual_shoe_two_arm_linucb",
+            "mode": "virtual_shoe_road_forecaster",
             "virtual_hand": hand_data,
             "virtual_outcome": actual,
             "virtual_outcome_text": hand_data["outcome_text"],
@@ -517,7 +521,7 @@ def run_virtual_round(
             "bandit_learning_applied": bool(bandit_update.get("updated", False)),
             "bandit_update": bandit_update,
             "disclaimer": (
-                "正式方向由剩餘牌組優先的 16 維 Contextual LinUCB 產生；"
+                "正式方向由已揭曉大路歷史的因果式線上邏輯迴歸產生；"
                 "單局結果具有高變異，模型機率不代表保證獲利。"
             ),
         }

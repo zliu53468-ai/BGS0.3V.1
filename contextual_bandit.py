@@ -1,10 +1,8 @@
-"""BGS 大路優先 Dynamic Contextual LinUCB 決策核心。
+"""BGS 正式下一手 forecaster 的兩向相容入口。
 
-正式方向只使用「初始截圖辨識的大路 + 後續人工 B/P/T 結果」形成的完整歷史。
-固定 16 維 Road Context 先建立可在冷啟動立即使用的 Road Prior；Dynamic LinUCB
-只做有界線上校正與探索。這避免第一筆永遠 50/50，也避免上一局勝方 reward
-直接累積成單邊機率階梯。OCR、截圖掃描與 LLM 均不在本模組內。
-上一手與連續長度只作低權重輔助；三連以上只衰減延續方向的 edge，不強制反打。
+方向與機率只由 road_forecaster 對已揭曉 B/P 歷史的因果式線上訓練決定。
+V4 LinUCB 狀態、16 維 context、update API 與 Road Prior 保留作相容診斷，
+方向權重為零，不能覆蓋 forecaster 的 argmax。OCR 與 LLM 不在本模組內。
 """
 from __future__ import annotations
 
@@ -19,6 +17,8 @@ import os
 import time
 
 import numpy as np
+
+from road_forecaster import forecast_next
 
 ARMS = ("P", "B")
 CONTEXT_DIM = 16
@@ -393,6 +393,8 @@ class ContextualLinUCB:
             root = _read_state()
             scope = dict(root["scopes"].get(scope_key) or _new_scope_state())
             result = self._update_scope(scope, action=action, context_vector=context_vector, actual_outcome=actual_outcome)
+            result["diagnostic_only"] = True
+            result["forecaster_update_mode"] = "replay_from_resolved_history_on_next_prediction"
             if clear_pending:
                 scope["pending"] = {}
             root["scopes"][scope_key] = scope
@@ -428,90 +430,94 @@ class ContextualLinUCB:
 
     def predict(self, *, history: Iterable[Any] | str | None, shoe_context: Mapping[str, Any] | None, scope_key: str) -> dict[str, Any]:
         raw = _normalize_history(history)
+        forecast = forecast_next(raw)
         snapshot = self.generator.build(raw, shoe_context)
-        prior = _road_prior(snapshot)
+        prior = dict(_road_prior(snapshot), diagnostic_only=True, direction_weight=0.0)
         raw_x = snapshot.vector
         x = _model_x(raw_x)
         fingerprint = _history_fingerprint(raw)
+        p_b, p_p = float(forecast["p_b"]), float(forecast["p_p"])
+        # Strict forecaster argmax, with B as the deterministic exact-tie choice.
+        # No LinUCB/streak/road-diagnostic rule may override these probabilities.
+        direction = "B" if p_b >= p_p else "P"
+        selected_probability = p_b if direction == "B" else p_p
         with _LOCK:
             root = _read_state()
             scope = dict(root["scopes"].get(scope_key) or _new_scope_state())
+            pending = dict(scope.get("pending") or {})
+            repeat_prediction = pending.get("history_fingerprint") == fingerprint and pending.get("raw_round_count") == len(raw)
             feedback = self._apply_pending(scope, raw)
+            feedback["diagnostic_only"] = True
+            feedback["forecaster_update_mode"] = "replay_from_resolved_history_only"
             n_bp = len(_bp(raw))
             base_scale = 1.35 if n_bp < 8 else 1.15 if n_bp < 15 else 1.0
             arms = dict(scope.get("arms") or {})
             eff = {arm: max(0.0, float((arms.get(arm) or {}).get("effective_n", (arms.get(arm) or {}).get("n", 0)) or 0.0)) for arm in ARMS}
             total_eff = sum(eff.values())
             scores: dict[str, dict[str, float]] = {}
-            prior_edge = float(prior["edge"])
             for arm in ARMS:
                 imbalance = math.sqrt(max(1.0, total_eff + 2.0) / max(1.0, eff[arm] + 1.0))
                 scale = base_scale * _clip(imbalance, 0.85, LINUCB_ARM_ALPHA_MAX_SCALE)
                 item = self._score(arms.get(arm, {}), x, scale)
-                prior_component = ROAD_PRIOR_SCORE_WEIGHT * prior_edge * (1.0 if arm == "B" else -1.0)
                 item["linucb_score"] = float(item["score"])
-                item["road_prior_component"] = prior_component
-                item["score"] = float(item["score"]) + prior_component
+                item["road_prior_component"] = 0.0
+                item["forecaster_probability"] = p_b if arm == "B" else p_p
+                item["score"] = item["forecaster_probability"]
                 item["alpha_scale"] = scale
+                item["anti_chase_score_adjustment"] = 0.0
                 scores[arm] = item
-            # Attenuate the online score gap separately: Road Prior was already
-            # attenuated above. This avoids damping the same prior edge twice.
-            linucb_edge = 0.5 * (scores["B"]["linucb_score"] - scores["P"]["linucb_score"])
-            adjusted_edge, score_anti_chase_factor = _attenuate_continuation_edge(linucb_edge, snapshot.metadata)
-            for arm in ARMS:
-                adjustment = (adjusted_edge - linucb_edge) * (1.0 if arm == "B" else -1.0)
-                scores[arm]["anti_chase_score_adjustment"] = adjustment
-                scores[arm]["score"] += adjustment
-            score_gap = float(scores["B"]["score"] - scores["P"]["score"])
-            if abs(score_gap) > LINUCB_SCORE_TIE_EPSILON:
-                direction = "B" if score_gap > 0 else "P"
-                selection_reason = "road_prior_plus_dynamic_linucb_score"
-            else:
-                direction, selection_reason = self._tie_choice(scope, scope_key, fingerprint)
-            mean_gap = float(scores["B"]["mean"] - scores["P"]["mean"])
-            learning_reliability = _clip(total_eff / 10.0, 0.0, 1.0)
-            learning_correction = LINUCB_PROBABILITY_CORRECTION_SPAN * math.tanh(mean_gap) * learning_reliability
-            learning_correction, probability_anti_chase_factor = _attenuate_continuation_edge(learning_correction, snapshot.metadata)
-            p_b = _clip(float(prior["banker_probability"]) + learning_correction, PROBABILITY_MIN, PROBABILITY_MAX)
-            if direction == "B" and p_b < 0.5:
-                p_b = 0.5
-            elif direction == "P" and p_b > 0.5:
-                p_b = 0.5
-            p_p = 1.0 - p_b
-            selected_probability = p_b if direction == "B" else p_p
-            probabilities = {"B": p_b, "P": p_p, "T": 0.0}
+            previous = str(scope.get("last_selected") or "").upper().strip()
+            previous_streak = int(scope.get("selection_streak", 0) or 0)
+            streak = previous_streak if repeat_prediction and previous == direction else previous_streak + 1 if previous == direction else 1
             snapshot.metadata.update({
+                "formal_direction_source": "road_forecaster",
+                "feature_priority": "forecaster_run_switch_supported_transitions_only",
+                "legacy_context_diagnostic_only": True,
+                "forecaster_features_used": dict(forecast["features_used"]),
                 "anti_chase_enabled": True,
-                # Applied reports conditional run decay, not the always-on feature discount.
-                "anti_chase_applied": bool(prior["anti_chase_applied"] or score_anti_chase_factor < 1.0 or probability_anti_chase_factor < 1.0),
+                "anti_chase_applied": bool(forecast["metadata"]["anti_chase_applied"]),
+                "anti_chase_feature_factors": dict(forecast["metadata"]["feature_decay_factors"]),
+                # Preserve old metadata keys; the legacy prior/feature scales
+                # are diagnostics only and no extra final-score decay is used.
                 "anti_chase_feature_scales": {"last_side_signed": _ANTI_CHASE_FEATURE_SCALE, "signed_run_length_norm": _ANTI_CHASE_FEATURE_SCALE},
                 "anti_chase_prior_factor": float(prior["anti_chase_factor"]),
-                "anti_chase_score_factor": score_anti_chase_factor,
-                "anti_chase_probability_factor": probability_anti_chase_factor,
+                "anti_chase_score_factor": 1.0,
+                "anti_chase_probability_factor": 1.0,
+                "selection_streak": streak,
+                "linucb_direction_weight": 0.0,
+                "road_prior_direction_weight": 0.0,
             })
-            previous = str(scope.get("last_selected") or "").upper().strip()
-            streak = int(scope.get("selection_streak", 0) or 0) + 1 if previous == direction else 1
-            scope.update({"last_selected": direction, "selection_streak": streak, "updated_at": int(time.time()), "pending": {"action": direction, "context_vector": [float(v) for v in raw_x], "raw_round_count": len(raw), "history_fingerprint": fingerprint, "created_at": int(time.time())}})
+            scope.update({"last_selected": direction, "selection_streak": streak, "updated_at": int(time.time()), "pending": {
+                "action": direction, "context_vector": [float(v) for v in raw_x],
+                "raw_round_count": len(raw), "history_fingerprint": fingerprint, "created_at": int(time.time()),
+            }})
             root["scopes"][scope_key] = scope
             _write_state(root)
         return {
-            "model": "two_arm_road_primary_dynamic_contextual_linucb", "version": STATE_VERSION,
+            "model": forecast["model_id"], "version": forecast["version"], "legacy_state_version": STATE_VERSION,
             "direction": direction, "selected_arm": direction, "arm_index": 1 if direction == "B" else 0,
-            "probabilities": probabilities, "selected_win_probability": float(selected_probability), "confidence": float(selected_probability),
+            "probabilities": {"B": p_b, "P": p_p, "T": 0.0},
+            "selected_win_probability": selected_probability, "confidence": selected_probability,
             "context_vector": [float(v) for v in raw_x], "model_context_vector": [float(v) for v in x],
             "context_feature_names": list(CONTEXT_FEATURE_NAMES), "context_dim": CONTEXT_DIM,
             "context_metadata": snapshot.metadata, "road_prior": prior,
             "road_prior_probability": {"B": float(prior["banker_probability"]), "P": float(prior["player_probability"])},
-            "linucb_probability_correction": float(learning_correction), "learning_reliability": float(learning_reliability),
-            "scores": scores, "alpha": self.alpha, "ridge": LINUCB_RIDGE, "forgetting": LINUCB_FORGETTING,
+            "road_forecaster": forecast, "features_used": dict(forecast["features_used"]),
+            "effective_support": forecast["effective_support"], "uncertainty": forecast["uncertainty"],
+            "linucb_probability_correction": 0.0, "linucb_direction_weight": 0.0,
+            "learning_reliability": _clip(total_eff / 10.0, 0.0, 1.0),
+            "scores": scores, "score_semantics": "forecaster_probabilities; linucb_score_is_diagnostic_only",
+            "alpha": self.alpha, "ridge": LINUCB_RIDGE, "forgetting": LINUCB_FORGETTING,
             "feedback_update": feedback, "scope_key": scope_key, "arms": list(ARMS),
-            "selection_reason": selection_reason, "selection_streak": streak, "effective_arm_samples": eff,
+            "selection_reason": "road_forecaster_probability_argmax", "selection_streak": streak, "effective_arm_samples": eff,
             "history_round_count": len(raw), "bp_history_round_count": n_bp, "history_fingerprint": fingerprint,
             "short_shoe_target_rounds": "50-70", "formal_context_source": "screenshot_big_road_plus_manual_history",
             "road_context_direction_weight": 1.0, "card_composition_direction_weight": 0.0,
-            "probability_semantics": "road_prior_recomputed_each_round_plus_bounded_forgetting_linucb_correction",
-            "cold_start_uses_road_prior": True, "shoe_context_used_for_formal_direction": False,
-            "anti_lock": {"enabled": True, "method": "road_prior_dynamic_forgetting_l2_context_adaptive_exploration", "fixed_player_tie_bias_removed": True, "tie_is_non_directional": True, "old_v1_v2_v3_state_reused": False, "winner_probability_staircase_removed": True},
+            "probability_semantics": "causal_online_logistic_next_resolved_BP_probability",
+            "cold_start_uses_road_prior": False, "shoe_context_used_for_formal_direction": False,
+            "anti_lock": {"enabled": True, "method": "supervised_forecaster_causal_features_contribution_decay",
+                          "fixed_player_tie_bias_removed": True, "tie_is_non_directional": True,
+                          "old_v1_v2_v3_state_reused": False, "winner_probability_staircase_removed": True},
         }
 
 _DEFAULT_BANDIT = ContextualLinUCB()

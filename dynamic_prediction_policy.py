@@ -1,8 +1,8 @@
-"""BGS 動態決策相容層：正式方向改由兩臂 Contextual LinUCB 產生。
+"""BGS 動態決策相容層：正式方向由因果式 road_forecaster 產生。
 
 保留舊模組常用 helper 名稱，避免其他程式 import 失效；但所有正式 P/B
-方向均以 contextual_bandit 的兩臂 LinUCB 為唯一決策來源。牌路統計只保留
-診斷用途，不再擁有正式方向否決權。
+方向經既有 contextual_bandit 入口轉接 forecaster 機率 argmax。
+LinUCB 與事後迴歸僅供診斷，不能覆蓋正式下一手方向。
 """
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ from contextual_bandit import (
     update_bandit,
 )
 from performance_tracker import get_resolved_records
+from road_forecaster import VERSION as FORECASTER_VERSION
 
-POLICY_VERSION = "LINUCB-2ARM-KELLY-SHORTSHOE-V1"
+POLICY_VERSION = FORECASTER_VERSION
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 12
 MARKOV_MAX_ORDER = 1
@@ -109,7 +110,7 @@ def _least_squares_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float, flo
 
 
 def regression_analysis_model(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """牌路斜率只作診斷輔助，不進入正式 LinUCB 16 維核心 Context。"""
+    """事後累積斜率只作診斷，不進入正式 forecaster 或決定下一手方向。"""
     sequence = normalize_big_road(history)
     n = len(sequence)
     if n == 0:
@@ -152,10 +153,8 @@ def regression_analysis_model(history: str | Iterable[Any] | None) -> dict[str, 
     }
 
 
-# 為什麼去掉第三臂：產品規格要求每一局必須得到明確 P/B，且缺資料時也要
-# 由中性牌組 Context + Ridge prior 產生方向，因此這裡只呼叫兩臂 LinUCB。
-# 為什麼牌組特徵優先：Context X[0:12] 描述有限牌靴的剩餘結構，X[12:16]
-# 才是近期 B 比例、龍長、切換率等純牌路輔助訊號。
+# 保留 linucb_policy 名稱與參數；predict_bandit 已轉接真正的下一手 forecaster。
+# 16 維 legacy context、LinUCB 與下方 regression 均沒有方向否決權。
 def linucb_policy(
     history: str | Iterable[Any] | None,
     *,
@@ -194,22 +193,20 @@ def linucb_policy(
             "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]),
             "state_key": "LINUCB",
             "transition_counts": {},
-            "effective_support": float(
-                sum(int(result["scores"][arm].get("uncertainty", 0.0) >= 0.0) for arm in OUTCOMES)
-            ),
+            "effective_support": float(result["road_forecaster"]["effective_support"]),
             "decay": 0.0,
             "selected_order": 0,
             "max_order": 0,
             "order_diagnostics": [],
             "global_probabilities": {"B": 0.5, "P": 0.5},
-            "policy_source": "contextual_linucb_two_arm",
+            "policy_source": "road_forecaster",
         }
     )
     return result
 
 
 class ShortShoePredictor:
-    """舊類別名稱相容層；正式內容已切換為兩臂 LinUCB。"""
+    """舊類別名稱相容層；正式內容為下一手 road_forecaster。"""
 
     def __init__(self, window_size: int = WINDOW_SIZE, decay: float = MARKOV_DECAY):
         self.window_size = max(4, int(window_size or WINDOW_SIZE))
@@ -221,7 +218,7 @@ class ShortShoePredictor:
         result["window_rounds"] = min(len(normalize_big_road(history)), self.window_size)
         result["history_rounds"] = len(normalize_big_road(history))
         result["sequence_length"] = len(normalize_big_road(history))
-        result["model"] = "short_shoe_two_arm_linucb_compatibility"
+        result["model"] = "short_shoe_road_forecaster_compatibility"
         return result
 
 
@@ -245,15 +242,15 @@ def global_trend_bias_correction(
     p_p = float(policy["probabilities"]["P"])
     return {
         "applied": True,
-        "mode": "linucb_formal_direction_compatibility",
-        "ensemble_regime": "linucb",
+        "mode": "road_forecaster_formal_direction_compatibility",
+        "ensemble_regime": "road_forecaster",
         "local_weight": 0.0,
         "global_weight": 0.0,
         "regression_weight": 0.0,
-        "ensemble_weights": {"linucb": 1.0},
+        "ensemble_weights": {"linucb": 0.0, "road_forecaster": 1.0},
         "anti_lock_applied": False,
         "direction_controller": {
-            "mode": "two_arm_linucb",
+            "mode": "road_forecaster_probability_argmax",
             "final_direction": policy["direction"],
             "final_p_b": p_b,
             "final_p_p": p_p,
@@ -275,12 +272,12 @@ def global_trend_bias_correction(
         "final_p_p": p_p,
         "final_direction": policy["direction"],
         "final_confidence_prob": float(policy["selected_win_probability"]),
-        "formula": "TwoArmLinUCB(X) with card-composition-first context",
+        "formula": "argmax(causal_road_forecaster.p_b, causal_road_forecaster.p_p)",
     }
 
 
 def road_only_policy(history: str | Iterable[Any] | None) -> dict[str, Any]:
-    """保留舊入口名稱；以中性牌組 Context 呼叫正式兩臂 LinUCB。"""
+    """保留舊入口名稱與簽名；呼叫正式下一手 forecaster。"""
     return linucb_policy(history, shoe_context={})
 
 
@@ -339,7 +336,7 @@ def recent_user_direction_feedback(
         "triggered": False,
         "window": ONLINE_WINDOW,
         "loss_trigger": ONLINE_CONSECUTIVE_LOSS_TRIGGER,
-        "semantics": "diagnostic_only_formal_direction_is_linucb",
+        "semantics": "diagnostic_only_formal_direction_is_road_forecaster",
     }
 
 
@@ -350,7 +347,7 @@ def record_online_feedback(
     context_vector: Sequence[float],
     actual_outcome: str,
 ) -> dict[str, Any]:
-    """session/虛擬結算可直接呼叫；真實畫面流程也會由下一次 history 自動對齊更新。"""
+    """保留結算 API；LinUCB 診斷更新，forecaster 於下一次已揭曉 history 重播訓練。"""
     return update_bandit(
         scope_key=scope_key,
         action=action,
