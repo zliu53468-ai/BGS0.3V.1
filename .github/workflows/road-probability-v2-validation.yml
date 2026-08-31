@@ -1,0 +1,63 @@
+name: Road Probability V2 validation
+
+on:
+  push:
+    branches:
+      - feature/road-probability-v2
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install core test dependency
+        run: python -m pip install 'numpy>=1.26,<2.4'
+      - name: Compile prediction core
+        run: >-
+          python -m py_compile
+          road_pattern_core.py
+          dynamic_prediction_policy.py
+          predictor.py
+          road_model.py
+          road_forecaster.py
+          pattern_survival.py
+          shoe_depth_estimator.py
+          money_management.py
+          shoe_composition.py
+      - name: Run Road Probability V2 regressions
+        run: >-
+          python -m unittest -v
+          test_road_pattern_primary.py
+          test_formal_shoe_decision.py
+          test_shoe_constants.py
+          test_shoe_composition.py
+      - name: Verify turning diagnostics
+        run: |
+          python - <<'PY'
+          from road_pattern_core import forecast_road_pattern
+          stable = forecast_road_pattern('BP' * 12)
+          shifted = forecast_road_pattern(('BP' * 9) + 'BBBBBB')
+          assert shifted['change_point_probability'] > stable['change_point_probability']
+          assert shifted['turning_pressure'] > stable['turning_pressure']
+          assert shifted['dynamic_window_weights']['6'] > stable['dynamic_window_weights']['6']
+          assert shifted['dynamic_window_weights']['24'] < stable['dynamic_window_weights']['24']
+          print('stable', stable['change_point_probability'], stable['turning_pressure'])
+          print('shifted', shifted['change_point_probability'], shifted['turning_pressure'])
+          PY
+      - name: Verify OCR and screenshot sources untouched
+        run: |
+          changed="$(git diff --name-only origin/main...HEAD)"
+          echo "$changed"
+          for file in room_ocr.py baccarat_vision.py screen_pipeline.py screenshot_predictor.py road_detector.py; do
+            if echo "$changed" | grep -Fxq "$file"; then
+              echo "Forbidden OCR/screen change: $file"
+              exit 1
+            fi
+          done
+      - name: Check whitespace
+        run: git diff --check origin/main...HEAD
