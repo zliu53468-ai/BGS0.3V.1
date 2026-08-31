@@ -14,8 +14,14 @@ from functools import lru_cache
 from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import os
 
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    SHOE_DECKS,
+    fresh_point_counts,
+)
 
-DECKS = max(1, min(16, int(os.getenv("SHOE_DECKS", "8") or "8")))
+# Compatibility alias; authoritative value lives in shoe_constants.py.
+DECKS = SHOE_DECKS
 BANKER_COMMISSION = min(
     0.20,
     max(0.0, float(os.getenv("BANKER_COMMISSION", "0.05") or "0.05")),
@@ -56,9 +62,8 @@ STANDARD_EIGHT_DECK_BASELINE = {
 
 
 def fresh_counts(decks: int = DECKS) -> List[int]:
-    """回傳點數 0..9 的新牌靴張數；0 包含 10/J/Q/K。"""
-    count = max(1, min(16, int(decks)))
-    return [16 * count] + [4 * count] * 9
+    """回傳點數 0..9 的新牌靴張數；權威張數表由 shoe_constants 提供。"""
+    return fresh_point_counts(decks)
 
 
 def parse_card_value(value: Any) -> int:
@@ -585,6 +590,13 @@ def analyze_shoe_composition(
                 context.get("source") or source
             ),
             "decks": decks,
+            "shoe_decks": decks,
+            "remaining_cards": int(sum(counts)),
+            "remaining_cards_source": (
+                "exact_counts" if source == "remaining_counts" else "observed_cards"
+            ),
+            "average_cards_per_hand": float(AVERAGE_CARDS_PER_HAND),
+            "remaining_cards_semantics": "exact_from_card_composition",
             "remaining_counts": list(counts),
             "probabilities": probabilities,
             "probability_delta_from_standard": {

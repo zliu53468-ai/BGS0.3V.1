@@ -19,6 +19,12 @@ import time
 import numpy as np
 
 from road_forecaster import forecast_next
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    BURN_CARDS,
+    SHOE_DECKS,
+    estimate_remaining_cards,
+)
 
 ARMS = ("P", "B")
 CONTEXT_DIM = 16
@@ -41,8 +47,6 @@ CONTEXT_FEATURE_NAMES = (
     "local_global_slope_gap",
 )
 
-SHOE_DECKS = max(1, int(os.getenv("SHOE_DECKS", "8") or "8"))
-ESTIMATED_CARDS_PER_ROUND = max(4.0, min(6.0, float(os.getenv("ESTIMATED_CARDS_PER_ROUND", "4.8") or "4.8")))
 LINUCB_ALPHA = max(0.0, float(os.getenv("LINUCB_ALPHA", "0.5") or "0.5"))
 LINUCB_RIDGE = max(1e-6, float(os.getenv("LINUCB_RIDGE", "1.0") or "1.0"))
 LINUCB_UPDATE_WEIGHT = max(1e-3, float(os.getenv("LINUCB_UPDATE_WEIGHT", "1.0") or "1.0"))
@@ -223,10 +227,19 @@ class ContextGenerator:
             raise RuntimeError(f"context dimension mismatch: {vector.shape}")
         vector = np.nan_to_num(vector, nan=0.0, posinf=1.0, neginf=-1.0)
         ctx = dict(shoe_context or {})
+        remaining_hint = ctx.get("remaining_cards")
+        if remaining_hint is None or remaining_hint == "":
+            ctx["remaining_cards"] = estimate_remaining_cards(
+                len(raw), decks=SHOE_DECKS,
+                average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
+                burn_cards=BURN_CARDS,
+            )
+            ctx["remaining_cards_source"] = "round_count_estimate"
         try:
             diagnostic_remaining = max(0.0, float(ctx.get("remaining_cards", 0.0) or 0.0))
         except (TypeError, ValueError):
-            diagnostic_remaining = 0.0
+            diagnostic_remaining = estimate_remaining_cards(len(raw), decks=SHOE_DECKS)
+            ctx["remaining_cards_source"] = "round_count_estimate"
         return ContextSnapshot(vector=vector, metadata={
             "raw_round_count": len(raw), "bp_round_count": len(values), "tie_count": sum(v == "T" for v in raw),
             "recent4_banker_centered": r4, "recent8_banker_centered": r8, "recent12_banker_centered": r12,
@@ -239,7 +252,12 @@ class ContextGenerator:
             "context_scaling": "centered_road_features_plus_l2_internal",
             "feature_priority": "screenshot_big_road_plus_manual_history_primary",
             "formal_direction_source": "road_history_only", "shoe_context_used_for_formal_direction": False,
-            "remaining_cards": diagnostic_remaining, "remaining_cards_source": str(ctx.get("remaining_cards_source") or "diagnostic_only"),
+            "remaining_cards": diagnostic_remaining,
+            "remaining_cards_source": str(ctx.get("remaining_cards_source") or "round_count_estimate"),
+            "average_cards_per_hand": float(AVERAGE_CARDS_PER_HAND),
+            "shoe_decks": int(SHOE_DECKS),
+            "burn_cards": int(BURN_CARDS),
+            "remaining_cards_semantics": "maturity_depth_estimate_not_exact_composition",
             "estimated_remaining_counts_0_to_9": [], "rank_ratio_source": "not_used_road_primary", "rank_ratios_a_to_10jqk": [],
         })
 

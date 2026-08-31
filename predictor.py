@@ -20,6 +20,14 @@ from dynamic_prediction_policy import (
 from money_management import MAX_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
 from shoe_composition import analyze_shoe_composition
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    BURN_CARDS,
+    CARDS_PER_DECK,
+    REFERENCE_HANDS,
+    SHOE_DECKS,
+)
+from shoe_depth_estimator import ShoeDepthEstimator
 
 OUTCOMES = ("B", "P", "T")
 _MONEY = MoneyManagementModel()
@@ -123,6 +131,12 @@ def predict(
 
     raw_history = _normalize_outcome_history(_history_values(history))
     big_road = normalize_big_road(raw_history)
+    depth_estimate = ShoeDepthEstimator(
+        shoe_decks=SHOE_DECKS,
+        average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
+        reference_hands=REFERENCE_HANDS,
+        burn_cards=BURN_CARDS,
+    ).estimate(raw_history).as_dict()
 
     supplied_road = dict(road_context or {})
     if (
@@ -237,17 +251,16 @@ def predict(
     bandit_feedback_update = dict(policy.get("feedback_update") or {})
 
     exact_counts = list(shoe_analysis.get("remaining_counts") or []) if shoe_available else []
-    remaining_cards_value = (
-        float(sum(exact_counts))
-        if exact_counts
-        else float(context_meta.get("remaining_cards", 0.0) or 0.0)
-    )
-    estimated_counts = exact_counts or list(context_meta.get("estimated_remaining_counts_0_to_9") or [])
-    if not remaining_cards_value:
-        try:
-            remaining_cards_value = max(0.0, float(context.get("remaining_cards", 0.0) or 0.0))
-        except (TypeError, ValueError):
-            remaining_cards_value = 0.0
+    if shoe_available:
+        remaining_cards_value = float(sum(exact_counts))
+        remaining_cards_source = (
+            "exact_counts" if composition_source == "remaining_counts" else "observed_cards"
+        )
+        estimated_counts = exact_counts
+    else:
+        remaining_cards_value = float(depth_estimate["remaining_cards"])
+        remaining_cards_source = "round_count_estimate"
+        estimated_counts = []
 
     context_meta.update(
         {
@@ -258,8 +271,14 @@ def predict(
             "card_composition_source": composition_source,
             "remaining_counts_source": composition_source,
             "remaining_cards": remaining_cards_value,
-            "remaining_cards_source": composition_source if shoe_available else str(
-                context_meta.get("remaining_cards_source") or "estimated"
+            "remaining_cards_source": remaining_cards_source,
+            "average_cards_per_hand": float(AVERAGE_CARDS_PER_HAND),
+            "shoe_decks": int(SHOE_DECKS),
+            "burn_cards": int(BURN_CARDS),
+            "reference_hands": int(REFERENCE_HANDS),
+            "remaining_cards_semantics": (
+                "exact_from_card_composition" if shoe_available
+                else "maturity_depth_estimate_not_exact_composition"
             ),
             "estimated_remaining_counts_0_to_9": estimated_counts,
         }
@@ -345,13 +364,17 @@ def predict(
         or context.get("remaining_cards")
     )
     depth_constraint = {
-        "applied": shoe_available or supplied_remaining,
+        "applied": True,
         "reason": (
             f"{composition_source}_used_for_exact_shoe_ev"
-            if shoe_available
-            else "remaining_depth_estimated_or_diagnostic_only"
+            if shoe_available else "round_count_maturity_depth_estimate"
         ),
         "target_remaining_cards": remaining_cards_value,
+        "source": remaining_cards_source,
+        "semantics": (
+            "exact_total_from_composition" if shoe_available
+            else "burn_plus_hand_count_times_average_not_exact_composition"
+        ),
     }
     shoe_estimate = {
         "direction": direction,
@@ -361,26 +384,27 @@ def predict(
             "P": p_p / max(1e-12, p_b + p_p),
         },
         "expected_remaining_cards": remaining_cards_value,
-        "expected_remaining_decks": remaining_cards_value / 52.0,
+        "expected_remaining_decks": remaining_cards_value / float(CARDS_PER_DECK),
         "expected_remaining_counts": estimated_counts,
         "remaining_count_std": [],
         "remaining_card_state": {
-            "available": shoe_available,
-            "conditioned_rounds": len(big_road),
-            "source": composition_source if shoe_available else "none",
+            "available": True,
+            "conditioned_rounds": len(raw_history),
+            "source": remaining_cards_source,
+            "exact_composition": bool(shoe_available),
         },
-        "conditioned_rounds": len(big_road),
+        "conditioned_rounds": len(raw_history),
         "particle_count": 0,
-        "reliability": 1.0 if shoe_available else 0.0,
+        "reliability": 1.0 if shoe_available else 0.5,
         "fusion_weight": card_weight,
         "target_remaining_cards": remaining_cards_value,
-        "depth_constraint_applied": shoe_available,
+        "depth_constraint_applied": True,
         "depth_constraint": depth_constraint,
         "shoe_tendency": dict(shoe_analysis.get("composition") or {}),
         "inference_semantics": (
             "exact_nonreplacement_next_hand_probability"
             if shoe_available
-            else "unavailable_road_fallback"
+            else "round_count_maturity_depth_estimate_road_fallback"
         ),
         "source": composition_source,
         "expected_returns": dict(shoe_analysis.get("expected_returns") or {}),
@@ -456,6 +480,11 @@ def predict(
         "road_context_direction_weight": road_weight,
         "card_composition_source": composition_source,
         "remaining_counts_source": composition_source,
+        "remaining_cards_source": remaining_cards_source,
+        "average_cards_per_hand": float(AVERAGE_CARDS_PER_HAND),
+        "shoe_decks": int(SHOE_DECKS),
+        "burn_cards": int(BURN_CARDS),
+        "reference_hands": int(REFERENCE_HANDS),
         "banker_expected_return": banker_ev,
         "player_expected_return": player_ev,
         "banker_ev": banker_ev,
@@ -469,11 +498,14 @@ def predict(
         "confidence_label": "較高" if confidence >= 0.56 else "中等" if confidence >= 0.52 else "保守",
         "entropy_bits": 0.0,
         "entropy_base_weight": confidence,
-        "shoe_progress": float(min(1.0, len(big_road) / 70.0)),
+        "shoe_progress": float(depth_estimate["shoe_progress"]),
         "shoe_depth_estimate": {
-            "rounds": len(big_road),
+            **dict(depth_estimate),
+            "rounds": len(raw_history),
             "remaining_cards": remaining_cards_value,
-            "source": composition_source if shoe_available else str(context_meta.get("remaining_cards_source") or "estimated"),
+            "remaining_cards_source": remaining_cards_source,
+            "source": remaining_cards_source,
+            "exact_composition": bool(shoe_available),
         },
         "remaining_card_state": dict(shoe_estimate["remaining_card_state"]),
         "estimated_remaining_cards": remaining_cards_value,

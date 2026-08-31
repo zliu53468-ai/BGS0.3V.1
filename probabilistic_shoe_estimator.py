@@ -21,12 +21,23 @@ import math
 import random
 import statistics
 
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    BURN_CARDS,
+    CARDS_PER_DECK,
+    SHOE_DECKS,
+    estimate_cards_used,
+    estimate_remaining_cards,
+    fresh_point_counts,
+    total_cards_for_decks,
+)
+
 # Keep MODEL_VERSION stable because it is part of the deterministic RNG seed.
 MODEL_VERSION = "PROBABILISTIC-SHOE-PARTICLE-V3-DEPTH-CONDITIONED"
 DRAW_DIAGNOSTICS_VERSION = "SHOE-DRAW-DIAGNOSTICS-V1"
 OUTCOMES = ("B", "P", "T")
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
-DECKS = 8
+DECKS = SHOE_DECKS  # compatibility alias; authoritative value is centralized
 
 PARTICLE_COUNT = 64
 LIKELIHOOD_DRAWS = 6
@@ -66,8 +77,7 @@ def _clean_threeway(values: Iterable[Any]) -> list[str]:
 
 
 def _fresh_counts(decks: int = DECKS) -> list[int]:
-    decks = max(1, min(16, int(decks)))
-    return [16 * decks] + [4 * decks] * 9
+    return fresh_point_counts(decks)
 
 
 def _draw_point(counts: list[int], rng: random.Random) -> int:
@@ -371,7 +381,17 @@ def estimate_probabilistic_shoe(
     sequence = full_sequence[-MAX_CONDITIONING_ROUNDS:]
     particle_count = max(24, min(160, int(particle_count)))
     decks = max(1, min(16, int(decks)))
-    start_cards = 52 * decks
+    start_cards = total_cards_for_decks(decks)
+    round_count_remaining_cards = estimate_remaining_cards(
+        len(full_sequence), decks=decks,
+        average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
+        burn_cards=BURN_CARDS,
+    )
+    round_count_cards_used = estimate_cards_used(
+        len(full_sequence),
+        average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
+        burn_cards=BURN_CARDS,
+    )
 
     # Keep the base outcome-conditioned particle population deterministic for a
     # given history. A rejected depth estimate must not change the RNG path.
@@ -515,20 +535,29 @@ def estimate_probabilistic_shoe(
         std_counts = [0.0] * 10
         remaining_totals = [float(sum(expected_counts))]
 
-    expected_remaining_cards = float(sum(expected_counts))
-    expected_cards_used = max(0.0, float(start_cards) - expected_remaining_cards)
+    posterior_expected_remaining_cards = float(sum(expected_counts))
+    posterior_expected_cards_used = max(
+        0.0, float(start_cards) - posterior_expected_remaining_cards
+    )
     mean_cards_per_round = (
-        expected_cards_used / conditioned_rounds
+        posterior_expected_cards_used / conditioned_rounds
         if conditioned_rounds > 0 else 0.0
     )
     mean_ess_ratio = (
         sum(ess_ratios) / len(ess_ratios) if ess_ratios else 1.0
     )
 
-    remaining_cards_interval = _card_interval(remaining_totals)
-    remaining_cards_interval["semantics"] = (
+    posterior_remaining_cards_interval = _card_interval(remaining_totals)
+    posterior_remaining_cards_interval["semantics"] = (
         "posterior_particle_interval_not_exact_remaining_card_count"
     )
+    round_count_remaining_interval = {
+        "p10": float(round_count_remaining_cards),
+        "p50": float(round_count_remaining_cards),
+        "p90": float(round_count_remaining_cards),
+        "width_p90_p10": 0.0,
+        "semantics": "round_count_maturity_depth_point_estimate_not_exact_composition",
+    }
 
     total_card_count_samples = sum(next_hand_card_counts.values())
     if total_card_count_samples > 0:
@@ -569,7 +598,7 @@ def estimate_probabilistic_shoe(
             "baccarat_rule_based_4_5_6_card_consumption_distribution_not_directional_vote"
         ),
     }
-    phase = _shoe_phase(start_cards, expected_remaining_cards)
+    phase = _shoe_phase(start_cards, round_count_remaining_cards)
 
     bp_mass = probabilities["B"] + probabilities["P"]
     if bp_mass > 1e-12:
@@ -652,10 +681,23 @@ def estimate_probabilistic_shoe(
         "next_hand_draws_per_particle": int(NEXT_HAND_DRAWS_PER_PARTICLE),
         "expected_remaining_counts": [float(x) for x in expected_counts],
         "remaining_count_std": [float(x) for x in std_counts],
-        "expected_remaining_cards": expected_remaining_cards,
-        "remaining_cards_interval": remaining_cards_interval,
-        "expected_remaining_decks": expected_remaining_cards / 52.0,
-        "expected_cards_used": expected_cards_used,
+        "expected_remaining_counts_source": "probabilistic_particle_posterior_not_exact",
+        "expected_remaining_cards": float(round_count_remaining_cards),
+        "remaining_cards_interval": round_count_remaining_interval,
+        "expected_remaining_decks": float(round_count_remaining_cards) / float(CARDS_PER_DECK),
+        "expected_cards_used": float(round_count_cards_used),
+        "round_count_estimated_remaining_cards": float(round_count_remaining_cards),
+        "round_count_estimated_cards_used": float(round_count_cards_used),
+        "posterior_expected_remaining_cards": float(posterior_expected_remaining_cards),
+        "posterior_remaining_cards_interval": posterior_remaining_cards_interval,
+        "posterior_expected_remaining_decks": float(posterior_expected_remaining_cards) / float(CARDS_PER_DECK),
+        "posterior_expected_cards_used": float(posterior_expected_cards_used),
+        "remaining_cards_source": "round_count_estimate",
+        "average_cards_per_hand": float(AVERAGE_CARDS_PER_HAND),
+        "shoe_decks": int(decks),
+        "burn_cards": int(BURN_CARDS),
+        "depth_estimate_semantics": "maturity_depth_estimate_not_exact_composition",
+        "posterior_composition_semantics": "probabilistic_particle_composition_not_exact_remaining_counts",
         "mean_cards_per_conditioned_round": float(mean_cards_per_round),
         "next_hand_draw_profile": next_hand_draw_profile,
         "next_remaining_cards_interval": next_remaining_cards_interval,

@@ -39,6 +39,12 @@ from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
 from room_ocr import preload_ocr
 from shoe_composition import validate_remaining_counts
+from shoe_constants import (
+    AVERAGE_CARDS_PER_HAND,
+    SHOE_DECKS,
+    TOTAL_SHOE_CARDS,
+    estimate_remaining_cards,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -81,10 +87,7 @@ _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 _USER_LOCKS: Dict[str, asyncio.Lock] = {}
 _USER_IMAGE_LOCKS: Dict[str, threading.Lock] = {}
 _USER_IMAGE_LOCKS_GUARD = threading.Lock()
-SCREEN_ESTIMATED_CARDS_PER_ROUND = max(
-    0,
-    min(6, int(os.getenv("SCREEN_ESTIMATED_CARDS_PER_ROUND", "5") or "5")),
-)
+SCREEN_ESTIMATED_CARDS_PER_ROUND = AVERAGE_CARDS_PER_HAND  # compatibility alias
 
 
 VENUES: List[Dict[str, str]] = [
@@ -175,7 +178,7 @@ class ShoeCardsRequest(UserRequest):
 class ExactRemainingCountsRequest(UserRequest):
     """使用者明確輸入的點數 0..9 剩餘張數；不是 OCR 猜測值。"""
     remaining_counts: List[Any] = Field(default_factory=list)
-    decks: int = Field(default=8, ge=1, le=16)
+    decks: int = Field(default=SHOE_DECKS, ge=1, le=16)
 
 
 class LiffSessionStartRequest(VenueRequest):
@@ -517,7 +520,7 @@ def _exact_shoe_context(session: Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(counts, list) and len(counts) == 10:
         context.update({
             "remaining_counts": list(counts),
-            "decks": int(session.get("exact_remaining_decks", 8) or 8),
+            "decks": int(session.get("exact_remaining_decks", SHOE_DECKS) or SHOE_DECKS),
             "source": "user_exact_remaining_counts",
         })
     return context
@@ -1574,12 +1577,9 @@ def _refresh_screen_prediction(
             or ""
         )
 
-        current_remaining = int(
-            session.get("screen_remaining_cards")
-            or ocr.get("remaining_cards")
-            or 416
+        remaining = int(
+            round(estimate_remaining_cards(len(raw_history), decks=SHOE_DECKS))
         )
-        remaining = max(6, current_remaining - SCREEN_ESTIMATED_CARDS_PER_ROUND)
         screen_metadata = {
             "input_type": str(
                 session.get("screen_input_type")
@@ -1805,7 +1805,7 @@ def _process_screen_image_sync(
             ]
 
         resolved = dict(screen.get("resolved") or {})
-        remaining = int(resolved.get("remaining_cards") or 416)
+        remaining = int(resolved.get("remaining_cards") or TOTAL_SHOE_CARDS)
         resolved["remaining_cards"] = remaining
         expected_version = int(current_session.get("screen_data_version", 0) or 0)
         screen_metadata = {

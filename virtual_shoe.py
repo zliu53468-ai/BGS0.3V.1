@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import os
 import secrets
 
+from shoe_constants import SHOE_DECKS
+
 from particle_filter_points import (
     EngineSettings,
     HandResult,
@@ -32,7 +34,7 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
-DEFAULT_DECKS = _env_int("PF_DECKS", 8, 1, 16)
+DEFAULT_DECKS = SHOE_DECKS
 DEFAULT_CUT_CARD_MIN = _env_int("VIRTUAL_CUT_CARD_MIN", 60, 12, 160)
 DEFAULT_CUT_CARD_MAX = _env_int("VIRTUAL_CUT_CARD_MAX", 85, 12, 180)
 
