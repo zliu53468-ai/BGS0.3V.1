@@ -1,16 +1,16 @@
-"""Production Road-Primary wrapper: exact V1 core + capped human derived roads.
+"""Production Road-Primary wrapper: exact V1 + derived roads + regime gate.
 
-The underlying Big-Road predictor is preserved exactly in road_pattern_v1_core.
-This wrapper adds only one auxiliary stage after V1 has already produced its
-B/P probability: a human-style Big Eye / Small Road / Cockroach Ask-Road model.
+The exact Big-Road V1 core remains unchanged in ``road_pattern_v1_core``.
+Formal prediction is built in three ordered stages:
 
-The derived-road auxiliary now has two sublayers:
-1. Human R/U sequence patterns (recent rhythm, replay, N-gram, pattern break).
-2. Standard six-row display geometry (vertical drop, horizontal tail, collision
-   turns, column-height rhythm and stair/shape structure).
+1. V1 Big-Road probability.
+2. Capped Human Derived Ask-Road auxiliary (R/U sequence + six-row geometry).
+3. A small HSMM-inspired run-hazard residual gate that estimates whether the
+   current road is persisting, alternating, transitioning or noisy.
 
-Both sublayers come from the same Big-Road history, so their combined formal
-reliability remains capped and cannot dominate a strong V1 signal.
+The regime layer never becomes an independent vote. Directional sign comes from
+empirical continue/turn hazard; the hidden-state posterior only controls how much
+that residual may adjust an already-computed V1 + derived probability.
 """
 from __future__ import annotations
 
@@ -34,8 +34,9 @@ from road_pattern_v1_core import (
     forecast_road_pattern as forecast_v1_road_pattern,
     normalize_bp,
 )
+from road_regime_gate import MAX_REGIME_DIRECTION_WEIGHT, analyze_road_regime_gate
 
-VERSION = f"{V1_VERSION}|HUMAN-DERIVED-ASK-V2.1-GEOMETRY"
+VERSION = f"{V1_VERSION}|HUMAN-DERIVED-ASK-V2.1-GEOMETRY|HSMM-HAZARD-GATE-V1"
 
 
 def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -91,7 +92,6 @@ def _combine_derived_layers(
     )
     geometry_rel = _clip(geometry.get("reliability", 0.0), 0.0, 0.10)
 
-    # Sequence reading remains primary inside the derived-road subsystem.
     human_weight = 0.78 * human_rel
     geometry_weight = 0.22 * geometry_rel
     if human_weight + geometry_weight <= 1e-12:
@@ -173,12 +173,7 @@ def fuse_v1_with_derived(
     v1_banker_probability: float,
     derived_analysis: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Apply a capped Ask-Road log-odds correction to a V1 probability.
-
-    Strong V1 signals are intentionally hard to overturn. Derived roads gain
-    their highest relative influence only when V1 is near neutral and at least
-    two derived roads are active with non-trivial Ask-Road separation.
-    """
+    """Apply a capped Ask-Road log-odds correction to a V1 probability."""
     base_p_b = _clip(v1_banker_probability, 0.37, 0.63)
     likelihood = dict(derived_analysis.get("likelihood") or {})
     derived_p_b = _clip(likelihood.get("B", 0.5), 0.20, 0.80)
@@ -217,15 +212,69 @@ def fuse_v1_with_derived(
     }
 
 
+def fuse_with_regime_gate(
+    base_banker_probability: float,
+    regime_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply a small HSMM-gated hazard residual after V1 + derived roads.
+
+    Strong existing Road signals are protected. A direction flip is only possible
+    near neutrality, and only when the empirical hazard has non-trivial support
+    and the hidden-regime gate grants reliability.
+    """
+    base_p_b = _clip(base_banker_probability, 0.37, 0.63)
+    likelihood = dict(regime_gate.get("likelihood") or {})
+    gate_p_b = _clip(likelihood.get("B", 0.5), 0.20, 0.80)
+    reliability = _clip(
+        regime_gate.get("reliability", 0.0),
+        0.0,
+        MAX_REGIME_DIRECTION_WEIGHT,
+    )
+    separation = abs(gate_p_b - 0.5) * 2.0
+    ambiguity = _clip(1.0 - abs(base_p_b - 0.5) / 0.09)
+
+    if not bool(regime_gate.get("available")) or separation < 0.06:
+        effective_weight = 0.0
+    else:
+        effective_weight = reliability * (0.25 + 0.75 * ambiguity)
+        if abs(base_p_b - 0.5) >= 0.06:
+            effective_weight *= 0.25
+
+    final_logit = _logit(base_p_b) + effective_weight * _logit(gate_p_b)
+    final_p_b = _clip(_sigmoid(final_logit), 0.37, 0.63)
+    return {
+        "base_p_b": float(base_p_b),
+        "base_p_p": float(1.0 - base_p_b),
+        "regime_p_b": float(gate_p_b),
+        "regime_p_p": float(1.0 - gate_p_b),
+        "regime_reliability": float(reliability),
+        "regime_effective_weight": float(effective_weight),
+        "main_ambiguity": float(ambiguity),
+        "regime_separation": float(separation),
+        "final_p_b": float(final_p_b),
+        "final_p_p": float(1.0 - final_p_b),
+        "direction_override": (
+            (base_p_b >= 0.5) != (final_p_b >= 0.5)
+            and abs(base_p_b - 0.5) < 0.04
+        ),
+        "semantics": "post_road_hsmm_gated_empirical_continue_turn_residual",
+    }
+
+
 def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]:
     base = dict(forecast_v1_road_pattern(history))
     sequence = normalize_bp(history)
     derived = _derived_analysis(sequence)
     base_probabilities = dict(base.get("probabilities") or {})
     base_p_b = _clip(base_probabilities.get("B", 0.5), 0.37, 0.63)
-    fusion = fuse_v1_with_derived(base_p_b, derived)
-    p_b = float(fusion["final_p_b"])
-    p_p = float(fusion["final_p_p"])
+
+    derived_fusion = fuse_v1_with_derived(base_p_b, derived)
+    pre_regime_p_b = float(derived_fusion["final_p_b"])
+    regime_gate = analyze_road_regime_gate(sequence, derived_analysis=derived)
+    regime_fusion = fuse_with_regime_gate(pre_regime_p_b, regime_gate)
+
+    p_b = float(regime_fusion["final_p_b"])
+    p_p = float(regime_fusion["final_p_p"])
     direction = "B" if p_b >= p_p else "P"
     confidence = max(p_b, p_p)
 
@@ -248,13 +297,23 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             "v1_model_id": MODEL_ID,
             "v1_version": V1_VERSION,
             "derived_ask_road": derived,
-            "derived_ask_road_fusion": fusion,
-            "derived_direction_weight": float(fusion["derived_effective_weight"]),
+            "derived_ask_road_fusion": derived_fusion,
+            "derived_direction_weight": float(derived_fusion["derived_effective_weight"]),
             "derived_direction_authority": "capped_auxiliary_only",
+            "pre_regime_probabilities": {
+                "B": float(pre_regime_p_b),
+                "P": float(1.0 - pre_regime_p_b),
+                "T": 0.0,
+            },
+            "regime_gate": regime_gate,
+            "regime_gate_fusion": regime_fusion,
+            "regime_direction_weight": float(regime_fusion["regime_effective_weight"]),
+            "regime_direction_authority": "capped_residual_only",
+            # Preserve the public compatibility string used by existing clients.
             "direction_authority": "road_pattern_v1_plus_human_derived_ask_road",
             "semantics": (
-                "road_v1_primary_plus_capped_human_derived_sequence_and_geometry_"
-                "ask_road_auxiliary"
+                "road_v1_plus_derived_sequence_geometry_then_capped_hsmm_hazard_"
+                "continue_turn_residual"
             ),
         }
     )
@@ -271,5 +330,6 @@ __all__ = [
     "REPLAY_LENGTHS",
     "normalize_bp",
     "fuse_v1_with_derived",
+    "fuse_with_regime_gate",
     "forecast_road_pattern",
 ]
