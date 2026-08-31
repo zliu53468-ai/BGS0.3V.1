@@ -461,17 +461,20 @@ def _unavailable(
 ) -> Dict[str, Any]:
     return {
         "available": False,
+        "direction": None,
         "action": None,
         "action_text": "牌靴資料不可用，交由牌路模型",
         "formal_no_observe_arm": True,
         "source": source,
         "reason_code": reason_code,
         "reason": reason,
+        "probabilities": {"B": None, "P": None, "T": None},
         "expected_returns": {
             "B": None,
             "P": None,
             "T": None,
         },
+        "ev": {"B": None, "P": None, "T": None},
         "selected_side_by_ev": None,
         "selected_expected_return": None,
         "best_raw_expected_return": None,
@@ -577,6 +580,7 @@ def analyze_shoe_composition(
 
         return {
             "available": True,
+            "direction": selected_side,
             "action": selected_side,
             "action_text": (
                 "莊"
@@ -612,6 +616,11 @@ def analyze_shoe_composition(
             ),
             "banker_commission": BANKER_COMMISSION,
             "expected_returns": returns,
+            "ev": {
+                "B": float(returns["B"]),
+                "P": float(returns["P"]),
+                "T": None,
+            },
             "banker_ev": float(returns["B"]),
             "player_ev": float(returns["P"]),
             "selected_side_by_ev": selected_side,
