@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Install focused-test dependency
+        run: python -m pip install --quiet numpy
       - name: Apply soft patch
         run: |
           python tools/apply_soft_transition_v2.py
