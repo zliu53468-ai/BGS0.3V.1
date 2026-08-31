@@ -6,7 +6,8 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn runtime_app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # Production deploy stays manual; only verified main commits should be deployed.
+    # Production deploy stays manual so a partially verified GitHub change cannot
+    # replace a healthy service. Deploy the merged main commit after CI passes.
     autoDeploy: false
     disk:
       name: bgs-runtime-data
@@ -16,7 +17,27 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.11
       - key: BGS_BUILD_LABEL
-        value: lstm-shortshoe-v2
+        value: lstm-shoe-cut-production-v2
+      - key: LSTM_ROAD_WINDOW
+        value: "24"
+      - key: LSTM_ROAD_MIN_HISTORY
+        value: "16"
+      - key: LSTM_ROAD_FULL_MATURITY
+        value: "36"
+      - key: LSTM_ROAD_MIN_CONTEXT
+        value: "6"
+      - key: LSTM_ROAD_MIN_ONLINE_SAMPLES
+        value: "10"
+      - key: LSTM_ROAD_REPLAY_WINDOW
+        value: "36"
+      - key: LSTM_ROAD_ONLINE_LR
+        value: "0.00015"
+      - key: BGS_TARGET_HANDS_MIN
+        value: "50"
+      - key: BGS_TARGET_HANDS_MAX
+        value: "70"
+      - key: BGS_CUT_CARD_REMAINING
+        value: "70"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
@@ -41,26 +62,3 @@ services:
         value: "0"
       - key: SESSION_DATA_FILE
         value: /var/data/sessions.json
-      - key: LSTM_ROAD_WINDOW
-        value: "24"
-      - key: LSTM_ROAD_MIN_HISTORY
-        value: "16"
-      - key: LSTM_ROAD_MIN_ONLINE_SAMPLES
-        value: "12"
-      - key: LSTM_ROAD_ONLINE_LR
-        value: "0.0001"
-      - key: LSTM_ROAD_REPLAY_WINDOW
-        value: "24"
-      - key: LSTM_ROAD_TEMPERATURE
-        value: "1.20"
-      - key: LSTM_ROAD_MAX_IN_SHOE_CONF
-        value: "0.66"
-      - key: BGS_SHOE_MIN_HANDS
-        value: "50"
-      - key: BGS_SHOE_MAX_HANDS
-        value: "70"
-      - key: BGS_SHOE_TARGET_HANDS
-        value: "60"
-      # 0 = auto-calculate cut reserve from target hands, decks and avg cards/hand.
-      - key: BGS_CUT_CARD_REMAINING
-        value: "0"
