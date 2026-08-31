@@ -1,0 +1,103 @@
+name: Apply soft transition v2
+
+on:
+  push:
+    branches:
+      - fix/transition-hazard-shoe-confidence
+    paths:
+      - tools/apply_soft_transition_v2.py
+      - .github/workflows/apply-soft-transition-v2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/transition-hazard-shoe-confidence
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Apply soft patch
+        run: python tools/apply_soft_transition_v2.py
+      - name: Syntax validation
+        run: python -m py_compile run_length_hazard.py hsmm_regime.py pattern_survival.py
+      - name: Transition behavior validation
+        run: |
+          python - <<'PY'
+          from run_length_hazard import analyze_run_length_hazard, MAX_HAZARD_RELIABILITY
+          from hsmm_regime import analyze_hidden_regime
+          from pattern_survival import calculate_pattern_survival
+
+          def history_from_runs(lengths):
+              out=[]
+              side='B'
+              for n in lengths:
+                  out.extend([side]*n)
+                  side='P' if side=='B' else 'B'
+              return out
+
+          # 8,6,9,8 completed, active run grows 4..9 toward common break region.
+          probs=[]
+          for active in range(4,10):
+              h=history_from_runs([8,6,9,8,active])
+              result=analyze_run_length_hazard(h)
+              probs.append(result['turn_probability'])
+              assert 0.0 <= result['turn_probability'] <= 1.0
+              assert result['max_reliability'] == MAX_HAZARD_RELIABILITY == 0.25
+          jumps=[abs(b-a) for a,b in zip(probs, probs[1:])]
+          print('hazard_curve', probs)
+          print('max_adjacent_jump', max(jumps) if jumps else 0.0)
+          assert max(jumps) < 0.12, jumps
+
+          markov={
+              'sample_count': 40,
+              'entropy_bits': 1.15,
+              'history': history_from_runs([8,6,9,8,7]),
+              'support_strength': 0.72,
+              'multi_order_agreement': 0.78,
+              'regime_profile': {
+                  'regime':'TRANSITION','base_regime':'DRAGON','stability':0.42,
+                  'alternation_ratio':0.25,'current_run_length':7,
+                  'recent_run_lengths':[8,6,9,8,7],
+                  'entropy_delta':0.18,'change_point':True,'pattern_break':True,
+              },
+              'state': {'recent5':['B','B','B','B','B']},
+          }
+          hsmm=analyze_hidden_regime(markov)
+          print('hsmm', hsmm['dominant_state'], hsmm['pattern_factor'], hsmm['hazard_factor'], hsmm['transition_evidence'])
+          assert hsmm['pattern_factor'] >= 0.70
+          assert hsmm['hazard_factor'] >= 0.80
+
+          mature={'shoe_stage':'MATURE','shoe_stage_factor':1.0,'reliability':0.85}
+          late={'shoe_stage':'LATE','shoe_stage_factor':0.90,'reliability':0.85}
+          ps_m=calculate_pattern_survival(markov, {}, mature)
+          ps_l=calculate_pattern_survival(markov, {}, late)
+          print('survival_mature', ps_m['score'], 'late', ps_l['score'])
+          print('change_factor', ps_m['change_point_factor'], 'late_effective_stage', ps_l['effective_stage_factor'])
+          assert 0.66 <= ps_m['change_point_factor'] <= 0.78
+          assert ps_l['effective_stage_factor'] >= 0.88
+          assert ps_l['score'] <= ps_m['score'] + 1e-12
+          assert ps_l['score'] >= ps_m['score'] * 0.85
+          assert ps_m['retained_hazard_component'] >= 0.0
+          PY
+      - name: Existing focused tests
+        run: python -m unittest -v test_shoe_constants test_shoe_composition test_formal_shoe_decision
+      - name: Diff check
+        run: git diff --check
+      - name: Commit target changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add run_length_hazard.py hsmm_regime.py pattern_survival.py
+          if git diff --cached --quiet; then
+            echo 'No target changes to commit'
+          else
+            git commit -m 'Soften transition hazard and shoe confidence calibration'
+            git push origin HEAD:fix/transition-hazard-shoe-confidence
+          fi
