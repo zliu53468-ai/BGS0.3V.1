@@ -520,7 +520,7 @@ def _exact_shoe_context(session: Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(counts, list) and len(counts) == 10:
         context.update({
             "remaining_counts": list(counts),
-            "decks": int(session.get("exact_remaining_decks", 8) or SHOE_DECKS),
+            "decks": int(session.get("exact_remaining_decks", SHOE_DECKS) or SHOE_DECKS),
             "source": "user_exact_remaining_counts",
         })
     return context
@@ -1577,14 +1577,8 @@ def _refresh_screen_prediction(
             or ""
         )
 
-        current_remaining = int(
-            session.get("screen_remaining_cards")
-            or ocr.get("remaining_cards")
-            or TOTAL_SHOE_CARDS
-        )
-        remaining = max(
-            6,
-            int(round(estimate_remaining_cards(len(raw_history), decks=SHOE_DECKS))),
+        remaining = int(
+            round(estimate_remaining_cards(len(raw_history), decks=SHOE_DECKS))
         )
         screen_metadata = {
             "input_type": str(
