@@ -1,10 +1,14 @@
 """Runtime entrypoint for the BGS LINE/FastAPI application.
 
-The runtime installs the dynamic prediction policy before loading the legacy app.
-The prediction core is road-only and the bankroll display bridge now preserves
-its exact quarter-Kelly ratio instead of imposing the previous 5% minimum.
+The runtime installs the dynamic policy before loading the legacy app, then
+keeps the formal predictor contract intact at the UI boundary:
+- formal action is always B/P;
+- shoe evidence priority is remaining_counts > observed_cards > none;
+- exact shoe EV owns direction when exact composition is available;
+- road forecaster is the fallback when it is not;
+- the core fractional-Kelly ratio is preserved inside the 5%..30% product band.
 
-OCR, screenshot upload, LINE transport and UI layout remain unchanged.
+OCR, screenshot recognition, LINE transport and UI layout remain unchanged.
 """
 from __future__ import annotations
 
@@ -18,97 +22,138 @@ install_dynamic_prediction_policy()
 import app as legacy_app
 
 
-def _attach_threeway_bankroll_advice(
-    prediction: Mapping[str, Any],
-    session: Mapping[str, Any],
-) -> dict[str, Any]:
-    result = dict(prediction or {})
-    bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
-    money = dict(result.get("money_management") or {})
+MIN_FORMAL_BET_RATIO = 0.05
+MAX_FORMAL_BET_RATIO = 0.30
 
+
+def _formal_bp_action(result: Mapping[str, Any]) -> str:
     action = str(
         result.get("action")
         or result.get("recommend")
         or result.get("direction")
         or ""
     ).upper().strip()
-    core_bet_allowed = bool(
-        money.get(
-            "bet_allowed",
-            result.get("bet_allowed", result.get("signal_allowed", False)),
-        )
-    )
-    core_ratio = max(
-        0.0,
-        min(
-            0.30,
-            float(
-                result.get(
-                    "final_bet_ratio",
-                    money.get("final_bet_ratio", 0.0),
-                )
-                or 0.0
-            ),
-        ),
-    )
-    skip_active = action in {"SKIP", "O"} or not core_bet_allowed or core_ratio <= 0.0
+    if action in {"B", "P"}:
+        return action
+    try:
+        banker = float(result.get("banker_rate", 0.0) or 0.0)
+        player = float(result.get("player_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        banker = player = 0.0
+    return "B" if banker >= player else "P"
 
-    if skip_active:
-        ratio = 0.0
-        amount = 0.0
-        level = "觀望 / SKIP"
-        reason = str(
-            result.get("signal_status_text")
-            or result.get("skip_reason")
-            or money.get("reason")
-            or "目前未通過牌路模型／虛擬 EV 決策閘門。"
+
+def _formal_shoe_context(session: Mapping[str, Any]) -> dict[str, Any]:
+    """Read verified shoe evidence from Session using the formal priority order."""
+    context: dict[str, Any] = {
+        "bankroll": max(0.0, float(session.get("bankroll", 0.0) or 0.0)),
+    }
+
+    # Priority 1: explicitly supplied remaining point counts (0..9).
+    counts = session.get("exact_remaining_counts")
+    if isinstance(counts, list) and len(counts) == 10:
+        context.update(
+            {
+                "remaining_counts": list(counts),
+                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "source": "remaining_counts",
+            }
         )
-        risk_gate_open = False
-    else:
-        # Preserve the exact ratio produced by MoneyManagementModel.  Do not
-        # re-introduce the legacy mandatory 5% floor here.
-        ratio = core_ratio
-        amount = bankroll * ratio
-        risk_gate_open = True
-        if bankroll <= 0.0:
-            level = "尚未設定"
-            reason = "請先設定本次分析本金；方向訊號已通過牌路模型與虛擬 EV 閘門。"
-        else:
-            level = "+EV 通過／1/4 Kelly"
-            reason = (
-                f"confidence={float(result.get('confidence', 0.0) or 0.0):.3f}；"
-                f"Kelly={float(result.get('kelly_fraction', 0.0) or 0.0):.4f}；"
-                f"final_ratio={ratio:.4f}；"
-                f"mode={str(money.get('reason') or 'positive_virtual_ev_quarter_kelly')}。"
+        return context
+
+    # Priority 2: actual observed card values saved by /api/shoe/cards.
+    observed = session.get("observed_cards")
+    if isinstance(observed, list) and observed:
+        context.update(
+            {
+                "observed_cards": list(observed),
+                "decks": int(session.get("exact_remaining_decks", 8) or 8),
+                "source": "observed_cards",
+            }
+        )
+    return context
+
+
+def _attach_formal_bankroll_advice(
+    prediction: Mapping[str, Any],
+    session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve the formal B/P + 5%..30% Kelly contract at the runtime UI edge."""
+    result = dict(prediction or {})
+    bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
+    money = dict(result.get("money_management") or {})
+    action = _formal_bp_action(result)
+
+    try:
+        core_ratio = float(
+            result.get(
+                "final_bet_ratio",
+                money.get("final_bet_ratio", MIN_FORMAL_BET_RATIO),
             )
+            or MIN_FORMAL_BET_RATIO
+        )
+    except (TypeError, ValueError):
+        core_ratio = MIN_FORMAL_BET_RATIO
+    ratio = max(MIN_FORMAL_BET_RATIO, min(MAX_FORMAL_BET_RATIO, core_ratio))
+    amount = bankroll * ratio
+    text = "莊" if action == "B" else "閒"
 
-    result.update({
-        "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
-        "risk_gate_open": bool(risk_gate_open),
-        "mandatory_bet": False,
-        "suggested_bet_amount": float(amount),
-        "bet_amount": float(amount),
-        "bet_percentage": float(ratio * 100.0),
-        "final_bet_ratio": float(ratio),
-        "bet_level_text": level,
-        "bet_reason": reason,
-        "screen_edge": round(float(result.get("direction_edge", 0.0) or 0.0), 6),
-    })
+    result.update(
+        {
+            "action": action,
+            "recommend": action,
+            "next_round_direction": action,
+            "direction": action,
+            "action_text": text,
+            "recommend_text": text,
+            "next_round_direction_text": text,
+            "direction_text": text,
+            "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
+            "risk_gate_open": True,
+            "signal_allowed": True,
+            "bet_allowed": True,
+            "mandatory_bet": True,
+            "skip": False,
+            "skip_reason": "",
+            "suggested_bet_amount": float(amount),
+            "bet_amount": float(amount),
+            "bet_percentage": float(ratio * 100.0),
+            "final_bet_ratio": float(ratio),
+            "bet_level_text": (
+                "精確牌靴 EV／Fractional Kelly"
+                if bool(result.get("shoe_context_used_for_formal_direction"))
+                else "牌路方向／Fractional Kelly"
+            ),
+            "bet_reason": str(
+                result.get("signal_reason")
+                or money.get("reason")
+                or "B/P two-arm fractional Kelly"
+            ),
+            "screen_edge": round(
+                float(result.get("direction_edge", 0.0) or 0.0),
+                6,
+            ),
+        }
+    )
 
     if isinstance(result.get("money_management"), Mapping):
         result["money_management"] = {
             **dict(result["money_management"]),
+            "direction": action,
             "bankroll": bankroll,
             "final_bet_ratio": float(ratio),
             "bet_percentage": float(ratio * 100.0),
             "bet_amount": float(amount),
-            "bet_allowed": bool(risk_gate_open),
-            "mandatory_bet": False,
+            "bet_allowed": True,
+            "mandatory_bet": True,
         }
     return result
 
 
-legacy_app._attach_bankroll_advice = _attach_threeway_bankroll_advice
+# app.py still contains legacy compatibility helpers. Override only these two
+# runtime seams instead of modifying OCR/screenshot/LINE code in the large file.
+legacy_app._exact_shoe_context = _formal_shoe_context
+legacy_app._attach_bankroll_advice = _attach_formal_bankroll_advice
 app = legacy_app.app
 
 __all__ = ["app"]

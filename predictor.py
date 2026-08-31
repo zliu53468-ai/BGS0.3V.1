@@ -1,7 +1,8 @@
-"""BGS 正式預測器：已揭曉 B/P 歷史 -> 因果式 road_forecaster -> Kelly。
+"""BGS 正式預測器：精確牌靴 EV 優先，缺資料時回退因果式 road forecaster。
 
 公開 predict() 參數與主要回傳欄位維持相容。OCR / screenshot / road adapter
-仍可傳入既有 context，但正式下一局方向只由 forecaster 機率 argmax 決定。
+不做修改。正式下一局方向永遠只會是 B/P：
+1) remaining_counts；2) observed_cards；3) road forecaster fallback。
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from dynamic_prediction_policy import (
 )
 from money_management import MAX_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
+from shoe_composition import analyze_shoe_composition
 
 OUTCOMES = ("B", "P", "T")
 _MONEY = MoneyManagementModel()
@@ -54,7 +56,6 @@ def _history_values(history: Union[str, Iterable[Any], None]) -> List[Any]:
 
 
 def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
-    """既有牌路模型只保留 UI/稽核診斷，不參與正式 forecaster 方向。"""
     try:
         banker = max(0.0, min(1.0, float(road.get("banker_probability", 0.5) or 0.5)))
     except (TypeError, ValueError):
@@ -82,6 +83,32 @@ def _road_diagnostic(road: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _shoe_source(context: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
+    if not bool(analysis.get("available")):
+        return "none"
+    raw_counts = context.get("remaining_counts")
+    if isinstance(raw_counts, (list, tuple)) and len(raw_counts) == 10:
+        return "remaining_counts"
+    observed = context.get("observed_cards")
+    if isinstance(observed, (list, tuple)) and len(observed) > 0:
+        return "observed_cards"
+    source = str(analysis.get("source") or "").strip().lower()
+    if source in {"remaining_counts", "exact_remaining_counts"}:
+        return "remaining_counts"
+    if source in {"observed_cards", "observed_card_values"}:
+        return "observed_cards"
+    return "none"
+
+
+def _resolved_confidence(probabilities: Mapping[str, Any], direction: str) -> float:
+    p_b = max(0.0, float(probabilities.get("B", 0.0) or 0.0))
+    p_p = max(0.0, float(probabilities.get("P", 0.0) or 0.0))
+    resolved = p_b + p_p
+    if resolved <= 1e-12:
+        return 0.5
+    return float((p_b if direction == "B" else p_p) / resolved)
+
+
 def predict(
     history: Union[str, Iterable[Any], None] = None,
     venue: str = "",
@@ -97,7 +124,6 @@ def predict(
     raw_history = _normalize_outcome_history(_history_values(history))
     big_road = normalize_big_road(raw_history)
 
-    # OCR/掃描資料只讀取既有輸出，不改動任何掃描程式；road_context 只做診斷。
     supplied_road = dict(road_context or {})
     if (
         isinstance(supplied_road.get("road_features"), list)
@@ -117,8 +143,8 @@ def predict(
     context = dict(shoe_context or {})
     bankroll = max(0.0, float(context.get("bankroll", 0.0) or 0.0))
 
-    # 保留 linucb_policy 呼叫介面；其正式來源已切換為逐手訓練的 forecaster。
-    # 只使用已揭曉大路 B/P。牌組欄位、OCR 診斷及事後斜率不能覆蓋方向。
+    # Road path is always evaluated so diagnostics/online feedback/public interfaces
+    # remain compatible. Exact shoe composition, when available, owns formal direction.
     policy = linucb_policy(
         raw_history,
         shoe_context=context,
@@ -127,15 +153,48 @@ def predict(
         room=room,
         shoe_id=shoe_id,
     )
-    probabilities = dict(policy["probabilities"])
-    direction = str(policy["direction"])
-    confidence = float(policy["selected_win_probability"])
+    road_probabilities = dict(policy["probabilities"])
+    road_direction = str(policy["direction"])
+    road_confidence = float(policy["selected_win_probability"])
+
+    shoe_analysis = dict(analyze_shoe_composition(context))
+    shoe_available = bool(shoe_analysis.get("available"))
+    composition_source = _shoe_source(context, shoe_analysis)
+
+    if shoe_available:
+        probabilities = dict(shoe_analysis.get("probabilities") or {})
+        returns = dict(shoe_analysis.get("expected_returns") or {})
+        b_ev = float(returns.get("B", 0.0) or 0.0)
+        p_ev = float(returns.get("P", 0.0) or 0.0)
+        # No EV gate and no third arm: even if both sides are negative, choose the
+        # mathematically better B/P side. Low/negative edge is handled by Kelly floor.
+        direction = "B" if b_ev >= p_ev else "P"
+        confidence = _resolved_confidence(probabilities, direction)
+        formal_source = "shoe_composition_ev_argmax"
+        card_weight = 1.0
+        road_weight = 0.0
+        selected_physical_ev = b_ev if direction == "B" else p_ev
+        shoe_analysis["action"] = direction
+        shoe_analysis["action_text"] = "莊" if direction == "B" else "閒"
+        shoe_analysis["formal_direction"] = direction
+        shoe_analysis["formal_no_observe_arm"] = True
+    else:
+        probabilities = dict(road_probabilities)
+        direction = road_direction if road_direction in {"B", "P"} else "B"
+        confidence = road_confidence
+        formal_source = "road_forecaster_probability_argmax"
+        card_weight = 0.0
+        road_weight = 1.0
+        selected_physical_ev = None
+        shoe_analysis["action"] = None
+        shoe_analysis["action_text"] = "牌靴資料不可用，正式方向回退牌路"
+        shoe_analysis["formal_direction"] = direction
+        shoe_analysis["formal_no_observe_arm"] = True
+
     action = direction
     text = "莊" if action == "B" else "閒"
     direction_text = text
 
-    # 強制 5%～30%：每局都要有明確可執行注碼；Kelly 仍負責相對風險尺度，
-    # 最後由硬下限/上限控制實際資金暴露。
     money = _MONEY.allocate(
         direction=direction,
         probabilities=probabilities,
@@ -143,7 +202,11 @@ def predict(
         bankroll=bankroll,
     )
     bet_allowed = True
-    signal_status_code = "LINUCB_TWO_ARM_KELLY_5_30"
+    signal_status_code = (
+        "SHOE_EV_TWO_ARM_KELLY_5_30"
+        if shoe_available
+        else "LINUCB_TWO_ARM_KELLY_5_30"
+    )
     signal_status_text = (
         f"下一手模型：{direction_text} {confidence:.1%}；"
         f"Kelly {float(money.get('bet_percentage', 5.0) or 5.0):.2f}%"
@@ -157,13 +220,14 @@ def predict(
                 str(room or "").strip(),
                 str(shoe_id or "").strip(),
                 POLICY_VERSION,
+                composition_source,
             )
         ).encode("utf-8")
     ).hexdigest()[:24]
 
     road_predict = _road_diagnostic(road)
-    p_b = float(probabilities["B"])
-    p_p = float(probabilities["P"])
+    p_b = float(probabilities.get("B", 0.5) or 0.0)
+    p_p = float(probabilities.get("P", 0.5) or 0.0)
     p_t = float(probabilities.get("T", 0.0) or 0.0)
     feedback = recent_user_direction_feedback(user_id)
     context_vector = list(policy.get("context_vector") or [])
@@ -172,16 +236,64 @@ def predict(
     bandit_scores = dict(policy.get("scores") or {})
     bandit_feedback_update = dict(policy.get("feedback_update") or {})
 
+    exact_counts = list(shoe_analysis.get("remaining_counts") or []) if shoe_available else []
+    remaining_cards_value = (
+        float(sum(exact_counts))
+        if exact_counts
+        else float(context_meta.get("remaining_cards", 0.0) or 0.0)
+    )
+    estimated_counts = exact_counts or list(context_meta.get("estimated_remaining_counts_0_to_9") or [])
+    if not remaining_cards_value:
+        try:
+            remaining_cards_value = max(0.0, float(context.get("remaining_cards", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            remaining_cards_value = 0.0
+
+    context_meta.update(
+        {
+            "formal_direction_source": formal_source,
+            "shoe_context_used_for_formal_direction": shoe_available,
+            "card_composition_direction_weight": card_weight,
+            "road_context_direction_weight": road_weight,
+            "card_composition_source": composition_source,
+            "remaining_counts_source": composition_source,
+            "remaining_cards": remaining_cards_value,
+            "remaining_cards_source": composition_source if shoe_available else str(
+                context_meta.get("remaining_cards_source") or "estimated"
+            ),
+            "estimated_remaining_counts_0_to_9": estimated_counts,
+        }
+    )
+    policy["context_metadata"] = context_meta
+    policy["road_direction_before_shoe_override"] = road_direction
+    policy["road_probabilities_before_shoe_override"] = dict(road_probabilities)
+    policy["direction"] = direction
+    policy["selected_arm"] = direction
+    policy["action"] = direction
+    policy["action_text"] = text
+    policy["latent_direction"] = direction
+    policy["probabilities"] = dict(probabilities)
+    policy["selected_win_probability"] = confidence
+    policy["confidence"] = confidence
+    policy["confidence_prob"] = confidence
+    policy["selection_reason"] = formal_source
+    policy["formal_context_source"] = (
+        composition_source if shoe_available else "screenshot_big_road_plus_manual_history"
+    )
+    policy["road_context_direction_weight"] = road_weight
+    policy["card_composition_direction_weight"] = card_weight
+    policy["shoe_context_used_for_formal_direction"] = shoe_available
+
     markov_predict = {
         "direction": direction,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "pattern_calibrated_probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "state": {
-            "direction_context": "LINUCB",
+            "direction_context": "SHOE_EV" if shoe_available else "LINUCB",
             "density": "CardCompositionFirst",
             "tie_trigger": "RewardZero",
         },
-        "state_key": "LINUCB",
+        "state_key": "SHOE_EV" if shoe_available else "LINUCB",
         "transition_counts": {},
         "effective_support": float(sum(int((bandit_scores.get(side) or {}).get("uncertainty", 0.0) >= 0.0) for side in ("B", "P"))),
         "entropy_bits": 0.0,
@@ -208,67 +320,111 @@ def predict(
     }
 
     component_probabilities = {
-        "road_forecaster": {"B": p_b, "P": p_p, "T": p_t},
-        # Legacy alias retained; these are forecaster probabilities, not UCB output.
-        "contextual_linucb": {"B": p_b, "P": p_p, "T": p_t},
+        "road_forecaster": {
+            "B": float(road_probabilities.get("B", 0.5) or 0.5),
+            "P": float(road_probabilities.get("P", 0.5) or 0.5),
+            "T": float(road_probabilities.get("T", 0.0) or 0.0),
+        },
+        "contextual_linucb": {
+            "B": float(road_probabilities.get("B", 0.5) or 0.5),
+            "P": float(road_probabilities.get("P", 0.5) or 0.5),
+            "T": float(road_probabilities.get("T", 0.0) or 0.0),
+        },
         "road_diagnostic": {
             "B": float(road_predict["banker_probability"]),
             "P": float(road_predict["player_probability"]),
             "T": 0.0,
         },
     }
+    if shoe_available:
+        component_probabilities["card_composition"] = {"B": p_b, "P": p_p, "T": p_t}
 
-    remaining_cards_value = float(context_meta.get("remaining_cards", 0.0) or 0.0)
-    estimated_counts = list(context_meta.get("estimated_remaining_counts_0_to_9") or [])
-    supplied_remaining = bool(context.get("remaining_cards") or context.get("remaining_counts"))
+    supplied_remaining = bool(
+        context.get("remaining_counts") is not None
+        or context.get("observed_cards") is not None
+        or context.get("remaining_cards")
+    )
     depth_constraint = {
-        "applied": supplied_remaining,
+        "applied": shoe_available or supplied_remaining,
         "reason": (
-            "supplied_remaining_card_depth_used_in_linucb_context"
-            if supplied_remaining
-            else "remaining_depth_estimated_from_round_count"
+            f"{composition_source}_used_for_exact_shoe_ev"
+            if shoe_available
+            else "remaining_depth_estimated_or_diagnostic_only"
         ),
         "target_remaining_cards": remaining_cards_value,
     }
     shoe_estimate = {
         "direction": direction,
-        "probabilities": {"B": p_b, "P": p_p, "T": 0.0},
-        "bp_conditional_probabilities": {"B": p_b, "P": p_p},
+        "probabilities": {"B": p_b, "P": p_p, "T": p_t},
+        "bp_conditional_probabilities": {
+            "B": p_b / max(1e-12, p_b + p_p),
+            "P": p_p / max(1e-12, p_b + p_p),
+        },
         "expected_remaining_cards": remaining_cards_value,
         "expected_remaining_decks": remaining_cards_value / 52.0,
         "expected_remaining_counts": estimated_counts,
         "remaining_count_std": [],
         "remaining_card_state": {
-            "available": True,
+            "available": shoe_available,
             "conditioned_rounds": len(big_road),
-            "source": str(context_meta.get("remaining_cards_source") or "estimated"),
+            "source": composition_source if shoe_available else "none",
         },
         "conditioned_rounds": len(big_road),
         "particle_count": 0,
-        "reliability": 1.0 if supplied_remaining else 0.5,
-        "fusion_weight": 0.0,
+        "reliability": 1.0 if shoe_available else 0.0,
+        "fusion_weight": card_weight,
         "target_remaining_cards": remaining_cards_value,
-        "depth_constraint_applied": supplied_remaining,
+        "depth_constraint_applied": shoe_available,
         "depth_constraint": depth_constraint,
-        "shoe_tendency": {
-            "high_vs_four_ratio_delta": float(context_vector[11]) if len(context_vector) > 11 else 0.0,
-        },
-        "inference_semantics": "linucb_context_estimate_not_exact_next_card_probability",
+        "shoe_tendency": dict(shoe_analysis.get("composition") or {}),
+        "inference_semantics": (
+            "exact_nonreplacement_next_hand_probability"
+            if shoe_available
+            else "unavailable_road_fallback"
+        ),
+        "source": composition_source,
+        "expected_returns": dict(shoe_analysis.get("expected_returns") or {}),
     }
 
     edge = float(money.get("edge", 0.0) or 0.0)
     final_ratio = float(money.get("final_bet_ratio", 0.05) or 0.05)
     bet_percentage = float(money.get("bet_percentage", final_ratio * 100.0) or final_ratio * 100.0)
+    shoe_returns = dict(shoe_analysis.get("expected_returns") or {})
+    banker_ev = shoe_returns.get("B") if shoe_available else None
+    player_ev = shoe_returns.get("P") if shoe_available else None
+    selected_ev = (
+        float(selected_physical_ev)
+        if selected_physical_ev is not None
+        else float(money.get("virtual_ev", 0.0) or 0.0)
+    )
+
+    if shoe_available:
+        signal_reason = (
+            f"ShoeSource={composition_source}；EV(B)={float(banker_ev):.6f}；"
+            f"EV(P)={float(player_ev):.6f}；formal={direction}；"
+            f"Kelly={bet_percentage:.2f}%。"
+        )
+    else:
+        signal_reason = (
+            f"Forecaster={str(policy.get('road_forecaster', {}).get('model_id', ''))}；"
+            f"support={float(policy.get('effective_support', 0.0)):.0f}；"
+            f"P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
+            f"Kelly={bet_percentage:.2f}%；feedback={bool(bandit_feedback_update.get('updated', False))}。"
+        )
 
     result = {
         "ok": True,
-        "engine": "CAUSAL_ROAD_FORECASTER_BP",
+        "engine": "EXACT_SHOE_EV_BP" if shoe_available else "CAUSAL_ROAD_FORECASTER_BP",
         "model_version": POLICY_VERSION,
-        "shoe_posterior_model_version": "CONTEXT_GENERATOR_V1",
+        "shoe_posterior_model_version": "EXACT_NON_REPLACEMENT_V1" if shoe_available else "CONTEXT_GENERATOR_V1",
         "system_model_version": POLICY_VERSION,
-        "model_variant": "ONLINE_L2_LOGISTIC_ROAD_FORECASTER_KELLY_5_30",
-        "model_core": "road_forecaster",
-        "decision_pipeline": "observed_BP_prefix_to_causal_logistic_argmax_to_existing_kelly",
+        "model_variant": "EXACT_SHOE_EV_ARGMAX_KELLY_5_30" if shoe_available else "ONLINE_L2_LOGISTIC_ROAD_FORECASTER_KELLY_5_30",
+        "model_core": "shoe_composition" if shoe_available else "road_forecaster",
+        "decision_pipeline": (
+            "remaining_counts_or_observed_cards_to_exact_nonreplacement_EV_argmax_to_existing_kelly"
+            if shoe_available
+            else "observed_BP_prefix_to_causal_logistic_argmax_to_existing_kelly"
+        ),
         "prediction_fingerprint": fingerprint,
         "probabilities": {"B": p_b, "P": p_p, "T": p_t},
         "raw_direction_probabilities": {"B": p_b, "P": p_p},
@@ -291,14 +447,20 @@ def predict(
         "mandatory_bet": True,
         "signal_status_code": signal_status_code,
         "signal_status_text": signal_status_text,
-        "signal_reason": (
-            f"Forecaster={str(policy.get('road_forecaster', {}).get('model_id', ''))}；"
-            f"support={float(policy.get('effective_support', 0.0)):.0f}；"
-            f"P(B)={p_b:.3f}；P(P)={p_p:.3f}；"
-            f"Kelly={bet_percentage:.2f}%；feedback={bool(bandit_feedback_update.get('updated', False))}。"
-        ),
+        "signal_reason": signal_reason,
         "internal_signal_reason": "",
-        "direction_source": "road_forecaster_probability_argmax",
+        "direction_source": formal_source,
+        "formal_direction_source": formal_source,
+        "shoe_context_used_for_formal_direction": shoe_available,
+        "card_composition_direction_weight": card_weight,
+        "road_context_direction_weight": road_weight,
+        "card_composition_source": composition_source,
+        "remaining_counts_source": composition_source,
+        "banker_expected_return": banker_ev,
+        "player_expected_return": player_ev,
+        "banker_ev": banker_ev,
+        "player_ev": player_ev,
+        "shoe_composition": dict(shoe_analysis),
         "confidence": confidence,
         "raw_markov_confidence": confidence,
         "pattern_calibrated_confidence": confidence,
@@ -311,7 +473,7 @@ def predict(
         "shoe_depth_estimate": {
             "rounds": len(big_road),
             "remaining_cards": remaining_cards_value,
-            "source": str(context_meta.get("remaining_cards_source") or "estimated"),
+            "source": composition_source if shoe_available else str(context_meta.get("remaining_cards_source") or "estimated"),
         },
         "remaining_card_state": dict(shoe_estimate["remaining_card_state"]),
         "estimated_remaining_cards": remaining_cards_value,
@@ -325,9 +487,9 @@ def predict(
         "tie_risk_active": False,
         "direction_edge": edge,
         "direction_edge_percent": round(edge * 100.0, 4),
-        "selected_expected_return": float(money.get("virtual_ev", 0.0) or 0.0),
-        "selected_expected_return_percent": float(money.get("virtual_ev_percent", 0.0) or 0.0),
-        "bet_allowed": True,
+        "selected_expected_return": selected_ev,
+        "selected_expected_return_percent": selected_ev * 100.0,
+        "bet_allowed": bet_allowed,
         "markov": dict(markov_predict),
         "markov_probs": {"B": p_b, "P": p_p, "T": p_t},
         "final_probs": {"B": p_b, "P": p_p, "T": p_t},
@@ -341,24 +503,24 @@ def predict(
             "direction": direction,
             "probabilities": {"B": p_b, "P": p_p, "T": p_t},
             "markov_prior_weight": 0.0,
-            "probabilistic_shoe_weight": 0.0,
-            "road_forecaster_weight": 1.0,
+            "probabilistic_shoe_weight": card_weight,
+            "road_forecaster_weight": road_weight,
             "derived_road_likelihood_power": 0.0,
             "run_length_hazard_likelihood_power": 0.0,
-            "road_applied": False,
+            "road_applied": not shoe_available,
             "hazard_applied": False,
-            "method": "road_forecaster_probability_argmax",
-            "semantics": "formal_direction_uses_only_causal_BP_prefix_features",
+            "method": formal_source,
+            "semantics": "exact_shoe_EV_has_formal_priority" if shoe_available else "road_fallback_when_exact_shoe_unavailable",
         },
         "fusion": {
-            "method": "road_forecaster_probability_argmax",
-            "shoe_reliability": 1.0 if supplied_remaining else 0.5,
-            "road_reliability": 0.25,
+            "method": formal_source,
+            "shoe_reliability": 1.0 if shoe_available else 0.0,
+            "road_reliability": road_weight,
             "hazard_reliability": 0.0,
         },
         "markov_state": {
-            "state_key": "LINUCB",
-            "direction_context": "LINUCB",
+            "state_key": "SHOE_EV" if shoe_available else "LINUCB",
+            "direction_context": "SHOE_EV" if shoe_available else "LINUCB",
             "density": "CardCompositionFirst",
             "tie_trigger": "RewardZero",
             "sample_count": len(big_road),
@@ -373,13 +535,13 @@ def predict(
         "road_support": road,
         "derived_road_analysis": dict(policy.get("regression_analysis") or {}),
         "road_fusion": {
-            "applied": False,
-            "mode": "diagnostic_only",
-            "reliability": 0.25,
-            "raw_reliability": 0.25,
+            "applied": not shoe_available,
+            "mode": "formal_fallback" if not shoe_available else "diagnostic_only",
+            "reliability": road_weight,
+            "raw_reliability": road_weight,
             "pattern_survival_score": 1.0,
             "likelihood": None,
-            "reason": "本區事後牌路診斷不參與方向；正式方向由逐手訓練 forecaster 決定。",
+            "reason": "精確牌組可用，牌路不覆蓋牌靴 EV。" if shoe_available else "缺少精確牌組，正式方向回退既有 road forecaster。",
         },
         "run_length_hazard_fusion": {
             "applied": False,
@@ -424,17 +586,18 @@ def predict(
         "venue": str(venue or ""),
         "room": str(room or ""),
         "shoe_id": str(shoe_id or ""),
-        "probability_semantics": "causal_online_logistic_next_resolved_BP_probability",
+        "probability_semantics": "exact_nonreplacement_BPT_probability" if shoe_available else "causal_online_logistic_next_resolved_BP_probability",
         "dynamic_prediction_policy": {
             "version": POLICY_VERSION,
-            "road_only": True,
+            "road_only": not shoe_available,
             "big_road_rounds": len(big_road),
             "forecast": dict(policy),
             "penalty_observe": {"active": False, "force_observe": False},
-            "exact_card_dependency": False,
-            "shoe_probability_decision_weight": 0.0,
+            "exact_card_dependency": shoe_available,
+            "shoe_probability_decision_weight": card_weight,
             "ocr_or_screen_flow_modified": False,
-            "formal_direction_source": "road_forecaster",
+            "formal_direction_source": formal_source,
+            "card_composition_source": composition_source,
         },
         "dynamic_policy_version": POLICY_VERSION,
         "online_performance_feedback": feedback,
@@ -445,10 +608,10 @@ def predict(
         "decision_gate": {
             "decision": action,
             "allowed": True,
-            "reason": "road_forecaster_argmax_always_returns_BP",
+            "reason": "exact_shoe_EV_argmax_always_returns_BP" if shoe_available else "road_forecaster_argmax_always_returns_BP",
             "direction": direction,
             "resolved_confidence": confidence,
-            "expected_net_ev": float(money.get("virtual_ev", 0.0) or 0.0),
+            "expected_net_ev": selected_ev,
             "penalty_observe": False,
         },
         "timeline_alignment": {
@@ -465,7 +628,7 @@ def run_virtual_round(
     session: Mapping[str, Any],
     run_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """先由 forecaster 預測，再開牌；LinUCB 診斷回饋與既有回傳介面保留。"""
+    """先以虛擬牌靴精確剩餘組成預測，再開牌；公開回傳介面維持相容。"""
     from particle_filter_points import counts_from_shoe, deal_ordered_hand
 
     hidden_shoe = [int(card) for card in list(session.get("virtual_shoe") or [])]
@@ -484,8 +647,10 @@ def run_virtual_round(
         shoe_context={
             "bankroll": float(session.get("bankroll", 0.0) or 0.0),
             "remaining_cards": len(hidden_shoe),
+            "remaining_counts": counts_from_shoe(hidden_shoe),
             "remaining_cards_reliability": 1.0,
-            "remaining_cards_source": "virtual_shoe_exact_total",
+            "remaining_cards_source": "virtual_shoe_exact_counts",
+            "source": "remaining_counts",
         },
     )
 
@@ -508,7 +673,7 @@ def run_virtual_round(
     prediction.update(
         {
             "ok": True,
-            "mode": "virtual_shoe_road_forecaster",
+            "mode": "virtual_shoe_exact_composition",
             "virtual_hand": hand_data,
             "virtual_outcome": actual,
             "virtual_outcome_text": hand_data["outcome_text"],
@@ -521,7 +686,7 @@ def run_virtual_round(
             "bandit_learning_applied": bool(bandit_update.get("updated", False)),
             "bandit_update": bandit_update,
             "disclaimer": (
-                "正式方向由已揭曉大路歷史的因果式線上邏輯迴歸產生；"
+                "有精確牌組時正式方向由不放回牌靴 EV 決定；缺少牌組時回退 road forecaster。"
                 "單局結果具有高變異，模型機率不代表保證獲利。"
             ),
         }

@@ -1,8 +1,9 @@
 """Screenshot adapter for the BGS quant predictor.
 
-The image pipeline preserves chronological B/P/T outcomes and now forwards a
-plausible screenshot/session remaining-card total into the probabilistic shoe
-posterior as a *soft depth constraint*. The total card count never becomes an
+Image/road recognition remains unchanged. This adapter only forwards verified
+shoe evidence into predictor with strict priority:
+remaining_counts > observed_cards > screenshot/session remaining-card total.
+A total card count is only a soft depth hint and is never promoted into an
 exact composition claim.
 """
 from __future__ import annotations
@@ -29,6 +30,23 @@ def _clean_raw(values: Iterable[Any]) -> list[str]:
 
 def _clean_bp(values: Iterable[Any]) -> list[str]:
     return [value for value in _clean_raw(values) if value in {"B", "P"}][-1000:]
+
+
+def _as_exact_counts(values: Any) -> Optional[list[Any]]:
+    if isinstance(values, Mapping):
+        ordered: list[Any] = []
+        for point in range(10):
+            if point in values:
+                ordered.append(values[point])
+            elif str(point) in values:
+                ordered.append(values[str(point)])
+            else:
+                return None
+        return ordered
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        raw = list(values)
+        return raw if len(raw) == 10 else None
+    return None
 
 
 def predict_from_screenshot(
@@ -100,16 +118,22 @@ def predict_from_screenshot(
             prediction_id=str(previous_prediction_id or ""),
         )
 
-    prior_counts_ignored = bool(prior_counts)
-    observed_cards_ignored = bool(observed_cards)
-
     model_shoe_context = dict(shoe_context or {})
 
-    # Priority 1: explicitly verified remaining point-counts. We still pass only
-    # their total to this depth channel; exact composition remains a separate
-    # evidence type and is never fabricated from a screenshot.
-    exact_counts = model_shoe_context.get("remaining_counts")
-    if isinstance(exact_counts, (list, tuple)) and len(exact_counts) == 10:
+    # Priority 1: exact remaining point counts. Keep the existing shoe_context
+    # field first; legacy prior_counts is accepted only as a compatibility alias.
+    exact_counts = _as_exact_counts(model_shoe_context.get("remaining_counts"))
+    prior_counts_used = False
+    if exact_counts is None:
+        exact_counts = _as_exact_counts(prior_counts)
+        if exact_counts is not None:
+            model_shoe_context["remaining_counts"] = exact_counts
+            model_shoe_context.setdefault("source", "remaining_counts")
+            prior_counts_used = True
+    elif exact_counts is not None:
+        model_shoe_context["remaining_counts"] = exact_counts
+
+    if exact_counts is not None:
         try:
             exact_total = sum(max(0, int(value)) for value in exact_counts)
         except (TypeError, ValueError):
@@ -120,10 +144,26 @@ def predict_from_screenshot(
             model_shoe_context["remaining_cards_source"] = (
                 "user_exact_remaining_counts_total"
             )
+            model_shoe_context.setdefault("source", "remaining_counts")
 
-    # Priority 2: screenshot/session total. The particle estimator itself performs
-    # a 4..6-cards-per-round physical plausibility check, so a stale/default 416
-    # after many observed rounds is automatically rejected.
+    # Priority 2: verified observed card faces/point values. Do not overwrite
+    # remaining_counts because exact remaining counts are higher priority.
+    observed_cards_used = False
+    if exact_counts is None and "observed_cards" not in model_shoe_context:
+        if observed_cards is not None:
+            observed_list = list(observed_cards)
+            if observed_list:
+                model_shoe_context["observed_cards"] = observed_list
+                model_shoe_context.setdefault("source", "observed_cards")
+                observed_cards_used = True
+    elif exact_counts is None:
+        existing_observed = model_shoe_context.get("observed_cards")
+        if isinstance(existing_observed, Iterable) and not isinstance(
+            existing_observed, (str, bytes, Mapping)
+        ):
+            observed_cards_used = bool(list(existing_observed))
+
+    # Priority 3: screenshot/session total is only a soft physical depth hint.
     if "remaining_cards" not in model_shoe_context:
         try:
             screen_remaining = int(remaining_cards or 0)
@@ -158,13 +198,18 @@ def predict_from_screenshot(
         "estimated_remaining_counts": list(
             shoe_estimate.get("expected_remaining_counts") or []
         ),
-        "composition_source": (
-            "outcome_conditioned_particle_posterior_plus_soft_screen_depth"
-            if depth_constraint.get("applied")
-            else "outcome_conditioned_particle_posterior"
+        "composition_source": str(
+            result.get("card_composition_source")
+            or (
+                "outcome_conditioned_particle_posterior_plus_soft_screen_depth"
+                if depth_constraint.get("applied")
+                else "outcome_conditioned_particle_posterior"
+            )
         ),
         "composition_quality": (
-            "probabilistic_not_exact_card_composition"
+            "exact_card_composition"
+            if bool(result.get("shoe_context_used_for_formal_direction"))
+            else "probabilistic_not_exact_card_composition"
         ),
         "screen_depth_constraint_applied": bool(
             depth_constraint.get("applied", False)
@@ -173,12 +218,11 @@ def predict_from_screenshot(
         "remaining_cards_source": str(
             model_shoe_context.get("remaining_cards_source") or ""
         ),
-        "exact_remaining_counts_supplied": bool(
-            isinstance(model_shoe_context.get("remaining_counts"), (list, tuple))
-            and len(model_shoe_context.get("remaining_counts") or []) == 10
-        ),
-        "prior_counts_ignored": prior_counts_ignored,
-        "observed_cards_ignored": observed_cards_ignored,
+        "exact_remaining_counts_supplied": bool(exact_counts is not None),
+        "prior_counts_ignored": bool(prior_counts) and not prior_counts_used,
+        "prior_counts_used_as_remaining_counts": prior_counts_used,
+        "observed_cards_ignored": bool(observed_cards) and not observed_cards_used,
+        "observed_cards_forwarded": observed_cards_used,
         "shoe_context_ignored": False,
         "road_sequence_length": len(cleaned_bp),
         "raw_outcome_length": len(combined_raw),
