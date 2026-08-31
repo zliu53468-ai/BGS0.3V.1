@@ -4,6 +4,6 @@ requests>=2.31,<3.0
 numpy>=1.26,<2.4
 opencv-python-headless==4.12.0.88
 easyocr==1.7.2
-# LSTM road primary uses TensorFlow/Keras; no PyTorch runtime is required.
+# Production direction core: masked/class-balanced LSTM + exact shoe + cut depth.
 tensorflow-cpu==2.21.0
 gunicorn==23.0.0
