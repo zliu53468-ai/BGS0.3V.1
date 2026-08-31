@@ -17,6 +17,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare patcher
+        run: python tools/prepare_unified_shoe_patcher.py
+
       - name: Apply deterministic patch
         run: python tools/apply_unified_shoe_patch.py
 
