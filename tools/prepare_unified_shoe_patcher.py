@@ -4,6 +4,7 @@ from pathlib import Path
 
 path = Path(__file__).with_name("apply_unified_shoe_patch.py")
 text = path.read_text(encoding="utf-8")
+
 old = '''replace_once(
     "predictor.py",
     "        \\\"remaining_counts_source\\\": composition_source,\\n",
@@ -31,6 +32,22 @@ new = '''replace_once(
 )
 '''
 if old not in text:
-    raise RuntimeError("target patcher block not found")
-path.write_text(text.replace(old, new, 1), encoding="utf-8")
-print("Prepared unified shoe patcher v2.")
+    raise RuntimeError("target predictor metadata patcher block not found")
+text = text.replace(old, new, 1)
+
+obsolete = '''replace_once(
+    "predictor.py",
+    "            \\\"remaining_cards\\\": len(hidden_shoe),\\n            \\\"remaining_cards_reliability\\\": 1.0,\\n            \\\"remaining_cards_source\\\": \\\"virtual_shoe_exact_total\\\",\\n",
+    "            \\\"remaining_counts\\\": counts_from_shoe(hidden_shoe),\\n"
+    "            \\\"remaining_cards\\\": len(hidden_shoe),\\n"
+    "            \\\"remaining_cards_reliability\\\": 1.0,\\n"
+    "            \\\"remaining_cards_source\\\": \\\"exact_counts\\\",\\n"
+    "            \\\"decks\\\": SHOE_DECKS,\\n",
+)
+'''
+if obsolete not in text:
+    raise RuntimeError("obsolete virtual-shoe patcher block not found")
+text = text.replace(obsolete, "", 1)
+
+path.write_text(text, encoding="utf-8")
+print("Prepared unified shoe patcher v3.")
