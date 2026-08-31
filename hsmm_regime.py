@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 import math
 
-MODEL_VERSION = "HSMM-REGIME-CALIBRATION-V1-CONSERVATIVE"
+MODEL_VERSION = "HSMM-REGIME-CALIBRATION-V2-SMOOTH-TRANSITION"
 STATE_NAMES = (
     "S0_PERSISTENT",
     "S1_ALTERNATING",
@@ -47,11 +47,11 @@ _STATE_PROFILES = {
     "S2_TRANSITION": {
         "mean": (0.52, 0.34, 0.82, 0.72),
         "std": (0.28, 0.26, 0.18, 0.23),
-        "duration_mean": 2.0,
-        "pattern_factor": 0.48,
-        "markov_factor": 0.52,
-        "road_factor": 0.48,
-        "hazard_factor": 0.78,
+        "duration_mean": 3.2,
+        "pattern_factor": 0.66,
+        "markov_factor": 0.68,
+        "road_factor": 0.62,
+        "hazard_factor": 0.88,
     },
     "S3_NOISE": {
         "mean": (0.55, 0.27, 0.94, 0.55),
@@ -70,6 +70,8 @@ _PRIOR = {
     "S2_TRANSITION": 0.20,
     "S3_NOISE": 0.30,
 }
+
+_TRANSITION_WINDOW = 5
 
 
 def _clip(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -100,6 +102,46 @@ def _run_height_volatility(recent_runs: list[int]) -> float:
     return _clip((sum(diffs) / len(diffs)) / 3.0)
 
 
+def _transition_stability(recent_runs: list[int]) -> float:
+    """Return 0..1 convergence of the last 3-5 completed run heights."""
+    heights = [
+        max(1, int(value))
+        for value in recent_runs[-_TRANSITION_WINDOW:]
+        if int(value) > 0
+    ]
+    if len(heights) < 3:
+        return 0.50
+
+    diffs = [
+        abs(right - left)
+        for left, right in zip(heights, heights[1:])
+    ]
+    if len(diffs) < 2:
+        return 0.50
+
+    recent_count = min(2, len(diffs))
+    recent = diffs[-recent_count:]
+    earlier = diffs[:-recent_count] or diffs[:1]
+    recent_mean = sum(recent) / len(recent)
+    earlier_mean = sum(earlier) / len(earlier)
+
+    convergence = _clip(
+        0.50
+        + (earlier_mean - recent_mean)
+        / max(1.0, earlier_mean + recent_mean)
+    )
+    recent_spread = max(recent) - min(recent)
+    dispersion_stability = 1.0 - _clip(
+        recent_spread / max(1.0, max(recent) if recent else 1.0)
+    )
+    low_motion = 1.0 - _clip(recent_mean / 4.0)
+    return _clip(
+        0.45 * convergence
+        + 0.35 * dispersion_stability
+        + 0.20 * low_motion
+    )
+
+
 def _trailing_alternation_duration(recent5: list[str]) -> int:
     bp = [str(value).upper() for value in recent5 if str(value).upper() in {"B", "P"}]
     if not bp:
@@ -120,20 +162,26 @@ def _state_duration_proxy(
     recent5: list[str],
     recent_runs: list[int],
     change_point: bool,
+    transition_stability: float,
 ) -> float:
     if state == "S0_PERSISTENT":
         return float(max(1, current_run))
     if state == "S1_ALTERNATING":
         return float(_trailing_alternation_duration(recent5))
     if state == "S2_TRANSITION":
-        return 1.0 if change_point else 2.0
+        # A single change-point hand should not immediately look like a fully
+        # established transition regime. Converging run heights gradually raise
+        # the duration proxy toward the transition state's expected duration.
+        if change_point:
+            return float(1.35 + 1.65 * _clip(transition_stability))
+        return float(2.20 + 0.90 * _clip(transition_stability))
     return float(max(1, min(4, len(recent_runs))))
 
 
 def _duration_log_likelihood(observed: float, expected: float) -> float:
     obs = math.log1p(max(0.0, observed))
     mean = math.log1p(max(1.0, expected))
-    sigma = 0.70
+    sigma = 0.62
     z = (obs - mean) / sigma
     return -0.5 * z * z - math.log(sigma)
 
@@ -161,6 +209,7 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
         for value in list(profile.get("recent_run_lengths") or [])
     ]
     volatility = _run_height_volatility(recent_runs)
+    transition_stability = _transition_stability(recent_runs)
     recent5 = [
         str(value).upper()
         for value in list(state.get("recent5") or [])
@@ -168,6 +217,20 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
     ]
     change_point = bool(profile.get("change_point", False))
     pattern_break = bool(profile.get("pattern_break", False))
+
+    event_strength = _clip(
+        0.62 * (1.0 if change_point else 0.0)
+        + 0.38 * (1.0 if pattern_break else 0.0)
+    )
+    transition_evidence = _clip(
+        (
+            0.72 * event_strength
+            + 0.28 * volatility
+        )
+        * (0.72 + 0.28 * (1.0 - transition_stability))
+    )
+    if not (change_point or pattern_break):
+        transition_evidence *= 0.60
 
     observation = (alternation, current_run_norm, entropy_norm, volatility)
     raw_scores: dict[str, float] = {}
@@ -184,16 +247,20 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
             recent5=recent5,
             recent_runs=recent_runs,
             change_point=change_point,
+            transition_stability=transition_stability,
         )
-        log_score += 0.35 * _duration_log_likelihood(
+        duration_weight = 0.55 if hidden_state == "S2_TRANSITION" else 0.35
+        log_score += duration_weight * _duration_log_likelihood(
             duration_proxy,
             float(config["duration_mean"]),
         )
 
-        if hidden_state == "S2_TRANSITION" and (change_point or pattern_break):
-            log_score += math.log(2.8)
-        elif hidden_state in {"S0_PERSISTENT", "S1_ALTERNATING"} and change_point:
-            log_score += math.log(0.45)
+        if hidden_state == "S2_TRANSITION":
+            # Continuous evidence replaces the old hard 2.8x jump.
+            log_score += math.log(1.0 + 1.35 * transition_evidence)
+        elif hidden_state in {"S0_PERSISTENT", "S1_ALTERNATING"}:
+            # Stable regimes are faded gradually rather than hard-cut to 0.45x.
+            log_score += math.log(max(0.62, 1.0 - 0.34 * transition_evidence))
 
         raw_scores[hidden_state] = math.exp(max(-40.0, min(30.0, log_score)))
 
@@ -234,6 +301,7 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
                 recent5=recent5,
                 recent_runs=recent_runs,
                 change_point=change_point,
+                transition_stability=transition_stability,
             )
         )
         for hidden_state in STATE_NAMES
@@ -256,6 +324,8 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
         "reliability": float(reliability),
         "transition_probability": float(transition_probability),
         "stable_probability": float(stable_probability),
+        "transition_stability": float(transition_stability),
+        "transition_evidence": float(transition_evidence),
         "pattern_factor": float(factor("pattern_factor")),
         "markov_factor": float(factor("markov_factor")),
         "road_factor": float(factor("road_factor")),
@@ -265,6 +335,8 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
             "current_run_norm": float(current_run_norm),
             "entropy_norm": float(entropy_norm),
             "run_height_volatility": float(volatility),
+            "transition_stability": float(transition_stability),
+            "transition_evidence": float(transition_evidence),
             "change_point": change_point,
             "pattern_break": pattern_break,
         },
