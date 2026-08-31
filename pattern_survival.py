@@ -30,11 +30,11 @@ PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 OUTCOMES = ("B", "P", "T")
 
 SHOE_STAGE_FACTORS = {
-    "OPENING": 0.45,
-    "DEVELOPING": 0.75,
+    "OPENING": 0.92,
+    "DEVELOPING": 0.97,
     "MATURE": 1.00,
-    "LATE": 0.80,
-    "UNKNOWN": 0.70,
+    "LATE": 0.90,
+    "UNKNOWN": 0.95,
 }
 
 # Transition confidence has a second, explicit shoe-stage calibration. It is
@@ -42,18 +42,18 @@ SHOE_STAGE_FACTORS = {
 # most trusted region for structural transition evidence, while LATE is more
 # conservative because remaining-card uncertainty/cut depth matters more.
 TRANSITION_SHOE_STAGE_FACTORS = {
-    "OPENING": 0.82,
-    "DEVELOPING": 0.93,
+    "OPENING": 0.95,
+    "DEVELOPING": 0.98,
     "MATURE": 1.00,
-    "LATE": 0.72,
-    "UNKNOWN": 0.84,
+    "LATE": 0.88,
+    "UNKNOWN": 0.95,
 }
 
-# Mild transition attenuation. This replaces the former hard 0.25 multiplier.
-TRANSITION_CHANGE_FACTOR = 0.62
-TRANSITION_CHANGE_FACTOR_MIN = 0.58
-TRANSITION_CHANGE_FACTOR_MAX = 0.70
-TRANSITION_HAZARD_RETAIN = 0.12
+# Soft transition attenuation. The old 0.25 hard cut is intentionally gone.
+TRANSITION_CHANGE_FACTOR = 0.70
+TRANSITION_CHANGE_FACTOR_MIN = 0.66
+TRANSITION_CHANGE_FACTOR_MAX = 0.78
+TRANSITION_HAZARD_RETAIN = 0.16
 
 # Markov multi-order agreement lies in [0.5, 1.0]. Agreement at or above this
 # threshold receives no bonus and no penalty. Lower values only reduce trust.
@@ -253,8 +253,7 @@ def _transition_shoe_confidence(
     # Unreliable depth information cannot strongly assert that a shoe is late or
     # mature. As reliability rises, the stage-specific anchor is allowed to act.
     stage_application = 1.0 - reliability * (1.0 - stage_anchor)
-    reliability_quality = 0.86 + 0.14 * reliability
-    return _clip(reliability_quality * stage_application, 0.65, 1.0)
+    return _clip(stage_application, 0.88, 1.0)
 
 
 def calculate_pattern_survival(
@@ -382,9 +381,11 @@ def calculate_pattern_survival(
         float(hazard.get("max_reliability", 0.15) or 0.15),
     )
     hazard_support = _clip(hazard_reliability / hazard_max_reliability)
-    hazard_pressure_strength = _clip(abs(turn_pressure) * 2.0)
+    # Only positive turn pressure boosts change confidence. Negative pressure
+    # still remains visible diagnostically but cannot manufacture a turn signal.
+    hazard_pressure_strength = _clip(max(0.0, turn_pressure) * 2.0)
     hazard_transition_signal = _clip(
-        hazard_pressure_strength * (0.40 + 0.60 * hazard_support)
+        hazard_pressure_strength * (0.45 + 0.55 * hazard_support)
     )
 
     if base_regime == "DRAGON":
@@ -400,9 +401,9 @@ def calculate_pattern_survival(
     elif regime == "TRANSITION":
         # Preserve useful structure instead of collapsing this component to 0.15.
         recent_pattern = _clip(
-            0.28
-            + 0.22 * transition_stability
-            + 0.15 * hazard_transition_signal
+            0.34
+            + 0.20 * transition_stability
+            + 0.18 * hazard_transition_signal
         )
     else:
         recent_pattern = 0.40
@@ -410,9 +411,9 @@ def calculate_pattern_survival(
     if in_transition:
         change_factor = _clip(
             TRANSITION_CHANGE_FACTOR
-            + 0.05 * transition_stability
-            + 0.03 * hazard_transition_signal
-            - 0.02 * (1.0 if (change_point and pattern_break) else 0.0),
+            + 0.04 * transition_stability
+            + 0.04 * hazard_transition_signal
+            - 0.01 * (1.0 if (change_point and pattern_break) else 0.0),
             TRANSITION_CHANGE_FACTOR_MIN,
             TRANSITION_CHANGE_FACTOR_MAX,
         )
@@ -453,11 +454,15 @@ def calculate_pattern_survival(
     )
     raw_score = _clip(base_score_with_transition * agreement_factor)
 
+    # Apply shoe depth once. Transition uses its reliability-gated soft stage
+    # factor instead of multiplying the general stage factor a second time.
+    effective_stage_factor = (
+        transition_shoe_factor if in_transition else stage_factor
+    )
     pre_hidden_score = _clip(
         raw_score
-        * stage_factor
+        * effective_stage_factor
         * change_factor
-        * transition_shoe_factor
     )
     score = _clip(pre_hidden_score * hidden_factor)
 
@@ -482,6 +487,7 @@ def calculate_pattern_survival(
             )
         ),
         "transition_shoe_factor": float(transition_shoe_factor),
+        "effective_stage_factor": float(effective_stage_factor),
         "transition_confidence_factor": float(transition_confidence_factor),
         "remaining_card_reliability": float(remaining_reliability),
         "change_point": change_point,
@@ -511,6 +517,7 @@ def calculate_pattern_survival(
             "transition_hazard_signal": float(hazard_transition_signal),
             "retained_hazard_component": float(retained_hazard_component),
             "transition_shoe_factor": float(transition_shoe_factor),
+            "effective_stage_factor": float(effective_stage_factor),
             "hidden_regime_factor": float(hidden_factor),
         },
         "semantics": (

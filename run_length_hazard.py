@@ -27,16 +27,16 @@ from typing import Any, Iterable, Mapping, Sequence
 import math
 
 HAZARD_SUPPORT_THRESHOLD = 4
-HAZARD_TRANSITION_SUPPORT_BOOST = 2
-HAZARD_BACKOFF_ALPHA = 0.82
+HAZARD_TRANSITION_SUPPORT_BOOST = 1
+HAZARD_BACKOFF_ALPHA = 0.88
 HAZARD_PRIOR_STRENGTH = 6.0
-MAX_HAZARD_RELIABILITY = 0.15
+MAX_HAZARD_RELIABILITY = 0.25
 DELTA_MAX_ORDER = 3
 DELTA_SUPPORT_THRESHOLD = 3
 
 LENGTH_PRIOR_STRENGTH = 4.0
-LENGTH_SMOOTH_BLEND_MIN = 0.22
-LENGTH_SMOOTH_BLEND_MAX = 0.50
+LENGTH_SMOOTH_BLEND_MIN = 0.24
+LENGTH_SMOOTH_BLEND_MAX = 0.48
 TRANSITION_STABILITY_WINDOW = 5
 
 _EVENTS = ("CONTINUE", "TURN")
@@ -473,11 +473,11 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         else:
             penalty = 0.0
 
-    raw_continue_probability = (
-        (1.0 - penalty) * 0.5
-        + penalty * float(selected_probability["CONTINUE"])
-    )
-    raw_turn_probability = 1.0 - raw_continue_probability
+    # Backoff now changes reliability, not the probability itself. Sparse
+    # contexts are blended with the global parent below instead of being pulled
+    # directly toward 0.5, which preserves useful transition structure.
+    raw_continue_probability = float(selected_probability["CONTINUE"])
+    raw_turn_probability = float(selected_probability["TURN"])
 
     # Hierarchical parent smoothing keeps a sparse context from taking control
     # in a single step.  The global completed-run hazard is the parent; more
@@ -495,7 +495,7 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         context_specificity_weight = _clip(
             support / max(1e-9, support + 1.50 * effective_support_threshold),
             0.25,
-            0.85,
+            0.72,
         )
     context_smoothed_turn_probability = _clip(
         context_specificity_weight * raw_turn_probability
@@ -509,14 +509,14 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
     )
 
     support_factor = (
-        support / (support + effective_support_threshold)
+        support / (support + 0.75 * effective_support_threshold)
         if support > 0.0 else 0.0
     )
     length_blend = _clip(
         LENGTH_SMOOTH_BLEND_MIN
-        + 0.16 * critical_proximity
-        + 0.08 * (1.0 - support_factor)
-        + 0.04 * (1.0 - transition_stability),
+        + 0.14 * critical_proximity
+        + 0.06 * (1.0 - support_factor)
+        + 0.03 * (1.0 - transition_stability),
         LENGTH_SMOOTH_BLEND_MIN,
         LENGTH_SMOOTH_BLEND_MAX,
     )
@@ -529,15 +529,16 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
 
     maturity = min(1.0, len(completed_runs) / 8.0)
     separation = abs(continue_probability - turn_probability)
-    stability_factor = 0.82 + 0.18 * transition_stability
+    stability_factor = 0.90 + 0.10 * transition_stability
+    backoff_reliability = 0.85 + 0.15 * penalty
     reliability = min(
         MAX_HAZARD_RELIABILITY,
         MAX_HAZARD_RELIABILITY
         * support_factor
         * maturity
-        * penalty
+        * backoff_reliability
         * stability_factor
-        * (0.65 + 0.35 * separation),
+        * (0.75 + 0.25 * separation),
     )
 
     if current_side == "B":
@@ -579,6 +580,7 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         "base_support_threshold": int(HAZARD_SUPPORT_THRESHOLD),
         "backoff_steps": int(backoff_steps),
         "backoff_penalty": float(penalty),
+        "backoff_reliability_factor": float(backoff_reliability),
         "reliability": float(reliability),
         "max_reliability": float(MAX_HAZARD_RELIABILITY),
         "context_diagnostics": context_diagnostics,
