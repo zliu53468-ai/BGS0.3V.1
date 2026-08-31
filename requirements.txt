@@ -4,5 +4,5 @@ requests>=2.31,<3.0
 numpy>=1.26,<2.4
 opencv-python-headless==4.12.0.88
 easyocr==1.7.2
-# Production direction core is road-pattern only; no TensorFlow runtime required.
+# Production direction core is road-pattern only; no neural runtime required.
 gunicorn==23.0.0
