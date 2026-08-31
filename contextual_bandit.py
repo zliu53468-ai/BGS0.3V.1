@@ -4,6 +4,7 @@
 固定 16 維 Road Context 先建立可在冷啟動立即使用的 Road Prior；Dynamic LinUCB
 只做有界線上校正與探索。這避免第一筆永遠 50/50，也避免上一局勝方 reward
 直接累積成單邊機率階梯。OCR、截圖掃描與 LLM 均不在本模組內。
+上一手與連續長度只作低權重輔助；三連以上只衰減延續方向的 edge，不強制反打。
 """
 from __future__ import annotations
 
@@ -54,6 +55,7 @@ LINUCB_PROBABILITY_CORRECTION_SPAN = max(0.0, min(0.04, float(os.getenv("LINUCB_
 PROBABILITY_MIN = 0.42
 PROBABILITY_MAX = 0.58
 STATE_VERSION = "LINUCB-2ARM-ROAD-PRIMARY-DYNAMIC-V4"
+_ANTI_CHASE_FEATURE_SCALE = 0.20
 _LOCK = RLock()
 
 
@@ -166,6 +168,26 @@ def _model_x(vector: Sequence[float]) -> np.ndarray:
     return x / norm if norm > 1e-12 else x
 
 
+def _anti_chase_x(vector: Sequence[float]) -> np.ndarray:
+    """Discount last-side/run evidence for scoring without changing the V4 state basis."""
+    x = np.asarray(vector, dtype=np.float64).copy()
+    x[6:8] *= _ANTI_CHASE_FEATURE_SCALE  # last_side_signed, signed_run_length_norm
+    # Do not renormalize: doing so would undo the discount for sparse contexts.
+    # Raw/exported contexts and update-time A/b/pending vectors remain unchanged.
+    return x
+
+
+def _attenuate_continuation_edge(edge: float, metadata: Mapping[str, Any]) -> tuple[float, float]:
+    """Shrink only evidence continuing a 3+ B/P run; never force a reversal."""
+    run_length = int(metadata.get("run_length", 0) or 0)
+    run_side = str(metadata.get("run_side") or "")
+    run_sign = 1.0 if run_side == "B" else -1.0 if run_side == "P" else 0.0
+    if run_length < 3 or edge * run_sign <= 0.0:
+        return edge, 1.0
+    factor = 0.60 if run_length == 3 else 0.40 if run_length == 4 else 0.25
+    return edge * factor, factor
+
+
 @dataclass(frozen=True)
 class ContextSnapshot:
     vector: np.ndarray
@@ -222,8 +244,8 @@ class ContextGenerator:
         })
 
 
-def _road_prior(snapshot: ContextSnapshot) -> dict[str, float | int]:
-    x = snapshot.vector
+def _road_prior(snapshot: ContextSnapshot) -> dict[str, float | int | bool]:
+    x = _anti_chase_x(snapshot.vector)
     meta = snapshot.metadata
     n = int(meta.get("bp_round_count", 0) or 0)
     support_conf = _clip(n / 12.0, 0.20 if n > 0 else 0.0, 1.0)
@@ -231,14 +253,21 @@ def _road_prior(snapshot: ContextSnapshot) -> dict[str, float | int]:
     order2_support = int(meta.get("order2_transition_support", 0) or 0)
     trans1_conf = _clip(order1_support / 5.0, 0.0, 1.0)
     trans2_conf = _clip(order2_support / 4.0, 0.0, 1.0)
+    # Halve transition/run coefficients; last_side_signed has no direct prior term.
     raw_edge = (
-        0.24 * float(x[12]) * trans2_conf + 0.18 * float(x[11]) * trans1_conf + 0.15 * float(x[5])
+        0.12 * float(x[12]) * trans2_conf + 0.09 * float(x[11]) * trans1_conf + 0.15 * float(x[5])
         + 0.13 * float(x[13]) + 0.08 * float(x[15]) + 0.06 * float(x[14]) + 0.05 * float(x[0])
-        + 0.04 * float(x[1]) + 0.04 * float(x[10]) + 0.03 * float(x[7]) * (1.0 - abs(float(x[8])))
+        + 0.04 * float(x[1]) + 0.04 * float(x[10]) + 0.015 * float(x[7]) * (1.0 - abs(float(x[8])))
     )
-    edge = float(math.tanh(1.8 * raw_edge) * support_conf)
+    edge_before_anti_chase = float(math.tanh(1.8 * raw_edge) * support_conf)
+    edge, anti_chase_factor = _attenuate_continuation_edge(edge_before_anti_chase, meta)
     p_b = _clip(0.5 + ROAD_PRIOR_PROBABILITY_SPAN * edge, PROBABILITY_MIN, PROBABILITY_MAX)
-    return {"edge": edge, "raw_edge": raw_edge, "banker_probability": p_b, "player_probability": 1.0 - p_b, "support_confidence": support_conf, "order1_support": order1_support, "order2_support": order2_support}
+    return {
+        "edge": edge, "raw_edge": raw_edge, "banker_probability": p_b, "player_probability": 1.0 - p_b,
+        "support_confidence": support_conf, "order1_support": order1_support, "order2_support": order2_support,
+        "edge_before_anti_chase": edge_before_anti_chase, "anti_chase_factor": anti_chase_factor,
+        "anti_chase_applied": anti_chase_factor < 1.0,
+    }
 
 
 def _state_path() -> Path:
@@ -314,6 +343,7 @@ class ContextualLinUCB:
         self.generator = ContextGenerator()
 
     def _score(self, arm_state: Mapping[str, Any], x: np.ndarray, alpha_scale: float) -> dict[str, float]:
+        x = _anti_chase_x(x)
         A, b = _arm_arrays(arm_state)
         try:
             theta = np.linalg.solve(A, b)
@@ -424,6 +454,14 @@ class ContextualLinUCB:
                 item["score"] = float(item["score"]) + prior_component
                 item["alpha_scale"] = scale
                 scores[arm] = item
+            # Attenuate the online score gap separately: Road Prior was already
+            # attenuated above. This avoids damping the same prior edge twice.
+            linucb_edge = 0.5 * (scores["B"]["linucb_score"] - scores["P"]["linucb_score"])
+            adjusted_edge, score_anti_chase_factor = _attenuate_continuation_edge(linucb_edge, snapshot.metadata)
+            for arm in ARMS:
+                adjustment = (adjusted_edge - linucb_edge) * (1.0 if arm == "B" else -1.0)
+                scores[arm]["anti_chase_score_adjustment"] = adjustment
+                scores[arm]["score"] += adjustment
             score_gap = float(scores["B"]["score"] - scores["P"]["score"])
             if abs(score_gap) > LINUCB_SCORE_TIE_EPSILON:
                 direction = "B" if score_gap > 0 else "P"
@@ -433,6 +471,7 @@ class ContextualLinUCB:
             mean_gap = float(scores["B"]["mean"] - scores["P"]["mean"])
             learning_reliability = _clip(total_eff / 10.0, 0.0, 1.0)
             learning_correction = LINUCB_PROBABILITY_CORRECTION_SPAN * math.tanh(mean_gap) * learning_reliability
+            learning_correction, probability_anti_chase_factor = _attenuate_continuation_edge(learning_correction, snapshot.metadata)
             p_b = _clip(float(prior["banker_probability"]) + learning_correction, PROBABILITY_MIN, PROBABILITY_MAX)
             if direction == "B" and p_b < 0.5:
                 p_b = 0.5
@@ -441,6 +480,15 @@ class ContextualLinUCB:
             p_p = 1.0 - p_b
             selected_probability = p_b if direction == "B" else p_p
             probabilities = {"B": p_b, "P": p_p, "T": 0.0}
+            snapshot.metadata.update({
+                "anti_chase_enabled": True,
+                # Applied reports conditional run decay, not the always-on feature discount.
+                "anti_chase_applied": bool(prior["anti_chase_applied"] or score_anti_chase_factor < 1.0 or probability_anti_chase_factor < 1.0),
+                "anti_chase_feature_scales": {"last_side_signed": _ANTI_CHASE_FEATURE_SCALE, "signed_run_length_norm": _ANTI_CHASE_FEATURE_SCALE},
+                "anti_chase_prior_factor": float(prior["anti_chase_factor"]),
+                "anti_chase_score_factor": score_anti_chase_factor,
+                "anti_chase_probability_factor": probability_anti_chase_factor,
+            })
             previous = str(scope.get("last_selected") or "").upper().strip()
             streak = int(scope.get("selection_streak", 0) or 0) + 1 if previous == direction else 1
             scope.update({"last_selected": direction, "selection_streak": streak, "updated_at": int(time.time()), "pending": {"action": direction, "context_vector": [float(v) for v in raw_x], "raw_round_count": len(raw), "history_fingerprint": fingerprint, "created_at": int(time.time())}})
