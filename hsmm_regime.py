@@ -47,11 +47,11 @@ _STATE_PROFILES = {
     "S2_TRANSITION": {
         "mean": (0.52, 0.34, 0.82, 0.72),
         "std": (0.28, 0.26, 0.18, 0.23),
-        "duration_mean": 3.2,
-        "pattern_factor": 0.66,
-        "markov_factor": 0.68,
-        "road_factor": 0.62,
-        "hazard_factor": 0.88,
+        "duration_mean": 3.4,
+        "pattern_factor": 0.72,
+        "markov_factor": 0.70,
+        "road_factor": 0.70,
+        "hazard_factor": 0.84,
     },
     "S3_NOISE": {
         "mean": (0.55, 0.27, 0.94, 0.55),
@@ -181,7 +181,7 @@ def _state_duration_proxy(
 def _duration_log_likelihood(observed: float, expected: float) -> float:
     obs = math.log1p(max(0.0, observed))
     mean = math.log1p(max(1.0, expected))
-    sigma = 0.62
+    sigma = 0.68
     z = (obs - mean) / sigma
     return -0.5 * z * z - math.log(sigma)
 
@@ -219,18 +219,16 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
     pattern_break = bool(profile.get("pattern_break", False))
 
     event_strength = _clip(
-        0.62 * (1.0 if change_point else 0.0)
-        + 0.38 * (1.0 if pattern_break else 0.0)
+        0.50 * (1.0 if change_point else 0.0)
+        + 0.30 * (1.0 if pattern_break else 0.0)
     )
     transition_evidence = _clip(
-        (
-            0.72 * event_strength
-            + 0.28 * volatility
-        )
-        * (0.72 + 0.28 * (1.0 - transition_stability))
+        0.60 * event_strength
+        + 0.25 * volatility
+        + 0.15 * (1.0 - transition_stability)
     )
     if not (change_point or pattern_break):
-        transition_evidence *= 0.60
+        transition_evidence *= 0.55
 
     observation = (alternation, current_run_norm, entropy_norm, volatility)
     raw_scores: dict[str, float] = {}
@@ -249,7 +247,7 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
             change_point=change_point,
             transition_stability=transition_stability,
         )
-        duration_weight = 0.55 if hidden_state == "S2_TRANSITION" else 0.35
+        duration_weight = 0.50 if hidden_state == "S2_TRANSITION" else 0.35
         log_score += duration_weight * _duration_log_likelihood(
             duration_proxy,
             float(config["duration_mean"]),
@@ -257,10 +255,11 @@ def analyze_hidden_regime(markov: Mapping[str, Any]) -> dict[str, Any]:
 
         if hidden_state == "S2_TRANSITION":
             # Continuous evidence replaces the old hard 2.8x jump.
-            log_score += math.log(1.0 + 1.35 * transition_evidence)
+            log_score += math.log(1.0 + 0.80 * transition_evidence)
         elif hidden_state in {"S0_PERSISTENT", "S1_ALTERNATING"}:
-            # Stable regimes are faded gradually rather than hard-cut to 0.45x.
-            log_score += math.log(max(0.62, 1.0 - 0.34 * transition_evidence))
+            # Stable regimes fade gently, so one or two noisy hands cannot force
+            # an abrupt transition posterior.
+            log_score += math.log(max(0.75, 1.0 - 0.22 * transition_evidence))
 
         raw_scores[hidden_state] = math.exp(max(-40.0, min(30.0, log_score)))
 
