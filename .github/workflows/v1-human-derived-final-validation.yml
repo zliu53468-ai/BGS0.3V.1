@@ -1,0 +1,70 @@
+name: V1 Human Derived final validation
+
+on:
+  push:
+    branches:
+      - feature/v1-human-derived-final-test
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install core dependency
+        run: python -m pip install 'numpy>=1.26,<2.4'
+      - name: Compile production core
+        run: >-
+          python -m py_compile
+          road_pattern_v1_core.py
+          road_pattern_core.py
+          derived_road_markov.py
+          road_model.py
+          dynamic_prediction_policy.py
+          predictor.py
+          shoe_depth_estimator.py
+          money_management.py
+          shoe_composition.py
+      - name: Run final candidate regressions
+        run: >-
+          python -m unittest -v
+          test_road_pattern_primary.py
+          test_human_derived_road.py
+          test_formal_shoe_decision.py
+          test_shoe_constants.py
+          test_shoe_composition.py
+      - name: Verify exact V1 core blob
+        run: |
+          test "$(git hash-object road_pattern_v1_core.py)" = "09c0043dbee14bf800e1d02e5910645dc14be9fc"
+      - name: Verify V2 turning core is gone
+        run: |
+          python - <<'PY'
+          from road_pattern_core import COMPONENT_WEIGHTS, forecast_road_pattern
+          r = forecast_road_pattern('BPBPBBPPBPBPBBPPBPBP')
+          assert COMPONENT_WEIGHTS == {
+              'multi_window': 0.30,
+              'pattern_replay': 0.30,
+              'ngram': 0.25,
+              'pattern_survival': 0.15,
+          }
+          assert 'probabilistic_turning' not in r['components']
+          assert 'change_point_probability' not in r
+          assert r['derived_ask_road_fusion']['derived_effective_weight'] <= 0.18
+          print(r['v1_probabilities'], r['derived_ask_road_fusion'], r['probabilities'])
+          PY
+      - name: Verify OCR and screenshot sources untouched
+        run: |
+          changed="$(git diff --name-only origin/main...HEAD)"
+          echo "$changed"
+          for file in room_ocr.py baccarat_vision.py screen_pipeline.py screenshot_predictor.py road_detector.py; do
+            if echo "$changed" | grep -Fxq "$file"; then
+              echo "Forbidden OCR/screen change: $file"
+              exit 1
+            fi
+          done
+      - name: Check whitespace
+        run: git diff --check origin/main...HEAD
