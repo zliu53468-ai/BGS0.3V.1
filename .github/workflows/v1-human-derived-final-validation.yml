@@ -39,7 +39,10 @@ jobs:
           test_shoe_composition.py
       - name: Verify exact V1 core blob
         run: |
-          test "$(git hash-object road_pattern_v1_core.py)" = "09c0043dbee14bf800e1d02e5910645dc14be9fc"
+          old_blob="$(git rev-parse cf1ab002a2c8a5faccacaecd32a90659af78a3f8:road_pattern_core.py)"
+          restored_blob="$(git rev-parse HEAD:road_pattern_v1_core.py)"
+          echo "old=$old_blob restored=$restored_blob"
+          test "$old_blob" = "$restored_blob"
       - name: Verify V2 turning core is gone
         run: |
           python - <<'PY'
