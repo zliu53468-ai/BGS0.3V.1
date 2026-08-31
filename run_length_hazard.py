@@ -1,7 +1,7 @@
 """Run-length structural hazard model for baccarat Big Road.
 
 This module learns from the *observed Big-Road run structure* instead of assigning
-fixed names such as dragon/stair/chop to a road.  Ties do not create a new run.
+fixed names such as dragon/stair/chop to a road. Ties do not create a new run.
 
 Two related views are exposed:
 1) completed-column height structure: H=[h1,h2,...] and delta-H symbols
@@ -11,8 +11,12 @@ Two related views are exposed:
        h(l, x) = P(TURN next | current run length=l, structural context=x)
 
 Training is leakage-safe within the current shoe: only completed historical runs
-are used as duration outcomes.  For a completed run of final length L, every
+are used as duration outcomes. For a completed run of final length L, every
 at-risk length l contributes CONTINUE when l<L and TURN when l=L.
+
+The raw context posterior is blended with a local length-aware hazard prior around
+the historical break-length region. This keeps turn probability continuous near
+critical run lengths while preserving the original context/backoff model.
 
 This is a stochastic calibration channel, not a guarantee of a baccarat turn.
 """
@@ -23,11 +27,17 @@ from typing import Any, Iterable, Mapping, Sequence
 import math
 
 HAZARD_SUPPORT_THRESHOLD = 4
-HAZARD_BACKOFF_ALPHA = 0.75
+HAZARD_TRANSITION_SUPPORT_BOOST = 2
+HAZARD_BACKOFF_ALPHA = 0.82
 HAZARD_PRIOR_STRENGTH = 6.0
 MAX_HAZARD_RELIABILITY = 0.15
 DELTA_MAX_ORDER = 3
 DELTA_SUPPORT_THRESHOLD = 3
+
+LENGTH_PRIOR_STRENGTH = 4.0
+LENGTH_SMOOTH_BLEND_MIN = 0.22
+LENGTH_SMOOTH_BLEND_MAX = 0.50
+TRANSITION_STABILITY_WINDOW = 5
 
 _EVENTS = ("CONTINUE", "TURN")
 _DELTAS = ("UP", "DOWN", "EQUAL")
@@ -103,6 +113,157 @@ def _previous_structure(previous_heights: Sequence[int]) -> tuple[int, str, str]
     return previous_height, delta1, delta2
 
 
+def _transition_stability(heights: Sequence[int]) -> float:
+    """Return 0..1 convergence of recent completed-run height changes."""
+    values = [
+        max(1, int(value))
+        for value in list(heights)[-TRANSITION_STABILITY_WINDOW:]
+    ]
+    if len(values) < 3:
+        return 0.50
+
+    diffs = [
+        abs(right - left)
+        for left, right in zip(values, values[1:])
+    ]
+    if len(diffs) < 2:
+        return 0.50
+
+    recent_count = min(2, len(diffs))
+    recent = diffs[-recent_count:]
+    earlier = diffs[:-recent_count] or diffs[:1]
+    recent_mean = sum(recent) / len(recent)
+    earlier_mean = sum(earlier) / len(earlier)
+
+    convergence = _clip(
+        0.50
+        + (earlier_mean - recent_mean)
+        / max(1.0, earlier_mean + recent_mean)
+    )
+    recent_spread = max(recent) - min(recent)
+    dispersion_stability = 1.0 - _clip(
+        recent_spread / max(1.0, max(recent) if recent else 1.0)
+    )
+    low_motion = 1.0 - _clip(recent_mean / 4.0)
+
+    return _clip(
+        0.45 * convergence
+        + 0.35 * dispersion_stability
+        + 0.20 * low_motion
+    )
+
+
+def _critical_length_reference(
+    completed_heights: Sequence[int],
+    current_length: int,
+) -> dict[str, float]:
+    """Estimate the historical break region without creating a hard threshold."""
+    recent = [
+        max(1, int(value))
+        for value in list(completed_heights)[-12:]
+    ]
+    if not recent:
+        return {
+            "critical_run_length": float(max(1, current_length)),
+            "critical_scale": 1.25,
+            "critical_proximity": 0.0,
+        }
+
+    ordered = sorted(recent)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        median = float(ordered[midpoint])
+    else:
+        median = 0.5 * float(ordered[midpoint - 1] + ordered[midpoint])
+    mean = sum(recent) / len(recent)
+    variance = sum((value - mean) ** 2 for value in recent) / len(recent)
+    spread = math.sqrt(max(0.0, variance))
+
+    critical = 0.55 * median + 0.45 * mean
+    scale = max(1.50, min(3.50, spread if spread > 1e-9 else 1.50))
+    proximity = math.exp(
+        -abs(float(current_length) - critical) / max(1e-9, scale)
+    )
+    return {
+        "critical_run_length": float(critical),
+        "critical_scale": float(scale),
+        "critical_proximity": float(_clip(proximity)),
+    }
+
+
+def _logistic_turn_prior(
+    length: int,
+    *,
+    critical_length: float,
+    scale: float,
+) -> float:
+    """Smooth length-aware prior bounded away from 0/1."""
+    z = (
+        float(max(1, int(length))) - float(critical_length)
+    ) / max(0.90, float(scale))
+    z = max(-12.0, min(12.0, z))
+    logistic = 1.0 / (1.0 + math.exp(-z))
+    return _clip(0.20 + 0.60 * logistic)
+
+
+def _smoothed_length_hazard(
+    completed_heights: Sequence[int],
+    current_length: int,
+    critical: Mapping[str, float],
+) -> dict[str, float]:
+    """Kernel-smooth empirical hazard across adjacent at-risk lengths."""
+    heights = [max(1, int(value)) for value in completed_heights]
+    if not heights:
+        return {
+            "turn_probability": 0.5,
+            "support": 0.0,
+            "length_prior": 0.5,
+        }
+
+    critical_length = float(
+        critical.get("critical_run_length", current_length)
+    )
+    scale = float(critical.get("critical_scale", 1.25))
+    current_prior = _logistic_turn_prior(
+        current_length,
+        critical_length=critical_length,
+        scale=scale,
+    )
+
+    numer = 0.0
+    denom = 0.0
+    for offset, kernel_weight in (
+        (-2, 0.55), (-1, 1.0), (0, 1.80), (1, 1.0), (2, 0.55)
+    ):
+        at_risk = max(1, int(current_length) + offset)
+        risk = sum(1 for final_length in heights if final_length >= at_risk)
+        turns = sum(1 for final_length in heights if final_length == at_risk)
+        prior = _logistic_turn_prior(
+            at_risk,
+            critical_length=critical_length,
+            scale=scale,
+        )
+        posterior = (
+            turns + LENGTH_PRIOR_STRENGTH * prior
+        ) / max(1e-9, risk + LENGTH_PRIOR_STRENGTH)
+        support_weight = 0.45 + 0.55 * (
+            risk / max(1.0, risk + LENGTH_PRIOR_STRENGTH)
+        )
+        weight = kernel_weight * support_weight
+        numer += weight * posterior
+        denom += weight
+
+    smoothed = numer / denom if denom > 1e-12 else current_prior
+    current_support = sum(
+        1 for final_length in heights if final_length >= current_length
+    )
+    return {
+        "turn_probability": float(_clip(smoothed)),
+        "support": float(current_support),
+        "length_prior": float(current_prior),
+    }
+
+
 def _hazard_contexts(
     *,
     side: str,
@@ -133,11 +294,7 @@ def _new_event_counts() -> dict[str, float]:
 
 
 def _build_hazard_table(runs: Sequence[tuple[str, int]]) -> dict[str, dict[str, float]]:
-    """Build hazard counts from completed runs only.
-
-    The final run in ``runs`` is the currently active column and is deliberately
-    excluded because its terminal length is not known yet.
-    """
+    """Build hazard counts from completed runs only."""
     completed = list(runs[:-1])
     table: dict[str, dict[str, float]] = defaultdict(_new_event_counts)
     completed_heights = [length for _, length in completed]
@@ -232,12 +389,40 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
             "likelihood": {"B": 0.5, "P": 0.5},
             "reliability": 0.0,
             "max_reliability": float(MAX_HAZARD_RELIABILITY),
+            "raw_turn_probability": 0.5,
+            "smoothed_turn_probability": 0.5,
+            "turn_probability": 0.5,
+            "turn_pressure": 0.0,
+            "critical_proximity": 0.0,
+            "transition_stability": 0.5,
             "reason": "no_big_road_runs",
         }
 
     current_side, current_length = runs[-1]
     completed_runs = runs[:-1]
     completed_heights = [int(length) for _, length in completed_runs]
+    transition_stability = _transition_stability(completed_heights)
+    critical = _critical_length_reference(completed_heights, current_length)
+    critical_proximity = _clip(
+        float(critical.get("critical_proximity", 0.0) or 0.0)
+    )
+
+    support_boost = int(
+        round(
+            HAZARD_TRANSITION_SUPPORT_BOOST
+            * (1.0 - transition_stability)
+        )
+    )
+    if critical_proximity >= 0.75:
+        support_boost += 1
+    effective_support_threshold = max(
+        HAZARD_SUPPORT_THRESHOLD,
+        min(
+            HAZARD_SUPPORT_THRESHOLD + HAZARD_TRANSITION_SUPPORT_BOOST + 1,
+            HAZARD_SUPPORT_THRESHOLD + support_boost,
+        ),
+    )
+
     table = _build_hazard_table(runs)
     current_contexts = _hazard_contexts(
         side=current_side,
@@ -257,11 +442,12 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         counts = dict(table.get(key, _new_event_counts()))
         support = sum(counts.values())
         posterior = _event_posterior(counts)
-        qualifies = support >= HAZARD_SUPPORT_THRESHOLD
+        qualifies = support >= effective_support_threshold
         context_diagnostics[tier] = {
             "key": key,
             "support": float(support),
-            "support_threshold": int(HAZARD_SUPPORT_THRESHOLD),
+            "support_threshold": int(effective_support_threshold),
+            "base_support_threshold": int(HAZARD_SUPPORT_THRESHOLD),
             "qualifies": bool(qualifies),
             "counts": counts,
             "posterior": posterior,
@@ -276,7 +462,6 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
             penalty *= HAZARD_BACKOFF_ALPHA
             backoff_steps += 1
 
-    # Global is the final data-driven fallback even when its support is below K.
     if selected_tier == "prior":
         global_counts = dict(table.get("HZG|GLOBAL", _new_event_counts()))
         global_support = sum(global_counts.values())
@@ -288,26 +473,70 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         else:
             penalty = 0.0
 
-    continue_probability = (
+    raw_continue_probability = (
         (1.0 - penalty) * 0.5
         + penalty * float(selected_probability["CONTINUE"])
     )
-    turn_probability = 1.0 - continue_probability
+    raw_turn_probability = 1.0 - raw_continue_probability
 
-    # Reliability is based only on observed structural support and maturity.
+    # Hierarchical parent smoothing keeps a sparse context from taking control
+    # in a single step.  The global completed-run hazard is the parent; more
+    # specific contexts earn more weight only as their at-risk support grows.
+    global_counts_for_smoothing = dict(table.get("HZG|GLOBAL", _new_event_counts()))
+    global_support_for_smoothing = sum(global_counts_for_smoothing.values())
+    global_turn_probability = float(
+        _event_posterior(global_counts_for_smoothing)["TURN"]
+    ) if global_support_for_smoothing > 0.0 else 0.5
+
     support = sum(selected_counts.values())
+    if selected_tier in {"global", "global_fallback", "prior"}:
+        context_specificity_weight = 1.0
+    else:
+        context_specificity_weight = _clip(
+            support / max(1e-9, support + 1.50 * effective_support_threshold),
+            0.25,
+            0.85,
+        )
+    context_smoothed_turn_probability = _clip(
+        context_specificity_weight * raw_turn_probability
+        + (1.0 - context_specificity_weight) * global_turn_probability
+    )
+
+    length_hazard = _smoothed_length_hazard(
+        completed_heights,
+        current_length,
+        critical,
+    )
+
     support_factor = (
-        support / (support + HAZARD_SUPPORT_THRESHOLD)
+        support / (support + effective_support_threshold)
         if support > 0.0 else 0.0
     )
+    length_blend = _clip(
+        LENGTH_SMOOTH_BLEND_MIN
+        + 0.16 * critical_proximity
+        + 0.08 * (1.0 - support_factor)
+        + 0.04 * (1.0 - transition_stability),
+        LENGTH_SMOOTH_BLEND_MIN,
+        LENGTH_SMOOTH_BLEND_MAX,
+    )
+    smoothed_turn_probability = _clip(
+        (1.0 - length_blend) * context_smoothed_turn_probability
+        + length_blend * float(length_hazard["turn_probability"])
+    )
+    turn_probability = smoothed_turn_probability
+    continue_probability = 1.0 - turn_probability
+
     maturity = min(1.0, len(completed_runs) / 8.0)
     separation = abs(continue_probability - turn_probability)
+    stability_factor = 0.82 + 0.18 * transition_stability
     reliability = min(
         MAX_HAZARD_RELIABILITY,
         MAX_HAZARD_RELIABILITY
         * support_factor
         * maturity
         * penalty
+        * stability_factor
         * (0.65 + 0.35 * separation),
     )
 
@@ -326,6 +555,19 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         "height_deltas": encode_height_deltas(completed_heights),
         "continue_probability": float(continue_probability),
         "turn_probability": float(turn_probability),
+        "raw_turn_probability": float(raw_turn_probability),
+        "context_smoothed_turn_probability": float(context_smoothed_turn_probability),
+        "global_parent_turn_probability": float(global_turn_probability),
+        "context_specificity_weight": float(context_specificity_weight),
+        "smoothed_turn_probability": float(smoothed_turn_probability),
+        "length_aware_turn_probability": float(length_hazard["turn_probability"]),
+        "length_aware_turn_prior": float(length_hazard["length_prior"]),
+        "length_aware_support": float(length_hazard["support"]),
+        "critical_run_length": float(critical["critical_run_length"]),
+        "critical_scale": float(critical["critical_scale"]),
+        "critical_proximity": float(critical_proximity),
+        "transition_stability": float(transition_stability),
+        "length_smoothing_weight": float(length_blend),
         "likelihood": {
             "B": float(likelihood["B"]),
             "P": float(likelihood["P"]),
@@ -333,7 +575,8 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         "selected_context_tier": selected_tier,
         "selected_context": selected_key,
         "support": float(support),
-        "support_threshold": int(HAZARD_SUPPORT_THRESHOLD),
+        "support_threshold": int(effective_support_threshold),
+        "base_support_threshold": int(HAZARD_SUPPORT_THRESHOLD),
         "backoff_steps": int(backoff_steps),
         "backoff_penalty": float(penalty),
         "reliability": float(reliability),
@@ -342,7 +585,7 @@ def analyze_run_length_hazard(history: Iterable[Any]) -> dict[str, Any]:
         "height_delta_markov": _delta_markov(completed_heights),
         "turn_pressure": float(turn_probability - 0.5),
         "semantics": (
-            "run_length_duration_hazard_from_completed_big_road_columns_"
+            "smoothed_run_length_duration_hazard_from_completed_big_road_columns_"
             "not_deterministic_turn_probability"
         ),
     }

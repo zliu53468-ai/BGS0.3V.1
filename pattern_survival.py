@@ -24,6 +24,7 @@ from typing import Any, Mapping
 import math
 
 from hsmm_regime import analyze_hidden_regime
+from run_length_hazard import analyze_run_length_hazard
 
 PHYSICAL_PRIOR = {"B": 0.4586, "P": 0.4462, "T": 0.0952}
 OUTCOMES = ("B", "P", "T")
@@ -35,6 +36,24 @@ SHOE_STAGE_FACTORS = {
     "LATE": 0.80,
     "UNKNOWN": 0.70,
 }
+
+# Transition confidence has a second, explicit shoe-stage calibration. It is
+# separate from the general Pattern Survival stage factor above: MATURE is the
+# most trusted region for structural transition evidence, while LATE is more
+# conservative because remaining-card uncertainty/cut depth matters more.
+TRANSITION_SHOE_STAGE_FACTORS = {
+    "OPENING": 0.82,
+    "DEVELOPING": 0.93,
+    "MATURE": 1.00,
+    "LATE": 0.72,
+    "UNKNOWN": 0.84,
+}
+
+# Mild transition attenuation. This replaces the former hard 0.25 multiplier.
+TRANSITION_CHANGE_FACTOR = 0.62
+TRANSITION_CHANGE_FACTOR_MIN = 0.58
+TRANSITION_CHANGE_FACTOR_MAX = 0.70
+TRANSITION_HAZARD_RETAIN = 0.12
 
 # Markov multi-order agreement lies in [0.5, 1.0]. Agreement at or above this
 # threshold receives no bonus and no penalty. Lower values only reduce trust.
@@ -214,6 +233,30 @@ def _agreement_conflict_factor(agreement: float) -> float:
     return _clip(1.0 - penalty)
 
 
+def _first_mapping(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _transition_shoe_confidence(
+    stage: str,
+    remaining_reliability: float,
+) -> float:
+    """Use stage only to the extent that the remaining-card state is reliable."""
+    reliability = _clip(remaining_reliability)
+    stage_anchor = _clip(
+        TRANSITION_SHOE_STAGE_FACTORS.get(stage, TRANSITION_SHOE_STAGE_FACTORS["UNKNOWN"])
+    )
+
+    # Unreliable depth information cannot strongly assert that a shoe is late or
+    # mature. As reliability rises, the stage-specific anchor is allowed to act.
+    stage_application = 1.0 - reliability * (1.0 - stage_anchor)
+    reliability_quality = 0.86 + 0.14 * reliability
+    return _clip(reliability_quality * stage_application, 0.65, 1.0)
+
+
 def calculate_pattern_survival(
     markov: Mapping[str, Any],
     road_analysis: Mapping[str, Any] | None,
@@ -256,21 +299,6 @@ def calculate_pattern_survival(
         for value in list(profile.get("recent_run_lengths") or [])
     ]
 
-    if base_regime == "DRAGON":
-        recent_pattern = _clip(current_run / 6.0)
-    elif base_regime == "CHOP":
-        recent_pattern = alternation
-    elif base_regime == "DOUBLE_CHOP":
-        window = recent_runs[-4:]
-        recent_pattern = (
-            sum(1 for length in window if length in {1, 2}) / len(window)
-            if window else 0.35
-        )
-    elif regime == "TRANSITION":
-        recent_pattern = 0.15
-    else:
-        recent_pattern = 0.40
-
     derived = dict(road.get("derived_road_markov") or {})
     road_reliability = max(
         0.0,
@@ -311,11 +339,90 @@ def calculate_pattern_survival(
 
     change_point = bool(profile.get("change_point", False))
     pattern_break = bool(profile.get("pattern_break", False))
-    change_factor = 0.25 if (
+    in_transition = bool(
         change_point
         or pattern_break
         or regime == "TRANSITION"
-    ) else 1.0
+    )
+
+    hidden_regime = analyze_hidden_regime(markov)
+    hidden_factor = _clip(
+        float(hidden_regime.get("pattern_factor", 1.0) or 1.0)
+    )
+    transition_stability = _clip(
+        float(hidden_regime.get("transition_stability", 0.50) or 0.50)
+    )
+
+    hazard = _first_mapping(
+        road.get("run_length_hazard"),
+        road.get("run_length_hazard_analysis"),
+        road.get("hazard"),
+        markov.get("run_length_hazard"),
+    )
+    # Production currently calculates Pattern Survival before its external hazard
+    # member.  Reuse the already-observed Markov history here so transition
+    # confidence can retain turn pressure without changing the integrator API.
+    if not hazard:
+        history = markov.get("history")
+        if history:
+            try:
+                hazard = dict(analyze_run_length_hazard(history))
+            except Exception:
+                hazard = {}
+    try:
+        turn_pressure = float(hazard.get("turn_pressure", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        turn_pressure = 0.0
+    turn_pressure = max(-0.5, min(0.5, turn_pressure))
+    hazard_reliability = _clip(
+        float(hazard.get("reliability", 0.0) or 0.0)
+    )
+    hazard_max_reliability = max(
+        1e-9,
+        float(hazard.get("max_reliability", 0.15) or 0.15),
+    )
+    hazard_support = _clip(hazard_reliability / hazard_max_reliability)
+    hazard_pressure_strength = _clip(abs(turn_pressure) * 2.0)
+    hazard_transition_signal = _clip(
+        hazard_pressure_strength * (0.40 + 0.60 * hazard_support)
+    )
+
+    if base_regime == "DRAGON":
+        recent_pattern = _clip(current_run / 6.0)
+    elif base_regime == "CHOP":
+        recent_pattern = alternation
+    elif base_regime == "DOUBLE_CHOP":
+        window = recent_runs[-4:]
+        recent_pattern = (
+            sum(1 for length in window if length in {1, 2}) / len(window)
+            if window else 0.35
+        )
+    elif regime == "TRANSITION":
+        # Preserve useful structure instead of collapsing this component to 0.15.
+        recent_pattern = _clip(
+            0.28
+            + 0.22 * transition_stability
+            + 0.15 * hazard_transition_signal
+        )
+    else:
+        recent_pattern = 0.40
+
+    if in_transition:
+        change_factor = _clip(
+            TRANSITION_CHANGE_FACTOR
+            + 0.05 * transition_stability
+            + 0.03 * hazard_transition_signal
+            - 0.02 * (1.0 if (change_point and pattern_break) else 0.0),
+            TRANSITION_CHANGE_FACTOR_MIN,
+            TRANSITION_CHANGE_FACTOR_MAX,
+        )
+    else:
+        change_factor = 1.0
+
+    transition_shoe_factor = (
+        _transition_shoe_confidence(stage, remaining_reliability)
+        if in_transition else 1.0
+    )
 
     # Base structural score intentionally excludes a positive agreement term.
     # The weights sum to 1.0. Agreement only applies a one-way conflict penalty.
@@ -327,30 +434,64 @@ def calculate_pattern_survival(
         + 0.13 * derived_component
         + 0.10 * remaining_reliability
     )
-    raw_score = _clip(base_score * agreement_factor)
 
-    hidden_regime = analyze_hidden_regime(markov)
-    hidden_factor = _clip(
-        float(hidden_regime.get("pattern_factor", 1.0) or 1.0)
+    # During transition retain a small, reliability-gated part of hazard turn
+    # pressure. Pattern Survival is still a confidence gate, not a direction vote,
+    # so only the magnitude is used here.
+    retained_hazard_component = 0.0
+    if in_transition:
+        retained_hazard_component = _clip(
+            TRANSITION_HAZARD_RETAIN
+            * hazard_transition_signal
+            * (0.75 + 0.25 * transition_stability),
+            0.0,
+            TRANSITION_HAZARD_RETAIN,
+        )
+
+    base_score_with_transition = _clip(
+        base_score + retained_hazard_component
     )
+    raw_score = _clip(base_score_with_transition * agreement_factor)
 
     pre_hidden_score = _clip(
-        raw_score * stage_factor * change_factor
+        raw_score
+        * stage_factor
+        * change_factor
+        * transition_shoe_factor
     )
     score = _clip(pre_hidden_score * hidden_factor)
+
+    transition_confidence_factor = _clip(
+        change_factor * transition_shoe_factor
+    ) if in_transition else 1.0
 
     return {
         "score": float(score),
         "raw_score": float(raw_score),
         "base_structural_score": float(base_score),
+        "base_structural_score_with_transition": float(base_score_with_transition),
         "pre_hidden_regime_score": float(pre_hidden_score),
         "pattern": regime,
         "base_pattern": base_regime,
         "shoe_stage": stage,
         "shoe_stage_factor": float(stage_factor),
+        "transition_shoe_stage_factor": float(
+            TRANSITION_SHOE_STAGE_FACTORS.get(
+                stage,
+                TRANSITION_SHOE_STAGE_FACTORS["UNKNOWN"],
+            )
+        ),
+        "transition_shoe_factor": float(transition_shoe_factor),
+        "transition_confidence_factor": float(transition_confidence_factor),
+        "remaining_card_reliability": float(remaining_reliability),
         "change_point": change_point,
         "pattern_break": pattern_break,
         "change_point_factor": float(change_factor),
+        "transition_stability": float(transition_stability),
+        "run_length_turn_pressure": float(turn_pressure),
+        "run_length_hazard_support": float(hazard_support),
+        "transition_hazard_signal": float(hazard_transition_signal),
+        "retained_hazard_component": float(retained_hazard_component),
         "hidden_regime": hidden_regime,
         "hidden_regime_factor": float(hidden_factor),
         "multi_order_agreement": float(agreement),
@@ -364,11 +505,17 @@ def calculate_pattern_survival(
             "entropy_stability": float(entropy_stability),
             "derived_road_support": float(derived_component),
             "remaining_card_reliability": float(remaining_reliability),
+            "transition_stability": float(transition_stability),
+            "run_length_turn_pressure": float(turn_pressure),
+            "run_length_hazard_support": float(hazard_support),
+            "transition_hazard_signal": float(hazard_transition_signal),
+            "retained_hazard_component": float(retained_hazard_component),
+            "transition_shoe_factor": float(transition_shoe_factor),
             "hidden_regime_factor": float(hidden_factor),
         },
         "semantics": (
-            "pattern_survival_with_agreement_conflict_only_and_duration_aware_"
-            "hidden_regime_downweight_not_next_hand_win_probability"
+            "pattern_survival_with_smoothed_transition_hazard_and_explicit_"
+            "shoe_depth_transition_confidence_not_next_hand_win_probability"
         ),
     }
 
@@ -398,6 +545,8 @@ def calibrate_markov_probabilities(
 __all__ = [
     "PHYSICAL_PRIOR",
     "SHOE_STAGE_FACTORS",
+    "TRANSITION_SHOE_STAGE_FACTORS",
+    "TRANSITION_CHANGE_FACTOR",
     "build_remaining_card_state",
     "calculate_pattern_survival",
     "calibrate_markov_probabilities",
