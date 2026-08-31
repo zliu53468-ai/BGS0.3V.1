@@ -17,6 +17,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install focused test dependency
+        run: python -m pip install "numpy>=1.26,<2.4"
+
       - name: Prepare patcher
         run: python tools/prepare_unified_shoe_patcher.py
 
