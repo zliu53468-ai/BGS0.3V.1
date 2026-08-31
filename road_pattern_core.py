@@ -4,15 +4,20 @@ The underlying Big-Road predictor is preserved exactly in road_pattern_v1_core.
 This wrapper adds only one auxiliary stage after V1 has already produced its
 B/P probability: a human-style Big Eye / Small Road / Cockroach Ask-Road model.
 
-Derived roads are deterministic transformations of Big Road, so their
-reliability is capped and they cannot dominate a strong V1 signal. They matter
-most when V1 is near 50/50 and at least two derived roads are mature.
+The derived-road auxiliary now has two sublayers:
+1. Human R/U sequence patterns (recent rhythm, replay, N-gram, pattern break).
+2. Standard six-row display geometry (vertical drop, horizontal tail, collision
+   turns, column-height rhythm and stair/shape structure).
+
+Both sublayers come from the same Big-Road history, so their combined formal
+reliability remains capped and cannot dominate a strong V1 signal.
 """
 from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 import math
 
+from derived_road_geometry import score_geometry_ask_road_scenarios
 from derived_road_markov import (
     MAX_DERIVED_ROAD_RELIABILITY,
     score_ask_road_scenarios,
@@ -30,7 +35,7 @@ from road_pattern_v1_core import (
     normalize_bp,
 )
 
-VERSION = f"{V1_VERSION}|HUMAN-DERIVED-ASK-V2"
+VERSION = f"{V1_VERSION}|HUMAN-DERIVED-ASK-V2.1-GEOMETRY"
 
 
 def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -72,6 +77,81 @@ def _scenario_marks(
     return result
 
 
+def _combine_derived_layers(
+    human: Mapping[str, Any],
+    geometry: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Combine sequence and grid-shape Ask-Road evidence under one 18% cap."""
+    human_likelihood = dict(human.get("likelihood") or {})
+    geometry_likelihood = dict(geometry.get("likelihood") or {})
+    human_p_b = _clip(human_likelihood.get("B", 0.5), 0.20, 0.80)
+    geometry_p_b = _clip(geometry_likelihood.get("B", 0.5), 0.20, 0.80)
+    human_rel = _clip(
+        human.get("reliability", 0.0), 0.0, MAX_DERIVED_ROAD_RELIABILITY
+    )
+    geometry_rel = _clip(geometry.get("reliability", 0.0), 0.0, 0.10)
+
+    # Sequence reading remains primary inside the derived-road subsystem.
+    human_weight = 0.78 * human_rel
+    geometry_weight = 0.22 * geometry_rel
+    if human_weight + geometry_weight <= 1e-12:
+        combined_p_b = 0.5
+    else:
+        combined_logit = (
+            human_weight * _logit(human_p_b)
+            + geometry_weight * _logit(geometry_p_b)
+        ) / (human_weight + geometry_weight)
+        combined_p_b = _clip(_sigmoid(combined_logit), 0.20, 0.80)
+
+    human_side = 1 if human_p_b >= 0.5 else -1
+    geometry_side = 1 if geometry_p_b >= 0.5 else -1
+    layers_agree = (
+        human_rel <= 0.0
+        or geometry_rel <= 0.0
+        or human_side == geometry_side
+    )
+    agreement_factor = 1.0 if layers_agree else 0.80
+    combined_rel = min(
+        MAX_DERIVED_ROAD_RELIABILITY,
+        max(human_rel, 0.65 * geometry_rel)
+        + (0.15 * geometry_rel if layers_agree else 0.0),
+    ) * agreement_factor
+
+    human_active = set(human.get("active_roads") or [])
+    geometry_active = set(geometry.get("active_roads") or [])
+    active_roads = sorted(human_active | geometry_active)
+    if len(active_roads) < 2:
+        combined_rel = 0.0
+
+    result = dict(human)
+    result.update(
+        {
+            "model_id": "HUMAN-DERIVED-ASK-ROAD-V2.1-GEOMETRY",
+            "likelihood": {
+                "B": float(combined_p_b),
+                "P": float(1.0 - combined_p_b),
+            },
+            "reliability": float(combined_rel),
+            "raw_reliability": float(combined_rel),
+            "max_reliability": float(MAX_DERIVED_ROAD_RELIABILITY),
+            "active_roads": active_roads,
+            "active_road_count": len(active_roads),
+            "sequence_layer": dict(human),
+            "geometry_layer": dict(geometry),
+            "layer_agreement": bool(layers_agree),
+            "sequence_layer_p_b": float(human_p_b),
+            "geometry_layer_p_b": float(geometry_p_b),
+            "sequence_layer_reliability": float(human_rel),
+            "geometry_layer_reliability": float(geometry_rel),
+            "semantics": (
+                "human_RU_sequence_plus_standard_six_row_geometry_ask_road_"
+                "with_single_shared_history_reliability_cap"
+            ),
+        }
+    )
+    return result
+
+
 def _derived_analysis(sequence: Sequence[str]) -> dict[str, Any]:
     standard = build_standard_derived_roads(sequence)
     derived = {
@@ -80,7 +160,9 @@ def _derived_analysis(sequence: Sequence[str]) -> dict[str, Any]:
         "cockroach_road": list(standard.get("cockroach_road") or []),
     }
     scenarios = _scenario_marks(sequence, derived)
-    analysis = score_ask_road_scenarios(derived, scenarios)
+    human = score_ask_road_scenarios(derived, scenarios)
+    geometry = score_geometry_ask_road_scenarios(derived, scenarios)
+    analysis = _combine_derived_layers(human, geometry)
     analysis["derived_roads"] = derived
     analysis["rule_version"] = standard.get("rule_version")
     analysis["encoding"] = dict(standard.get("encoding") or {})
@@ -169,8 +251,11 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             "derived_ask_road_fusion": fusion,
             "derived_direction_weight": float(fusion["derived_effective_weight"]),
             "derived_direction_authority": "capped_auxiliary_only",
-            "direction_authority": "road_pattern_v1_plus_human_derived_ask_road",
-            "semantics": "road_v1_primary_plus_capped_human_derived_ask_road_auxiliary",
+            "direction_authority": "road_pattern_v1_plus_human_derived_ask_road_geometry",
+            "semantics": (
+                "road_v1_primary_plus_capped_human_derived_sequence_and_geometry_"
+                "ask_road_auxiliary"
+            ),
         }
     )
     return base
