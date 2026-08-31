@@ -1,16 +1,14 @@
-"""Production Road-Primary wrapper: exact V1 + derived roads + regime gate.
+"""Production Road-Primary wrapper: V1 + anti-echo + derived roads + regime gate.
 
-The exact Big-Road V1 core remains unchanged in ``road_pattern_v1_core``.
-Formal prediction is built in three ordered stages:
+Formal prediction is built in four ordered stages:
+1. Exact Road V1 Big-Road probability (kept unchanged in road_pattern_v1_core).
+2. Fresh-switch Anti-Echo calibration that prevents old SAME inertia from being
+   blindly re-anchored to a single newly switched result.
+3. Capped Human Derived Ask-Road auxiliary (R/U sequence + six-row geometry).
+4. Capped HSMM-inspired run-hazard residual gate.
 
-1. V1 Big-Road probability.
-2. Capped Human Derived Ask-Road auxiliary (R/U sequence + six-row geometry).
-3. A small HSMM-inspired run-hazard residual gate that estimates whether the
-   current road is persisting, alternating, transitioning or noisy.
-
-The regime layer never becomes an independent vote. Directional sign comes from
-empirical continue/turn hazard; the hidden-state posterior only controls how much
-that residual may adjust an already-computed V1 + derived probability.
+Anti-Echo is a calibrator, not an opposite-side rule. Derived roads and regime
+signals remain bounded auxiliaries and the public B/P contract is preserved.
 """
 from __future__ import annotations
 
@@ -22,6 +20,7 @@ from derived_road_markov import (
     MAX_DERIVED_ROAD_RELIABILITY,
     score_ask_road_scenarios,
 )
+from road_anti_echo import calibrate_fresh_switch
 from road_model import build_standard_derived_roads
 from road_pattern_v1_core import (
     COMPONENT_WEIGHTS,
@@ -36,7 +35,10 @@ from road_pattern_v1_core import (
 )
 from road_regime_gate import MAX_REGIME_DIRECTION_WEIGHT, analyze_road_regime_gate
 
-VERSION = f"{V1_VERSION}|HUMAN-DERIVED-ASK-V2.1-GEOMETRY|HSMM-HAZARD-GATE-V1"
+VERSION = (
+    f"{V1_VERSION}|FRESH-SWITCH-ANTI-ECHO-V1|"
+    "HUMAN-DERIVED-ASK-V2.1-GEOMETRY|HSMM-HAZARD-GATE-V1"
+)
 
 
 def _clip(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -173,7 +175,7 @@ def fuse_v1_with_derived(
     v1_banker_probability: float,
     derived_analysis: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Apply a capped Ask-Road log-odds correction to a V1 probability."""
+    """Apply a capped Ask-Road log-odds correction to a calibrated V1 probability."""
     base_p_b = _clip(v1_banker_probability, 0.37, 0.63)
     likelihood = dict(derived_analysis.get("likelihood") or {})
     derived_p_b = _clip(likelihood.get("B", 0.5), 0.20, 0.80)
@@ -208,7 +210,7 @@ def fuse_v1_with_derived(
             (base_p_b >= 0.5) != (final_p_b >= 0.5)
             and abs(base_p_b - 0.5) < 0.06
         ),
-        "semantics": "v1_logit_plus_capped_human_derived_ask_road_auxiliary",
+        "semantics": "calibrated_v1_logit_plus_capped_human_derived_ask_road_auxiliary",
     }
 
 
@@ -216,12 +218,7 @@ def fuse_with_regime_gate(
     base_banker_probability: float,
     regime_gate: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Apply a small HSMM-gated hazard residual after V1 + derived roads.
-
-    Strong existing Road signals are protected. A direction flip is only possible
-    near neutrality, and only when the empirical hazard has non-trivial support
-    and the hidden-regime gate grants reliability.
-    """
+    """Apply a small HSMM-gated hazard residual after V1 + derived roads."""
     base_p_b = _clip(base_banker_probability, 0.37, 0.63)
     likelihood = dict(regime_gate.get("likelihood") or {})
     gate_p_b = _clip(likelihood.get("B", 0.5), 0.20, 0.80)
@@ -264,11 +261,18 @@ def fuse_with_regime_gate(
 def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]:
     base = dict(forecast_v1_road_pattern(history))
     sequence = normalize_bp(history)
-    derived = _derived_analysis(sequence)
     base_probabilities = dict(base.get("probabilities") or {})
-    base_p_b = _clip(base_probabilities.get("B", 0.5), 0.37, 0.63)
+    raw_v1_p_b = _clip(base_probabilities.get("B", 0.5), 0.37, 0.63)
 
-    derived_fusion = fuse_v1_with_derived(base_p_b, derived)
+    anti_echo = calibrate_fresh_switch(
+        sequence,
+        raw_v1_p_b,
+        v1_components=dict(base.get("components") or {}),
+    )
+    calibrated_v1_p_b = _clip(anti_echo.get("final_p_b", raw_v1_p_b), 0.37, 0.63)
+
+    derived = _derived_analysis(sequence)
+    derived_fusion = fuse_v1_with_derived(calibrated_v1_p_b, derived)
     pre_regime_p_b = float(derived_fusion["final_p_b"])
     regime_gate = analyze_road_regime_gate(sequence, derived_analysis=derived)
     regime_fusion = fuse_with_regime_gate(pre_regime_p_b, regime_gate)
@@ -290,12 +294,19 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             "margin": float(abs(p_b - p_p)),
             "v1_direction": str(base.get("direction") or "B"),
             "v1_probabilities": {
-                "B": float(base_p_b),
-                "P": float(1.0 - base_p_b),
+                "B": float(raw_v1_p_b),
+                "P": float(1.0 - raw_v1_p_b),
                 "T": 0.0,
             },
             "v1_model_id": MODEL_ID,
             "v1_version": V1_VERSION,
+            "anti_echo_calibration": anti_echo,
+            "anti_echo_applied": bool(anti_echo.get("applied")),
+            "post_anti_echo_v1_probabilities": {
+                "B": float(calibrated_v1_p_b),
+                "P": float(1.0 - calibrated_v1_p_b),
+                "T": 0.0,
+            },
             "derived_ask_road": derived,
             "derived_ask_road_fusion": derived_fusion,
             "derived_direction_weight": float(derived_fusion["derived_effective_weight"]),
@@ -312,8 +323,8 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             # Preserve the public compatibility string used by existing clients.
             "direction_authority": "road_pattern_v1_plus_human_derived_ask_road",
             "semantics": (
-                "road_v1_plus_derived_sequence_geometry_then_capped_hsmm_hazard_"
-                "continue_turn_residual"
+                "road_v1_then_fresh_switch_anti_echo_then_derived_sequence_geometry_"
+                "then_capped_hsmm_hazard_continue_turn_residual"
             ),
         }
     )
