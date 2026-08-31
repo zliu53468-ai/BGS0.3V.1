@@ -227,7 +227,8 @@ class ContextGenerator:
             raise RuntimeError(f"context dimension mismatch: {vector.shape}")
         vector = np.nan_to_num(vector, nan=0.0, posinf=1.0, neginf=-1.0)
         ctx = dict(shoe_context or {})
-        if ctx.get("remaining_cards") in {None, ""}:
+        remaining_hint = ctx.get("remaining_cards")
+        if remaining_hint is None or remaining_hint == "":
             ctx["remaining_cards"] = estimate_remaining_cards(
                 len(raw), decks=SHOE_DECKS,
                 average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
