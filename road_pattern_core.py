@@ -251,7 +251,7 @@ def forecast_road_pattern(history: str | Iterable[Any] | None) -> dict[str, Any]
             "derived_ask_road_fusion": fusion,
             "derived_direction_weight": float(fusion["derived_effective_weight"]),
             "derived_direction_authority": "capped_auxiliary_only",
-            "direction_authority": "road_pattern_v1_plus_human_derived_ask_road_geometry",
+            "direction_authority": "road_pattern_v1_plus_human_derived_ask_road",
             "semantics": (
                 "road_v1_primary_plus_capped_human_derived_sequence_and_geometry_"
                 "ask_road_auxiliary"
