@@ -6,6 +6,7 @@ on:
       - fix/transition-hazard-shoe-confidence
     paths:
       - tools/apply_soft_transition_v2.py
+      - tools/soft_transition_v2_followup.py
       - .github/workflows/apply-soft-transition-v2.yml
   workflow_dispatch:
 
@@ -24,7 +25,9 @@ jobs:
         with:
           python-version: '3.13'
       - name: Apply soft patch
-        run: python tools/apply_soft_transition_v2.py
+        run: |
+          python tools/apply_soft_transition_v2.py
+          python tools/soft_transition_v2_followup.py
       - name: Syntax validation
         run: python -m py_compile run_length_hazard.py hsmm_regime.py pattern_survival.py
       - name: Transition behavior validation
@@ -42,7 +45,6 @@ jobs:
                   side='P' if side=='B' else 'B'
               return out
 
-          # 8,6,9,8 completed, active run grows 4..9 toward common break region.
           probs=[]
           for active in range(4,10):
               h=history_from_runs([8,6,9,8,active])
