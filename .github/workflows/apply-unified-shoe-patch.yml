@@ -1,0 +1,73 @@
+name: Apply unified shoe configuration patch
+
+on:
+  push:
+    branches:
+      - fix/unified-shoe-consumption
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: ${{ !contains(github.event.head_commit.message, '[shoe-config-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply deterministic patch
+        run: python tools/apply_unified_shoe_patch.py
+
+      - name: Compile changed Python modules
+        run: |
+          python -m py_compile \
+            shoe_constants.py \
+            shoe_depth_estimator.py \
+            shoe_composition.py \
+            contextual_bandit.py \
+            predictor.py \
+            probabilistic_shoe_estimator.py \
+            particle_filter_points.py \
+            store.py \
+            virtual_shoe.py \
+            shoe_state_db.py \
+            runtime_app.py \
+            app.py \
+            test_shoe_constants.py
+
+      - name: Run focused regression tests
+        run: |
+          python -m unittest -v \
+            test_shoe_constants \
+            test_shoe_composition \
+            test_formal_shoe_decision
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Commit patched sources
+        run: |
+          if git diff --quiet; then
+            echo "No patch changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            shoe_constants.py \
+            shoe_depth_estimator.py \
+            shoe_composition.py \
+            contextual_bandit.py \
+            predictor.py \
+            probabilistic_shoe_estimator.py \
+            particle_filter_points.py \
+            store.py \
+            virtual_shoe.py \
+            shoe_state_db.py \
+            runtime_app.py \
+            app.py \
+            test_shoe_constants.py
+          git commit -m "Unify shoe consumption constants and depth semantics [shoe-config-applied]"
+          git push origin HEAD:fix/unified-shoe-consumption
