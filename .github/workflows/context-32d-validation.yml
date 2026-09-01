@@ -60,7 +60,7 @@ jobs:
           assert x[14] == 0.0 and x[15] == 0.0
           assert x[16] == 0.0
           assert math.isclose(x[17], 0.125, abs_tol=1e-9)
-          assert math.isclose(x[20], 0.4, abs_tol=1e-9)
+          assert math.isclose(x[20], 0.6, abs_tol=1e-9)
           assert math.isclose(x[21], 0.5, abs_tol=1e-9)
           assert math.isclose(x[23], 0.75, abs_tol=1e-9)
           assert math.isclose(x[24], 5.0/7.0, abs_tol=1e-9)
