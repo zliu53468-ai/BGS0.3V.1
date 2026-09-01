@@ -24,7 +24,7 @@ from contextual_bandit import (
 )
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "LINUCB-SINGLE-BRAIN-V5"
+POLICY_VERSION = "LINUCB-32D-BBB-WEB-PARITY-V10"
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 24
 MARKOV_MAX_ORDER = 1

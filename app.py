@@ -1,9 +1,9 @@
-"""BGS V10.3 LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋保守線上校準。
+"""BGS LINE Bot：手機雙模式快速分析＋B/P/T完整歷史＋BBB Frozen Direct 32D。
 
 LINE 主流程：選館 -> 開始分析 -> 設定本金 -> 首次上傳截圖 -> 後續只按莊／閒／和。
 收到圖片後直接在 Webhook 內完成房間 OCR、大路偵測與模型分析，最長等待 3.5 秒，
 成功時使用同一個 replyToken 回覆分析面板；超時則立即回覆重新上傳提示。
-後續按莊／閒／和也改為在 Webhook 內以 deadline 同步完成模型更新，直接用同一個 replyToken 回覆下一局面板，不再依賴 LINE Push API。
+後續按莊／閒／和會在 Webhook 內以 deadline 同步完成下一局直接預測，正式流程不 bootstrap、不自動更新 A/b。
 虛擬牌靴程式仍保留給既有 API 相容用途，但不再混入 LINE 截圖流程。
 """
 from __future__ import annotations
@@ -1006,7 +1006,7 @@ def liff_page() -> FileResponse:
 def health() -> JSONResponse:
     return JSONResponse({
         "ok": True,
-        "version": "10.7.0-linucb-single-brain-v5",
+        "version": "10.8.0-linucb-32d-bbb-web-parity-v10",
         "engine": "CONTEXTUAL_LINUCB_SINGLE_BRAIN_BP",
         "activation_code_fix": True,
         "activation_persistence_check": True,
@@ -1025,9 +1025,12 @@ def health() -> JSONResponse:
         "uid_isolated_sessions": True,
         "first_image_then_bpt_only": True,
         "tie_result_supported": True,
-        "online_calibration": True,
+        "online_calibration": False,
         "adaptive_ensemble": False,
         "single_brain_linucb": True,
+        "bbb_web_panel_parity": True,
+        "linucb_bootstrap": False,
+        "linucb_automatic_feedback": False,
         "exact_shoe_composition": True,
         "banker_commission_ev": True,
         "fractional_kelly": True,

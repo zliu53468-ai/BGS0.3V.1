@@ -1,15 +1,14 @@
 """Frozen-direct 32D Single-Brain Contextual LinUCB core.
 
-Production behavior intentionally mirrors the standalone test panel's
+Production behavior mirrors the BBB standalone web panel's
 "reuse local 32D brain and predict directly" mode:
 
-1. A new scope performs one walk-forward bootstrap over the currently supplied
-   B/P/T history to create its local LinUCB A/b matrices.
-2. After bootstrap, newly appended B/P/T results only change the current 32D
-   context. They do NOT resolve the previous prediction, decay the matrices, or
-   update A/b automatically.
-3. The persisted A/b matrices are therefore frozen for the rest of that scope
-   unless the explicit update_bandit API is called by a separate caller.
+1. A new scope starts with the untouched ridge matrices (A=I, b=0).
+2. Starting analysis never replays B/P/T history and never bootstraps A/b.
+3. Newly appended B/P/T results only change the current 32D context. They do
+   NOT resolve the previous prediction, decay the matrices, or update A/b.
+4. The persisted A/b matrices remain frozen unless the explicit update_bandit
+   compatibility API is called by a separate caller.
 
 Formal Banker/Player direction remains owned only by two-arm LinUCB UCB score
 comparison. OCR, screenshot parsing, API fields and money management are outside
@@ -31,7 +30,6 @@ import time
 import numpy as np
 
 from road_model import build_standard_derived_roads
-from shoe_composition import analyze_shoe_composition, fresh_counts
 from shoe_constants import AVERAGE_CARDS_PER_HAND, SHOE_DECKS
 
 ARMS = ("P", "B")
@@ -85,7 +83,7 @@ ROAD_PRIOR_PROBABILITY_SPAN = 0.0
 LINUCB_PROBABILITY_CORRECTION_SPAN = 0.0
 PROBABILITY_MIN = 0.42
 PROBABILITY_MAX = 0.58
-STATE_VERSION = "LINUCB-2ARM-SINGLE-BRAIN-CONTEXT-16SHOE-16ROAD-32D-FROZEN-DIRECT-V9"
+STATE_VERSION = "LINUCB-2ARM-SINGLE-BRAIN-CONTEXT-16SHOE-16ROAD-32D-WEB-PARITY-V10"
 ESTIMATED_CARDS_PER_ROUND = AVERAGE_CARDS_PER_HAND
 _LOCK = RLock()
 
@@ -330,61 +328,24 @@ class ContextGenerator:
         decks = max(1, min(16, decks))
         total_cards = float(52 * decks)
 
-        exact = analyze_shoe_composition(context, default_decks=decks)
-        counts: list[float] = []
-        if exact.get("available"):
-            try:
-                counts = [float(value) for value in exact.get("remaining_counts", [])]
-            except (TypeError, ValueError):
-                counts = []
-        exact_available = len(counts) == 10
-
-        if exact_available:
-            remaining_cards = float(sum(counts))
-            remaining_source = str(exact.get("remaining_cards_source") or exact.get("source") or "exact_remaining_counts")
-        else:
-            remaining_cards = max(0.0, total_cards - len(raw) * float(AVERAGE_CARDS_PER_HAND))
-            remaining_source = "panel_history_round_estimate"
+        # BBB is a button-only panel and has no exact card-rank input. Keep the
+        # production predictor on the same feature contract: shoe depth comes
+        # only from the B/P/T round count, while rank ratios stay neutral.
+        # The caller may still supply verified card data for outward API and
+        # diagnostics, but it must not change this web-parity context vector.
+        exact_available = False
+        remaining_cards = max(0.0, total_cards - len(raw) * float(AVERAGE_CARDS_PER_HAND))
+        remaining_source = "panel_history_round_estimate"
         remaining_cards = max(0.0, min(total_cards, remaining_cards))
         remaining_ratio = _clip(remaining_cards / total_cards if total_cards else 1.0)
         penetration_ratio = _clip(1.0 - remaining_ratio)
         shoe_maturity_ratio = _clip(len(raw) / 70.0)
 
-        rank_ratios: list[float]
-        group_ratios: list[float]
-        if exact_available:
-            fresh = [float(value) for value in fresh_counts(decks)]
-            rank_ratios = []
-            for point in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0):
-                expected = fresh[point] * remaining_ratio
-                rank_ratios.append(_clip(1.0 if expected <= 1e-12 else counts[point] / expected, 0.0, 2.0))
-
-            def grouped_ratio(points: Sequence[int]) -> float:
-                expected = sum(fresh[point] * remaining_ratio for point in points)
-                observed = sum(counts[point] for point in points)
-                return _clip(1.0 if expected <= 1e-12 else observed / expected, 0.0, 2.0)
-
-            group_ratios = [
-                grouped_ratio((1, 2, 3)),
-                grouped_ratio((4, 5)),
-                grouped_ratio((6,)),
-                grouped_ratio((7,)),
-                grouped_ratio((8,)),
-                grouped_ratio((9,)),
-                grouped_ratio((0,)),
-            ]
-            rank_ratio_source = "exact_relative_to_expected_depth"
-        else:
-            rank_ratios = [1.0] * 10
-            group_ratios = [1.0] * 7
-            rank_ratio_source = "neutral_fallback"
-
-        edge_weights = (0.02, 0.01, 0.01, 0.02, 0.03, 0.04, 0.04, 0.03, 0.02, -0.03)
-        physical_edge_proxy = (
-            _clip(sum(weight * (ratio - 1.0) for weight, ratio in zip(edge_weights, rank_ratios)), -1.0, 1.0)
-            if exact_available else 0.0
-        )
-        shoe_information_reliability = 1.0 if exact_available else 0.0
+        rank_ratios = [1.0] * 10
+        group_ratios = [1.0] * 7
+        rank_ratio_source = "neutral_fallback_web_panel"
+        physical_edge_proxy = 0.0
+        shoe_information_reliability = 0.0
 
         run_values = _runs(raw)
         current_side, current_run = run_values[-1] if run_values else ("", 0)
@@ -467,7 +428,10 @@ class ContextGenerator:
             "estimated_hands_remaining_norm": remaining_ratio,
             "shoe_maturity_ratio": shoe_maturity_ratio,
             "remaining_cards_source": remaining_source,
-            "soft_remaining_cards_ignored_for_panel_compatibility": bool(not exact_available and context.get("remaining_cards")),
+            "soft_remaining_cards_ignored_for_panel_compatibility": bool(context.get("remaining_cards")),
+            "exact_card_input_ignored_for_web_panel_compatibility": bool(
+                "remaining_counts" in context or "observed_cards" in context
+            ),
             "exact_composition_available": exact_available,
             "rank_ratio_source": rank_ratio_source,
             "rank_ratios_a_to_10jqk": [float(value) for value in rank_ratios],
@@ -504,7 +468,7 @@ class ContextGenerator:
             "small_cockroach_regularity": small_cockroach_regularity,
             "derived_road_consensus": derived_consensus,
             "context_layout": "16_shoe_plus_16_road_32d",
-            "context_compatibility": "standalone_32d_panel_frozen_direct",
+            "context_compatibility": "bbb_standalone_32d_panel_frozen_direct",
             "shoe_feature_values": [float(value) for value in shoe_features],
             "road_feature_values": [float(value) for value in road_features],
             "formal_direction_source": "contextual_linucb",
@@ -557,10 +521,9 @@ def _new_scope() -> dict[str, Any]:
         "updates": 0,
         "last_selected": "",
         "selection_streak": 0,
-        "panel_bootstrap_done": False,
-        "bootstrap_rounds": 0,
-        "bootstrap_source_rounds": 0,
-        "bootstrap_history_fingerprint": "",
+        "direct_predict_only": True,
+        "no_bootstrap_on_start": True,
+        "no_feedback_update": True,
         "created_at": now,
         "updated_at": now,
     }
@@ -698,7 +661,7 @@ class ContextualLinUCB:
         }
 
     def update(self, *, scope_key: str, action: str, context_vector: Sequence[float], actual_outcome: str, clear_pending: bool = True) -> dict[str, Any]:
-        """Explicit compatibility API. Formal predict() never calls this after bootstrap."""
+        """Explicit compatibility API. Formal predict() never calls this."""
         with _LOCK:
             root = _read_state()
             scope = deepcopy(dict(root["scopes"].get(scope_key) or _new_scope()))
@@ -719,8 +682,14 @@ class ContextualLinUCB:
         last = str(scope.get("last_selected") or "").upper().strip()
         if last in ARMS:
             return ("P" if last == "B" else "B"), "tie_opposite_previous_arm"
-        token = sha256(("LOCAL_32D|" + "".join(raw_history)).encode("utf-8")).digest()[0]
-        return ("B" if token % 2 else "P"), "tie_deterministic_history_hash"
+        # Match BBB app.js exactly:
+        #   h = (h * 31 + token.charCodeAt(i)) >>> 0
+        #   direction = h % 2 ? "B" : "P"
+        token = "LOCAL_32D|" + "".join(raw_history)
+        panel_hash = 0
+        for char in token:
+            panel_hash = (panel_hash * 31 + ord(char)) & 0xFFFFFFFF
+        return ("B" if panel_hash % 2 else "P"), "tie_deterministic_history_hash"
 
     def _choose(self, scope: Mapping[str, Any], context_vector: np.ndarray, raw_history: Sequence[str]):
         bp_rounds = len(_bp(raw_history))
@@ -753,47 +722,6 @@ class ContextualLinUCB:
         scope.update({"last_selected": direction, "selection_streak": streak, "updated_at": int(time.time())})
         return streak
 
-    def _bootstrap(self, scope: dict[str, Any], raw_history: Sequence[str], shoe_context: Mapping[str, Any]) -> dict[str, Any]:
-        if scope.get("panel_bootstrap_done"):
-            return {
-                "applied": False,
-                "reason": "bootstrap_already_done_frozen_brain",
-                "bootstrap_rounds": int(scope.get("bootstrap_rounds", 0) or 0),
-            }
-        updates = directional_updates = tie_updates = 0
-        for index in range(1, len(raw_history)):
-            prefix = list(raw_history[:index])
-            snapshot = self.generator.build(prefix, shoe_context)
-            _, _, _, direction, _, _ = self._choose(scope, _model_x(snapshot.vector), prefix)
-            self._remember_selection(scope, direction)
-            result = self._update_scope(
-                scope,
-                action=direction,
-                context_vector=snapshot.vector,
-                actual_outcome=raw_history[index],
-            )
-            updates += int(bool(result.get("updated")))
-            directional_updates += int(bool(result.get("directional_sample_applied")))
-            tie_updates += int(raw_history[index] == "T")
-        scope.update({
-            "pending": {},
-            "panel_bootstrap_done": True,
-            "bootstrap_rounds": max(0, len(raw_history) - 1),
-            "bootstrap_source_rounds": len(raw_history),
-            "bootstrap_history_fingerprint": _history_fingerprint(raw_history),
-            "frozen_direct_mode": True,
-            "updated_at": int(time.time()),
-        })
-        return {
-            "applied": True,
-            "reason": "initial_walk_forward_bootstrap_then_freeze",
-            "bootstrap_rounds": max(0, len(raw_history) - 1),
-            "updates": updates,
-            "directional_updates": directional_updates,
-            "tie_updates": tie_updates,
-            "source_rounds": len(raw_history),
-        }
-
     def predict(self, *, history: Iterable[Any] | str | None, shoe_context: Mapping[str, Any] | None, scope_key: str) -> dict[str, Any]:
         raw_history = _normalize_history(deepcopy(history))
         context = deepcopy(dict(shoe_context or {}))
@@ -805,21 +733,23 @@ class ContextualLinUCB:
         with _LOCK:
             root = _read_state()
             scope = deepcopy(dict(root["scopes"].get(scope_key) or _new_scope()))
-            bootstrap = self._bootstrap(scope, raw_history, context)
+            bootstrap = {
+                "applied": False,
+                "reason": "web_panel_direct_no_bootstrap",
+                "bootstrap_rounds": 0,
+                "source_rounds": len(raw_history),
+            }
 
-            # Critical V9 behavior: after the initial bootstrap, prediction is
-            # direct/frozen. A newly appended history result changes only the
-            # context vector; it does not resolve the prior prediction, decay
-            # A/b, or update A/b.
+            # BBB behavior: load the current local brain, calculate the latest
+            # 32D context, predict directly, and save selection metadata only.
+            # A/b, n, effective_n and updates remain untouched.
             feedback = {
                 "updated": False,
-                "reason": "frozen_direct_prediction_no_previous_feedback_update",
+                "reason": "web_panel_direct_no_feedback_update",
                 "diagnostic_only": False,
                 "formal_model": "contextual_linucb",
-                "a_b_frozen_after_bootstrap": True,
+                "a_b_frozen_without_bootstrap": True,
             }
-            if bootstrap.get("applied"):
-                feedback["bootstrap"] = deepcopy(bootstrap)
 
             scores, effective_samples, total_effective, direction, reason, score_gap = self._choose(scope, x, raw_history)
             raw_p_b = 1.0 / (1.0 + math.exp(-max(-8.0, min(8.0, score_gap / LINUCB_SCORE_TEMPERATURE))))
@@ -840,15 +770,19 @@ class ContextualLinUCB:
                 "panel_bootstrap": deepcopy(bootstrap),
                 "prediction_mode": "frozen_32d_local_brain_direct",
                 "automatic_feedback_update_enabled": False,
-                "a_b_frozen_after_bootstrap": True,
+                "a_b_frozen_without_bootstrap": True,
+                "no_bootstrap_on_start": True,
             })
 
-            # No pending prediction is stored in V9 formal mode. The next B/P/T
+            # No pending prediction is stored in web-parity formal mode. The next B/P/T
             # result is simply part of the next history/context, exactly like
             # typing one more record into the test panel then pressing direct
             # predict.
             scope["pending"] = {}
             scope["frozen_direct_mode"] = True
+            scope["direct_predict_only"] = True
+            scope["no_bootstrap_on_start"] = True
+            scope["no_feedback_update"] = True
             root["scopes"][scope_key] = scope
             _write_state(root)
 
@@ -900,13 +834,16 @@ class ContextualLinUCB:
             "card_composition_direction_weight": 0.0,
             "probability_semantics": "bounded_logistic_mapping_of_linucb_ucb_score_gap",
             "cold_start_uses_road_prior": False,
-            "shoe_context_used_for_formal_direction": True,
-            "shoe_context_used_as_features": True,
+            "shoe_context_used_for_formal_direction": False,
+            "shoe_context_used_as_features": False,
+            "history_estimated_shoe_features_used": True,
             "shoe_context_independent_vote": False,
             "external_road_vote_enabled": False,
             "anti_echo_external_penalty": False,
             "panel_compatible": True,
             "frozen_direct_mode": True,
+            "direct_predict_only": True,
+            "no_bootstrap_on_start": True,
             "automatic_feedback_update_enabled": False,
             "anti_lock": {
                 "enabled": False,

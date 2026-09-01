@@ -1,11 +1,11 @@
 """Runtime entrypoint for the BGS LINE/FastAPI application.
 
-The runtime installs the dynamic policy before loading the legacy app, then
-keeps the formal predictor contract intact at the UI boundary:
+The runtime installs the BBB Frozen Direct 32D policy before loading the legacy
+app, then keeps the formal predictor contract intact at the UI boundary:
 - formal action is always B/P;
-- shoe evidence priority is remaining_counts > observed_cards > none;
-- exact shoe EV owns direction when exact composition is available;
-- road forecaster is the fallback when it is not;
+- B/P/T history builds the same 16-shoe + 16-road context as the web panel;
+- exact card evidence stays diagnostic and does not alter the formal context;
+- prediction never bootstraps or automatically updates A/b;
 - the core fractional-Kelly ratio is preserved inside the 5%..30% product band.
 
 OCR, screenshot recognition, LINE transport and UI layout remain unchanged.
