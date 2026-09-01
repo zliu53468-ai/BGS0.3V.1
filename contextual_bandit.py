@@ -1,13 +1,13 @@
 """Single-brain Contextual LinUCB core for BGS.
 
 Formal Banker/Player direction has exactly one owner: the two-arm LinUCB score
-comparison. The fixed 16-dimensional context is deliberately split into eight
-shoe-state features and eight road-state features. No external road model,
+comparison. The fixed 32-dimensional context is deliberately split into sixteen
+shoe-state features and sixteen road-state features. No external road model,
 Anti-Echo rule, geometry vote, Markov vote or LLM may override B/P.
 
 The public state/update API and contextual_linucb_state.json persistence contract
 are preserved. Changing STATE_VERSION intentionally invalidates old A/b matrices
-because the 16-dimensional feature basis changed.
+because the contextual feature basis changed from 16D to 32D.
 """
 from __future__ import annotations
 
@@ -33,31 +33,48 @@ from shoe_composition import analyze_shoe_composition, fresh_counts
 from shoe_constants import (
     AVERAGE_CARDS_PER_HAND,
     BURN_CARDS,
+    REFERENCE_HANDS,
     SHOE_DECKS,
     estimate_remaining_cards,
 )
 
 ARMS = ("P", "B")
-CONTEXT_DIM = 16
+CONTEXT_DIM = 32
 CONTEXT_FEATURE_NAMES = (
-    # 1-8: what remains in the shoe.
+    # 1-16: shoe state.
     "remaining_cards_ratio",
-    "shoe_A23_relative_ratio",
-    "shoe_45_relative_ratio",
-    "shoe_6_relative_ratio",
-    "shoe_7_relative_ratio",
-    "shoe_8_relative_ratio",
-    "shoe_9_relative_ratio",
-    "shoe_10JQK_relative_ratio",
-    # 9-16: how the current road is behaving.
+    "penetration_ratio",
+    "estimated_hands_remaining_norm",
+    "shoe_maturity_ratio",
+    "rank_A_relative_ratio",
+    "rank_2_relative_ratio",
+    "rank_3_relative_ratio",
+    "rank_4_relative_ratio",
+    "rank_5_relative_ratio",
+    "rank_6_relative_ratio",
+    "rank_7_relative_ratio",
+    "rank_8_relative_ratio",
+    "rank_9_relative_ratio",
+    "rank_10JQK_relative_ratio",
+    "physical_edge_proxy",
+    "shoe_information_reliability",
+    # 17-32: road state.
     "current_side_banker_binary",
     "current_run_length_norm",
+    "previous_run_length_norm",
+    "previous2_run_length_norm",
+    "recent5_banker_ratio",
     "recent8_banker_ratio",
+    "recent12_banker_ratio",
+    "recent5_turn_rate",
     "recent8_turn_rate",
+    "recent12_turn_rate",
     "run_length_hazard_rate",
     "hsmm_stable_probability",
     "big_eye_regularity",
-    "small_cockroach_regularity",
+    "small_road_regularity",
+    "cockroach_road_regularity",
+    "derived_road_consensus",
 )
 
 LINUCB_ALPHA = max(0.0, float(os.getenv("LINUCB_ALPHA", "0.5") or "0.5"))
@@ -72,7 +89,7 @@ ROAD_PRIOR_PROBABILITY_SPAN = 0.0
 LINUCB_PROBABILITY_CORRECTION_SPAN = 0.0
 PROBABILITY_MIN = 0.42
 PROBABILITY_MAX = 0.58
-STATE_VERSION = "LINUCB-2ARM-SINGLE-BRAIN-CONTEXT-8SHOE-8ROAD-V6"
+STATE_VERSION = "LINUCB-2ARM-SINGLE-BRAIN-CONTEXT-16SHOE-16ROAD-32D-V7"
 ESTIMATED_CARDS_PER_ROUND = AVERAGE_CARDS_PER_HAND
 _LOCK = RLock()
 
@@ -113,17 +130,40 @@ def _bp(history: Sequence[str]) -> list[str]:
     return [v for v in history if v in {"B", "P"}]
 
 
-def _run_length(sequence: Sequence[str]) -> tuple[str, int]:
+def _runs(sequence: Sequence[str]) -> list[tuple[str, int]]:
     values = _bp(sequence)
     if not values:
-        return "", 0
-    last = values[-1]
-    length = 0
-    for value in reversed(values):
-        if value != last:
-            break
-        length += 1
-    return last, length
+        return []
+    result: list[tuple[str, int]] = []
+    side, length = values[0], 1
+    for value in values[1:]:
+        if value == side:
+            length += 1
+        else:
+            result.append((side, length))
+            side, length = value, 1
+    result.append((side, length))
+    return result
+
+
+def _run_length(sequence: Sequence[str]) -> tuple[str, int]:
+    values = _runs(sequence)
+    return values[-1] if values else ("", 0)
+
+
+def _recent_banker_ratio(sequence: Sequence[str], window: int) -> float:
+    values = _bp(sequence)[-max(1, int(window)):]
+    if not values:
+        return 0.5
+    return float(sum(value == "B" for value in values) / len(values))
+
+
+def _turn_rate(sequence: Sequence[str], window: int) -> float:
+    values = _bp(sequence)[-max(2, int(window)):]
+    if len(values) < 2:
+        return 0.5
+    turns = sum(values[index] != values[index - 1] for index in range(1, len(values)))
+    return float(turns / (len(values) - 1))
 
 
 def _road_regularity(values: Iterable[Any], window: int = 8) -> tuple[float, int]:
@@ -171,18 +211,24 @@ class ContextGenerator:
             except (TypeError, ValueError):
                 remaining_cards = 0.0
             if remaining_cards <= 0.0:
-                remaining_cards = estimate_remaining_cards(len(raw), decks=decks, average_cards_per_hand=AVERAGE_CARDS_PER_HAND, burn_cards=BURN_CARDS)
+                remaining_cards = estimate_remaining_cards(
+                    len(raw), decks=decks,
+                    average_cards_per_hand=AVERAGE_CARDS_PER_HAND,
+                    burn_cards=BURN_CARDS,
+                )
             counts = []
             remaining_source = str(ctx.get("remaining_cards_source") or "round_count_estimate")
 
         remaining_cards = max(0.0, min(total_shoe_cards, remaining_cards))
         remaining_ratio = _clip(remaining_cards / total_shoe_cards if total_shoe_cards > 0.0 else 1.0, 0.0, 1.0)
+        penetration_ratio = _clip(1.0 - remaining_ratio, 0.0, 1.0)
+        estimated_hands_remaining_norm = remaining_ratio
+        shoe_maturity_ratio = _clip(len(raw) / float(max(1, REFERENCE_HANDS)), 0.0, 1.0)
 
-        # Keep the old ten point-ratios as diagnostics for outward compatibility,
-        # but compress them into seven grouped shoe features for the formal 8D shoe block.
         rank_ratios: list[float] = []
         shoe_group_ratios: list[float] = []
-        if exact_available and len(counts) == 10:
+        exact_counts_available = bool(exact_available and len(counts) == 10)
+        if exact_counts_available:
             fresh = [float(v) for v in fresh_counts(decks)]
             point_order = (1, 2, 3, 4, 5, 6, 7, 8, 9, 0)
             for point in point_order:
@@ -196,22 +242,27 @@ class ContextGenerator:
                 return _clip(1.0 if expected <= 1e-12 else observed / expected, 0.0, 2.0)
 
             shoe_group_ratios = [
-                grouped_ratio((1, 2, 3)),
-                grouped_ratio((4, 5)),
-                grouped_ratio((6,)),
-                grouped_ratio((7,)),
-                grouped_ratio((8,)),
-                grouped_ratio((9,)),
-                grouped_ratio((0,)),
+                grouped_ratio((1, 2, 3)), grouped_ratio((4, 5)),
+                grouped_ratio((6,)), grouped_ratio((7,)), grouped_ratio((8,)),
+                grouped_ratio((9,)), grouped_ratio((0,)),
             ]
-            rank_ratio_source = "exact_grouped_relative_to_expected_depth"
+            rank_ratio_source = "exact_relative_to_expected_depth"
         else:
             rank_ratios = [1.0] * 10
             shoe_group_ratios = [1.0] * 7
             rank_ratio_source = "neutral_fallback"
 
-        # Preserve probabilistic shoe diagnostics, but it is no longer a separate
-        # formal context dimension in the new clean 8-shoe / 8-road layout.
+        # Match the 32D test panel: the physical edge dimension stays neutral
+        # without exact point counts and becomes a conservative zero-centered
+        # weighted residual only when exact point composition is supplied.
+        edge_weights = (0.02, 0.01, 0.01, 0.02, 0.03, 0.04, 0.04, 0.03, 0.02, -0.03)
+        physical_edge_proxy = (
+            _clip(sum(weight * (ratio - 1.0) for weight, ratio in zip(edge_weights, rank_ratios)), -1.0, 1.0)
+            if exact_counts_available else 0.0
+        )
+        shoe_information_reliability = 1.0 if exact_counts_available else 0.0
+
+        # Preserve the existing probabilistic shoe calculation as diagnostics only.
         try:
             depth_reliability = float(ctx.get("remaining_cards_reliability", 0.65) or 0.65)
         except (TypeError, ValueError):
@@ -235,22 +286,21 @@ class ContextGenerator:
         baseline_edge = baseline_b / baseline_total - baseline_p / baseline_total
         combinatorial_advantage = _clip((p_b_physical - p_p_physical) - baseline_edge, -1.0, 1.0)
 
-        # Road block: eight compact measurements of how the current shoe is running.
-        current_side, run_length = _run_length(raw)
+        road_runs = _runs(raw)
+        current_side, run_length = road_runs[-1] if road_runs else ("", 0)
+        previous_run_length = road_runs[-2][1] if len(road_runs) >= 2 else 0
+        previous2_run_length = road_runs[-3][1] if len(road_runs) >= 3 else 0
         current_side_banker_binary = 1.0 if current_side == "B" else 0.0 if current_side == "P" else 0.5
         run_length_norm = _clip(run_length / 8.0, 0.0, 1.0)
+        previous_run_length_norm = _clip(previous_run_length / 8.0, 0.0, 1.0)
+        previous2_run_length_norm = _clip(previous2_run_length / 8.0, 0.0, 1.0)
 
-        recent8 = bp_values[-8:]
-        recent8_banker_ratio = (
-            float(sum(side == "B" for side in recent8) / len(recent8)) if recent8 else 0.5
-        )
-        if len(recent8) >= 2:
-            recent8_turn_rate = float(
-                sum(recent8[index] != recent8[index - 1] for index in range(1, len(recent8)))
-                / (len(recent8) - 1)
-            )
-        else:
-            recent8_turn_rate = 0.5
+        recent5_banker_ratio = _recent_banker_ratio(raw, 5)
+        recent8_banker_ratio = _recent_banker_ratio(raw, 8)
+        recent12_banker_ratio = _recent_banker_ratio(raw, 12)
+        recent5_turn_rate = _turn_rate(raw, 5)
+        recent8_turn_rate = _turn_rate(raw, 8)
+        recent12_turn_rate = _turn_rate(raw, 12)
 
         hazard = analyze_run_length_hazard(deepcopy(raw))
         hazard_rate = _clip(hazard.get("turn_probability", 0.5), 0.0, 1.0)
@@ -266,6 +316,15 @@ class ContextGenerator:
         big_eye_regularity, big_eye_samples = _road_regularity(big_eye)
         small_regularity, small_samples = _road_regularity(small_road)
         cockroach_regularity, cockroach_samples = _road_regularity(cockroach_road)
+        regularity_mean = (big_eye_regularity + small_regularity + cockroach_regularity) / 3.0
+        derived_road_consensus = _clip(
+            1.0 - (
+                abs(big_eye_regularity - regularity_mean)
+                + abs(small_regularity - regularity_mean)
+                + abs(cockroach_regularity - regularity_mean)
+            ) / 1.5,
+            0.0, 1.0,
+        )
         combined_samples = small_samples + cockroach_samples
         small_cockroach_regularity = (
             (small_regularity * small_samples + cockroach_regularity * cockroach_samples) / combined_samples
@@ -285,16 +344,32 @@ class ContextGenerator:
         else:
             derived_regularity_binary = 0.0
 
-        shoe_features = [remaining_ratio, *shoe_group_ratios]
+        shoe_features = [
+            remaining_ratio,
+            penetration_ratio,
+            estimated_hands_remaining_norm,
+            shoe_maturity_ratio,
+            *rank_ratios,
+            physical_edge_proxy,
+            shoe_information_reliability,
+        ]
         road_features = [
             current_side_banker_binary,
             run_length_norm,
+            previous_run_length_norm,
+            previous2_run_length_norm,
+            recent5_banker_ratio,
             recent8_banker_ratio,
+            recent12_banker_ratio,
+            recent5_turn_rate,
             recent8_turn_rate,
+            recent12_turn_rate,
             hazard_rate,
             regime_probability,
             big_eye_regularity,
-            small_cockroach_regularity,
+            small_regularity,
+            cockroach_regularity,
+            derived_road_consensus,
         ]
         vector = np.asarray([*shoe_features, *road_features], dtype=np.float64)
         if vector.shape != (CONTEXT_DIM,):
@@ -303,7 +378,10 @@ class ContextGenerator:
         return ContextSnapshot(vector=vector, metadata={
             "raw_round_count": len(raw), "bp_round_count": len(bp_values), "tie_count": sum(v == "T" for v in raw),
             "remaining_cards": float(remaining_cards), "remaining_ratio": float(remaining_ratio),
-            "remaining_cards_source": remaining_source, "exact_composition_available": exact_available,
+            "penetration_ratio": float(penetration_ratio),
+            "estimated_hands_remaining_norm": float(estimated_hands_remaining_norm),
+            "shoe_maturity_ratio": float(shoe_maturity_ratio),
+            "remaining_cards_source": remaining_source, "exact_composition_available": exact_counts_available,
             "rank_ratio_source": rank_ratio_source, "rank_ratios_a_to_10jqk": [float(v) for v in rank_ratios],
             "shoe_group_ratios": {
                 "A23": float(shoe_group_ratios[0]), "45": float(shoe_group_ratios[1]),
@@ -311,16 +389,27 @@ class ContextGenerator:
                 "8": float(shoe_group_ratios[4]), "9": float(shoe_group_ratios[5]),
                 "10JQK": float(shoe_group_ratios[6]),
             },
+            "physical_edge_proxy": float(physical_edge_proxy),
+            "shoe_information_reliability": float(shoe_information_reliability),
             "combinatorial_advantage_offset": float(combinatorial_advantage),
             "probabilistic_shoe_reliability": float(probabilistic_shoe.get("reliability", 0.0) or 0.0),
             "hsmm_stable_probability": float(regime_probability), "hazard_rate": float(hazard_rate),
             "derived_road_regularity_binary": float(derived_regularity_binary), "derived_latest_marks": list(latest_marks),
             "run_length": int(run_length), "run_length_norm": float(run_length_norm), "shoe_decks": int(decks),
+            "previous_run_length": int(previous_run_length), "previous2_run_length": int(previous2_run_length),
             "current_side": current_side, "current_side_banker_binary": float(current_side_banker_binary),
-            "recent8_banker_ratio": float(recent8_banker_ratio), "recent8_turn_rate": float(recent8_turn_rate),
+            "recent5_banker_ratio": float(recent5_banker_ratio),
+            "recent8_banker_ratio": float(recent8_banker_ratio),
+            "recent12_banker_ratio": float(recent12_banker_ratio),
+            "recent5_turn_rate": float(recent5_turn_rate),
+            "recent8_turn_rate": float(recent8_turn_rate),
+            "recent12_turn_rate": float(recent12_turn_rate),
             "big_eye_regularity": float(big_eye_regularity),
+            "small_road_regularity": float(small_regularity),
+            "cockroach_road_regularity": float(cockroach_regularity),
             "small_cockroach_regularity": float(small_cockroach_regularity),
-            "context_layout": "8_shoe_plus_8_road",
+            "derived_road_consensus": float(derived_road_consensus),
+            "context_layout": "16_shoe_plus_16_road_32d",
             "shoe_feature_values": [float(v) for v in shoe_features],
             "road_feature_values": [float(v) for v in road_features],
             "formal_direction_source": "contextual_linucb", "single_brain": True,
@@ -554,7 +643,7 @@ class ContextualLinUCB:
             "feedback_update": feedback, "scope_key": scope_key, "arms": list(ARMS),
             "selection_reason": selection_reason, "selection_streak": int(streak), "effective_arm_samples": eff,
             "history_round_count": len(raw), "bp_history_round_count": n_bp, "history_fingerprint": fingerprint,
-            "short_shoe_target_rounds": "50-70", "formal_context_source": "single_brain_16d_context",
+            "short_shoe_target_rounds": "50-70", "formal_context_source": "single_brain_32d_context",
             "formal_direction_source": "contextual_linucb", "road_context_direction_weight": 0.0, "card_composition_direction_weight": 0.0,
             "probability_semantics": "bounded_logistic_mapping_of_linucb_ucb_score_gap",
             "cold_start_uses_road_prior": False, "shoe_context_used_for_formal_direction": True, "shoe_context_used_as_features": True,
