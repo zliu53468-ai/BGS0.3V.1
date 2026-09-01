@@ -1,0 +1,73 @@
+name: Frozen 32D Direct V9 validation
+
+on:
+  push:
+    branches:
+      - refactor/frozen-32d-direct-v9
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal dependency
+        run: python -m pip install --disable-pip-version-check 'numpy>=1.26,<2.4'
+      - name: Compile core
+        run: python -m py_compile contextual_bandit.py dynamic_prediction_policy.py
+      - name: Validate frozen direct semantics
+        run: |
+          python - <<'PY'
+          import copy
+          import json
+          import os
+          import tempfile
+
+          os.environ['LINUCB_STATE_FILE'] = tempfile.mktemp(prefix='linucb-v9-', suffix='.json')
+          import contextual_bandit as cb
+          import dynamic_prediction_policy as dp
+
+          assert cb.CONTEXT_DIM == 32
+          assert len(cb.CONTEXT_FEATURE_NAMES) == 32
+          assert 'FROZEN-DIRECT-V9' in cb.STATE_VERSION
+          assert dp.CONTEXT_DIM == 32
+
+          model = cb.ContextualLinUCB()
+          history = 'BPPBBPBP'
+          first = model.predict(history=history, shoe_context={'decks': 8}, scope_key='scope-a')
+          assert first['panel_bootstrap_applied'] is True
+          assert first['frozen_direct_mode'] is True
+          assert first['automatic_feedback_update_enabled'] is False
+          assert first['feedback_update']['updated'] is False
+
+          with open(os.environ['LINUCB_STATE_FILE'], encoding='utf-8') as handle:
+              state1 = json.load(handle)['scopes']['scope-a']
+          arms1 = copy.deepcopy(state1['arms'])
+          updates1 = state1['updates']
+          effective1 = {arm: state1['arms'][arm]['effective_n'] for arm in cb.ARMS}
+
+          second = model.predict(history=history + 'B', shoe_context={'decks': 8}, scope_key='scope-a')
+          assert second['panel_bootstrap_applied'] is False
+          assert second['feedback_update']['reason'] == 'frozen_direct_prediction_no_previous_feedback_update'
+          assert second['history_round_count'] == first['history_round_count'] + 1
+          assert second['context_vector'] != first['context_vector']
+
+          with open(os.environ['LINUCB_STATE_FILE'], encoding='utf-8') as handle:
+              state2 = json.load(handle)['scopes']['scope-a']
+          assert state2['arms'] == arms1
+          assert state2['updates'] == updates1
+          assert {arm: state2['arms'][arm]['effective_n'] for arm in cb.ARMS} == effective1
+          assert state2['pending'] == {}
+
+          third = model.predict(history=history + 'BP', shoe_context={'decks': 8}, scope_key='scope-a')
+          with open(os.environ['LINUCB_STATE_FILE'], encoding='utf-8') as handle:
+              state3 = json.load(handle)['scopes']['scope-a']
+          assert state3['arms'] == arms1
+          assert state3['updates'] == updates1
+          assert state3['pending'] == {}
+
+          print('Frozen 32D Direct V9 validation OK')
+          PY
