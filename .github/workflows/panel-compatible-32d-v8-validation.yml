@@ -1,0 +1,73 @@
+name: Panel-compatible 32D V8 validation
+
+on:
+  push:
+    branches:
+      - refactor/panel-compatible-32d-v8
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal dependency
+        run: python -m pip install --disable-pip-version-check 'numpy>=1.26,<2.4'
+      - name: Compile core
+        run: python -m py_compile contextual_bandit.py
+      - name: Validate panel-compatible semantics
+        run: |
+          python - <<'PY'
+          import math, os, tempfile
+          os.environ['LINUCB_STATE_FILE'] = tempfile.mktemp(prefix='linucb-v8-', suffix='.json')
+          import contextual_bandit as cb
+
+          assert cb.CONTEXT_DIM == 32
+          assert len(cb.CONTEXT_FEATURE_NAMES) == 32
+          assert 'PANEL-V8' in cb.STATE_VERSION
+
+          cb.analyze_shoe_composition = lambda ctx, default_decks=8: {'available': False}
+          cb.build_standard_derived_roads = lambda history: {
+              'big_eye': ['R','U','R','R'], 'small_road': ['R','R'], 'cockroach_road': ['U','R']
+          }
+
+          hist = 'BPPBBPBP'
+          snap = cb.ContextGenerator().build(hist, {'decks': 8, 'remaining_cards': 416})
+          x = snap.vector.tolist()
+          expected_remaining = max(0.0, 416.0 - len(hist) * float(cb.AVERAGE_CARDS_PER_HAND))
+          assert math.isclose(x[0], expected_remaining / 416.0, rel_tol=0, abs_tol=1e-9)
+          assert math.isclose(x[1], 1.0 - x[0], rel_tol=0, abs_tol=1e-9)
+          assert math.isclose(x[3], len(hist) / 70.0, rel_tol=0, abs_tol=1e-9)
+          assert x[4:14] == [1.0] * 10
+          assert snap.metadata['remaining_cards_source'] == 'panel_history_round_estimate'
+          assert snap.metadata['soft_remaining_cards_ignored_for_panel_compatibility'] is True
+          assert snap.metadata['hazard_formula'] == 'panel_proxy'
+          assert snap.metadata['hsmm_formula'] == 'panel_proxy'
+
+          model = cb.ContextualLinUCB()
+          first = model.predict(history=hist, shoe_context={'decks':8}, scope_key='scope-a')
+          assert first['panel_bootstrap_applied'] is True
+          assert first['bootstrap_update']['bootstrap_rounds'] == len(hist)-1
+          assert first['effective_support'] > 0.0
+
+          repeat = model.predict(history=hist, shoe_context={'decks':8}, scope_key='scope-a')
+          assert repeat['panel_bootstrap_applied'] is False
+          assert repeat['feedback_update']['reason'] == 'no_new_resolved_round'
+
+          nxt = model.predict(history=hist+'B', shoe_context={'decks':8}, scope_key='scope-a')
+          assert nxt['panel_bootstrap_applied'] is False
+          assert nxt['feedback_update']['updated'] is True
+          assert nxt['feedback_update']['history_aligned'] is True
+
+          # History-only cold tie break: same one-round history, different scope keys.
+          left = model.predict(history='B', shoe_context={'decks':8}, scope_key='cold-left')
+          right = model.predict(history='B', shoe_context={'decks':8}, scope_key='cold-right')
+          assert left['direction'] == right['direction']
+          assert left['selection_reason'] == 'tie_deterministic_history_hash'
+          assert right['selection_reason'] == 'tie_deterministic_history_hash'
+
+          print('panel-compatible 32D V8 validation OK')
+          PY
