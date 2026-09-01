@@ -7,8 +7,7 @@ services:
     startCommand: uvicorn runtime_app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     # Production follows main automatically. Single-Brain LinUCB V5 is the
-    # active decision core. The two mobile ROI values below are late fallbacks
-    # used only after the existing venue/profile detectors fail quality gates.
+    # active decision core; OCR / screenshot recognition remain unchanged.
     autoDeploy: true
     disk:
       name: bgs-runtime-data
@@ -18,17 +17,13 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.11
       - key: BGS_BUILD_LABEL
-        value: linucb-single-brain-v5-road-v11-8-mobile-grid120
+        value: linucb-single-brain-v5
       - key: BGS_TARGET_HANDS_MIN
         value: "50"
       - key: BGS_TARGET_HANDS_MAX
         value: "70"
       - key: BGS_CUT_CARD_REMAINING
         value: "70"
-      - key: MOBILE_FULLSCREEN_COMPACT_ROI
-        value: "0.305,0.730,0.650,0.094"
-      - key: MOBILE_FULLSCREEN_WIDE_ROI
-        value: "0.295,0.727,0.665,0.098"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
