@@ -24,7 +24,7 @@ from contextual_bandit import (
 )
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "LINUCB-32D-BBB-WEB-PARITY-V10"
+POLICY_VERSION = "LINUCB-256D-BBB-WEB-PARITY-V11"
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 24
 MARKOV_MAX_ORDER = 1
@@ -150,7 +150,7 @@ def linucb_policy(history: str | Iterable[Any] | None, *, shoe_context: Mapping[
         "direction": direction, "selected_arm": direction, "action": direction, "action_text": "莊" if direction == "B" else "閒", "latent_direction": direction,
         "confidence_prob": confidence, "margin": abs(float(probabilities.get("B", 0.5)) - float(probabilities.get("P", 0.5))),
         "regression_analysis": regression_analysis_model(history), "penalty_observe": {"active": False, "force_observe": False, "observe_remaining": 0},
-        "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]), "state_key": "LINUCB_SINGLE_BRAIN_V5",
+        "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]), "state_key": "LINUCB_SINGLE_BRAIN_256D_V11",
         "policy_source": "contextual_linucb", "formal_direction_source": "contextual_linucb", "diagnostic_only": False, "formal_direction_weight": 1.0,
         "linucb_direction_weight": 1.0, "road_pattern_direction_weight": 0.0, "road_forecaster_direction_weight": 0.0,
         "derived_road_direction_weight": 0.0, "geometry_direction_weight": 0.0, "anti_echo_direction_weight": 0.0,
