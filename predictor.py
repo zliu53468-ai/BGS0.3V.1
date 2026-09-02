@@ -1,8 +1,9 @@
 """BGS production predictor: Single-Brain Contextual LinUCB B/P core.
 
 Formal direction, probability and confidence are produced only by the two-arm
-Contextual LinUCB policy. Shoe composition, HSMM regime, run-length hazard and
-derived-road structure enter only through the fixed 16-D context vector.
+Contextual LinUCB policy. Shoe progression, HSMM regime, run-length hazard and
+derived-road structure enter only through the fixed 256-D context vector
+(128D shoe/progression + 128D road/structure).
 Legacy road/Markov/geometry diagnostics remain outward-compatible at zero
 formal direction weight. OCR and screenshot recognition are untouched.
 """
@@ -120,8 +121,8 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
 
     result: Dict[str, Any] = {
         "ok": True, "engine": "CONTEXTUAL_LINUCB_SINGLE_BRAIN_BP", "model_version": POLICY_VERSION, "system_model_version": POLICY_VERSION,
-        "shoe_posterior_model_version": "SHOE_FEATURE_PROVIDER_V5", "model_variant": "LINUCB_SINGLE_BRAIN_16D_50_70_KELLY_5_30", "model_core": "contextual_linucb", "primary_model": "CONTEXTUAL_LINUCB",
-        "decision_pipeline": "16d_context_to_two_arm_linucb_ucb_argmax_to_kelly", "prediction_fingerprint": fingerprint, "probabilities": probabilities, "raw_direction_probabilities": dict(raw_probabilities),
+        "shoe_posterior_model_version": "SHOE_FEATURE_PROVIDER_V5", "model_variant": "LINUCB_SINGLE_BRAIN_256D_128SHOE_128ROAD_50_70_KELLY_5_30", "model_core": "contextual_linucb", "primary_model": "CONTEXTUAL_LINUCB",
+        "decision_pipeline": "256d_context_128shoe_128road_to_two_arm_linucb_ucb_argmax_to_kelly", "prediction_fingerprint": fingerprint, "probabilities": probabilities, "raw_direction_probabilities": dict(raw_probabilities),
         "banker_rate": round(p_b * 100.0, 2), "player_rate": round(p_p * 100.0, 2), "tie_rate": 0.0,
         "recommend": direction, "recommend_text": text, "action": direction, "action_text": text, "internal_recommend": direction, "internal_action": direction,
         "next_round_direction": direction, "next_round_direction_text": text, "direction": direction, "direction_text": text, "adaptive_only_direction": direction,
@@ -174,7 +175,7 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     prediction = predict(history=deepcopy(history), venue=str(isolated_session.get("venue") or ""), room=str(isolated_session.get("room") or ""), shoe_id=str(isolated_session.get("shoe_id") or ""), user_id=str(isolated_session.get("user_id") or ""), run_seed=seed, shoe_context={"bankroll": float(isolated_session.get("bankroll", 0.0) or 0.0), "remaining_cards": len(hidden_shoe), "remaining_counts": counts_from_shoe(hidden_shoe), "remaining_cards_reliability": 1.0, "remaining_cards_source": "virtual_shoe_exact_counts_feature", "source": "remaining_counts", "cut_card_remaining_cards": float(isolated_session.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING) or DEFAULT_CUT_CARD_REMAINING)})
     hand, remaining_shoe = deal_ordered_hand(hidden_shoe); hand_data = hand.as_dict(); predicted = str(prediction.get("action") or "B").upper(); actual = str(hand.outcome or "").upper(); verdict = "TIE_SKIPPED" if actual == "T" else ("HIT" if predicted == actual else "MISS")
     update = {"updated": False, "reason": "web_panel_direct_no_feedback_update", "formal_model": "contextual_linucb"}
-    prediction.update({"ok": True, "mode": "virtual_shoe_contextual_linucb_single_brain", "virtual_hand": hand_data, "virtual_outcome": actual, "virtual_outcome_text": hand_data["outcome_text"], "verdict": verdict, "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict], "cards_consumed": int(hand.cards_used), "remaining_cards_after": len(remaining_shoe), "remaining_counts_after": counts_from_shoe(remaining_shoe), "round_number": int(isolated_session.get("hand_number", 0) or 0) + 1, "bandit_learning_applied": False, "bandit_update": update, "disclaimer": "正式方向由 BBB Frozen Direct 32D Contextual LinUCB 的兩臂 UCB Score 單獨產生；正式流程不 bootstrap、不自動更新 A/b。"})
+    prediction.update({"ok": True, "mode": "virtual_shoe_contextual_linucb_single_brain", "virtual_hand": hand_data, "virtual_outcome": actual, "virtual_outcome_text": hand_data["outcome_text"], "verdict": verdict, "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict], "cards_consumed": int(hand.cards_used), "remaining_cards_after": len(remaining_shoe), "remaining_counts_after": counts_from_shoe(remaining_shoe), "round_number": int(isolated_session.get("hand_number", 0) or 0) + 1, "bandit_learning_applied": False, "bandit_update": update, "disclaimer": "正式方向由 BBB Frozen Direct 256D（128D牌靴＋128D牌路）Contextual LinUCB 的兩臂 UCB Score 單獨產生；正式流程不 bootstrap、不 Walk-forward、不 replay、不結算上一筆、不更新 A/b、不 decay。"})
     return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
 
