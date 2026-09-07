@@ -22,9 +22,10 @@ from contextual_bandit import (
     predict_bandit,
     update_bandit,
 )
+from bbb_v23_hazard import predict_v23_bandit
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "LINUCB-256D-BBB-WEB-PARITY-V11"
+POLICY_VERSION = "LINUCB-256D-BBB-V23-SHORT-X-DYNAMIC-PARITY"
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 24
 MARKOV_MAX_ORDER = 1
@@ -140,7 +141,7 @@ def _road_pattern_diagnostic(history: str | Iterable[Any] | None) -> dict[str, A
 
 def linucb_policy(history: str | Iterable[Any] | None, *, shoe_context: Mapping[str, Any] | None = None, user_id: str = "", venue: str = "", room: str = "", shoe_id: str = "") -> dict[str, Any]:
     scope_key = make_scope_key(user_id=user_id, venue=venue, room=room, shoe_id=shoe_id)
-    result = predict_bandit(history=history, shoe_context=dict(shoe_context or {}), scope_key=scope_key)
+    result = predict_v23_bandit(history=history, shoe_context=dict(shoe_context or {}), scope_key=scope_key)
     direction = str(result.get("direction") or "B").upper().strip()
     if direction not in OUTCOMES:
         direction = "B"
@@ -150,7 +151,7 @@ def linucb_policy(history: str | Iterable[Any] | None, *, shoe_context: Mapping[
         "direction": direction, "selected_arm": direction, "action": direction, "action_text": "莊" if direction == "B" else "閒", "latent_direction": direction,
         "confidence_prob": confidence, "margin": abs(float(probabilities.get("B", 0.5)) - float(probabilities.get("P", 0.5))),
         "regression_analysis": regression_analysis_model(history), "penalty_observe": {"active": False, "force_observe": False, "observe_remaining": 0},
-        "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]), "state_key": "LINUCB_SINGLE_BRAIN_256D_V11",
+        "big_road_sequence": "".join(normalize_big_road(history)[-WINDOW_SIZE:]), "state_key": "LINUCB_SINGLE_BRAIN_256D_V23_SHORT_X_DYNAMIC",
         "policy_source": "contextual_linucb", "formal_direction_source": "contextual_linucb", "diagnostic_only": False, "formal_direction_weight": 1.0,
         "linucb_direction_weight": 1.0, "road_pattern_direction_weight": 0.0, "road_forecaster_direction_weight": 0.0,
         "derived_road_direction_weight": 0.0, "geometry_direction_weight": 0.0, "anti_echo_direction_weight": 0.0,
