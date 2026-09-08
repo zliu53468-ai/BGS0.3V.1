@@ -52,10 +52,7 @@ def __getattr__(name: str) -> Any:
     return getattr(_core, name)
 
 
-__all__ = list(getattr(_core, "__all__", []))
-if "predict_v23_bandit" not in __all__:
-    __all__.append("predict_v23_bandit")
-if "VERSION" not in __all__:
-    __all__.append("VERSION")
-if "GAP_SCALE" not in __all__:
-    __all__.append("GAP_SCALE")
+__all__ = [name for name in dir(_core) if not name.startswith("_")]
+for _name in ("predict_v23_bandit", "VERSION", "GAP_SCALE"):
+    if _name not in __all__:
+        __all__.append(_name)
