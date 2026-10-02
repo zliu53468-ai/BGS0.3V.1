@@ -19,6 +19,6 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install "numpy>=1.26,<2.4"
       - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py screen_pipeline.py road_detector.py road_detector_mt_ofalive_profile.py baccarat_vision.py room_ocr.py
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
