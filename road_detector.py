@@ -1539,7 +1539,7 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
     # 這可保留被截掉最後邊界線的容錯，同時排除 Safari/Chrome/Dream
     # 畫面右側的純白餘邊。
     if (
-        0.55 * pitch_x <= right_remainder <= 1.35 * pitch_x
+        0.55 * pitch_x <= right_remainder <= 1.85 * pitch_x
         and grid_columns < ROAD_GENERIC_AUTO_COL_MAX
     ):
         extra_x1 = max(0, min(width - 1, int(round(float(best_run["x_last"])))))
