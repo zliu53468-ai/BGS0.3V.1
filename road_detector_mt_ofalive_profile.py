@@ -86,7 +86,12 @@ def _try_mt_ofalive99(
             )
             current = dict(current)
             candidates.append(current)
-            if not _base._acceptable(current):
+            effective = dict(current.get("effective_grid") or {})
+            if not (
+                _base._strong_acceptable(current)
+                and int(current.get("recognized_count", 0) or 0) >= 12
+                and float(effective.get("score", 0.0) or 0.0) >= 0.58
+            ):
                 continue
 
             result = dict(current)
