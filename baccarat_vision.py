@@ -39,14 +39,14 @@ ADAPTIVE_BLOCK_SIZE = _env_int("VISION_ADAPTIVE_BLOCK_SIZE", 31, 11, 101)
 if ADAPTIVE_BLOCK_SIZE % 2 == 0:
     ADAPTIVE_BLOCK_SIZE += 1
 ADAPTIVE_C = _env_int("VISION_ADAPTIVE_C", 7, -30, 30)
-MIN_CIRCLE_AREA = _env_float("VISION_MIN_CIRCLE_AREA", 24.0, 4.0, 5000.0)
+MIN_CIRCLE_AREA = _env_float("VISION_MIN_CIRCLE_AREA", 16.0, 4.0, 5000.0)
 MAX_CIRCLE_AREA_RATIO = _env_float("VISION_MAX_CIRCLE_AREA_RATIO", 0.025, 0.001, 0.20)
-MIN_CIRCULARITY = _env_float("VISION_MIN_CIRCULARITY", 0.30, 0.05, 0.95)
-MIN_SATURATION = _env_float("VISION_MIN_SATURATION", 34.0, 0.0, 255.0)
+MIN_CIRCULARITY = _env_float("VISION_MIN_CIRCULARITY", 0.24, 0.05, 0.95)
+MIN_SATURATION = _env_float("VISION_MIN_SATURATION", 28.0, 0.0, 255.0)
 CENTER_PATCH_RADIUS = _env_int("VISION_CENTER_PATCH_RADIUS", 2, 1, 8)
 RING_INNER_RATIO = _env_float("VISION_RING_INNER_RATIO", 0.22, 0.08, 0.42)
 RING_OUTER_RATIO = _env_float("VISION_RING_OUTER_RATIO", 0.52, 0.30, 0.78)
-RING_MIN_COLOR_RATIO = _env_float("VISION_RING_MIN_COLOR_RATIO", 0.10, 0.02, 0.60)
+RING_MIN_COLOR_RATIO = _env_float("VISION_RING_MIN_COLOR_RATIO", 0.065, 0.02, 0.60)
 COLUMN_TOLERANCE_RATIO = _env_float("VISION_COLUMN_TOLERANCE_RATIO", 0.62, 0.25, 1.50)
 MAX_UNKNOWN_RATIO = _env_float("VISION_MAX_UNKNOWN_RATIO", 0.18, 0.0, 0.80)
 MIN_RECOGNIZED_FOR_PREDICTION = _env_int("VISION_MIN_RECOGNIZED", 8, 1, 200)
@@ -346,10 +346,10 @@ def _geometry_candidates(image: np.ndarray, contour_map: np.ndarray) -> List[Cir
         if area < MIN_CIRCLE_AREA or area > max_area:
             continue
         x, y, width, height = cv2.boundingRect(contour)
-        if width < 6 or height < 6:
+        if width < 5 or height < 5:
             continue
         aspect_ratio = width / float(max(1, height))
-        if not 0.76 <= aspect_ratio <= 1.28:
+        if not 0.70 <= aspect_ratio <= 1.38:
             continue
         perimeter = float(cv2.arcLength(contour, True))
         if perimeter <= 0:
@@ -358,7 +358,7 @@ def _geometry_candidates(image: np.ndarray, contour_map: np.ndarray) -> List[Cir
         if circularity < MIN_CIRCULARITY:
             continue
         fill_ratio = area / float(max(1, width * height))
-        if not 0.08 <= fill_ratio <= 0.96:
+        if not 0.04 <= fill_ratio <= 0.96:
             continue
         candidates.append(CircleCandidate(
             x=int(x + width / 2), y=int(y + height / 2), width=int(width), height=int(height),
