@@ -964,6 +964,8 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
     image_lock = _user_image_lock(user_id)
     image_lock_acquired = False
     prediction_slot_acquired = False
+    queue_wait_ms = 0.0
+    stage = "init"
     try:
         _raise_if_image_timed_out(cancel_event, deadline)
         lock_wait = min(1.0, _remaining_image_time(deadline))
