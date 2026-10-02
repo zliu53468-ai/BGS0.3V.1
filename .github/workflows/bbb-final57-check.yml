@@ -17,8 +17,50 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
-      - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
+      - name: Syntax check prediction and DB/DG vision
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py road_detector.py screen_pipeline.py baccarat_vision.py road_detector_mt_ofalive_profile.py
+      - name: DB and DG content-locator smoke tests
+        run: |
+          python - <<'PY'
+          import cv2, numpy as np
+          import road_detector as rd
+
+          # DG：全畫面底部白色路紙，左珠盤、右上大路、右下下三路。
+          dg = np.full((1280, 590, 3), 28, np.uint8)
+          py, ph = 900, 250
+          cv2.rectangle(dg, (0, py), (589, py+ph), (245,245,243), -1)
+          x1, y1, rw, rh = 190, py+4, 380, 122
+          rows, cols = 6, 18
+          cw, ch = rw/cols, rh/rows
+          for r in range(rows+1):
+              y=int(round(y1+r*ch)); cv2.line(dg,(x1,y),(x1+rw,y),(188,188,188),1)
+          for c in range(cols+1):
+              x=int(round(x1+c*cw)); cv2.line(dg,(x,y1),(x,y1+rh),(188,188,188),1)
+          seq=[(0,0,'B'),(0,1,'B'),(1,0,'P'),(2,0,'B'),(3,0,'P'),(4,0,'B'),(4,1,'B'),(5,0,'P')]
+          for c,r,o in seq:
+              cx=int(round(x1+(c+.5)*cw)); cy=int(round(y1+(r+.5)*ch))
+              color=(30,30,220) if o=='B' else (220,90,35)
+              cv2.circle(dg,(cx,cy),7,color,2,cv2.LINE_AA)
+          dg_candidates=rd._dg_white_grid_feature_candidates(dg)
+          assert dg_candidates, "DG locator found no candidate"
+          assert dg_candidates[0][0][1] > 0.65, dg_candidates[0]
+
+          # DB：深色路紙，只靠紅藍空心圓 lattice。
+          db = np.full((1280, 590, 3), (54,47,58), np.uint8)
+          x1, y1, rw, rh = 215, 975, 370, 88
+          pitch_x, pitch_y = 22, 13
+          seq=[(0,0,'B'),(0,1,'P'),(1,0,'B'),(1,1,'P'),(2,0,'B'),(3,0,'P'),(4,0,'B'),(5,0,'P'),(6,0,'B')]
+          for c,r,o in seq:
+              cx=int(round(x1+10+c*pitch_x)); cy=int(round(y1+9+r*pitch_y))
+              color=(25,35,225) if o=='B' else (225,95,35)
+              cv2.circle(db,(cx,cy),7,color,2,cv2.LINE_AA)
+          db_candidates=rd._db_dark_ring_feature_candidates(db)
+          assert db_candidates, "DB locator found no candidate"
+          assert db_candidates[0][0][1] > 0.70, db_candidates[0]
+
+          print("DG", dg_candidates[0])
+          print("DB", db_candidates[0])
+          PY
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
