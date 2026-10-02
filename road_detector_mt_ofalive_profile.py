@@ -140,6 +140,8 @@ def detect_road_sequence_detailed(
         )
         if preferred is not None:
             return preferred
+    except TimeoutError:
+        raise
     except Exception:
         pass
 
