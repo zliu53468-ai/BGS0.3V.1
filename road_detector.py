@@ -92,7 +92,8 @@ MT_MOBILE_BIG_ROAD_ROI = _env_roi(
 )
 DB_MOBILE_BIG_ROAD_ROI = _env_roi(
     "DB_MOBILE_BIG_ROAD_ROI",
-    (0.350, 0.775, 0.650, 0.086),
+    # DB 深色手機版實圖校準；真正大路位於右側上層，避免把下三路一起裁入。
+    (0.360, 0.755, 0.640, 0.075),
 )
 
 # 橫向「珠盤路＋大路＋下三路」裁圖中的右上第一區塊。
@@ -119,7 +120,8 @@ DG_MOBILE_LOWER_FULL_VIEW_ROI = _env_roi(
 )
 DG_MOBILE_LOWER_BROWSER_VIEW_ROI = _env_roi(
     "DG_MOBILE_LOWER_BROWSER_VIEW_ROI",
-    (0.302, 0.720, 0.653, 0.104),
+    # DG Dream Gaming 實圖校準；只取白色面板上半部大路，不包含下三路。
+    (0.330, 0.730, 0.650, 0.092),
 )
 
 # Android Chrome（例如 ofalive99）直式全畫面：瀏覽器工具列與底部導覽列
@@ -189,6 +191,15 @@ MOBILE_PROFILE_MAX_CANDIDATES = _env_int(
     "MOBILE_PROFILE_MAX_CANDIDATES", 2, 1, 2
 )
 MOBILE_AUTO_FOCUS_ENABLED = os.getenv("MOBILE_AUTO_FOCUS_ENABLED", "1").strip() == "1"
+DG_DB_FEATURE_LOCATORS_ENABLED = (
+    os.getenv("DG_DB_FEATURE_LOCATORS_ENABLED", "1").strip() == "1"
+)
+DG_FEATURE_MAX_CANDIDATES = _env_int(
+    "DG_FEATURE_MAX_CANDIDATES", 2, 1, 3
+)
+DB_FEATURE_MAX_CANDIDATES = _env_int(
+    "DB_FEATURE_MAX_CANDIDATES", 2, 1, 3
+)
 MOBILE_AUTO_FOCUS_MAX_CANDIDATES = _env_int(
     "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 3, 1, 4
 )
@@ -2581,6 +2592,291 @@ def _general_road_candidates(
         if not duplicate:
             selected.append((roi, score))
         if len(selected) >= MOBILE_AUTO_FOCUS_MAX_CANDIDATES:
+            break
+    return selected
+
+
+
+def _roi_iou(
+    first: Tuple[float, float, float, float],
+    second: Tuple[float, float, float, float],
+) -> float:
+    ax, ay, aw, ah = first
+    bx, by, bw, bh = second
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _dg_white_grid_feature_candidates(
+    image: np.ndarray,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
+) -> List[Tuple[Tuple[float, float, float, float], float]]:
+    """DG：先找白色路紙面板，再在面板上半部找 6 列大路。"""
+    _deadline_guard(deadline, cancel_event, min_remaining=0.25)
+    height, width = image.shape[:2]
+    scale = min(1.0, 720.0 / max(height, width))
+    preview = (
+        cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        if scale < 0.999
+        else image
+    )
+    ph, pw = preview.shape[:2]
+    pixels = preview.astype(np.int16, copy=False)
+    channel_min = np.min(pixels, axis=2)
+    channel_span = np.max(pixels, axis=2) - channel_min
+    white = ((channel_min >= 168) & (channel_span <= 88)).astype(np.uint8) * 255
+    white[: int(ph * 0.48), :] = 0
+    white = cv2.morphologyEx(
+        white,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(7, int(round(pw * 0.018))), max(3, int(round(ph * 0.006)))),
+        ),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
+    red_blue = (
+        (sat >= 18)
+        & (val >= 28)
+        & (
+            (hue <= 30)
+            | (hue >= 150)
+            | ((hue >= 82) & (hue <= 158))
+        )
+    )
+
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:12]:
+        _deadline_guard(deadline, cancel_event, min_remaining=0.12)
+        x, y, w, h = cv2.boundingRect(contour)
+        if (
+            w < pw * 0.55
+            or h < ph * 0.055
+            or y < ph * 0.50
+            or (w * h) < ph * pw * 0.025
+        ):
+            continue
+
+        # 大路固定在路紙上半部且位於珠盤路右側；用面板自身比例而非手機座標。
+        for x_fraction, width_fraction in ((0.28, 0.70), (0.32, 0.66), (0.24, 0.74)):
+            for height_fraction in (0.42, 0.50, 0.58):
+                rx1 = max(0, int(round(x + w * x_fraction)))
+                rx2 = min(pw, int(round(x + w * min(0.995, x_fraction + width_fraction))))
+                ry1 = max(0, y)
+                ry2 = min(ph, int(round(y + h * height_fraction)))
+                if rx2 - rx1 < 80 or ry2 - ry1 < 28:
+                    continue
+                crop = preview[ry1:ry2, rx1:rx2]
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                periodicity = _grid_periodicity_score(gray)
+                color_fraction = float(np.mean(red_blue[ry1:ry2, rx1:rx2]))
+                sample = pixels[ry1:ry2, rx1:rx2]
+                neutral_fraction = float(
+                    np.mean(
+                        (np.min(sample, axis=2) >= 155)
+                        & ((np.max(sample, axis=2) - np.min(sample, axis=2)) <= 95)
+                    )
+                )
+                aspect = (rx2 - rx1) / max(1.0, float(ry2 - ry1))
+                if (
+                    periodicity < 0.24
+                    or color_fraction < 0.0010
+                    or neutral_fraction < 0.48
+                    or aspect < 2.2
+                ):
+                    continue
+                score = (
+                    3.2 * periodicity
+                    + 1.2 * min(1.0, color_fraction / 0.040)
+                    + 0.8 * neutral_fraction
+                    + 0.15 * min(1.0, aspect / 4.5)
+                )
+                scored.append(
+                    (
+                        (
+                            rx1 / float(pw),
+                            ry1 / float(ph),
+                            (rx2 - rx1) / float(pw),
+                            (ry2 - ry1) / float(ph),
+                        ),
+                        score,
+                    )
+                )
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for roi, score in scored:
+        if any(_roi_iou(roi, prior) >= 0.68 for prior, _ in selected):
+            continue
+        selected.append((roi, score))
+        if len(selected) >= DG_FEATURE_MAX_CANDIDATES:
+            break
+    return selected
+
+
+def _db_dark_ring_feature_candidates(
+    image: np.ndarray,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
+) -> List[Tuple[Tuple[float, float, float, float], float]]:
+    """DB：直接在下半畫面找紅藍空心圓 lattice，不依賴白色格線。"""
+    _deadline_guard(deadline, cancel_event, min_remaining=0.30)
+    height, width = image.shape[:2]
+    scale = min(1.0, 720.0 / max(height, width))
+    preview = (
+        cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        if scale < 0.999
+        else image
+    )
+    ph, pw = preview.shape[:2]
+    search_y1 = int(round(ph * 0.58))
+    search_y2 = int(round(ph * 0.93))
+    zone = preview[search_y1:search_y2]
+    if zone.size == 0:
+        return []
+
+    gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    max_radius = max(8, int(round(pw * 0.028)))
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=max(5.0, pw * 0.010),
+        param1=90,
+        param2=10,
+        minRadius=2,
+        maxRadius=max_radius,
+    )
+    if circles is None:
+        return []
+
+    hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
+    red = (
+        (sat >= 18)
+        & (val >= 24)
+        & ((hue <= 30) | (hue >= 150))
+    )
+    blue = (
+        (sat >= 18)
+        & (val >= 24)
+        & (hue >= 82)
+        & (hue <= 158)
+    )
+    yy, xx = np.ogrid[:ph, :pw]
+    colored: List[Tuple[float, float, float]] = []
+    for index, raw in enumerate(np.round(circles[0]).astype(int)):
+        if (index & 15) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.12)
+        cx, local_y, radius = [int(value) for value in raw]
+        cy = local_y + search_y1
+        if cx < pw * 0.20 or cy < ph * 0.62:
+            continue
+        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        annulus = (
+            (d2 <= float(radius + 2) ** 2)
+            & (d2 >= float(max(1, radius - 3)) ** 2)
+        )
+        red_pixels = int(np.count_nonzero(red[annulus]))
+        blue_pixels = int(np.count_nonzero(blue[annulus]))
+        dominant = max(red_pixels, blue_pixels)
+        secondary = min(red_pixels, blue_pixels)
+        if dominant < max(4, int(round(radius * 1.2))):
+            continue
+        if dominant / max(1.0, float(secondary)) < 1.10:
+            continue
+        colored.append((float(cx), float(cy), float(radius)))
+
+    if len(colored) < 5:
+        return []
+
+    radii = [item[2] for item in colored]
+    median_radius = max(2.5, float(np.median(np.asarray(radii, dtype=np.float64))))
+    # DB 大路的 row pitch 約為直徑的 1.5~2.2 倍；掃少量候選避免固定手機比例。
+    pitch_guesses = (
+        median_radius * 2.0,
+        median_radius * 2.4,
+        median_radius * 2.8,
+    )
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    y_values = sorted({int(round(item[1])) for item in colored})
+    for pitch in pitch_guesses:
+        road_height = max(28.0, pitch * 6.35)
+        for seed_y in y_values:
+            for row_offset in (0, 1, 2):
+                top = seed_y - row_offset * pitch - 0.55 * pitch
+                bottom = top + road_height
+                members = [
+                    item
+                    for item in colored
+                    if top <= item[1] <= bottom
+                ]
+                if len(members) < 5:
+                    continue
+                xs = [item[0] for item in members]
+                span_x = max(xs) - min(xs)
+                if span_x < max(pw * 0.15, pitch * 4.0):
+                    continue
+                left = max(pw * 0.18, min(xs) - pitch * 1.4)
+                right = min(float(pw), max(pw * 0.88, max(xs) + pitch * 3.0))
+                top_clamped = max(0.0, top)
+                bottom_clamped = min(float(ph), bottom)
+                if bottom_clamped <= top_clamped:
+                    continue
+                crop_h = bottom_clamped - top_clamped
+                crop_w = right - left
+                if crop_w / max(1.0, crop_h) < 2.6:
+                    continue
+                # 深色底 + 水平延伸的彩色圓群，比珠盤路與下三路更符合大路。
+                roi_pixels = preview[
+                    int(top_clamped):int(bottom_clamped),
+                    int(left):int(right),
+                ]
+                hsv_roi = cv2.cvtColor(roi_pixels, cv2.COLOR_BGR2HSV)
+                dark_fraction = float(np.mean(hsv_roi[:, :, 2] <= 165))
+                score = (
+                    1.8 * min(1.0, len(members) / 16.0)
+                    + 1.0 * min(1.0, span_x / max(1.0, pw * 0.40))
+                    + 0.7 * dark_fraction
+                    - 0.20 * abs((crop_h / 6.0) - pitch) / max(1.0, pitch)
+                )
+                scored.append(
+                    (
+                        (
+                            left / float(pw),
+                            top_clamped / float(ph),
+                            crop_w / float(pw),
+                            crop_h / float(ph),
+                        ),
+                        score,
+                    )
+                )
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for roi, score in scored:
+        if any(_roi_iou(roi, prior) >= 0.65 for prior, _ in selected):
+            continue
+        selected.append((roi, score))
+        if len(selected) >= DB_FEATURE_MAX_CANDIDATES:
             break
     return selected
 
