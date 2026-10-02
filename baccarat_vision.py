@@ -50,6 +50,7 @@ RING_MIN_COLOR_RATIO = _env_float("VISION_RING_MIN_COLOR_RATIO", 0.10, 0.02, 0.6
 COLUMN_TOLERANCE_RATIO = _env_float("VISION_COLUMN_TOLERANCE_RATIO", 0.62, 0.25, 1.50)
 MAX_UNKNOWN_RATIO = _env_float("VISION_MAX_UNKNOWN_RATIO", 0.18, 0.0, 0.80)
 MIN_RECOGNIZED_FOR_PREDICTION = _env_int("VISION_MIN_RECOGNIZED", 8, 1, 200)
+ADAPTIVE_COLOR = os.getenv("VISION_ADAPTIVE_COLOR", "1").strip() == "1"
 
 
 @dataclass(frozen=True)
@@ -118,8 +119,76 @@ def _center_patch_hsv(hsv: np.ndarray, cx: int, cy: int) -> Tuple[float, float, 
     return _circular_hsv_mean(hsv[y1:y2, x1:x2])
 
 
-def _classify_local_color(hue: float, saturation: float, value: float) -> str:
-    if saturation < MIN_SATURATION or value < 30.0:
+def _hue_distance(value: float, center: float) -> float:
+    delta = abs(float(value) - float(center))
+    return min(delta, 180.0 - delta)
+
+
+def _adaptive_color_profile(hsv: np.ndarray) -> Dict[str, float]:
+    hue, saturation, value = cv2.split(hsv)
+    valid = (saturation >= 18) & (value >= 28)
+    red_seed = valid & ((hue <= 30) | (hue >= 150))
+    blue_seed = valid & (hue >= 68) & (hue <= 158)
+
+    red_hues = hue[red_seed].astype(np.float32)
+    if red_hues.size >= 8:
+        signed = np.where(red_hues > 90.0, red_hues - 180.0, red_hues)
+        center_signed = float(np.median(signed))
+        red_center = center_signed % 180.0
+        red_tol = float(np.clip(14.0 + np.median(np.abs(signed - center_signed)) * 2.2, 16.0, 34.0))
+        red_s = float(np.clip(np.percentile(saturation[red_seed], 18) * 0.58, 22.0, MIN_SATURATION))
+    else:
+        red_center, red_tol, red_s = 0.0, 20.0, MIN_SATURATION
+
+    blue_hues = hue[blue_seed].astype(np.float32)
+    if blue_hues.size >= 8:
+        blue_center = float(np.median(blue_hues))
+        blue_tol = float(np.clip(16.0 + np.median(np.abs(blue_hues - blue_center)) * 2.0, 18.0, 38.0))
+        blue_s = float(np.clip(np.percentile(saturation[blue_seed], 18) * 0.58, 20.0, MIN_SATURATION))
+    else:
+        blue_center, blue_tol, blue_s = 112.0, 30.0, MIN_SATURATION
+
+    return {
+        "red_center": red_center,
+        "red_tol": red_tol,
+        "red_s": red_s,
+        "blue_center": blue_center,
+        "blue_tol": blue_tol,
+        "blue_s": blue_s,
+    }
+
+
+def _classify_local_color(
+    hue: float,
+    saturation: float,
+    value: float,
+    profile: Dict[str, float] | None = None,
+) -> str:
+    if value < 28.0:
+        return ""
+    if profile:
+        red_ok = (
+            saturation >= profile["red_s"]
+            and _hue_distance(hue, profile["red_center"]) <= profile["red_tol"]
+        )
+        blue_ok = (
+            saturation >= profile["blue_s"]
+            and _hue_distance(hue, profile["blue_center"]) <= profile["blue_tol"]
+        )
+        if red_ok and not blue_ok:
+            return "B"
+        if blue_ok and not red_ok:
+            return "P"
+        if red_ok and blue_ok:
+            return (
+                "B"
+                if _hue_distance(hue, profile["red_center"])
+                <= _hue_distance(hue, profile["blue_center"])
+                else "P"
+            )
+        return ""
+
+    if saturation < MIN_SATURATION:
         return ""
     red_distance = min(abs(hue), abs(hue - 180.0))
     blue_distance = abs(hue - 110.0)
@@ -132,7 +201,11 @@ def _classify_local_color(hue: float, saturation: float, value: float) -> str:
     return ""
 
 
-def _ring_color_stats(hsv: np.ndarray, candidate: CircleCandidate) -> Tuple[str, float, float, float, float, float]:
+def _ring_color_stats(
+    hsv: np.ndarray,
+    candidate: CircleCandidate,
+    profile: Dict[str, float] | None = None,
+) -> Tuple[str, float, float, float, float, float]:
     """只讀取圓圈外框環形區域，適用紅／藍空心圓。"""
     height, width = hsv.shape[:2]
     radius = max(4.0, candidate.diameter / 2.0)
@@ -156,10 +229,22 @@ def _ring_color_stats(hsv: np.ndarray, candidate: CircleCandidate) -> Tuple[str,
     h = pixels[:, 0].astype(np.float64)
     s = pixels[:, 1].astype(np.float64)
     v = pixels[:, 2].astype(np.float64)
-    valid = (s >= MIN_SATURATION) & (v >= 30.0)
     denominator = max(1, int(np.count_nonzero(mask)))
-    red = valid & ((h <= 22.0) | (h >= 158.0))
-    blue = valid & (h >= 75.0) & (h <= 148.0)
+    if profile:
+        red = (
+            (s >= profile["red_s"])
+            & (v >= 28.0)
+            & (np.minimum(np.abs(h - profile["red_center"]), 180.0 - np.abs(h - profile["red_center"])) <= profile["red_tol"])
+        )
+        blue = (
+            (s >= profile["blue_s"])
+            & (v >= 28.0)
+            & (np.minimum(np.abs(h - profile["blue_center"]), 180.0 - np.abs(h - profile["blue_center"])) <= profile["blue_tol"])
+        )
+    else:
+        valid = (s >= MIN_SATURATION) & (v >= 30.0)
+        red = valid & ((h <= 22.0) | (h >= 158.0))
+        blue = valid & (h >= 75.0) & (h <= 148.0)
     red_ratio = float(np.count_nonzero(red)) / denominator
     blue_ratio = float(np.count_nonzero(blue)) / denominator
 
@@ -466,15 +551,16 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
     raw_candidates = _geometry_candidates(image, contour_map)
     unique_candidates = _deduplicate_candidates(raw_candidates)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    color_profile = _adaptive_color_profile(hsv) if ADAPTIVE_COLOR else None
 
     colored: List[CircleCandidate] = []
     unknown_candidates_raw: List[Tuple[CircleCandidate, float, float, float]] = []
     for candidate in unique_candidates:
-        outcome, red_ratio, blue_ratio, hue, saturation, value = _ring_color_stats(hsv, candidate)
+        outcome, red_ratio, blue_ratio, hue, saturation, value = _ring_color_stats(hsv, candidate, color_profile)
         method = "ring_hsv"
         if not outcome:
             hue, saturation, value = _center_patch_hsv(hsv, candidate.x, candidate.y)
-            outcome = _classify_local_color(hue, saturation, value)
+            outcome = _classify_local_color(hue, saturation, value, color_profile)
             method = "center_hsv_fallback" if outcome else "unknown"
         if not outcome:
             unknown_candidates_raw.append((candidate, float(red_ratio), float(blue_ratio), float(saturation)))
