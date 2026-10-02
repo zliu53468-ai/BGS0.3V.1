@@ -2954,10 +2954,17 @@ def _dg_white_grid_feature_candidates(
                     periodicity = _grid_periodicity_score(roi_gray)
                     if periodicity < 0.18:
                         continue
+                    split_y = ry1 + max(1, int(round((ry2 - ry1) * 0.68)))
+                    upper_color_fraction = _rect_mean(
+                        color_integral, rx1, ry1, rx2, min(ry2, split_y)
+                    )
+                    width_score = min(1.0, (rx2 - rx1) / max(1.0, pw * 0.64))
                     score = (
                         3.4 * periodicity
-                        + 1.45 * min(1.0, color_fraction / 0.035)
+                        + 1.30 * min(1.0, color_fraction / 0.035)
                         + 0.72 * white_fraction
+                        + 0.42 * min(1.0, upper_color_fraction / 0.28)
+                        + 0.28 * width_score
                         + 0.08 * min(1.0, source_score)
                     )
                     scored.append(
@@ -3040,19 +3047,22 @@ def _db_dark_ring_feature_candidates(
     ph, pw = preview.shape[:2]
     hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
     hue, sat, val = cv2.split(hsv)
+    # DB 路紙背景很暗，低彩度像素的 hue 不可靠；粗搜尋只看高彩度真紅/真藍。
     red = (
-        (sat >= 16)
-        & (val >= 22)
-        & ((hue <= 32) | (hue >= 148))
+        (sat >= 52)
+        & (val >= 30)
+        & ((hue <= 28) | (hue >= 152))
     )
     blue = (
-        (sat >= 16)
-        & (val >= 22)
-        & (hue >= 80)
-        & (hue <= 160)
+        (sat >= 52)
+        & (val >= 30)
+        & (hue >= 86)
+        & (hue <= 154)
     )
     color_union = (red | blue).astype(np.uint8)
-    dark_neutral = ((val <= 180) & (sat <= 135)).astype(np.uint8)
+    dark_neutral = ((val <= 188) & (sat <= 120)).astype(np.uint8)
+    red_integral = cv2.integral(red.astype(np.uint8), sdepth=cv2.CV_32S)
+    blue_integral = cv2.integral(blue.astype(np.uint8), sdepth=cv2.CV_32S)
     color_integral = cv2.integral(color_union, sdepth=cv2.CV_32S)
     dark_integral = cv2.integral(dark_neutral, sdepth=cv2.CV_32S)
 
@@ -3077,14 +3087,24 @@ def _db_dark_ring_feature_candidates(
                     aspect = (x2 - x1) / max(1.0, float(y2 - y1))
                     if aspect < 2.35:
                         continue
+                    red_fraction = _rect_mean(red_integral, x1, y1, x2, y2)
+                    blue_fraction = _rect_mean(blue_integral, x1, y1, x2, y2)
                     color_fraction = _rect_mean(color_integral, x1, y1, x2, y2)
                     dark_fraction = _rect_mean(dark_integral, x1, y1, x2, y2)
-                    if color_fraction < 0.0014 or dark_fraction < 0.38:
+                    balanced_color = min(red_fraction, blue_fraction)
+                    # 必須同時有紅、藍；可排除 Safari/Chrome 藍色工具列與整片紅桌面 UI。
+                    if (
+                        red_fraction < 0.00045
+                        or blue_fraction < 0.00045
+                        or balanced_color < 0.00045
+                        or dark_fraction < 0.28
+                    ):
                         continue
                     score = (
-                        2.2 * min(1.0, color_fraction / 0.040)
-                        + 0.9 * dark_fraction
-                        + 0.12 * min(1.0, aspect / 5.0)
+                        2.5 * min(1.0, balanced_color / 0.025)
+                        + 0.75 * min(1.0, color_fraction / 0.055)
+                        + 0.72 * dark_fraction
+                        + 0.10 * min(1.0, aspect / 5.0)
                     )
                     coarse.append((score, (x1, y1, x2, y2)))
     coarse.sort(key=lambda item: item[0], reverse=True)
@@ -3106,15 +3126,17 @@ def _db_dark_ring_feature_candidates(
         gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         zone_h, zone_w = gray.shape[:2]
-        max_radius = max(7, int(round(min(zone_h, zone_w) * 0.16)))
+        expected_row_pitch = zone_h / float(ROAD_GRID_ROWS)
+        min_radius = max(2, int(round(expected_row_pitch * 0.20)))
+        max_radius = max(min_radius + 2, int(round(expected_row_pitch * 0.58)))
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1.0,
-            minDist=max(4.0, zone_h * 0.08),
+            minDist=max(4.0, expected_row_pitch * 0.48),
             param1=85,
             param2=9,
-            minRadius=2,
+            minRadius=min_radius,
             maxRadius=max_radius,
         )
         if circles is None:
@@ -3152,9 +3174,14 @@ def _db_dark_ring_feature_candidates(
                 # 排除投注區的大型彩色 UI；DB 路紙背景通常偏暗/低彩度。
                 if background_v > 205 and background_s > 120:
                     continue
-            colored.append((float(cx), float(cy), float(radius)))
+            outcome = "B" if red_pixels > blue_pixels else "P"
+            colored.append((float(cx), float(cy), float(radius), outcome))
 
         if len(colored) < 5:
+            continue
+        banker_count = sum(1 for item in colored if item[3] == "B")
+        player_count = sum(1 for item in colored if item[3] == "P")
+        if len(colored) >= 7 and (banker_count == 0 or player_count == 0):
             continue
 
         radii = np.asarray([item[2] for item in colored], dtype=np.float64)
@@ -3166,8 +3193,9 @@ def _db_dark_ring_feature_candidates(
         if len(radius_filtered) >= 5:
             colored = radius_filtered
 
-        pitch_y = _estimate_ring_pitch_free(colored, axis="y", median_radius=median_radius)
-        pitch_x = _estimate_ring_pitch_free(colored, axis="x", median_radius=median_radius)
+        pitch_items = [(item[0], item[1], item[2]) for item in colored]
+        pitch_y = _estimate_ring_pitch_free(pitch_items, axis="y", median_radius=median_radius)
+        pitch_x = _estimate_ring_pitch_free(pitch_items, axis="x", median_radius=median_radius)
         xs = [item[0] for item in colored]
         ys = [item[1] for item in colored]
         span_x = max(xs) - min(xs)
