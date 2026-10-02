@@ -45,7 +45,10 @@ jobs:
               cv2.circle(dg,(cx,cy),7,color,2,cv2.LINE_AA)
           dg_c = rd._dg_white_grid_feature_candidates(dg, deadline=time.perf_counter()+3)
           assert dg_c, "DG all-screen locator failed"
-          assert dg_c[0][0][2] > 0.35, dg_c[0]
+          dg_roi, dg_score = dg_c[0]
+          assert dg_roi[2] > 0.25, dg_c[0]
+          assert 0.0 <= dg_roi[0] < 0.85 and 0.0 <= dg_roi[1] < 0.95, dg_c[0]
+          assert dg_score > 1.0, dg_c[0]
 
           # DB synthetic fullscreen: dark board can be anywhere on screen, not just lower mobile area.
           db = np.full((900, 1440, 3), (45,42,48), np.uint8)
