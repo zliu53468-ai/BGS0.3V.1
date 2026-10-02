@@ -17,8 +17,60 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
-      - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
+      - name: Syntax check prediction and DG direct grid
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py road_detector.py
+
+      - name: DG obscured-top grid regression
+        run: |
+          python - <<'PY'
+          import cv2, numpy as np
+          import road_detector as rd
+
+          h, w = 176, 574
+          img = np.full((h, w, 3), 246, np.uint8)
+          rows, cols = 6, 20
+          pitch_x = w / cols
+          grid_h = 168
+          pitch_y = grid_h / rows
+
+          # 垂直格線完整；水平頂線故意不畫，模擬真實 DG 第一排圓環遮線。
+          for c in range(cols + 1):
+              x = int(round(c * pitch_x))
+              x = min(w - 1, x)
+              cv2.line(img, (x, 0), (x, grid_h), (190,190,190), 1)
+          for r in range(1, rows + 1):
+              y = int(round(r * pitch_y))
+              y = min(h - 1, y)
+              cv2.line(img, (0, y), (w - 1, y), (190,190,190), 1)
+
+          seq = [
+              (0,0,'P'),(1,0,'B'),(1,1,'B'),(2,0,'P'),
+              (3,0,'B'),(3,1,'B'),(3,2,'B'),(4,0,'P'),
+              (5,0,'B'),(6,0,'P'),(6,1,'P'),(7,0,'B'),
+              (8,0,'P'),(9,0,'B'),(10,0,'P'),(11,0,'B'),
+          ]
+          for c,r,o in seq:
+              cx=int(round((c+.5)*pitch_x)); cy=int(round((r+.5)*pitch_y))
+              color=(28,28,220) if o=='B' else (220,90,35)
+              cv2.circle(img,(cx,cy),8,color,2,cv2.LINE_AA)
+
+          bounds = rd._dg_line_grid_bounds(img)
+          assert bounds is not None, "DG line geometry not found"
+          assert bounds["grid_columns"] == 20, bounds
+          assert bounds["line_vertical_peaks"] >= 20, bounds
+          assert bounds["line_horizontal_peaks"] >= 5, bounds
+
+          result = rd._detect_fixed_grid(
+              img,
+              profile="dg_feature_white_grid",
+          )
+          print("bounds", bounds)
+          print("result", result["grid_columns"], result["recognized_count"], result["fallback_reason"], result["method"])
+          assert result["grid_columns"] == 20, result["column_candidates"]
+          assert result["reconstructed_all"] is True, result["fallback_reason"]
+          assert result["quality_ok"] is True, result["fallback_reason"]
+          assert result["method"] == "dg_direct_gridline_6xN_v1"
+          PY
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
