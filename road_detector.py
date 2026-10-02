@@ -1245,10 +1245,10 @@ def _nms_projection_peaks(
 
 
 def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
-    """直接由 DG 白色路紙的灰色格線推回 6 列與實際欄數。
+    """直接由 DG 白色路紙灰色格線推回 6 列與實際欄數。
 
-    這條路徑不靠 ROI 寬高比猜欄數。只在格線高度規則、x/y pitch
-    接近正方形且大部分預測邊界都有真實灰線時才啟用。
+    DG 的第一排圓環常遮住最上方水平線，因此水平軸允許頂線缺失；
+    垂直軸則取最長等距格線序列。只有格距一致且 x/y pitch 接近時才啟用。
     """
     if crop is None or crop.size == 0:
         return None
@@ -1312,124 +1312,130 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
     if square_score < 0.68:
         return None
 
-    column_norm = column_strength / max(
-        1.0,
-        float(np.percentile(column_strength, 95)),
-    )
-    row_norm = row_strength / max(
-        1.0,
-        float(np.percentile(row_strength, 95)),
-    )
+    # 垂直格線：找與 pitch_x 同相位的最大群組。
+    best_vertical: List[int] = []
+    best_vertical_error = float("inf")
+    for anchor in vertical_peaks:
+        matched: List[int] = []
+        errors: List[float] = []
+        for peak in vertical_peaks:
+            multiple = int(round((float(peak) - float(anchor)) / pitch_x))
+            predicted = float(anchor) + multiple * pitch_x
+            error = abs(float(peak) - predicted)
+            if error <= max(2.0, pitch_x * 0.16):
+                matched.append(int(peak))
+                errors.append(error)
+        mean_error = float(np.mean(errors)) if errors else float("inf")
+        if (
+            len(matched) > len(best_vertical)
+            or (
+                len(matched) == len(best_vertical)
+                and mean_error < best_vertical_error
+            )
+        ):
+            best_vertical = sorted(set(matched))
+            best_vertical_error = mean_error
 
-    def _local_strength(data: np.ndarray, position: float, radius: int = 2) -> float:
-        center = int(round(position))
-        left = max(0, center - radius)
-        right = min(data.size, center + radius + 1)
-        if right <= left:
-            return 0.0
-        return min(1.0, float(np.max(data[left:right])))
-
-    # x 軸：格線 crop 通常從第一個可見欄邊界附近開始。
-    x_candidates: List[Tuple[float, float, int, List[float]]] = []
-    for peak in vertical_peaks:
-        quotient = int(round(float(peak) / max(1.0, pitch_x)))
-        for k in (quotient - 1, quotient, quotient + 1):
-            x0 = float(peak) - float(k) * pitch_x
-            while x0 < 0.0:
-                x0 += pitch_x
-            while x0 >= pitch_x:
-                x0 -= pitch_x
-            columns = int(math.floor((width - x0 + pitch_x * 0.18) / pitch_x))
-            if not (ROAD_GRID_AUTO_COL_MIN <= columns <= ROAD_GENERIC_AUTO_COL_MAX):
-                continue
-            positions = [x0 + index * pitch_x for index in range(columns + 1)]
-            if positions[-1] > width + pitch_x * 0.25:
-                continue
-            strengths = [_local_strength(column_norm, pos) for pos in positions]
-            coverage = sum(value >= 0.52 for value in strengths) / max(1, len(strengths))
-            score = float(np.mean(strengths)) + 0.22 * coverage
-            x_candidates.append((score, x0, columns, strengths))
-    if not x_candidates:
+    if len(best_vertical) < 8:
         return None
-    x_score, x0, grid_columns, x_strengths = max(
-        x_candidates,
-        key=lambda item: item[0],
-    )
+    x0_raw = float(best_vertical[0])
+    x_last_raw = float(best_vertical[-1])
+    grid_columns = int(round((x_last_raw - x0_raw) / pitch_x))
+    if not (ROAD_GRID_AUTO_COL_MIN <= grid_columns <= ROAD_GENERIC_AUTO_COL_MAX):
+        return None
+    if grid_columns + 1 < len(best_vertical) - 1:
+        return None
 
-    # y 軸：頂線常被第一排圓環遮住，所以把每個強水平線映射到 0..6 任一邊界。
-    y_candidates: List[Tuple[float, float, List[float]]] = []
+    # 水平格線：將可見線映射到 0..6 邊界；頂線可在 crop 外約 1/3 格。
+    y_candidates: List[Tuple[int, float, float]] = []
     for peak in horizontal_peaks:
         for boundary_index in range(ROAD_GRID_ROWS + 1):
             y0 = float(peak) - boundary_index * pitch_y
-            if y0 < -pitch_y * 0.35:
+            if y0 < -pitch_y * 0.40:
                 continue
-            if y0 + ROAD_GRID_ROWS * pitch_y > height + pitch_y * 0.35:
+            if y0 + ROAD_GRID_ROWS * pitch_y > height + pitch_y * 0.40:
                 continue
-            y0 = min(
-                max(0.0, y0),
-                max(0.0, height - ROAD_GRID_ROWS * pitch_y),
-            )
-            positions = [
-                y0 + index * pitch_y
-                for index in range(ROAD_GRID_ROWS + 1)
-            ]
-            strengths = [_local_strength(row_norm, pos) for pos in positions]
-            # 頂線可被圓環遮住，因此用最佳 6 條 + 全體平均。
-            best_six = sorted(strengths, reverse=True)[:ROAD_GRID_ROWS]
-            coverage = sum(value >= 0.48 for value in strengths) / len(strengths)
-            score = float(np.mean(best_six)) + 0.14 * float(np.mean(strengths)) + 0.12 * coverage
-            y_candidates.append((score, y0, strengths))
+            matches = 0
+            total_error = 0.0
+            for other in horizontal_peaks:
+                nearest = int(round((float(other) - y0) / pitch_y))
+                if not (0 <= nearest <= ROAD_GRID_ROWS):
+                    continue
+                predicted = y0 + nearest * pitch_y
+                error = abs(float(other) - predicted)
+                if error <= max(2.0, pitch_y * 0.16):
+                    matches += 1
+                    total_error += error
+            mean_error = total_error / max(1, matches)
+            y_candidates.append((matches, -mean_error, y0))
     if not y_candidates:
         return None
-    y_score, y0, y_strengths = max(y_candidates, key=lambda item: item[0])
-
-    x_coverage = sum(value >= 0.52 for value in x_strengths) / max(1, len(x_strengths))
-    y_coverage = sum(value >= 0.48 for value in y_strengths) / max(1, len(y_strengths))
-    if x_coverage < 0.70 or y_coverage < 0.55:
+    matches_y, _, y0_raw = max(y_candidates, key=lambda item: (item[0], item[1]))
+    if matches_y < 4:
         return None
 
-    x2 = min(float(width), x0 + grid_columns * pitch_x)
-    y2 = min(float(height), y0 + ROAD_GRID_ROWS * pitch_y)
-    grid_width = max(1, int(round(x2 - x0)))
-    grid_height = max(1, int(round(y2 - y0)))
-    x1_i = max(0, min(width - 1, int(round(x0))))
-    y1_i = max(0, min(height - 1, int(round(y0))))
-    x2_i = max(x1_i + 1, min(width, x1_i + grid_width))
-    y2_i = max(y1_i + 1, min(height, y1_i + grid_height))
-    pitch_x_effective = (x2_i - x1_i) / max(1.0, float(grid_columns))
-    pitch_y_effective = (y2_i - y1_i) / float(ROAD_GRID_ROWS)
+    x1 = max(0, min(width - 1, int(round(x0_raw))))
+    x2 = max(
+        x1 + 1,
+        min(width, int(round(x0_raw + grid_columns * pitch_x))),
+    )
+    y1 = max(0, min(height - 1, int(round(y0_raw))))
+    y2 = max(
+        y1 + 1,
+        min(height, int(round(y0_raw + ROAD_GRID_ROWS * pitch_y))),
+    )
+
+    # 若頂線落在 crop 外，使用可見區 0 作為實際上界；底線仍由 6-row pitch 決定。
+    if y0_raw < 0.0:
+        y1 = 0
+    if y0_raw + ROAD_GRID_ROWS * pitch_y > height:
+        y2 = height
+
+    pitch_x_effective = (x2 - x1) / max(1.0, float(grid_columns))
+    pitch_y_effective = (y2 - y1) / float(ROAD_GRID_ROWS)
     square_effective = max(
         0.0,
         1.0 - abs(pitch_x_effective - pitch_y_effective)
         / max(1.0, pitch_x_effective, pitch_y_effective),
     )
-    line_score = float(
-        0.42 * min(1.0, x_score)
-        + 0.42 * min(1.0, y_score)
-        + 0.16 * square_effective
+
+    vertical_coverage = min(
+        1.0,
+        len(best_vertical) / max(1.0, float(grid_columns + 1)),
     )
-    coverage = float((x_coverage + y_coverage) / 2.0)
+    horizontal_coverage = min(
+        1.0,
+        matches_y / float(ROAD_GRID_ROWS + 1),
+    )
+    coverage = float((vertical_coverage + horizontal_coverage) / 2.0)
+    score = float(
+        0.40 * vertical_coverage
+        + 0.40 * horizontal_coverage
+        + 0.20 * square_effective
+    )
+    if vertical_coverage < 0.75 or horizontal_coverage < 0.55:
+        return None
 
     return {
-        "x": x1_i,
-        "y": y1_i,
-        "width": x2_i - x1_i,
-        "height": y2_i - y1_i,
-        "score": line_score,
+        "x": x1,
+        "y": y1,
+        "width": x2 - x1,
+        "height": y2 - y1,
+        "score": score,
         "coverage": coverage,
         "square_cell_score": float(square_effective),
         "cell_pitch_x": float(pitch_x_effective),
         "cell_pitch_y": float(pitch_y_effective),
-        "offset_x": x1_i,
-        "offset_y": y1_i,
-        "scale_x": (x2_i - x1_i) / max(1.0, float(width)),
-        "scale_y": (y2_i - y1_i) / max(1.0, float(height)),
+        "offset_x": x1,
+        "offset_y": y1,
+        "scale_x": (x2 - x1) / max(1.0, float(width)),
+        "scale_y": (y2 - y1) / max(1.0, float(height)),
         "gain_x": 0.0,
         "gain_y": 0.0,
         "grid_columns": int(grid_columns),
         "line_grid": True,
-        "line_x_coverage": round(float(x_coverage), 6),
-        "line_y_coverage": round(float(y_coverage), 6),
+        "line_vertical_peaks": int(len(best_vertical)),
+        "line_horizontal_peaks": int(matches_y),
         "line_pitch_x": round(float(pitch_x), 6),
         "line_pitch_y": round(float(pitch_y), 6),
     }
