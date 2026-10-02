@@ -159,6 +159,8 @@ def analyze_game_screen(
         if not isinstance(road, Mapping):
             raise TypeError("road_detector 回傳值不是 Mapping")
         road = dict(road)
+    except TimeoutError:
+        raise
     except Exception as exc:
         road_error = str(exc)
         road = {
