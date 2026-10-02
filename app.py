@@ -431,7 +431,7 @@ def _attach_bankroll_advice(prediction: Mapping[str, Any], session: Mapping[str,
         "bet_amount": amount,
         "bet_percentage": fraction * 100.0,
         "kelly_percentage_applied": fraction * 100.0,
-        "bet_level_text": "Single-Brain Kelly 5%～30%",
+        "bet_level_text": "5%～30%",
         "bet_reason": str(result.get("signal_reason") or "Contextual LinUCB 正式方向與 Kelly 配置"),
         "screen_edge": round(float(result.get("direction_edge", 0.0) or 0.0), 6),
     })
