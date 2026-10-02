@@ -673,12 +673,17 @@ def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
 
 def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     del user_id
-    return _clean_flex({"type": "flex", "altText": "上傳牌局畫面", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
-        {"type": "text", "text": "建立牌局資料", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本金：{_format_money(session.get('bankroll', 0))} 元\n\n請開始上傳最新完整遊戲畫面進行分析。建議保留完整大路區域，避免裁掉左上起始格與六列格線。", "wrap": True, "margin": "md", "color": "#4C3900"},
+    return _yellow_white_panel("建立牌局資料", "上傳牌局畫面", [
+        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本金：{_format_money(session.get('bankroll', 0))} 元", "wrap": True, "color": "#272727"},
+        {"type": "separator", "margin": "md", "color": "#F1B900"},
+        {"type": "text", "text": "請開始上傳最新完整遊戲畫面進行分析。建議保留完整大路區域，避免裁掉左上起始格與六列格線。", "wrap": True, "margin": "md", "color": "#272727"},
         {"type": "text", "text": "首次畫面完成後，系統將建立初始牌路；後續每局只需回報實際開出莊或閒。", "wrap": True, "size": "sm", "margin": "md", "color": "#806A2A"},
-        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [_postback_button("調整本金", "change_bankroll", color="#E29B19"), _postback_button("重新選擇館別", "venues", style="secondary"), _postback_button("結束本次分析", "end", style="secondary")]},
-    ]}}})
+        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+            _postback_button("調整本金", "change_bankroll", color="#E29B19"),
+            _postback_button("重新選擇館別", "venues", style="secondary"),
+            _postback_button("結束本次分析", "end", style="secondary"),
+        ]},
+    ])
 
 
 def image_received_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
@@ -749,6 +754,10 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
             {"type": "text", "text": "和", "weight": "bold", "color": "#159447", "flex": 1},
             {"type": "text", "text": f"{float(prediction.get('tie_rate', 0.0)):.2f}%", "weight": "bold", "align": "end", "color": "#159447", "flex": 2},
+        ]},
+        {"type": "box", "layout": "horizontal", "margin": "md", "backgroundColor": "#FFD400", "borderColor": "#272727", "borderWidth": "1px", "cornerRadius": "sm", "paddingAll": "10px", "contents": [
+            {"type": "text", "text": "推薦", "weight": "bold", "size": "lg", "color": "#272727", "flex": 1},
+            {"type": "text", "text": formal_text, "weight": "bold", "size": "lg", "align": "end", "color": "#272727", "flex": 1},
         ]},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
