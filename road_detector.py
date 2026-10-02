@@ -190,7 +190,7 @@ MOBILE_PROFILE_MAX_CANDIDATES = _env_int(
 )
 MOBILE_AUTO_FOCUS_ENABLED = os.getenv("MOBILE_AUTO_FOCUS_ENABLED", "1").strip() == "1"
 MOBILE_AUTO_FOCUS_MAX_CANDIDATES = _env_int(
-    "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 2, 1, 3
+    "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 3, 1, 4
 )
 MOBILE_AUTO_FOCUS_PREVIEW_SIDE = _env_int(
     "MOBILE_AUTO_FOCUS_PREVIEW_SIDE", 640, 420, 960
@@ -202,7 +202,7 @@ MOBILE_AUTO_FOCUS_MAX_AREA_RATIO = _env_float(
     "MOBILE_AUTO_FOCUS_MAX_AREA_RATIO", 0.42, 0.10, 0.80
 )
 MOBILE_AUTO_FOCUS_MIN_ASPECT = _env_float(
-    "MOBILE_AUTO_FOCUS_MIN_ASPECT", 1.55, 1.10, 4.00
+    "MOBILE_AUTO_FOCUS_MIN_ASPECT", 1.12, 1.02, 4.00
 )
 MOBILE_AUTO_FOCUS_MIN_WHITE = _env_float(
     "MOBILE_AUTO_FOCUS_MIN_WHITE", 0.48, 0.20, 0.90
@@ -210,6 +210,24 @@ MOBILE_AUTO_FOCUS_MIN_WHITE = _env_float(
 ROAD_ADAPTIVE_COLOR = os.getenv("ROAD_ADAPTIVE_COLOR", "1").strip() == "1"
 ROAD_FAST_MAX_COLUMN_CANDIDATES = _env_int(
     "ROAD_FAST_MAX_COLUMN_CANDIDATES", 3, 1, 8
+)
+ROAD_GENERIC_AUTO_COL_MAX = _env_int(
+    "ROAD_GENERIC_AUTO_COL_MAX", 48, 24, 60
+)
+ROAD_GENERIC_MAX_COLUMN_CANDIDATES = _env_int(
+    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 5, 3, 8
+)
+ROAD_GENERIC_MIN_SQUARE_SCORE = _env_float(
+    "ROAD_GENERIC_MIN_SQUARE_SCORE", 0.46, 0.25, 0.80
+)
+ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES = _env_int(
+    "ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES", 2, 1, 4
+)
+ROAD_RECONSTRUCTION_ONE_CELL_REPAIR = (
+    os.getenv("ROAD_RECONSTRUCTION_ONE_CELL_REPAIR", "1").strip() == "1"
+)
+ROAD_REPAIR_MAX_CANDIDATES = _env_int(
+    "ROAD_REPAIR_MAX_CANDIDATES", 4, 1, 8
 )
 
 # 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
@@ -412,24 +430,76 @@ def _circular_hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
     return np.minimum(delta, 180.0 - delta)
 
 
-def _adaptive_hsv_profile(hsv: np.ndarray) -> Dict[str, float]:
-    hue, saturation, value = cv2.split(hsv)
-    valid = (saturation >= 18) & (value >= 28)
-    red_seed = valid & ((hue <= 30) | (hue >= 150))
-    blue_seed = valid & (hue >= 68) & (hue <= 158)
+def _compact_component_mask(mask: np.ndarray) -> np.ndarray:
+    """只保留圓環/小標記型彩色元件，排除大按鈕、橫幅、整片 UI。"""
+    source = (mask > 0).astype(np.uint8)
+    if source.size == 0 or int(source.sum()) == 0:
+        return source
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(source, 8)
+    out = np.zeros_like(source)
+    image_area = float(source.shape[0] * source.shape[1])
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if area < 3:
+            continue
+        area_ratio = area / max(1.0, image_area)
+        span_x = width / max(1.0, float(source.shape[1]))
+        span_y = height / max(1.0, float(source.shape[0]))
+        aspect = max(width, height) / max(1.0, float(min(width, height)))
+        if area_ratio > 0.035 or span_x > 0.42 or span_y > 0.42 or aspect > 7.0:
+            continue
+        out[labels == index] = 1
+    return out
+
+
+def _slice_bounds(
+    array: np.ndarray,
+    bounds: Optional[Mapping[str, Any]],
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    height, width = array.shape[:2]
+    if not bounds:
+        return array, (0, 0, width, height)
+    x1 = max(0, min(width - 1, int(bounds.get("x", 0) or 0)))
+    y1 = max(0, min(height - 1, int(bounds.get("y", 0) or 0)))
+    x2 = max(x1 + 1, min(width, x1 + int(bounds.get("width", width) or width)))
+    y2 = max(y1 + 1, min(height, y1 + int(bounds.get("height", height) or height)))
+    return array[y1:y2, x1:x2], (x1, y1, x2, y2)
+
+
+def _adaptive_hsv_profile(
+    hsv: np.ndarray,
+    calibration_bounds: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, float]:
+    sample, _ = _slice_bounds(hsv, calibration_bounds)
+    hue, saturation, value = cv2.split(sample)
+    valid = (saturation >= 16) & (value >= 25)
+
+    # 藍色起點提高到 82，避免綠色和局/青綠 UI 進入藍色校準池。
+    red_broad = valid & ((hue <= 28) | (hue >= 152))
+    blue_broad = valid & (hue >= 82) & (hue <= 155)
+    red_seed = _compact_component_mask(red_broad.astype(np.uint8)) > 0
+    blue_seed = _compact_component_mask(blue_broad.astype(np.uint8)) > 0
+
+    # 若圓環被壓縮得太碎，才退回 grid bounds 內的 broad seed；仍不使用整張 UI。
+    if int(red_seed.sum()) < 8:
+        red_seed = red_broad
+    if int(blue_seed.sum()) < 8:
+        blue_seed = blue_broad
 
     def _channel_floor(values: np.ndarray, fallback: int, low: float) -> float:
         if values.size < 8:
             return float(fallback)
-        return float(np.clip(np.percentile(values, 18) * 0.58, low, fallback))
+        return float(np.clip(np.percentile(values, 18) * 0.60, low, fallback))
 
     red_hues = hue[red_seed].astype(np.float32)
     if red_hues.size >= 8:
         signed = np.where(red_hues > 90.0, red_hues - 180.0, red_hues)
-        red_center_signed = float(np.median(signed))
-        red_center = red_center_signed % 180.0
-        red_mad = float(np.median(np.abs(signed - red_center_signed)))
-        red_tol = float(np.clip(14.0 + red_mad * 2.2, 16.0, 34.0))
+        center_signed = float(np.median(signed))
+        red_center = center_signed % 180.0
+        red_mad = float(np.median(np.abs(signed - center_signed)))
+        red_tol = float(np.clip(12.0 + red_mad * 2.0, 14.0, 30.0))
     else:
         red_center, red_tol = 0.0, 20.0
 
@@ -437,27 +507,50 @@ def _adaptive_hsv_profile(hsv: np.ndarray) -> Dict[str, float]:
     if blue_hues.size >= 8:
         blue_center = float(np.median(blue_hues))
         blue_mad = float(np.median(np.abs(blue_hues - blue_center)))
-        blue_tol = float(np.clip(16.0 + blue_mad * 2.0, 18.0, 38.0))
+        blue_tol = float(np.clip(14.0 + blue_mad * 1.8, 16.0, 32.0))
     else:
-        blue_center, blue_tol = 112.0, 30.0
+        blue_center, blue_tol = 112.0, 28.0
 
     return {
         "red_center": red_center,
         "red_tol": red_tol,
         "blue_center": blue_center,
         "blue_tol": blue_tol,
-        "red_s": _channel_floor(saturation[red_seed], ROAD_GRID_RED_MIN_S, 24.0),
-        "red_v": _channel_floor(value[red_seed], ROAD_GRID_RED_MIN_V, 28.0),
-        "blue_s": _channel_floor(saturation[blue_seed], ROAD_GRID_BLUE_MIN_S, 22.0),
-        "blue_v": _channel_floor(value[blue_seed], ROAD_GRID_BLUE_MIN_V, 26.0),
+        "red_s": _channel_floor(saturation[red_seed], ROAD_GRID_RED_MIN_S, 20.0),
+        "red_v": _channel_floor(value[red_seed], ROAD_GRID_RED_MIN_V, 24.0),
+        "blue_s": _channel_floor(saturation[blue_seed], ROAD_GRID_BLUE_MIN_S, 18.0),
+        "blue_v": _channel_floor(value[blue_seed], ROAD_GRID_BLUE_MIN_V, 24.0),
     }
 
 
-def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _broad_color_masks(
+    crop: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """格線對齊第一階段只用寬鬆色罩，不做整張 UI 的自適應校色。"""
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    valid = (saturation >= 18) & (value >= 25)
+    red = (valid & ((hue <= 30) | (hue >= 150))).astype(np.uint8)
+    blue = (valid & (hue >= 82) & (hue <= 158)).astype(np.uint8)
+    green = (
+        (hue >= 30)
+        & (hue <= 92)
+        & (saturation >= 24)
+        & (value >= 25)
+    ).astype(np.uint8)
+    union = ((red | blue | green) > 0).astype(np.uint8)
+    return red, blue, green, union
+
+
+def _color_masks(
+    crop: np.ndarray,
+    *,
+    calibration_bounds: Optional[Mapping[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     hue, saturation, value = cv2.split(hsv)
     if ROAD_ADAPTIVE_COLOR:
-        profile = _adaptive_hsv_profile(hsv)
+        profile = _adaptive_hsv_profile(hsv, calibration_bounds)
         red_hue = _circular_hue_distance(hue, profile["red_center"]) <= profile["red_tol"]
         blue_hue = _circular_hue_distance(hue, profile["blue_center"]) <= profile["blue_tol"]
         red = (
@@ -471,6 +564,7 @@ def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
             & (value >= profile["blue_v"])
         ).astype(np.uint8)
     else:
+        _, _, _, _ = _broad_color_masks(crop)
         red = (
             ((hue <= 15) | (hue >= 165))
             & (saturation >= ROAD_GRID_RED_MIN_S)
@@ -485,8 +579,8 @@ def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
     green = (
         (hue >= 30)
         & (hue <= 92)
-        & (saturation >= max(28, int(ROAD_GRID_GREEN_MIN_S * 0.72)))
-        & (value >= max(28, int(ROAD_GRID_GREEN_MIN_V * 0.72)))
+        & (saturation >= max(24, int(ROAD_GRID_GREEN_MIN_S * 0.68)))
+        & (value >= max(25, int(ROAD_GRID_GREEN_MIN_V * 0.68)))
     ).astype(np.uint8)
     union = ((red | blue | green) > 0).astype(np.uint8)
     return red, blue, green, union
@@ -993,19 +1087,52 @@ def _debug_overlay(
     return str(path)
 
 
-def _column_candidates(crop: np.ndarray, requested: Optional[int] = None) -> List[int]:
+def _column_candidates(
+    crop: np.ndarray,
+    requested: Optional[int] = None,
+    *,
+    profile: str = "",
+) -> List[int]:
     if requested is not None:
         return [max(5, min(60, int(requested)))]
     height, width = crop.shape[:2]
-    estimated = int(round((width / max(1.0, float(height))) * ROAD_GRID_ROWS))
-    estimated = max(ROAD_GRID_AUTO_COL_MIN, min(ROAD_GRID_AUTO_COL_MAX, estimated))
+    aspect = width / max(1.0, float(height))
+    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    maximum = max(ROAD_GRID_AUTO_COL_MAX, ROAD_GENERIC_AUTO_COL_MAX) if generic_auto else ROAD_GRID_AUTO_COL_MAX
+
     if not ROAD_GRID_AUTO_COLUMNS:
         return [ROAD_GRID_COLS]
 
-    values = {estimated, ROAD_GRID_COLS}
+    values = {ROAD_GRID_COLS}
+    if generic_auto:
+        # 不再假設格子一定正方形；用多個 cell-width / cell-height 比例推回欄數。
+        for cell_ratio in (0.68, 0.82, 1.0, 1.22, 1.45):
+            estimated = int(round(aspect * ROAD_GRID_ROWS / cell_ratio))
+            estimated = max(ROAD_GRID_AUTO_COL_MIN, min(maximum, estimated))
+            values.add(estimated)
+            for delta in (-1, 1):
+                candidate = estimated + delta
+                if ROAD_GRID_AUTO_COL_MIN <= candidate <= maximum:
+                    values.add(candidate)
+        square_estimate = int(round(aspect * ROAD_GRID_ROWS))
+        ordered = sorted(
+            values,
+            key=lambda value: (
+                min(
+                    abs(value - aspect * ROAD_GRID_ROWS / ratio)
+                    for ratio in (0.68, 0.82, 1.0, 1.22, 1.45)
+                ),
+                abs(value - square_estimate),
+            ),
+        )
+        return ordered[:ROAD_GENERIC_MAX_COLUMN_CANDIDATES]
+
+    estimated = int(round(aspect * ROAD_GRID_ROWS))
+    estimated = max(ROAD_GRID_AUTO_COL_MIN, min(maximum, estimated))
+    values.add(estimated)
     for delta in range(-ROAD_GRID_AUTO_COL_RADIUS, ROAD_GRID_AUTO_COL_RADIUS + 1):
         candidate = estimated + delta
-        if ROAD_GRID_AUTO_COL_MIN <= candidate <= ROAD_GRID_AUTO_COL_MAX:
+        if ROAD_GRID_AUTO_COL_MIN <= candidate <= maximum:
             values.add(candidate)
     ordered = sorted(
         values,
@@ -1018,6 +1145,101 @@ def _column_candidates(crop: np.ndarray, requested: Optional[int] = None) -> Lis
     return ordered[:ROAD_FAST_MAX_COLUMN_CANDIDATES]
 
 
+def _repair_one_cell_reconstruction(
+    cells: Sequence[Mapping[str, Any]],
+    uncertain_cells: Sequence[Mapping[str, Any]],
+    all_grid_cells: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """只允許唯一解的一格修復；多解或兩格以上缺失一律不修。"""
+    if not ROAD_RECONSTRUCTION_ONE_CELL_REPAIR:
+        return None
+
+    occupied = {
+        (int(item.get("column", -1)), int(item.get("row", -1)))
+        for item in cells
+    }
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+
+    def _add_candidate(source: Mapping[str, Any], bonus: float = 0.0) -> None:
+        item = dict(source)
+        position = (int(item.get("column", -1)), int(item.get("row", -1)))
+        if position in occupied or position[0] < 0 or position[1] < 0:
+            return
+        red = float(item.get("red_pixels", 0) or 0)
+        blue = float(item.get("blue_pixels", 0) or 0)
+        minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+        dominance = float(item.get("dominance", 1.0) or 1.0)
+        evidence = max(red, blue) / minimum
+        score = evidence + 0.15 * min(3.0, dominance) + bonus
+        candidates.append((score, item))
+
+    for item in uncertain_cells:
+        _add_candidate(item, 0.35)
+
+    # 低飽和壓縮後可能被標為 empty；只收有明顯殘留紅/藍像素的弱格。
+    for item in all_grid_cells:
+        if not bool(item.get("empty")):
+            continue
+        red = float(item.get("red_pixels", 0) or 0)
+        blue = float(item.get("blue_pixels", 0) or 0)
+        minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+        dominance = float(item.get("dominance", 1.0) or 1.0)
+        if max(red, blue) >= minimum * 0.28 and dominance >= 1.08:
+            _add_candidate(item, 0.0)
+
+    # 左上原點是大路重建的硬需求；但仍要求至少有少量紅/藍殘留，
+    # 禁止在完全空白格憑空補出第一局。
+    for item in all_grid_cells:
+        if int(item.get("column", -1)) == 0 and int(item.get("row", -1)) == 0:
+            red = float(item.get("red_pixels", 0) or 0)
+            blue = float(item.get("blue_pixels", 0) or 0)
+            minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+            dominance = float(item.get("dominance", 1.0) or 1.0)
+            if max(red, blue) >= minimum * 0.12 and dominance >= 1.03:
+                _add_candidate(item, 0.50)
+            break
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    successes: List[Dict[str, Any]] = []
+    seen = set()
+    for _, source in candidates[:ROAD_REPAIR_MAX_CANDIDATES]:
+        position = (int(source.get("column", -1)), int(source.get("row", -1)))
+        if position in seen:
+            continue
+        seen.add(position)
+        for outcome in ("B", "P"):
+            repaired_cell = dict(source)
+            repaired_cell["outcome"] = outcome
+            repaired_cell["uncertain"] = False
+            repaired_cell["empty"] = False
+            repaired_cell["repaired_from_weak_cell"] = True
+            repaired_cell["confidence"] = max(
+                0.30,
+                min(0.49, float(source.get("confidence", 0.0) or 0.0)),
+            )
+            repaired_cells = [dict(item) for item in cells] + [repaired_cell]
+            reconstruction = _reconstruct_big_road_order(
+                repaired_cells,
+                return_details=True,
+                grid_rows=ROAD_GRID_ROWS,
+            )
+            if (
+                bool(reconstruction.get("reconstructed_all"))
+                and len(reconstruction.get("positions") or []) == len(repaired_cells)
+                and int(reconstruction.get("solution_count", 0) or 0) == 1
+            ):
+                successes.append({
+                    "cells": repaired_cells,
+                    "reconstruction": reconstruction,
+                    "repaired_cell": repaired_cell,
+                })
+
+    # 只有全域唯一解才接受，否則維持原本 fail-safe。
+    if len(successes) != 1:
+        return None
+    return successes[0]
+
+
 def _detect_fixed_grid_for_columns(
     crop: np.ndarray,
     grid_columns: int,
@@ -1025,9 +1247,13 @@ def _detect_fixed_grid_for_columns(
     profile: str = "",
 ) -> Dict[str, Any]:
     image_height, image_width = crop.shape[:2]
-    red_mask, blue_mask, green_mask, union_mask = _color_masks(crop)
+    _, _, _, broad_union_mask = _broad_color_masks(crop)
     grid_bounds = _effective_grid_bounds(
-        crop, union_mask, grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS
+        crop, broad_union_mask, grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS
+    )
+    red_mask, blue_mask, green_mask, _ = _color_masks(
+        crop,
+        calibration_bounds=grid_bounds,
     )
     classified = _classify_grid(
         crop, red_mask, blue_mask, green_mask, grid_bounds,
@@ -1039,6 +1265,29 @@ def _detect_fixed_grid_for_columns(
     reconstruction = _reconstruct_big_road_order(
         cells, return_details=True, grid_rows=ROAD_GRID_ROWS
     )
+    repaired_cell: Optional[Dict[str, Any]] = None
+    if not bool(reconstruction.get("reconstructed_all")):
+        repair = _repair_one_cell_reconstruction(
+            cells,
+            uncertain_cells,
+            all_grid_cells,
+        )
+        if repair is not None:
+            cells = list(repair["cells"])
+            reconstruction = dict(repair["reconstruction"])
+            repaired_cell = dict(repair["repaired_cell"])
+            repaired_position = (
+                int(repaired_cell.get("column", -1)),
+                int(repaired_cell.get("row", -1)),
+            )
+            uncertain_cells = [
+                item for item in uncertain_cells
+                if (
+                    int(item.get("column", -1)),
+                    int(item.get("row", -1)),
+                ) != repaired_position
+            ]
+
     ordered_positions = list(reconstruction["positions"])
     cell_lookup = {(int(item["column"]), int(item["row"])): item for item in cells}
     ordered_cells: List[Dict[str, Any]] = []
@@ -1070,10 +1319,18 @@ def _detect_fixed_grid_for_columns(
     uncertain_ratio = uncertain_count / max(1, candidate_total)
     confidences = [float(item.get("confidence", 0.0) or 0.0) for item in cells]
     median_confidence = float(np.median(confidences)) if confidences else 0.0
+    generic_auto_profile = str(profile or "").startswith("mobile_auto_general")
+    minimum_alignment_score = (
+        max(0.30, ROAD_GRID_MIN_ALIGNMENT_SCORE - 0.08)
+        if generic_auto_profile
+        else ROAD_GRID_MIN_ALIGNMENT_SCORE
+    )
+    minimum_coverage = 0.70 if generic_auto_profile else 0.80
+    minimum_square_score = ROAD_GENERIC_MIN_SQUARE_SCORE if generic_auto_profile else 0.72
     alignment_ok = bool(
-        float(grid_bounds["score"]) >= ROAD_GRID_MIN_ALIGNMENT_SCORE
-        and float(grid_bounds["coverage"]) >= 0.80
-        and float(grid_bounds.get("square_cell_score", 0.0)) >= 0.72
+        float(grid_bounds["score"]) >= minimum_alignment_score
+        and float(grid_bounds["coverage"]) >= minimum_coverage
+        and float(grid_bounds.get("square_cell_score", 0.0)) >= minimum_square_score
     )
     quality_ok = bool(
         recognized_count >= ROAD_GRID_MIN_RECOGNIZED
@@ -1142,11 +1399,13 @@ def _detect_fixed_grid_for_columns(
         "median_cell_confidence": round(median_confidence, 6),
         "reconstructed_all": bool(reconstruction["reconstructed_all"]),
         "reconstruction_solution_count": int(reconstruction["solution_count"]),
+        "reconstruction_repaired": bool(repaired_cell),
+        "repaired_cell": repaired_cell or {},
         "partial_reconstruction": list(reconstruction["partial_positions"]),
         "fallback_preview_positions": list(reconstruction["fallback_preview"]),
         "fallback_reason": fallback_reason,
         "uncertain_cells": uncertain_cells,
-        "count_is_confirmed": bool(quality_ok and uncertain_count == 0),
+        "count_is_confirmed": bool(quality_ok and uncertain_count == 0 and not repaired_cell),
         "debug_overlay_path": debug_overlay_path,
         "debug_enabled": ROAD_GRID_DEBUG,
         "layout_profile": profile,
@@ -1165,13 +1424,19 @@ def _detect_fixed_grid(
         raise ValueError("固定大路裁圖為空。")
 
     results: List[Dict[str, Any]] = []
-    for columns in _column_candidates(crop, grid_columns):
+    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    minimum_trials = 2 if generic_auto else 1
+    for columns in _column_candidates(crop, grid_columns, profile=profile):
         item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
         results.append(item)
+        effective = dict(item.get("effective_grid") or {})
         if (
             ROAD_FAST_EARLY_EXIT
+            and len(results) >= minimum_trials
             and bool(item.get("quality_ok"))
             and int(item.get("recognized_count", 0) or 0) >= ROAD_FAST_MIN_RECOGNIZED
+            and float(effective.get("score", 0.0) or 0.0) >= (0.46 if generic_auto else 0.52)
+            and float(item.get("median_cell_confidence", 0.0) or 0.0) >= 0.46
         ):
             break
 
@@ -1788,15 +2053,26 @@ def _score_result(result: Mapping[str, Any], preference: float = 0.0) -> float:
     fixed = str(result.get("method") or "").startswith("fixed_")
     quality_bonus = 55.0 if bool(result.get("quality_ok")) else -35.0
     reconstruction_bonus = 25.0 if bool(result.get("reconstructed_all", not fixed)) else -45.0
-    alignment = float(dict(result.get("effective_grid") or {}).get("score", 0.0) or 0.0)
+    effective_grid = dict(result.get("effective_grid") or {})
+    alignment = float(effective_grid.get("score", 0.0) or 0.0)
+    geometry = float(effective_grid.get("square_cell_score", 0.0) or 0.0)
+    median_confidence = float(result.get("median_cell_confidence", 0.0) or 0.0)
+    unknown_ratio = unknown / max(1.0, float(recognized + unknown))
+    preference_bonus = math.copysign(
+        min(18.0, abs(float(preference)) * 0.30),
+        float(preference),
+    )
     return (
         recognized * 3.0
         - unknown * 4.0
+        - unknown_ratio * 45.0
         - noise * 0.04
-        + preference
+        + preference_bonus
         + quality_bonus
         + reconstruction_bonus
-        + alignment * 20.0
+        + alignment * 28.0
+        + geometry * 10.0
+        + median_confidence * 25.0
     )
 
 def _run_region(
@@ -1852,6 +2128,25 @@ def _acceptable(result: Mapping[str, Any]) -> bool:
         recognized >= ROAD_FAST_MIN_RECOGNIZED
         and ratio <= ROAD_FAST_MAX_UNKNOWN_RATIO
         and result.get("quality_ok", True)
+    )
+
+
+def _strong_acceptable(result: Mapping[str, Any]) -> bool:
+    if not _acceptable(result):
+        return False
+    recognized = int(result.get("recognized_count", 0) or 0)
+    unknown = int(result.get("unknown_candidates", result.get("uncertain_count", 0)) or 0)
+    ratio = unknown / max(1, recognized + unknown)
+    effective = dict(result.get("effective_grid") or {})
+    alignment = float(effective.get("score", 0.0) or 0.0)
+    median_confidence = float(result.get("median_cell_confidence", 0.0) or 0.0)
+    fixed = bool(result.get("fixed_grid")) or str(result.get("method") or "").startswith("fixed_")
+    return bool(
+        recognized >= max(10, ROAD_FAST_MIN_RECOGNIZED)
+        and ratio <= min(0.10, ROAD_FAST_MAX_UNKNOWN_RATIO)
+        and bool(result.get("reconstructed_all", True))
+        and (not fixed or alignment >= 0.48)
+        and (not fixed or median_confidence >= 0.46 or bool(result.get("ring_grid")))
     )
 
 
@@ -1981,14 +2276,50 @@ def _deadline_guard(
         raise TimeoutError("大路辨識已達處理時限。")
 
 
-def _mobile_white_road_candidates(
+def _grid_periodicity_score(gray: np.ndarray) -> float:
+    if gray is None or gray.size == 0 or min(gray.shape[:2]) < 12:
+        return 0.0
+    edge_x = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)), axis=0)
+    edge_y = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)), axis=1)
+
+    def _boundary_score(projection: np.ndarray, divisions: int) -> float:
+        if projection.size < divisions + 1:
+            return 0.0
+        denominator = max(1e-6, float(np.percentile(projection, 92)))
+        best = 0.0
+        for trim in (0.0, 0.025, 0.05, 0.075):
+            start = trim * projection.size
+            end = (1.0 - trim) * projection.size
+            samples: List[float] = []
+            for position in np.linspace(start, end, divisions + 1):
+                center = int(round(position))
+                left = max(0, center - 2)
+                right = min(projection.size, center + 3)
+                if right > left:
+                    samples.append(min(1.0, float(np.max(projection[left:right])) / denominator))
+            if samples:
+                best = max(best, float(np.mean(samples)))
+        return best
+
+    row_score = _boundary_score(edge_y, ROAD_GRID_ROWS)
+    aspect = gray.shape[1] / max(1.0, float(gray.shape[0]))
+    col_scores = []
+    for cell_ratio in (0.72, 0.88, 1.0, 1.20, 1.40):
+        columns = int(round(aspect * ROAD_GRID_ROWS / cell_ratio))
+        if 5 <= columns <= ROAD_GENERIC_AUTO_COL_MAX:
+            col_scores.append(_boundary_score(edge_x, columns))
+    column_score = max(col_scores or [0.0])
+    return float(0.56 * row_score + 0.44 * column_score)
+
+
+def _general_road_candidates(
     image: np.ndarray,
 ) -> List[Tuple[Tuple[float, float, float, float], float]]:
-    """用白色路紙 + 格線邊緣 + 紅藍像素搜尋直式手機的大路候選。"""
+    """跨直/橫式、白/米黃/深色背景，以路紙材質 + 格線週期 + 紅藍環排序候選。"""
     if not MOBILE_AUTO_FOCUS_ENABLED or image is None or image.size == 0:
         return []
     height, width = image.shape[:2]
-    if height <= width * 1.12 or min(height, width) < 240:
+    if min(height, width) < 220:
         return []
 
     scale = min(1.0, MOBILE_AUTO_FOCUS_PREVIEW_SIDE / max(height, width))
@@ -2002,84 +2333,150 @@ def _mobile_white_road_candidates(
         else image
     )
     ph, pw = preview.shape[:2]
+    hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
     pixels = preview.astype(np.int16, copy=False)
     channel_min = np.min(pixels, axis=2)
     channel_span = np.max(pixels, axis=2) - channel_min
-    adaptive_bright = int(np.clip(np.percentile(channel_min, 72) * 0.88, 145, 205))
-    white = ((channel_min >= adaptive_bright) & (channel_span <= 72)).astype(np.uint8) * 255
 
-    close_w = max(9, int(round(pw * 0.035)))
-    close_h = max(3, int(round(ph * 0.008)))
-    white = cv2.morphologyEx(
-        white,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h)),
-        iterations=1,
+    bright_floor = int(np.clip(np.percentile(channel_min, 70) * 0.86, 135, 205))
+    bright_neutral = (channel_min >= bright_floor) & (channel_span <= 82)
+    warm_paper = (
+        (val >= 105)
+        & (sat >= 5)
+        & (sat <= 115)
+        & (hue >= 3)
+        & (hue <= 38)
     )
-    white = cv2.morphologyEx(
-        white,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
+    dark_neutral = (
+        (val >= 24)
+        & (val <= 155)
+        & (sat <= 58)
     )
-    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    image_area = float(ph * pw)
-    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    paper_masks = [
+        bright_neutral.astype(np.uint8),
+        warm_paper.astype(np.uint8),
+        dark_neutral.astype(np.uint8),
+    ]
 
-    hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
-    hue, sat, val = cv2.split(hsv)
-    broad_color = (
-        (sat >= 28)
-        & (val >= 35)
+    red_blue = (
+        (sat >= 20)
+        & (val >= 28)
         & (
-            (hue <= 32)
+            (hue <= 30)
             | (hue >= 150)
-            | ((hue >= 68) & (hue <= 158))
+            | ((hue >= 82) & (hue <= 158))
         )
-    )
+    ).astype(np.uint8)
 
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        area_ratio = (w * h) / max(1.0, image_area)
-        aspect = w / max(1.0, float(h))
-        if not (
-            MOBILE_AUTO_FOCUS_MIN_AREA_RATIO <= area_ratio <= MOBILE_AUTO_FOCUS_MAX_AREA_RATIO
-            and aspect >= MOBILE_AUTO_FOCUS_MIN_ASPECT
-            and w >= pw * 0.24
-            and h >= ph * 0.035
-        ):
+    gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
+    edge_x_full = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    edge_y_full = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    edge_mag = np.clip((edge_x_full + edge_y_full) / 160.0, 0.0, 1.0).astype(np.float32)
+
+    paper_union = np.maximum.reduce(paper_masks).astype(np.uint8)
+    paper_integral = cv2.integral(paper_union, sdepth=cv2.CV_32S)
+    color_integral = cv2.integral(red_blue, sdepth=cv2.CV_32S)
+    edge_integral = cv2.integral(edge_mag, sdepth=cv2.CV_64F)
+
+    def _rect_mean(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+        area = max(1, (x2 - x1) * (y2 - y1))
+        total = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+        return float(total) / float(area)
+
+    boxes: List[Tuple[int, int, int, int, float]] = []
+    image_area = float(ph * pw)
+
+    # 先從三種路紙材質的連通區塊提出候選。
+    for source_mask in paper_masks:
+        mask = (source_mask * 255).astype(np.uint8)
+        close_w = max(7, int(round(pw * 0.025)))
+        close_h = max(3, int(round(ph * 0.006)))
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h)),
+            iterations=1,
+        )
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            area_ratio = (w * h) / max(1.0, image_area)
+            aspect = w / max(1.0, float(h))
+            if (
+                MOBILE_AUTO_FOCUS_MIN_AREA_RATIO <= area_ratio <= MOBILE_AUTO_FOCUS_MAX_AREA_RATIO
+                and aspect >= MOBILE_AUTO_FOCUS_MIN_ASPECT
+                and w >= pw * 0.18
+                and h >= ph * 0.025
+            ):
+                x1 = max(0, x - int(round(w * 0.03)))
+                x2 = min(pw, x + w + int(round(w * 0.03)))
+                y1 = max(0, y - int(round(h * 0.12)))
+                y2 = min(ph, y + h + int(round(h * 0.12)))
+                boxes.append((x1, y1, x2, y2, 1.0))
+
+    # 紙色被 UI 切碎時，用低成本滑窗做最後保險；只用 integral image 粗排。
+    coarse: List[Tuple[float, Tuple[int, int, int, int]]] = []
+    for height_fraction in (0.07, 0.10, 0.14, 0.20, 0.28):
+        box_h = max(24, int(round(ph * height_fraction)))
+        step_y = max(12, int(round(box_h * 0.55)))
+        for width_fraction in (0.44, 0.64, 0.84, 1.0):
+            box_w = max(48, int(round(pw * width_fraction)))
+            x_positions = sorted(set((0, max(0, (pw - box_w) // 2), max(0, pw - box_w))))
+            for y1 in range(0, max(1, ph - box_h + 1), step_y):
+                y2 = min(ph, y1 + box_h)
+                if y2 - y1 < 20:
+                    continue
+                for x1 in x_positions:
+                    x2 = min(pw, x1 + box_w)
+                    aspect = (x2 - x1) / max(1.0, float(y2 - y1))
+                    if aspect < MOBILE_AUTO_FOCUS_MIN_ASPECT:
+                        continue
+                    paper_mean = _rect_mean(paper_integral, x1, y1, x2, y2)
+                    color_mean = _rect_mean(color_integral, x1, y1, x2, y2)
+                    edge_mean = _rect_mean(edge_integral, x1, y1, x2, y2)
+                    if color_mean < 0.0005 or edge_mean < 0.035:
+                        continue
+                    coarse_score = (
+                        1.0 * paper_mean
+                        + 1.5 * min(1.0, color_mean / 0.030)
+                        + 1.2 * min(1.0, edge_mean / 0.18)
+                    )
+                    coarse.append((coarse_score, (x1, y1, x2, y2)))
+    coarse.sort(key=lambda item: item[0], reverse=True)
+    for score, box in coarse[:18]:
+        boxes.append((*box, score))
+
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    seen_boxes = set()
+    for x1, y1, x2, y2, source_score in boxes:
+        key = (int(x1 // 4), int(y1 // 4), int(x2 // 4), int(y2 // 4))
+        if key in seen_boxes:
             continue
-
-        x1 = max(0, x - int(round(w * 0.025)))
-        x2 = min(pw, x + w + int(round(w * 0.025)))
-        y1 = max(0, y - int(round(h * 0.15)))
-        y2 = min(ph, y + h + int(round(h * 0.15)))
+        seen_boxes.add(key)
         if x2 <= x1 or y2 <= y1:
             continue
-        roi_white = white[y1:y2, x1:x2] > 0
-        white_fraction = float(np.mean(roi_white))
-        if white_fraction < MOBILE_AUTO_FOCUS_MIN_WHITE:
+        area_ratio = ((x2 - x1) * (y2 - y1)) / max(1.0, image_area)
+        if not (MOBILE_AUTO_FOCUS_MIN_AREA_RATIO <= area_ratio <= MOBILE_AUTO_FOCUS_MAX_AREA_RATIO):
             continue
 
-        color_fraction = float(np.mean(broad_color[y1:y2, x1:x2]))
-        gray = cv2.cvtColor(preview[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-        edge_x = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)), axis=0)
-        edge_y = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)), axis=1)
-        grid_energy = float(
-            min(
-                1.0,
-                (float(np.percentile(edge_x, 90)) + float(np.percentile(edge_y, 90))) / 115.0,
-            )
-        )
-        if color_fraction < 0.0007 or grid_energy < 0.12:
+        paper_fraction = _rect_mean(paper_integral, x1, y1, x2, y2)
+        color_fraction = _rect_mean(color_integral, x1, y1, x2, y2)
+        if color_fraction < 0.0006:
+            continue
+        roi_gray = gray[y1:y2, x1:x2]
+        periodicity = _grid_periodicity_score(roi_gray)
+        if periodicity < 0.14:
             continue
 
-        lower_prior = float((y1 + y2) / 2.0 / max(1.0, ph))
+        aspect = (x2 - x1) / max(1.0, float(y2 - y1))
+        geometry_prior = min(1.0, max(0.0, (aspect - 1.0) / 3.0))
         score = (
-            2.6 * white_fraction
-            + 1.8 * grid_energy
-            + 1.4 * min(1.0, color_fraction / 0.035)
-            + 0.15 * lower_prior
+            2.8 * periodicity
+            + 1.5 * min(1.0, color_fraction / 0.035)
+            + 0.75 * paper_fraction
+            + 0.25 * geometry_prior
+            + 0.10 * min(1.0, source_score)
         )
         roi = (
             x1 / float(pw),
@@ -2100,7 +2497,7 @@ def _mobile_white_road_candidates(
             ix2, iy2 = min(x + w, px + pw0), min(y + h, py + ph0)
             inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
             union = w * h + pw0 * ph0 - inter
-            if union > 0 and inter / union >= 0.62:
+            if union > 0 and inter / union >= 0.58:
                 duplicate = True
                 break
         if not duplicate:
@@ -2277,18 +2674,6 @@ def detect_road_sequence_detailed(
                     "grid_columns": None,
                     "profile": "db_mobile_full_screen",
                 })
-        if portrait and MOBILE_AUTO_FOCUS_ENABLED:
-            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
-            for index, (roi, auto_score) in enumerate(_mobile_white_road_candidates(image)):
-                plan.append({
-                    "name": f"mobile_auto_white_road_{index}",
-                    "roi": roi,
-                    "preference": 58.0 + min(4.0, auto_score),
-                    "fixed_grid": True,
-                    "grid_columns": None,
-                    "profile": "mobile_auto_white_road",
-                })
-
         if landscape and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
@@ -2312,6 +2697,18 @@ def detect_road_sequence_detailed(
                 "grid_columns": None,
                 "profile": "mt_full_screen",
             })
+        if MOBILE_AUTO_FOCUS_ENABLED:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
+            for index, (roi, auto_score) in enumerate(_general_road_candidates(image)):
+                plan.append({
+                    "name": f"mobile_auto_general_{index}",
+                    "roi": roi,
+                    "preference": 22.0 + min(15.0, auto_score * 3.0),
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "mobile_auto_general",
+                })
+
         if venue_code in VENUE_ROIS and venue_code != "MT":
             plan.append({
                 "name": f"{venue_code.lower()}_venue_roi",
@@ -2354,6 +2751,11 @@ def detect_road_sequence_detailed(
 
     seen = set()
     best: Optional[Dict[str, Any]] = None
+    has_general_auto = any(
+        str(item.get("profile") or "") == "mobile_auto_general"
+        for item in plan
+    )
+    evaluated_general_auto = False
     for item in plan:
         _deadline_guard(deadline, cancel_event, min_remaining=0.20)
         roi = tuple(float(value) for value in item["roi"])
@@ -2382,12 +2784,23 @@ def detect_road_sequence_detailed(
                 layout_profile=str(item.get("profile") or ""),
             )
             candidates.append(current)
+            if str(item.get("profile") or "") == "mobile_auto_general":
+                evaluated_general_auto = True
             if best is None or float(current.get("selection_score", -9999)) > float(
                 best.get("selection_score", -9999)
             ):
                 best = current
-            if ROAD_FAST_EARLY_EXIT and _acceptable(current):
-                best = current
+            minimum_trials = 1 if likely_crop else ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES
+            if (
+                ROAD_FAST_EARLY_EXIT
+                and len(candidates) >= minimum_trials
+                and (likely_crop or not has_general_auto or evaluated_general_auto)
+                and _strong_acceptable(current)
+            ):
+                best = max(
+                    candidates,
+                    key=lambda item: float(item.get("selection_score", -9999.0) or -9999.0),
+                )
                 break
         except Exception as exc:
             errors.append(f"{name}: {exc}")
@@ -2417,7 +2830,7 @@ def detect_road_sequence_detailed(
         "road_crop_signature": bool(crop_signature),
         "dream_compact_mobile_profile_detected": bool(dream_compact_mobile_layout),
         "ofalive_android_profile_detected": bool(ofalive_android_layout),
-        "mobile_auto_focus_used": str(best.get("region_name") or "").startswith("mobile_auto_white_road_"),
+        "mobile_auto_focus_used": str(best.get("region_name") or "").startswith("mobile_auto_general_"),
         "image_size": {"width": image_width, "height": image_height},
         "candidate_regions": [
             {

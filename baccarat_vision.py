@@ -124,37 +124,92 @@ def _hue_distance(value: float, center: float) -> float:
     return min(delta, 180.0 - delta)
 
 
-def _adaptive_color_profile(hsv: np.ndarray) -> Dict[str, float]:
-    hue, saturation, value = cv2.split(hsv)
-    valid = (saturation >= 18) & (value >= 28)
-    red_seed = valid & ((hue <= 30) | (hue >= 150))
-    blue_seed = valid & (hue >= 68) & (hue <= 158)
+def _adaptive_color_profile(
+    hsv: np.ndarray,
+    candidates: Sequence[CircleCandidate],
+) -> Dict[str, float]:
+    """只從幾何圓環附近取樣，避免整張 UI 的按鈕/圖示污染紅藍中心。"""
+    height, width = hsv.shape[:2]
+    filtered = list(candidates)
+    if filtered:
+        diameters = np.asarray([item.diameter for item in filtered], dtype=np.float64)
+        median_diameter = float(np.median(diameters))
+        filtered = [
+            item for item in filtered
+            if 0.58 * median_diameter <= item.diameter <= 1.55 * median_diameter
+            and item.circularity >= max(0.22, MIN_CIRCULARITY * 0.75)
+        ] or list(candidates)
 
-    red_hues = hue[red_seed].astype(np.float32)
+    sampled: List[np.ndarray] = []
+    for candidate in filtered[:160]:
+        radius = max(4.0, candidate.diameter / 2.0)
+        outer = max(3, int(round(radius * 0.68)))
+        inner = max(1, int(round(radius * 0.18)))
+        x1, x2 = max(0, candidate.x - outer), min(width, candidate.x + outer + 1)
+        y1, y2 = max(0, candidate.y - outer), min(height, candidate.y + outer + 1)
+        patch = hsv[y1:y2, x1:x2]
+        if patch.size == 0:
+            continue
+        yy, xx = np.ogrid[:patch.shape[0], :patch.shape[1]]
+        cx = candidate.x - x1
+        cy = candidate.y - y1
+        distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        annulus = (distance2 <= outer ** 2) & (distance2 >= inner ** 2)
+        pixels = patch[annulus]
+        if pixels.size:
+            sampled.append(pixels.reshape(-1, 3))
+
+    if sampled:
+        pixels = np.concatenate(sampled, axis=0)
+    else:
+        # 幾何候選不足才退回整張 crop；仍使用不與綠色重疊的藍色 seed。
+        pixels = hsv.reshape(-1, 3)
+
+    hue = pixels[:, 0].astype(np.float32)
+    saturation = pixels[:, 1].astype(np.float32)
+    value = pixels[:, 2].astype(np.float32)
+    valid = (saturation >= 16) & (value >= 25)
+    red_seed = valid & ((hue <= 28) | (hue >= 152))
+    blue_seed = valid & (hue >= 82) & (hue <= 155)
+
+    def _floor(values: np.ndarray, fallback: float, low: float) -> float:
+        if values.size < 8:
+            return float(fallback)
+        return float(np.clip(np.percentile(values, 18) * 0.60, low, fallback))
+
+    red_hues = hue[red_seed]
     if red_hues.size >= 8:
         signed = np.where(red_hues > 90.0, red_hues - 180.0, red_hues)
         center_signed = float(np.median(signed))
         red_center = center_signed % 180.0
-        red_tol = float(np.clip(14.0 + np.median(np.abs(signed - center_signed)) * 2.2, 16.0, 34.0))
-        red_s = float(np.clip(np.percentile(saturation[red_seed], 18) * 0.58, 22.0, MIN_SATURATION))
+        red_tol = float(np.clip(
+            12.0 + np.median(np.abs(signed - center_signed)) * 2.0,
+            14.0,
+            30.0,
+        ))
     else:
-        red_center, red_tol, red_s = 0.0, 20.0, MIN_SATURATION
+        red_center, red_tol = 0.0, 20.0
 
-    blue_hues = hue[blue_seed].astype(np.float32)
+    blue_hues = hue[blue_seed]
     if blue_hues.size >= 8:
         blue_center = float(np.median(blue_hues))
-        blue_tol = float(np.clip(16.0 + np.median(np.abs(blue_hues - blue_center)) * 2.0, 18.0, 38.0))
-        blue_s = float(np.clip(np.percentile(saturation[blue_seed], 18) * 0.58, 20.0, MIN_SATURATION))
+        blue_tol = float(np.clip(
+            14.0 + np.median(np.abs(blue_hues - blue_center)) * 1.8,
+            16.0,
+            32.0,
+        ))
     else:
-        blue_center, blue_tol, blue_s = 112.0, 30.0, MIN_SATURATION
+        blue_center, blue_tol = 112.0, 28.0
 
     return {
         "red_center": red_center,
         "red_tol": red_tol,
-        "red_s": red_s,
+        "red_s": _floor(saturation[red_seed], MIN_SATURATION, 18.0),
         "blue_center": blue_center,
         "blue_tol": blue_tol,
-        "blue_s": blue_s,
+        "blue_s": _floor(saturation[blue_seed], MIN_SATURATION, 18.0),
+        "sample_source": "ring_candidates" if sampled else "crop_fallback",
+        "sample_count": int(pixels.shape[0]),
     }
 
 
@@ -551,7 +606,11 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
     raw_candidates = _geometry_candidates(image, contour_map)
     unique_candidates = _deduplicate_candidates(raw_candidates)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    color_profile = _adaptive_color_profile(hsv) if ADAPTIVE_COLOR else None
+    color_profile = (
+        _adaptive_color_profile(hsv, unique_candidates)
+        if ADAPTIVE_COLOR
+        else None
+    )
 
     colored: List[CircleCandidate] = []
     unknown_candidates_raw: List[Tuple[CircleCandidate, float, float, float]] = []
