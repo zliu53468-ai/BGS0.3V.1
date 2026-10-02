@@ -1187,10 +1187,16 @@ def _repair_one_cell_reconstruction(
         if max(red, blue) >= minimum * 0.28 and dominance >= 1.08:
             _add_candidate(item, 0.0)
 
-    # 左上原點是大路重建的硬需求；若它只有微弱顏色，也優先嘗試。
+    # 左上原點是大路重建的硬需求；但仍要求至少有少量紅/藍殘留，
+    # 禁止在完全空白格憑空補出第一局。
     for item in all_grid_cells:
         if int(item.get("column", -1)) == 0 and int(item.get("row", -1)) == 0:
-            _add_candidate(item, 0.50)
+            red = float(item.get("red_pixels", 0) or 0)
+            blue = float(item.get("blue_pixels", 0) or 0)
+            minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+            dominance = float(item.get("dominance", 1.0) or 1.0)
+            if max(red, blue) >= minimum * 0.12 and dominance >= 1.03:
+                _add_candidate(item, 0.50)
             break
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
