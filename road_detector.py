@@ -3986,7 +3986,14 @@ def detect_road_sequence_detailed(
                 "grid_columns": None,
                 "profile": "mt_full_screen",
             })
-        if MOBILE_AUTO_FOCUS_ENABLED:
+        # DG / Dream 已經找到內容式白色 6×N 候選時，不要在評估它之前
+        # 再花數秒生成 generic auto-focus。這是 LINE 手機 timeout 的主要來源之一。
+        # 專用候選完全找不到時，才啟用 generic auto 作為 fallback。
+        skip_general_auto = bool(
+            (venue_code == "DG" or dream_compact_mobile_layout)
+            and dream_feature_candidates
+        )
+        if MOBILE_AUTO_FOCUS_ENABLED and not skip_general_auto:
             _deadline_guard(detector_deadline, cancel_event, min_remaining=0.6)
             for index, (roi, auto_score) in enumerate(
                 _general_road_candidates(
