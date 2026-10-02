@@ -297,6 +297,9 @@ def analyze_game_screen(
         "median_cell_confidence": float(
             road.get("median_cell_confidence", 0.0) or 0.0
         ),
+        "mobile_auto_focus_used": bool(road.get("mobile_auto_focus_used")),
+        "reconstruction_repaired": bool(road.get("reconstruction_repaired")),
+        "repaired_cell": dict(road.get("repaired_cell") or {}),
         "debug_overlay_path": str(road.get("debug_overlay_path") or ""),
         # 真人截圖沒有真實剩餘牌點組成，預測端必須視為 estimated。
         "composition_quality": "estimated",
