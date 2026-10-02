@@ -2167,7 +2167,11 @@ def _run_region(
     elif ROAD_USE_YOLO and _get_yolo_model() is not None:
         result = _detect_yolo(crop)
     else:
-        result = analyze_baccarat_array_detailed(crop)
+        result = analyze_baccarat_array_detailed(
+            crop,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     result = dict(result or {})
     result.update(
