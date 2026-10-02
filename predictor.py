@@ -20,6 +20,7 @@ from dynamic_prediction_policy import (
     recent_user_direction_feedback,
     road_only_policy,
 )
+from bbb_final57_runtime import VERSION as FINAL57_VERSION, apply_final_prediction
 from money_management import MAX_BET_RATIO, MIN_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
 from shoe_composition import analyze_shoe_composition
@@ -80,6 +81,180 @@ def _normalize_policy_probabilities(policy: Mapping[str, Any]) -> tuple[dict[str
     if direction not in {"B", "P"}: direction = "B" if p_b >= p_p else "P"
     confidence = _clip(float(policy.get("selected_win_probability", probabilities[direction]) or probabilities[direction]), 0.0, 1.0)
     return probabilities, direction, confidence
+
+
+def _overlay_bbb_final57(
+    result: Dict[str, Any],
+    *,
+    history: List[str],
+    core_policy: Mapping[str, Any],
+    bankroll: float,
+) -> Dict[str, Any]:
+    """Replace only the formal prediction/decision fields with BBB Final57 output."""
+    final = apply_final_prediction(history, core_policy)
+    probabilities = dict(final["probabilities"])
+    direction = str(final["direction"])
+    is_skip = direction == "Skip"
+    text = "觀望" if is_skip else ("莊" if direction == "B" else "閒")
+    direction_probability = float(final["direction_probability"])
+    final_confidence = float(final["confidence"])
+    selected_ev = 0.0 if is_skip else float(final["ev_banker"] if direction == "B" else final["ev_player"])
+
+    if is_skip:
+        money = {
+            "direction": "Skip", "bankroll": bankroll,
+            "resolved_win_probability": direction_probability,
+            "clamped_win_probability": direction_probability,
+            "edge": 0.0, "edge_percent": 0.0,
+            "expected_value_per_unit": 0.0, "virtual_ev": 0.0, "virtual_ev_percent": 0.0,
+            "kelly_fraction": 0.0, "final_bet_ratio": 0.0, "bet_percentage": 0.0,
+            "bet_amount": 0.0, "bet_allowed": False, "mandatory_bet": False,
+            "reason": "bbb_final57_ev_skip",
+        }
+        final_ratio = 0.0
+    else:
+        money = _MONEY.allocate(
+            direction=direction,
+            probabilities=probabilities,
+            final_weight=direction_probability,
+            bankroll=bankroll,
+        )
+        final_ratio = min(
+            float(MAX_BET_RATIO),
+            max(float(MIN_BET_RATIO), float(money.get("final_bet_ratio", MIN_BET_RATIO) or MIN_BET_RATIO)),
+        )
+        money.update({
+            "final_bet_ratio": final_ratio,
+            "bet_percentage": final_ratio * 100.0,
+            "bet_amount": bankroll * final_ratio,
+            "bet_allowed": True,
+            "mandatory_bet": True,
+        })
+
+    core_probabilities = dict(result.get("probabilities") or {})
+    components = dict(result.get("component_probabilities") or {})
+    components["bbb_v23_r1_core"] = core_probabilities
+    components["bbb_final57"] = probabilities
+    signal_reason = (
+        f"BBB V23 R1 Core P(B)={float(final['core_p_b']):.4f}；"
+        f"Final57 P(B)={float(final['final_p_b']):.4f}；"
+        f"EV(B)={float(final['ev_banker']):+.4f}；EV(P)={float(final['ev_player']):+.4f}；"
+        f"MinEV={float(final['activation_ev']):.4f}。"
+    )
+
+    result.update({
+        "engine": "BBB_V23_R1_PHYSICS48_FINAL57_EV",
+        "model_version": FINAL57_VERSION,
+        "system_model_version": FINAL57_VERSION,
+        "model_variant": "BBB_V23_R1_256D_CORE_PLUS_48D_PHYSICS_PLUS_57D_XGB_DIRECT_EV",
+        "model_core": "bbb_final57_direct_classifier",
+        "primary_model": "BBB_FINAL57",
+        "decision_pipeline": "bbb_v23_r1_core_to_physics48_to_final57_xgb_to_dynamic_clip_to_ev",
+        "probabilities": probabilities,
+        "raw_direction_probabilities": core_probabilities,
+        "banker_rate": round(float(probabilities["B"]) * 100.0, 2),
+        "player_rate": round(float(probabilities["P"]) * 100.0, 2),
+        "tie_rate": 0.0,
+        "recommend": direction,
+        "recommend_text": text,
+        "action": direction,
+        "action_text": text,
+        "internal_recommend": direction,
+        "internal_action": direction,
+        "next_round_direction": direction,
+        "next_round_direction_text": text,
+        "direction": direction,
+        "direction_text": text,
+        "adaptive_only_direction": direction,
+        "signal_allowed": not is_skip,
+        "risk_gate_open": not is_skip,
+        "mandatory_bet": not is_skip,
+        "signal_status_code": "BBB_FINAL57_SKIP" if is_skip else "BBB_FINAL57_EV_ENTRY",
+        "signal_status_text": "下一手模型：觀望 Skip" if is_skip else f"下一手模型：{text} {direction_probability:.1%}",
+        "signal_reason": signal_reason,
+        "internal_signal_reason": signal_reason,
+        "direction_source": "bbb_final57_xgb_ev",
+        "formal_direction_source": "bbb_final57_xgb_ev",
+        "confidence": final_confidence,
+        "raw_model_confidence": direction_probability,
+        "pattern_calibrated_confidence": final_confidence,
+        "ensemble_confidence": final_confidence,
+        "quality_score": direction_probability,
+        "confidence_label": "觀望" if is_skip else ("較高" if direction_probability >= 0.56 else "中等" if direction_probability >= 0.52 else "保守"),
+        "confidence_calibration": {
+            "applied": True,
+            "raw_confidence": direction_probability,
+            "final_confidence": final_confidence,
+            "direction_override": direction != str(core_policy.get("direction") or ""),
+            "semantics": "bbb_final57_direct_probability_plus_ev_decision",
+        },
+        "banker_ev": float(final["ev_banker"]),
+        "player_ev": float(final["ev_player"]),
+        "direction_edge": selected_ev,
+        "direction_edge_percent": selected_ev * 100.0,
+        "selected_expected_return": selected_ev,
+        "selected_expected_return_percent": selected_ev * 100.0,
+        "bet_allowed": not is_skip,
+        "final_probs": probabilities,
+        "direction_probs": probabilities,
+        "economic_probs": probabilities,
+        "final_probability": direction_probability,
+        "economic_probability_for_direction": direction_probability,
+        "fusion_decision": {
+            "direction": direction,
+            "probabilities": probabilities,
+            "linucb_weight": 0.0,
+            "road_pattern_weight": 0.0,
+            "shoe_composition_weight": 0.0,
+            "lstm_weight": 0.0,
+            "fallback_markov_weight": 0.0,
+            "road_applied": False,
+            "hazard_applied": True,
+            "method": "bbb_final57_direct_xgb_ev",
+            "semantics": "V23_R1_core_is_feature_then_Final57_is_formal_decision",
+            "details": {"core_direction": str(core_policy.get("direction") or ""), "flipped": bool(final["flipped"])},
+        },
+        "fusion": {
+            **dict(result.get("fusion") or {}),
+            "method": "bbb_v23_r1_physics48_final57_xgb_ev",
+        },
+        "component_probabilities": components,
+        "money_management": money,
+        "kelly_fraction": float(money.get("kelly_fraction", 0.0) or 0.0),
+        "pre_tie_adjusted_ratio": final_ratio,
+        "adjusted_ratio": final_ratio,
+        "final_bet_ratio": final_ratio,
+        "bet_percentage": final_ratio * 100.0,
+        "suggested_bet_amount": bankroll * final_ratio,
+        "bet_amount": bankroll * final_ratio,
+        "bet_multiplier": min(1.0, final_ratio / MAX_BET_RATIO) if MAX_BET_RATIO > 0.0 else 0.0,
+        "probability_semantics": "bbb_final57_direct_xgb_binary_probability_after_dynamic_clip",
+        "decision": direction,
+        "decision_text": text,
+        "skip": is_skip,
+        "skip_reason": "final57_ev_below_activation_threshold" if is_skip else "",
+        "force_observe": is_skip,
+        "decision_gate": {
+            "decision": direction,
+            "allowed": not is_skip,
+            "reason": "bbb_final57_ev_gate",
+            "direction": direction,
+            "resolved_confidence": final_confidence,
+            "expected_net_ev": selected_ev,
+            "penalty_observe": is_skip,
+        },
+        "bbb_final57": final,
+    })
+    dynamic = dict(result.get("dynamic_prediction_policy") or {})
+    dynamic.update({
+        "version": FINAL57_VERSION,
+        "formal_direction_source": "bbb_final57_xgb_ev",
+        "final57_active": True,
+        "ocr_or_screen_flow_modified": False,
+    })
+    result["dynamic_prediction_policy"] = dynamic
+    result["dynamic_policy_version"] = FINAL57_VERSION
+    return result
 
 
 def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", room: str = "", shoe_id: str = "", user_id: str = "", run_seed: Optional[int] = None, shoe_context: Optional[Mapping[str, Any]] = None, road_context: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -164,6 +339,12 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "decision_gate": {"decision": direction, "allowed": True, "reason": "contextual_linucb_always_returns_BP", "direction": direction, "resolved_confidence": confidence, "expected_net_ev": selected_ev, "penalty_observe": False},
         "timeline_alignment": {"raw_round_count": len(raw_history), "bp_round_count": len(big_road), "ties_ignored_for_direction_context": len(raw_history) - len(big_road)}, "context_metadata": context_meta,
     }
+    result = _overlay_bbb_final57(
+        result,
+        history=raw_history,
+        core_policy=policy,
+        bankroll=bankroll,
+    )
     return result
 
 
@@ -173,9 +354,9 @@ def run_virtual_round(session: Mapping[str, Any], run_seed: Optional[int] = None
     if len(hidden_shoe) < 6: raise ValueError("虛擬牌靴不足，請重新建立牌靴。")
     history = _normalize_outcome_history(list(isolated_session.get("round_history") or [])); seed = int(run_seed if run_seed is not None else secrets.randbits(32)) & 0xFFFFFFFF
     prediction = predict(history=deepcopy(history), venue=str(isolated_session.get("venue") or ""), room=str(isolated_session.get("room") or ""), shoe_id=str(isolated_session.get("shoe_id") or ""), user_id=str(isolated_session.get("user_id") or ""), run_seed=seed, shoe_context={"bankroll": float(isolated_session.get("bankroll", 0.0) or 0.0), "remaining_cards": len(hidden_shoe), "remaining_counts": counts_from_shoe(hidden_shoe), "remaining_cards_reliability": 1.0, "remaining_cards_source": "virtual_shoe_exact_counts_feature", "source": "remaining_counts", "cut_card_remaining_cards": float(isolated_session.get("cut_card_remaining_cards", DEFAULT_CUT_CARD_REMAINING) or DEFAULT_CUT_CARD_REMAINING)})
-    hand, remaining_shoe = deal_ordered_hand(hidden_shoe); hand_data = hand.as_dict(); predicted = str(prediction.get("action") or "B").upper(); actual = str(hand.outcome or "").upper(); verdict = "TIE_SKIPPED" if actual == "T" else ("HIT" if predicted == actual else "MISS")
+    hand, remaining_shoe = deal_ordered_hand(hidden_shoe); hand_data = hand.as_dict(); predicted = str(prediction.get("action") or "B").upper(); actual = str(hand.outcome or "").upper(); verdict = "TIE_SKIPPED" if actual == "T" else ("OBSERVE" if predicted not in {"B", "P"} else ("HIT" if predicted == actual else "MISS"))
     update = {"updated": False, "reason": "web_panel_direct_no_feedback_update", "formal_model": "contextual_linucb"}
-    prediction.update({"ok": True, "mode": "virtual_shoe_contextual_linucb_single_brain", "virtual_hand": hand_data, "virtual_outcome": actual, "virtual_outcome_text": hand_data["outcome_text"], "verdict": verdict, "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計"}[verdict], "cards_consumed": int(hand.cards_used), "remaining_cards_after": len(remaining_shoe), "remaining_counts_after": counts_from_shoe(remaining_shoe), "round_number": int(isolated_session.get("hand_number", 0) or 0) + 1, "bandit_learning_applied": False, "bandit_update": update, "disclaimer": "正式方向由 BBB Frozen Direct 256D（128D牌靴＋128D牌路）Contextual LinUCB 的兩臂 UCB Score 單獨產生；正式流程不 bootstrap、不 Walk-forward、不 replay、不結算上一筆、不更新 A/b、不 decay。"})
+    prediction.update({"ok": True, "mode": "virtual_shoe_contextual_linucb_single_brain", "virtual_hand": hand_data, "virtual_outcome": actual, "virtual_outcome_text": hand_data["outcome_text"], "verdict": verdict, "verdict_text": {"HIT": "命中", "MISS": "未命中", "TIE_SKIPPED": "和局不計", "OBSERVE": "觀望"}[verdict], "cards_consumed": int(hand.cards_used), "remaining_cards_after": len(remaining_shoe), "remaining_counts_after": counts_from_shoe(remaining_shoe), "round_number": int(isolated_session.get("hand_number", 0) or 0) + 1, "bandit_learning_applied": False, "bandit_update": update, "disclaimer": "正式方向由 BBB Frozen Direct 256D（128D牌靴＋128D牌路）Contextual LinUCB 的兩臂 UCB Score 單獨產生；正式流程不 bootstrap、不 Walk-forward、不 replay、不結算上一筆、不更新 A/b、不 decay。"})
     return {"prediction": prediction, "hand": hand_data, "remaining_shoe": remaining_shoe}
 
 
