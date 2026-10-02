@@ -269,10 +269,20 @@ def predict_physics(history: str | Sequence[str], bundle: Mapping[str, Any] | No
     intercepts = list(bundle.get("intercepts") or [])
     if not coefs or len(coefs) != len(intercepts):
         raise ValueError("invalid physics model")
+
+    # Keep the same accumulation order as BBB/final_probability_runtime.js.
+    # This avoids BLAS reduction-order drift near an XGBoost split threshold.
+    h_values = [float(v) for v in h]
     for layer, (weights, bias) in enumerate(zip(coefs, intercepts)):
-        h = h @ np.asarray(weights, dtype=np.float64) + np.asarray(bias, dtype=np.float64)
-        if layer < len(coefs) - 1:
-            h = np.maximum(0.0, h)
+        out = [0.0] * len(bias)
+        relu = layer < len(coefs) - 1
+        for j in range(len(bias)):
+            total = float(bias[j] or 0.0)
+            for i in range(len(h_values)):
+                total += float(h_values[i] or 0.0) * float(weights[i][j] or 0.0)
+            out[j] = max(0.0, total) if relu else total
+        h_values = out
+    h = np.asarray(h_values, dtype=np.float64)
 
     loss_scale = np.asarray(bundle.get("loss_scale") or np.ones(PHYSICS_DIM), dtype=np.float64)
     if loss_scale.size == PHYSICS_DIM:
