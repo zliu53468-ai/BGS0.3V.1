@@ -17,8 +17,70 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
-      - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
+      - name: Syntax check prediction and DG road detector
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py road_detector.py
+
+      - name: DG right-edge column regression
+        run: |
+          python - <<'PY'
+          import cv2, numpy as np
+          import road_detector as rd
+
+          def draw_case(missing_right_boundary=False):
+              h, w = 172, 592
+              grid_w = 573
+              rows, cols = 6, 20
+              pitch_x = grid_w / cols
+              pitch_y = h / rows
+              img = np.full((h, w, 3), 246, np.uint8)
+
+              vertical_count = cols if missing_right_boundary else cols + 1
+              for c in range(vertical_count):
+                  x = min(w-1, int(round(c * pitch_x)))
+                  cv2.line(img, (x,0), (x,h-1), (188,188,188), 1)
+              for r in range(rows + 1):
+                  y = min(h-1, int(round(r * pitch_y)))
+                  cv2.line(img, (0,y), (int(round(grid_w)),y), (188,188,188), 1)
+
+              seq = [
+                  (0,0,'P'),(1,0,'B'),(1,1,'B'),(2,0,'P'),
+                  (3,0,'B'),(3,1,'B'),(3,2,'B'),(4,0,'P'),
+                  (5,0,'B'),(6,0,'P'),(6,1,'P'),(7,0,'B'),
+                  (8,0,'P'),(9,0,'B'),(10,0,'P'),(11,0,'B'),
+              ]
+              if missing_right_boundary:
+                  seq.append((19,0,'P'))
+              for c,r,o in seq:
+                  cx=int(round((c+.5)*pitch_x)); cy=int(round((r+.5)*pitch_y))
+                  color=(30,30,220) if o=='B' else (220,90,35)
+                  cv2.circle(img,(cx,cy),8,color,2,cv2.LINE_AA)
+              return img
+
+          # A: supplied-screen failure shape: real 20-column road ends before a ~0.66 cell white margin.
+          case_a = draw_case(False)
+          bounds_a = rd._dg_line_grid_bounds(case_a)
+          assert bounds_a is not None, "case A bounds missing"
+          print("A", bounds_a)
+          assert bounds_a["grid_columns"] == 20, bounds_a
+          assert bounds_a["line_right_boundary_inferred"] is False, bounds_a
+
+          result_a = rd._detect_fixed_grid(case_a, profile="dg_feature_white_grid")
+          assert result_a["grid_columns"] == 20, result_a["column_candidates"]
+          assert result_a["recognized_count"] >= 16, result_a["recognized_count"]
+          assert result_a["reconstructed_all"] is True, result_a["fallback_reason"]
+          assert result_a["quality_ok"] is True, result_a["fallback_reason"]
+
+          # B: if the last right grid line is genuinely clipped, real ring pixels in that column allow repair.
+          case_b = draw_case(True)
+          bounds_b = rd._dg_line_grid_bounds(case_b)
+          assert bounds_b is not None, "case B bounds missing"
+          print("B", bounds_b)
+          assert bounds_b["grid_columns"] == 20, bounds_b
+          assert bounds_b["line_right_boundary_inferred"] is True, bounds_b
+          assert bounds_b["line_right_inference_color_pixels"] >= 5, bounds_b
+
+          print("dg-right-edge-regression-ok")
+          PY
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
