@@ -657,12 +657,17 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     del user_id
     prediction = dict(session.get("screen_last_prediction") or {})
     formal_code = str(prediction.get("internal_action") or prediction.get("internal_recommend") or prediction.get("action") or prediction.get("recommend") or "").upper().strip()
-    if formal_code not in {"B", "P"}:
-        banker = float(prediction.get("banker_rate", 0.0) or 0.0)
-        player = float(prediction.get("player_rate", 0.0) or 0.0)
-        formal_code = "B" if banker >= player else "P"
-    formal_text = "莊" if formal_code == "B" else "閒"
-    direction_color = "#D52B2B" if formal_code == "B" else "#2667D8"
+    if formal_code in {"SKIP", "O", "OBSERVE"} or bool(prediction.get("skip")):
+        formal_code = "SKIP"
+        formal_text = "觀望"
+        direction_color = "#7B5600"
+    else:
+        if formal_code not in {"B", "P"}:
+            banker = float(prediction.get("banker_rate", 0.0) or 0.0)
+            player = float(prediction.get("player_rate", 0.0) or 0.0)
+            formal_code = "B" if banker >= player else "P"
+        formal_text = "莊" if formal_code == "B" else "閒"
+        direction_color = "#D52B2B" if formal_code == "B" else "#2667D8"
     prediction["formal_direction"] = formal_code
     prediction["formal_direction_text"] = formal_text
     prediction["next_round_direction"] = formal_code
