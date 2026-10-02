@@ -239,6 +239,31 @@ def _reply(token: str, messages: List[Dict[str, Any]]) -> bool:
     return True
 
 
+def _start_loading_animation(user_id: str, loading_seconds: int = 20) -> bool:
+    """Show LINE's native chat loading animation; failures never block replies."""
+    target = str(user_id or "").strip()
+    if not target or not CHANNEL_ACCESS_TOKEN:
+        return False
+    seconds = min(60, max(5, int(round(float(loading_seconds or 20) / 5.0) * 5)))
+    try:
+        response = _LINE_HTTP.post(
+            "https://api.line.me/v2/bot/chat/loading/start",
+            headers={
+                "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"chatId": target, "loadingSeconds": seconds},
+            timeout=3,
+        )
+        if response.status_code >= 300:
+            print("LINE loading animation failed", response.status_code, (response.text or "")[:300])
+            return False
+        return True
+    except Exception as exc:
+        print("LINE loading animation exception", str(exc)[:300])
+        return False
+
+
 def _push(
     to: str,
     messages: List[Dict[str, Any]],
@@ -552,6 +577,41 @@ def _clean_flex(value: Any) -> Any:
     return value
 
 
+def _yellow_white_panel(title: str, alt_text: str, body_contents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Classic BGS yellow title bar + white data area used by LINE cards."""
+    return _clean_flex({
+        "type": "flex",
+        "altText": alt_text,
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#FFD400",
+                "paddingAll": "12px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": title,
+                        "weight": "bold",
+                        "size": "xl",
+                        "align": "center",
+                        "color": "#272727",
+                    }
+                ],
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#FFFFFF",
+                "paddingAll": "16px",
+                "contents": body_contents,
+            },
+        },
+    })
+
+
 def guide_panel() -> Dict[str, Any]:
     return _clean_flex({"type": "flex", "altText": "BGS AI預測系統使用指南", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFFFFF", "paddingAll": "18px", "contents": [
         {"type": "text", "text": "BGS AI預測系統", "weight": "bold", "size": "xl", "color": "#3E3100"},
@@ -565,11 +625,11 @@ def guide_panel() -> Dict[str, Any]:
 
 def selected_venue_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
     venue_name = _venue_name(str(session.get("venue") or ""))
-    return _clean_flex({"type": "flex", "altText": f"已選擇：{venue_name}", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
-        {"type": "text", "text": "館別選擇完成", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"目前選擇：{venue_name}\n桌號：{session.get('room') or '1'}", "wrap": True, "margin": "md", "color": "#3E3100"},
-        {"type": "text", "text": "下一步請輸入本次分析本金，系統會依正式訊號提供配置建議。", "wrap": True, "margin": "md", "color": "#665000"},
-    ]}}})
+    return _yellow_white_panel("館別選擇完成", f"已選擇：{venue_name}", [
+        {"type": "text", "text": f"目前選擇：{venue_name}", "wrap": True, "color": "#272727"},
+        {"type": "separator", "margin": "md", "color": "#F1B900"},
+        {"type": "text", "text": "下一步請輸入本次分析本金，系統會依正式訊號提供配置建議。", "wrap": True, "margin": "md", "color": "#3E3100"},
+    ])
 
 
 def venue_panel(user_id: str) -> Dict[str, Any]:
@@ -593,7 +653,7 @@ def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     bankroll_text = f"{_format_money(bankroll)} 元" if bankroll > 0 else "尚未設定"
     body = {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
         {"type": "text", "text": "BGS AI預測系統", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"分析館別：{venue}\n桌號：{session.get('room') or '1'}\n資金設定：{bankroll_text}\n\n選擇館別後請設定本金，再上傳最新完整遊戲畫面。首次辨識完成後，每局只需回報莊／閒／和。", "wrap": True, "margin": "md", "color": "#4C3900"},
+        {"type": "text", "text": f"分析館別：{venue}\n資金設定：{bankroll_text}\n\n選擇館別後請設定本金，再上傳最新完整遊戲畫面。首次辨識完成後，每局只需回報莊／閒／和。", "wrap": True, "margin": "md", "color": "#4C3900"},
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [_postback_button("開始牌局分析", "start_screen"), _postback_button("設定／調整本金", "change_bankroll", color="#E29B19"), _postback_button("重新選擇館別", "venues", style="secondary")]},
     ]}
     return _clean_flex({"type": "flex", "altText": "BGS AI預測系統", "contents": {"type": "bubble", "size": "mega", "body": body}})
@@ -603,18 +663,19 @@ def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     del user_id
     current = int(session.get("bankroll", 0) or 0)
     current_text = f"目前設定：{_format_money(current)} 元\n" if current > 0 else ""
-    return _clean_flex({"type": "flex", "altText": "設定分析本金", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
-        {"type": "text", "text": "設定分析本金", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"{current_text}請直接輸入金額，例如：10000\n\n系統會依方向訊號、模型一致度與風險區間計算建議配置。", "wrap": True, "margin": "md", "color": "#4C3900"},
-        _postback_button("返回館別選單", "venues", style="secondary"),
-    ]}}})
+    return _yellow_white_panel("設定分析本金", "設定分析本金", [
+        {"type": "text", "text": f"{current_text}請直接輸入金額，例如：10000\n\n系統會依方向訊號、模型一致度與風險區間計算建議配置。", "wrap": True, "color": "#272727"},
+        {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
+            _postback_button("返回館別選單", "venues", style="secondary"),
+        ]},
+    ])
 
 
 def upload_request_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     del user_id
     return _clean_flex({"type": "flex", "altText": "上傳牌局畫面", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
         {"type": "text", "text": "建立牌局資料", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n桌號：{session.get('room') or '1'}\n本金：{_format_money(session.get('bankroll', 0))} 元\n\n請開始上傳最新完整遊戲畫面進行分析。建議保留完整大路區域，避免裁掉左上起始格與六列格線。", "wrap": True, "margin": "md", "color": "#4C3900"},
+        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本金：{_format_money(session.get('bankroll', 0))} 元\n\n請開始上傳最新完整遊戲畫面進行分析。建議保留完整大路區域，避免裁掉左上起始格與六列格線。", "wrap": True, "margin": "md", "color": "#4C3900"},
         {"type": "text", "text": "首次畫面完成後，系統將建立初始牌路；後續每局只需回報實際開出莊或閒。", "wrap": True, "size": "sm", "margin": "md", "color": "#806A2A"},
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [_postback_button("調整本金", "change_bankroll", color="#E29B19"), _postback_button("重新選擇館別", "venues", style="secondary"), _postback_button("結束本次分析", "end", style="secondary")]},
     ]}}})
@@ -638,8 +699,8 @@ def result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     verdict = str(prediction.get("verdict_text") or "-")
     round_number = int(session.get("hand_number", 0) or 0)
     body_contents: List[Dict[str, Any]] = [
-        {"type": "text", "text": f"分析結果 #{round_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}｜桌號：{session.get('room') or '1'}\n牌靴：{str(session.get('shoe_id') or '-')[:12]}｜剩餘：{len(session.get('virtual_shoe') or [])} 張", "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
+        {"type": "text", "text": "分析結果", "weight": "bold", "size": "xl", "color": "#7B5600"},
+        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n牌靴：{str(session.get('shoe_id') or '-')[:12]}｜剩餘：{len(session.get('virtual_shoe') or [])} 張", "wrap": True, "size": "sm", "margin": "sm", "color": "#665000"},
         {"type": "separator", "margin": "md", "color": "#E1BD43"},
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": [
             {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
@@ -660,42 +721,44 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     if formal_code in {"SKIP", "O", "OBSERVE"} or bool(prediction.get("skip")):
         formal_code = "SKIP"
         formal_text = "觀望"
-        direction_color = "#7B5600"
     else:
         if formal_code not in {"B", "P"}:
             banker = float(prediction.get("banker_rate", 0.0) or 0.0)
             player = float(prediction.get("player_rate", 0.0) or 0.0)
             formal_code = "B" if banker >= player else "P"
         formal_text = "莊" if formal_code == "B" else "閒"
-        direction_color = "#D52B2B" if formal_code == "B" else "#2667D8"
     prediction["formal_direction"] = formal_code
     prediction["formal_direction_text"] = formal_text
     prediction["next_round_direction"] = formal_code
     prediction["next_round_direction_text"] = formal_text
-    analysis_number = int(session.get("screen_analysis_count", 0) or 0)
+
     bankroll = int(prediction.get("bankroll", session.get("bankroll", 0)) or 0)
     suggested = int(prediction.get("suggested_bet_amount", 0) or 0)
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
-    bet_level = str(prediction.get("bet_level_text") or "標準區間")
-    bet_text = f"{_format_money(suggested)} 元（{percentage:.1f}%｜{bet_level}）" if suggested > 0 else f"0 元（{percentage:.1f}%）"
-    return _clean_flex({"type": "flex", "altText": f"BGS AI 下一局方向：{formal_text}", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
-        {"type": "text", "text": f"BGS AI 下一局分析 #{analysis_number}", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "separator", "margin": "md", "color": "#E1BD43"},
-        {"type": "text", "text": f"下一局方向評估：{formal_text}", "weight": "bold", "size": "xl", "margin": "md", "color": direction_color},
-        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": [
-            {"type": "text", "text": f"莊　{float(prediction.get('banker_rate', 0.0)):.2f}%", "color": "#D52B2B", "weight": "bold"},
-            {"type": "text", "text": f"閒　{float(prediction.get('player_rate', 0.0)):.2f}%", "color": "#2667D8", "weight": "bold"},
-            {"type": "text", "text": f"和　{float(prediction.get('tie_rate', 0.0)):.2f}%", "color": "#259B55", "weight": "bold"},
+    bet_text = f"{_format_money(suggested)} 元（{percentage:.1f}%）" if suggested > 0 else f"0 元（{percentage:.1f}%）"
+
+    return _yellow_white_panel("分析數據", f"BGS AI 下一局方向：{formal_text}", [
+        {"type": "box", "layout": "horizontal", "contents": [
+            {"type": "text", "text": "莊", "weight": "bold", "color": "#D52B2B", "flex": 1},
+            {"type": "text", "text": f"{float(prediction.get('banker_rate', 0.0)):.2f}%", "weight": "bold", "align": "end", "color": "#D52B2B", "flex": 2},
         ]},
-        {"type": "separator", "margin": "md", "color": "#E1BD43"},
-        {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#3E3100"},
+        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+            {"type": "text", "text": "閒", "weight": "bold", "color": "#2667D8", "flex": 1},
+            {"type": "text", "text": f"{float(prediction.get('player_rate', 0.0)):.2f}%", "weight": "bold", "align": "end", "color": "#2667D8", "flex": 2},
+        ]},
+        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+            {"type": "text", "text": "和", "weight": "bold", "color": "#159447", "flex": 1},
+            {"type": "text", "text": f"{float(prediction.get('tie_rate', 0.0)):.2f}%", "weight": "bold", "align": "end", "color": "#159447", "flex": 2},
+        ]},
+        {"type": "separator", "margin": "md", "color": "#F1B900"},
+        {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
             _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
             _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
             _postback_button("🟢 本局結果：和", "road_append", color="#159447", result="T"),
             _postback_button("結束本次分析", "end", style="secondary"),
         ]},
-    ]}}})
+    ])
 
 
 def ended_panel() -> Dict[str, Any]:
@@ -1257,6 +1320,8 @@ async def webhook(request: Request) -> JSONResponse:
         if not user_id:
             _reply(token, [_text("無法取得 LINE UID，請改在與機器人的一對一聊天室操作。")])
             continue
+        if str(source.get("type") or "").lower() == "user":
+            await asyncio.to_thread(_start_loading_animation, user_id, 20)
         try:
             event_type = event.get("type")
             message = event.get("message") or {}
