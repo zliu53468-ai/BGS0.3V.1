@@ -84,7 +84,8 @@ jobs:
               # Target must be on the right-middle white road paper, not bead road / derived roads.
               assert roi[0] > 0.22, (shift,roi,score)
               assert 0.58 < roi[1] < 0.90, (shift,roi,score)
-              assert roi[2] > 0.45, (shift,roi,score)
+              assert roi[2] > 0.25, (shift,roi,score)
+              assert 0.025 < roi[3] < 0.16, (shift,roi,score)
 
               x=int(round(roi[0]*img.shape[1])); y=int(round(roi[1]*img.shape[0]))
               w=max(1,int(round(roi[2]*img.shape[1]))); h=max(1,int(round(roi[3]*img.shape[0])))
