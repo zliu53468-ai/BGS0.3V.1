@@ -83,6 +83,8 @@ def _try_mt_ofalive99(
                 ring_grid=True,
                 grid_columns=None,
                 layout_profile="mt_ofalive99_mobile_full_screen",
+                deadline=deadline,
+                cancel_event=cancel_event,
             )
             current = dict(current)
             candidates.append(current)
@@ -120,6 +122,8 @@ def _try_mt_ofalive99(
                 }
             )
             return result
+        except TimeoutError:
+            raise
         except Exception as exc:
             errors.append(f"{name}: {exc}")
 
@@ -134,13 +138,20 @@ def detect_road_sequence_detailed(
     deadline: Optional[float] = None,
     cancel_event: Any = None,
 ) -> Dict[str, Any]:
-    """先嘗試新增 MT/ofalive99 Profile；未命中就原封不動走既有 detector。"""
+    """先嘗試 MT/ofalive99 Profile；整個 wrapper 與 base detector 共用同一硬截止。"""
+    started = time.perf_counter()
+    internal_deadline = started + float(_base.ROAD_DETECTOR_HARD_TIMEOUT_SECONDS)
+    effective_deadline = (
+        min(float(deadline), internal_deadline)
+        if deadline is not None
+        else internal_deadline
+    )
     try:
         preferred = _try_mt_ofalive99(
             image_path,
             venue=venue,
             input_type=input_type,
-            deadline=deadline,
+            deadline=effective_deadline,
             cancel_event=cancel_event,
         )
         if preferred is not None:
@@ -154,7 +165,7 @@ def detect_road_sequence_detailed(
         image_path,
         venue=venue,
         input_type=input_type,
-        deadline=deadline,
+        deadline=effective_deadline,
         cancel_event=cancel_event,
     )
 
