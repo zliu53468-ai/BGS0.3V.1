@@ -1159,7 +1159,31 @@ def _column_candidates(
 
     values = {ROAD_GRID_COLS}
     if generic_auto:
-        # 不再假設格子一定正方形；用多個 cell-width / cell-height 比例推回欄數。
+        square_estimate = int(round(aspect * ROAD_GRID_ROWS))
+        square_estimate = max(
+            ROAD_GRID_AUTO_COL_MIN,
+            min(maximum, square_estimate),
+        )
+
+        # DG 白色大路格線在手機與電腦版都接近正方形。
+        # 先測幾何上最直接的欄數與 ±1，避免正確欄數被其他矩形比例假設排到第 4 名之後。
+        if profile_key.startswith("dg_feature_white_grid"):
+            ordered: List[int] = []
+            for candidate in (
+                square_estimate,
+                square_estimate - 1,
+                square_estimate + 1,
+                ROAD_GRID_COLS,
+            ):
+                candidate = max(
+                    ROAD_GRID_AUTO_COL_MIN,
+                    min(maximum, int(candidate)),
+                )
+                if candidate not in ordered:
+                    ordered.append(candidate)
+            return ordered[:ROAD_GENERIC_MAX_COLUMN_CANDIDATES]
+
+        # 通用 Auto Focus 仍保留多種矩形 cell 比例假設。
         for cell_ratio in (0.68, 0.82, 1.0, 1.22, 1.45):
             estimated = int(round(aspect * ROAD_GRID_ROWS / cell_ratio))
             estimated = max(ROAD_GRID_AUTO_COL_MIN, min(maximum, estimated))
@@ -1168,7 +1192,7 @@ def _column_candidates(
                 candidate = estimated + delta
                 if ROAD_GRID_AUTO_COL_MIN <= candidate <= maximum:
                     values.add(candidate)
-        square_estimate = int(round(aspect * ROAD_GRID_ROWS))
+        values.add(square_estimate)
         ordered = sorted(
             values,
             key=lambda value: (
