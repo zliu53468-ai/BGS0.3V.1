@@ -2231,18 +2231,6 @@ def detect_road_sequence_detailed(
                 "profile": "dg_mobile_full_screen",
             })
 
-        if portrait and MOBILE_AUTO_FOCUS_ENABLED:
-            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
-            for index, (roi, auto_score) in enumerate(_mobile_white_road_candidates(image)):
-                plan.append({
-                    "name": f"mobile_auto_white_road_{index}",
-                    "roi": roi,
-                    "preference": 58.0 + min(4.0, auto_score),
-                    "fixed_grid": True,
-                    "grid_columns": None,
-                    "profile": "mobile_auto_white_road",
-                })
-
         if portrait and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
@@ -2289,6 +2277,18 @@ def detect_road_sequence_detailed(
                     "grid_columns": None,
                     "profile": "db_mobile_full_screen",
                 })
+        if portrait and MOBILE_AUTO_FOCUS_ENABLED:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
+            for index, (roi, auto_score) in enumerate(_mobile_white_road_candidates(image)):
+                plan.append({
+                    "name": f"mobile_auto_white_road_{index}",
+                    "roi": roi,
+                    "preference": 58.0 + min(4.0, auto_score),
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "mobile_auto_white_road",
+                })
+
         if landscape and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
@@ -2417,6 +2417,7 @@ def detect_road_sequence_detailed(
         "road_crop_signature": bool(crop_signature),
         "dream_compact_mobile_profile_detected": bool(dream_compact_mobile_layout),
         "ofalive_android_profile_detected": bool(ofalive_android_layout),
+        "mobile_auto_focus_used": str(best.get("region_name") or "").startswith("mobile_auto_white_road_"),
         "image_size": {"width": image_width, "height": image_height},
         "candidate_regions": [
             {
