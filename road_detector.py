@@ -3333,17 +3333,14 @@ def _dg_white_grid_feature_candidates(
 
     hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
     hue, sat, val = cv2.split(hsv)
-    red_blue = (
-        (sat >= 16)
-        & (val >= 25)
-        & (
-            (hue <= 32)
-            | (hue >= 148)
-            | ((hue >= 80) & (hue <= 160))
-        )
-    )
+    color_valid = (sat >= 16) & (val >= 25)
+    red_bool = color_valid & ((hue <= 32) | (hue >= 148))
+    blue_bool = color_valid & (hue >= 82) & (hue <= 160)
+    red_blue = red_bool | blue_bool
 
     white_integral = cv2.integral(white_bool.astype(np.uint8), sdepth=cv2.CV_32S)
+    red_integral = cv2.integral(red_bool.astype(np.uint8), sdepth=cv2.CV_32S)
+    blue_integral = cv2.integral(blue_bool.astype(np.uint8), sdepth=cv2.CV_32S)
     color_integral = cv2.integral(red_blue.astype(np.uint8), sdepth=cv2.CV_32S)
 
     def _rect_mean(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
@@ -3372,6 +3369,102 @@ def _dg_white_grid_feature_candidates(
         ):
             continue
         candidate_boxes.append((x, y, x + w, y + h, 1.0))
+
+    # Fast path：大型白色路紙一旦找到，直接在其上半部鎖 6×N 真實格線。
+    # 這比後面的多尺度 coarse-window 搜尋快非常多，也能讓 LINE 先在 6~9 秒內完成。
+    fast_scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for box_index, (x1, y1, x2, y2, source_score) in enumerate(candidate_boxes[:8]):
+        if (box_index & 3) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.18)
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < pw * 0.50 or box_h < ph * 0.055:
+            continue
+
+        # DG/Dream 大路位於白色路紙的上半部偏右；只測少量寬鬆子區，
+        # 讓 _dg_line_grid_bounds() 自己排除左珠盤與下三路。
+        for x_fraction in (0.12, 0.20, 0.28):
+            sx1 = max(0, int(round(x1 + box_w * x_fraction)))
+            sx2 = min(pw, x2)
+            if sx2 - sx1 < 120:
+                continue
+            for height_fraction in (0.72, 0.82):
+                sy1 = max(0, y1)
+                sy2 = min(ph, int(round(y1 + box_h * height_fraction)))
+                if sy2 - sy1 < 48:
+                    continue
+                sub = preview[sy1:sy2, sx1:sx2]
+                bounds = _dg_line_grid_bounds(sub)
+                if bounds is None:
+                    continue
+
+                columns = int(bounds.get("grid_columns", 0) or 0)
+                coverage = float(bounds.get("coverage", 0.0) or 0.0)
+                square = float(bounds.get("square_cell_score", 0.0) or 0.0)
+                center_alignment = float(
+                    bounds.get("line_color_center_alignment", 0.0) or 0.0
+                )
+                if (
+                    columns < 10
+                    or coverage < 0.78
+                    or square < 0.76
+                    or center_alignment < 0.40
+                ):
+                    continue
+
+                gx1 = sx1 + int(bounds["x"])
+                gy1 = sy1 + int(bounds["y"])
+                gx2 = gx1 + int(bounds["width"])
+                gy2 = gy1 + int(bounds["height"])
+                gx1 = max(0, min(pw - 1, gx1))
+                gy1 = max(0, min(ph - 1, gy1))
+                gx2 = max(gx1 + 1, min(pw, gx2))
+                gy2 = max(gy1 + 1, min(ph, gy2))
+
+                red_fraction = _rect_mean(red_integral, gx1, gy1, gx2, gy2)
+                blue_fraction = _rect_mean(blue_integral, gx1, gy1, gx2, gy2)
+                white_fraction = _rect_mean(white_integral, gx1, gy1, gx2, gy2)
+                if (
+                    red_fraction < 0.00035
+                    or blue_fraction < 0.00035
+                    or white_fraction < 0.42
+                ):
+                    continue
+
+                aspect = (gx2 - gx1) / max(1.0, float(gy2 - gy1))
+                if aspect < 2.4:
+                    continue
+                score = (
+                    4.0
+                    + 1.25 * coverage
+                    + 1.10 * square
+                    + 0.90 * center_alignment
+                    + 0.35 * min(1.0, columns / 20.0)
+                    + 0.20 * min(1.0, source_score)
+                )
+                fast_scored.append(
+                    (
+                        (
+                            gx1 / float(pw),
+                            gy1 / float(ph),
+                            (gx2 - gx1) / float(pw),
+                            (gy2 - gy1) / float(ph),
+                        ),
+                        score,
+                    )
+                )
+
+    if fast_scored:
+        fast_scored.sort(key=lambda item: item[1], reverse=True)
+        selected_fast: List[Tuple[Tuple[float, float, float, float], float]] = []
+        for roi, score in fast_scored:
+            if any(_roi_iou(roi, prior) >= 0.72 for prior, _ in selected_fast):
+                continue
+            selected_fast.append((roi, score))
+            if len(selected_fast) >= DG_FEATURE_MAX_CANDIDATES:
+                break
+        if selected_fast:
+            return selected_fast
 
     # Contour 被格線切碎時，用全畫面 integral-image coarse scan 補候選。
     coarse: List[Tuple[float, Tuple[int, int, int, int]]] = []
