@@ -300,6 +300,10 @@ def analyze_game_screen(
         "mobile_auto_focus_used": bool(road.get("mobile_auto_focus_used")),
         "reconstruction_repaired": bool(road.get("reconstruction_repaired")),
         "repaired_cell": dict(road.get("repaired_cell") or {}),
+        "reconstruction_search_ms": float(road.get("reconstruction_search_ms", 0.0) or 0.0),
+        "reconstruction_budget_exhausted": bool(road.get("reconstruction_budget_exhausted")),
+        "detector_hard_timeout_reached": bool(road.get("detector_hard_timeout_reached")),
+        "detector_elapsed_ms": float(road.get("detector_elapsed_ms", 0.0) or 0.0),
         "debug_overlay_path": str(road.get("debug_overlay_path") or ""),
         # 真人截圖沒有真實剩餘牌點組成，預測端必須視為 estimated。
         "composition_quality": "estimated",
