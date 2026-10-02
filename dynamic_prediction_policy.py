@@ -25,7 +25,7 @@ from contextual_bandit import (
 from bbb_v23_hazard import predict_v23_bandit
 from performance_tracker import get_resolved_records
 
-POLICY_VERSION = "LINUCB-256D-BBB-V23-SHORT-X-DYNAMIC-PARITY"
+POLICY_VERSION = "LINUCB-256D-BBB-V23-R1-FINAL57-BRIDGE"
 OUTCOMES = ("B", "P")
 WINDOW_SIZE = 24
 MARKOV_MAX_ORDER = 1
