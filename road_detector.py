@@ -202,6 +202,18 @@ DG_FEATURE_MAX_CANDIDATES = _env_int(
 DB_FEATURE_MAX_CANDIDATES = _env_int(
     "DB_FEATURE_MAX_CANDIDATES", 2, 1, 3
 )
+DB_FEATURE_PREVIEW_SIDE = _env_int(
+    "DB_FEATURE_PREVIEW_SIDE", 820, 640, 1080
+)
+DB_FEATURE_PROBE_WINDOWS = _env_int(
+    "DB_FEATURE_PROBE_WINDOWS", 18, 8, 32
+)
+DB_RING_MIN_DOMINANCE = _env_float(
+    "DB_RING_MIN_DOMINANCE", 1.08, 1.02, 1.80
+)
+DB_RING_MIN_COLOR_RATIO = _env_float(
+    "DB_RING_MIN_COLOR_RATIO", 0.045, 0.020, 0.12
+)
 MOBILE_AUTO_FOCUS_MAX_CANDIDATES = _env_int(
     "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 3, 1, 4
 )
@@ -606,6 +618,56 @@ def _color_masks(
     ).astype(np.uint8)
     union = ((red | blue | green) > 0).astype(np.uint8)
     return red, blue, green, union
+
+
+def _db_color_masks(
+    crop: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    """DB 真人專用自適應顏色。
+
+    DB 的紅環大多落在 HSV 高紅端，藍環落在約 90~140。
+    這裡刻意讓紅/藍 hue 區間不重疊，避免深色 UI / 瀏覽器 icon
+    同時被算成紅與藍。飽和度則依每張圖自動下修，兼容手機色溫、
+    LINE 壓縮與低飽和截圖。
+    """
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    valid = (value >= 22) & (saturation >= 8)
+
+    red_hue = (hue <= 24) | (hue >= 156)
+    blue_hue = (hue >= 86) & (hue <= 146)
+
+    def _adaptive_s_floor(seed: np.ndarray, fallback: float) -> float:
+        values = saturation[seed & valid]
+        if values.size < 12:
+            return float(fallback)
+        return float(np.clip(np.percentile(values, 20) * 0.58, 16.0, 44.0))
+
+    red_s = _adaptive_s_floor(red_hue, 28.0)
+    blue_s = _adaptive_s_floor(blue_hue, 26.0)
+
+    red = (
+        red_hue
+        & (saturation >= red_s)
+        & (value >= 24)
+    ).astype(np.uint8)
+    blue = (
+        blue_hue
+        & (saturation >= blue_s)
+        & (value >= 24)
+    ).astype(np.uint8)
+    green = (
+        (hue >= 30)
+        & (hue <= 92)
+        & (saturation >= 18)
+        & (value >= 22)
+    ).astype(np.uint8)
+
+    union = ((red | blue | green) > 0).astype(np.uint8)
+    return red, blue, green, union, {
+        "red_s": red_s,
+        "blue_s": blue_s,
+    }
 
 
 def _axis_alignment(
@@ -2116,6 +2178,61 @@ def _nearest_ring_pitch(
         if abs(value - median) <= max(2.5, median * 0.18)
     ]
     return _median_float(trimmed, median)
+
+
+def _db_select_six_row_band(
+    items: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], float]:
+    """從 DB 候選圓中選出真正的六列大路 band。
+
+    不再固定刪除 crop 上方 30%。改由圓環自身半徑推估 row pitch，
+    再找能容納最多圓、水平跨度最大的 6-row 區帶，因而可排除
+    問路按鈕、瀏覽器 icon 與上方投注 UI。
+    """
+    if not items:
+        return [], 0.0
+
+    radii = [
+        float(item.get("radius", 0.0) or 0.0)
+        for item in items
+        if float(item.get("radius", 0.0) or 0.0) > 0.0
+    ]
+    median_radius = _median_float(radii, 4.0)
+    expected_pitch = max(7.0, median_radius * 2.55)
+    pitch_y = _nearest_ring_pitch(
+        items,
+        axis="y",
+        expected=expected_pitch,
+    )
+    pitch_y = max(6.0, float(pitch_y))
+
+    best: Optional[Tuple[float, float, List[Dict[str, Any]]]] = None
+    for source in items:
+        source_y = float(source.get("cy", 0.0) or 0.0)
+        # 真正第一列圓心附近作為 band 上緣；允許少量 AA / Hough 誤差。
+        band_top = source_y - pitch_y * 0.38
+        band_bottom = band_top + pitch_y * 6.15
+        selected = [
+            dict(item)
+            for item in items
+            if band_top <= float(item.get("cy", 0.0) or 0.0) <= band_bottom
+        ]
+        if not selected:
+            continue
+        xs = [float(item.get("cx", 0.0) or 0.0) for item in selected]
+        span_x = max(xs) - min(xs) if len(xs) >= 2 else 0.0
+        score = (
+            len(selected) * 3.0
+            + min(12.0, span_x / max(1.0, pitch_y)) * 0.6
+        )
+        if best is None or score > best[0]:
+            best = (score, band_top, selected)
+
+    if best is None:
+        return [dict(item) for item in items], pitch_y
+
+    selected = best[2]
+    return selected, pitch_y
 
 
 def _debug_ring_overlay(
