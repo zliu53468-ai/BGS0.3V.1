@@ -17,8 +17,73 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
-      - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
+      - name: Syntax check prediction and road detector
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py road_detector.py screen_pipeline.py baccarat_vision.py
+      - name: DG fixed-grid and DB ring-repair smoke tests
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import road_detector as rd
+
+          assert rd.ROAD_RECONSTRUCT_MAX_NODES >= 200000
+
+          # DG bug regression: profile must be accepted by _classify_grid without NameError.
+          crop = np.full((120, 240, 3), 245, np.uint8)
+          red = np.zeros((120, 240), np.uint8)
+          blue = np.zeros((120, 240), np.uint8)
+          green = np.zeros((120, 240), np.uint8)
+          red[8:25, 8:25] = 1
+          blue[8:25, 48:65] = 1
+          bounds = {
+              "x": 0, "y": 0, "width": 240, "height": 120,
+              "score": 1.0, "coverage": 1.0, "square_cell_score": 1.0,
+              "cell_pitch_x": 40.0, "cell_pitch_y": 20.0,
+              "offset_x": 0, "offset_y": 0, "scale_x": 1.0, "scale_y": 1.0,
+              "gain_x": 0.0, "gain_y": 0.0,
+          }
+          classified = rd._classify_grid(
+              crop, red, blue, green, bounds,
+              grid_columns=6, grid_rows=6,
+              profile="dg_feature_white_grid",
+          )
+          assert isinstance(classified, dict)
+
+          # DB ring-hole regression: one real-color missing cell + unique road solution is repairable.
+          cells = [
+              {"column":0,"row":0,"outcome":"P","radius":6,"cx":10.0,"cy":10.0},
+              {"column":0,"row":1,"outcome":"P","radius":6,"cx":10.0,"cy":30.0},
+              {"column":0,"row":2,"outcome":"P","radius":6,"cx":10.0,"cy":50.0},
+              {"column":1,"row":0,"outcome":"B","radius":6,"cx":30.0,"cy":10.0},
+              {"column":1,"row":1,"outcome":"B","radius":6,"cx":30.0,"cy":30.0},
+              {"column":2,"row":0,"outcome":"P","radius":6,"cx":50.0,"cy":10.0},
+              {"column":2,"row":1,"outcome":"P","radius":6,"cx":50.0,"cy":30.0},
+              {"column":3,"row":1,"outcome":"B","radius":6,"cx":70.0,"cy":30.0},
+              {"column":3,"row":2,"outcome":"B","radius":6,"cx":70.0,"cy":50.0},
+          ]
+          red_mask = np.zeros((130, 130), np.uint8)
+          blue_mask = np.zeros((130, 130), np.uint8)
+          green_mask = np.zeros((130, 130), np.uint8)
+          yy, xx = np.ogrid[:130, :130]
+          missing = (xx - 70.0) ** 2 + (yy - 10.0) ** 2 <= 8.0 ** 2
+          red_mask[missing] = 1
+
+          repair = rd._repair_one_ring_grid_cell(
+              cells,
+              red_mask=red_mask,
+              blue_mask=blue_mask,
+              green_mask=green_mask,
+              pitch_x=20.0,
+              pitch_y=20.0,
+              origin_x=10.0,
+              origin_y=10.0,
+          )
+          assert repair is not None
+          assert repair["repaired_cell"]["column"] == 3
+          assert repair["repaired_cell"]["row"] == 0
+          assert repair["repaired_cell"]["outcome"] == "B"
+          assert repair["reconstruction"]["reconstructed_all"] is True
+          print("road-detector-regressions-ok")
+          PY
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
