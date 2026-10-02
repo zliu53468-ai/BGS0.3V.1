@@ -1145,6 +1145,95 @@ def _column_candidates(
     return ordered[:ROAD_FAST_MAX_COLUMN_CANDIDATES]
 
 
+def _repair_one_cell_reconstruction(
+    cells: Sequence[Mapping[str, Any]],
+    uncertain_cells: Sequence[Mapping[str, Any]],
+    all_grid_cells: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """只允許唯一解的一格修復；多解或兩格以上缺失一律不修。"""
+    if not ROAD_RECONSTRUCTION_ONE_CELL_REPAIR:
+        return None
+
+    occupied = {
+        (int(item.get("column", -1)), int(item.get("row", -1)))
+        for item in cells
+    }
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+
+    def _add_candidate(source: Mapping[str, Any], bonus: float = 0.0) -> None:
+        item = dict(source)
+        position = (int(item.get("column", -1)), int(item.get("row", -1)))
+        if position in occupied or position[0] < 0 or position[1] < 0:
+            return
+        red = float(item.get("red_pixels", 0) or 0)
+        blue = float(item.get("blue_pixels", 0) or 0)
+        minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+        dominance = float(item.get("dominance", 1.0) or 1.0)
+        evidence = max(red, blue) / minimum
+        score = evidence + 0.15 * min(3.0, dominance) + bonus
+        candidates.append((score, item))
+
+    for item in uncertain_cells:
+        _add_candidate(item, 0.35)
+
+    # 低飽和壓縮後可能被標為 empty；只收有明顯殘留紅/藍像素的弱格。
+    for item in all_grid_cells:
+        if not bool(item.get("empty")):
+            continue
+        red = float(item.get("red_pixels", 0) or 0)
+        blue = float(item.get("blue_pixels", 0) or 0)
+        minimum = max(1.0, float(item.get("minimum_color_pixels", 1) or 1))
+        dominance = float(item.get("dominance", 1.0) or 1.0)
+        if max(red, blue) >= minimum * 0.28 and dominance >= 1.08:
+            _add_candidate(item, 0.0)
+
+    # 左上原點是大路重建的硬需求；若它只有微弱顏色，也優先嘗試。
+    for item in all_grid_cells:
+        if int(item.get("column", -1)) == 0 and int(item.get("row", -1)) == 0:
+            _add_candidate(item, 0.50)
+            break
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    successes: List[Dict[str, Any]] = []
+    seen = set()
+    for _, source in candidates[:ROAD_REPAIR_MAX_CANDIDATES]:
+        position = (int(source.get("column", -1)), int(source.get("row", -1)))
+        if position in seen:
+            continue
+        seen.add(position)
+        for outcome in ("B", "P"):
+            repaired_cell = dict(source)
+            repaired_cell["outcome"] = outcome
+            repaired_cell["uncertain"] = False
+            repaired_cell["empty"] = False
+            repaired_cell["repaired_from_weak_cell"] = True
+            repaired_cell["confidence"] = max(
+                0.30,
+                min(0.49, float(source.get("confidence", 0.0) or 0.0)),
+            )
+            repaired_cells = [dict(item) for item in cells] + [repaired_cell]
+            reconstruction = _reconstruct_big_road_order(
+                repaired_cells,
+                return_details=True,
+                grid_rows=ROAD_GRID_ROWS,
+            )
+            if (
+                bool(reconstruction.get("reconstructed_all"))
+                and len(reconstruction.get("positions") or []) == len(repaired_cells)
+                and int(reconstruction.get("solution_count", 0) or 0) == 1
+            ):
+                successes.append({
+                    "cells": repaired_cells,
+                    "reconstruction": reconstruction,
+                    "repaired_cell": repaired_cell,
+                })
+
+    # 只有全域唯一解才接受，否則維持原本 fail-safe。
+    if len(successes) != 1:
+        return None
+    return successes[0]
+
+
 def _detect_fixed_grid_for_columns(
     crop: np.ndarray,
     grid_columns: int,
@@ -1170,6 +1259,29 @@ def _detect_fixed_grid_for_columns(
     reconstruction = _reconstruct_big_road_order(
         cells, return_details=True, grid_rows=ROAD_GRID_ROWS
     )
+    repaired_cell: Optional[Dict[str, Any]] = None
+    if not bool(reconstruction.get("reconstructed_all")):
+        repair = _repair_one_cell_reconstruction(
+            cells,
+            uncertain_cells,
+            all_grid_cells,
+        )
+        if repair is not None:
+            cells = list(repair["cells"])
+            reconstruction = dict(repair["reconstruction"])
+            repaired_cell = dict(repair["repaired_cell"])
+            repaired_position = (
+                int(repaired_cell.get("column", -1)),
+                int(repaired_cell.get("row", -1)),
+            )
+            uncertain_cells = [
+                item for item in uncertain_cells
+                if (
+                    int(item.get("column", -1)),
+                    int(item.get("row", -1)),
+                ) != repaired_position
+            ]
+
     ordered_positions = list(reconstruction["positions"])
     cell_lookup = {(int(item["column"]), int(item["row"])): item for item in cells}
     ordered_cells: List[Dict[str, Any]] = []
@@ -1281,11 +1393,13 @@ def _detect_fixed_grid_for_columns(
         "median_cell_confidence": round(median_confidence, 6),
         "reconstructed_all": bool(reconstruction["reconstructed_all"]),
         "reconstruction_solution_count": int(reconstruction["solution_count"]),
+        "reconstruction_repaired": bool(repaired_cell),
+        "repaired_cell": repaired_cell or {},
         "partial_reconstruction": list(reconstruction["partial_positions"]),
         "fallback_preview_positions": list(reconstruction["fallback_preview"]),
         "fallback_reason": fallback_reason,
         "uncertain_cells": uncertain_cells,
-        "count_is_confirmed": bool(quality_ok and uncertain_count == 0),
+        "count_is_confirmed": bool(quality_ok and uncertain_count == 0 and not repaired_cell),
         "debug_overlay_path": debug_overlay_path,
         "debug_enabled": ROAD_GRID_DEBUG,
         "layout_profile": profile,
