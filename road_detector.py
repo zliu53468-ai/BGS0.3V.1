@@ -706,12 +706,6 @@ def _classify_grid(
             red_pixels = _rect_sum(red_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             blue_pixels = _rect_sum(blue_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             green_pixels = _rect_sum(green_integral, inner_x1, inner_y1, inner_x2, inner_y2)
-            red_component, red_span_x, red_span_y = _largest_component_stats(
-                red_mask[inner_y1:inner_y2, inner_x1:inner_x2]
-            )
-            blue_component, blue_span_x, blue_span_y = _largest_component_stats(
-                blue_mask[inner_y1:inner_y2, inner_x1:inner_x2]
-            )
             minimum_pixels = max(
                 ROAD_GRID_MIN_COLOR_PIXELS,
                 int(round(inner_area * ROAD_GRID_MIN_COLOR_RATIO)),
@@ -719,6 +713,19 @@ def _classify_grid(
             minimum_component = max(
                 4, int(round(inner_area * ROAD_GRID_MIN_COMPONENT_AREA_RATIO))
             )
+            component_probe = max(3, int(round(minimum_pixels * 0.35)))
+            if red_pixels >= component_probe:
+                red_component, red_span_x, red_span_y = _largest_component_stats(
+                    red_mask[inner_y1:inner_y2, inner_x1:inner_x2]
+                )
+            else:
+                red_component, red_span_x, red_span_y = 0, 0.0, 0.0
+            if blue_pixels >= component_probe:
+                blue_component, blue_span_x, blue_span_y = _largest_component_stats(
+                    blue_mask[inner_y1:inner_y2, inner_x1:inner_x2]
+                )
+            else:
+                blue_component, blue_span_x, blue_span_y = 0, 0.0, 0.0
             red_shape_ok = bool(
                 red_component >= minimum_component
                 and min(red_span_x, red_span_y) >= ROAD_GRID_MIN_COMPONENT_SPAN_RATIO
@@ -742,13 +749,16 @@ def _classify_grid(
             elif max(red_pixels, blue_pixels) >= minimum_pixels and (red_shape_ok or blue_shape_ok):
                 is_uncertain = True
 
-            largest_green, green_concentration, green_span_x, green_span_y = _green_component_stats(
-                green_mask[inner_y1:inner_y2, inner_x1:inner_x2]
-            )
             tie_minimum = max(
                 ROAD_GRID_TIE_MIN_PIXELS,
                 int(round(inner_area * ROAD_GRID_TIE_MIN_AREA_RATIO)),
             )
+            if outcome and green_pixels >= max(3, int(round(tie_minimum * 0.35))):
+                largest_green, green_concentration, green_span_x, green_span_y = _green_component_stats(
+                    green_mask[inner_y1:inner_y2, inner_x1:inner_x2]
+                )
+            else:
+                largest_green, green_concentration, green_span_x, green_span_y = 0, 0.0, 0.0, 0.0
             green_area_ratio = green_pixels / max(1.0, float(inner_area))
             tie_confident = bool(
                 outcome
