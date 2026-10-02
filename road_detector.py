@@ -163,25 +163,27 @@ DREAM_COMPACT_MOBILE_PROFILE_ENABLED = (
 )
 DREAM_COMPACT_MOBILE_BIG_ROAD_ROI = _env_roi(
     "DREAM_COMPACT_MOBILE_BIG_ROAD_ROI",
-    (0.272, 0.725, 0.450, 0.145),
+    # 869x1884 supplied screenshot target ~= (0.326, 0.732, 0.647, 0.091).
+    # Keep padding so browser chrome / safe-area shifts still leave all six rows visible.
+    (0.305, 0.710, 0.685, 0.125),
 )
 DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y = _env_float(
-    "DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y", 0.020, 0.0, 0.10
+    "DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y", 0.065, 0.0, 0.14
 )
 DREAM_COMPACT_MOBILE_MIN_WIDTH = _env_int(
-    "DREAM_COMPACT_MOBILE_MIN_WIDTH", 320, 240, 1600
+    "DREAM_COMPACT_MOBILE_MIN_WIDTH", 280, 240, 1600
 )
 DREAM_COMPACT_MOBILE_MAX_WIDTH = _env_int(
-    "DREAM_COMPACT_MOBILE_MAX_WIDTH", 1200, 240, 2400
+    "DREAM_COMPACT_MOBILE_MAX_WIDTH", 1600, 240, 2400
 )
 DREAM_COMPACT_MOBILE_MIN_TALL_RATIO = _env_float(
-    "DREAM_COMPACT_MOBILE_MIN_TALL_RATIO", 2.10, 1.20, 4.00
+    "DREAM_COMPACT_MOBILE_MIN_TALL_RATIO", 1.55, 1.20, 4.00
 )
 DREAM_COMPACT_MOBILE_MAX_TALL_RATIO = _env_float(
-    "DREAM_COMPACT_MOBILE_MAX_TALL_RATIO", 2.19, 1.20, 4.00
+    "DREAM_COMPACT_MOBILE_MAX_TALL_RATIO", 2.75, 1.20, 4.00
 )
 DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION = _env_float(
-    "DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION", 0.62, 0.10, 0.95
+    "DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION", 0.38, 0.10, 0.95
 )
 
 # 專用手機 Profile 只先嘗試最接近的兩個 ROI，避免某一張全圖因為
@@ -821,9 +823,12 @@ def _classify_grid(
             red_pixels = _rect_sum(red_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             blue_pixels = _rect_sum(blue_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             green_pixels = _rect_sum(green_integral, inner_x1, inner_y1, inner_x2, inner_y2)
+            profile_key = str(profile or "").lower()
             mobile_like_profile = (
-                "mobile" in str(profile or "").lower()
-                or str(profile or "").startswith("road_crop")
+                "mobile" in profile_key
+                or profile_key.startswith("road_crop")
+                or profile_key.startswith("dg_feature_white_grid")
+                or profile_key.startswith("dream_compact")
             )
             if mobile_like_profile:
                 minimum_pixels = max(
@@ -2783,8 +2788,8 @@ def _looks_like_ofalive_android_fullscreen(image: np.ndarray) -> bool:
 
 
 def _looks_like_dream_compact_mobile_fullscreen(image: np.ndarray) -> bool:
-    """判斷珠盤路／大路／下三路橫向並列的 Dream 緊湊手機版。"""
-    if not DREAM_COMPACT_MOBILE_PROFILE_ENABLED:
+    """Dream/DG 手機全畫面：用白色路紙 + 紅藍環 + 格線證據判斷，不綁單一瀏覽器比例。"""
+    if not DREAM_COMPACT_MOBILE_PROFILE_ENABLED or image is None or image.size == 0:
         return False
 
     height, width = image.shape[:2]
@@ -2801,18 +2806,48 @@ def _looks_like_dream_compact_mobile_fullscreen(image: np.ndarray) -> bool:
     ):
         return False
 
-    sample, _ = _crop(image, DREAM_COMPACT_MOBILE_BIG_ROAD_ROI)
-    if sample.size == 0:
-        return False
+    # 只測 3 個低成本 Y 位移；瀏覽器網址列 / 底部導覽列改變時仍可命中。
+    x, y, roi_w, roi_h = DREAM_COMPACT_MOBILE_BIG_ROAD_ROI
+    for dy in (0.0, -DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y, DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y):
+        shifted = (
+            x,
+            max(0.0, min(1.0 - roi_h, y + float(dy))),
+            roi_w,
+            roi_h,
+        )
+        sample, _ = _crop(image, shifted)
+        if sample.size == 0 or min(sample.shape[:2]) < 24:
+            continue
 
-    pixels = sample.astype(np.int16, copy=False)
-    channel_min = np.min(pixels, axis=2)
-    channel_span = np.max(pixels, axis=2) - channel_min
-    bright_neutral = (channel_min >= 175) & (channel_span <= 75)
-    return bool(
-        float(np.mean(bright_neutral))
-        >= DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION
-    )
+        pixels = sample.astype(np.int16, copy=False)
+        channel_min = np.min(pixels, axis=2)
+        channel_span = np.max(pixels, axis=2) - channel_min
+        bright_neutral = (channel_min >= 155) & (channel_span <= 96)
+        bright_fraction = float(np.mean(bright_neutral))
+        if bright_fraction < DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION:
+            continue
+
+        hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        red_blue = (
+            (saturation >= 16)
+            & (value >= 25)
+            & (
+                (hue <= 32)
+                | (hue >= 148)
+                | ((hue >= 80) & (hue <= 160))
+            )
+        )
+        color_fraction = float(np.mean(red_blue))
+        if color_fraction < 0.0010:
+            continue
+
+        gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+        periodicity = _grid_periodicity_score(gray)
+        if periodicity >= 0.14:
+            return True
+
+    return False
 
 
 def _shifted_profile_rois(
@@ -3605,27 +3640,40 @@ def detect_road_sequence_detailed(
             and _looks_like_ofalive_android_fullscreen(image)
         )
 
-        # DB / DG 優先使用畫面內容定位，不先信任固定手機 ROI。
-        if DG_DB_FEATURE_LOCATORS_ENABLED and venue_code == "DG":
+        # DG / Dream 優先使用內容定位：白色路紙 + 6列格線 + 紅藍空心圓。
+        # Dream 網址/瀏覽器不同時不依賴固定 ROI；同一 locator 同時覆蓋 DG 與 Dream Gaming。
+        dream_feature_candidates: List[Tuple[Tuple[float, float, float, float], float]] = []
+        if (
+            DG_DB_FEATURE_LOCATORS_ENABLED
+            and (venue_code == "DG" or dream_compact_mobile_layout)
+        ):
             try:
+                dream_feature_candidates = _dg_white_grid_feature_candidates(
+                    image,
+                    deadline=detector_deadline,
+                    cancel_event=cancel_event,
+                )
                 for index, (roi, feature_score) in enumerate(
-                    _dg_white_grid_feature_candidates(
-                        image,
-                        deadline=detector_deadline,
-                        cancel_event=cancel_event,
-                    )
+                    dream_feature_candidates[:DG_FEATURE_MAX_CANDIDATES]
                 ):
                     plan.append({
-                        "name": f"dg_feature_white_grid_{index}",
+                        "name": (
+                            f"dg_feature_white_grid_{index}"
+                            if venue_code == "DG"
+                            else f"dream_feature_white_grid_{index}"
+                        ),
                         "roi": roi,
-                        "preference": 76.0 + min(8.0, feature_score),
+                        "preference": (
+                            88.0 if dream_compact_mobile_layout else 76.0
+                        ) + min(8.0, feature_score),
                         "fixed_grid": True,
                         "ring_grid": False,
                         "grid_columns": None,
+                        # Reuse DG direct-gridline geometry because Dream/DG road paper is the same 6-row style.
                         "profile": "dg_feature_white_grid",
                     })
             except TimeoutError:
-                pass
+                dream_feature_candidates = []
 
         if DG_DB_FEATURE_LOCATORS_ENABLED and venue_code == "DB":
             try:
@@ -3649,18 +3697,17 @@ def detect_road_sequence_detailed(
                 pass
 
         if dream_compact_mobile_layout:
-            # 必須先於 ofalive 與既有 DG 手機候選執行；這張版型的右側是下三路，
-            # 只有中間白色六列區塊可作為大路反推。候選失敗時仍會繼續原有流程。
-            for index, roi in enumerate(
-                _shifted_profile_rois(
-                    DREAM_COMPACT_MOBILE_BIG_ROAD_ROI,
-                    y_radius=DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y,
-                )[:MOBILE_PROFILE_MAX_CANDIDATES]
-            ):
+            # 內容式 locator 是第一順位；固定 ROI 只留 1 個校準後 fallback，
+            # 避免 2~6 個滑動 ROI 把 7 秒 budget 吃掉或混入珠盤/下三路。
+            fallback_rois = _shifted_profile_rois(
+                DREAM_COMPACT_MOBILE_BIG_ROAD_ROI,
+                y_radius=DREAM_COMPACT_MOBILE_PROFILE_SEARCH_Y,
+            )
+            if fallback_rois:
                 plan.append({
-                    "name": f"dream_compact_mobile_big_road_{index}",
-                    "roi": roi,
-                    "preference": 64.0 - index * 0.4,
+                    "name": "dream_compact_mobile_big_road_fallback",
+                    "roi": fallback_rois[0],
+                    "preference": 34.0,
                     "fixed_grid": True,
                     "grid_columns": None,
                     "profile": "dream_compact_mobile_full_screen",
