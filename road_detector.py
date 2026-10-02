@@ -215,7 +215,7 @@ ROAD_GENERIC_AUTO_COL_MAX = _env_int(
     "ROAD_GENERIC_AUTO_COL_MAX", 48, 24, 60
 )
 ROAD_GENERIC_MAX_COLUMN_CANDIDATES = _env_int(
-    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 5, 3, 8
+    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 3, 2, 6
 )
 ROAD_GENERIC_MIN_SQUARE_SCORE = _env_float(
     "ROAD_GENERIC_MIN_SQUARE_SCORE", 0.46, 0.25, 0.80
@@ -228,6 +228,15 @@ ROAD_RECONSTRUCTION_ONE_CELL_REPAIR = (
 )
 ROAD_REPAIR_MAX_CANDIDATES = _env_int(
     "ROAD_REPAIR_MAX_CANDIDATES", 4, 1, 8
+)
+ROAD_DETECTOR_HARD_TIMEOUT_SECONDS = _env_float(
+    "ROAD_DETECTOR_HARD_TIMEOUT_SECONDS", 7.0, 2.0, 12.0
+)
+ROAD_RECONSTRUCT_MAX_SECONDS = _env_float(
+    "ROAD_RECONSTRUCT_MAX_SECONDS", 0.18, 0.03, 1.0
+)
+ROAD_RECONSTRUCT_MAX_NODES = _env_int(
+    "ROAD_RECONSTRUCT_MAX_NODES", 12000, 500, 100000
 )
 
 # 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
@@ -284,7 +293,7 @@ ROAD_GRID_MAX_UNCERTAIN_RATIO = max(
 
 # 固定格內容自適應與顏色可信度。
 ROAD_GRID_ALIGN_MAX_TRIM = _env_float("ROAD_GRID_ALIGN_MAX_TRIM", 0.12, 0.0, 0.25)
-ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 17, 5, 41)
+ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 9, 5, 41)
 ROAD_GRID_MIN_ALIGNMENT_SCORE = _env_float("ROAD_GRID_MIN_ALIGNMENT_SCORE", 0.46, 0.0, 1.0)
 ROAD_GRID_MIN_COLOR_RATIO = _env_float("ROAD_GRID_MIN_COLOR_RATIO", 0.018, 0.001, 0.20)
 ROAD_GRID_INNER_MARGIN_MAX = _env_float("ROAD_GRID_INNER_MARGIN_MAX", 0.18, 0.02, 0.35)
@@ -354,10 +363,10 @@ DB_MOBILE_RING_HOUGH_PARAM2 = _env_float(
     "DB_MOBILE_RING_HOUGH_PARAM2", 12.0, 4.0, 40.0
 )
 MOBILE_RING_MIN_COLOR_PIXELS = _env_int(
-    "MOBILE_RING_MIN_COLOR_PIXELS", 18, 5, 300
+    "MOBILE_RING_MIN_COLOR_PIXELS", 10, 4, 300
 )
 MOBILE_RING_COLOR_DOMINANCE = _env_float(
-    "MOBILE_RING_COLOR_DOMINANCE", 1.35, 1.05, 5.0
+    "MOBILE_RING_COLOR_DOMINANCE", 1.20, 1.05, 5.0
 )
 MOBILE_RING_MAX_UNCERTAIN_RATIO = _env_float(
     "MOBILE_RING_MAX_UNCERTAIN_RATIO", 0.20, 0.0, 0.80
@@ -800,13 +809,27 @@ def _classify_grid(
             red_pixels = _rect_sum(red_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             blue_pixels = _rect_sum(blue_integral, inner_x1, inner_y1, inner_x2, inner_y2)
             green_pixels = _rect_sum(green_integral, inner_x1, inner_y1, inner_x2, inner_y2)
-            minimum_pixels = max(
-                ROAD_GRID_MIN_COLOR_PIXELS,
-                int(round(inner_area * ROAD_GRID_MIN_COLOR_RATIO)),
+            mobile_like_profile = (
+                "mobile" in str(profile or "").lower()
+                or str(profile or "").startswith("road_crop")
             )
-            minimum_component = max(
-                4, int(round(inner_area * ROAD_GRID_MIN_COMPONENT_AREA_RATIO))
-            )
+            if mobile_like_profile:
+                minimum_pixels = max(
+                    5,
+                    int(round(inner_area * min(ROAD_GRID_MIN_COLOR_RATIO, 0.010))),
+                )
+                minimum_component = max(
+                    3,
+                    int(round(inner_area * min(ROAD_GRID_MIN_COMPONENT_AREA_RATIO, 0.010))),
+                )
+            else:
+                minimum_pixels = max(
+                    ROAD_GRID_MIN_COLOR_PIXELS,
+                    int(round(inner_area * ROAD_GRID_MIN_COLOR_RATIO)),
+                )
+                minimum_component = max(
+                    4, int(round(inner_area * ROAD_GRID_MIN_COMPONENT_AREA_RATIO))
+                )
             component_probe = max(3, int(round(minimum_pixels * 0.35)))
             if red_pixels >= component_probe:
                 red_component, red_span_x, red_span_y = _largest_component_stats(
@@ -935,38 +958,38 @@ def _reconstruct_big_road_order(
     return_details: bool = False,
     grid_rows: int = ROAD_GRID_ROWS,
 ) -> Any:
-    """依六列大路規則反推時間序；長龍轉右後會保持右黏，不再錯誤往下。"""
+    """依大路規則反推時間序；歧義搜尋有硬 node/time budget，禁止 DFS 卡死。"""
     grid: Dict[Tuple[int, int], str] = {
         (int(item.get("column", 0)), int(item.get("row", 0))): str(item.get("outcome") or "").upper()
         for item in cells
         if str(item.get("outcome") or "").upper() in {"B", "P"}
     }
     fallback_preview = sorted(grid, key=lambda position: (position[0], position[1]))
+    base_details = {
+        "positions": [],
+        "reconstructed_all": False,
+        "partial_positions": [],
+        "fallback_preview": fallback_preview,
+        "solution_count": 0,
+        "search_nodes": 0,
+        "search_ms": 0.0,
+        "budget_exhausted": False,
+    }
     if not grid:
-        details = {
-            "positions": [],
-            "reconstructed_all": False,
-            "fallback_reason": "no_recognized_cells",
-            "partial_positions": [],
-            "fallback_preview": [],
-            "solution_count": 0,
-        }
+        details = {**base_details, "fallback_reason": "no_recognized_cells", "fallback_preview": []}
         return details if return_details else []
     if (0, 0) not in grid:
-        details = {
-            "positions": [],
-            "reconstructed_all": False,
-            "fallback_reason": "missing_big_road_origin_0_0",
-            "partial_positions": [],
-            "fallback_preview": fallback_preview,
-            "solution_count": 0,
-        }
+        details = {**base_details, "fallback_reason": "missing_big_road_origin_0_0"}
         return details if return_details else []
 
     target_count = len(grid)
     first_outcome = grid[(0, 0)]
     best_partial: List[Tuple[int, int]] = [(0, 0)]
     solutions: List[List[Tuple[int, int]]] = []
+    search_started = time.perf_counter()
+    search_deadline = search_started + ROAD_RECONSTRUCT_MAX_SECONDS
+    search_nodes = 0
+    budget_exhausted = False
 
     def search(
         current: Tuple[int, int],
@@ -976,13 +999,20 @@ def _reconstruct_big_road_order(
         visited: set[Tuple[int, int]],
         ordered: List[Tuple[int, int]],
     ) -> None:
-        nonlocal best_partial
+        nonlocal best_partial, search_nodes, budget_exhausted
+        search_nodes += 1
+        if search_nodes > ROAD_RECONSTRUCT_MAX_NODES:
+            budget_exhausted = True
+            return
+        if (search_nodes & 31) == 0 and time.perf_counter() >= search_deadline:
+            budget_exhausted = True
+            return
         if len(ordered) > len(best_partial):
             best_partial = list(ordered)
         if len(ordered) == target_count:
             solutions.append(list(ordered))
             return
-        if len(solutions) >= 2:
+        if len(solutions) >= 2 or budget_exhausted:
             return
 
         column, row = current
@@ -1008,6 +1038,8 @@ def _reconstruct_big_road_order(
             options.append((opposite_position, next_start_column, opposite, False))
 
         for position, candidate_start, candidate_outcome, candidate_tailing in options:
+            if budget_exhausted:
+                break
             visited.add(position)
             ordered.append(position)
             search(
@@ -1024,10 +1056,13 @@ def _reconstruct_big_road_order(
                 return
 
     search((0, 0), 0, first_outcome, False, {(0, 0)}, [(0, 0)])
-    unique = len(solutions) == 1
+    search_ms = (time.perf_counter() - search_started) * 1000.0
+    unique = len(solutions) == 1 and not budget_exhausted
     positions = solutions[0] if unique else []
     if unique:
         fallback_reason = ""
+    elif budget_exhausted:
+        fallback_reason = f"big_road_reconstruction_budget_exhausted_{len(best_partial)}_of_{target_count}"
     elif len(solutions) > 1:
         fallback_reason = "ambiguous_big_road_reconstruction"
     else:
@@ -1039,6 +1074,9 @@ def _reconstruct_big_road_order(
         "partial_positions": best_partial,
         "fallback_preview": fallback_preview,
         "solution_count": len(solutions),
+        "search_nodes": int(search_nodes),
+        "search_ms": round(float(search_ms), 3),
+        "budget_exhausted": bool(budget_exhausted),
     }
     return details if return_details else positions
 
@@ -1399,6 +1437,9 @@ def _detect_fixed_grid_for_columns(
         "median_cell_confidence": round(median_confidence, 6),
         "reconstructed_all": bool(reconstruction["reconstructed_all"]),
         "reconstruction_solution_count": int(reconstruction["solution_count"]),
+        "reconstruction_search_nodes": int(reconstruction.get("search_nodes", 0) or 0),
+        "reconstruction_search_ms": float(reconstruction.get("search_ms", 0.0) or 0.0),
+        "reconstruction_budget_exhausted": bool(reconstruction.get("budget_exhausted")),
         "reconstruction_repaired": bool(repaired_cell),
         "repaired_cell": repaired_cell or {},
         "partial_reconstruction": list(reconstruction["partial_positions"]),
@@ -1418,6 +1459,8 @@ def _detect_fixed_grid(
     *,
     grid_columns: Optional[int] = None,
     profile: str = "",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """固定六列、欄數自動；先測最接近幾何估計的少量欄數，可信即早停。"""
     if crop is None or crop.size == 0:
@@ -1425,9 +1468,17 @@ def _detect_fixed_grid(
 
     results: List[Dict[str, Any]] = []
     generic_auto = str(profile or "").startswith("mobile_auto_general")
-    minimum_trials = 2 if generic_auto else 1
+    minimum_trials = 1
+    hard_timeout_reached = False
     for columns in _column_candidates(crop, grid_columns, profile=profile):
-        item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
+        try:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.35)
+            item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
+        except TimeoutError:
+            if results:
+                hard_timeout_reached = True
+                break
+            raise
         results.append(item)
         effective = dict(item.get("effective_grid") or {})
         if (
@@ -1452,6 +1503,7 @@ def _detect_fixed_grid(
         ),
     )
     output = dict(best)
+    output["hard_timeout_reached"] = bool(hard_timeout_reached)
     output["column_candidates"] = [
         {
             "grid_columns": int(item.get("grid_columns", 0) or 0),
@@ -1601,6 +1653,8 @@ def _detect_mobile_ring_grid(
     crop: np.ndarray,
     *,
     profile: str,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """MT／DB 手機全畫面專用彩色圓環大路偵測。
 
@@ -1609,6 +1663,7 @@ def _detect_mobile_ring_grid(
     """
     if crop is None or crop.size == 0:
         raise ValueError("MT/DB 手機大路裁圖為空。")
+    _deadline_guard(deadline, cancel_event, min_remaining=0.30)
 
     image_height, image_width = crop.shape[:2]
     expected_pitch_y = image_height / max(1.0, float(ROAD_GRID_ROWS))
@@ -1634,13 +1689,16 @@ def _detect_mobile_ring_grid(
         maxRadius=maximum_radius,
     )
 
+    _deadline_guard(deadline, cancel_event, min_remaining=0.20)
     red_mask, blue_mask, green_mask, _ = _color_masks(crop)
     yy, xx = np.ogrid[:image_height, :image_width]
     colored: List[Dict[str, Any]] = []
     uncertain_cells: List[Dict[str, Any]] = []
 
     raw_circles = [] if circles is None else np.round(circles[0]).astype(int)
-    for raw_circle in raw_circles:
+    for circle_index, raw_circle in enumerate(raw_circles):
+        if (circle_index & 15) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.12)
         cx, cy, radius = [int(value) for value in raw_circle]
         if not (0 <= cx < image_width and 0 <= cy < image_height):
             continue
@@ -1658,7 +1716,7 @@ def _detect_mobile_ring_grid(
         dominance = dominant / max(1.0, float(secondary))
         minimum_color = max(
             MOBILE_RING_MIN_COLOR_PIXELS,
-            int(round(math.pi * radius * radius * 0.12)),
+            int(round(math.pi * radius * radius * 0.065)),
         )
         base = {
             "cx": float(cx),
@@ -2085,22 +2143,35 @@ def _run_region(
     ring_grid: bool = False,
     grid_columns: Optional[int] = None,
     layout_profile: str = "",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     crop, pixels = _crop(image, roi)
     started = time.perf_counter()
 
     if ring_grid:
         result = _detect_mobile_ring_grid(
-            crop, profile=layout_profile or name
+            crop,
+            profile=layout_profile or name,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif fixed_grid:
         result = _detect_fixed_grid(
-            crop, grid_columns=grid_columns, profile=layout_profile or name
+            crop,
+            grid_columns=grid_columns,
+            profile=layout_profile or name,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif ROAD_USE_YOLO and _get_yolo_model() is not None:
         result = _detect_yolo(crop)
     else:
-        result = analyze_baccarat_array_detailed(crop)
+        result = analyze_baccarat_array_detailed(
+            crop,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     result = dict(result or {})
     result.update(
@@ -2314,6 +2385,9 @@ def _grid_periodicity_score(gray: np.ndarray) -> float:
 
 def _general_road_candidates(
     image: np.ndarray,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> List[Tuple[Tuple[float, float, float, float], float]]:
     """跨直/橫式、白/米黃/深色背景，以路紙材質 + 格線週期 + 紅藍環排序候選。"""
     if not MOBILE_AUTO_FOCUS_ENABLED or image is None or image.size == 0:
@@ -2389,6 +2463,7 @@ def _general_road_candidates(
 
     # 先從三種路紙材質的連通區塊提出候選。
     for source_mask in paper_masks:
+        _deadline_guard(deadline, cancel_event, min_remaining=0.15)
         mask = (source_mask * 255).astype(np.uint8)
         close_w = max(7, int(round(pw * 0.025)))
         close_h = max(3, int(round(ph * 0.006)))
@@ -2418,6 +2493,7 @@ def _general_road_candidates(
     # 紙色被 UI 切碎時，用低成本滑窗做最後保險；只用 integral image 粗排。
     coarse: List[Tuple[float, Tuple[int, int, int, int]]] = []
     for height_fraction in (0.07, 0.10, 0.14, 0.20, 0.28):
+        _deadline_guard(deadline, cancel_event, min_remaining=0.15)
         box_h = max(24, int(round(ph * height_fraction)))
         step_y = max(12, int(round(box_h * 0.55)))
         for width_fraction in (0.44, 0.64, 0.84, 1.0):
@@ -2449,7 +2525,9 @@ def _general_road_candidates(
 
     scored: List[Tuple[Tuple[float, float, float, float], float]] = []
     seen_boxes = set()
-    for x1, y1, x2, y2, source_score in boxes:
+    for index, (x1, y1, x2, y2, source_score) in enumerate(boxes):
+        if (index & 7) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.10)
         key = (int(x1 // 4), int(y1 // 4), int(x2 // 4), int(y2 // 4))
         if key in seen_boxes:
             continue
@@ -2515,7 +2593,15 @@ def detect_road_sequence_detailed(
     deadline: Optional[float] = None,
     cancel_event: Any = None,
 ) -> Dict[str, Any]:
-    _deadline_guard(deadline, cancel_event)
+    detector_started = time.perf_counter()
+    caller_deadline = deadline
+    internal_deadline = detector_started + ROAD_DETECTOR_HARD_TIMEOUT_SECONDS
+    detector_deadline = (
+        min(float(caller_deadline), internal_deadline)
+        if caller_deadline is not None
+        else internal_deadline
+    )
+    _deadline_guard(detector_deadline, cancel_event)
     image = _read_image(image_path)
     image_height, image_width = image.shape[:2]
     venue_code = str(venue or "").upper().strip()
@@ -2698,8 +2784,14 @@ def detect_road_sequence_detailed(
                 "profile": "mt_full_screen",
             })
         if MOBILE_AUTO_FOCUS_ENABLED:
-            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
-            for index, (roi, auto_score) in enumerate(_general_road_candidates(image)):
+            _deadline_guard(detector_deadline, cancel_event, min_remaining=0.6)
+            for index, (roi, auto_score) in enumerate(
+                _general_road_candidates(
+                    image,
+                    deadline=detector_deadline,
+                    cancel_event=cancel_event,
+                )
+            ):
                 plan.append({
                     "name": f"mobile_auto_general_{index}",
                     "roi": roi,
@@ -2749,6 +2841,21 @@ def detect_road_sequence_detailed(
                 "profile": "legacy_full_image",
             })
 
+    general_auto_items = [
+        item for item in plan
+        if str(item.get("profile") or "") == "mobile_auto_general"
+    ]
+    specific_items = [
+        item for item in plan
+        if str(item.get("profile") or "") != "mobile_auto_general"
+    ]
+    if general_auto_items and specific_items and not likely_crop:
+        plan = (
+            [specific_items[0], general_auto_items[0]]
+            + specific_items[1:]
+            + general_auto_items[1:]
+        )
+
     seen = set()
     best: Optional[Dict[str, Any]] = None
     has_general_auto = any(
@@ -2756,8 +2863,16 @@ def detect_road_sequence_detailed(
         for item in plan
     )
     evaluated_general_auto = False
+    detector_hard_timeout_reached = False
     for item in plan:
-        _deadline_guard(deadline, cancel_event, min_remaining=0.20)
+        try:
+            _deadline_guard(detector_deadline, cancel_event, min_remaining=0.20)
+        except TimeoutError as exc:
+            if best is not None:
+                errors.append(f"detector_hard_timeout: {exc}")
+                detector_hard_timeout_reached = True
+                break
+            raise
         roi = tuple(float(value) for value in item["roi"])
         fixed_grid = bool(item["fixed_grid"])
         ring_grid = bool(item.get("ring_grid", False))
@@ -2782,6 +2897,8 @@ def detect_road_sequence_detailed(
                 ring_grid=ring_grid,
                 grid_columns=item.get("grid_columns"),
                 layout_profile=str(item.get("profile") or ""),
+                deadline=detector_deadline,
+                cancel_event=cancel_event,
             )
             candidates.append(current)
             if str(item.get("profile") or "") == "mobile_auto_general":
@@ -2790,18 +2907,25 @@ def detect_road_sequence_detailed(
                 best.get("selection_score", -9999)
             ):
                 best = current
-            minimum_trials = 1 if likely_crop else ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES
+            minimum_trials = 1 if (likely_crop or not has_general_auto) else 2
             if (
                 ROAD_FAST_EARLY_EXIT
                 and len(candidates) >= minimum_trials
                 and (likely_crop or not has_general_auto or evaluated_general_auto)
-                and _strong_acceptable(current)
             ):
-                best = max(
+                current_best = max(
                     candidates,
                     key=lambda item: float(item.get("selection_score", -9999.0) or -9999.0),
                 )
+                if _strong_acceptable(current_best):
+                    best = current_best
+                    break
+        except TimeoutError as exc:
+            if best is not None:
+                errors.append(f"{name}: {exc}")
+                detector_hard_timeout_reached = True
                 break
+            raise
         except Exception as exc:
             errors.append(f"{name}: {exc}")
 
@@ -2831,6 +2955,9 @@ def detect_road_sequence_detailed(
         "dream_compact_mobile_profile_detected": bool(dream_compact_mobile_layout),
         "ofalive_android_profile_detected": bool(ofalive_android_layout),
         "mobile_auto_focus_used": str(best.get("region_name") or "").startswith("mobile_auto_general_"),
+        "detector_hard_timeout_reached": bool(detector_hard_timeout_reached),
+        "detector_elapsed_ms": round((time.perf_counter() - detector_started) * 1000.0, 2),
+        "detector_budget_ms": round(ROAD_DETECTOR_HARD_TIMEOUT_SECONDS * 1000.0, 2),
         "image_size": {"width": image_width, "height": image_height},
         "candidate_regions": [
             {
