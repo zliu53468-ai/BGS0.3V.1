@@ -363,10 +363,10 @@ DB_MOBILE_RING_HOUGH_PARAM2 = _env_float(
     "DB_MOBILE_RING_HOUGH_PARAM2", 12.0, 4.0, 40.0
 )
 MOBILE_RING_MIN_COLOR_PIXELS = _env_int(
-    "MOBILE_RING_MIN_COLOR_PIXELS", 18, 5, 300
+    "MOBILE_RING_MIN_COLOR_PIXELS", 10, 4, 300
 )
 MOBILE_RING_COLOR_DOMINANCE = _env_float(
-    "MOBILE_RING_COLOR_DOMINANCE", 1.35, 1.05, 5.0
+    "MOBILE_RING_COLOR_DOMINANCE", 1.20, 1.05, 5.0
 )
 MOBILE_RING_MAX_UNCERTAIN_RATIO = _env_float(
     "MOBILE_RING_MAX_UNCERTAIN_RATIO", 0.20, 0.0, 0.80
@@ -1469,9 +1469,16 @@ def _detect_fixed_grid(
     results: List[Dict[str, Any]] = []
     generic_auto = str(profile or "").startswith("mobile_auto_general")
     minimum_trials = 1
+    hard_timeout_reached = False
     for columns in _column_candidates(crop, grid_columns, profile=profile):
-        _deadline_guard(deadline, cancel_event, min_remaining=0.35)
-        item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
+        try:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.35)
+            item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
+        except TimeoutError:
+            if results:
+                hard_timeout_reached = True
+                break
+            raise
         results.append(item)
         effective = dict(item.get("effective_grid") or {})
         if (
@@ -1496,6 +1503,7 @@ def _detect_fixed_grid(
         ),
     )
     output = dict(best)
+    output["hard_timeout_reached"] = bool(hard_timeout_reached)
     output["column_candidates"] = [
         {
             "grid_columns": int(item.get("grid_columns", 0) or 0),
@@ -1645,6 +1653,8 @@ def _detect_mobile_ring_grid(
     crop: np.ndarray,
     *,
     profile: str,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """MT／DB 手機全畫面專用彩色圓環大路偵測。
 
@@ -1653,6 +1663,7 @@ def _detect_mobile_ring_grid(
     """
     if crop is None or crop.size == 0:
         raise ValueError("MT/DB 手機大路裁圖為空。")
+    _deadline_guard(deadline, cancel_event, min_remaining=0.30)
 
     image_height, image_width = crop.shape[:2]
     expected_pitch_y = image_height / max(1.0, float(ROAD_GRID_ROWS))
@@ -1678,13 +1689,16 @@ def _detect_mobile_ring_grid(
         maxRadius=maximum_radius,
     )
 
+    _deadline_guard(deadline, cancel_event, min_remaining=0.20)
     red_mask, blue_mask, green_mask, _ = _color_masks(crop)
     yy, xx = np.ogrid[:image_height, :image_width]
     colored: List[Dict[str, Any]] = []
     uncertain_cells: List[Dict[str, Any]] = []
 
     raw_circles = [] if circles is None else np.round(circles[0]).astype(int)
-    for raw_circle in raw_circles:
+    for circle_index, raw_circle in enumerate(raw_circles):
+        if (circle_index & 15) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.12)
         cx, cy, radius = [int(value) for value in raw_circle]
         if not (0 <= cx < image_width and 0 <= cy < image_height):
             continue
@@ -1702,7 +1716,7 @@ def _detect_mobile_ring_grid(
         dominance = dominant / max(1.0, float(secondary))
         minimum_color = max(
             MOBILE_RING_MIN_COLOR_PIXELS,
-            int(round(math.pi * radius * radius * 0.12)),
+            int(round(math.pi * radius * radius * 0.065)),
         )
         base = {
             "cx": float(cx),
@@ -2137,7 +2151,10 @@ def _run_region(
 
     if ring_grid:
         result = _detect_mobile_ring_grid(
-            crop, profile=layout_profile or name
+            crop,
+            profile=layout_profile or name,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif fixed_grid:
         result = _detect_fixed_grid(
