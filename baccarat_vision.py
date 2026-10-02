@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 import math
 import os
+import time
 
 import cv2
 import numpy as np
@@ -73,6 +74,18 @@ class CircleCandidate:
     @property
     def diameter(self) -> float:
         return (float(self.width) + float(self.height)) / 2.0
+
+
+def _vision_deadline_guard(
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+    *,
+    min_remaining: float = 0.0,
+) -> None:
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise TimeoutError("圓環辨識已取消。")
+    if deadline is not None and float(deadline) - time.perf_counter() <= float(min_remaining):
+        raise TimeoutError("圓環辨識已達硬截止。")
 
 
 def _read_image(path: str | Path) -> np.ndarray:
@@ -598,11 +611,19 @@ def _sort_big_road_detailed(candidates: Sequence[CircleCandidate]) -> Dict[str, 
 def _sort_big_road(candidates: Sequence[CircleCandidate]) -> List[CircleCandidate]:
     return list(_sort_big_road_detailed(candidates).get("ordered") or [])
 
-def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
+def analyze_baccarat_array_detailed(
+    source: np.ndarray,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> Dict[str, Any]:
     if source is None or not isinstance(source, np.ndarray) or source.size == 0:
         raise ValueError("無法讀取路紙圖片。")
+    _vision_deadline_guard(deadline, cancel_event, min_remaining=0.15)
     image, resize_scale = _resize_for_analysis(source.copy())
+    _vision_deadline_guard(deadline, cancel_event, min_remaining=0.12)
     contour_map = _preprocess_geometry(image)
+    _vision_deadline_guard(deadline, cancel_event, min_remaining=0.10)
     raw_candidates = _geometry_candidates(image, contour_map)
     unique_candidates = _deduplicate_candidates(raw_candidates)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -614,7 +635,9 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
 
     colored: List[CircleCandidate] = []
     unknown_candidates_raw: List[Tuple[CircleCandidate, float, float, float]] = []
-    for candidate in unique_candidates:
+    for candidate_index, candidate in enumerate(unique_candidates):
+        if (candidate_index & 31) == 0:
+            _vision_deadline_guard(deadline, cancel_event, min_remaining=0.08)
         outcome, red_ratio, blue_ratio, hue, saturation, value = _ring_color_stats(hsv, candidate, color_profile)
         method = "ring_hsv"
         if not outcome:
@@ -631,6 +654,7 @@ def analyze_baccarat_array_detailed(source: np.ndarray) -> Dict[str, Any]:
             red_ratio=round(red_ratio, 4), blue_ratio=round(blue_ratio, 4), color_method=method,
         ))
 
+    _vision_deadline_guard(deadline, cancel_event, min_remaining=0.05)
     ordering = _sort_big_road_detailed(colored)
     ordered = list(ordering.get("ordered") or [])
     sequence = [item.outcome for item in ordered]
