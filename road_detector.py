@@ -1147,7 +1147,11 @@ def _column_candidates(
         return [max(5, min(60, int(requested)))]
     height, width = crop.shape[:2]
     aspect = width / max(1.0, float(height))
-    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    profile_key = str(profile or "").lower()
+    generic_auto = (
+        profile_key.startswith("mobile_auto_general")
+        or profile_key.startswith("dg_feature_white_grid")
+    )
     maximum = max(ROAD_GRID_AUTO_COL_MAX, ROAD_GENERIC_AUTO_COL_MAX) if generic_auto else ROAD_GRID_AUTO_COL_MAX
 
     if not ROAD_GRID_AUTO_COLUMNS:
@@ -1375,14 +1379,27 @@ def _detect_fixed_grid_for_columns(
     uncertain_ratio = uncertain_count / max(1, candidate_total)
     confidences = [float(item.get("confidence", 0.0) or 0.0) for item in cells]
     median_confidence = float(np.median(confidences)) if confidences else 0.0
-    generic_auto_profile = str(profile or "").startswith("mobile_auto_general")
-    minimum_alignment_score = (
-        max(0.30, ROAD_GRID_MIN_ALIGNMENT_SCORE - 0.08)
-        if generic_auto_profile
-        else ROAD_GRID_MIN_ALIGNMENT_SCORE
-    )
-    minimum_coverage = 0.70 if generic_auto_profile else 0.80
-    minimum_square_score = ROAD_GENERIC_MIN_SQUARE_SCORE if generic_auto_profile else 0.72
+    profile_key = str(profile or "").lower()
+    generic_auto_profile = profile_key.startswith("mobile_auto_general")
+    dg_feature_profile = profile_key.startswith("dg_feature_white_grid")
+    if dg_feature_profile:
+        minimum_alignment_score = max(0.28, ROAD_GRID_MIN_ALIGNMENT_SCORE - 0.14)
+        minimum_coverage = 0.62
+        minimum_square_score = max(0.34, ROAD_GENERIC_MIN_SQUARE_SCORE - 0.08)
+        maximum_uncertain_ratio = max(ROAD_GRID_MAX_UNCERTAIN_RATIO, 0.22)
+        minimum_median_confidence = max(0.28, ROAD_GRID_MIN_MEDIAN_CONFIDENCE - 0.12)
+    elif generic_auto_profile:
+        minimum_alignment_score = max(0.30, ROAD_GRID_MIN_ALIGNMENT_SCORE - 0.08)
+        minimum_coverage = 0.70
+        minimum_square_score = ROAD_GENERIC_MIN_SQUARE_SCORE
+        maximum_uncertain_ratio = ROAD_GRID_MAX_UNCERTAIN_RATIO
+        minimum_median_confidence = ROAD_GRID_MIN_MEDIAN_CONFIDENCE
+    else:
+        minimum_alignment_score = ROAD_GRID_MIN_ALIGNMENT_SCORE
+        minimum_coverage = 0.80
+        minimum_square_score = 0.72
+        maximum_uncertain_ratio = ROAD_GRID_MAX_UNCERTAIN_RATIO
+        minimum_median_confidence = ROAD_GRID_MIN_MEDIAN_CONFIDENCE
     alignment_ok = bool(
         float(grid_bounds["score"]) >= minimum_alignment_score
         and float(grid_bounds["coverage"]) >= minimum_coverage
@@ -1390,19 +1407,19 @@ def _detect_fixed_grid_for_columns(
     )
     quality_ok = bool(
         recognized_count >= ROAD_GRID_MIN_RECOGNIZED
-        and uncertain_ratio <= ROAD_GRID_MAX_UNCERTAIN_RATIO
+        and uncertain_ratio <= maximum_uncertain_ratio
         and bool(reconstruction["reconstructed_all"])
         and alignment_ok
-        and median_confidence >= ROAD_GRID_MIN_MEDIAN_CONFIDENCE
+        and median_confidence >= minimum_median_confidence
     )
     fallback_reason = str(reconstruction.get("fallback_reason") or "")
     if not fallback_reason and not alignment_ok:
         fallback_reason = "grid_alignment_not_confident"
-    if not fallback_reason and median_confidence < ROAD_GRID_MIN_MEDIAN_CONFIDENCE:
+    if not fallback_reason and median_confidence < minimum_median_confidence:
         fallback_reason = "cell_color_confidence_too_low"
     if not fallback_reason and recognized_count < ROAD_GRID_MIN_RECOGNIZED:
         fallback_reason = "recognized_count_below_minimum"
-    if not fallback_reason and uncertain_ratio > ROAD_GRID_MAX_UNCERTAIN_RATIO:
+    if not fallback_reason and uncertain_ratio > maximum_uncertain_ratio:
         fallback_reason = "too_many_uncertain_cells"
 
     pitch_x = float(grid_bounds.get("cell_pitch_x", 0.0) or 0.0)
@@ -1485,7 +1502,11 @@ def _detect_fixed_grid(
         raise ValueError("固定大路裁圖為空。")
 
     results: List[Dict[str, Any]] = []
-    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    profile_key = str(profile or "").lower()
+    generic_auto = (
+        profile_key.startswith("mobile_auto_general")
+        or profile_key.startswith("dg_feature_white_grid")
+    )
     minimum_trials = 1
     hard_timeout_reached = False
     for columns in _column_candidates(crop, grid_columns, profile=profile):
@@ -2403,12 +2424,17 @@ def _strong_acceptable(result: Mapping[str, Any]) -> bool:
     alignment = float(effective.get("score", 0.0) or 0.0)
     median_confidence = float(result.get("median_cell_confidence", 0.0) or 0.0)
     fixed = bool(result.get("fixed_grid")) or str(result.get("method") or "").startswith("fixed_")
+    layout_profile = str(result.get("layout_profile") or "").lower()
+    venue_feature = layout_profile in {"dg_feature_white_grid", "db_feature_dark_ring"}
+    max_ratio = 0.18 if venue_feature else min(0.10, ROAD_FAST_MAX_UNKNOWN_RATIO)
+    min_alignment = 0.32 if layout_profile == "dg_feature_white_grid" else 0.48
+    min_confidence = 0.30 if layout_profile == "dg_feature_white_grid" else 0.46
     return bool(
-        recognized >= max(10, ROAD_FAST_MIN_RECOGNIZED)
-        and ratio <= min(0.10, ROAD_FAST_MAX_UNKNOWN_RATIO)
+        recognized >= max(8 if venue_feature else 10, ROAD_FAST_MIN_RECOGNIZED)
+        and ratio <= max_ratio
         and bool(result.get("reconstructed_all", True))
-        and (not fixed or alignment >= 0.48)
-        and (not fixed or median_confidence >= 0.46 or bool(result.get("ring_grid")))
+        and (not fixed or alignment >= min_alignment)
+        and (not fixed or median_confidence >= min_confidence or bool(result.get("ring_grid")))
     )
 
 
@@ -2796,10 +2822,10 @@ def _dg_white_grid_feature_candidates(
     deadline: Optional[float] = None,
     cancel_event: Any = None,
 ) -> List[Tuple[Tuple[float, float, float, float], float]]:
-    """DG：先找白色路紙面板，再在面板上半部找 6 列大路。"""
+    """DG 全畫面白色格線搜尋：不限制手機/電腦，也不依賴固定 Y 軸。"""
     _deadline_guard(deadline, cancel_event, min_remaining=0.25)
     height, width = image.shape[:2]
-    scale = min(1.0, 720.0 / max(height, width))
+    scale = min(1.0, 760.0 / max(height, width))
     preview = (
         cv2.resize(
             image,
@@ -2813,97 +2839,183 @@ def _dg_white_grid_feature_candidates(
     pixels = preview.astype(np.int16, copy=False)
     channel_min = np.min(pixels, axis=2)
     channel_span = np.max(pixels, axis=2) - channel_min
-    white = ((channel_min >= 168) & (channel_span <= 88)).astype(np.uint8) * 255
-    white[: int(ph * 0.48), :] = 0
-    white = cv2.morphologyEx(
-        white,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (max(7, int(round(pw * 0.018))), max(3, int(round(ph * 0.006)))),
-        ),
-        iterations=1,
-    )
-    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bright_floor = int(np.clip(np.percentile(channel_min, 78) * 0.90, 145, 190))
+    white_bool = (channel_min >= bright_floor) & (channel_span <= 96)
+    white = white_bool.astype(np.uint8) * 255
+
     hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
     hue, sat, val = cv2.split(hsv)
     red_blue = (
-        (sat >= 18)
-        & (val >= 28)
+        (sat >= 16)
+        & (val >= 25)
         & (
-            (hue <= 30)
-            | (hue >= 150)
-            | ((hue >= 82) & (hue <= 158))
+            (hue <= 32)
+            | (hue >= 148)
+            | ((hue >= 80) & (hue <= 160))
         )
     )
 
-    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:12]:
-        _deadline_guard(deadline, cancel_event, min_remaining=0.12)
+    white_integral = cv2.integral(white_bool.astype(np.uint8), sdepth=cv2.CV_32S)
+    color_integral = cv2.integral(red_blue.astype(np.uint8), sdepth=cv2.CV_32S)
+
+    def _rect_mean(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+        area = max(1, (x2 - x1) * (y2 - y1))
+        total = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+        return float(total) / float(area)
+
+    # 先由白色路紙連通區提出候選；不再砍掉畫面上半部。
+    close_w = max(7, int(round(pw * 0.018)))
+    close_h = max(3, int(round(ph * 0.005)))
+    white_closed = cv2.morphologyEx(
+        white,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h)),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(white_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidate_boxes: List[Tuple[int, int, int, int, float]] = []
+
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:18]:
         x, y, w, h = cv2.boundingRect(contour)
         if (
-            w < pw * 0.55
-            or h < ph * 0.055
-            or y < ph * 0.50
-            or (w * h) < ph * pw * 0.025
+            w < pw * 0.42
+            or h < max(24, ph * 0.035)
+            or (w * h) < ph * pw * 0.012
         ):
             continue
+        candidate_boxes.append((x, y, x + w, y + h, 1.0))
 
-        # 大路固定在路紙上半部且位於珠盤路右側；用面板自身比例而非手機座標。
-        for x_fraction, width_fraction in ((0.28, 0.70), (0.32, 0.66), (0.24, 0.74)):
-            for height_fraction in (0.42, 0.50, 0.58):
-                rx1 = max(0, int(round(x + w * x_fraction)))
-                rx2 = min(pw, int(round(x + w * min(0.995, x_fraction + width_fraction))))
-                ry1 = max(0, y)
-                ry2 = min(ph, int(round(y + h * height_fraction)))
-                if rx2 - rx1 < 80 or ry2 - ry1 < 28:
+    # Contour 被格線切碎時，用全畫面 integral-image coarse scan 補候選。
+    coarse: List[Tuple[float, Tuple[int, int, int, int]]] = []
+    for height_fraction in (0.065, 0.085, 0.11, 0.145, 0.19):
+        _deadline_guard(deadline, cancel_event, min_remaining=0.15)
+        box_h = max(28, int(round(ph * height_fraction)))
+        step_y = max(14, int(round(box_h * 0.48)))
+        for width_fraction in (0.46, 0.60, 0.74, 0.88):
+            box_w = max(100, int(round(pw * width_fraction)))
+            step_x = max(24, int(round(box_w * 0.34)))
+            for y1 in range(0, max(1, ph - box_h + 1), step_y):
+                y2 = min(ph, y1 + box_h)
+                for x1 in range(0, max(1, pw - box_w + 1), step_x):
+                    x2 = min(pw, x1 + box_w)
+                    aspect = (x2 - x1) / max(1.0, float(y2 - y1))
+                    if aspect < 2.1:
+                        continue
+                    white_fraction = _rect_mean(white_integral, x1, y1, x2, y2)
+                    color_fraction = _rect_mean(color_integral, x1, y1, x2, y2)
+                    if white_fraction < 0.48 or color_fraction < 0.0012:
+                        continue
+                    score = 1.5 * white_fraction + 1.8 * min(1.0, color_fraction / 0.035)
+                    coarse.append((score, (x1, y1, x2, y2)))
+    coarse.sort(key=lambda item: item[0], reverse=True)
+    for score, box in coarse[:16]:
+        candidate_boxes.append((*box, score))
+
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    seen = set()
+    for box_index, (x1, y1, x2, y2, source_score) in enumerate(candidate_boxes):
+        if (box_index & 7) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.10)
+        key = (x1 // 5, y1 // 5, x2 // 5, y2 // 5)
+        if key in seen:
+            continue
+        seen.add(key)
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w <= 0 or box_h <= 0:
+            continue
+
+        # 白色面板可能包含珠盤路/下三路/統計列；在面板內再搜尋 6-row 大路子區。
+        for y_offset_fraction in (0.0, 0.04, 0.08, 0.14, 0.20):
+            for height_fraction in (0.34, 0.42, 0.50, 0.58, 0.66):
+                ry1 = int(round(y1 + box_h * y_offset_fraction))
+                ry2 = int(round(ry1 + box_h * height_fraction))
+                if ry2 > y2:
                     continue
-                crop = preview[ry1:ry2, rx1:rx2]
-                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                periodicity = _grid_periodicity_score(gray)
-                color_fraction = float(np.mean(red_blue[ry1:ry2, rx1:rx2]))
-                sample = pixels[ry1:ry2, rx1:rx2]
-                neutral_fraction = float(
-                    np.mean(
-                        (np.min(sample, axis=2) >= 155)
-                        & ((np.max(sample, axis=2) - np.min(sample, axis=2)) <= 95)
-                    )
-                )
-                aspect = (rx2 - rx1) / max(1.0, float(ry2 - ry1))
-                if (
-                    periodicity < 0.24
-                    or color_fraction < 0.0010
-                    or neutral_fraction < 0.48
-                    or aspect < 2.2
+                for x_fraction, width_fraction in (
+                    (0.18, 0.80),
+                    (0.24, 0.74),
+                    (0.28, 0.70),
+                    (0.32, 0.66),
+                    (0.05, 0.92),
                 ):
-                    continue
-                score = (
-                    3.2 * periodicity
-                    + 1.2 * min(1.0, color_fraction / 0.040)
-                    + 0.8 * neutral_fraction
-                    + 0.15 * min(1.0, aspect / 4.5)
-                )
-                scored.append(
-                    (
-                        (
-                            rx1 / float(pw),
-                            ry1 / float(ph),
-                            (rx2 - rx1) / float(pw),
-                            (ry2 - ry1) / float(ph),
-                        ),
-                        score,
+                    rx1 = max(0, int(round(x1 + box_w * x_fraction)))
+                    rx2 = min(pw, int(round(x1 + box_w * min(0.995, x_fraction + width_fraction))))
+                    if rx2 - rx1 < 90 or ry2 - ry1 < 28:
+                        continue
+                    aspect = (rx2 - rx1) / max(1.0, float(ry2 - ry1))
+                    if aspect < 2.15:
+                        continue
+                    color_fraction = _rect_mean(color_integral, rx1, ry1, rx2, ry2)
+                    white_fraction = _rect_mean(white_integral, rx1, ry1, rx2, ry2)
+                    if color_fraction < 0.0010 or white_fraction < 0.44:
+                        continue
+                    roi_gray = cv2.cvtColor(preview[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2GRAY)
+                    periodicity = _grid_periodicity_score(roi_gray)
+                    if periodicity < 0.18:
+                        continue
+                    score = (
+                        3.4 * periodicity
+                        + 1.45 * min(1.0, color_fraction / 0.035)
+                        + 0.72 * white_fraction
+                        + 0.08 * min(1.0, source_score)
                     )
-                )
+                    scored.append(
+                        (
+                            (
+                                rx1 / float(pw),
+                                ry1 / float(ph),
+                                (rx2 - rx1) / float(pw),
+                                (ry2 - ry1) / float(ph),
+                            ),
+                            score,
+                        )
+                    )
 
     scored.sort(key=lambda item: item[1], reverse=True)
     selected: List[Tuple[Tuple[float, float, float, float], float]] = []
     for roi, score in scored:
-        if any(_roi_iou(roi, prior) >= 0.68 for prior, _ in selected):
+        if any(_roi_iou(roi, prior) >= 0.66 for prior, _ in selected):
             continue
         selected.append((roi, score))
         if len(selected) >= DG_FEATURE_MAX_CANDIDATES:
             break
     return selected
+
+
+def _estimate_ring_pitch_free(
+    items: Sequence[Tuple[float, float, float]],
+    *,
+    axis: str,
+    median_radius: float,
+) -> float:
+    """不依賴 crop 高度估計 DB lattice pitch。"""
+    diffs: List[float] = []
+    orthogonal_limit = max(4.0, median_radius * 1.9)
+    minimum = max(5.0, median_radius * 1.45)
+    maximum = max(minimum + 1.0, median_radius * 5.0)
+    for index, first in enumerate(items):
+        for second in items[index + 1:]:
+            dx = abs(float(first[0]) - float(second[0]))
+            dy = abs(float(first[1]) - float(second[1]))
+            if axis == "x":
+                if dy > orthogonal_limit:
+                    continue
+                distance = dx
+            else:
+                if dx > orthogonal_limit:
+                    continue
+                distance = dy
+            if minimum <= distance <= maximum:
+                diffs.append(distance)
+    if not diffs:
+        return max(8.0, median_radius * 2.7)
+    diffs.sort()
+    # 最近鄰群通常就是一格 pitch；取較小一半再用中位數抗離群。
+    take = diffs[: max(1, min(len(diffs), max(4, len(diffs) // 2)))]
+    median = float(np.median(np.asarray(take, dtype=np.float64)))
+    trimmed = [value for value in take if abs(value - median) <= max(2.0, median * 0.22)]
+    return _median_float(trimmed, median)
 
 
 def _db_dark_ring_feature_candidates(
@@ -2912,10 +3024,10 @@ def _db_dark_ring_feature_candidates(
     deadline: Optional[float] = None,
     cancel_event: Any = None,
 ) -> List[Tuple[Tuple[float, float, float, float], float]]:
-    """DB：直接在下半畫面找紅藍空心圓 lattice，不依賴白色格線。"""
+    """DB 全畫面深色紅藍環搜尋：手機/電腦皆不依賴固定 Y 軸。"""
     _deadline_guard(deadline, cancel_event, min_remaining=0.30)
     height, width = image.shape[:2]
-    scale = min(1.0, 720.0 / max(height, width))
+    scale = min(1.0, 760.0 / max(height, width))
     preview = (
         cv2.resize(
             image,
@@ -2926,148 +3038,178 @@ def _db_dark_ring_feature_candidates(
         else image
     )
     ph, pw = preview.shape[:2]
-    search_y1 = int(round(ph * 0.68))
-    search_y2 = int(round(ph * 0.93))
-    zone = preview[search_y1:search_y2]
-    if zone.size == 0:
-        return []
-
-    gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    max_radius = max(8, int(round(pw * 0.028)))
-    circles = cv2.HoughCircles(
-        gray,
-        cv2.HOUGH_GRADIENT,
-        dp=1.0,
-        minDist=max(5.0, pw * 0.010),
-        param1=90,
-        param2=10,
-        minRadius=2,
-        maxRadius=max_radius,
-    )
-    if circles is None:
-        return []
-
     hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
     hue, sat, val = cv2.split(hsv)
     red = (
-        (sat >= 18)
-        & (val >= 24)
-        & ((hue <= 30) | (hue >= 150))
+        (sat >= 16)
+        & (val >= 22)
+        & ((hue <= 32) | (hue >= 148))
     )
     blue = (
-        (sat >= 18)
-        & (val >= 24)
-        & (hue >= 82)
-        & (hue <= 158)
+        (sat >= 16)
+        & (val >= 22)
+        & (hue >= 80)
+        & (hue <= 160)
     )
-    yy, xx = np.ogrid[:ph, :pw]
-    colored: List[Tuple[float, float, float]] = []
-    for index, raw in enumerate(np.round(circles[0]).astype(int)):
-        if (index & 15) == 0:
-            _deadline_guard(deadline, cancel_event, min_remaining=0.12)
-        cx, local_y, radius = [int(value) for value in raw]
-        cy = local_y + search_y1
-        # DB 大路固定在路紙區上層偏右；排除左側珠盤與上方投注 UI。
-        if cx < pw * 0.22 or cy < ph * 0.735:
-            continue
-        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
-        annulus = (
-            (d2 <= float(radius + 2) ** 2)
-            & (d2 >= float(max(1, radius - 3)) ** 2)
-        )
-        red_pixels = int(np.count_nonzero(red[annulus]))
-        blue_pixels = int(np.count_nonzero(blue[annulus]))
-        dominant = max(red_pixels, blue_pixels)
-        secondary = min(red_pixels, blue_pixels)
-        if dominant < max(4, int(round(radius * 1.2))):
-            continue
-        if dominant / max(1.0, float(secondary)) < 1.10:
-            continue
-        colored.append((float(cx), float(cy), float(radius)))
+    color_union = (red | blue).astype(np.uint8)
+    dark_neutral = ((val <= 180) & (sat <= 135)).astype(np.uint8)
+    color_integral = cv2.integral(color_union, sdepth=cv2.CV_32S)
+    dark_integral = cv2.integral(dark_neutral, sdepth=cv2.CV_32S)
 
-    if len(colored) < 5:
-        return []
+    def _rect_mean(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+        area = max(1, (x2 - x1) * (y2 - y1))
+        total = integral[y2, x2] - integral[y1, x2] - integral[y2, x1] + integral[y1, x1]
+        return float(total) / float(area)
 
-    radii = [item[2] for item in colored]
-    median_radius = max(2.5, float(np.median(np.asarray(radii, dtype=np.float64))))
-    # DB 大路的 row pitch 約為直徑的 1.5~2.2 倍；掃少量候選避免固定手機比例。
-    pitch_guesses = (
-        median_radius * 2.4,
-        median_radius * 3.0,
-        median_radius * 3.6,
-    )
-    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
-    y_values = sorted({int(round(item[1])) for item in colored})
-    for pitch in pitch_guesses:
-        road_height = max(28.0, pitch * 6.35)
-        for seed_y in y_values:
-            for row_offset in (0, 1, 2):
-                top = seed_y - row_offset * pitch - 0.55 * pitch
-                bottom = top + road_height
-                members = [
-                    item
-                    for item in colored
-                    if top <= item[1] <= bottom
-                ]
-                if len(members) < 5:
-                    continue
-                xs = [item[0] for item in members]
-                span_x = max(xs) - min(xs)
-                if span_x < max(pw * 0.15, pitch * 4.0):
-                    continue
-                ys = [item[1] for item in members]
-                # Hough 在縮圖上常只抓到圓環內側，bbox 必須向左、向上補一格，
-                # 否則第一欄／第一列會被裁掉。
-                left = max(
-                    pw * 0.20,
-                    min(xs) - max(pitch * 3.0, pw * 0.035),
-                )
-                right = min(
-                    float(pw),
-                    max(pw * 0.96, max(xs) + pitch * 4.0),
-                )
-                top_clamped = max(
-                    ph * 0.72,
-                    min(ys) - max(pitch * 1.35, ph * 0.010),
-                )
-                crop_h = max(ph * 0.068, pitch * 6.8)
-                bottom_clamped = min(float(ph), top_clamped + crop_h)
-                if bottom_clamped <= top_clamped:
-                    continue
-                crop_h = bottom_clamped - top_clamped
-                crop_w = right - left
-                if crop_w / max(1.0, crop_h) < 2.6:
-                    continue
-                # 深色底 + 水平延伸的彩色圓群，比珠盤路與下三路更符合大路。
-                roi_pixels = preview[
-                    int(top_clamped):int(bottom_clamped),
-                    int(left):int(right),
-                ]
-                hsv_roi = cv2.cvtColor(roi_pixels, cv2.COLOR_BGR2HSV)
-                dark_fraction = float(np.mean(hsv_roi[:, :, 2] <= 165))
-                score = (
-                    1.8 * min(1.0, len(members) / 16.0)
-                    + 1.0 * min(1.0, span_x / max(1.0, pw * 0.40))
-                    + 0.7 * dark_fraction
-                    - 0.20 * abs((crop_h / 6.0) - pitch) / max(1.0, pitch)
-                )
-                scored.append(
-                    (
-                        (
-                            left / float(pw),
-                            top_clamped / float(ph),
-                            crop_w / float(pw),
-                            crop_h / float(ph),
-                        ),
-                        score,
+    # 全畫面 coarse scan 只做 integral-image 計算；不先假設道路在下半部。
+    coarse: List[Tuple[float, Tuple[int, int, int, int]]] = []
+    for height_fraction in (0.055, 0.075, 0.095, 0.125, 0.16):
+        _deadline_guard(deadline, cancel_event, min_remaining=0.18)
+        box_h = max(26, int(round(ph * height_fraction)))
+        step_y = max(12, int(round(box_h * 0.48)))
+        for width_fraction in (0.44, 0.58, 0.72, 0.88):
+            box_w = max(90, int(round(pw * width_fraction)))
+            step_x = max(22, int(round(box_w * 0.30)))
+            for y1 in range(0, max(1, ph - box_h + 1), step_y):
+                y2 = min(ph, y1 + box_h)
+                for x1 in range(0, max(1, pw - box_w + 1), step_x):
+                    x2 = min(pw, x1 + box_w)
+                    aspect = (x2 - x1) / max(1.0, float(y2 - y1))
+                    if aspect < 2.35:
+                        continue
+                    color_fraction = _rect_mean(color_integral, x1, y1, x2, y2)
+                    dark_fraction = _rect_mean(dark_integral, x1, y1, x2, y2)
+                    if color_fraction < 0.0014 or dark_fraction < 0.38:
+                        continue
+                    score = (
+                        2.2 * min(1.0, color_fraction / 0.040)
+                        + 0.9 * dark_fraction
+                        + 0.12 * min(1.0, aspect / 5.0)
                     )
-                )
+                    coarse.append((score, (x1, y1, x2, y2)))
+    coarse.sort(key=lambda item: item[0], reverse=True)
+
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+    yy, xx = np.ogrid[:ph, :pw]
+    seen_windows = set()
+    for window_index, (coarse_score, (x1, y1, x2, y2)) in enumerate(coarse[:14]):
+        if (window_index & 3) == 0:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.14)
+        key = (x1 // 6, y1 // 6, x2 // 6, y2 // 6)
+        if key in seen_windows:
+            continue
+        seen_windows.add(key)
+
+        zone = preview[y1:y2, x1:x2]
+        if zone.size == 0:
+            continue
+        gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        zone_h, zone_w = gray.shape[:2]
+        max_radius = max(7, int(round(min(zone_h, zone_w) * 0.16)))
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=max(4.0, zone_h * 0.08),
+            param1=85,
+            param2=9,
+            minRadius=2,
+            maxRadius=max_radius,
+        )
+        if circles is None:
+            continue
+
+        colored: List[Tuple[float, float, float]] = []
+        for raw in np.round(circles[0]).astype(int):
+            cx_local, cy_local, radius = [int(value) for value in raw]
+            cx = cx_local + x1
+            cy = cy_local + y1
+            if not (0 <= cx < pw and 0 <= cy < ph):
+                continue
+            d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            annulus = (
+                (d2 <= float(radius + 2) ** 2)
+                & (d2 >= float(max(1, radius - 3)) ** 2)
+            )
+            outer = (
+                (d2 <= float(radius + 5) ** 2)
+                & (d2 >= float(radius + 2) ** 2)
+            )
+            red_pixels = int(np.count_nonzero(red[annulus]))
+            blue_pixels = int(np.count_nonzero(blue[annulus]))
+            dominant = max(red_pixels, blue_pixels)
+            secondary = min(red_pixels, blue_pixels)
+            if dominant < max(4, int(round(radius * 1.0))):
+                continue
+            if dominant / max(1.0, float(secondary)) < 1.08:
+                continue
+            outer_v = val[outer]
+            outer_s = sat[outer]
+            if outer_v.size:
+                background_v = float(np.median(outer_v))
+                background_s = float(np.median(outer_s))
+                # 排除投注區的大型彩色 UI；DB 路紙背景通常偏暗/低彩度。
+                if background_v > 205 and background_s > 120:
+                    continue
+            colored.append((float(cx), float(cy), float(radius)))
+
+        if len(colored) < 5:
+            continue
+
+        radii = np.asarray([item[2] for item in colored], dtype=np.float64)
+        median_radius = max(2.5, float(np.median(radii)))
+        radius_filtered = [
+            item for item in colored
+            if 0.55 * median_radius <= item[2] <= 1.65 * median_radius
+        ]
+        if len(radius_filtered) >= 5:
+            colored = radius_filtered
+
+        pitch_y = _estimate_ring_pitch_free(colored, axis="y", median_radius=median_radius)
+        pitch_x = _estimate_ring_pitch_free(colored, axis="x", median_radius=median_radius)
+        xs = [item[0] for item in colored]
+        ys = [item[1] for item in colored]
+        span_x = max(xs) - min(xs)
+        if span_x < max(pw * 0.12, pitch_x * 3.5):
+            continue
+
+        left = max(0.0, min(xs) - pitch_x * 0.75)
+        top = max(0.0, min(ys) - pitch_y * 0.60)
+        right = min(float(pw), max(xs) + pitch_x * 1.20)
+        bottom = min(float(ph), top + pitch_y * 6.25)
+        crop_w = right - left
+        crop_h = bottom - top
+        if crop_h <= 0 or crop_w / max(1.0, crop_h) < 2.25:
+            continue
+
+        roi_pixels = preview[int(top):int(bottom), int(left):int(right)]
+        hsv_roi = cv2.cvtColor(roi_pixels, cv2.COLOR_BGR2HSV)
+        dark_fraction = float(np.mean(hsv_roi[:, :, 2] <= 185))
+        geometry_bonus = min(1.0, len(colored) / 18.0)
+        score = (
+            2.1 * geometry_bonus
+            + 1.0 * min(1.0, span_x / max(1.0, pw * 0.36))
+            + 0.75 * dark_fraction
+            + 0.22 * min(1.0, coarse_score)
+            - 0.15 * abs((crop_h / 6.0) - pitch_y) / max(1.0, pitch_y)
+        )
+        scored.append(
+            (
+                (
+                    left / float(pw),
+                    top / float(ph),
+                    crop_w / float(pw),
+                    crop_h / float(ph),
+                ),
+                score,
+            )
+        )
 
     scored.sort(key=lambda item: item[1], reverse=True)
     selected: List[Tuple[Tuple[float, float, float, float], float]] = []
     for roi, score in scored:
-        if any(_roi_iou(roi, prior) >= 0.65 for prior, _ in selected):
+        if any(_roi_iou(roi, prior) >= 0.62 for prior, _ in selected):
             continue
         selected.append((roi, score))
         if len(selected) >= DB_FEATURE_MAX_CANDIDATES:
@@ -3382,7 +3524,23 @@ def detect_road_sequence_detailed(
         item for item in plan
         if str(item.get("profile") or "") != "mobile_auto_general"
     ]
-    if general_auto_items and specific_items and not likely_crop:
+    if venue_code in {"DG", "DB"} and not likely_crop:
+        venue_feature_items = [
+            item for item in specific_items
+            if str(item.get("profile") or "") in {
+                "dg_feature_white_grid",
+                "db_feature_dark_ring",
+            }
+        ]
+        other_specific_items = [
+            item for item in specific_items
+            if str(item.get("profile") or "") not in {
+                "dg_feature_white_grid",
+                "db_feature_dark_ring",
+            }
+        ]
+        plan = venue_feature_items + other_specific_items + general_auto_items
+    elif general_auto_items and specific_items and not likely_crop:
         plan = (
             [specific_items[0], general_auto_items[0]]
             + specific_items[1:]
