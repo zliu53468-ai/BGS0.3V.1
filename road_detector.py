@@ -1418,11 +1418,24 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
         return None
 
     grid_columns = int(best_run["grid_columns"])
-    if not (ROAD_GRID_AUTO_COL_MIN <= grid_columns <= ROAD_GENERIC_AUTO_COL_MAX):
-        return None
     pitch_x = float(best_run["pitch_x"])
     x0_raw = float(best_run["x0"])
     x2_raw = x0_raw + grid_columns * pitch_x
+
+    # 候選 ROI 可能剛好在最後一條「空白右邊界」前被截掉。
+    # 若最後可見格線到 crop 右緣仍接近一格寬，補回那個未畫出的最後欄位。
+    right_remainder = float(width) - float(best_run["x_last"])
+    right_boundary_inferred = False
+    if (
+        0.55 * pitch_x <= right_remainder <= 1.35 * pitch_x
+        and grid_columns < ROAD_GENERIC_AUTO_COL_MAX
+    ):
+        grid_columns += 1
+        x2_raw = min(float(width), x0_raw + grid_columns * pitch_x)
+        right_boundary_inferred = True
+
+    if not (ROAD_GRID_AUTO_COL_MIN <= grid_columns <= ROAD_GENERIC_AUTO_COL_MAX):
+        return None
 
     # 水平起點不能只看格線數：下三路就在大路下方，常多出第 7 條規律線。
     # 用真正紅/藍圓像素在每格「中央」的對齊程度來選 6-row band。
@@ -1597,6 +1610,7 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
         "line_color_center_alignment": round(float(center_alignment), 6),
         "line_color_pixel_count": int(color_count),
         "line_missing_verticals": int(best_run["missing_lines"]),
+        "line_right_boundary_inferred": bool(right_boundary_inferred),
         "line_y_score": round(float(y_score), 6),
     }
 
