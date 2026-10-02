@@ -2953,6 +2953,49 @@ def detect_road_sequence_detailed(
             and _looks_like_ofalive_android_fullscreen(image)
         )
 
+        # DB / DG 優先使用畫面內容定位，不先信任固定手機 ROI。
+        if DG_DB_FEATURE_LOCATORS_ENABLED and venue_code == "DG":
+            try:
+                for index, (roi, feature_score) in enumerate(
+                    _dg_white_grid_feature_candidates(
+                        image,
+                        deadline=detector_deadline,
+                        cancel_event=cancel_event,
+                    )
+                ):
+                    plan.append({
+                        "name": f"dg_feature_white_grid_{index}",
+                        "roi": roi,
+                        "preference": 76.0 + min(8.0, feature_score),
+                        "fixed_grid": True,
+                        "ring_grid": False,
+                        "grid_columns": None,
+                        "profile": "dg_feature_white_grid",
+                    })
+            except TimeoutError:
+                pass
+
+        if DG_DB_FEATURE_LOCATORS_ENABLED and venue_code == "DB":
+            try:
+                for index, (roi, feature_score) in enumerate(
+                    _db_dark_ring_feature_candidates(
+                        image,
+                        deadline=detector_deadline,
+                        cancel_event=cancel_event,
+                    )
+                ):
+                    plan.append({
+                        "name": f"db_feature_dark_ring_{index}",
+                        "roi": roi,
+                        "preference": 78.0 + min(8.0, feature_score),
+                        "fixed_grid": False,
+                        "ring_grid": True,
+                        "grid_columns": None,
+                        "profile": "db_feature_dark_ring",
+                    })
+            except TimeoutError:
+                pass
+
         if dream_compact_mobile_layout:
             # 必須先於 ofalive 與既有 DG 手機候選執行；這張版型的右側是下三路，
             # 只有中間白色六列區塊可作為大路反推。候選失敗時仍會繼續原有流程。
@@ -3251,6 +3294,7 @@ def detect_road_sequence_detailed(
         "dream_compact_mobile_profile_detected": bool(dream_compact_mobile_layout),
         "ofalive_android_profile_detected": bool(ofalive_android_layout),
         "mobile_auto_focus_used": str(best.get("region_name") or "").startswith("mobile_auto_general_"),
+        "venue_feature_locator_used": str(best.get("region_name") or "").startswith(("dg_feature_", "db_feature_")),
         "detector_hard_timeout_reached": bool(detector_hard_timeout_reached),
         "detector_elapsed_ms": round((time.perf_counter() - detector_started) * 1000.0, 2),
         "detector_budget_ms": round(ROAD_DETECTOR_HARD_TIMEOUT_SECONDS * 1000.0, 2),
