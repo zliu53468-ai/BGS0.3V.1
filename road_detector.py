@@ -215,7 +215,7 @@ ROAD_GENERIC_AUTO_COL_MAX = _env_int(
     "ROAD_GENERIC_AUTO_COL_MAX", 48, 24, 60
 )
 ROAD_GENERIC_MAX_COLUMN_CANDIDATES = _env_int(
-    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 5, 3, 8
+    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 3, 2, 6
 )
 ROAD_GENERIC_MIN_SQUARE_SCORE = _env_float(
     "ROAD_GENERIC_MIN_SQUARE_SCORE", 0.46, 0.25, 0.80
@@ -284,7 +284,7 @@ ROAD_GRID_MAX_UNCERTAIN_RATIO = max(
 
 # 固定格內容自適應與顏色可信度。
 ROAD_GRID_ALIGN_MAX_TRIM = _env_float("ROAD_GRID_ALIGN_MAX_TRIM", 0.12, 0.0, 0.25)
-ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 17, 5, 41)
+ROAD_GRID_ALIGN_SEARCH_STEPS = _env_int("ROAD_GRID_ALIGN_SEARCH_STEPS", 9, 5, 41)
 ROAD_GRID_MIN_ALIGNMENT_SCORE = _env_float("ROAD_GRID_MIN_ALIGNMENT_SCORE", 0.46, 0.0, 1.0)
 ROAD_GRID_MIN_COLOR_RATIO = _env_float("ROAD_GRID_MIN_COLOR_RATIO", 0.018, 0.001, 0.20)
 ROAD_GRID_INNER_MARGIN_MAX = _env_float("ROAD_GRID_INNER_MARGIN_MAX", 0.18, 0.02, 0.35)
@@ -1418,6 +1418,8 @@ def _detect_fixed_grid(
     *,
     grid_columns: Optional[int] = None,
     profile: str = "",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """固定六列、欄數自動；先測最接近幾何估計的少量欄數，可信即早停。"""
     if crop is None or crop.size == 0:
@@ -1425,8 +1427,9 @@ def _detect_fixed_grid(
 
     results: List[Dict[str, Any]] = []
     generic_auto = str(profile or "").startswith("mobile_auto_general")
-    minimum_trials = 2 if generic_auto else 1
+    minimum_trials = 1
     for columns in _column_candidates(crop, grid_columns, profile=profile):
+        _deadline_guard(deadline, cancel_event, min_remaining=0.35)
         item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
         results.append(item)
         effective = dict(item.get("effective_grid") or {})
@@ -2085,6 +2088,8 @@ def _run_region(
     ring_grid: bool = False,
     grid_columns: Optional[int] = None,
     layout_profile: str = "",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     crop, pixels = _crop(image, roi)
     started = time.perf_counter()
@@ -2095,7 +2100,11 @@ def _run_region(
         )
     elif fixed_grid:
         result = _detect_fixed_grid(
-            crop, grid_columns=grid_columns, profile=layout_profile or name
+            crop,
+            grid_columns=grid_columns,
+            profile=layout_profile or name,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif ROAD_USE_YOLO and _get_yolo_model() is not None:
         result = _detect_yolo(crop)
@@ -2749,6 +2758,21 @@ def detect_road_sequence_detailed(
                 "profile": "legacy_full_image",
             })
 
+    general_auto_items = [
+        item for item in plan
+        if str(item.get("profile") or "") == "mobile_auto_general"
+    ]
+    specific_items = [
+        item for item in plan
+        if str(item.get("profile") or "") != "mobile_auto_general"
+    ]
+    if general_auto_items and specific_items and not likely_crop:
+        plan = (
+            [specific_items[0], general_auto_items[0]]
+            + specific_items[1:]
+            + general_auto_items[1:]
+        )
+
     seen = set()
     best: Optional[Dict[str, Any]] = None
     has_general_auto = any(
@@ -2782,6 +2806,8 @@ def detect_road_sequence_detailed(
                 ring_grid=ring_grid,
                 grid_columns=item.get("grid_columns"),
                 layout_profile=str(item.get("profile") or ""),
+                deadline=deadline,
+                cancel_event=cancel_event,
             )
             candidates.append(current)
             if str(item.get("profile") or "") == "mobile_auto_general":
@@ -2790,18 +2816,21 @@ def detect_road_sequence_detailed(
                 best.get("selection_score", -9999)
             ):
                 best = current
-            minimum_trials = 1 if likely_crop else ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES
+            minimum_trials = 1 if (likely_crop or not has_general_auto) else 2
             if (
                 ROAD_FAST_EARLY_EXIT
                 and len(candidates) >= minimum_trials
                 and (likely_crop or not has_general_auto or evaluated_general_auto)
-                and _strong_acceptable(current)
             ):
-                best = max(
+                current_best = max(
                     candidates,
                     key=lambda item: float(item.get("selection_score", -9999.0) or -9999.0),
                 )
-                break
+                if _strong_acceptable(current_best):
+                    best = current_best
+                    break
+        except TimeoutError:
+            raise
         except Exception as exc:
             errors.append(f"{name}: {exc}")
 
