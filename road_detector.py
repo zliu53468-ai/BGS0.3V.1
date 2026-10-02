@@ -246,7 +246,7 @@ ROAD_DETECTOR_HARD_TIMEOUT_SECONDS = _env_float(
     "ROAD_DETECTOR_HARD_TIMEOUT_SECONDS", 7.0, 2.0, 12.0
 )
 ROAD_RECONSTRUCT_MAX_SECONDS = _env_float(
-    "ROAD_RECONSTRUCT_MAX_SECONDS", 0.18, 0.03, 1.0
+    "ROAD_RECONSTRUCT_MAX_SECONDS", 0.35, 0.03, 1.0
 )
 ROAD_RECONSTRUCT_MAX_NODES = _env_int(
     "ROAD_RECONSTRUCT_MAX_NODES", 300000, 200000, 2000000
@@ -1422,17 +1422,15 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
     x0_raw = float(best_run["x0"])
     x2_raw = x0_raw + grid_columns * pitch_x
 
-    # 候選 ROI 可能剛好在最後一條「空白右邊界」前被截掉。
-    # 若最後可見格線到 crop 右緣仍接近一格寬，補回那個未畫出的最後欄位。
+    # 先不要因為 crop 右緣還剩約一格白底就直接「腦補」一欄。
+    # Dream/DG 全畫面在最右側常有 0.6~1.0 格寬的純白 UI 邊界；
+    # 舊邏輯會把 20 欄誤推成 21 欄，造成整條大路重建失敗。
+    # 是否真的需要補最後一欄，延後到 6-row band 決定後，再用該欄的
+    # 真實紅/藍像素證據判斷。
     right_remainder = float(width) - float(best_run["x_last"])
     right_boundary_inferred = False
-    if (
-        0.55 * pitch_x <= right_remainder <= 1.35 * pitch_x
-        and grid_columns < ROAD_GENERIC_AUTO_COL_MAX
-    ):
-        grid_columns += 1
-        x2_raw = min(float(width), x0_raw + grid_columns * pitch_x)
-        right_boundary_inferred = True
+    right_inference_color_pixels = 0
+    right_inference_center_alignment = 0.0
 
     if not (ROAD_GRID_AUTO_COL_MIN <= grid_columns <= ROAD_GENERIC_AUTO_COL_MAX):
         return None
@@ -1536,6 +1534,50 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
         key=lambda item: item[0],
     )
 
+    # 只有「幾何上像一格」且該額外欄在真正 6-row 大路 band 內有
+    # 足夠紅/藍像素、並且像素集中在格子中央時，才允許補右側欄位。
+    # 這可保留被截掉最後邊界線的容錯，同時排除 Safari/Chrome/Dream
+    # 畫面右側的純白餘邊。
+    if (
+        0.55 * pitch_x <= right_remainder <= 1.35 * pitch_x
+        and grid_columns < ROAD_GENERIC_AUTO_COL_MAX
+    ):
+        extra_x1 = max(0, min(width - 1, int(round(float(best_run["x_last"])))))
+        extra_x2 = max(
+            extra_x1 + 1,
+            min(width, int(round(float(best_run["x_last"]) + pitch_x))),
+        )
+        band_y1 = max(0, min(height - 1, int(math.floor(y0_raw))))
+        band_y2 = max(
+            band_y1 + 1,
+            min(height, int(math.ceil(y0_raw + ROAD_GRID_ROWS * pitch_y_seed))),
+        )
+        extra_mask = red_blue[band_y1:band_y2, extra_x1:extra_x2]
+        local_y, local_x = np.nonzero(extra_mask)
+        right_inference_color_pixels = int(local_x.size)
+        if local_x.size:
+            normalized_x = local_x.astype(np.float64) / max(1.0, float(extra_x2 - extra_x1))
+            right_inference_center_alignment = float(
+                np.mean(
+                    np.clip(
+                        1.0 - np.abs(normalized_x - 0.5) / 0.5,
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+        minimum_extra_color = max(
+            5,
+            int(round(max(1.0, pitch_x * pitch_y_seed) * 0.025)),
+        )
+        if (
+            right_inference_color_pixels >= minimum_extra_color
+            and right_inference_center_alignment >= 0.30
+        ):
+            grid_columns += 1
+            x2_raw = min(float(width), x0_raw + grid_columns * pitch_x)
+            right_boundary_inferred = True
+
     x1 = max(0, min(width - 1, int(round(x0_raw))))
     x2 = max(
         x1 + 1,
@@ -1611,6 +1653,10 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
         "line_color_pixel_count": int(color_count),
         "line_missing_verticals": int(best_run["missing_lines"]),
         "line_right_boundary_inferred": bool(right_boundary_inferred),
+        "line_right_inference_color_pixels": int(right_inference_color_pixels),
+        "line_right_inference_center_alignment": round(
+            float(right_inference_center_alignment), 6
+        ),
         "line_y_score": round(float(y_score), 6),
     }
 
