@@ -86,11 +86,11 @@ LINE_IMAGE_MAX_BYTES = max(
     min(20_000_000, int(os.getenv("LINE_IMAGE_MAX_BYTES", "10000000") or "10000000")),
 )
 SCREEN_ANALYSIS_MAX_SIDE = max(
-    720, min(1600, int(os.getenv("SCREEN_ANALYSIS_MAX_SIDE", "1100") or "1100"))
+    900, min(1800, int(os.getenv("SCREEN_ANALYSIS_MAX_SIDE", "1500") or "1500"))
 )
 SCREEN_ANALYSIS_MAX_PIXELS = max(
-    350_000,
-    min(2_500_000, int(os.getenv("SCREEN_ANALYSIS_MAX_PIXELS", "850000") or "850000")),
+    600_000,
+    min(3_000_000, int(os.getenv("SCREEN_ANALYSIS_MAX_PIXELS", "1200000") or "1200000")),
 )
 IMAGE_MIN_REMAINING_FOR_VISION = max(
     1.5,
@@ -599,11 +599,12 @@ def _prepare_analysis_image(source_path: Path) -> Path:
         (new_width, new_height),
         interpolation=cv2.INTER_AREA,
     )
-    prepared = path.with_name(f"{path.stem}_analysis.jpg")
+    # 手機大路圓環通常只有十幾到二十幾像素高；縮圖後禁止再做 JPEG 有損壓縮。
+    prepared = path.with_name(f"{path.stem}_analysis.png")
     ok, encoded = cv2.imencode(
-        ".jpg",
+        ".png",
         resized,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        [int(cv2.IMWRITE_PNG_COMPRESSION), 1],
     )
     if not ok:
         return path
@@ -861,6 +862,7 @@ def _refresh_screen_prediction(user_id: str, outcome: str, expected_run_id: str,
     operation_lock = _user_image_lock(user_id)
     operation_lock_acquired = False
     prediction_slot_acquired = False
+    queue_wait_ms = 0.0
     try:
         _raise_if_manual_timed_out(cancel_event, deadline)
         lock_wait = _remaining_manual_time(deadline)
@@ -973,9 +975,17 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
         semaphore_wait = min(float(PREDICTION_QUEUE_TIMEOUT), _remaining_image_time(deadline))
         if semaphore_wait <= 0.0:
             raise TimeoutError("等待圖片分析名額時已超時。")
+        queue_started = time.perf_counter()
         prediction_slot_acquired = _PREDICTION_SLOTS.acquire(timeout=semaphore_wait)
+        queue_wait_ms = (time.perf_counter() - queue_started) * 1000.0
         if not prediction_slot_acquired:
             raise TimeoutError("目前分析人數較多，等待圖片分析名額已超時。")
+        # 背景模式的 deadline 包含排隊時間；取得名額後重新給完整影像處理預算，
+        # 避免第二位使用者只是排隊就把自己的視覺辨識秒數耗光。
+        deadline = min(
+            float(deadline),
+            time.perf_counter() + float(LINE_IMAGE_PROCESSING_TIMEOUT),
+        )
         download_started = time.perf_counter()
         temporary_image = _download_line_image(
             message_id,
@@ -1039,7 +1049,7 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         source = f"screen_image_{screen_metadata['input_type']}"
         session = store.update_screen_analysis(user_id, ocr=copy.deepcopy(dict(screen.get("ocr") or {})), detection=copy.deepcopy(dict(screen.get("road") or {})), sequence=copy.deepcopy(sequence), raw_outcomes=copy.deepcopy(raw_outcomes), tie_markers=copy.deepcopy(tie_markers), initial_image_history=copy.deepcopy(raw_outcomes), manual_outcome_history=[], initial_grid_cells=copy.deepcopy(grid_cells), recognition_quality={"recognized_count": recognized_count, "uncertain_count": uncertain_count, "quality_ok": recognition_quality_ok}, prediction=copy.deepcopy(prediction), resolved=copy.deepcopy(resolved), processing_ms=elapsed_ms, source=source, expected_run_id=str(expected_run_id or ""), expected_data_version=expected_version)
-        print("screen_timing", json.dumps({"uid": user_id[-8:], "download_ms": round(download_ms, 2), "prepare_ms": round(prepare_ms, 2), **dict(screen.get("timings") or {}), "model_ms": round(model_ms, 2), "total_ms": round(elapsed_ms, 2), "deadline_remaining_ms": round(_remaining_image_time(deadline) * 1000.0, 2), "input_type": screen_metadata["input_type"], "room_source": screen_metadata["room_source"], "road_count": len(sequence), "reply_mode": not LINE_IMAGE_IMMEDIATE_ACK}, ensure_ascii=False))
+        print("screen_timing", json.dumps({"uid": user_id[-8:], "queue_wait_ms": round(queue_wait_ms, 2), "download_ms": round(download_ms, 2), "prepare_ms": round(prepare_ms, 2), **dict(screen.get("timings") or {}), "model_ms": round(model_ms, 2), "total_ms": round(elapsed_ms, 2), "deadline_remaining_ms": round(_remaining_image_time(deadline) * 1000.0, 2), "input_type": screen_metadata["input_type"], "room_source": screen_metadata["room_source"], "road_count": len(sequence), "reply_mode": not LINE_IMAGE_IMMEDIATE_ACK}, ensure_ascii=False))
         return [screen_result_panel(user_id, session)]
     except AccessExpiredError:
         return [_text("試用已到期，請聯繫管理員開通。")]
@@ -1071,7 +1081,8 @@ async def _process_screen_image_background(
     expected_run_id: str,
 ) -> None:
     cancel_event = threading.Event()
-    deadline = time.perf_counter() + LINE_IMAGE_PROCESSING_TIMEOUT
+    total_budget = float(PREDICTION_QUEUE_TIMEOUT) + float(LINE_IMAGE_PROCESSING_TIMEOUT)
+    deadline = time.perf_counter() + total_budget
     try:
         messages = await asyncio.wait_for(
             asyncio.to_thread(
@@ -1082,7 +1093,7 @@ async def _process_screen_image_background(
                 cancel_event,
                 deadline,
             ),
-            timeout=LINE_IMAGE_PROCESSING_TIMEOUT + 0.5,
+            timeout=total_budget + 0.5,
         )
     except TimeoutError:
         cancel_event.set()
