@@ -2746,7 +2746,7 @@ def _db_dark_ring_feature_candidates(
         else image
     )
     ph, pw = preview.shape[:2]
-    search_y1 = int(round(ph * 0.58))
+    search_y1 = int(round(ph * 0.68))
     search_y2 = int(round(ph * 0.93))
     zone = preview[search_y1:search_y2]
     if zone.size == 0:
@@ -2788,7 +2788,8 @@ def _db_dark_ring_feature_candidates(
             _deadline_guard(deadline, cancel_event, min_remaining=0.12)
         cx, local_y, radius = [int(value) for value in raw]
         cy = local_y + search_y1
-        if cx < pw * 0.20 or cy < ph * 0.62:
+        # DB 大路固定在路紙區上層偏右；排除左側珠盤與上方投注 UI。
+        if cx < pw * 0.22 or cy < ph * 0.735:
             continue
         d2 = (xx - cx) ** 2 + (yy - cy) ** 2
         annulus = (
@@ -2812,9 +2813,9 @@ def _db_dark_ring_feature_candidates(
     median_radius = max(2.5, float(np.median(np.asarray(radii, dtype=np.float64))))
     # DB 大路的 row pitch 約為直徑的 1.5~2.2 倍；掃少量候選避免固定手機比例。
     pitch_guesses = (
-        median_radius * 2.0,
         median_radius * 2.4,
-        median_radius * 2.8,
+        median_radius * 3.0,
+        median_radius * 3.6,
     )
     scored: List[Tuple[Tuple[float, float, float, float], float]] = []
     y_values = sorted({int(round(item[1])) for item in colored})
@@ -2835,10 +2836,23 @@ def _db_dark_ring_feature_candidates(
                 span_x = max(xs) - min(xs)
                 if span_x < max(pw * 0.15, pitch * 4.0):
                     continue
-                left = max(pw * 0.18, min(xs) - pitch * 1.4)
-                right = min(float(pw), max(pw * 0.88, max(xs) + pitch * 3.0))
-                top_clamped = max(0.0, top)
-                bottom_clamped = min(float(ph), bottom)
+                ys = [item[1] for item in members]
+                # Hough 在縮圖上常只抓到圓環內側，bbox 必須向左、向上補一格，
+                # 否則第一欄／第一列會被裁掉。
+                left = max(
+                    pw * 0.20,
+                    min(xs) - max(pitch * 3.0, pw * 0.035),
+                )
+                right = min(
+                    float(pw),
+                    max(pw * 0.96, max(xs) + pitch * 4.0),
+                )
+                top_clamped = max(
+                    ph * 0.72,
+                    min(ys) - max(pitch * 1.35, ph * 0.010),
+                )
+                crop_h = max(ph * 0.068, pitch * 6.8)
+                bottom_clamped = min(float(ph), top_clamped + crop_h)
                 if bottom_clamped <= top_clamped:
                     continue
                 crop_h = bottom_clamped - top_clamped
