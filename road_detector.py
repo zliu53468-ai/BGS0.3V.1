@@ -2052,12 +2052,16 @@ def _score_result(result: Mapping[str, Any], preference: float = 0.0) -> float:
     geometry = float(effective_grid.get("square_cell_score", 0.0) or 0.0)
     median_confidence = float(result.get("median_cell_confidence", 0.0) or 0.0)
     unknown_ratio = unknown / max(1.0, float(recognized + unknown))
+    preference_bonus = math.copysign(
+        min(18.0, abs(float(preference)) * 0.30),
+        float(preference),
+    )
     return (
         recognized * 3.0
         - unknown * 4.0
         - unknown_ratio * 45.0
         - noise * 0.04
-        + preference
+        + preference_bonus
         + quality_bonus
         + reconstruction_bonus
         + alignment * 28.0
@@ -2741,6 +2745,11 @@ def detect_road_sequence_detailed(
 
     seen = set()
     best: Optional[Dict[str, Any]] = None
+    has_general_auto = any(
+        str(item.get("profile") or "") == "mobile_auto_general"
+        for item in plan
+    )
+    evaluated_general_auto = False
     for item in plan:
         _deadline_guard(deadline, cancel_event, min_remaining=0.20)
         roi = tuple(float(value) for value in item["roi"])
@@ -2769,6 +2778,8 @@ def detect_road_sequence_detailed(
                 layout_profile=str(item.get("profile") or ""),
             )
             candidates.append(current)
+            if str(item.get("profile") or "") == "mobile_auto_general":
+                evaluated_general_auto = True
             if best is None or float(current.get("selection_score", -9999)) > float(
                 best.get("selection_score", -9999)
             ):
@@ -2777,6 +2788,7 @@ def detect_road_sequence_detailed(
             if (
                 ROAD_FAST_EARLY_EXIT
                 and len(candidates) >= minimum_trials
+                and (likely_crop or not has_general_auto or evaluated_general_auto)
                 and _strong_acceptable(current)
             ):
                 best = max(
