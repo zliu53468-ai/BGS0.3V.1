@@ -190,7 +190,7 @@ MOBILE_PROFILE_MAX_CANDIDATES = _env_int(
 )
 MOBILE_AUTO_FOCUS_ENABLED = os.getenv("MOBILE_AUTO_FOCUS_ENABLED", "1").strip() == "1"
 MOBILE_AUTO_FOCUS_MAX_CANDIDATES = _env_int(
-    "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 2, 1, 3
+    "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 3, 1, 4
 )
 MOBILE_AUTO_FOCUS_PREVIEW_SIDE = _env_int(
     "MOBILE_AUTO_FOCUS_PREVIEW_SIDE", 640, 420, 960
@@ -202,7 +202,7 @@ MOBILE_AUTO_FOCUS_MAX_AREA_RATIO = _env_float(
     "MOBILE_AUTO_FOCUS_MAX_AREA_RATIO", 0.42, 0.10, 0.80
 )
 MOBILE_AUTO_FOCUS_MIN_ASPECT = _env_float(
-    "MOBILE_AUTO_FOCUS_MIN_ASPECT", 1.55, 1.10, 4.00
+    "MOBILE_AUTO_FOCUS_MIN_ASPECT", 1.12, 1.02, 4.00
 )
 MOBILE_AUTO_FOCUS_MIN_WHITE = _env_float(
     "MOBILE_AUTO_FOCUS_MIN_WHITE", 0.48, 0.20, 0.90
@@ -210,6 +210,24 @@ MOBILE_AUTO_FOCUS_MIN_WHITE = _env_float(
 ROAD_ADAPTIVE_COLOR = os.getenv("ROAD_ADAPTIVE_COLOR", "1").strip() == "1"
 ROAD_FAST_MAX_COLUMN_CANDIDATES = _env_int(
     "ROAD_FAST_MAX_COLUMN_CANDIDATES", 3, 1, 8
+)
+ROAD_GENERIC_AUTO_COL_MAX = _env_int(
+    "ROAD_GENERIC_AUTO_COL_MAX", 48, 24, 60
+)
+ROAD_GENERIC_MAX_COLUMN_CANDIDATES = _env_int(
+    "ROAD_GENERIC_MAX_COLUMN_CANDIDATES", 5, 3, 8
+)
+ROAD_GENERIC_MIN_SQUARE_SCORE = _env_float(
+    "ROAD_GENERIC_MIN_SQUARE_SCORE", 0.46, 0.25, 0.80
+)
+ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES = _env_int(
+    "ROAD_FAST_EARLY_EXIT_MIN_CANDIDATES", 2, 1, 4
+)
+ROAD_RECONSTRUCTION_ONE_CELL_REPAIR = (
+    os.getenv("ROAD_RECONSTRUCTION_ONE_CELL_REPAIR", "1").strip() == "1"
+)
+ROAD_REPAIR_MAX_CANDIDATES = _env_int(
+    "ROAD_REPAIR_MAX_CANDIDATES", 4, 1, 8
 )
 
 # 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
@@ -412,24 +430,76 @@ def _circular_hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
     return np.minimum(delta, 180.0 - delta)
 
 
-def _adaptive_hsv_profile(hsv: np.ndarray) -> Dict[str, float]:
-    hue, saturation, value = cv2.split(hsv)
-    valid = (saturation >= 18) & (value >= 28)
-    red_seed = valid & ((hue <= 30) | (hue >= 150))
-    blue_seed = valid & (hue >= 68) & (hue <= 158)
+def _compact_component_mask(mask: np.ndarray) -> np.ndarray:
+    """只保留圓環/小標記型彩色元件，排除大按鈕、橫幅、整片 UI。"""
+    source = (mask > 0).astype(np.uint8)
+    if source.size == 0 or int(source.sum()) == 0:
+        return source
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(source, 8)
+    out = np.zeros_like(source)
+    image_area = float(source.shape[0] * source.shape[1])
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if area < 3:
+            continue
+        area_ratio = area / max(1.0, image_area)
+        span_x = width / max(1.0, float(source.shape[1]))
+        span_y = height / max(1.0, float(source.shape[0]))
+        aspect = max(width, height) / max(1.0, float(min(width, height)))
+        if area_ratio > 0.035 or span_x > 0.42 or span_y > 0.42 or aspect > 7.0:
+            continue
+        out[labels == index] = 1
+    return out
+
+
+def _slice_bounds(
+    array: np.ndarray,
+    bounds: Optional[Mapping[str, Any]],
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    height, width = array.shape[:2]
+    if not bounds:
+        return array, (0, 0, width, height)
+    x1 = max(0, min(width - 1, int(bounds.get("x", 0) or 0)))
+    y1 = max(0, min(height - 1, int(bounds.get("y", 0) or 0)))
+    x2 = max(x1 + 1, min(width, x1 + int(bounds.get("width", width) or width)))
+    y2 = max(y1 + 1, min(height, y1 + int(bounds.get("height", height) or height)))
+    return array[y1:y2, x1:x2], (x1, y1, x2, y2)
+
+
+def _adaptive_hsv_profile(
+    hsv: np.ndarray,
+    calibration_bounds: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, float]:
+    sample, _ = _slice_bounds(hsv, calibration_bounds)
+    hue, saturation, value = cv2.split(sample)
+    valid = (saturation >= 16) & (value >= 25)
+
+    # 藍色起點提高到 82，避免綠色和局/青綠 UI 進入藍色校準池。
+    red_broad = valid & ((hue <= 28) | (hue >= 152))
+    blue_broad = valid & (hue >= 82) & (hue <= 155)
+    red_seed = _compact_component_mask(red_broad.astype(np.uint8)) > 0
+    blue_seed = _compact_component_mask(blue_broad.astype(np.uint8)) > 0
+
+    # 若圓環被壓縮得太碎，才退回 grid bounds 內的 broad seed；仍不使用整張 UI。
+    if int(red_seed.sum()) < 8:
+        red_seed = red_broad
+    if int(blue_seed.sum()) < 8:
+        blue_seed = blue_broad
 
     def _channel_floor(values: np.ndarray, fallback: int, low: float) -> float:
         if values.size < 8:
             return float(fallback)
-        return float(np.clip(np.percentile(values, 18) * 0.58, low, fallback))
+        return float(np.clip(np.percentile(values, 18) * 0.60, low, fallback))
 
     red_hues = hue[red_seed].astype(np.float32)
     if red_hues.size >= 8:
         signed = np.where(red_hues > 90.0, red_hues - 180.0, red_hues)
-        red_center_signed = float(np.median(signed))
-        red_center = red_center_signed % 180.0
-        red_mad = float(np.median(np.abs(signed - red_center_signed)))
-        red_tol = float(np.clip(14.0 + red_mad * 2.2, 16.0, 34.0))
+        center_signed = float(np.median(signed))
+        red_center = center_signed % 180.0
+        red_mad = float(np.median(np.abs(signed - center_signed)))
+        red_tol = float(np.clip(12.0 + red_mad * 2.0, 14.0, 30.0))
     else:
         red_center, red_tol = 0.0, 20.0
 
@@ -437,27 +507,50 @@ def _adaptive_hsv_profile(hsv: np.ndarray) -> Dict[str, float]:
     if blue_hues.size >= 8:
         blue_center = float(np.median(blue_hues))
         blue_mad = float(np.median(np.abs(blue_hues - blue_center)))
-        blue_tol = float(np.clip(16.0 + blue_mad * 2.0, 18.0, 38.0))
+        blue_tol = float(np.clip(14.0 + blue_mad * 1.8, 16.0, 32.0))
     else:
-        blue_center, blue_tol = 112.0, 30.0
+        blue_center, blue_tol = 112.0, 28.0
 
     return {
         "red_center": red_center,
         "red_tol": red_tol,
         "blue_center": blue_center,
         "blue_tol": blue_tol,
-        "red_s": _channel_floor(saturation[red_seed], ROAD_GRID_RED_MIN_S, 24.0),
-        "red_v": _channel_floor(value[red_seed], ROAD_GRID_RED_MIN_V, 28.0),
-        "blue_s": _channel_floor(saturation[blue_seed], ROAD_GRID_BLUE_MIN_S, 22.0),
-        "blue_v": _channel_floor(value[blue_seed], ROAD_GRID_BLUE_MIN_V, 26.0),
+        "red_s": _channel_floor(saturation[red_seed], ROAD_GRID_RED_MIN_S, 20.0),
+        "red_v": _channel_floor(value[red_seed], ROAD_GRID_RED_MIN_V, 24.0),
+        "blue_s": _channel_floor(saturation[blue_seed], ROAD_GRID_BLUE_MIN_S, 18.0),
+        "blue_v": _channel_floor(value[blue_seed], ROAD_GRID_BLUE_MIN_V, 24.0),
     }
 
 
-def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _broad_color_masks(
+    crop: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """格線對齊第一階段只用寬鬆色罩，不做整張 UI 的自適應校色。"""
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    valid = (saturation >= 18) & (value >= 25)
+    red = (valid & ((hue <= 30) | (hue >= 150))).astype(np.uint8)
+    blue = (valid & (hue >= 82) & (hue <= 158)).astype(np.uint8)
+    green = (
+        (hue >= 30)
+        & (hue <= 92)
+        & (saturation >= 24)
+        & (value >= 25)
+    ).astype(np.uint8)
+    union = ((red | blue | green) > 0).astype(np.uint8)
+    return red, blue, green, union
+
+
+def _color_masks(
+    crop: np.ndarray,
+    *,
+    calibration_bounds: Optional[Mapping[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     hue, saturation, value = cv2.split(hsv)
     if ROAD_ADAPTIVE_COLOR:
-        profile = _adaptive_hsv_profile(hsv)
+        profile = _adaptive_hsv_profile(hsv, calibration_bounds)
         red_hue = _circular_hue_distance(hue, profile["red_center"]) <= profile["red_tol"]
         blue_hue = _circular_hue_distance(hue, profile["blue_center"]) <= profile["blue_tol"]
         red = (
@@ -471,6 +564,7 @@ def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
             & (value >= profile["blue_v"])
         ).astype(np.uint8)
     else:
+        _, _, _, _ = _broad_color_masks(crop)
         red = (
             ((hue <= 15) | (hue >= 165))
             & (saturation >= ROAD_GRID_RED_MIN_S)
@@ -485,8 +579,8 @@ def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
     green = (
         (hue >= 30)
         & (hue <= 92)
-        & (saturation >= max(28, int(ROAD_GRID_GREEN_MIN_S * 0.72)))
-        & (value >= max(28, int(ROAD_GRID_GREEN_MIN_V * 0.72)))
+        & (saturation >= max(24, int(ROAD_GRID_GREEN_MIN_S * 0.68)))
+        & (value >= max(25, int(ROAD_GRID_GREEN_MIN_V * 0.68)))
     ).astype(np.uint8)
     union = ((red | blue | green) > 0).astype(np.uint8)
     return red, blue, green, union
@@ -993,19 +1087,52 @@ def _debug_overlay(
     return str(path)
 
 
-def _column_candidates(crop: np.ndarray, requested: Optional[int] = None) -> List[int]:
+def _column_candidates(
+    crop: np.ndarray,
+    requested: Optional[int] = None,
+    *,
+    profile: str = "",
+) -> List[int]:
     if requested is not None:
         return [max(5, min(60, int(requested)))]
     height, width = crop.shape[:2]
-    estimated = int(round((width / max(1.0, float(height))) * ROAD_GRID_ROWS))
-    estimated = max(ROAD_GRID_AUTO_COL_MIN, min(ROAD_GRID_AUTO_COL_MAX, estimated))
+    aspect = width / max(1.0, float(height))
+    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    maximum = max(ROAD_GRID_AUTO_COL_MAX, ROAD_GENERIC_AUTO_COL_MAX) if generic_auto else ROAD_GRID_AUTO_COL_MAX
+
     if not ROAD_GRID_AUTO_COLUMNS:
         return [ROAD_GRID_COLS]
 
-    values = {estimated, ROAD_GRID_COLS}
+    values = {ROAD_GRID_COLS}
+    if generic_auto:
+        # 不再假設格子一定正方形；用多個 cell-width / cell-height 比例推回欄數。
+        for cell_ratio in (0.68, 0.82, 1.0, 1.22, 1.45):
+            estimated = int(round(aspect * ROAD_GRID_ROWS / cell_ratio))
+            estimated = max(ROAD_GRID_AUTO_COL_MIN, min(maximum, estimated))
+            values.add(estimated)
+            for delta in (-1, 1):
+                candidate = estimated + delta
+                if ROAD_GRID_AUTO_COL_MIN <= candidate <= maximum:
+                    values.add(candidate)
+        square_estimate = int(round(aspect * ROAD_GRID_ROWS))
+        ordered = sorted(
+            values,
+            key=lambda value: (
+                min(
+                    abs(value - aspect * ROAD_GRID_ROWS / ratio)
+                    for ratio in (0.68, 0.82, 1.0, 1.22, 1.45)
+                ),
+                abs(value - square_estimate),
+            ),
+        )
+        return ordered[:ROAD_GENERIC_MAX_COLUMN_CANDIDATES]
+
+    estimated = int(round(aspect * ROAD_GRID_ROWS))
+    estimated = max(ROAD_GRID_AUTO_COL_MIN, min(maximum, estimated))
+    values.add(estimated)
     for delta in range(-ROAD_GRID_AUTO_COL_RADIUS, ROAD_GRID_AUTO_COL_RADIUS + 1):
         candidate = estimated + delta
-        if ROAD_GRID_AUTO_COL_MIN <= candidate <= ROAD_GRID_AUTO_COL_MAX:
+        if ROAD_GRID_AUTO_COL_MIN <= candidate <= maximum:
             values.add(candidate)
     ordered = sorted(
         values,
@@ -1025,9 +1152,13 @@ def _detect_fixed_grid_for_columns(
     profile: str = "",
 ) -> Dict[str, Any]:
     image_height, image_width = crop.shape[:2]
-    red_mask, blue_mask, green_mask, union_mask = _color_masks(crop)
+    _, _, _, broad_union_mask = _broad_color_masks(crop)
     grid_bounds = _effective_grid_bounds(
-        crop, union_mask, grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS
+        crop, broad_union_mask, grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS
+    )
+    red_mask, blue_mask, green_mask, _ = _color_masks(
+        crop,
+        calibration_bounds=grid_bounds,
     )
     classified = _classify_grid(
         crop, red_mask, blue_mask, green_mask, grid_bounds,
@@ -1070,10 +1201,18 @@ def _detect_fixed_grid_for_columns(
     uncertain_ratio = uncertain_count / max(1, candidate_total)
     confidences = [float(item.get("confidence", 0.0) or 0.0) for item in cells]
     median_confidence = float(np.median(confidences)) if confidences else 0.0
+    generic_auto_profile = str(profile or "").startswith("mobile_auto_general")
+    minimum_alignment_score = (
+        max(0.30, ROAD_GRID_MIN_ALIGNMENT_SCORE - 0.08)
+        if generic_auto_profile
+        else ROAD_GRID_MIN_ALIGNMENT_SCORE
+    )
+    minimum_coverage = 0.70 if generic_auto_profile else 0.80
+    minimum_square_score = ROAD_GENERIC_MIN_SQUARE_SCORE if generic_auto_profile else 0.72
     alignment_ok = bool(
-        float(grid_bounds["score"]) >= ROAD_GRID_MIN_ALIGNMENT_SCORE
-        and float(grid_bounds["coverage"]) >= 0.80
-        and float(grid_bounds.get("square_cell_score", 0.0)) >= 0.72
+        float(grid_bounds["score"]) >= minimum_alignment_score
+        and float(grid_bounds["coverage"]) >= minimum_coverage
+        and float(grid_bounds.get("square_cell_score", 0.0)) >= minimum_square_score
     )
     quality_ok = bool(
         recognized_count >= ROAD_GRID_MIN_RECOGNIZED
@@ -1165,13 +1304,19 @@ def _detect_fixed_grid(
         raise ValueError("固定大路裁圖為空。")
 
     results: List[Dict[str, Any]] = []
-    for columns in _column_candidates(crop, grid_columns):
+    generic_auto = str(profile or "").startswith("mobile_auto_general")
+    minimum_trials = 2 if generic_auto else 1
+    for columns in _column_candidates(crop, grid_columns, profile=profile):
         item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
         results.append(item)
+        effective = dict(item.get("effective_grid") or {})
         if (
             ROAD_FAST_EARLY_EXIT
+            and len(results) >= minimum_trials
             and bool(item.get("quality_ok"))
             and int(item.get("recognized_count", 0) or 0) >= ROAD_FAST_MIN_RECOGNIZED
+            and float(effective.get("score", 0.0) or 0.0) >= (0.46 if generic_auto else 0.52)
+            and float(item.get("median_cell_confidence", 0.0) or 0.0) >= 0.46
         ):
             break
 
