@@ -14,7 +14,7 @@ import time
 import numpy as np
 import contextual_bandit as cb
 
-VERSION = "V23_SHORT_X_DYNAMIC_HAZARD"
+VERSION = "V23_SHORT_X_DYNAMIC_HAZARD_R1"
 GAP_SCALE = 0.30
 
 
@@ -245,7 +245,8 @@ def _single_hazard_signals(sequence: Sequence[str], base_prediction: Mapping[str
             "candidate": {"pSame": 0.5, "pSwitch": 0.5, "support": 0.0},
             "background": {"pSame": 0.5, "pSwitch": 0.5, "support": 0.0},
             "cliffEvidence": 0.0, "formationBoost": 0.0,
-            "shortSwitchPhase": False, "switchConsensus": False, "consensusStrength": 0.0,
+            "shortSwitchPhase": False, "switchConsensus": False,
+            "consensusSupport": 0.0, "consensusStrengthRaw": 0.0, "consensusStrength": 0.0,
             "staleScale": 1.0, "shortSwitchBoost": 0.0,
             "weights": {"stageWeight": 0.0, "contextWeight": 0.0, "motifWeight": 0.0, "depthWeight": 0.0, "candidateWeight": 0.0, "backgroundWeight": 0.0, "neutralWeight": 0.0},
         }
@@ -256,8 +257,13 @@ def _single_hazard_signals(sequence: Sequence[str], base_prediction: Mapping[str
 
     short_switch_phase = state["length"] == 1 and depth.get("token") == "X"
     switch_consensus = bool(short_switch_phase and motif["pSwitch"] >= 0.54 and depth["pSwitch"] >= 0.54)
-    consensus_strength = cb._clip(((motif["pSwitch"] - 0.50) + (depth["pSwitch"] - 0.50)) / 0.28) if switch_consensus else 0.0
-    stale_scale = cb._clip(0.60 - 0.18 * consensus_strength, 0.42, 0.60) if switch_consensus else 1.0
+    consensus_support = math.sqrt(cb._clip(motif["support"]) * cb._clip(depth["support"]))
+    consensus_strength_raw = (
+        cb._clip(((motif["pSwitch"] - 0.50) + (depth["pSwitch"] - 0.50)) / 0.28)
+        if switch_consensus else 0.0
+    )
+    consensus_strength = consensus_strength_raw * consensus_support
+    stale_scale = cb._clip(1.0 - 0.58 * consensus_strength, 0.42, 1.0) if switch_consensus else 1.0
 
     stage_base = 0.17 if short_switch_phase else 0.30
     context_base = 0.12 if short_switch_phase else 0.20
@@ -267,7 +273,7 @@ def _single_hazard_signals(sequence: Sequence[str], base_prediction: Mapping[str
 
     stage_weight = stage_base * (0.28 + 0.72 * stage["support"]) * stale_scale
     context_weight = context_base * (0.28 + 0.72 * stage["contextSupport"]) * stale_scale
-    motif_weight = motif_base * (0.30 + 0.70 * motif["support"]) * (0.78 + 0.22 * motif["agreement"])
+    motif_weight = motif_base * (0.30 + 0.70 * motif["support"]) * (0.60 + 0.40 * motif["agreement"])
     depth_weight = depth_base * (0.30 + 0.70 * depth["support"])
     candidate_weight = candidate_base * (0.30 + 0.70 * candidate["support"])
 
@@ -317,14 +323,20 @@ def _single_hazard_signals(sequence: Sequence[str], base_prediction: Mapping[str
             0.52 * cb._clip((motif["pSwitch"] - 0.50) / 0.22) * (0.35 + 0.65 * motif["support"]) +
             0.48 * cb._clip((depth["pSwitch"] - 0.50) / 0.22) * (0.35 + 0.65 * depth["support"])
         )
-        short_switch_boost = 0.045 * evidence
+        short_switch_boost = 0.045 * evidence * (0.25 + 0.75 * consensus_support)
         p_same -= short_switch_boost
 
     formation_boost = 0.0
     if state["length"] == 2:
-        agreement = min(stage["pSame"], stage["contextPSame"])
+        stage_edge = stage["pSame"] - 0.5
+        context_edge = stage["contextPSame"] - 0.5
+        aligned = stage_edge * context_edge > 0.0
+        agreement_edge = (
+            math.copysign(min(abs(stage_edge), abs(context_edge)), stage_edge)
+            if aligned else 0.0
+        )
         formation_support = min(1.0, 0.55 * stage["support"] + 0.45 * stage["contextSupport"])
-        formation_boost = cb._clip((agreement - 0.5) / 0.32) * formation_support * 0.055
+        formation_boost = cb._signed(agreement_edge / 0.32) * formation_support * 0.045
         p_same += formation_boost
 
     p_same = cb._clip(p_same, 0.16, 0.84)
@@ -346,6 +358,8 @@ def _single_hazard_signals(sequence: Sequence[str], base_prediction: Mapping[str
         "formationBoost": formation_boost,
         "shortSwitchPhase": short_switch_phase,
         "switchConsensus": switch_consensus,
+        "consensusSupport": consensus_support,
+        "consensusStrengthRaw": consensus_strength_raw,
         "consensusStrength": consensus_strength,
         "staleScale": stale_scale,
         "shortSwitchBoost": short_switch_boost,
@@ -401,6 +415,7 @@ def _hazard_choose(sequence: Sequence[str], base_prediction: Mapping[str, Any]) 
         "transitionDepth": signal["depth"].get("depth", 0),
         "motifPSame": signal["motif"].get("pSame", 0.5),
         "motifSupport": signal["motif"].get("support", 0.0),
+        "motifAgreement": signal["motif"].get("agreement", 0.0),
         "depthPSame": signal["depth"].get("pSame", 0.5),
         "depthSupport": signal["depth"].get("support", 0.0),
         "stagePSame": signal["stage"].get("pSame", 0.5),
@@ -415,6 +430,9 @@ def _hazard_choose(sequence: Sequence[str], base_prediction: Mapping[str, Any]) 
         "backgroundWeight": signal["weights"].get("backgroundWeight", 0.0),
         "shortSwitchPhase": signal["shortSwitchPhase"],
         "switchConsensus": signal["switchConsensus"],
+        "consensusSupport": signal.get("consensusSupport", 0.0),
+        "consensusStrengthRaw": signal.get("consensusStrengthRaw", 0.0),
+        "consensusStrength": signal.get("consensusStrength", 0.0),
         "staleScale": signal["staleScale"],
         "shortSwitchBoost": signal["shortSwitchBoost"],
     }
