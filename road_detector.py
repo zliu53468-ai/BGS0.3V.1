@@ -1223,6 +1223,228 @@ def _column_candidates(
     return ordered[:ROAD_FAST_MAX_COLUMN_CANDIDATES]
 
 
+def _nms_projection_peaks(
+    values: np.ndarray,
+    *,
+    threshold: float,
+    min_distance: int,
+) -> List[int]:
+    data = np.asarray(values, dtype=np.float64).reshape(-1)
+    candidates = np.where(data >= float(threshold))[0]
+    if candidates.size == 0:
+        return []
+    ordered = candidates[np.argsort(data[candidates])[::-1]]
+    selected: List[int] = []
+    distance = max(2, int(min_distance))
+    for raw in ordered:
+        index = int(raw)
+        if any(abs(index - prior) < distance for prior in selected):
+            continue
+        selected.append(index)
+    return sorted(selected)
+
+
+def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
+    """直接由 DG 白色路紙灰色格線推回 6 列與實際欄數。
+
+    DG 的第一排圓環常遮住最上方水平線，因此水平軸允許頂線缺失；
+    垂直軸則取最長等距格線序列。只有格距一致且 x/y pitch 接近時才啟用。
+    """
+    if crop is None or crop.size == 0:
+        return None
+    height, width = crop.shape[:2]
+    if height < 60 or width < 180:
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    _, saturation, value = cv2.split(hsv)
+    # 先估白底亮度，再只保留「比白底暗」的低彩度灰格線。
+    # 避免壓縮後白底 V=240~250 時整片背景被誤當成格線。
+    white_reference = float(np.percentile(value, 78))
+    neutral_upper = int(np.clip(white_reference - 7.0, 170.0, 244.0))
+    neutral_grid = (
+        (saturation <= 50)
+        & (value >= 80)
+        & (value <= neutral_upper)
+    ).astype(np.uint8)
+
+    column_strength = neutral_grid.sum(axis=0).astype(np.float64)
+    row_strength = neutral_grid.sum(axis=1).astype(np.float64)
+    expected_pitch = max(6.0, height / float(ROAD_GRID_ROWS))
+    nms_distance = max(4, int(round(expected_pitch * 0.42)))
+
+    vertical_peaks = _nms_projection_peaks(
+        column_strength,
+        threshold=max(8.0, height * 0.48),
+        min_distance=nms_distance,
+    )
+    horizontal_peaks = _nms_projection_peaks(
+        row_strength,
+        threshold=max(24.0, width * 0.48),
+        min_distance=nms_distance,
+    )
+    if len(vertical_peaks) < 8 or len(horizontal_peaks) < 4:
+        return None
+
+    def _pitch_from_peaks(peaks: Sequence[int], expected: float) -> Optional[float]:
+        diffs = [
+            float(right - left)
+            for left, right in zip(peaks, peaks[1:])
+            if expected * 0.60 <= (right - left) <= expected * 1.45
+        ]
+        if len(diffs) < 3:
+            return None
+        pitch = float(np.median(np.asarray(diffs, dtype=np.float64)))
+        close = [
+            item
+            for item in diffs
+            if abs(item - pitch) <= max(2.0, pitch * 0.18)
+        ]
+        if len(close) >= 3:
+            pitch = float(np.median(np.asarray(close, dtype=np.float64)))
+        return pitch
+
+    pitch_x = _pitch_from_peaks(vertical_peaks, expected_pitch)
+    pitch_y = _pitch_from_peaks(horizontal_peaks, expected_pitch)
+    if pitch_x is None or pitch_y is None:
+        return None
+
+    square_score = max(
+        0.0,
+        1.0 - abs(pitch_x - pitch_y) / max(1.0, pitch_x, pitch_y),
+    )
+    if square_score < 0.68:
+        return None
+
+    # 垂直格線：找與 pitch_x 同相位的最大群組。
+    best_vertical: List[int] = []
+    best_vertical_error = float("inf")
+    for anchor in vertical_peaks:
+        matched: List[int] = []
+        errors: List[float] = []
+        for peak in vertical_peaks:
+            multiple = int(round((float(peak) - float(anchor)) / pitch_x))
+            predicted = float(anchor) + multiple * pitch_x
+            error = abs(float(peak) - predicted)
+            if error <= max(2.0, pitch_x * 0.16):
+                matched.append(int(peak))
+                errors.append(error)
+        mean_error = float(np.mean(errors)) if errors else float("inf")
+        if (
+            len(matched) > len(best_vertical)
+            or (
+                len(matched) == len(best_vertical)
+                and mean_error < best_vertical_error
+            )
+        ):
+            best_vertical = sorted(set(matched))
+            best_vertical_error = mean_error
+
+    if len(best_vertical) < 8:
+        return None
+    x0_raw = float(best_vertical[0])
+    x_last_raw = float(best_vertical[-1])
+    grid_columns = int(round((x_last_raw - x0_raw) / pitch_x))
+    if not (ROAD_GRID_AUTO_COL_MIN <= grid_columns <= ROAD_GENERIC_AUTO_COL_MAX):
+        return None
+    if grid_columns + 1 < len(best_vertical) - 1:
+        return None
+
+    # 水平格線：將可見線映射到 0..6 邊界；頂線可在 crop 外約 1/3 格。
+    y_candidates: List[Tuple[int, float, float]] = []
+    for peak in horizontal_peaks:
+        for boundary_index in range(ROAD_GRID_ROWS + 1):
+            y0 = float(peak) - boundary_index * pitch_y
+            if y0 < -pitch_y * 0.40:
+                continue
+            if y0 + ROAD_GRID_ROWS * pitch_y > height + pitch_y * 0.40:
+                continue
+            matches = 0
+            total_error = 0.0
+            for other in horizontal_peaks:
+                nearest = int(round((float(other) - y0) / pitch_y))
+                if not (0 <= nearest <= ROAD_GRID_ROWS):
+                    continue
+                predicted = y0 + nearest * pitch_y
+                error = abs(float(other) - predicted)
+                if error <= max(2.0, pitch_y * 0.16):
+                    matches += 1
+                    total_error += error
+            mean_error = total_error / max(1, matches)
+            y_candidates.append((matches, -mean_error, y0))
+    if not y_candidates:
+        return None
+    matches_y, _, y0_raw = max(y_candidates, key=lambda item: (item[0], item[1]))
+    if matches_y < 4:
+        return None
+
+    x1 = max(0, min(width - 1, int(round(x0_raw))))
+    x2 = max(
+        x1 + 1,
+        min(width, int(round(x0_raw + grid_columns * pitch_x))),
+    )
+    y1 = max(0, min(height - 1, int(round(y0_raw))))
+    y2 = max(
+        y1 + 1,
+        min(height, int(round(y0_raw + ROAD_GRID_ROWS * pitch_y))),
+    )
+
+    # 若頂線落在 crop 外，使用可見區 0 作為實際上界；底線仍由 6-row pitch 決定。
+    if y0_raw < 0.0:
+        y1 = 0
+    if y0_raw + ROAD_GRID_ROWS * pitch_y > height:
+        y2 = height
+
+    pitch_x_effective = (x2 - x1) / max(1.0, float(grid_columns))
+    pitch_y_effective = (y2 - y1) / float(ROAD_GRID_ROWS)
+    square_effective = max(
+        0.0,
+        1.0 - abs(pitch_x_effective - pitch_y_effective)
+        / max(1.0, pitch_x_effective, pitch_y_effective),
+    )
+
+    vertical_coverage = min(
+        1.0,
+        len(best_vertical) / max(1.0, float(grid_columns + 1)),
+    )
+    horizontal_coverage = min(
+        1.0,
+        matches_y / float(ROAD_GRID_ROWS + 1),
+    )
+    coverage = float((vertical_coverage + horizontal_coverage) / 2.0)
+    score = float(
+        0.40 * vertical_coverage
+        + 0.40 * horizontal_coverage
+        + 0.20 * square_effective
+    )
+    if vertical_coverage < 0.75 or horizontal_coverage < 0.55:
+        return None
+
+    return {
+        "x": x1,
+        "y": y1,
+        "width": x2 - x1,
+        "height": y2 - y1,
+        "score": score,
+        "coverage": coverage,
+        "square_cell_score": float(square_effective),
+        "cell_pitch_x": float(pitch_x_effective),
+        "cell_pitch_y": float(pitch_y_effective),
+        "offset_x": x1,
+        "offset_y": y1,
+        "scale_x": (x2 - x1) / max(1.0, float(width)),
+        "scale_y": (y2 - y1) / max(1.0, float(height)),
+        "gain_x": 0.0,
+        "gain_y": 0.0,
+        "grid_columns": int(grid_columns),
+        "line_grid": True,
+        "line_vertical_peaks": int(len(best_vertical)),
+        "line_horizontal_peaks": int(matches_y),
+        "line_pitch_x": round(float(pitch_x), 6),
+        "line_pitch_y": round(float(pitch_y), 6),
+    }
+
+
 def _repair_one_cell_reconstruction(
     cells: Sequence[Mapping[str, Any]],
     uncertain_cells: Sequence[Mapping[str, Any]],
@@ -1323,12 +1545,19 @@ def _detect_fixed_grid_for_columns(
     grid_columns: int,
     *,
     profile: str = "",
+    grid_bounds_override: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     image_height, image_width = crop.shape[:2]
     _, _, _, broad_union_mask = _broad_color_masks(crop)
-    grid_bounds = _effective_grid_bounds(
-        crop, broad_union_mask, grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS
-    )
+    if grid_bounds_override:
+        grid_bounds = dict(grid_bounds_override)
+    else:
+        grid_bounds = _effective_grid_bounds(
+            crop,
+            broad_union_mask,
+            grid_columns=grid_columns,
+            grid_rows=ROAD_GRID_ROWS,
+        )
     red_mask, blue_mask, green_mask, _ = _color_masks(
         crop,
         calibration_bounds=grid_bounds,
@@ -1533,6 +1762,41 @@ def _detect_fixed_grid(
     )
     minimum_trials = 1
     hard_timeout_reached = False
+
+    # DG 專用：白色路紙有清楚灰色格線時，直接從實際格線求 6×N，
+    # 不再先用 crop 寬高比猜欄數。這條路徑失敗才回到原本候選搜尋。
+    if profile_key.startswith("dg_feature_white_grid") and grid_columns is None:
+        line_bounds = _dg_line_grid_bounds(crop)
+        if line_bounds is not None:
+            line_columns = int(line_bounds.get("grid_columns", 0) or 0)
+            if ROAD_GRID_AUTO_COL_MIN <= line_columns <= ROAD_GENERIC_AUTO_COL_MAX:
+                line_item = _detect_fixed_grid_for_columns(
+                    crop,
+                    line_columns,
+                    profile=profile,
+                    grid_bounds_override=line_bounds,
+                )
+                line_item["method"] = "dg_direct_gridline_6xN_v1"
+                line_item["line_grid_used"] = True
+                results.append(line_item)
+                if bool(line_item.get("quality_ok")):
+                    output = dict(line_item)
+                    output["hard_timeout_reached"] = False
+                    output["column_candidates"] = [{
+                        "grid_columns": int(line_item.get("grid_columns", 0) or 0),
+                        "quality_ok": True,
+                        "recognized_count": int(line_item.get("recognized_count", 0) or 0),
+                        "reconstructed_all": bool(line_item.get("reconstructed_all")),
+                        "alignment_score": float(
+                            dict(line_item.get("effective_grid") or {}).get("score", 0.0) or 0.0
+                        ),
+                        "square_cell_score": float(
+                            dict(line_item.get("effective_grid") or {}).get("square_cell_score", 0.0) or 0.0
+                        ),
+                        "score": float(line_item.get("column_candidate_score", -9999.0) or -9999.0),
+                        "fallback_reason": "",
+                    }]
+                    return output
     for columns in _column_candidates(crop, grid_columns, profile=profile):
         try:
             _deadline_guard(deadline, cancel_event, min_remaining=0.35)
