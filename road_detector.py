@@ -3260,6 +3260,19 @@ def detect_road_sequence_detailed(
                 best.get("selection_score", -9999)
             ):
                 best = current
+
+            # DB / DG 內容式 locator 已通過強品質閘門時直接採用；
+            # 不再為了 generic auto 多跑一輪昂貴候選。
+            if (
+                str(item.get("profile") or "") in {
+                    "dg_feature_white_grid",
+                    "db_feature_dark_ring",
+                }
+                and _strong_acceptable(current)
+            ):
+                best = current
+                break
+
             minimum_trials = 1 if (likely_crop or not has_general_auto) else 2
             if (
                 ROAD_FAST_EARLY_EXIT
