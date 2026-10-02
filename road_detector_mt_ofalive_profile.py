@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+import time
 
 import road_detector as _base
 
@@ -47,6 +48,8 @@ def _try_mt_ofalive99(
     *,
     venue: str = "",
     input_type: str = "auto",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any] | None:
     venue_code = str(venue or "").upper().strip()
     requested = str(input_type or "auto").lower().strip()
@@ -64,6 +67,10 @@ def _try_mt_ofalive99(
     errors: List[str] = []
 
     for index, roi in enumerate(MT_OFALIVE99_MOBILE_ROIS):
+        if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+            raise TimeoutError("MT 手機大路掃描已取消。")
+        if deadline is not None and time.perf_counter() >= float(deadline):
+            raise TimeoutError("MT 手機大路掃描已超時。")
         name = f"mt_ofalive99_mobile_big_road_{index}"
         attempted.append(name)
         try:
@@ -119,6 +126,8 @@ def detect_road_sequence_detailed(
     *,
     venue: str = "",
     input_type: str = "auto",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """先嘗試新增 MT/ofalive99 Profile；未命中就原封不動走既有 detector。"""
     try:
@@ -126,9 +135,13 @@ def detect_road_sequence_detailed(
             image_path,
             venue=venue,
             input_type=input_type,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         if preferred is not None:
             return preferred
+    except TimeoutError:
+        raise
     except Exception:
         pass
 
@@ -136,6 +149,8 @@ def detect_road_sequence_detailed(
         image_path,
         venue=venue,
         input_type=input_type,
+        deadline=deadline,
+        cancel_event=cancel_event,
     )
 
 

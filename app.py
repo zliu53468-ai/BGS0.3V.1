@@ -14,6 +14,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import threading
@@ -83,6 +84,26 @@ PUSH_RETRY_DELAY_SECONDS = max(
 LINE_IMAGE_MAX_BYTES = max(
     1_000_000,
     min(20_000_000, int(os.getenv("LINE_IMAGE_MAX_BYTES", "10000000") or "10000000")),
+)
+SCREEN_ANALYSIS_MAX_SIDE = max(
+    720, min(1600, int(os.getenv("SCREEN_ANALYSIS_MAX_SIDE", "1100") or "1100"))
+)
+SCREEN_ANALYSIS_MAX_PIXELS = max(
+    350_000,
+    min(2_500_000, int(os.getenv("SCREEN_ANALYSIS_MAX_PIXELS", "850000") or "850000")),
+)
+IMAGE_MIN_REMAINING_FOR_VISION = max(
+    1.5,
+    min(8.0, float(os.getenv("IMAGE_MIN_REMAINING_FOR_VISION", "3.5") or "3.5")),
+)
+IMAGE_MIN_REMAINING_FOR_MODEL = max(
+    0.5,
+    min(5.0, float(os.getenv("IMAGE_MIN_REMAINING_FOR_MODEL", "1.2") or "1.2")),
+)
+LINE_IMAGE_IMMEDIATE_ACK = os.getenv("LINE_IMAGE_IMMEDIATE_ACK", "1").strip() == "1"
+LINE_IMAGE_PROCESSING_TIMEOUT = max(
+    6.0,
+    min(25.0, float(os.getenv("LINE_IMAGE_PROCESSING_TIMEOUT", str(LINE_IMAGE_ANALYSIS_TIMEOUT)) or LINE_IMAGE_ANALYSIS_TIMEOUT)),
 )
 _PREDICTION_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_PREDICTIONS)
 _BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
@@ -345,7 +366,21 @@ def _remaining_image_time(deadline: float) -> float:
 
 def _raise_if_image_timed_out(cancel_event: threading.Event, deadline: float) -> None:
     if cancel_event.is_set() or _remaining_image_time(deadline) <= 0.0:
-        raise TimeoutError("LINE 圖片分析已超過 replyToken 時限。")
+        raise TimeoutError("LINE 圖片分析已超過處理時限。")
+
+
+def _require_image_budget(
+    cancel_event: threading.Event,
+    deadline: float,
+    minimum_seconds: float,
+    stage: str,
+) -> None:
+    _raise_if_image_timed_out(cancel_event, deadline)
+    remaining = _remaining_image_time(deadline)
+    if remaining < float(minimum_seconds):
+        raise TimeoutError(
+            f"圖片分析剩餘時間不足，已在 {stage} 前安全中止（剩餘 {remaining:.2f}s）。"
+        )
 
 
 def _remaining_manual_time(deadline: float) -> float:
@@ -541,23 +576,35 @@ def _download_line_image(message_id: str, *, timeout_seconds: Optional[float] = 
 
 
 def _prepare_analysis_image(source_path: Path) -> Path:
+    """LINE 圖片只縮不放；先控制像素量再交給 OpenCV / OCR。"""
     path = Path(source_path)
     data = np.fromfile(str(path), dtype=np.uint8)
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None or image.size == 0:
         return path
+
     height, width = image.shape[:2]
     long_side = max(height, width)
-    short_side = min(height, width)
-    target_long_side = 1800
-    target_short_side = 900
-    scale = max(1.0, target_long_side / max(1.0, float(long_side)), target_short_side / max(1.0, float(short_side)))
-    scale = min(scale, 2.5)
-    if scale <= 1.05:
+    pixel_count = max(1, height * width)
+    scale_side = SCREEN_ANALYSIS_MAX_SIDE / max(1.0, float(long_side))
+    scale_pixels = math.sqrt(SCREEN_ANALYSIS_MAX_PIXELS / float(pixel_count))
+    scale = min(1.0, scale_side, scale_pixels)
+    if scale >= 0.985:
         return path
-    resized = cv2.resize(image, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))), interpolation=cv2.INTER_CUBIC)
-    prepared = path.with_name(f"{path.stem}_analysis.png")
-    ok, encoded = cv2.imencode(".png", resized)
+
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    prepared = path.with_name(f"{path.stem}_analysis.jpg")
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        resized,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+    )
     if not ok:
         return path
     encoded.tofile(str(prepared))
@@ -930,12 +977,26 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
         if not prediction_slot_acquired:
             raise TimeoutError("目前分析人數較多，等待圖片分析名額已超時。")
         download_started = time.perf_counter()
-        temporary_image = _download_line_image(message_id, timeout_seconds=_remaining_image_time(deadline))
+        temporary_image = _download_line_image(
+            message_id,
+            timeout_seconds=max(1.0, _remaining_image_time(deadline)),
+        )
         download_ms = (time.perf_counter() - download_started) * 1000.0
-        _raise_if_image_timed_out(cancel_event, deadline)
+        _require_image_budget(
+            cancel_event, deadline, IMAGE_MIN_REMAINING_FOR_VISION, "影像辨識"
+        )
+        prepare_started = time.perf_counter()
         analysis_image = _prepare_analysis_image(temporary_image)
-        screen = analyze_game_screen(analysis_image, copy.deepcopy(current_session))
-        _raise_if_image_timed_out(cancel_event, deadline)
+        prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
+        screen = analyze_game_screen(
+            analysis_image,
+            copy.deepcopy(current_session),
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+        _require_image_budget(
+            cancel_event, deadline, IMAGE_MIN_REMAINING_FOR_MODEL, "預測模型"
+        )
         sequence = list(screen.get("sequence") or [])
         raw_outcomes = list(screen.get("raw_outcomes") or sequence)
         tie_markers = dict(screen.get("tie_markers") or {})
@@ -978,7 +1039,7 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         source = f"screen_image_{screen_metadata['input_type']}"
         session = store.update_screen_analysis(user_id, ocr=copy.deepcopy(dict(screen.get("ocr") or {})), detection=copy.deepcopy(dict(screen.get("road") or {})), sequence=copy.deepcopy(sequence), raw_outcomes=copy.deepcopy(raw_outcomes), tie_markers=copy.deepcopy(tie_markers), initial_image_history=copy.deepcopy(raw_outcomes), manual_outcome_history=[], initial_grid_cells=copy.deepcopy(grid_cells), recognition_quality={"recognized_count": recognized_count, "uncertain_count": uncertain_count, "quality_ok": recognition_quality_ok}, prediction=copy.deepcopy(prediction), resolved=copy.deepcopy(resolved), processing_ms=elapsed_ms, source=source, expected_run_id=str(expected_run_id or ""), expected_data_version=expected_version)
-        print("screen_timing", json.dumps({"uid": user_id[-8:], "download_ms": round(download_ms, 2), **dict(screen.get("timings") or {}), "model_ms": round(model_ms, 2), "total_ms": round(elapsed_ms, 2), "input_type": screen_metadata["input_type"], "room_source": screen_metadata["room_source"], "road_count": len(sequence), "reply_mode": True}, ensure_ascii=False))
+        print("screen_timing", json.dumps({"uid": user_id[-8:], "download_ms": round(download_ms, 2), "prepare_ms": round(prepare_ms, 2), **dict(screen.get("timings") or {}), "model_ms": round(model_ms, 2), "total_ms": round(elapsed_ms, 2), "deadline_remaining_ms": round(_remaining_image_time(deadline) * 1000.0, 2), "input_type": screen_metadata["input_type"], "room_source": screen_metadata["room_source"], "road_count": len(sequence), "reply_mode": not LINE_IMAGE_IMMEDIATE_ACK}, ensure_ascii=False))
         return [screen_result_panel(user_id, session)]
     except AccessExpiredError:
         return [_text("試用已到期，請聯繫管理員開通。")]
@@ -1002,6 +1063,40 @@ def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: s
             temporary_image.unlink(missing_ok=True)
         if image_lock_acquired:
             image_lock.release()
+
+
+async def _process_screen_image_background(
+    user_id: str,
+    message_id: str,
+    expected_run_id: str,
+) -> None:
+    cancel_event = threading.Event()
+    deadline = time.perf_counter() + LINE_IMAGE_PROCESSING_TIMEOUT
+    try:
+        messages = await asyncio.wait_for(
+            asyncio.to_thread(
+                _process_screen_image_sync,
+                user_id,
+                message_id,
+                expected_run_id,
+                cancel_event,
+                deadline,
+            ),
+            timeout=LINE_IMAGE_PROCESSING_TIMEOUT + 0.5,
+        )
+    except TimeoutError:
+        cancel_event.set()
+        messages = [_text("⚠️ 圖片分析超時，請裁切保留完整大路後再上傳一次。")]
+    except Exception as exc:
+        cancel_event.set()
+        traceback.print_exc()
+        messages = [_road_error_message(f"圖片處理失敗：{exc}")]
+    await asyncio.to_thread(
+        _push,
+        user_id,
+        messages or [_text("圖片分析未產生結果，請重新上傳一次。")],
+        max_retries=1,
+    )
 
 
 async def _process_manual_outcome_via_reply(token: str, user_id: str, outcome: str, expected_run_id: str) -> bool:
@@ -1356,10 +1451,30 @@ async def webhook(request: Request) -> JSONResponse:
                 if not message_id:
                     raise ValueError("LINE 圖片 messageId 不存在。")
                 run_id = str(session.get("analysis_run_id") or "")
+                if LINE_IMAGE_IMMEDIATE_ACK:
+                    _reply(
+                        token,
+                        [_text("⏳ 圖片已收到，正在自動對焦大路並分析，完成後會自動回傳結果。")],
+                    )
+                    _schedule_background(
+                        _process_screen_image_background(user_id, message_id, run_id)
+                    )
+                    continue
+
                 cancel_event = threading.Event()
                 deadline = time.perf_counter() + LINE_IMAGE_ANALYSIS_TIMEOUT
                 try:
-                    messages = await asyncio.wait_for(asyncio.to_thread(_process_screen_image_sync, user_id, message_id, run_id, cancel_event, deadline), timeout=LINE_IMAGE_ANALYSIS_TIMEOUT)
+                    messages = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _process_screen_image_sync,
+                            user_id,
+                            message_id,
+                            run_id,
+                            cancel_event,
+                            deadline,
+                        ),
+                        timeout=LINE_IMAGE_ANALYSIS_TIMEOUT,
+                    )
                 except TimeoutError:
                     cancel_event.set()
                     messages = [_text("⚠️ 伺服器分析超時，請重新上傳一次圖片試試看！")]

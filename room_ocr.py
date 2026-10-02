@@ -65,6 +65,8 @@ OCR_MIN_CONFIDENCE = _env_float("OCR_MIN_CONFIDENCE", 0.20, 0.0, 1.0)
 OCR_MAX_IMAGE_SIDE = _env_int("OCR_MAX_IMAGE_SIDE", 1400, 640, 3000)
 OCR_FAST_VARIANTS = _env_int("OCR_FAST_VARIANTS", 1, 1, 3)
 OCR_MAX_ROIS = _env_int("OCR_MAX_ROIS", 3, 1, 6)
+OCR_STRICT_FAST = os.getenv("OCR_STRICT_FAST", "1").strip() == "1"
+OCR_CANVAS_SIZE = _env_int("OCR_CANVAS_SIZE", 768, 512, 1600)
 OCR_ALLOWLIST = os.getenv(
     "OCR_ALLOWLIST", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-#"
 ).strip()
@@ -150,15 +152,18 @@ def _preprocess_variants(crop: np.ndarray, *, fast: bool = True) -> List[Tuple[s
         interpolation=cv2.INTER_CUBIC if OCR_UPSCALE > 1.0 else cv2.INTER_AREA,
     )
     gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+    if fast:
+        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        return [("gray_fast", normalized)]
+
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
     denoised = cv2.bilateralFilter(clahe, 5, 35, 35)
     variants: List[Tuple[str, np.ndarray]] = [("gray_clahe", denoised)]
-    if not fast or OCR_FAST_VARIANTS >= 2:
-        variants.append(("color", upscaled))
-    if not fast or OCR_FAST_VARIANTS >= 3:
+    variants.append(("color", upscaled))
+    if OCR_FAST_VARIANTS >= 3:
         otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         variants.append(("otsu", otsu))
-    return variants[: OCR_FAST_VARIANTS if fast else len(variants)]
+    return variants[:max(1, OCR_FAST_VARIANTS)]
 
 
 def _get_easy_reader() -> Any:
@@ -195,6 +200,7 @@ def _tokens_easyocr(image: np.ndarray) -> List[OCRToken]:
         "contrast_ths": 0.05, "adjust_contrast": 0.7,
         "text_threshold": 0.45, "low_text": 0.25, "link_threshold": 0.30,
         "mag_ratio": 1.0,
+        "canvas_size": OCR_CANVAS_SIZE,
     }
     if OCR_ALLOWLIST:
         kwargs["allowlist"] = OCR_ALLOWLIST
@@ -322,7 +328,12 @@ def parse_room_info_text(
     )
 
 
-def _candidate_rois(preferred_venue: str, input_type: str) -> List[Tuple[str, Tuple[float, float, float, float]]]:
+def _candidate_rois(
+    preferred_venue: str,
+    input_type: str,
+    *,
+    fast: bool = True,
+) -> List[Tuple[str, Tuple[float, float, float, float]]]:
     venue = str(preferred_venue or "").upper().strip()
     mode = str(input_type or "auto").lower().strip()
     values: List[Tuple[str, Tuple[float, float, float, float]]] = []
@@ -339,7 +350,8 @@ def _candidate_rois(preferred_venue: str, input_type: str) -> List[Tuple[str, Tu
         if key not in seen:
             seen.add(key)
             unique.append((name, roi))
-    return unique[:OCR_MAX_ROIS]
+    limit = min(OCR_MAX_ROIS, 2) if fast and OCR_STRICT_FAST else OCR_MAX_ROIS
+    return unique[:limit]
 
 
 def analyze_room_info(
@@ -358,7 +370,7 @@ def analyze_room_info(
     used_roi_pixels: Dict[str, int] = {}
     used_roi = OCR_INFO_ROI
 
-    for roi_name, roi in _candidate_rois(preferred_venue, input_type):
+    for roi_name, roi in _candidate_rois(preferred_venue, input_type, fast=fast):
         crop, roi_pixels = _crop_normalized(image, roi)
         variants = _preprocess_variants(crop, fast=fast)
         for backend in backends:

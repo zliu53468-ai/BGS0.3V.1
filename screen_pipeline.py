@@ -23,6 +23,10 @@ SKIP_OCR_WHEN_SESSION_READY = (
 SCREEN_DEFAULT_REMAINING_CARDS = max(
     1, int(os.getenv("SCREEN_DEFAULT_REMAINING_CARDS", "416") or "416")
 )
+SCREEN_OCR_MIN_REMAINING_SECONDS = max(
+    0.5,
+    min(6.0, float(os.getenv("SCREEN_OCR_MIN_REMAINING_SECONDS", "2.5") or "2.5")),
+)
 SCREEN_INPUT_TYPE = os.getenv("SCREEN_INPUT_TYPE", "auto").strip().lower() or "auto"
 if SCREEN_INPUT_TYPE not in {"auto", "full_screen", "road_crop", "wide_multi_road"}:
     SCREEN_INPUT_TYPE = "auto"
@@ -101,11 +105,26 @@ def _mapping_list(values: Any) -> list[Dict[str, Any]]:
     return [dict(item) for item in list(values or []) if isinstance(item, Mapping)]
 
 
+def _remaining_seconds(deadline: Optional[float]) -> float:
+    if deadline is None:
+        return 9999.0
+    return max(0.0, float(deadline) - time.perf_counter())
+
+
+def _check_deadline(deadline: Optional[float], cancel_event: Any = None) -> None:
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise TimeoutError("圖片分析已取消。")
+    if deadline is not None and _remaining_seconds(deadline) <= 0.0:
+        raise TimeoutError("圖片分析已超過時限。")
+
+
 def analyze_game_screen(
     image_path: str | Path,
     existing_session: Optional[Mapping[str, Any]] = None,
     *,
     input_type: Optional[str] = None,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     """辨識完整畫面或牌路裁圖；品質失敗時不污染 session 與 predictor。"""
     started = time.perf_counter()
@@ -126,6 +145,7 @@ def analyze_game_screen(
     }:
         requested_input_type = "auto"
 
+    _check_deadline(deadline, cancel_event)
     road_started = time.perf_counter()
     road_error = ""
     try:
@@ -133,10 +153,14 @@ def analyze_game_screen(
             image_path,
             venue=str(session.get("venue") or ""),
             input_type=requested_input_type,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
         if not isinstance(road, Mapping):
             raise TypeError("road_detector 回傳值不是 Mapping")
         road = dict(road)
+    except TimeoutError:
+        raise
     except Exception as exc:
         road_error = str(exc)
         road = {
@@ -156,10 +180,14 @@ def analyze_game_screen(
         }
     road_ms = (time.perf_counter() - road_started) * 1000.0
 
+    _check_deadline(deadline, cancel_event)
+    deadline_too_close_for_ocr = bool(
+        deadline is not None
+        and _remaining_seconds(deadline) < SCREEN_OCR_MIN_REMAINING_SECONDS
+    )
     should_skip_ocr = bool(
-        FAST_SCREEN_MODE
-        and SKIP_OCR_WHEN_SESSION_READY
-        and _session_is_ready(session)
+        (FAST_SCREEN_MODE and SKIP_OCR_WHEN_SESSION_READY and _session_is_ready(session))
+        or deadline_too_close_for_ocr
     )
     ocr_error = ""
     if should_skip_ocr:
@@ -168,7 +196,12 @@ def analyze_game_screen(
     else:
         ocr_started = time.perf_counter()
         try:
-            raw_ocr = analyze_room_info(image_path)
+            raw_ocr = analyze_room_info(
+                image_path,
+                preferred_venue=str(session.get("venue") or ""),
+                input_type=requested_input_type,
+                fast=True,
+            )
             if not isinstance(raw_ocr, Mapping):
                 raise TypeError("room_ocr 回傳值不是 Mapping")
             ocr = dict(raw_ocr)
@@ -339,6 +372,8 @@ def analyze_game_screen(
             "ocr_ms": round(ocr_ms, 2),
             "screen_total_ms": round(elapsed_ms, 2),
             "ocr_skipped": should_skip_ocr,
+            "ocr_skipped_for_deadline": deadline_too_close_for_ocr,
+            "deadline_remaining_ms": round(_remaining_seconds(deadline) * 1000.0, 2),
         },
         "elapsed_ms": round(elapsed_ms, 2),
     }
