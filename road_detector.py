@@ -247,7 +247,7 @@ ROAD_RECONSTRUCT_MAX_SECONDS = _env_float(
     "ROAD_RECONSTRUCT_MAX_SECONDS", 0.18, 0.03, 1.0
 )
 ROAD_RECONSTRUCT_MAX_NODES = _env_int(
-    "ROAD_RECONSTRUCT_MAX_NODES", 12000, 500, 100000
+    "ROAD_RECONSTRUCT_MAX_NODES", 300000, 200000, 2000000
 )
 
 # 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
@@ -780,6 +780,7 @@ def _classify_grid(
     *,
     grid_columns: int,
     grid_rows: int = ROAD_GRID_ROWS,
+    profile: str = "",
 ) -> Dict[str, Any]:
     red_integral = _integral(red_mask)
     blue_integral = _integral(blue_mask)
@@ -1305,8 +1306,14 @@ def _detect_fixed_grid_for_columns(
         calibration_bounds=grid_bounds,
     )
     classified = _classify_grid(
-        crop, red_mask, blue_mask, green_mask, grid_bounds,
-        grid_columns=grid_columns, grid_rows=ROAD_GRID_ROWS,
+        crop,
+        red_mask,
+        blue_mask,
+        green_mask,
+        grid_bounds,
+        grid_columns=grid_columns,
+        grid_rows=ROAD_GRID_ROWS,
+        profile=profile,
     )
     cells = list(classified["cells"])
     uncertain_cells = list(classified["uncertain_cells"])
@@ -1660,6 +1667,133 @@ def _debug_ring_overlay(
     return str(path)
 
 
+def _repair_one_ring_grid_cell(
+    cells: Sequence[Mapping[str, Any]],
+    *,
+    red_mask: np.ndarray,
+    blue_mask: np.ndarray,
+    green_mask: np.ndarray,
+    pitch_x: float,
+    pitch_y: float,
+    origin_x: float,
+    origin_y: float,
+) -> Optional[Dict[str, Any]]:
+    """DB 圓環路只補一個有真實像素證據、且可形成唯一大路解的漏格。"""
+    if not ROAD_RECONSTRUCTION_ONE_CELL_REPAIR or not cells:
+        return None
+
+    height, width = red_mask.shape[:2]
+    occupied = {
+        (int(item.get("column", -1)), int(item.get("row", -1)))
+        for item in cells
+    }
+    max_column = max((position[0] for position in occupied), default=-1)
+    if max_column < 0:
+        return None
+
+    radii = [
+        float(item.get("radius", 0.0) or 0.0)
+        for item in cells
+        if float(item.get("radius", 0.0) or 0.0) > 0.0
+    ]
+    radius = max(
+        3.0,
+        _median_float(
+            radii,
+            max(3.0, min(float(pitch_x), float(pitch_y)) * 0.32),
+        ),
+    )
+    yy, xx = np.ogrid[:height, :width]
+    successes: List[Dict[str, Any]] = []
+
+    for column in range(max_column + 2):
+        for row in range(ROAD_GRID_ROWS):
+            position = (column, row)
+            if position in occupied:
+                continue
+
+            neighbors = sum(
+                neighbor in occupied
+                for neighbor in (
+                    (column - 1, row),
+                    (column + 1, row),
+                    (column, row - 1),
+                    (column, row + 1),
+                )
+            )
+            if neighbors <= 0:
+                continue
+
+            cx = float(origin_x + column * pitch_x)
+            cy = float(origin_y + row * pitch_y)
+            if not (0 <= cx < width and 0 <= cy < height):
+                continue
+
+            outer = max(3.0, radius + 3.0)
+            inner = max(1.0, radius - 4.0)
+            distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            annulus = (distance2 <= outer ** 2) & (distance2 >= inner ** 2)
+            disk = distance2 <= outer ** 2
+            red_pixels = int(red_mask[annulus].sum())
+            blue_pixels = int(blue_mask[annulus].sum())
+            green_pixels = int(green_mask[disk].sum())
+            dominant = max(red_pixels, blue_pixels)
+            secondary = min(red_pixels, blue_pixels)
+            dominance = dominant / max(1.0, float(secondary))
+
+            # 必須真的看到殘留紅/藍像素；不能只靠路規則憑空補牌。
+            if dominant < max(4, int(round(MOBILE_RING_MIN_COLOR_PIXELS * 0.45))):
+                continue
+            if dominance < 1.08:
+                continue
+
+            outcome = "B" if red_pixels > blue_pixels else "P"
+            candidate = {
+                "cx": round(cx, 3),
+                "cy": round(cy, 3),
+                "radius": int(round(radius)),
+                "red_pixels": red_pixels,
+                "blue_pixels": blue_pixels,
+                "green_pixels": green_pixels,
+                "color_dominance": round(dominance, 6),
+                "outcome": outcome,
+                "tie_count": 0,
+                "confidence": min(
+                    0.55,
+                    0.28 + 0.12 * min(2.0, dominance - 1.0),
+                ),
+                "uncertain": False,
+                "column": column,
+                "row": row,
+                "fit_error_x": 0.0,
+                "fit_error_y": 0.0,
+                "repaired_from_ring_pixels": True,
+            }
+            repaired_cells = [dict(item) for item in cells] + [candidate]
+            reconstruction = _reconstruct_big_road_order(
+                repaired_cells,
+                return_details=True,
+                grid_rows=ROAD_GRID_ROWS,
+            )
+            if (
+                bool(reconstruction.get("reconstructed_all"))
+                and int(reconstruction.get("solution_count", 0) or 0) == 1
+                and len(reconstruction.get("positions") or []) == len(repaired_cells)
+            ):
+                successes.append(
+                    {
+                        "cells": repaired_cells,
+                        "reconstruction": reconstruction,
+                        "repaired_cell": candidate,
+                    }
+                )
+
+    # 只接受全域唯一的一個補洞位置／顏色。
+    if len(successes) != 1:
+        return None
+    return successes[0]
+
+
 def _detect_mobile_ring_grid(
     crop: np.ndarray,
     *,
@@ -1760,6 +1894,21 @@ def _detect_mobile_ring_grid(
             }
         )
 
+    if profile_key.startswith("db_feature_dark_ring"):
+        # DB feature locator 為了容錯會在大路上方保留一些 padding；
+        # 這裡移除上方問路/投注 UI 的彩色圓形按鈕，避免 origin_y 被拉到 UI。
+        lower_cut = image_height * 0.30
+        road_colored = [
+            item for item in colored
+            if float(item.get("cy", 0.0) or 0.0) >= lower_cut
+        ]
+        if len(road_colored) >= ROAD_GRID_MIN_RECOGNIZED:
+            colored = road_colored
+            uncertain_cells = [
+                item for item in uncertain_cells
+                if float(item.get("cy", image_height) or image_height) >= lower_cut
+            ]
+
     if not colored:
         return {
             "ok": False,
@@ -1844,6 +1993,37 @@ def _detect_mobile_ring_grid(
         return_details=True,
         grid_rows=ROAD_GRID_ROWS,
     )
+    repaired_cell: Optional[Dict[str, Any]] = None
+    if (
+        not bool(reconstruction.get("reconstructed_all"))
+        and profile_key.startswith("db_")
+    ):
+        repair = _repair_one_ring_grid_cell(
+            cells,
+            red_mask=red_mask,
+            blue_mask=blue_mask,
+            green_mask=green_mask,
+            pitch_x=pitch_x,
+            pitch_y=pitch_y,
+            origin_x=origin_x,
+            origin_y=origin_y,
+        )
+        if repair is not None:
+            cells = list(repair["cells"])
+            reconstruction = dict(repair["reconstruction"])
+            repaired_cell = dict(repair["repaired_cell"])
+            repaired_cx = float(repaired_cell.get("cx", 0.0) or 0.0)
+            repaired_cy = float(repaired_cell.get("cy", 0.0) or 0.0)
+            uncertain_cells = [
+                item for item in uncertain_cells
+                if (
+                    abs(float(item.get("cx", -9999.0) or -9999.0) - repaired_cx)
+                    > max(3.0, pitch_x * 0.40)
+                    or abs(float(item.get("cy", -9999.0) or -9999.0) - repaired_cy)
+                    > max(3.0, pitch_y * 0.40)
+                )
+            ]
+
     cell_lookup = {
         (int(item["column"]), int(item["row"])): item
         for item in cells
