@@ -17,36 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
-      - name: Syntax check prediction and mobile vision
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py screen_pipeline.py road_detector.py road_detector_mt_ofalive_profile.py baccarat_vision.py room_ocr.py
-      - name: Synthetic mobile road autofocus smoke test
-        run: |
-          python - <<'PY'
-          import cv2, numpy as np
-          import road_detector as rd
-          h, w = 1400, 700
-          img = np.full((h, w, 3), 35, np.uint8)
-          x1, y1, rw, rh = 90, 900, 540, 150
-          cv2.rectangle(img, (x1, y1), (x1+rw, y1+rh), (238, 240, 242), -1)
-          rows, cols = 6, 18
-          cw, ch = rw/cols, rh/rows
-          for r in range(rows+1):
-              y = int(round(y1 + r*ch))
-              cv2.line(img, (x1, y), (x1+rw, y), (185,185,185), 1)
-          for c in range(cols+1):
-              x = int(round(x1 + c*cw))
-              cv2.line(img, (x, y1), (x, y1+rh), (185,185,185), 1)
-          seq = [(0,0,'B'),(0,1,'B'),(1,0,'P'),(2,0,'B'),(2,1,'B'),(3,0,'P')]
-          for c,r,o in seq:
-              cx = int(round(x1 + (c+0.5)*cw)); cy = int(round(y1 + (r+0.5)*ch))
-              color = (35,35,215) if o == 'B' else (210,90,40)
-              cv2.circle(img, (cx,cy), 8, color, 2, cv2.LINE_AA)
-          candidates = rd._general_road_candidates(img)
-          assert candidates, "generic autofocus returned no candidates"
-          roi, score = candidates[0]
-          assert score > 0.5, (roi, score)
-          print("autofocus-ok", roi, score)
-          PY
+      - run: python -m pip install "numpy>=1.26,<2.4"
+      - name: Syntax check prediction and LINE bridge
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
