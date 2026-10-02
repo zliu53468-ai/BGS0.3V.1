@@ -1258,10 +1258,14 @@ def _dg_line_grid_bounds(crop: np.ndarray) -> Optional[Dict[str, Any]]:
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     _, saturation, value = cv2.split(hsv)
+    # 先估白底亮度，再只保留「比白底暗」的低彩度灰格線。
+    # 避免壓縮後白底 V=240~250 時整片背景被誤當成格線。
+    white_reference = float(np.percentile(value, 78))
+    neutral_upper = int(np.clip(white_reference - 7.0, 170.0, 244.0))
     neutral_grid = (
         (saturation <= 50)
-        & (value >= 95)
-        & (value <= 250)
+        & (value >= 80)
+        & (value <= neutral_upper)
     ).astype(np.uint8)
 
     column_strength = neutral_grid.sum(axis=0).astype(np.float64)
