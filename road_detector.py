@@ -188,6 +188,29 @@ DREAM_COMPACT_MOBILE_MIN_BRIGHT_FRACTION = _env_float(
 MOBILE_PROFILE_MAX_CANDIDATES = _env_int(
     "MOBILE_PROFILE_MAX_CANDIDATES", 2, 1, 2
 )
+MOBILE_AUTO_FOCUS_ENABLED = os.getenv("MOBILE_AUTO_FOCUS_ENABLED", "1").strip() == "1"
+MOBILE_AUTO_FOCUS_MAX_CANDIDATES = _env_int(
+    "MOBILE_AUTO_FOCUS_MAX_CANDIDATES", 2, 1, 3
+)
+MOBILE_AUTO_FOCUS_PREVIEW_SIDE = _env_int(
+    "MOBILE_AUTO_FOCUS_PREVIEW_SIDE", 640, 420, 960
+)
+MOBILE_AUTO_FOCUS_MIN_AREA_RATIO = _env_float(
+    "MOBILE_AUTO_FOCUS_MIN_AREA_RATIO", 0.012, 0.004, 0.20
+)
+MOBILE_AUTO_FOCUS_MAX_AREA_RATIO = _env_float(
+    "MOBILE_AUTO_FOCUS_MAX_AREA_RATIO", 0.42, 0.10, 0.80
+)
+MOBILE_AUTO_FOCUS_MIN_ASPECT = _env_float(
+    "MOBILE_AUTO_FOCUS_MIN_ASPECT", 1.55, 1.10, 4.00
+)
+MOBILE_AUTO_FOCUS_MIN_WHITE = _env_float(
+    "MOBILE_AUTO_FOCUS_MIN_WHITE", 0.48, 0.20, 0.90
+)
+ROAD_ADAPTIVE_COLOR = os.getenv("ROAD_ADAPTIVE_COLOR", "1").strip() == "1"
+ROAD_FAST_MAX_COLUMN_CANDIDATES = _env_int(
+    "ROAD_FAST_MAX_COLUMN_CANDIDATES", 3, 1, 8
+)
 
 # 不依賴手機型號、畫面比例或館別的最後一層全圖容錯。它們只會排在
 # 所有既有專用 ROI 與 legacy generic ROI 之後；因此原本成功的格式
@@ -384,25 +407,86 @@ def _grid_bounds(length: int, index: int, count: int) -> Tuple[int, int]:
     return max(0, start), max(start + 1, min(length, end))
 
 
+def _circular_hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
+    delta = np.abs(hue.astype(np.float32) - float(center))
+    return np.minimum(delta, 180.0 - delta)
+
+
+def _adaptive_hsv_profile(hsv: np.ndarray) -> Dict[str, float]:
+    hue, saturation, value = cv2.split(hsv)
+    valid = (saturation >= 18) & (value >= 28)
+    red_seed = valid & ((hue <= 30) | (hue >= 150))
+    blue_seed = valid & (hue >= 68) & (hue <= 158)
+
+    def _channel_floor(values: np.ndarray, fallback: int, low: float) -> float:
+        if values.size < 8:
+            return float(fallback)
+        return float(np.clip(np.percentile(values, 18) * 0.58, low, fallback))
+
+    red_hues = hue[red_seed].astype(np.float32)
+    if red_hues.size >= 8:
+        signed = np.where(red_hues > 90.0, red_hues - 180.0, red_hues)
+        red_center_signed = float(np.median(signed))
+        red_center = red_center_signed % 180.0
+        red_mad = float(np.median(np.abs(signed - red_center_signed)))
+        red_tol = float(np.clip(14.0 + red_mad * 2.2, 16.0, 34.0))
+    else:
+        red_center, red_tol = 0.0, 20.0
+
+    blue_hues = hue[blue_seed].astype(np.float32)
+    if blue_hues.size >= 8:
+        blue_center = float(np.median(blue_hues))
+        blue_mad = float(np.median(np.abs(blue_hues - blue_center)))
+        blue_tol = float(np.clip(16.0 + blue_mad * 2.0, 18.0, 38.0))
+    else:
+        blue_center, blue_tol = 112.0, 30.0
+
+    return {
+        "red_center": red_center,
+        "red_tol": red_tol,
+        "blue_center": blue_center,
+        "blue_tol": blue_tol,
+        "red_s": _channel_floor(saturation[red_seed], ROAD_GRID_RED_MIN_S, 24.0),
+        "red_v": _channel_floor(value[red_seed], ROAD_GRID_RED_MIN_V, 28.0),
+        "blue_s": _channel_floor(saturation[blue_seed], ROAD_GRID_BLUE_MIN_S, 22.0),
+        "blue_v": _channel_floor(value[blue_seed], ROAD_GRID_BLUE_MIN_V, 26.0),
+    }
+
+
 def _color_masks(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     hue, saturation, value = cv2.split(hsv)
-    red = (
-        ((hue <= 15) | (hue >= 165))
-        & (saturation >= ROAD_GRID_RED_MIN_S)
-        & (value >= ROAD_GRID_RED_MIN_V)
-    ).astype(np.uint8)
-    blue = (
-        (hue >= 88)
-        & (hue <= 142)
-        & (saturation >= ROAD_GRID_BLUE_MIN_S)
-        & (value >= ROAD_GRID_BLUE_MIN_V)
-    ).astype(np.uint8)
+    if ROAD_ADAPTIVE_COLOR:
+        profile = _adaptive_hsv_profile(hsv)
+        red_hue = _circular_hue_distance(hue, profile["red_center"]) <= profile["red_tol"]
+        blue_hue = _circular_hue_distance(hue, profile["blue_center"]) <= profile["blue_tol"]
+        red = (
+            red_hue
+            & (saturation >= profile["red_s"])
+            & (value >= profile["red_v"])
+        ).astype(np.uint8)
+        blue = (
+            blue_hue
+            & (saturation >= profile["blue_s"])
+            & (value >= profile["blue_v"])
+        ).astype(np.uint8)
+    else:
+        red = (
+            ((hue <= 15) | (hue >= 165))
+            & (saturation >= ROAD_GRID_RED_MIN_S)
+            & (value >= ROAD_GRID_RED_MIN_V)
+        ).astype(np.uint8)
+        blue = (
+            (hue >= 88)
+            & (hue <= 142)
+            & (saturation >= ROAD_GRID_BLUE_MIN_S)
+            & (value >= ROAD_GRID_BLUE_MIN_V)
+        ).astype(np.uint8)
     green = (
-        (hue >= 34)
-        & (hue <= 87)
-        & (saturation >= ROAD_GRID_GREEN_MIN_S)
-        & (value >= ROAD_GRID_GREEN_MIN_V)
+        (hue >= 30)
+        & (hue <= 92)
+        & (saturation >= max(28, int(ROAD_GRID_GREEN_MIN_S * 0.72)))
+        & (value >= max(28, int(ROAD_GRID_GREEN_MIN_V * 0.72)))
     ).astype(np.uint8)
     union = ((red | blue | green) > 0).astype(np.uint8)
     return red, blue, green, union
@@ -907,13 +991,21 @@ def _column_candidates(crop: np.ndarray, requested: Optional[int] = None) -> Lis
     estimated = max(ROAD_GRID_AUTO_COL_MIN, min(ROAD_GRID_AUTO_COL_MAX, estimated))
     if not ROAD_GRID_AUTO_COLUMNS:
         return [ROAD_GRID_COLS]
-    values = {ROAD_GRID_COLS, estimated}
+
+    values = {estimated, ROAD_GRID_COLS}
     for delta in range(-ROAD_GRID_AUTO_COL_RADIUS, ROAD_GRID_AUTO_COL_RADIUS + 1):
-        values.add(estimated + delta)
-    return sorted(
-        value for value in values
-        if ROAD_GRID_AUTO_COL_MIN <= value <= ROAD_GRID_AUTO_COL_MAX
+        candidate = estimated + delta
+        if ROAD_GRID_AUTO_COL_MIN <= candidate <= ROAD_GRID_AUTO_COL_MAX:
+            values.add(candidate)
+    ordered = sorted(
+        values,
+        key=lambda value: (
+            abs(value - estimated),
+            0 if value == ROAD_GRID_COLS else 1,
+            value,
+        ),
     )
+    return ordered[:ROAD_FAST_MAX_COLUMN_CANDIDATES]
 
 
 def _detect_fixed_grid_for_columns(
@@ -1058,13 +1150,21 @@ def _detect_fixed_grid(
     grid_columns: Optional[int] = None,
     profile: str = "",
 ) -> Dict[str, Any]:
-    """固定六列、欄數自動；逐一驗證格線幾何與完整大路反推後選最佳候選。"""
+    """固定六列、欄數自動；先測最接近幾何估計的少量欄數，可信即早停。"""
     if crop is None or crop.size == 0:
         raise ValueError("固定大路裁圖為空。")
-    results = [
-        _detect_fixed_grid_for_columns(crop, columns, profile=profile)
-        for columns in _column_candidates(crop, grid_columns)
-    ]
+
+    results: List[Dict[str, Any]] = []
+    for columns in _column_candidates(crop, grid_columns):
+        item = _detect_fixed_grid_for_columns(crop, columns, profile=profile)
+        results.append(item)
+        if (
+            ROAD_FAST_EARLY_EXIT
+            and bool(item.get("quality_ok"))
+            and int(item.get("recognized_count", 0) or 0) >= ROAD_FAST_MIN_RECOGNIZED
+        ):
+            break
+
     best = max(
         results,
         key=lambda item: (
@@ -1091,7 +1191,6 @@ def _detect_fixed_grid(
         for item in results
     ]
     return output
-
 
 
 def _median_float(values: Sequence[float], default: float) -> float:
@@ -1860,12 +1959,156 @@ def _shifted_profile_rois(
     return variants
 
 
+def _deadline_guard(
+    deadline: Optional[float],
+    cancel_event: Any = None,
+    *,
+    min_remaining: float = 0.0,
+) -> None:
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise TimeoutError("大路辨識已取消。")
+    if deadline is not None and float(deadline) - time.perf_counter() <= float(min_remaining):
+        raise TimeoutError("大路辨識已達處理時限。")
+
+
+def _mobile_white_road_candidates(
+    image: np.ndarray,
+) -> List[Tuple[Tuple[float, float, float, float], float]]:
+    """用白色路紙 + 格線邊緣 + 紅藍像素搜尋直式手機的大路候選。"""
+    if not MOBILE_AUTO_FOCUS_ENABLED or image is None or image.size == 0:
+        return []
+    height, width = image.shape[:2]
+    if height <= width * 1.12 or min(height, width) < 240:
+        return []
+
+    scale = min(1.0, MOBILE_AUTO_FOCUS_PREVIEW_SIDE / max(height, width))
+    preview = (
+        cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        if scale < 0.999
+        else image
+    )
+    ph, pw = preview.shape[:2]
+    pixels = preview.astype(np.int16, copy=False)
+    channel_min = np.min(pixels, axis=2)
+    channel_span = np.max(pixels, axis=2) - channel_min
+    adaptive_bright = int(np.clip(np.percentile(channel_min, 72) * 0.88, 145, 205))
+    white = ((channel_min >= adaptive_bright) & (channel_span <= 72)).astype(np.uint8) * 255
+
+    close_w = max(9, int(round(pw * 0.035)))
+    close_h = max(3, int(round(ph * 0.008)))
+    white = cv2.morphologyEx(
+        white,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h)),
+        iterations=1,
+    )
+    white = cv2.morphologyEx(
+        white,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = float(ph * pw)
+    scored: List[Tuple[Tuple[float, float, float, float], float]] = []
+
+    hsv = cv2.cvtColor(preview, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
+    broad_color = (
+        (sat >= 28)
+        & (val >= 35)
+        & (
+            (hue <= 32)
+            | (hue >= 150)
+            | ((hue >= 68) & (hue <= 158))
+        )
+    )
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area_ratio = (w * h) / max(1.0, image_area)
+        aspect = w / max(1.0, float(h))
+        if not (
+            MOBILE_AUTO_FOCUS_MIN_AREA_RATIO <= area_ratio <= MOBILE_AUTO_FOCUS_MAX_AREA_RATIO
+            and aspect >= MOBILE_AUTO_FOCUS_MIN_ASPECT
+            and w >= pw * 0.24
+            and h >= ph * 0.035
+        ):
+            continue
+
+        x1 = max(0, x - int(round(w * 0.025)))
+        x2 = min(pw, x + w + int(round(w * 0.025)))
+        y1 = max(0, y - int(round(h * 0.15)))
+        y2 = min(ph, y + h + int(round(h * 0.15)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi_white = white[y1:y2, x1:x2] > 0
+        white_fraction = float(np.mean(roi_white))
+        if white_fraction < MOBILE_AUTO_FOCUS_MIN_WHITE:
+            continue
+
+        color_fraction = float(np.mean(broad_color[y1:y2, x1:x2]))
+        gray = cv2.cvtColor(preview[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        edge_x = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)), axis=0)
+        edge_y = np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)), axis=1)
+        grid_energy = float(
+            min(
+                1.0,
+                (float(np.percentile(edge_x, 90)) + float(np.percentile(edge_y, 90))) / 115.0,
+            )
+        )
+        if color_fraction < 0.0007 or grid_energy < 0.12:
+            continue
+
+        lower_prior = float((y1 + y2) / 2.0 / max(1.0, ph))
+        score = (
+            2.6 * white_fraction
+            + 1.8 * grid_energy
+            + 1.4 * min(1.0, color_fraction / 0.035)
+            + 0.15 * lower_prior
+        )
+        roi = (
+            x1 / float(pw),
+            y1 / float(ph),
+            (x2 - x1) / float(pw),
+            (y2 - y1) / float(ph),
+        )
+        scored.append((roi, score))
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for roi, score in scored:
+        x, y, w, h = roi
+        duplicate = False
+        for prior, _ in selected:
+            px, py, pw0, ph0 = prior
+            ix1, iy1 = max(x, px), max(y, py)
+            ix2, iy2 = min(x + w, px + pw0), min(y + h, py + ph0)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            union = w * h + pw0 * ph0 - inter
+            if union > 0 and inter / union >= 0.62:
+                duplicate = True
+                break
+        if not duplicate:
+            selected.append((roi, score))
+        if len(selected) >= MOBILE_AUTO_FOCUS_MAX_CANDIDATES:
+            break
+    return selected
+
+
 def detect_road_sequence_detailed(
     image_path: str | Path,
     *,
     venue: str = "",
     input_type: str = "auto",
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
+    _deadline_guard(deadline, cancel_event)
     image = _read_image(image_path)
     image_height, image_width = image.shape[:2]
     venue_code = str(venue or "").upper().strip()
@@ -1978,11 +2221,23 @@ def detect_road_sequence_detailed(
                 "profile": "dg_mobile_full_screen",
             })
 
+        if portrait and MOBILE_AUTO_FOCUS_ENABLED:
+            _deadline_guard(deadline, cancel_event, min_remaining=0.6)
+            for index, (roi, auto_score) in enumerate(_mobile_white_road_candidates(image)):
+                plan.append({
+                    "name": f"mobile_auto_white_road_{index}",
+                    "roi": roi,
+                    "preference": 58.0 + min(4.0, auto_score),
+                    "fixed_grid": True,
+                    "grid_columns": None,
+                    "profile": "mobile_auto_white_road",
+                })
+
         if portrait and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
                     DG_MOBILE_BIG_ROAD_ROI, y_radius=ROAD_PROFILE_SEARCH_Y_MOBILE
-                )
+                )[:MOBILE_PROFILE_MAX_CANDIDATES]
             ):
                 plan.append({
                     "name": f"dg_mobile_big_road_{index}",
@@ -1997,7 +2252,7 @@ def detect_road_sequence_detailed(
                 _shifted_profile_rois(
                     MT_MOBILE_BIG_ROAD_ROI,
                     y_radius=MT_PROFILE_SEARCH_Y_MOBILE,
-                )
+                )[:MOBILE_PROFILE_MAX_CANDIDATES]
             ):
                 plan.append({
                     "name": f"mt_mobile_big_road_{index}",
@@ -2013,7 +2268,7 @@ def detect_road_sequence_detailed(
                 _shifted_profile_rois(
                     DB_MOBILE_BIG_ROAD_ROI,
                     y_radius=DB_PROFILE_SEARCH_Y_MOBILE,
-                )
+                )[:MOBILE_PROFILE_MAX_CANDIDATES]
             ):
                 plan.append({
                     "name": f"db_mobile_big_road_{index}",
@@ -2090,6 +2345,7 @@ def detect_road_sequence_detailed(
     seen = set()
     best: Optional[Dict[str, Any]] = None
     for item in plan:
+        _deadline_guard(deadline, cancel_event, min_remaining=0.20)
         roi = tuple(float(value) for value in item["roi"])
         fixed_grid = bool(item["fixed_grid"])
         ring_grid = bool(item.get("ring_grid", False))
