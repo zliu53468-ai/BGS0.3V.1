@@ -17,8 +17,98 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
-      - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+      - run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.10,<5"
+      - name: Syntax check prediction and DG detector
+        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py road_detector.py
+
+      - name: DG mixed-panel regression
+        run: |
+          python - <<'PY'
+          import cv2, numpy as np, tempfile, time
+          import road_detector as rd
+
+          # Reproduce the post-LINE-preprocess geometry of the supplied 869x1884 screenshot:
+          # roughly 590x1280, with left bead road + target big road + lower derived road.
+          H,W=1280,590
+          img=np.full((H,W,3),24,np.uint8)
+          panel_y=895
+          cv2.rectangle(img,(0,panel_y),(589,1125),(246,246,244),-1)
+
+          # left bead-road contamination
+          for rr in range(6):
+              for cc in range(5):
+                  cx=18+cc*24; cy=920+rr*24
+                  color=(30,30,220) if (rr+cc)%2 else (220,90,35)
+                  cv2.circle(img,(cx,cy),9,color,-1,cv2.LINE_AA)
+
+          # target DG road: 20 columns x 6 rows, ~19.5px pitch, x≈192, y≈937
+          x0,y0=192,937
+          px,py=19.5,19.5
+          cols,rows=20,6
+          for c in range(cols+1):
+              x=int(round(x0+c*px))
+              cv2.line(img,(x,y0),(x,int(round(y0+rows*py))),(188,188,188),1)
+          for r in range(rows+1):
+              y=int(round(y0+r*py))
+              cv2.line(img,(x0,y),(int(round(x0+cols*px)),y),(188,188,188),1)
+
+          seq=[
+              (0,0,'P'),(1,0,'B'),(1,1,'B'),(2,0,'P'),
+              (3,0,'B'),(3,1,'B'),(3,2,'B'),(3,3,'B'),(3,4,'B'),(3,5,'B'),
+              (4,0,'P'),(5,0,'B'),(6,0,'P'),(6,1,'P'),(6,2,'P'),(6,3,'P'),
+              (6,4,'P'),(6,5,'P'),(7,5,'P'),(8,5,'P'),(7,0,'B'),(7,1,'B'),
+              (8,0,'P'),(8,1,'P'),(9,0,'B'),(9,1,'B'),(9,2,'B'),(10,0,'P'),
+              (11,0,'B'),(12,0,'P'),(13,0,'B'),(13,1,'B'),(14,0,'P'),
+              (14,1,'P'),(14,2,'P'),(14,3,'P'),(14,4,'P'),(15,0,'B'),
+              (15,1,'B'),(15,2,'B'),(15,3,'B'),(16,0,'P'),(17,0,'B'),
+          ]
+          for c,r,o in seq:
+              cx=int(round(x0+(c+.5)*px)); cy=int(round(y0+(r+.5)*py))
+              color=(30,30,220) if o=='B' else (220,90,35)
+              cv2.circle(img,(cx,cy),6,color,2,cv2.LINE_AA)
+
+          # lower derived-road line with the same approximate pitch; old horizontal phase logic
+          # could use it as a 7th boundary and shift the grid down one row.
+          lower_y=int(round(y0+7*py))
+          cv2.line(img,(192,lower_y),(575,lower_y),(188,188,188),1)
+          for c in range(12):
+              x=200+c*18
+              y=lower_y+12+(c%3)*10
+              cv2.line(img,(x,y),(x+8,y-8),(220,80,30) if c%2 else (220,120,35),2)
+
+          # Broad candidate deliberately includes the bead road and lower derived line.
+          broad=img[941:1079,106:578].copy()
+          bounds=rd._dg_line_grid_bounds(broad)
+          assert bounds is not None, "DG direct grid lock failed"
+          assert bounds["grid_columns"] == 20, bounds
+          assert 75 <= bounds["x"] <= 95, bounds
+          assert bounds["y"] <= 4, bounds
+          assert 18.0 <= bounds["cell_pitch_x"] <= 21.0, bounds
+          assert 18.0 <= bounds["cell_pitch_y"] <= 21.0, bounds
+
+          direct=rd._detect_fixed_grid(
+              broad,
+              profile="dg_feature_white_grid",
+              deadline=time.perf_counter()+2.0,
+          )
+          assert direct["quality_ok"] is True, direct["fallback_reason"]
+          assert direct["reconstructed_all"] is True, direct["fallback_reason"]
+          assert direct["recognized_count"] == len(seq), direct["recognized_count"]
+          assert direct["grid_columns"] == 20, direct["grid_columns"]
+
+          # End-to-end full-screen DG path must choose a DG feature candidate, not bead/derived fallback.
+          with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+              cv2.imwrite(tmp.name,img)
+              result=rd.detect_road_sequence_detailed(
+                  tmp.name,
+                  venue="DG",
+                  input_type="full_screen",
+                  deadline=time.perf_counter()+5.0,
+              )
+          print("selected",result.get("selected_region"),"count",result.get("recognized_count"),"ms",result.get("detector_elapsed_ms"))
+          assert result["ok"] is True, result
+          assert str(result.get("selected_region","")).startswith("dg_feature_white_grid_"), result.get("selected_region")
+          assert result["recognized_count"] >= 40, result["recognized_count"]
+          PY
       - name: Run Final57 runtime tests
         run: python -m unittest -v test_bbb_final57_runtime.py
