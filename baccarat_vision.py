@@ -18,6 +18,8 @@ import time
 import cv2
 import numpy as np
 
+from image_normalize import normalize_capture
+
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
@@ -35,15 +37,15 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, value))
 
 
-MAX_IMAGE_SIDE = _env_int("VISION_MAX_IMAGE_SIDE", 900, 480, 3000)
+MAX_IMAGE_SIDE = _env_int("VISION_MAX_IMAGE_SIDE", 1400, 800, 2000)
 ADAPTIVE_BLOCK_SIZE = _env_int("VISION_ADAPTIVE_BLOCK_SIZE", 31, 11, 101)
 if ADAPTIVE_BLOCK_SIZE % 2 == 0:
     ADAPTIVE_BLOCK_SIZE += 1
 ADAPTIVE_C = _env_int("VISION_ADAPTIVE_C", 7, -30, 30)
-MIN_CIRCLE_AREA = _env_float("VISION_MIN_CIRCLE_AREA", 16.0, 4.0, 5000.0)
+MIN_CIRCLE_AREA = _env_float("VISION_MIN_CIRCLE_AREA", 12.0, 6.0, 5000.0)
 MAX_CIRCLE_AREA_RATIO = _env_float("VISION_MAX_CIRCLE_AREA_RATIO", 0.025, 0.001, 0.20)
 MIN_CIRCULARITY = _env_float("VISION_MIN_CIRCULARITY", 0.24, 0.05, 0.95)
-MIN_SATURATION = _env_float("VISION_MIN_SATURATION", 28.0, 0.0, 255.0)
+MIN_SATURATION = _env_float("VISION_MIN_SATURATION", 24.0, 12.0, 255.0)
 CENTER_PATCH_RADIUS = _env_int("VISION_CENTER_PATCH_RADIUS", 2, 1, 8)
 RING_INNER_RATIO = _env_float("VISION_RING_INNER_RATIO", 0.22, 0.08, 0.42)
 RING_OUTER_RATIO = _env_float("VISION_RING_OUTER_RATIO", 0.52, 0.30, 0.78)
@@ -52,6 +54,40 @@ COLUMN_TOLERANCE_RATIO = _env_float("VISION_COLUMN_TOLERANCE_RATIO", 0.62, 0.25,
 MAX_UNKNOWN_RATIO = _env_float("VISION_MAX_UNKNOWN_RATIO", 0.18, 0.0, 0.80)
 MIN_RECOGNIZED_FOR_PREDICTION = _env_int("VISION_MIN_RECOGNIZED", 8, 1, 200)
 ADAPTIVE_COLOR = os.getenv("VISION_ADAPTIVE_COLOR", "1").strip() == "1"
+VISION_LIGHT_ENHANCE = os.getenv("VISION_LIGHT_ENHANCE", "1").strip() == "1"
+VISION_SCALE_RETRY_ENABLED = os.getenv("VISION_SCALE_RETRY_ENABLED", "1").strip() == "1"
+VISION_MAX_SCALES = _env_int("VISION_MAX_SCALES", 2, 1, 2)
+VISION_SCALE_RETRY_MIN_CANDIDATES = _env_int(
+    "VISION_SCALE_RETRY_MIN_CANDIDATES", 6, 1, 80
+)
+VISION_MAX_RAW_CONTOURS = _env_int("VISION_MAX_RAW_CONTOURS", 800, 100, 1200)
+VISION_MAX_CIRCLE_CANDIDATES = _env_int(
+    "VISION_MAX_CIRCLE_CANDIDATES", 200, 20, 300
+)
+VISION_RECONSTRUCT_MAX_NODES = _env_int(
+    "VISION_RECONSTRUCT_MAX_NODES", 12000, 1000, 50000
+)
+VISION_RECONSTRUCT_MAX_SECONDS = _env_float(
+    "VISION_RECONSTRUCT_MAX_SECONDS", 0.10, 0.01, 0.40
+)
+VISION_DARK_ROAD_COLOR_GEOMETRY = (
+    os.getenv("VISION_DARK_ROAD_COLOR_GEOMETRY", "1").strip() == "1"
+)
+VISION_DARK_ROAD_MAX_VALUE = _env_float(
+    "VISION_DARK_ROAD_MAX_VALUE", 175.0, 60.0, 230.0
+)
+VISION_DARK_COLOR_VALUE_FLOOR = _env_float(
+    "VISION_DARK_COLOR_VALUE_FLOOR", 120.0, 40.0, 245.0
+)
+VISION_DARK_COLOR_VALUE_DELTA = _env_float(
+    "VISION_DARK_COLOR_VALUE_DELTA", 20.0, 4.0, 100.0
+)
+VISION_DARK_RING_INNER_RATIO = _env_float(
+    "VISION_DARK_RING_INNER_RATIO", 0.70, 0.35, 0.90
+)
+VISION_DARK_RING_OUTER_RATIO = _env_float(
+    "VISION_DARK_RING_OUTER_RATIO", 1.05, 0.75, 1.20
+)
 
 
 @dataclass(frozen=True)
@@ -89,25 +125,30 @@ def _vision_deadline_guard(
 
 
 def _read_image(path: str | Path) -> np.ndarray:
-    data = np.fromfile(str(Path(path)), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None or image.size == 0:
-        raise ValueError("無法讀取圖片，請確認格式為 JPG、PNG 或 WEBP。")
+    image, meta = normalize_capture(
+        path, max_side=MAX_IMAGE_SIDE, enhance=VISION_LIGHT_ENHANCE
+    )
+    if image is None:
+        raise ValueError(str(meta.get("error") or "無法讀取路紙圖片。"))
     return image
 
 
-def _resize_for_analysis(image: np.ndarray) -> Tuple[np.ndarray, float]:
-    height, width = image.shape[:2]
-    longest = max(height, width)
-    if longest <= MAX_IMAGE_SIDE:
-        return image, 1.0
-    scale = MAX_IMAGE_SIDE / float(longest)
-    resized = cv2.resize(
+def _resize_for_analysis(
+    image: np.ndarray,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    normalized, meta = normalize_capture(
         image,
-        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
-        interpolation=cv2.INTER_AREA,
+        max_side=MAX_IMAGE_SIDE,
+        enhance=VISION_LIGHT_ENHANCE,
+        deadline=deadline,
+        cancel_event=cancel_event,
     )
-    return resized, scale
+    if normalized is None:
+        raise ValueError(str(meta.get("error") or "無法正規化路紙圖片。"))
+    return normalized, float(meta.get("scale", 1.0) or 1.0), dict(meta)
 
 
 def _circular_hsv_mean(patch_hsv: np.ndarray) -> Tuple[float, float, float]:
@@ -154,10 +195,16 @@ def _adaptive_color_profile(
         ] or list(candidates)
 
     sampled: List[np.ndarray] = []
+    dark_road = bool(
+        VISION_DARK_ROAD_COLOR_GEOMETRY
+        and float(np.median(hsv[:, :, 2])) <= VISION_DARK_ROAD_MAX_VALUE
+    )
     for candidate in filtered[:160]:
         radius = max(4.0, candidate.diameter / 2.0)
-        outer = max(3, int(round(radius * 0.68)))
-        inner = max(1, int(round(radius * 0.18)))
+        outer_ratio = VISION_DARK_RING_OUTER_RATIO if dark_road else 0.68
+        inner_ratio = VISION_DARK_RING_INNER_RATIO if dark_road else 0.18
+        outer = max(3, int(round(radius * outer_ratio)))
+        inner = max(1, int(round(radius * inner_ratio)))
         x1, x2 = max(0, candidate.x - outer), min(width, candidate.x + outer + 1)
         y1, y2 = max(0, candidate.y - outer), min(height, candidate.y + outer + 1)
         patch = hsv[y1:y2, x1:x2]
@@ -277,8 +324,14 @@ def _ring_color_stats(
     """只讀取圓圈外框環形區域，適用紅／藍空心圓。"""
     height, width = hsv.shape[:2]
     radius = max(4.0, candidate.diameter / 2.0)
-    outer = max(3, int(round(radius * RING_OUTER_RATIO)))
-    inner = max(1, int(round(radius * RING_INNER_RATIO)))
+    dark_road = bool(
+        VISION_DARK_ROAD_COLOR_GEOMETRY
+        and float(np.median(hsv[:, :, 2])) <= VISION_DARK_ROAD_MAX_VALUE
+    )
+    outer_ratio = VISION_DARK_RING_OUTER_RATIO if dark_road else RING_OUTER_RATIO
+    inner_ratio = VISION_DARK_RING_INNER_RATIO if dark_road else RING_INNER_RATIO
+    outer = max(3, int(round(radius * outer_ratio)))
+    inner = max(1, int(round(radius * inner_ratio)))
     x1, x2 = max(0, candidate.x - outer), min(width, candidate.x + outer + 1)
     y1, y2 = max(0, candidate.y - outer), min(height, candidate.y + outer + 1)
     patch = hsv[y1:y2, x1:x2]
@@ -346,11 +399,35 @@ def _preprocess_geometry(image: np.ndarray) -> np.ndarray:
     contour_map = cv2.morphologyEx(
         contour_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     )
+    if VISION_DARK_ROAD_COLOR_GEOMETRY and float(np.mean(gray)) <= VISION_DARK_ROAD_MAX_VALUE:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        # The DB road itself is dark maroon and falls in the red hue range.
+        # Keep only colour brighter than that local background so it contributes
+        # ring outlines rather than one giant background contour.
+        color_value_floor = max(
+            VISION_DARK_COLOR_VALUE_FLOOR,
+            float(np.median(value)) + VISION_DARK_COLOR_VALUE_DELTA,
+        )
+        high_saturation = (
+            (saturation >= max(14.0, MIN_SATURATION * 0.75))
+            & (value >= color_value_floor)
+        )
+        red_or_blue = ((hue <= 30) | (hue >= 150) | ((hue >= 76) & (hue <= 156)))
+        color_edges = (high_saturation & red_or_blue).astype(np.uint8) * 255
+        color_edges = cv2.morphologyEx(
+            color_edges,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        contour_map = cv2.bitwise_or(contour_map, color_edges)
     return contour_map
 
 
 def _geometry_candidates(image: np.ndarray, contour_map: np.ndarray) -> List[CircleCandidate]:
     contours, _ = cv2.findContours(contour_map, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) > VISION_MAX_RAW_CONTOURS:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:VISION_MAX_RAW_CONTOURS]
     image_area = float(image.shape[0] * image.shape[1])
     max_area = max(MIN_CIRCLE_AREA * 4.0, image_area * MAX_CIRCLE_AREA_RATIO)
     candidates: List[CircleCandidate] = []
@@ -377,6 +454,8 @@ def _geometry_candidates(image: np.ndarray, contour_map: np.ndarray) -> List[Cir
             x=int(x + width / 2), y=int(y + height / 2), width=int(width), height=int(height),
             area=area, circularity=circularity, fill_ratio=fill_ratio,
         ))
+        if len(candidates) >= VISION_MAX_CIRCLE_CANDIDATES:
+            break
     return candidates
 
 
@@ -443,58 +522,67 @@ def _reconstruct_big_road_detailed(
     target_count = len(grid)
     best: List[CircleCandidate] = [first]
     solutions: List[List[CircleCandidate]] = []
+    search_started = time.perf_counter()
+    nodes = 0
+    budget_exhausted = False
+    stack: List[Tuple[Tuple[CircleCandidate, ...], frozenset[Tuple[int, int]], Tuple[int, int], int, bool]] = [
+        ((first,), frozenset({(0, 0)}), (0, 0), 0, False)
+    ]
 
-    def walk(
-        ordered: List[CircleCandidate],
-        occupied: set[Tuple[int, int]],
-        current: Tuple[int, int],
-        start_column: int,
-        tailing_right: bool,
-    ) -> None:
-        nonlocal best
+    def _next_open(
+        start: int,
+        row: int,
+        occupied: frozenset[Tuple[int, int]],
+    ) -> Tuple[int, int] | None:
+        for offset in range(target_count + 1):
+            candidate = (start + offset, row)
+            if candidate not in occupied:
+                return candidate
+        return None
+
+    while stack:
+        nodes += 1
+        if (
+            nodes > VISION_RECONSTRUCT_MAX_NODES
+            or time.perf_counter() - search_started > VISION_RECONSTRUCT_MAX_SECONDS
+        ):
+            budget_exhausted = True
+            break
+        ordered, occupied, current, start_column, tailing_right = stack.pop()
         if len(ordered) > len(best):
             best = list(ordered)
         if len(ordered) == target_count:
             solutions.append(list(ordered))
-            return
-        if len(solutions) >= 2:
-            return
+            if len(solutions) >= 2:
+                break
+            continue
+
         last_side = ordered[-1].outcome
         column, row = current
         options: List[Tuple[CircleCandidate, Tuple[int, int], int, bool]] = []
-
         if not tailing_right and row < 5 and (column, row + 1) not in occupied:
-            same_cell = (column, row + 1)
-            next_tailing = False
+            same_cell, next_tailing = (column, row + 1), False
         else:
-            next_column = column + 1
-            while (next_column, row) in occupied:
-                next_column += 1
-            same_cell = (next_column, row)
-            next_tailing = True
-        same_item = grid.get(same_cell)
+            same_cell, next_tailing = _next_open(column + 1, row, occupied), True
+        same_item = grid.get(same_cell) if same_cell is not None else None
         if same_item is not None and same_item.outcome == last_side:
             options.append((same_item, same_cell, start_column, next_tailing))
 
         opposite = "P" if last_side == "B" else "B"
-        new_column = start_column + 1
-        while (new_column, 0) in occupied:
-            new_column += 1
-        opposite_cell = (new_column, 0)
-        opposite_item = grid.get(opposite_cell)
+        opposite_cell = _next_open(start_column + 1, 0, occupied)
+        opposite_item = grid.get(opposite_cell) if opposite_cell is not None else None
         if opposite_item is not None and opposite_item.outcome == opposite:
-            options.append((opposite_item, opposite_cell, new_column, False))
+            options.append((opposite_item, opposite_cell, start_column + 1, False))
 
-        for item, cell, next_start, next_tail in options:
-            occupied.add(cell)
-            ordered.append(item)
-            walk(ordered, occupied, cell, next_start, next_tail)
-            ordered.pop()
-            occupied.remove(cell)
-            if len(solutions) >= 2:
-                return
+        for item, cell, next_start, next_tail in reversed(options):
+            stack.append((
+                ordered + (item,),
+                occupied | frozenset({cell}),
+                cell,
+                next_start,
+                next_tail,
+            ))
 
-    walk([first], {(0, 0)}, (0, 0), 0, False)
     if len(solutions) == 1:
         return {
             "ordered": solutions[0],
@@ -504,7 +592,9 @@ def _reconstruct_big_road_detailed(
             "solution_count": 1,
         }
     reason = (
-        "ambiguous_big_road_reconstruction"
+        f"big_road_reconstruction_budget_exhausted_{len(best)}_of_{target_count}"
+        if budget_exhausted
+        else "ambiguous_big_road_reconstruction"
         if len(solutions) > 1
         else f"incomplete_big_road_reconstruction_{len(best)}_of_{target_count}"
     )
@@ -611,16 +701,16 @@ def _sort_big_road_detailed(candidates: Sequence[CircleCandidate]) -> Dict[str, 
 def _sort_big_road(candidates: Sequence[CircleCandidate]) -> List[CircleCandidate]:
     return list(_sort_big_road_detailed(candidates).get("ordered") or [])
 
-def analyze_baccarat_array_detailed(
-    source: np.ndarray,
+def _analyze_baccarat_working_image(
+    image: np.ndarray,
     *,
+    resize_scale: float = 1.0,
     deadline: float | None = None,
     cancel_event: object | None = None,
 ) -> Dict[str, Any]:
-    if source is None or not isinstance(source, np.ndarray) or source.size == 0:
+    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
         raise ValueError("無法讀取路紙圖片。")
     _vision_deadline_guard(deadline, cancel_event, min_remaining=0.15)
-    image, resize_scale = _resize_for_analysis(source.copy())
     _vision_deadline_guard(deadline, cancel_event, min_remaining=0.12)
     contour_map = _preprocess_geometry(image)
     _vision_deadline_guard(deadline, cancel_event, min_remaining=0.10)
@@ -729,8 +819,126 @@ def analyze_baccarat_array_detailed(
     }
 
 
-def analyze_baccarat_image_detailed(image_path: str | Path) -> Dict[str, Any]:
-    return analyze_baccarat_array_detailed(_read_image(image_path))
+def _analysis_rank(result: Dict[str, Any]) -> Tuple[int, int, int, int, float]:
+    unknown_value = result.get("unknown_ratio", 1.0)
+    unknown_ratio = float(1.0 if unknown_value is None else unknown_value)
+    return (
+        1 if bool(result.get("quality_ok")) else 0,
+        1 if bool(result.get("reconstructed_all")) else 0,
+        int(result.get("sequence_count", 0) or 0),
+        int(result.get("recognized_count", 0) or 0),
+        -unknown_ratio,
+    )
+
+
+def _retry_scale_factor(image: np.ndarray) -> float:
+    longest = max(image.shape[:2])
+    if longest * 1.25 <= MAX_IMAGE_SIDE:
+        return 1.25
+    return 0.85
+
+
+def analyze_baccarat_array_detailed(
+    source: np.ndarray,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+    _normalization_meta: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if source is None or not isinstance(source, np.ndarray) or source.size == 0:
+        raise ValueError("無法讀取路紙圖片。")
+
+    if _normalization_meta is None:
+        working, resize_scale, normalization = _resize_for_analysis(
+            source, deadline=deadline, cancel_event=cancel_event
+        )
+    else:
+        working = source
+        normalization = dict(_normalization_meta)
+        resize_scale = float(normalization.get("scale", 1.0) or 1.0)
+
+    primary = _analyze_baccarat_working_image(
+        working,
+        resize_scale=resize_scale,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    best = primary
+    scale_attempts = [{
+        "scale": 1.0,
+        "unique_candidates": int(primary.get("unique_geometry_candidates", 0) or 0),
+        "recognized_count": int(primary.get("recognized_count", 0) or 0),
+        "quality_ok": bool(primary.get("quality_ok")),
+    }]
+    sparse_primary = bool(
+        int(primary.get("unique_geometry_candidates", 0) or 0)
+        < VISION_SCALE_RETRY_MIN_CANDIDATES
+        or int(primary.get("recognized_count", 0) or 0)
+        < MIN_RECOGNIZED_FOR_PREDICTION
+    )
+    if (
+        VISION_SCALE_RETRY_ENABLED
+        and VISION_MAX_SCALES >= 2
+        and sparse_primary
+    ):
+        try:
+            _vision_deadline_guard(deadline, cancel_event, min_remaining=0.15)
+            factor = _retry_scale_factor(working)
+            retry = cv2.resize(
+                working,
+                (
+                    max(1, int(round(working.shape[1] * factor))),
+                    max(1, int(round(working.shape[0] * factor))),
+                ),
+                interpolation=cv2.INTER_CUBIC if factor > 1.0 else cv2.INTER_AREA,
+            )
+            retried = _analyze_baccarat_working_image(
+                retry,
+                resize_scale=resize_scale * factor,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
+            scale_attempts.append({
+                "scale": round(float(factor), 3),
+                "unique_candidates": int(retried.get("unique_geometry_candidates", 0) or 0),
+                "recognized_count": int(retried.get("recognized_count", 0) or 0),
+                "quality_ok": bool(retried.get("quality_ok")),
+            })
+            if _analysis_rank(retried) > _analysis_rank(best):
+                best = retried
+        except TimeoutError:
+            # Primary output remains valid; skip the optional scale retry on deadline.
+            pass
+        except Exception as exc:
+            scale_attempts.append({"scale": "retry_failed", "error": str(exc)[:120]})
+
+    output = dict(best)
+    output["normalization"] = normalization
+    output["scale_attempts"] = scale_attempts
+    return output
+
+
+def analyze_baccarat_image_detailed(
+    image_path: str | Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: object | None = None,
+) -> Dict[str, Any]:
+    image, meta = normalize_capture(
+        image_path,
+        max_side=MAX_IMAGE_SIDE,
+        enhance=VISION_LIGHT_ENHANCE,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    if image is None:
+        raise ValueError(str(meta.get("error") or "無法讀取路紙圖片。"))
+    return analyze_baccarat_array_detailed(
+        image,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        _normalization_meta=dict(meta),
+    )
 
 
 def analyze_baccarat_image(image_path: str | Path) -> List[str]:

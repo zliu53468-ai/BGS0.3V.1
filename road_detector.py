@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 from baccarat_vision import analyze_baccarat_array_detailed
+from image_normalize import normalize_capture
 
 _YOLO_MODEL: Any = None
 _YOLO_LOCK = Lock()
@@ -95,6 +96,17 @@ DB_MOBILE_BIG_ROAD_ROI = _env_roi(
     # DB 深色手機版實圖校準；真正大路位於右側上層，避免把下三路一起裁入。
     (0.360, 0.755, 0.640, 0.075),
 )
+
+# DB Gaming desktop full-screen captures keep a small dark-red big road at the
+# lower right.  These are bounded additive candidates; the mobile ROI remains.
+DB_DESKTOP_ROI_ENABLED = os.getenv("DB_DESKTOP_ROI_ENABLED", "1").strip() == "1"
+DB_DESKTOP_BIG_ROAD_ROI = _env_roi(
+    "DB_DESKTOP_BIG_ROAD_ROI", (0.58, 0.72, 0.40, 0.18)
+)
+DB_DESKTOP_BIG_ROAD_ROI_ALT = _env_roi(
+    "DB_DESKTOP_BIG_ROAD_ROI_ALT", (0.55, 0.70, 0.43, 0.20)
+)
+DB_DESKTOP_MAX_CANDIDATES = _env_int("DB_DESKTOP_MAX_CANDIDATES", 2, 1, 2)
 
 # 橫向「珠盤路＋大路＋下三路」裁圖中的右上第一區塊。
 WIDE_TOP_ROAD_ROI = _env_roi(
@@ -245,6 +257,8 @@ ROAD_REPAIR_MAX_CANDIDATES = _env_int(
 ROAD_DETECTOR_HARD_TIMEOUT_SECONDS = _env_float(
     "ROAD_DETECTOR_HARD_TIMEOUT_SECONDS", 7.0, 2.0, 12.0
 )
+ROAD_NORMALIZE_ENABLED = os.getenv("ROAD_NORMALIZE_ENABLED", "1").strip() == "1"
+ROAD_MAX_IMAGE_SIDE = _env_int("ROAD_MAX_IMAGE_SIDE", 1600, 800, 2000)
 ROAD_RECONSTRUCT_MAX_SECONDS = _env_float(
     "ROAD_RECONSTRUCT_MAX_SECONDS", 0.35, 0.03, 1.0
 )
@@ -390,6 +404,28 @@ MOBILE_RING_MAX_MEDIAN_FIT_ERROR = _env_float(
 MOBILE_RING_MAX_SINGLE_FIT_ERROR = _env_float(
     "MOBILE_RING_MAX_SINGLE_FIT_ERROR", 0.30, 0.10, 0.60
 )
+ROAD_RING_MAX_HOUGH_CANDIDATES = _env_int(
+    "ROAD_RING_MAX_HOUGH_CANDIDATES", 200, 40, 300
+)
+# Sample the outside of DB rings so a number/tie slash in the centre does not
+# turn a blue ring into red (or vice versa).
+DB_RING_INNER_RATIO = _env_float("DB_RING_INNER_RATIO", 0.70, 0.35, 0.90)
+DB_RING_OUTER_RATIO = _env_float("DB_RING_OUTER_RATIO", 1.05, 0.75, 1.20)
+DB_RING_MEDIAN_SAMPLE_RADIUS = (
+    os.getenv("DB_RING_MEDIAN_SAMPLE_RADIUS", "1").strip() == "1"
+)
+DB_DARK_ROAD_CROP_SIGNATURE_ENABLED = (
+    os.getenv("DB_DARK_ROAD_CROP_SIGNATURE_ENABLED", "1").strip() == "1"
+)
+DB_DARK_ROAD_CROP_MIN_ASPECT = _env_float(
+    "DB_DARK_ROAD_CROP_MIN_ASPECT", 2.60, 1.50, 6.00
+)
+DB_DARK_ROAD_CROP_MIN_FRACTION = _env_float(
+    "DB_DARK_ROAD_CROP_MIN_FRACTION", 0.55, 0.15, 0.95
+)
+DB_RING_PITCH_REFINE_ENABLED = (
+    os.getenv("DB_RING_PITCH_REFINE_ENABLED", "1").strip() == "1"
+)
 
 WIDE_LAYOUT_MIN_ASPECT = max(
     3.2,
@@ -417,11 +453,23 @@ YOLO_IMAGE_SIZE = max(
 )
 
 
-def _read_image(path: str | Path) -> np.ndarray:
-    data = np.fromfile(str(Path(path)), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None or image.size == 0:
-        raise ValueError("無法讀取遊戲畫面。")
+def _read_image(
+    path: str | Path,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
+) -> np.ndarray:
+    # Even when the optional light enhancement is off, keep the hard image-size
+    # ceiling so a caller cannot reintroduce unbounded full-screen processing.
+    image, meta = normalize_capture(
+        path,
+        max_side=ROAD_MAX_IMAGE_SIDE,
+        enhance=ROAD_NORMALIZE_ENABLED,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    if image is None:
+        raise ValueError(str(meta.get("error") or "無法讀取遊戲畫面。"))
     return image
 
 
@@ -2118,6 +2166,43 @@ def _nearest_ring_pitch(
     return _median_float(trimmed, median)
 
 
+def _refine_db_ring_pitch(
+    items: Sequence[Mapping[str, Any]],
+    pitch: float,
+    *,
+    axis: str,
+) -> float:
+    """Use a tiny bounded lattice fit for tightly packed DB dark-road rings."""
+    if not DB_RING_PITCH_REFINE_ENABLED or len(items) < 3:
+        return float(pitch)
+    coordinate = "cx" if axis == "x" else "cy"
+    values = sorted({round(float(item.get(coordinate, 0.0) or 0.0), 3) for item in items})
+    if len(values) < 3:
+        return float(pitch)
+    origin = values[0]
+
+    def _score(candidate_pitch: float) -> float:
+        positions = [int(round((value - origin) / candidate_pitch)) for value in values]
+        residuals = [
+            abs((value - origin) / candidate_pitch - round((value - origin) / candidate_pitch))
+            for value in values
+        ]
+        collisions = len(positions) - len(set(positions))
+        return _median_float(residuals, 1.0) + 0.40 * collisions / max(1, len(values))
+
+    base_score = _score(float(pitch))
+    best_pitch = float(pitch)
+    best_score = base_score
+    for step in range(-4, 5):
+        candidate_pitch = float(pitch) * (1.0 + 0.02 * step)
+        if candidate_pitch < 4.0:
+            continue
+        score = _score(candidate_pitch)
+        if score < best_score:
+            best_pitch, best_score = candidate_pitch, score
+    return best_pitch if best_score + 0.02 < base_score else float(pitch)
+
+
 def _debug_ring_overlay(
     crop: np.ndarray,
     cells: Sequence[Mapping[str, Any]],
@@ -2366,18 +2451,35 @@ def _detect_mobile_ring_grid(
     uncertain_cells: List[Dict[str, Any]] = []
 
     raw_circles = [] if circles is None else np.round(circles[0]).astype(int)
+    raw_circle_count = len(raw_circles)
+    if raw_circle_count > ROAD_RING_MAX_HOUGH_CANDIDATES:
+        raw_circles = raw_circles[:ROAD_RING_MAX_HOUGH_CANDIDATES]
+    # Hough can lock on the small inner marker of an otherwise normal DB ring.
+    # A single bounded median radius keeps colour sampling on the outer ring;
+    # it does not alter the Hough search or add another pass.
+    db_sample_radius: Optional[int] = None
+    if profile_key.startswith("db_") and DB_RING_MEDIAN_SAMPLE_RADIUS and len(raw_circles):
+        median_radius = float(np.median(np.asarray(raw_circles[:, 2], dtype=np.float64)))
+        db_sample_radius = int(round(max(minimum_radius, min(maximum_radius, median_radius))))
     for circle_index, raw_circle in enumerate(raw_circles):
         if (circle_index & 15) == 0:
             _deadline_guard(deadline, cancel_event, min_remaining=0.12)
-        cx, cy, radius = [int(value) for value in raw_circle]
+        cx, cy, detected_radius = [int(value) for value in raw_circle]
+        radius = db_sample_radius if db_sample_radius is not None else detected_radius
         if not (0 <= cx < image_width and 0 <= cy < image_height):
             continue
         squared_distance = (xx - cx) ** 2 + (yy - cy) ** 2
+        if profile_key.startswith("db_"):
+            outer_radius = max(2, int(round(radius * DB_RING_OUTER_RATIO)))
+            inner_radius = max(1, int(round(radius * DB_RING_INNER_RATIO)))
+        else:
+            outer_radius = radius + 2
+            inner_radius = max(1, radius - 3)
         annulus = (
-            (squared_distance <= float(radius + 2) ** 2)
-            & (squared_distance >= float(max(1, radius - 3)) ** 2)
+            (squared_distance <= float(outer_radius) ** 2)
+            & (squared_distance >= float(inner_radius) ** 2)
         )
-        disk = squared_distance <= float(radius + 2) ** 2
+        disk = squared_distance <= float(outer_radius) ** 2
         red_pixels = int(red_mask[annulus].sum())
         blue_pixels = int(blue_mask[annulus].sum())
         green_pixels = int(green_mask[disk].sum())
@@ -2402,7 +2504,7 @@ def _detect_mobile_ring_grid(
             continue
 
         outcome = "B" if red_pixels > blue_pixels else "P"
-        colored_fraction = dominant / max(1.0, math.pi * float(radius + 2) ** 2)
+        colored_fraction = dominant / max(1.0, math.pi * float(outer_radius) ** 2)
         confidence = min(
             1.0,
             0.55 * colored_fraction
@@ -2443,7 +2545,7 @@ def _detect_mobile_ring_grid(
             "recognized_count": 0,
             "unknown_candidates": len(uncertain_cells),
             "uncertain_count": len(uncertain_cells),
-            "raw_contours": len(raw_circles),
+            "raw_contours": raw_circle_count,
             "method": "fixed_ring_grid_6xN_mobile_v11_3",
             "reconstructed_all": False,
             "fallback_reason": "no_colored_big_road_rings",
@@ -2456,6 +2558,9 @@ def _detect_mobile_ring_grid(
     pitch_x = _nearest_ring_pitch(
         colored, axis="x", expected=expected_pitch_y
     )
+    if profile_key.startswith("db_"):
+        pitch_x = _refine_db_ring_pitch(colored, pitch_x, axis="x")
+        pitch_y = _refine_db_ring_pitch(colored, pitch_y, axis="y")
     origin_x = min(float(item["cx"]) for item in colored)
     origin_y = min(float(item["cy"]) for item in colored)
 
@@ -2673,7 +2778,7 @@ def _detect_mobile_ring_grid(
         "uncertain_count": uncertain_count,
         "unknown_candidates": uncertain_count,
         "unknown_ratio": round(uncertain_ratio, 6),
-        "raw_contours": len(raw_circles),
+        "raw_contours": raw_circle_count,
         "candidates": ordered_cells,
         "method": "fixed_ring_grid_6xN_mobile_v11_3",
         "grid_rows": ROAD_GRID_ROWS,
@@ -2964,6 +3069,23 @@ def _looks_like_road_crop(image: np.ndarray) -> bool:
         and color_fraction >= 0.001
         and periodic_energy >= 0.25
     )
+
+
+def _looks_like_db_dark_road_crop(image: np.ndarray) -> bool:
+    """Recognise a narrow maroon DB road crop without replacing white-road logic."""
+    if not DB_DARK_ROAD_CROP_SIGNATURE_ENABLED or image is None or image.size == 0:
+        return False
+    height, width = image.shape[:2]
+    if width / max(1.0, float(height)) < DB_DARK_ROAD_CROP_MIN_ASPECT:
+        return False
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    maroon = (
+        (value <= 180)
+        & (saturation >= 75)
+        & ((hue <= 16) | (hue >= 165))
+    )
+    return bool(float(np.mean(maroon)) >= DB_DARK_ROAD_CROP_MIN_FRACTION)
 
 
 def _looks_like_ofalive_android_fullscreen(image: np.ndarray) -> bool:
@@ -3770,20 +3892,27 @@ def _db_dark_ring_feature_candidates(
             continue
 
         colored: List[Tuple[float, float, float]] = []
-        for raw in np.round(circles[0]).astype(int):
+        raw_circles = np.round(circles[0]).astype(int)
+        if len(raw_circles) > ROAD_RING_MAX_HOUGH_CANDIDATES:
+            raw_circles = raw_circles[:ROAD_RING_MAX_HOUGH_CANDIDATES]
+        for circle_index, raw in enumerate(raw_circles):
+            if (circle_index & 31) == 0:
+                _deadline_guard(deadline, cancel_event, min_remaining=0.12)
             cx_local, cy_local, radius = [int(value) for value in raw]
             cx = cx_local + x1
             cy = cy_local + y1
             if not (0 <= cx < pw and 0 <= cy < ph):
                 continue
             d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            outer_radius = max(2, int(round(radius * DB_RING_OUTER_RATIO)))
+            inner_radius = max(1, int(round(radius * DB_RING_INNER_RATIO)))
             annulus = (
-                (d2 <= float(radius + 2) ** 2)
-                & (d2 >= float(max(1, radius - 3)) ** 2)
+                (d2 <= float(outer_radius) ** 2)
+                & (d2 >= float(inner_radius) ** 2)
             )
             outer = (
-                (d2 <= float(radius + 5) ** 2)
-                & (d2 >= float(radius + 2) ** 2)
+                (d2 <= float(outer_radius + 3) ** 2)
+                & (d2 >= float(outer_radius) ** 2)
             )
             red_pixels = int(np.count_nonzero(red[annulus]))
             blue_pixels = int(np.count_nonzero(blue[annulus]))
@@ -3889,7 +4018,9 @@ def detect_road_sequence_detailed(
         else internal_deadline
     )
     _deadline_guard(detector_deadline, cancel_event)
-    image = _read_image(image_path)
+    image = _read_image(
+        image_path, deadline=detector_deadline, cancel_event=cancel_event
+    )
     image_height, image_width = image.shape[:2]
     venue_code = str(venue or "").upper().strip()
     requested = str(input_type or "auto").lower().strip()
@@ -3898,6 +4029,8 @@ def detect_road_sequence_detailed(
     if requested not in {"auto", "full_screen", "road_crop", "wide_multi_road"}:
         requested = "auto"
     crop_signature = _looks_like_road_crop(image) if requested == "auto" else False
+    if requested == "auto" and venue_code == "DB":
+        crop_signature = crop_signature or _looks_like_db_dark_road_crop(image)
     likely_crop = requested == "road_crop" or crop_signature
     wide_multi_road = requested == "wide_multi_road" or (
         requested == "auto" and aspect >= WIDE_LAYOUT_MIN_ASPECT and not likely_crop
@@ -3914,6 +4047,16 @@ def detect_road_sequence_detailed(
     ofalive_android_layout = False
 
     if likely_crop:
+        if venue_code == "DB":
+            plan.append({
+                "name": "db_dark_road_crop_ring",
+                "roi": (0.0, 0.0, 1.0, 1.0),
+                "preference": 24.0,
+                "fixed_grid": False,
+                "ring_grid": True,
+                "grid_columns": None,
+                "profile": "db_dark_road_crop",
+            })
         plan.append({
             "name": "road_crop_dynamic_6xN",
             "roi": (0.0, 0.0, 1.0, 1.0),
@@ -4102,6 +4245,28 @@ def detect_road_sequence_detailed(
                     "grid_columns": None,
                     "profile": "db_mobile_full_screen",
                 })
+        db_desktop_candidate = bool(
+            DB_DESKTOP_ROI_ENABLED
+            and landscape
+            and (
+                venue_code == "DB"
+                or requested in {"auto", "full_screen"}
+            )
+        )
+        if db_desktop_candidate:
+            for index, roi in enumerate((
+                DB_DESKTOP_BIG_ROAD_ROI,
+                DB_DESKTOP_BIG_ROAD_ROI_ALT,
+            )[:DB_DESKTOP_MAX_CANDIDATES]):
+                plan.append({
+                    "name": f"db_desktop_dark_road_{index}",
+                    "roi": roi,
+                    "preference": 58.0 - index * 0.4 if venue_code == "DB" else 28.0 - index * 0.4,
+                    "fixed_grid": False,
+                    "ring_grid": True,
+                    "grid_columns": None,
+                    "profile": "db_desktop_dark_road",
+                })
         if landscape and venue_code in {"", "DG"}:
             for index, roi in enumerate(
                 _shifted_profile_rois(
@@ -4272,6 +4437,17 @@ def detect_road_sequence_detailed(
                 best.get("selection_score", -9999)
             ):
                 best = current
+
+            # A validated DB ring-grid result is already the dedicated dark-road
+            # path.  Preserve its normal quality gate, then return it instead of
+            # letting a high-count fixed-grid false positive outrank it.
+            if (
+                ring_grid
+                and str(item.get("profile") or "").startswith("db_")
+                and _acceptable(current)
+            ):
+                best = current
+                break
 
             # DB / DG 內容式 locator 已通過強品質閘門時直接採用；
             # 不再為了 generic auto 多跑一輪昂貴候選。

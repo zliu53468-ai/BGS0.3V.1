@@ -201,6 +201,8 @@ def analyze_game_screen(
                 preferred_venue=str(session.get("venue") or ""),
                 input_type=requested_input_type,
                 fast=True,
+                deadline=deadline,
+                cancel_event=cancel_event,
             )
             if not isinstance(raw_ocr, Mapping):
                 raise TypeError("room_ocr 回傳值不是 Mapping")
@@ -327,7 +329,9 @@ def analyze_game_screen(
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     fallback_reason = str(road.get("fallback_reason") or "")
-    if road_error:
+    if road_error and ("HEIC" in road_error.upper() or "HEIF" in road_error.upper()):
+        user_message = "HEIC/HEIF 圖片目前無法解碼，請改傳 JPG 或 PNG。"
+    elif road_error:
         user_message = "牌路掃描程式發生錯誤，請確認模組版本與圖片格式。"
     elif quality_ok:
         user_message = "牌路辨識完成。"

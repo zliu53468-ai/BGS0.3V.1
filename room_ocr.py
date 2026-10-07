@@ -16,6 +16,8 @@ import time
 import cv2
 import numpy as np
 
+from image_normalize import normalize_capture
+
 
 _EASY_READER: Any = None
 _EASY_READER_LOCK = Lock()
@@ -60,13 +62,17 @@ OCR_BACKEND = os.getenv("OCR_BACKEND", "easyocr").strip().lower()
 OCR_LANGS = [part.strip() for part in os.getenv("OCR_LANGS", "en").split(",") if part.strip()]
 OCR_GPU = os.getenv("OCR_GPU", "0").strip() == "1"
 OCR_INFO_ROI = _env_roi("OCR_INFO_ROI", (0.0, 0.0, 1.0, 0.30))
-OCR_UPSCALE = _env_float("OCR_UPSCALE", 1.35, 1.0, 3.0)
+OCR_UPSCALE = _env_float("OCR_UPSCALE", 1.5, 1.0, 2.2)
 OCR_MIN_CONFIDENCE = _env_float("OCR_MIN_CONFIDENCE", 0.20, 0.0, 1.0)
-OCR_MAX_IMAGE_SIDE = _env_int("OCR_MAX_IMAGE_SIDE", 1400, 640, 3000)
-OCR_FAST_VARIANTS = _env_int("OCR_FAST_VARIANTS", 1, 1, 3)
-OCR_MAX_ROIS = _env_int("OCR_MAX_ROIS", 3, 1, 6)
+OCR_MAX_IMAGE_SIDE = _env_int("OCR_MAX_IMAGE_SIDE", 1600, 640, 2000)
+OCR_FAST_VARIANTS = _env_int("OCR_FAST_VARIANTS", 2, 1, 3)
+OCR_MAX_ROIS = _env_int("OCR_MAX_ROIS", 3, 1, 4)
 OCR_STRICT_FAST = os.getenv("OCR_STRICT_FAST", "1").strip() == "1"
 OCR_CANVAS_SIZE = _env_int("OCR_CANVAS_SIZE", 768, 512, 1600)
+OCR_STEPWISE_VARIANTS = os.getenv("OCR_STEPWISE_VARIANTS", "1").strip() == "1"
+OCR_VARIANT_MIN_TOKENS = _env_int("OCR_VARIANT_MIN_TOKENS", 2, 1, 8)
+OCR_VARIANT_CONFIDENCE = _env_float("OCR_VARIANT_CONFIDENCE", 0.44, 0.05, 0.95)
+OCR_HARD_TIMEOUT_SECONDS = _env_float("OCR_HARD_TIMEOUT_SECONDS", 2.5, 0.5, 8.0)
 OCR_ALLOWLIST = os.getenv(
     "OCR_ALLOWLIST", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-#"
 ).strip()
@@ -115,23 +121,39 @@ class RoomInfo:
     confidence: float = 0.0
 
 
-def _read_image(path: str | Path) -> np.ndarray:
-    file_path = Path(path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"找不到圖片：{file_path}")
-    data = np.fromfile(str(file_path), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None or image.size == 0:
-        raise ValueError("無法讀取圖片。")
-    longest = max(image.shape[:2])
-    if longest > OCR_MAX_IMAGE_SIDE:
-        scale = OCR_MAX_IMAGE_SIDE / float(longest)
-        image = cv2.resize(
-            image,
-            (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
+def _read_image(
+    path: str | Path,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
+) -> np.ndarray:
+    image, meta = normalize_capture(
+        path, max_side=OCR_MAX_IMAGE_SIDE, deadline=deadline, cancel_event=cancel_event
+    )
+    if image is None:
+        raise ValueError(str(meta.get("error") or "無法讀取圖片。"))
     return image
+
+
+def _read_image_with_meta(
+    path: str | Path,
+    *,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    image, meta = normalize_capture(
+        path, max_side=OCR_MAX_IMAGE_SIDE, deadline=deadline, cancel_event=cancel_event
+    )
+    if image is None:
+        raise ValueError(str(meta.get("error") or "無法讀取圖片。"))
+    return image, dict(meta)
+
+
+def _ocr_deadline_guard(deadline: Optional[float], cancel_event: Any = None) -> None:
+    if cancel_event is not None and bool(getattr(cancel_event, "is_set", lambda: False)()):
+        raise TimeoutError("OCR 已取消。")
+    if deadline is not None and time.perf_counter() >= float(deadline):
+        raise TimeoutError("OCR 已達硬截止。")
 
 
 def _crop_normalized(image: np.ndarray, roi: Sequence[float]) -> Tuple[np.ndarray, Dict[str, int]]:
@@ -146,24 +168,28 @@ def _crop_normalized(image: np.ndarray, roi: Sequence[float]) -> Tuple[np.ndarra
     }
 
 
-def _preprocess_variants(crop: np.ndarray, *, fast: bool = True) -> List[Tuple[str, np.ndarray]]:
+def _preprocess_variants(crop: np.ndarray, *, fast: bool = True) -> Iterable[Tuple[str, np.ndarray]]:
+    """Yield OCR variants one at a time, only after the prior pass needs help."""
+    longest = max(crop.shape[:2])
+    bounded_scale = min(OCR_UPSCALE, OCR_MAX_IMAGE_SIDE / float(max(1, longest)))
     upscaled = cv2.resize(
-        crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE,
-        interpolation=cv2.INTER_CUBIC if OCR_UPSCALE > 1.0 else cv2.INTER_AREA,
+        crop, None, fx=bounded_scale, fy=bounded_scale,
+        interpolation=cv2.INTER_CUBIC if bounded_scale > 1.0 else cv2.INTER_AREA,
     )
     gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-    if fast:
-        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        return [("gray_fast", normalized)]
+    normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    yield "gray_fast", normalized
 
+    if OCR_FAST_VARIANTS < 2:
+        return
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
     denoised = cv2.bilateralFilter(clahe, 5, 35, 35)
-    variants: List[Tuple[str, np.ndarray]] = [("gray_clahe", denoised)]
-    variants.append(("color", upscaled))
-    if OCR_FAST_VARIANTS >= 3:
-        otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        variants.append(("otsu", otsu))
-    return variants[:max(1, OCR_FAST_VARIANTS)]
+    yield "clahe", denoised
+
+    if OCR_FAST_VARIANTS < 3:
+        return
+    otsu = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    yield "otsu", otsu
 
 
 def _get_easy_reader() -> Any:
@@ -204,7 +230,9 @@ def _tokens_easyocr(image: np.ndarray) -> List[OCRToken]:
     }
     if OCR_ALLOWLIST:
         kwargs["allowlist"] = OCR_ALLOWLIST
-    results = reader.readtext(image, **kwargs)
+    # Keep exactly one reader and one active inference call per process.
+    with _EASY_READER_LOCK:
+        results = reader.readtext(image, **kwargs)
     tokens: List[OCRToken] = []
     for box, text, confidence in results:
         confidence = float(confidence or 0.0)
@@ -274,6 +302,9 @@ def _room_candidate(compact: str, preferred_venue: str = "") -> str:
         patterns.extend([r"\bRB\d{1,2}\b", r"\bS\d{1,2}\b", r"\bQ[CD]\b"])
     elif venue == "MT":
         patterns.extend([r"\b(?:BACCARAT)?\d{1,2}[A-Z]?\b", r"\b[NP]?\d{1,2}[A-Z]?\b"])
+    elif venue == "DB":
+        # CJK table names such as "极速百家乐B05" do not create a \b boundary.
+        patterns.extend([r"B\d{1,3}\b", r"DB[-:]?B?\d{1,3}\b"])
     patterns.extend([
         r"(?:TABLE|ROOM|DESK)[:#-]?([A-Z]{0,4}\d{1,3}[A-Z]?)",
         r"\b(RB\d{1,2}|S\d{1,2}|Q[CD]|[A-Z]{1,3}\d{1,3}[A-Z]?)\b",
@@ -299,7 +330,14 @@ def parse_room_info_text(
     venue_code = ""
     venue_name = ""
     for code in ("DG", "MT", "DB", "SA", "OB", "T9"):
-        if re.search(rf"\b{code}\b", normalized, flags=re.IGNORECASE):
+        if code == "DB":
+            detected = bool(
+                re.search(r"\bDB(?:\s*GAMING)?\b", normalized, flags=re.IGNORECASE)
+                or "DBGAMING" in compact
+            )
+        else:
+            detected = bool(re.search(rf"\b{code}\b", normalized, flags=re.IGNORECASE))
+        if detected:
             venue_code, venue_name = VENUE_ALIASES[code]
             break
     preferred = str(preferred_venue or "").upper().strip()
@@ -359,9 +397,19 @@ def analyze_room_info(
     preferred_venue: str = "",
     input_type: str = "auto",
     fast: bool = True,
+    deadline: Optional[float] = None,
+    cancel_event: Any = None,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
-    image = _read_image(image_path)
+    ocr_deadline = (
+        min(float(deadline), started + OCR_HARD_TIMEOUT_SECONDS)
+        if deadline is not None
+        else started + OCR_HARD_TIMEOUT_SECONDS
+    )
+    _ocr_deadline_guard(ocr_deadline, cancel_event)
+    image, normalization = _read_image_with_meta(
+        image_path, deadline=ocr_deadline, cancel_event=cancel_event
+    )
     backends = [OCR_BACKEND] if OCR_BACKEND in {"easyocr", "tesseract"} else ["easyocr", "tesseract"]
     errors: List[str] = []
     all_tokens: List[OCRToken] = []
@@ -371,21 +419,25 @@ def analyze_room_info(
     used_roi = OCR_INFO_ROI
 
     for roi_name, roi in _candidate_rois(preferred_venue, input_type, fast=fast):
+        _ocr_deadline_guard(ocr_deadline, cancel_event)
         crop, roi_pixels = _crop_normalized(image, roi)
-        variants = _preprocess_variants(crop, fast=fast)
         for backend in backends:
             backend_tokens: List[OCRToken] = []
             try:
-                for _, variant in variants:
+                # The generator is deliberately recreated per backend: an EasyOCR
+                # failure may still leave a bounded Tesseract fallback available.
+                for _, variant in _preprocess_variants(crop, fast=fast):
+                    _ocr_deadline_guard(ocr_deadline, cancel_event)
                     backend_tokens.extend(_tokens_easyocr(variant) if backend == "easyocr" else _tokens_tesseract(variant))
-                backend_tokens = _deduplicate_tokens(backend_tokens)
-                if backend_tokens:
-                    merged = "\n".join(token.text for token in backend_tokens)
-                    avg = sum(token.confidence for token in backend_tokens) / len(backend_tokens)
+                    deduped = _deduplicate_tokens(backend_tokens)
+                    if not deduped:
+                        continue
+                    merged = "\n".join(token.text for token in deduped)
+                    avg = sum(token.confidence for token in deduped) / len(deduped)
                     parsed = parse_room_info_text(
                         merged, backend=backend, confidence=avg, preferred_venue=preferred_venue
                     )
-                    all_tokens.extend(backend_tokens)
+                    all_tokens.extend(deduped)
                     used_backend, used_roi_name, used_roi_pixels, used_roi = backend, roi_name, roi_pixels, roi
                     # 找到桌號即可立即結束；完整資訊不需為剩餘張數額外拖延。
                     if parsed.room:
@@ -395,12 +447,20 @@ def analyze_room_info(
                             "tokens": [asdict(token) for token in _deduplicate_tokens(all_tokens)],
                             "roi": used_roi_pixels, "normalized_roi": list(used_roi),
                             "roi_name": used_roi_name, "errors": errors[-4:],
+                            "normalization": normalization,
                             "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
                             "venue_source": "image_ocr" if parsed.venue_code and parsed.venue_code != str(preferred_venue or "").upper() else "session_selected",
                             "room_source": "image_ocr",
                         })
                         return result
-                    break
+                    sufficient = (
+                        len(deduped) >= OCR_VARIANT_MIN_TOKENS
+                        and avg >= OCR_VARIANT_CONFIDENCE
+                    )
+                    if OCR_STEPWISE_VARIANTS and sufficient:
+                        break
+            except TimeoutError:
+                raise
             except Exception as exc:
                 errors.append(f"{roi_name}/{backend}: {exc}")
 
@@ -416,7 +476,7 @@ def analyze_room_info(
         "ok": bool(info.venue_code or info.room or info.remaining_cards is not None),
         "tokens": [asdict(token) for token in tokens],
         "roi": used_roi_pixels, "normalized_roi": list(used_roi), "roi_name": used_roi_name,
-        "errors": errors[-4:],
+        "errors": errors[-4:], "normalization": normalization,
         "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
         "venue_source": "session_selected" if preferred_venue else "unknown",
         "room_source": "image_ocr" if info.room else "unknown",
