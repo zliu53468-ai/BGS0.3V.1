@@ -16,7 +16,7 @@ function fields(p){const r=p.finalProbability;return {
   direction:p.direction,confidence:p.confidence,final_p_b:r.finalPB,raw_p_b:r.rawPB,
   ev_banker:p.ev_banker,ev_player:p.ev_player,physics_48d:r.physics,features_57d:r.extended,
   smoothing_alpha:r.smoothingAlpha,execution_order:r.execution_order,
-  particle_count:r.particleDiagnostics.particle_count,blind_mode:r.blind_upgrade.mode,
+  particle_count:r.particleDiagnostics.particle_count,source_commit:m.commit,
 };}
 (async()=>{
   const standalone=[];

@@ -14,8 +14,7 @@ Important semantics:
   allowed to flip the Direct Physics B/P side by itself.
 */
 
-const VERSION="PARTICLE500_STATELESS_V2";
-const U=window.__BBB_BLIND_UPGRADE__;
+const VERSION="PARTICLE500_STATELESS_V1";
 const PARTICLE_COUNT=500;
 const LIKELIHOOD_DRAWS=2;
 const FALLBACK_DRAWS=2;
@@ -89,12 +88,12 @@ function normaliseWeights(values){
 function systematicResample(particles,consumed,weights,rng){
   const n=particles.length,cdf=Array(n);let s=0;
   for(let i=0;i<n;i++){s+=weights[i];cdf[i]=s;}
-  const start=rng()/n,next=Array(n),nextConsumed=Array(n),indices=Array(n);let j=0;
+  const start=rng()/n,next=Array(n),nextConsumed=Array(n);let j=0;
   for(let i=0;i<n;i++){
     const pos=start+i/n;while(j<n-1&&pos>cdf[j])j++;
-    next[i]=particles[j].slice();nextConsumed[i]=consumed[j];indices[i]=j;
+    next[i]=particles[j].slice();nextConsumed[i]=consumed[j];
   }
-  return {particles:next,consumed:nextConsumed,weights:Array(n).fill(1/n),indices};
+  return {particles:next,consumed:nextConsumed,weights:Array(n).fill(1/n)};
 }
 function entropy3(block){
   let h=0;
@@ -120,26 +119,13 @@ function preserveWinnerDirection(corrected,direct){
   corrected[23]=directionalMass*dir;corrected[24]=directionalMass*(1-dir);corrected[25]=t;
   return blocked;
 }
-function conditionalHand(base,actual,rng,requested=false){
-  // Complete legal deals; the default samples P(hand | outcome, current shoe).
-  let target=null;
-  if(requested){const q=U.requestedMatrix[actual],v=rng();target=v<q[0]?4:v<q[0]+q[1]?5:6;}
-  for(let k=0;k<(requested?2048:384);k++){
-    const hand=deal(base,rng);
-    if(hand.outcome===actual&&(target===null||hand.cardCount===target))return hand;
-  }
-  return null; // Zero weight, never a contradictory fallback.
-}
 function posteriorForecast(particles,consumed,weights,rng){
   const out=Array(48).fill(0);let mass=0;
   let consumedMean=0,consumedSq=0;
-  const draws=U?.enabled?64:FORECAST_DRAWS,probs=[],ws=[];let unsupported=0;
   for(let i=0;i<particles.length;i++){
-    const w=weights[i];if(w<=0)continue;
-    let bWins=0,pWins=0;consumedMean+=w*consumed[i];consumedSq+=w*consumed[i]*consumed[i];
-    for(let d=0;d<draws;d++){
-      const hand=deal(particles[i],rng),m=w/draws;mass+=m;
-      if(hand.outcome==="B")bWins++;if(hand.outcome==="P")pWins++;
+    const w=weights[i];consumedMean+=w*consumed[i];consumedSq+=w*consumed[i]*consumed[i];
+    for(let d=0;d<FORECAST_DRAWS;d++){
+      const hand=deal(particles[i],rng),m=w/FORECAST_DRAWS;mass+=m;
       out[{4:0,5:1,6:2}[hand.cardCount]]+=m;
       out[3+hand.playerPoint]+=m;out[13+hand.bankerPoint]+=m;
       out[23+(hand.outcome==="B"?0:hand.outcome==="P"?1:2)]+=m;
@@ -147,8 +133,6 @@ function posteriorForecast(particles,consumed,weights,rng){
       const diff=hand.bankerPoint-hand.playerPoint;
       out[46]+=m*diff/9;out[47]+=m*Math.abs(diff)/9;
     }
-    if(bWins+pWins<4)unsupported++;
-    probs.push(bWins+pWins?bWins/(bWins+pWins):.5);ws.push(w);
   }
   if(mass<=1e-12)throw new Error("particle forecast empty");
   for(const [start,n] of [[0,3],[3,10],[13,10],[23,3]])for(let i=0;i<n;i++)out[start+i]/=mass;
@@ -163,10 +147,7 @@ function posteriorForecast(particles,consumed,weights,rng){
   out[44]=total>0?low/total:0;out[45]=total>0?high/total:0;
   out[46]/=mass;out[47]/=mass;
   const variance=Math.max(0,consumedSq-consumedMean*consumedMean);
-  const mean=probs.reduce((a,p,i)=>a+ws[i]*p,0),sq=ws.reduce((a,w)=>a+w*w,0);
-  const pvar=probs.reduce((a,p,i)=>a+ws[i]*(p-mean)**2,0)/Math.max(1e-12,1-sq);
-  return {physics:out,consumedStd:Math.sqrt(variance),probabilityStd:Math.sqrt(pvar),
-    probabilityMcSe:Math.sqrt(pvar*sq),unsupported,draws};
+  return {physics:out,consumedStd:Math.sqrt(variance)};
 }
 function estimate(history,directPhysics,mode="quality"){
   const seq=(Array.isArray(history)?history:[]).map(x=>String(x||"").toUpperCase()).filter(x=>OUTCOMES.has(x));
@@ -182,26 +163,11 @@ function estimate(history,directPhysics,mode="quality"){
   let particles=Array.from({length:PARTICLE_COUNT},()=>Array(RANKS).fill(INITIAL_PER_RANK));
   let consumed=Array(PARTICLE_COUNT).fill(0),weights=Array(PARTICLE_COUNT).fill(1/PARTICLE_COUNT);
   let resamplingCount=0,lastEssRatio=1,tieUpdates=0;
-  let ancestors=Array.from({length:PARTICLE_COUNT},(_,i)=>i),preResampleEss=1,conditionalFailures=0;
-  const consumedByOutcome={B:[0,0,0],P:[0,0,0],T:[0,0,0]};
 
   for(const actual of seq){
     const next=Array(PARTICLE_COUNT),nextConsumed=Array(PARTICLE_COUNT),rawWeights=Array(PARTICLE_COUNT);
     for(let i=0;i<PARTICLE_COUNT;i++){
       const base=particles[i],proposals=[],matches=[];
-      if(U?.enabled){
-        next[i]=base;nextConsumed[i]=consumed[i];rawWeights[i]=0;
-        if(weights[i]<=0||base.reduce((a,b)=>a+b,0)<12)continue;
-        // Independent unbiased bootstrap estimate of P(observed outcome | shoe).
-        let hits=0;for(let d=0;d<12;d++)hits+=Number(deal(base,rng).outcome===actual);
-        if(hits===0)continue;
-        const chosen=conditionalHand(base,actual,rng,U.mode==="requested_prior");
-        if(!chosen){conditionalFailures++;continue;}
-        consumedByOutcome[actual][chosen.cardCount-4]++;
-        next[i]=chosen.counts;nextConsumed[i]=consumed[i]+chosen.cardCount;
-        rawWeights[i]=weights[i]*hits/12;
-        continue;
-      }
       for(let d=0;d<LIKELIHOOD_DRAWS;d++){const hand=deal(base,rng);proposals.push(hand);if(hand.outcome===actual)matches.push(hand);}
       const matchCount=matches.length;
       let likelihood=(matchCount+.20)/(LIKELIHOOD_DRAWS+.60);
@@ -213,12 +179,10 @@ function estimate(history,directPhysics,mode="quality"){
       if(actual==="T"){likelihood=(1-TIE_LIKELIHOOD_INFLUENCE)+TIE_LIKELIHOOD_INFLUENCE*likelihood;tieUpdates++;}
       next[i]=chosen.counts;nextConsumed[i]=consumed[i]+chosen.cardCount;rawWeights[i]=weights[i]*Math.max(1e-8,likelihood);
     }
-    if(U?.enabled&&!rawWeights.some(w=>w>0))throw Error("conditional particle support exhausted");
     weights=normaliseWeights(rawWeights);particles=next;consumed=nextConsumed;
     let sq=0;for(const w of weights)sq+=w*w;lastEssRatio=clip((1/Math.max(1e-12,sq))/PARTICLE_COUNT);
-    preResampleEss=lastEssRatio;
     if(lastEssRatio<ESS_RESAMPLE_THRESHOLD){
-      const r=systematicResample(particles,consumed,weights,rng);particles=r.particles;consumed=r.consumed;weights=r.weights;ancestors=r.indices.map(i=>ancestors[i]);resamplingCount++;lastEssRatio=1;
+      const r=systematicResample(particles,consumed,weights,rng);particles=r.particles;consumed=r.consumed;weights=r.weights;resamplingCount++;lastEssRatio=1;
     }
   }
 
@@ -229,8 +193,7 @@ function estimate(history,directPhysics,mode="quality"){
   const quality=clip(.45*lastEssRatio+.35*(1-posteriorUncertainty)+.20*(1-spread));
   const qualityBlendWeight=clip(MIN_BLEND+(MAX_BLEND-MIN_BLEND)*quality,MIN_BLEND,MAX_BLEND);
   const forcedBlendWeight=fixedBlendWeight(blendMode);
-  const ancestorRatio=new Set(ancestors).size/PARTICLE_COUNT;
-  const blendWeight=forcedBlendWeight===null?(U?.enabled?U.blendWeight(qualityBlendWeight,seq,{pre_resample_ess_ratio:preResampleEss}):qualityBlendWeight):forcedBlendWeight;
+  const blendWeight=forcedBlendWeight===null?qualityBlendWeight:forcedBlendWeight;
 
   const corrected=directPhysics.map(v=>+v||0);
   let directionFlipBlocked=false;
@@ -260,18 +223,12 @@ function estimate(history,directPhysics,mode="quality"){
     posterior,
     diagnostics:{
       version:VERSION,enabled:true,particle_filter_enabled:true,particle_count:PARTICLE_COUNT,
-      conditional_mode:U?.enabled?(U.mode==="requested_prior"?"requested_heuristic":"rules_conditioned"):"legacy",
-      consumed_by_outcome:consumedByOutcome,conditional_failures:conditionalFailures,
-      posterior_expected_consumed_cards:posterior[43],consumed_cards_std:forecast.consumedStd,
-      probability_std:forecast.probabilityStd,probability_mc_se:forecast.probabilityMcSe,
-      forecast_unsupported_particles:forecast.unsupported,
-      pre_resample_ess_ratio:preResampleEss,ancestor_ratio:ancestorRatio,
       policy:"stateless_rebuild_each_prediction",persistent_state:false,rebuild_from_scratch:true,
       history_rounds:seq.length,history_fingerprint:seq.join(""),likelihood_draws:LIKELIHOOD_DRAWS,
-      fallback_draws:FALLBACK_DRAWS,forecast_draws:forecast.draws,ess_resample_threshold:ESS_RESAMPLE_THRESHOLD,
+      fallback_draws:FALLBACK_DRAWS,forecast_draws:FORECAST_DRAWS,ess_resample_threshold:ESS_RESAMPLE_THRESHOLD,
       resampling_count:resamplingCount,recent_ess_ratio:lastEssRatio,posterior_uncertainty:posteriorUncertainty,
       particle_quality:quality,blend_weight:blendWeight,quality_blend_weight:qualityBlendWeight,particle_blend_mode:blendMode,
-      tie_soft_update:!U?.enabled,tie_likelihood_influence:U?.enabled?1:TIE_LIKELIHOOD_INFLUENCE,
+      tie_soft_update:true,tie_likelihood_influence:TIE_LIKELIHOOD_INFLUENCE,
       tie_observation_count:seq.filter(x=>x==="T").length,direction_flip_blocked:directionFlipBlocked,
       direct_directional_pb:clip(directPhysics[23]/Math.max(1e-9,directPhysics[23]+directPhysics[24])),
       corrected_directional_pb:clip(corrected[23]/Math.max(1e-9,corrected[23]+corrected[24])),

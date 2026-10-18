@@ -4,7 +4,6 @@
 const CORE=(typeof window!=="undefined")?window.__BGS256_CONTINUATION_TEST__:null;
 const PARTICLE500=(typeof window!=="undefined")?window.__BGS_PARTICLE500__:null;
 const MACRO=(typeof window!=="undefined")?window.__BGS_MACRO_EMA__:null;
-const BLIND=(typeof window!=="undefined")?window.__BBB_BLIND_UPGRADE__:null;
 if(!CORE||typeof CORE.hazardChoose!=="function")return;
 
 const EV_CONSISTENCY_V1=false; // Shadow gate failed; set true only after holdout acceptance.
@@ -425,7 +424,7 @@ function physicsPrecisionPenalty(roundIndex,uncertainty,consistency){
     .0045*Math.max(0,u-.35)/.65 + .0035*(1-c) + .0015*early*(1-c)
   );
 }
-function directPhysicsPrimary(physics,roundIndex,macroFeatures=null,context=null){
+function directPhysicsPrimary(physics,roundIndex,macroFeatures=null){
   const pB=clip(+physics?.[23]||0),pP=clip(+physics?.[24]||0),pT=clip(+physics?.[25]||0);
   const directionalMass=Math.max(1e-9,pB+pP),rawDirectionalPB=clip(pB/directionalMass);
   const uncertainty=clip(+physics?.[42]||0),consistency=physicsConsistencyScore(physics);
@@ -441,18 +440,13 @@ function directPhysicsPrimary(physics,roundIndex,macroFeatures=null,context=null
   const modelEvBanker=Number.isFinite(+physics?.[39])?+physics[39]:evBanker,modelEvPlayer=Number.isFinite(+physics?.[40])?+physics[40]:evPlayer;
   const precisionPenalty=physicsPrecisionPenalty(roundIndex,uncertainty,consistency);
   // V14.3 Low-Skip: retain the safety terms but reduce their dominance.
-  let physicsActivationEv=Math.max(0,policy.activationEv-LOW_SKIP_EV_RELIEF*(policy.reliefScale??1))+precisionPenalty;
-  let physicsConfidenceBand=Math.max(
+  const physicsActivationEv=Math.max(0,policy.activationEv-LOW_SKIP_EV_RELIEF*(policy.reliefScale??1))+precisionPenalty;
+  const physicsConfidenceBand=Math.max(
     policy.bandMinimum,
     policy.confidenceBand*LOW_SKIP_CONFIDENCE_SCALE+
       LOW_SKIP_CONSISTENCY_BAND_GAIN*(1-consistency)+
       LOW_SKIP_UNCERTAINTY_BAND_GAIN*Math.max(0,uncertainty-.50)
   );
-  const blindThreshold=BLIND?.enabled&&context?BLIND.thresholds(context.history.length,physicsActivationEv,physicsConfidenceBand,context.diagnostics):null;
-  if(blindThreshold){
-    physicsActivationEv=blindThreshold.ev;physicsConfidenceBand=blindThreshold.band;
-    policy.activationEv=blindThreshold.ev;policy.confidenceBand=blindThreshold.band;
-  }
   let candidate="Skip";
   if(distance>=physicsConfidenceBand){
     const bankerOk=evBanker>=evPlayer&&evBanker>physicsActivationEv+BANKER_EV_FLOOR;
@@ -462,20 +456,17 @@ function directPhysicsPrimary(physics,roundIndex,macroFeatures=null,context=null
   }
   const earlyTiePenaltyApplied=EV_CONSISTENCY_V1&&roundIndex<=40&&EARLY_TIE_PENALTY>0&&pT>0;
   return {pB,pP,pT,rawDirectionalPB,directionalPB,progressWeight,noise,policy,distance,uncertainty,consistency,precisionPenalty,earlyTiePenaltyApplied,
-    physicsActivationEv,physicsConfidenceBand,blindThreshold,evBanker,evPlayer,baseEvBanker,baseEvPlayer,modelEvBanker,modelEvPlayer,candidate,macro};
+    physicsActivationEv,physicsConfidenceBand,evBanker,evPlayer,baseEvBanker,baseEvPlayer,modelEvBanker,modelEvPlayer,candidate,macro};
 }
 
-function auxiliaryCandidateFilter(candidate,corePB,xgbPB,history=[]){
+function auxiliaryCandidateFilter(candidate,corePB,xgbPB){
   if(candidate!=="B"&&candidate!=="P")return {decision:"skip",reason:"physics_candidate_skip",coreSupport:.5,xgbSupport:.5,support:.5,shrink:0};
   const coreSupport=candidate==="B"?clip(corePB):1-clip(corePB),xgbSupport=candidate==="B"?clip(xgbPB):1-clip(xgbPB);
-  const structure=BLIND?.enabled?BLIND.structure(history):null,coreWeight=structure?.coreWeight??.15;
-  const support=coreWeight*coreSupport+(1-coreWeight)*xgbSupport;
+  const support=.15*coreSupport+.85*xgbSupport;
   const hardConflict=xgbSupport<.35&&coreSupport<.40;
   return hardConflict
     ?{decision:"skip",reason:"severe_joint_aux_conflict",coreSupport,xgbSupport,support,shrink:0}
-    :BLIND?.enabled&&structure?.supported&&support<.48
-      ?{decision:"downgrade",reason:"entropy_weighted_weak_support",coreSupport,xgbSupport,support,shrink:.85,coreWeight,structure}
-      :{decision:"keep",reason:"aux_support_ok",coreSupport,xgbSupport,support,shrink:1,coreWeight,structure};
+    :{decision:"keep",reason:"aux_support_ok",coreSupport,xgbSupport,support,shrink:1};
 }
 // V15 read-only decision audit. Does NOT alter probability, action or any Guard.
 function v15SkipDiagnostics(primary,auxFilter,decision,mode,error=""){
@@ -578,7 +569,7 @@ function applyFinalPrediction(seq,corePrediction=null){
   if(physics&&physicsBundleUsesPhysicalEv()&&(PARTICLE_BLEND_MODE==="off"||particleDiagnostics?.particle_count===500)){
     const roundIndex=Math.max(1,Math.min(70,seq.length+1));
     const macroFeatures=getMacroFeatures(seq);
-    primary=directPhysicsPrimary(physics,roundIndex,macroFeatures,{history:seq,diagnostics:particleDiagnostics});
+    primary=directPhysicsPrimary(physics,roundIndex,macroFeatures);
     primary.macroFeatures=macroFeatures;
     executionOrder.push("physics_candidate");
     rawPB=primary.directionalPB;
@@ -600,7 +591,7 @@ function applyFinalPrediction(seq,corePrediction=null){
         extended=buildExtended(corePB,original7,physicsDirect||physics);
         executionOrder.push("xgb_aux_filter");
         xgbAuxPB=predictFinalProbability(final56Bundle,extended,final56Bundle.feature_names||EXTENDED_NAMES);
-        auxFilter=auxiliaryCandidateFilter(primary.candidate,corePB,xgbAuxPB,seq);
+        auxFilter=auxiliaryCandidateFilter(primary.candidate,corePB,xgbAuxPB);
       }else{
         auxFilter=primary.candidate==="Skip"
           ?{decision:"skip",reason:"physics_candidate_skip",coreSupport:.5,xgbSupport:.5,support:.5,shrink:0}
@@ -637,7 +628,7 @@ function applyFinalPrediction(seq,corePrediction=null){
 
     executionOrder.push("volume_guard");
     const guard=volumeGuardState(roundIndex,finalPB,policy);
-    const effectiveBand=Math.max(policy.bandMinimum,baseBand-guard.bandRelief-(policy.finalBandRelief??LOW_SKIP_FINAL_BAND_RELIEF)),effectiveActivationEv=Math.max(BLIND?.enabled?.002:0,baseActivation-guard.evRelief);
+    const effectiveBand=Math.max(policy.bandMinimum,baseBand-guard.bandRelief-(policy.finalBandRelief??LOW_SKIP_FINAL_BAND_RELIEF)),effectiveActivationEv=Math.max(0,baseActivation-guard.evRelief);
     const guardedPass=auxFilter?.decision!=="skip"&&candidate!=="Skip"&&aligned&&distance>=effectiveBand&&candidateEdge>effectiveActivationEv;
     const direction=basePass||guardedPass?candidate:"Skip";
     const entryTier=direction==="Skip"?"skip":distance>=effectiveBand+policy.strongMargin?"strong":"weak";
@@ -677,7 +668,6 @@ function applyFinalPrediction(seq,corePrediction=null){
     decision_policy_enabled:evDecision?.policyEnabled??false,decision_policy_profile:evDecision?.policyProfile??"hard_ev",probabilities:{B:finalPB,P:finalPP},
     regime:mode==="physics_primary"?(direction==="Skip"?"Physics＋Particle觀望":auxFilter?.decision==="downgrade"?"Physics＋Particle / XGB降權":"Physics＋Particle / XGB篩選"):"模型未就緒／觀望",
     finalProbability:{version:VERSION,active:mode==="physics_primary",mode,
-      blind_upgrade:{version:BLIND?.version??null,mode:BLIND?.mode??"baseline",threshold:primary?.blindThreshold??null,structure:BLIND?.enabled?BLIND.structure(seq):null},
       skip_diagnostics:skipDiagnostics,
       primary_source:PARTICLE_BLEND_MODE==="off"?"direct_physics_physical_ev":"direct_physics_particle500_physical_ev",primary_candidate:primary?.candidate??"Skip",
       macro_ema:primary?.macroFeatures??null,macro_adjustment:primary?.macro??null,
@@ -785,7 +775,6 @@ function registerPrediction(seq,prediction){
     raw_p_b:Number.isFinite(+r.physics_raw_p_b)?+r.physics_raw_p_b:null,clipped_p_b:Number.isFinite(+r.physics_clipped_p_b)?+r.physics_clipped_p_b:null,smoothed_p_b:Number.isFinite(+r.physics_smoothed_p_b)?+r.physics_smoothed_p_b:null,
     primary_raw_p_b:Number.isFinite(+r.physics_raw_p_b)?+r.physics_raw_p_b:null,primary_smoothed_p_b:Number.isFinite(+r.physics_smoothed_p_b)?+r.physics_smoothed_p_b:null,physics_smoothed_p_b:Number.isFinite(+r.physics_smoothed_p_b)?+r.physics_smoothed_p_b:null,
     primary_candidate:r.primary_candidate||"Skip",skip_diagnostics:r.skip_diagnostics||null,xgb_aux_p_b:Number.isFinite(+r.xgb_aux_p_b)?+r.xgb_aux_p_b:null,core_aux_p_b:Number.isFinite(+r.core_aux_p_b)?+r.core_aux_p_b:null,aux_filter:r.aux_filter||null,
-    blind_upgrade:r.blind_upgrade??null,
     macro_schema_version:1,macro_ema:r.macro_ema??null,macro_adjustment:r.macro_adjustment??null,
     decision_stage:r.decision_stage,decision_progress:r.decision_progress,dynamic_band:r.dynamic_band??null,runtime_version:VERSION,
     smoothing_alpha:Number.isFinite(+r.smoothingAlpha)?+r.smoothingAlpha:1,smoothing_strength:Number.isFinite(+r.smoothingStrength)?+r.smoothingStrength:0,smoothing_profile:r.smoothingProfile||"off",final_p_b:Number.isFinite(+r.finalPB)?+r.finalPB:null,

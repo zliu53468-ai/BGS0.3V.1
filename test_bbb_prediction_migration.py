@@ -27,7 +27,7 @@ class BBBMigrationTests(unittest.TestCase):
                     "smoothing_alpha", "execution_order", "physics_48d", "features_57d"):
             self.assertEqual(actual[key], expected[key], key)
         self.assertEqual(actual["particle_diagnostics"]["particle_count"], 500)
-        self.assertEqual(actual["bbb_runtime"]["blind_upgrade"]["mode"], "baseline")
+        self.assertEqual(actual["source_commit"], self.reference["source_commit"])
 
     def test_browser_parity_cold_and_late_shoes(self):
         for row in self.reference["standalone"]:
