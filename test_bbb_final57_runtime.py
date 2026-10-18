@@ -58,7 +58,7 @@ class BBBFinal57RuntimeTests(unittest.TestCase):
             user_id="ci-public",
             shoe_context={"bankroll": 100000},
         )
-        self.assertEqual(output["engine"], "BBB_V23_R1_PHYSICS48_FINAL57_EV")
+        self.assertEqual(output["engine"], "BBB_PHYSICS_PARTICLE500_CORE_XGB_EV")
         self.assertIn(output["action"], {"B", "P", "Skip"})
         self.assertTrue(output["bbb_final57"]["active"])
         self.assertEqual(len(output["bbb_final57"]["features_57d"]), FEATURE_DIM)

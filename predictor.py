@@ -1,11 +1,9 @@
-"""BGS production predictor: Single-Brain Contextual LinUCB B/P core.
+"""BGS public prediction adapter to the pinned BBB Physics/Particle500 engine.
 
-Formal direction, probability and confidence are produced only by the two-arm
-Contextual LinUCB policy. Shoe progression, HSMM regime, run-length hazard and
-derived-road structure enter only through the fixed 256-D context vector
-(128D shoe/progression + 128D road/structure).
-Legacy road/Markov/geometry diagnostics remain outward-compatible at zero
-formal direction weight. OCR and screenshot recognition are untouched.
+The existing Python road/core calculations remain compatibility diagnostics.
+Formal direction, confidence and EV are replaced at the established prediction
+seam by BBB's unmodified JavaScript engine and model bundles. OCR, LINE and
+activation/session flows are outside this module and remain unchanged.
 """
 from __future__ import annotations
 
@@ -136,20 +134,20 @@ def _overlay_bbb_final57(
     components["bbb_v23_r1_core"] = core_probabilities
     components["bbb_final57"] = probabilities
     signal_reason = (
-        f"BBB V23 R1 Core P(B)={float(final['core_p_b']):.4f}；"
-        f"Final57 P(B)={float(final['final_p_b']):.4f}；"
+        f"BBB Frozen Core P(B)={float(final['core_p_b']):.4f}；"
+        f"Physics＋Particle500 P(B)={float(final['final_p_b']):.4f}；"
         f"EV(B)={float(final['ev_banker']):+.4f}；EV(P)={float(final['ev_player']):+.4f}；"
         f"MinEV={float(final['activation_ev']):.4f}。"
     )
 
     result.update({
-        "engine": "BBB_V23_R1_PHYSICS48_FINAL57_EV",
+        "engine": "BBB_PHYSICS_PARTICLE500_CORE_XGB_EV",
         "model_version": FINAL57_VERSION,
         "system_model_version": FINAL57_VERSION,
-        "model_variant": "BBB_V23_R1_256D_CORE_PLUS_48D_PHYSICS_PLUS_57D_XGB_DIRECT_EV",
-        "model_core": "bbb_final57_direct_classifier",
-        "primary_model": "BBB_FINAL57",
-        "decision_pipeline": "bbb_v23_r1_core_to_physics48_to_final57_xgb_to_dynamic_clip_to_ev",
+        "model_variant": "BBB_PINNED_PHYSICS48_PARTICLE500_CORE256_XGB57_NO_FLIP",
+        "model_core": "bbb_physics_particle500_primary",
+        "primary_model": "BBB_PHYSICS_PARTICLE500",
+        "decision_pipeline": "physics48_to_particle500_to_physics_ema_to_frozen_core_xgb_filter_to_ev",
         "probabilities": probabilities,
         "raw_direction_probabilities": core_probabilities,
         "banker_rate": round(float(probabilities["B"]) * 100.0, 2),
@@ -173,8 +171,8 @@ def _overlay_bbb_final57(
         "signal_status_text": "下一手模型：觀望 Skip" if is_skip else f"下一手模型：{text} {direction_probability:.1%}",
         "signal_reason": signal_reason,
         "internal_signal_reason": signal_reason,
-        "direction_source": "bbb_final57_xgb_ev",
-        "formal_direction_source": "bbb_final57_xgb_ev",
+        "direction_source": "bbb_physics_particle500_ev",
+        "formal_direction_source": "bbb_physics_particle500_ev",
         "confidence": final_confidence,
         "raw_model_confidence": direction_probability,
         "pattern_calibrated_confidence": final_confidence,
@@ -186,8 +184,12 @@ def _overlay_bbb_final57(
             "raw_confidence": direction_probability,
             "final_confidence": final_confidence,
             "direction_override": direction != str(core_policy.get("direction") or ""),
-            "semantics": "bbb_final57_direct_probability_plus_ev_decision",
+            "semantics": "bbb_physics_particle500_probability_and_guarded_ev",
         },
+        "linucb_direction_weight": 0.0,
+        "physics_particle_direction_weight": 1.0,
+        "banker_expected_return": float(final["ev_banker"]),
+        "player_expected_return": float(final["ev_player"]),
         "banker_ev": float(final["ev_banker"]),
         "player_ev": float(final["ev_player"]),
         "direction_edge": selected_ev,
@@ -210,13 +212,13 @@ def _overlay_bbb_final57(
             "fallback_markov_weight": 0.0,
             "road_applied": False,
             "hazard_applied": True,
-            "method": "bbb_final57_direct_xgb_ev",
-            "semantics": "V23_R1_core_is_feature_then_Final57_is_formal_decision",
+            "method": "bbb_physics_particle500_filtered_ev",
+            "semantics": "Physics_Particle500_primary_Core_XGB_auxiliary_no_flip",
             "details": {"core_direction": str(core_policy.get("direction") or ""), "flipped": bool(final["flipped"])},
         },
         "fusion": {
             **dict(result.get("fusion") or {}),
-            "method": "bbb_v23_r1_physics48_final57_xgb_ev",
+            "method": "bbb_physics_particle500_core_xgb_ev",
         },
         "component_probabilities": components,
         "money_management": money,
@@ -228,7 +230,7 @@ def _overlay_bbb_final57(
         "suggested_bet_amount": bankroll * final_ratio,
         "bet_amount": bankroll * final_ratio,
         "bet_multiplier": min(1.0, final_ratio / MAX_BET_RATIO) if MAX_BET_RATIO > 0.0 else 0.0,
-        "probability_semantics": "bbb_final57_direct_xgb_binary_probability_after_dynamic_clip",
+        "probability_semantics": "bbb_physics_particle500_binary_probability_after_filter",
         "decision": direction,
         "decision_text": text,
         "skip": is_skip,
@@ -248,8 +250,11 @@ def _overlay_bbb_final57(
     dynamic = dict(result.get("dynamic_prediction_policy") or {})
     dynamic.update({
         "version": FINAL57_VERSION,
-        "formal_direction_source": "bbb_final57_xgb_ev",
+        "formal_direction_source": "bbb_physics_particle500_ev",
         "final57_active": True,
+        "linucb_primary": False,
+        "physics_primary": True,
+        "particle_count": 500,
         "ocr_or_screen_flow_modified": False,
     })
     result["dynamic_prediction_policy"] = dynamic

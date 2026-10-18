@@ -3,6 +3,7 @@ name: BBB Final57 parity check
 on:
   push:
     branches:
+      - main
       - sync-bbb-final57-r1
   pull_request:
     branches:
@@ -17,8 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install "numpy>=1.26,<2.4"
+      - run: python -m pip install "numpy>=1.26,<2.4" "nodejs-wheel==24.19.0"
       - name: Syntax check prediction and LINE bridge
         run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
       - name: Run Final57 runtime tests
-        run: python -m unittest -v test_bbb_final57_runtime.py
+        run: python -m unittest -v test_bbb_final57_runtime.py test_bbb_prediction_migration.py

@@ -2,7 +2,7 @@
 
 The runtime installs the BBB Frozen Direct 32D policy before loading the legacy
 app, then keeps the formal predictor contract intact at the UI boundary:
-- formal action is always B/P;
+- formal BBB action is B/P/Skip; Skip remains zero-stake at this boundary;
 - B/P/T history builds the same 16-shoe + 16-road context as the web panel;
 - exact card evidence stays diagnostic and does not alter the formal context;
 - prediction never bootstraps or automatically updates A/b;
@@ -83,6 +83,26 @@ def _attach_formal_bankroll_advice(
     result = dict(prediction or {})
     bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
     money = dict(result.get("money_management") or {})
+    # Prediction boundary only: a BBB Skip must not be converted into a B/P bet.
+    final = dict(result.get("bbb_final57") or {})
+    if final.get("active") and final.get("direction") == "Skip":
+        result.update({
+            "action": "Skip", "recommend": "Skip", "direction": "Skip", "next_round_direction": "Skip",
+            "internal_action": "Skip", "internal_recommend": "Skip",
+            "action_text": "觀望", "recommend_text": "觀望", "direction_text": "觀望", "next_round_direction_text": "觀望",
+            "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
+            "risk_gate_open": False, "signal_allowed": False, "bet_allowed": False,
+            "mandatory_bet": False, "skip": True, "force_observe": True,
+            "skip_reason": "bbb_physics_particle500_skip",
+            "suggested_bet_amount": 0.0, "bet_amount": 0.0, "bet_percentage": 0.0,
+            "final_bet_ratio": 0.0, "kelly_fraction": 0.0,
+            "kelly_percentage_applied": 0.0, "bet_multiplier": 0.0,
+        })
+        money.update({"direction": "Skip", "bankroll": bankroll, "final_bet_ratio": 0.0,
+                      "kelly_fraction": 0.0, "bet_percentage": 0.0, "bet_amount": 0.0,
+                      "bet_allowed": False, "mandatory_bet": False})
+        result["money_management"] = money
+        return result
     action = _formal_bp_action(result)
 
     try:
