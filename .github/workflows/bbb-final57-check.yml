@@ -22,4 +22,4 @@ jobs:
       - name: Syntax check prediction and LINE bridge
         run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
       - name: Run Final57 runtime tests
-        run: python -m unittest -v test_bbb_final57_runtime.py test_bbb_prediction_migration.py
+        run: python -m unittest -v test_bbb_final57_runtime.py test_bbb_prediction_migration.py test_bbb_fixed_gap.py

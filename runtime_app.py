@@ -171,10 +171,29 @@ def _attach_formal_bankroll_advice(
     return result
 
 
+def _fixed_forecast_panel(user_id, session):
+    """Display the fixed 2pp forecast without changing wager/session state."""
+    prediction = dict(session.get("screen_last_prediction") or {})
+    final = dict(prediction.get("bbb_final57") or {})
+    forecast = final.get("next_hand_forecast") or {}
+    direction = final.get("forecast_direction")
+    if final.get("active") and forecast.get("available") and direction in ("B", "P", "Skip"):
+        prediction.update({
+            "internal_action": direction, "internal_recommend": direction,
+            "action": direction, "recommend": direction, "skip": direction == "Skip",
+            "banker_rate": float(forecast["directional"]["B"]) * 100.0,
+            "player_rate": float(forecast["directional"]["P"]) * 100.0,
+            "tie_rate": float(forecast["probabilities"]["T"]) * 100.0,
+        })
+    return _ORIGINAL_SCREEN_RESULT_PANEL(user_id, {**dict(session), "screen_last_prediction": prediction})
+
+
 # app.py still contains legacy compatibility helpers. Override only these two
 # runtime seams instead of modifying OCR/screenshot/LINE code in the large file.
 legacy_app._exact_shoe_context = _formal_shoe_context
 legacy_app._attach_bankroll_advice = _attach_formal_bankroll_advice
+_ORIGINAL_SCREEN_RESULT_PANEL = legacy_app.screen_result_panel
+legacy_app.screen_result_panel = _fixed_forecast_panel
 app = legacy_app.app
 
 __all__ = ["app"]

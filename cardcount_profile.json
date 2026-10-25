@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "name": "cardcount_middle_late_v2",
+  "enabled": true,
+  "display_gap": 0.02,
+  "stages": [
+    {
+      "name": "early",
+      "start": 1,
+      "end": 20
+    },
+    {
+      "name": "middle",
+      "start": 21,
+      "end": 45
+    },
+    {
+      "name": "late",
+      "start": 46,
+      "end": 70
+    }
+  ],
+  "anchors": {
+    "decision_alpha": [
+      [
+        1,
+        0.45
+      ],
+      [
+        18,
+        0.45
+      ],
+      [
+        20,
+        0.49000000000000005
+      ],
+      [
+        24,
+        0.6
+      ],
+      [
+        43,
+        0.6
+      ],
+      [
+        49,
+        0.72
+      ],
+      [
+        70,
+        0.72
+      ]
+    ],
+    "macro_short": [
+      [
+        1,
+        0.28
+      ],
+      [
+        18,
+        0.28
+      ],
+      [
+        20,
+        0.28800000000000003
+      ],
+      [
+        24,
+        0.33
+      ],
+      [
+        43,
+        0.33
+      ],
+      [
+        49,
+        0.35
+      ],
+      [
+        70,
+        0.35
+      ]
+    ],
+    "macro_long": [
+      [
+        1,
+        0.08
+      ],
+      [
+        18,
+        0.08
+      ],
+      [
+        20,
+        0.08800000000000001
+      ],
+      [
+        24,
+        0.11
+      ],
+      [
+        43,
+        0.11
+      ],
+      [
+        49,
+        0.12
+      ],
+      [
+        70,
+        0.12
+      ]
+    ],
+    "pf_max": [
+      [
+        1,
+        0.1
+      ],
+      [
+        18,
+        0.1
+      ],
+      [
+        20,
+        0.116
+      ],
+      [
+        24,
+        0.15
+      ],
+      [
+        43,
+        0.15
+      ],
+      [
+        49,
+        0.16
+      ],
+      [
+        70,
+        0.16
+      ]
+    ],
+    "training_weight": [
+      [
+        1,
+        1.1
+      ],
+      [
+        18,
+        1.1
+      ],
+      [
+        23,
+        1.15
+      ],
+      [
+        43,
+        1.15
+      ],
+      [
+        48,
+        1.25
+      ],
+      [
+        70,
+        1.25
+      ]
+    ],
+    "pf_draws": [
+      [
+        1,
+        3
+      ],
+      [
+        20,
+        3
+      ],
+      [
+        24,
+        4
+      ],
+      [
+        45,
+        4
+      ],
+      [
+        50,
+        5
+      ],
+      [
+        70,
+        5
+      ]
+    ],
+    "focus_training_weight": [
+      [
+        1,
+        1.1
+      ],
+      [
+        18,
+        1.1
+      ],
+      [
+        20,
+        1.12
+      ],
+      [
+        24,
+        1.25
+      ],
+      [
+        43,
+        1.25
+      ],
+      [
+        49,
+        1.35
+      ],
+      [
+        70,
+        1.35
+      ]
+    ]
+  },
+  "macro": {
+    "min_observations": 7,
+    "max_age": 5,
+    "max_delta": 0.04,
+    "progress_start": 0.22,
+    "progress_power": 1.6,
+    "noise_low": 0.55,
+    "noise_high": 0.72
+  },
+  "pf": {
+    "min_blend": 0.06,
+    "signal_gate": true,
+    "forecast_draws": 3
+  },
+  "training": {
+    "name": "aggressive_cardcount",
+    "shoes": 6000,
+    "validation_fraction": 0.2,
+    "calibration_fraction": 0.1,
+    "augment_ratio": 0.25,
+    "physics_weights": {
+      "winner": 3.5,
+      "points": 1.45,
+      "card_count": 1.65,
+      "rank": 0.55
+    },
+    "low_uncertainty_gain": 0.18,
+    "actionability_gain": 0.08,
+    "pattern_gain": 0.0,
+    "weight_cap": 1.5,
+    "xgb_candidates": [
+      {
+        "max_depth": 2,
+        "n_estimators": 500,
+        "learning_rate": 0.025,
+        "min_child_weight": 12,
+        "subsample": 0.9,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.3,
+        "reg_lambda": 14
+      },
+      {
+        "max_depth": 3,
+        "n_estimators": 600,
+        "learning_rate": 0.02,
+        "min_child_weight": 10,
+        "subsample": 0.9,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.3,
+        "reg_lambda": 12
+      },
+      {
+        "max_depth": 3,
+        "n_estimators": 750,
+        "learning_rate": 0.018,
+        "min_child_weight": 8,
+        "subsample": 0.9,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.2,
+        "reg_lambda": 10
+      },
+      {
+        "max_depth": 4,
+        "n_estimators": 650,
+        "learning_rate": 0.015,
+        "min_child_weight": 12,
+        "subsample": 0.9,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.5,
+        "reg_lambda": 16
+      }
+    ],
+    "middle_late_focus": {
+      "middle_extra_ratio": 0.1,
+      "late_extra_ratio": 0.2,
+      "weight_key": "focus_training_weight",
+      "candidates": [
+        {
+          "max_depth": 3,
+          "n_estimators": 800,
+          "learning_rate": 0.018,
+          "min_child_weight": 12,
+          "subsample": 0.9,
+          "colsample_bytree": 0.85,
+          "reg_alpha": 0.35,
+          "reg_lambda": 14
+        },
+        {
+          "max_depth": 4,
+          "n_estimators": 750,
+          "learning_rate": 0.015,
+          "min_child_weight": 16,
+          "subsample": 0.9,
+          "colsample_bytree": 0.85,
+          "reg_alpha": 0.5,
+          "reg_lambda": 18
+        }
+      ]
+    }
+  },
+  "local_calibration": {
+    "enabled": true,
+    "min_samples": 24,
+    "min_validation": 16,
+    "prior_strength": 100,
+    "max_delta": 0.005,
+    "validation_window": 32,
+    "min_brier_gain": 5e-05,
+    "noise_start": 0.55,
+    "noise_stop": 0.85,
+    "stage_anchors": {
+      "prior_strength": [
+        [
+          1,
+          100
+        ],
+        [
+          20,
+          100
+        ],
+        [
+          24,
+          90
+        ],
+        [
+          43,
+          90
+        ],
+        [
+          49,
+          80
+        ],
+        [
+          70,
+          80
+        ]
+      ],
+      "residual_decay": [
+        [
+          1,
+          1
+        ],
+        [
+          20,
+          1
+        ],
+        [
+          24,
+          0.98
+        ],
+        [
+          43,
+          0.98
+        ],
+        [
+          49,
+          0.96
+        ],
+        [
+          70,
+          0.96
+        ]
+      ],
+      "validation_window": [
+        [
+          1,
+          32
+        ],
+        [
+          20,
+          32
+        ],
+        [
+          24,
+          24
+        ],
+        [
+          43,
+          24
+        ],
+        [
+          49,
+          20
+        ],
+        [
+          70,
+          20
+        ]
+      ]
+    }
+  }
+}
