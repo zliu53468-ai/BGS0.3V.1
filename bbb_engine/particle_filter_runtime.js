@@ -119,13 +119,13 @@ function preserveWinnerDirection(corrected,direct){
   corrected[23]=directionalMass*dir;corrected[24]=directionalMass*(1-dir);corrected[25]=t;
   return blocked;
 }
-function posteriorForecast(particles,consumed,weights,rng){
+function posteriorForecast(particles,consumed,weights,rng,draws=FORECAST_DRAWS){
   const out=Array(48).fill(0);let mass=0;
   let consumedMean=0,consumedSq=0;
   for(let i=0;i<particles.length;i++){
     const w=weights[i];consumedMean+=w*consumed[i];consumedSq+=w*consumed[i]*consumed[i];
-    for(let d=0;d<FORECAST_DRAWS;d++){
-      const hand=deal(particles[i],rng),m=w/FORECAST_DRAWS;mass+=m;
+    for(let d=0;d<draws;d++){
+      const hand=deal(particles[i],rng),m=w/draws;mass+=m;
       out[{4:0,5:1,6:2}[hand.cardCount]]+=m;
       out[3+hand.playerPoint]+=m;out[13+hand.bankerPoint]+=m;
       out[23+(hand.outcome==="B"?0:hand.outcome==="P"?1:2)]+=m;
@@ -149,7 +149,7 @@ function posteriorForecast(particles,consumed,weights,rng){
   const variance=Math.max(0,consumedSq-consumedMean*consumedMean);
   return {physics:out,consumedStd:Math.sqrt(variance)};
 }
-function estimate(history,directPhysics,mode="quality"){
+function estimate(history,directPhysics,mode="quality",config={}){
   const seq=(Array.isArray(history)?history:[]).map(x=>String(x||"").toUpperCase()).filter(x=>OUTCOMES.has(x));
   if(!Array.isArray(directPhysics)||directPhysics.length!==48)throw new Error("particle500 requires Direct Physics 48D");
   const blendMode=normalizeBlendMode(mode);
@@ -186,12 +186,16 @@ function estimate(history,directPhysics,mode="quality"){
     }
   }
 
-  const forecast=posteriorForecast(particles,consumed,weights,rng),posterior=forecast.physics;
+  const forecastDraws=Math.round(clip(config.forecast_draws??FORECAST_DRAWS,1,5));
+  const forecast=posteriorForecast(particles,consumed,weights,rng,forecastDraws),posterior=forecast.physics;
   const winner=normalizeBlock(posterior.slice(23,26));
   const spread=clip(forecast.consumedStd/18);
   const posteriorUncertainty=clip(.55*entropy3(winner)+.30*(1-lastEssRatio)+.15*spread);
   const quality=clip(.45*lastEssRatio+.35*(1-posteriorUncertainty)+.20*(1-spread));
-  const qualityBlendWeight=clip(MIN_BLEND+(MAX_BLEND-MIN_BLEND)*quality,MIN_BLEND,MAX_BLEND);
+  const minimum=clip(config.min_blend??MIN_BLEND,0,MAX_BLEND),maximum=clip(config.max_blend??MAX_BLEND,minimum,MAX_BLEND);
+  const sameSide=(directPhysics[23]-directPhysics[24])*(posterior[23]-posterior[24])>0;
+  const signalGate=config.signal_gate===true?(sameSide?clip(lastEssRatio)*clip(1-posteriorUncertainty):0):1;
+  const qualityBlendWeight=clip(minimum+(maximum-minimum)*quality*signalGate,minimum,maximum);
   const forcedBlendWeight=fixedBlendWeight(blendMode);
   const blendWeight=forcedBlendWeight===null?qualityBlendWeight:forcedBlendWeight;
 
@@ -225,9 +229,9 @@ function estimate(history,directPhysics,mode="quality"){
       version:VERSION,enabled:true,particle_filter_enabled:true,particle_count:PARTICLE_COUNT,
       policy:"stateless_rebuild_each_prediction",persistent_state:false,rebuild_from_scratch:true,
       history_rounds:seq.length,history_fingerprint:seq.join(""),likelihood_draws:LIKELIHOOD_DRAWS,
-      fallback_draws:FALLBACK_DRAWS,forecast_draws:FORECAST_DRAWS,ess_resample_threshold:ESS_RESAMPLE_THRESHOLD,
+      fallback_draws:FALLBACK_DRAWS,forecast_draws:forecastDraws,ess_resample_threshold:ESS_RESAMPLE_THRESHOLD,
       resampling_count:resamplingCount,recent_ess_ratio:lastEssRatio,posterior_uncertainty:posteriorUncertainty,
-      particle_quality:quality,blend_weight:blendWeight,quality_blend_weight:qualityBlendWeight,particle_blend_mode:blendMode,
+      particle_quality:quality,signal_gate:signalGate,same_direction:sameSide,blend_min:minimum,blend_max:maximum,blend_weight:blendWeight,quality_blend_weight:qualityBlendWeight,particle_blend_mode:blendMode,
       tie_soft_update:true,tie_likelihood_influence:TIE_LIKELIHOOD_INFLUENCE,
       tie_observation_count:seq.filter(x=>x==="T").length,direction_flip_blocked:directionFlipBlocked,
       direct_directional_pb:clip(directPhysics[23]/Math.max(1e-9,directPhysics[23]+directPhysics[24])),

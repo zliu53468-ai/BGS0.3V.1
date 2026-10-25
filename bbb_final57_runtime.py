@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENGINE_DIR = BASE_DIR / "bbb_engine"
 PHYSICS_MODEL_PATH = BASE_DIR / "physics_multitask_model.json"
 FINAL_MODEL_PATH = BASE_DIR / "final_probability_model.json"
-VERSION = "PHYSICS_57D_V14_8_MACRO_EMA_GUARD"
+VERSION = "PHYSICS_57D_V14_8_FORECAST_FIRST"
 HISTORY_INPUT_DIM, PHYSICS_DIM, FEATURE_DIM = 213, 48, 57
 _LOCK = threading.RLock()
 
@@ -86,7 +86,7 @@ def _predict_scoped(seq: list[str], scope: str) -> dict:
     if not scope:
         return _run({"history": seq})
     # Separate prediction-only DB. Never reads/writes license or session contents.
-    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    key = hashlib.sha256((_verify_source()["commit"] + ":" + scope).encode("utf-8")).hexdigest()
     state_path = _state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     with _LOCK, closing(sqlite3.connect(state_path, timeout=5)) as db, db:
@@ -129,6 +129,11 @@ def apply_final_prediction(history, core_prediction=None, *, previous_final_pb=N
         "physics_forecast": r["physicsForecast"], "particle_diagnostics": r["particleDiagnostics"],
         "execution_order": r["execution_order"], "source_commit": out["source_commit"],
         "bbb_runtime": r,
+        "bet_direction": direction,
+        "forecast_direction": out["display_direction"],
+        "forecast_gap": out["fixed_display_gap"],
+        "next_hand_forecast": p.get("next_hand_forecast"),
+        "browser_calibration": p.get("browser_calibration"),
     }
 
 

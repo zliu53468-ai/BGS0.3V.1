@@ -1,24 +1,27 @@
 {
   "repository": "zliu53468-ai/BBB",
-  "commit": "ab86b5922fad901e701f81fe65d7563d26352e28",
-  "profile": "baseline",
+  "commit": "e11b52424d0641aeaa16437a15e744808848dfba",
+  "profile": "cardcount_middle_late_v2",
   "scripts": [
     "app256forward.js",
     "app256continuation.js",
     "particle_filter_runtime.js",
     "macro_ema.js",
+    "browser_calibration.js",
     "final_probability_runtime.js"
   ],
   "sha256": {
     "app256forward.js": "79d43e0be7b23f77e631909cd7c6808fc668df488df0171fe5cc4722e8597064",
     "app256continuation.js": "d3302c7d09db8932f7ab9ea7c722f394c6aa566d0654962e79bba751f30bf006",
-    "particle_filter_runtime.js": "fb3be11f97a48e61ee2d65b8570a8373de012b285ae4f935ee70905e936bd48a",
-    "macro_ema.js": "49e460dc5325e22054c21f47fe4d6d0bed927ac3125838b0a7b7cab7f51d69c3",
-    "final_probability_runtime.js": "dfb78dafa990bb5a9994c81773ba8dd1d5a60bfc911f11c5ce20135f1d2a0fee",
+    "particle_filter_runtime.js": "4c11f9122b9474ec1798ae38e2751de6f72115167fa2537affdf2cd4ae704d18",
+    "macro_ema.js": "aef47f2b6d82f86b35cd41cf0ff98b583c665ed7fb94aae0c2268f2003815b58",
+    "browser_calibration.js": "1080ecf9af81f24fffa14035c21f633c8241eeeb1352a097f2be35aedc2b78e3",
+    "final_probability_runtime.js": "0a8ec0a72c66849c0b1c7f7926e6f3f46dddf0ea7d51deec7c44bb909dfa76ce",
+    "cardcount_profile.json": "83316652c99b049ffc232a22c44f6538447ed6e8644fe51d02b31ccce9adf396",
     "physics_multitask_model.json": "3ec0d60251cb5b3fcb40bd67fec1334cb64d37becebbe0b040efbae871071138",
     "final_probability_model.json": "862347a6937b30ac9a8a3ece8f0eb9927569c97dee799e53cbb418e6c10be2f9"
   },
-  "bgs_base_commit": "fbe3f88cffd3b53b097d01c71c96cebbf688497e",
+  "bgs_base_commit": "dd419b404ec967c916e8307c6feffc00e600e3fa",
   "protected_files_sha256": {
     "PATCH_NOTES.md": "91faf2ca0f9f77bcc536f4742448aa9f23c17b50d483e457c7bd7efdecf75610",
     "Procfile": "dd6dfe1958e7dd7784fff50c27d9e3b48f1b3b57adca6b19c8e0d9b4416b6736",
@@ -91,5 +94,6 @@
     "test_web_panel_parity.py": "434891a8979b6c6609b1ab46b5865281e24d4b84034ee1cbe042af045bfb8608",
     "validated_decision_layer.py": "acf37aad004518fa0fa8748dfc07872572d7b5417661b0b2e0576a7e7a18fd9a",
     "virtual_shoe.py": "417c9ba61e4eaf9dcca66607ab9031a9214291daa98786d3387dd44974233872"
-  }
+  },
+  "fixed_display_gap": 0.02
 }

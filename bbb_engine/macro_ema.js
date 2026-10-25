@@ -47,13 +47,14 @@
     }
     return out;
   }
-  function update(state,hand){
+  function update(state,hand,config={}){
     const raw=values(hand); // Validate everything before mutating any EMA.
     state.rounds++;
     for(const key of NAMES){
       const x=raw[key],e=state.ema[key];if(x===null)continue;
-      e.short=e.count?.20*x+.80*e.short:x;
-      e.long=e.count?.05*x+.95*e.long:x;
+      const short=clamp(config.short_alpha??.20,.05,.50),long=clamp(config.long_alpha??.05,.01,.20);
+      e.short=e.count?short*x+(1-short)*e.short:x;
+      e.long=e.count?long*x+(1-long)*e.long:x;
       e.count++;e.last_round=state.rounds;
     }
     return snapshot(state);
@@ -99,7 +100,7 @@
     const weight=clamp((progress-start)/(1-start))**power,cap=clamp(number("max_delta",.03),0,.05);
     // v2 coefficients are literal probability-point sensitivities per normalized spread.
     // Legacy bundles retain their prior cap*tanh(signal) interpretation.
-    const gate=noiseGate(noise),probabilityUnits=config.coefficient_units==="probability_delta";
+    const gate=noiseGate(noise,number("noise_low",.60),number("noise_high",.75)),probabilityUnits=config.coefficient_units==="probability_delta";
     const boundedSignal=clamp(signal,-cap,cap);
     const delta=(probabilityUnits?boundedSignal:cap*Math.tanh(signal))*weight*gate;
     // B/P EV preference boundary: .95*p-(1-p) = (1-p)-p.
