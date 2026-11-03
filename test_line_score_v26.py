@@ -84,9 +84,8 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertGreater(counts["SKIP"], 19)
-        self.assertLessEqual(counts["SKIP"], 45)
-        self.assertEqual(sum(counts.values()), 100)
+        self.assertEqual(counts, {"B": 36, "P": 34, "SKIP": 30},
+                         "LINE V3 100-score benchmark must match BBB")
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
         print("BGS V2.6 V3 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
 
