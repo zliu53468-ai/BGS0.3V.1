@@ -12,8 +12,9 @@
   if(root)root.BBBPointSignalQualityGuard=api;
 })(typeof window!=="undefined"?window:null,function(){
 "use strict";
-const VERSION="BBB_V26_SELECTIVE_ENTRY_V3";
-// Rollback V3 -> previous moderate V2: set ACTIVE_PROFILE="moderate" in
+const VERSION="BBB_V26_SELECTIVE_ENTRY_V4";
+// Rollback V4 -> previous V3: set ACTIVE_PROFILE="moderate_high" in
+// both repositories. Rollback to V2: set ACTIVE_PROFILE="moderate" in
 // both repositories. Legacy V1: set MODERATE_ENTRY.enabled=false.
 // Neither setting changes the physical EV, PF, early-shoe or raw B/P choice.
 const ENTRY_PROFILES=Object.freeze({
@@ -30,9 +31,16 @@ const ENTRY_PROFILES=Object.freeze({
     low_quality_extra:.00055,
     uncertainty_proxy_threshold:.48,
     high_uncertainty_extra:.00035
+  }),
+  selective_v4:Object.freeze({
+    additional_ev_gap:.00275,
+    pf_quality_threshold:.70,
+    low_quality_extra:.00065,
+    uncertainty_proxy_threshold:.45,
+    high_uncertainty_extra:.00045
   })
 });
-const ACTIVE_PROFILE="moderate_high";
+const ACTIVE_PROFILE="selective_v4";
 const MODERATE_ENTRY=Object.freeze({
   enabled:true,
   ...ENTRY_PROFILES[ACTIVE_PROFILE]
