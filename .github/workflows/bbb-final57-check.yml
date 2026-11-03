@@ -20,6 +20,8 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install "numpy>=1.26,<2.4" "nodejs-wheel==24.19.0"
       - name: Syntax check prediction and LINE bridge
-        run: python -m py_compile bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py app.py
+        run: python -m py_compile bbb_v2_runtime.py bbb_v2_overlay.py bbb_final57_runtime.py bbb_v23_hazard_core.py bbb_v23_hazard.py dynamic_prediction_policy.py predictor.py runtime_app.py app.py
       - name: Run Final57 runtime tests
-        run: python -m unittest -v test_bbb_final57_runtime.py test_bbb_prediction_migration.py test_bbb_fixed_gap.py
+        run: python -m unittest -v test_bbb_final57_runtime.py test_bbb_prediction_migration.py test_bbb_fixed_gap.py test_bbb_v2_line_port.py
+      - name: Syntax check unchanged vendored BBB V2 scripts
+        run: python -m nodejs_wheel --check bbb_engine/quant256_online_runtime.js && python -m nodejs_wheel --check bbb_engine/physics_forecast_first_runtime.js && python -m nodejs_wheel --check bbb_engine/shoe_distribution_guard.js && python -m nodejs_wheel --check bbb_engine/worker_v2.cjs
