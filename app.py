@@ -802,6 +802,35 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     # Keep the exact legacy analysis card; point-score mode removes only the
     # B/P/T manual-result buttons. Legacy screenshot UI remains unchanged.
     point_score_card = bool(session.get("point_score_mode") and prediction.get("bbb_v26_score"))
+    # Diagnostic only: display the 4/5/6-card current-to-next joint matrix.
+    # Never use these probabilities to override B/P/SKIP, EV or wager eligibility.
+    draw_length_rows = []
+    if point_score_card:
+        score = prediction.get("bbb_v26_score") or {}
+        lengths = (score.get("physical_ev") or {}).get("draw_length_diagnostics") or {}
+        if lengths.get("joint_probability") and lengths.get("diagnostic_only") is True:
+            current = lengths["current_length_probability"]
+            upcoming = lengths["next_length_probability"]
+            matrix = lengths["joint_probability"]
+            def as_percent(value: float) -> str:
+                return f"{float(value) * 100:.1f}%"
+            def length_row(values: Mapping[str, Any]) -> str:
+                return "／".join(as_percent(values[str(n)]) for n in (4, 5, 6))
+            joint_lines = [
+                f"當局 {n} 張 → 下局 4／5／6 張：{length_row(matrix[str(n)])}"
+                for n in (4, 5, 6)
+            ]
+            draw_length_rows = [
+                {"type": "separator", "margin": "md", "color": "#F1B900"},
+                {"type": "text", "text": "4／5／6 張聯合模擬（診斷）",
+                 "weight": "bold", "wrap": True, "color": "#272727"},
+                {"type": "text", "text": "當局 4／5／6 張：" + length_row(current) +
+                 "\\n下局 4／5／6 張：" + length_row(upcoming) +
+                 "\\n" + "\\n".join(joint_lines),
+                 "wrap": True, "size": "sm", "color": "#272727"},
+                {"type": "text", "text": "實際發牌張數未知；聯合模擬不影響 EV、推薦或觀望。",
+                 "wrap": True, "size": "xs", "color": "#806A2A"},
+            ]
     result_buttons = (
         [_postback_button("結束分析", "end", style="secondary")]
         if point_score_card else [
@@ -831,6 +860,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         ]},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
+        *draw_length_rows,
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": result_buttons},
     ])
 
