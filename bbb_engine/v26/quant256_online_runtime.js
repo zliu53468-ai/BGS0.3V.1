@@ -69,7 +69,7 @@ function sampleHand(counts,rng){
  * observation. `hand` is one exact conditional draw among those branches.
  *
  * This integrates third-card noise analytically while preserving the fixed
- * Configurable RB four-card proposals per particle (default 384) and correct likelihood
+ * 384 independent four-card proposals per particle and correct likelihood
  * weighting. It is not an exact full-shoe outcome likelihood.
  */
 function validPointObservation(outcome,points){
@@ -150,9 +150,8 @@ function resampleConditionalTransition(parent,rng,outcome,points=null){
  * 它不是對真實牌靴的測量，亦不代表已知任何 A~K 殘量。
  */
 class BlindPhysicsEstimator{
-  constructor({particles=256,likelihoodProposals=384,seed=0xBBB256}={}){
-    this.size=clamp(Math.floor(particles)||256,8,1024);
-    this.likelihoodProposals=clamp(Math.floor(likelihoodProposals)||384,32,1024);
+  constructor({particles=256,seed=0xBBB256}={}){
+    this.size=clamp(Math.floor(particles)||256,8,256);
     this.seed=seed>>>0;this.reset();
   }
   reset(){
@@ -172,7 +171,7 @@ class BlindPhysicsEstimator{
     if(!valid(outcome))throw Error("invalid_outcome");
     if(!validPointObservation(outcome,points))throw Error("invalid_point_observation");
     const pointEvidence=points===null?null:{player:points.player,banker:points.banker};
-    const attempts=this.likelihoodProposals,next=new Array(this.size),updated=new Array(this.size);
+    const attempts=384,next=new Array(this.size),updated=new Array(this.size);
     const priorParticles=this.particles;
     let accepted=0,sum=0,likelihood=0,likelihoodVariance=0;
     for(let i=0;i<this.size;i++){
@@ -281,7 +280,7 @@ class BlindPhysicsEstimator{
       point_scores_are_not_observed_card_ranks:true,
       resampled:this.lastResampled,posterior_unavailable:this.posteriorUnavailable,
       likelihood_method:"rao_blackwell_third_card_given_first_four",
-      likelihood_proposals_per_particle:this.likelihoodProposals,
+      likelihood_proposals_per_particle:384,
       conditional_rejuvenation_moves:this.lastRejuvenated,
       conditional_rejuvenation_fallbacks:this.lastRejuvenationFallbacks,
       expected_draws_recent:recent.length?recent.reduce((s,v)=>s+v,0)/recent.length:4.94,
@@ -375,7 +374,7 @@ function solveSPD(A,v){
 function dot(a,b){let s=0;for(let i=0;i<K;i++)s+=a[i]*b[i];return s;}
 class OnlineLinUCB256{
   constructor({lambda=.82,alpha=.15,minSamples=0,confidenceThreshold=0,
-    lossGate=.04,particles=256,likelihoodProposals=384}={}){
+    lossGate=.04,particles=256}={}){
     if(!finite(lambda)||lambda<.75||lambda>.96)throw Error("lambda_must_be_0.75_to_0.96");
     if(!finite(alpha)||alpha<0||alpha>2)throw Error("invalid_alpha");
     if(!Number.isInteger(minSamples)||minSamples<0)throw Error("invalid_min_samples");
@@ -384,12 +383,11 @@ class OnlineLinUCB256{
     if(!finite(lossGate)||lossGate<0||lossGate>.5)throw Error("invalid_loss_gate");
     this.lambda=lambda;this.alpha=alpha;this.minSamples=minSamples;
     this.confidenceThreshold=confidenceThreshold;this.lossGate=lossGate;
-    this.particleCount=particles;this.likelihoodProposals=likelihoodProposals;this.reset();
+    this.particleCount=particles;this.reset();
   }
   reset(){
     this.history=[];this.arms={B:makeArm(),P:makeArm()};
-    this.physics=new BlindPhysicsEstimator({particles:this.particleCount,
-      likelihoodProposals:this.likelihoodProposals});
+    this.physics=new BlindPhysicsEstimator({particles:this.particleCount});
     this.trainedRounds=0;
     this.prequential={eligible:0,correct:0,wrong:0,ties:0,skipped:0};
     this.last_signal=null;this.last_settlement="none";
