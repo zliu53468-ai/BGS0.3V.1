@@ -1,7 +1,7 @@
 /**
- * BBB V2.6 / BGS LINE shared mild DISPLAY-ONLY quality guard.
+ * BBB V2.6 / BGS LINE shared moderate DISPLAY-ONLY quality guard.
  *
- * Single-final-score PF256 is evidence-limited: a small conditional EV gap is
+ * Single-final-score PF96 is evidence-limited: a small conditional EV gap is
  * not a verified edge or actual hit probability. This heuristic abstains only
  * on weak *relative* EV signals. No EV, PF, Early-Shoe, gate or BET mutation.
  */
@@ -12,10 +12,20 @@
   if(root)root.BBBPointSignalQualityGuard=api;
 })(typeof window!=="undefined"?window:null,function(){
 "use strict";
-const VERSION="BBB_V26_MILD_DISPLAY_SKIP_V1";
+const VERSION="BBB_V26_MODERATE_DISPLAY_SKIP_V2";
+// Rollback: set MODERATE_ENTRY.enabled=false and deploy both apps.
+// This restores the exact V1 threshold formula without touching EV / directions.
+const MODERATE_ENTRY=Object.freeze({
+  enabled:true,
+  additional_ev_gap:.00105,
+  pf_quality_threshold:.62,
+  low_quality_extra:.00035,
+  uncertainty_proxy_threshold:.52,
+  high_uncertainty_extra:.00025
+});
 const finite=Number.isFinite;
 const clamp=(v,low,high)=>Math.max(low,Math.min(high,v));
-function decide(report){
+function decide(report,{enabled=MODERATE_ENTRY.enabled}={}){
   const evB=report?.ev_banker,evP=report?.ev_player;
   const d=report?.early_shoe_guard;
   const invalid=!finite(evB)||!finite(evP)||
@@ -36,15 +46,28 @@ function decide(report){
   // EV-unit threshold: baseline 0.085 percentage points, rising *modestly*
   // with posterior/MC uncertainty and diminished particle support.
   // It is NOT a calibrated real-world confidence bound.
-  const threshold=.00085+.00055*(1-quality)+.00040*(1-ess)+
+  const legacyThreshold=.00085+.00055*(1-quality)+.00040*(1-ess)+
     .00030*(1-diversity)+.00060*mc+.00035*spread;
+  // Do not confuse the MC/posterior uncertainty proxy with 57D physics noise.
+  // All additions ONLY narrow display signals. No alternate direction or
+  // fabricated positive-EV qualification is introduced.
+  const uncertaintyProxy=Math.max(mc,spread);
+  const addition=enabled?
+    MODERATE_ENTRY.additional_ev_gap+
+    (quality<MODERATE_ENTRY.pf_quality_threshold?
+      MODERATE_ENTRY.low_quality_extra:0)+
+    (uncertaintyProxy>MODERATE_ENTRY.uncertainty_proxy_threshold?
+      MODERATE_ENTRY.high_uncertainty_extra:0):0;
+  const threshold=legacyThreshold+addition;
   const gap=Math.abs(evB-evP);
   const skip=gap<threshold;
   return{version:VERSION,direction:skip?"SKIP":rawDirection,
     raw_direction:rawDirection,reason:skip?"small_ev_gap_or_uncertain":"relative_ev_gap_pass",
-    threshold,gap,quality,ess_ratio:ess,ancestor_diversity:diversity,
+    threshold,gap,legacy_threshold:legacyThreshold,threshold_addition:addition,
+    moderate_entry_enabled:Boolean(enabled),uncertainty_proxy:uncertaintyProxy,
+    quality,ess_ratio:ess,ancestor_diversity:diversity,
     mc_gap_se:d.mc_gap_se,posterior_gap_spread:d.posterior_gap_spread,
     verified_edge:false,validated_hit_rate:false};
 }
-return{VERSION,decide};
+return{VERSION,MODERATE_ENTRY,decide};
 });
