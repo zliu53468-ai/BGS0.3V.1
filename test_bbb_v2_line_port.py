@@ -47,6 +47,14 @@ class BBBV2LINEBridgeTests(unittest.TestCase):
         self.assertEqual(rewind, a)
         self.assertEqual(bridge.predict_v2(H, scope_key="user-A/table-A/shoe-A"), moved)
 
+    def test_cold_start_50_round_ocr_import_fits_line_deadline(self):
+        # First screenshot may import 50 rounds of B/P/T at once.
+        # No sample-count reduction or shortcut is permitted for production.
+        seq = list("BPPBTBBPPT" * 5)
+        result = bridge.predict_v2(seq, scope_key="unit/cold/import-50")
+        self.assertEqual(result["history_length"], 50)
+        self.assertEqual(result["config"]["N"], 256)
+
     def test_research_display_always_zero_stake(self):
         baseline = {
             "probabilities": {"B": .5, "P": .5, "T": 0.0},
