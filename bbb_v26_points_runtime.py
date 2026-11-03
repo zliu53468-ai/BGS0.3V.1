@@ -26,7 +26,7 @@ SOURCE_BLOBS = {
     "shoe_distribution_guard.js": "b7c34f045952e9ffe7883b670e0314565c557890",
     "markov_residual_runtime.js": "8fbee10200b067c5ef1ac4632e63b2ec18da2ab8",
     "physics_forecast_first_runtime.js": "a2a1263b9844092c986ad0eed93568a7615fbcec",
-    "point_signal_quality_guard.js": "a83ffda959f038b474515a3206cbff718f74d260",
+    "point_signal_quality_guard.js": "f39b94ebb14f493afc402e2f32b116b551c27a2a",
 }
 TIMEOUT_SECONDS = 9.0
 _LOCK = threading.RLock()
