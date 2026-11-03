@@ -83,6 +83,41 @@ def _attach_formal_bankroll_advice(
     result = dict(prediction or {})
     bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
     money = dict(result.get("money_management") or {})
+    # V2: show BBB research B/P when it passes its original research gate,
+    # but keep official B/P/T-only BET qualification FALSE with zero stake.
+    # This boundary changes neither LINE presentation nor trial/activation.
+    v2 = result.get("bbb_v2")
+    if isinstance(v2, Mapping) and v2.get("active"):
+        research = dict(v2.get("research_signal") or {})
+        available = research.get("available") is True
+        research_direction = str(v2.get("display_direction") or "")
+        direction = research_direction if available and research_direction in ("B", "P") else "Skip"
+        if v2.get("action") != "SKIP" or v2.get("official_bet_allowed") is not False:
+            raise RuntimeError("BBB V2 B/P/T official BET qualification unexpectedly changed")
+        label = "觀望" if direction == "Skip" else ("莊" if direction == "B" else "閒")
+        result.update({
+            "action": direction, "recommend": direction, "direction": direction,
+            "internal_action": direction, "internal_recommend": direction,
+            "next_round_direction": direction,
+            "action_text": label, "recommend_text": label,
+            "direction_text": label, "next_round_direction_text": label,
+            "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
+            "risk_gate_open": False, "signal_allowed": available,
+            "bet_allowed": False, "mandatory_bet": False,
+            "skip": direction == "Skip", "force_observe": direction == "Skip",
+            "suggested_bet_amount": 0.0, "bet_amount": 0.0,
+            "bet_percentage": 0.0, "final_bet_ratio": 0.0,
+            "kelly_fraction": 0.0, "kelly_percentage_applied": 0.0,
+            "bet_multiplier": 0.0,
+        })
+        money.update({
+            "direction": "Skip", "bankroll": bankroll,
+            "final_bet_ratio": 0.0, "kelly_fraction": 0.0,
+            "bet_percentage": 0.0, "bet_amount": 0.0,
+            "bet_allowed": False, "mandatory_bet": False,
+        })
+        result["money_management"] = money
+        return result
     # Prediction boundary only: a BBB Skip must not be converted into a B/P bet.
     final = dict(result.get("bbb_final57") or {})
     if final.get("active") and final.get("direction") == "Skip":
