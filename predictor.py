@@ -19,6 +19,7 @@ from dynamic_prediction_policy import (
     road_only_policy,
 )
 from bbb_final57_runtime import VERSION as FINAL57_VERSION, apply_final_prediction
+from bbb_v2_overlay import overlay_v2
 from money_management import MAX_BET_RATIO, MIN_BET_RATIO, MoneyManagementModel
 from road_model import ROAD_FEATURE_NAMES, build_road_context
 from shoe_composition import analyze_shoe_composition
@@ -344,7 +345,8 @@ def predict(history: Union[str, Iterable[Any], None] = None, venue: str = "", ro
         "decision_gate": {"decision": direction, "allowed": True, "reason": "contextual_linucb_always_returns_BP", "direction": direction, "resolved_confidence": confidence, "expected_net_ev": selected_ev, "penalty_observe": False},
         "timeline_alignment": {"raw_round_count": len(raw_history), "bp_round_count": len(big_road), "ties_ignored_for_direction_context": len(raw_history) - len(big_road)}, "context_metadata": context_meta,
     }
-    result = _overlay_bbb_final57(
+    # Formal prediction mirrors BBB main V2 PF256; legacy Final57 is rollback-only.
+    result = overlay_v2(
         result,
         history=raw_history,
         core_policy=policy,
