@@ -805,8 +805,24 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     # Diagnostic only: display the 4/5/6-card current-to-next joint matrix.
     # Never use these probabilities to override B/P/SKIP, EV or wager eligibility.
     draw_length_rows = []
+    entry_gate_rows = []
     if point_score_card:
         score = prediction.get("bbb_v26_score") or {}
+        display_gate = score.get("display_signal") or {}
+        threshold = display_gate.get("threshold")
+        gap = display_gate.get("gap")
+        if isinstance(threshold, (int, float)) and isinstance(gap, (int, float)):
+            passed = score.get("direction") != "SKIP"
+            entry_gate_rows = [{
+                "type": "text",
+                "text": (
+                    "V4 觀望篩選：" + ("通過" if passed else "未通過（觀望）") +
+                    f"\\n實際 EV 差距：{float(gap) * 100:.3f}%"
+                    f"｜觀望門檻：{float(threshold) * 100:.3f}%"
+                    "\\n僅為模擬訊號篩選，不代表實際命中率"
+                ),
+                "wrap": True, "size": "sm", "margin": "md", "color": "#272727",
+            }]
         lengths = (score.get("physical_ev") or {}).get("draw_length_diagnostics") or {}
         if lengths.get("joint_probability") and lengths.get("diagnostic_only") is True:
             current = lengths["current_length_probability"]
@@ -860,6 +876,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         ]},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
+        *entry_gate_rows,
         *draw_length_rows,
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": result_buttons},
     ])
