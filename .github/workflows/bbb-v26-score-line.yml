@@ -1,0 +1,28 @@
+name: BGS LINE BBB V2.6 point-only parity and UID isolation
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+jobs:
+  score-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install prediction-only runtime
+        run: python -m pip install "numpy>=1.26,<2.4" "nodejs-wheel==24.19.0"
+      - name: Python syntax check
+        run: python -m py_compile app.py line_score_mode.py bbb_v26_points_runtime.py
+      - name: Exact unchanged BBB V2.6 Node modules and adapter syntax
+        run: |
+          python -m nodejs_wheel --check bbb_engine/v26/quant256_online_runtime.js
+          python -m nodejs_wheel --check bbb_engine/v26/shoe_distribution_guard.js
+          python -m nodejs_wheel --check bbb_engine/v26/markov_residual_runtime.js
+          python -m nodejs_wheel --check bbb_engine/v26/physics_forecast_first_runtime.js
+          python -m nodejs_wheel --check bbb_engine/worker_v26.cjs
+      - name: BBB V2.6 LINE 100-score parity and per-UID isolation
+        run: python -m unittest -v test_line_score_v26.py
