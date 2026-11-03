@@ -83,9 +83,8 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertGreater(counts["SKIP"], 12)
-        self.assertLessEqual(counts["SKIP"], 30)
-        self.assertEqual(counts["B"] + counts["P"] + counts["SKIP"], 100)
+        self.assertEqual(counts, {"B": 44, "P": 37, "SKIP": 19},
+                         "LINE moderate display must match BBB 100-score benchmark")
         print("BGS V2.6 moderate N96/L256/M96 display:", counts, "raw:", raw_counts)
 
     def test_text_parsing_is_unambiguous(self):
