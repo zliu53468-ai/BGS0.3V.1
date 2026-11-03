@@ -12,20 +12,36 @@
   if(root)root.BBBPointSignalQualityGuard=api;
 })(typeof window!=="undefined"?window:null,function(){
 "use strict";
-const VERSION="BBB_V26_MODERATE_DISPLAY_SKIP_V2";
-// Rollback: set MODERATE_ENTRY.enabled=false and deploy both apps.
-// This restores the exact V1 threshold formula without touching EV / directions.
+const VERSION="BBB_V26_SELECTIVE_ENTRY_V3";
+// Rollback V3 -> previous moderate V2: set ACTIVE_PROFILE="moderate" in
+// both repositories. Legacy V1: set MODERATE_ENTRY.enabled=false.
+// Neither setting changes the physical EV, PF, early-shoe or raw B/P choice.
+const ENTRY_PROFILES=Object.freeze({
+  moderate:Object.freeze({
+    additional_ev_gap:.00105,
+    pf_quality_threshold:.62,
+    low_quality_extra:.00035,
+    uncertainty_proxy_threshold:.52,
+    high_uncertainty_extra:.00025
+  }),
+  moderate_high:Object.freeze({
+    additional_ev_gap:.00200,
+    pf_quality_threshold:.68,
+    low_quality_extra:.00055,
+    uncertainty_proxy_threshold:.48,
+    high_uncertainty_extra:.00035
+  })
+});
+const ACTIVE_PROFILE="moderate_high";
 const MODERATE_ENTRY=Object.freeze({
   enabled:true,
-  additional_ev_gap:.00105,
-  pf_quality_threshold:.62,
-  low_quality_extra:.00035,
-  uncertainty_proxy_threshold:.52,
-  high_uncertainty_extra:.00025
+  ...ENTRY_PROFILES[ACTIVE_PROFILE]
 });
 const finite=Number.isFinite;
 const clamp=(v,low,high)=>Math.max(low,Math.min(high,v));
-function decide(report,{enabled=MODERATE_ENTRY.enabled}={}){
+function decide(report,{enabled=MODERATE_ENTRY.enabled,profile=ACTIVE_PROFILE}={}){
+  const tuning=ENTRY_PROFILES[profile];
+  if(!tuning)throw Error("invalid_entry_profile");
   const evB=report?.ev_banker,evP=report?.ev_player;
   const d=report?.early_shoe_guard;
   const invalid=!finite(evB)||!finite(evP)||
@@ -53,21 +69,22 @@ function decide(report,{enabled=MODERATE_ENTRY.enabled}={}){
   // fabricated positive-EV qualification is introduced.
   const uncertaintyProxy=Math.max(mc,spread);
   const addition=enabled?
-    MODERATE_ENTRY.additional_ev_gap+
-    (quality<MODERATE_ENTRY.pf_quality_threshold?
-      MODERATE_ENTRY.low_quality_extra:0)+
-    (uncertaintyProxy>MODERATE_ENTRY.uncertainty_proxy_threshold?
-      MODERATE_ENTRY.high_uncertainty_extra:0):0;
+    tuning.additional_ev_gap+
+    (quality<tuning.pf_quality_threshold?
+      tuning.low_quality_extra:0)+
+    (uncertaintyProxy>tuning.uncertainty_proxy_threshold?
+      tuning.high_uncertainty_extra:0):0;
   const threshold=legacyThreshold+addition;
   const gap=Math.abs(evB-evP);
   const skip=gap<threshold;
   return{version:VERSION,direction:skip?"SKIP":rawDirection,
     raw_direction:rawDirection,reason:skip?"small_ev_gap_or_uncertain":"relative_ev_gap_pass",
     threshold,gap,legacy_threshold:legacyThreshold,threshold_addition:addition,
-    moderate_entry_enabled:Boolean(enabled),uncertainty_proxy:uncertaintyProxy,
+    moderate_entry_enabled:Boolean(enabled),entry_profile:profile,
+    uncertainty_proxy:uncertaintyProxy,
     quality,ess_ratio:ess,ancestor_diversity:diversity,
     mc_gap_se:d.mc_gap_se,posterior_gap_spread:d.posterior_gap_spread,
     verified_edge:false,validated_hit_rate:false};
 }
-return{VERSION,MODERATE_ENTRY,decide};
+return{VERSION,ENTRY_PROFILES,ACTIVE_PROFILE,MODERATE_ENTRY,decide};
 });
