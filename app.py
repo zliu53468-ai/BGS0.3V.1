@@ -825,8 +825,8 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                 {"type": "text", "text": "4／5／6 張聯合模擬（診斷）",
                  "weight": "bold", "wrap": True, "color": "#272727"},
                 {"type": "text", "text": "當局 4／5／6 張：" + length_row(current) +
-                 "\\n下局 4／5／6 張：" + length_row(upcoming) +
-                 "\\n" + "\\n".join(joint_lines),
+                 "\n下局 4／5／6 張：" + length_row(upcoming) +
+                 "\n" + "\n".join(joint_lines),
                  "wrap": True, "size": "sm", "color": "#272727"},
                 {"type": "text", "text": "實際發牌張數未知；聯合模擬不影響 EV、推薦或觀望。",
                  "wrap": True, "size": "xs", "color": "#806A2A"},
