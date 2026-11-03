@@ -145,7 +145,7 @@ function simulate(counts,{samples=2048,seed=0x13877}={}){
     se_gap:seGap,draws_mean:expectedCards/samples,
     payout:{banker_win:.95,player_win:1,tie_push:true}};
 }
-function summarizeHypotheses(physics,_history,{samplesPerParticle=160}={}){
+function summarizeHypotheses(physics,_history,{samplesPerParticle=96}={}){
   if(!physics||!Array.isArray(physics.particles))throw Error("invalid_physics_particles");
   if(!Number.isInteger(samplesPerParticle)||samplesPerParticle<8||samplesPerParticle>1024)
     throw Error("invalid_shadow_sample_count");
@@ -340,7 +340,7 @@ function weightedContext(model,physical){
  * 不能偷看當前輸入開獎結果。B/P/T 盲估的高密度方向不等於 BET。
  */
 class PhysicsForecastFirstEngine{
-  constructor({simulationsPerParticle=160,observedSamples=12000,
+  constructor({simulationsPerParticle=96,observedSamples=12000,
     threshold=BASE_EV_GATE,lossGate=ONE_HAND_CUSHION,quantOptions={},
     independentFinalScoreMode=false}={}){
     if(!finite(threshold)||threshold<0||threshold>.5)throw Error("invalid_ev_gate");
