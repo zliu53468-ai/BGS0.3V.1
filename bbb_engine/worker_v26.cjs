@@ -7,6 +7,7 @@
  */
 const readline=require("node:readline");
 const {PhysicsForecastFirstEngine,VERSION}=require("./v26/physics_forecast_first_runtime.js");
+const mildGuard=require("./v26/point_signal_quality_guard.js");
 const SOURCE_COMMIT="a9e25b42d003f1a721007d6ae68127082ab86a29";
 const CONFIG=Object.freeze({
   threshold:.005,lossGate:.035,simulationsPerParticle:160,
@@ -33,10 +34,14 @@ function run(payload){
   if(!Number.isFinite(evB)||!Number.isFinite(evP)||
      report.physical_ev.simulation_exhausted)
     throw Error("physical_ev_unavailable");
-  const direction=evB>=evP?"B":"P";
+  const display=mildGuard.decide(report);
+  const rawDirection=evB>=evP?"B":"P";
+  if(display.raw_direction!==rawDirection)throw Error("mild_guard_unexpected_direction_flip");
+  const direction=display.direction;
   return {
     source_commit:SOURCE_COMMIT,version:VERSION,
     outcome,player,banker,direction,display_direction:direction,
+    raw_direction:rawDirection,display_signal:display,
     history_length:report.history_length,
     point_score_observation_count:report.point_score_observation_count,
     config:{N:fresh.quant.physics.size,L:384,M:fresh.simulationsPerParticle,
