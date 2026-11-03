@@ -1,6 +1,6 @@
 """Transport-only Python bridge for BBB V2.6 final-score independent mode.
 
-BBB V2.6 physics/EV formulas are preserved; the BGS-only PF runtime extends\nparticle and likelihood budgets. Unchanged JS modules still pin BBB Git blobs.
+Vendored JS modules are exact Git objects from BBB main a9e25b42.
 BGS user/session state and LINE credentials never enter the Node predictor.
 """
 from __future__ import annotations
@@ -22,13 +22,13 @@ ENGINE = ROOT / "bbb_engine"
 SOURCE_COMMIT = "a9e25b42d003f1a721007d6ae68127082ab86a29"
 VERSION = "BBB_PHYSICS_FORECAST_FIRST_V2_DYNAMIC_GATE"
 SOURCE_BLOBS = {
-    "quant256_online_runtime.js": "c317a7b58fedddf39e0c8adeffda128c0503a27c",
+    "quant256_online_runtime.js": "d8ef02cf7d09bd7bdbcbd7297a9193fdd872284f",
     "shoe_distribution_guard.js": "b7c34f045952e9ffe7883b670e0314565c557890",
     "markov_residual_runtime.js": "8fbee10200b067c5ef1ac4632e63b2ec18da2ab8",
     "physics_forecast_first_runtime.js": "52847b349de22684546f40bc5394156bc11c0b0a",
     "point_signal_quality_guard.js": "a83ffda959f038b474515a3206cbff718f74d260",
 }
-TIMEOUT_SECONDS = 15.0  # high-precision BGS-only PF1024/L1024/M512
+TIMEOUT_SECONDS = 9.0
 _LOCK = threading.RLock()
 _PROCESS: subprocess.Popen[bytes] | None = None
 _BUFFER = b""
@@ -97,7 +97,7 @@ def predict_final_score(player: int, banker: int) -> dict[str, Any]:
                     result.get("version") != VERSION):
                 raise RuntimeError("BBB V2.6 source/version mismatch")
             if result.get("config") != {
-                "N": 1024, "L": 1024, "M": 512,
+                "N": 256, "L": 384, "M": 160,
                 "ess_resampling_ratio": .5, "physics_weight": 5, "road_weight": .1,
                 "independentFinalScoreMode": True,
             }:
