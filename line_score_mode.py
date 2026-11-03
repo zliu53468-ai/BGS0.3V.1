@@ -17,11 +17,14 @@ from bbb_v26_points_runtime import predict_final_score
 _PAIR_PB = re.compile(r"^閒\s*[:=：]?\s*([0-9])\s*[,，/、\- ]*莊\s*[:=：]?\s*([0-9])$")
 _PAIR_BP = re.compile(r"^莊\s*[:=：]?\s*([0-9])\s*[,，/、\- ]*閒\s*[:=：]?\s*([0-9])$")
 _PAIR_BARE = re.compile(r"^([0-9])\s*[,，/、\- ]+\s*([0-9])$")
+# Exactly two digits: "53" means Player final 5, Banker final 3.
+# Require a full two-character match so access codes are not reinterpreted.
+_PAIR_COMPACT = re.compile(r"^([0-9])([0-9])$")
 _MAX_BATCH = 20
 
 
 def parse_score_pairs(value: str) -> list[dict[str, int]] | None:
-    """Left Player then Banker; accept one per line or a short historical batch.
+    """Left Player then Banker; accept compact "53", labeled, or delimited pairs.
 
     Return None for non-score commands (including unlock codes).
     """
@@ -41,7 +44,7 @@ def parse_score_pairs(value: str) -> list[dict[str, int]] | None:
             if match:
                 banker, player = map(int, match.groups())
             else:
-                match = _PAIR_BARE.fullmatch(chunk)
+                match = _PAIR_BARE.fullmatch(chunk) or _PAIR_COMPACT.fullmatch(chunk)
                 if not match:
                     return None
                 player, banker = map(int, match.groups())

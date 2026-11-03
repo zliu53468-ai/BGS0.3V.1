@@ -63,9 +63,16 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertEqual(line_score_mode.parse_score_pairs("閒8莊4"), [{"player": 8, "banker": 4}])
         self.assertEqual(line_score_mode.parse_score_pairs("莊4 閒8"), [{"player": 8, "banker": 4}])
         self.assertEqual(line_score_mode.parse_score_pairs("8,4"), [{"player": 8, "banker": 4}])
+        self.assertEqual(line_score_mode.parse_score_pairs("53"), [{"player": 5, "banker": 3}])
+        self.assertEqual(line_score_mode.parse_score_pairs("５３"), [{"player": 5, "banker": 3}])
+        self.assertEqual(line_score_mode.parse_score_pairs("09"), [{"player": 0, "banker": 9}])
+        self.assertEqual(line_score_mode.parse_score_pairs("53\n97"), [
+            {"player": 5, "banker": 3}, {"player": 9, "banker": 7}
+        ])
+
         self.assertEqual(line_score_mode.parse_score_pairs("閒9莊7\n閒8莊4"),
                          [{"player": 9, "banker": 7}, {"player": 8, "banker": 4}])
-        for bad in ("開始分析", "8", "10,9", "本局閒八莊九", "abc", "11223344"):
+        for bad in ("開始分析", "8", "10,9", "本局閒八莊九", "abc", "11223344", "0053", "1234"):
             self.assertIsNone(line_score_mode.parse_score_pairs(bad), bad)
 
     def test_two_UIDs_persist_separately_and_stale_run_cannot_commit(self):
@@ -107,18 +114,80 @@ class LineScoreV26Tests(unittest.TestCase):
                     line_score_mode.evaluate_and_save(
                         "UID-A", run_a, [{"player": 4, "banker": 3}], "stale-message")
 
-    def test_card_disables_manual_buttons_but_preserves_ocr_source(self):
+    def test_original_result_card_only_removes_manual_buttons(self):
+        """Exercise actual card builders without importing the FastAPI/OCR process."""
         source = (ROOT / "app.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        fns = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        card = ast.get_source_segment(source, fns["score_result_panel"])
-        self.assertIn('"end"', card)
-        self.assertNotIn('"road_append"', card)
-        self.assertIn('"觀望"', card)
+        fns = {
+            node.name: node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        # Compile only presentation functions, not the API, OCR or predictor.
+        from typing import Any, Dict, Mapping
+        api = {
+            "Any": Any, "Dict": Dict, "Mapping": Mapping,
+            "_postback_button": lambda label, action, **options:
+                {"label": label, "action": action, **options},
+            "_yellow_white_panel": lambda title, alt, contents:
+                {"title": title, "alt": alt, "body": contents},
+            "_format_money": lambda amount: format(int(amount), ","),
+            "point_input_panel": lambda session: {"title": "請輸入閒莊歷史點數"},
+        }
+        module = ast.Module(
+            body=[fns["screen_result_panel"], fns["score_result_panel"]],
+            type_ignores=[],
+        )
+        exec(compile(module, str(ROOT / "app.py"), "exec"), api)
+
+        def result_card(direction, point_mode=True):
+            pred = {
+                "bbb_v26_score": {"direction": direction},
+                "action": direction, "recommend": direction,
+                "banker_rate": 45.89, "player_rate": 44.93,
+                "tie_rate": 9.18,
+                "suggested_bet_amount": 0, "bet_percentage": 0,
+            }
+            session = {
+                "user_id": "UID-A", "venue": "DG", "bankroll": 30000,
+                "point_score_mode": point_mode,
+                "screen_last_prediction": pred,
+            }
+            return api["score_result_panel"](session) if point_mode else (
+                api["screen_result_panel"]("UID-A", session)
+            )
+
+        for direction, text in (("B", "莊"), ("P", "閒"), ("SKIP", "觀望")):
+            card = result_card(direction)
+            self.assertEqual(card["title"], "分析數據")
+            contents = card["body"]
+            self.assertEqual(contents[0]["contents"][1]["text"], "45.89%")
+            self.assertEqual(contents[1]["contents"][1]["text"], "44.93%")
+            self.assertEqual(contents[2]["contents"][1]["text"], "9.18%")
+            self.assertEqual(contents[3]["contents"][0]["text"], "推薦")
+            self.assertEqual(contents[3]["contents"][1]["text"], text)
+            self.assertIn("分析本金：30,000 元", contents[5]["text"])
+            buttons = contents[-1]["contents"]
+            self.assertEqual([button["action"] for button in buttons], ["end"])
+            self.assertEqual(buttons[0]["label"], "結束分析")
+
+        legacy = result_card("P", point_mode=False)
+        self.assertEqual(legacy["title"], "分析數據")
+        self.assertEqual(
+            [button["action"] for button in legacy["body"][-1]["contents"]],
+            ["road_append", "road_append", "road_append", "end"],
+            "Legacy/OCR card remains unchanged",
+        )
+
+        self.assertEqual(
+            api["score_result_panel"]({
+                "screen_last_prediction": {}, "point_score_mode": True
+            })["title"],
+            "請輸入閒莊歷史點數",
+        )
         self.assertIn('LINE_OCR_ENABLED = os.getenv("BGS_LINE_OCR_ENABLED", "0")', source)
         self.assertIn("if not LINE_OCR_ENABLED:", source)
         self.assertIn("def _process_screen_image_sync(", source)
-        self.assertIn("def _process_manual_outcome_via_reply(", source) if False else None
+        self.assertIn("def _process_manual_outcome_via_reply(", source)
 
 
 if __name__ == "__main__":
