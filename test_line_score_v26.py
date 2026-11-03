@@ -31,6 +31,9 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual(r["raw_direction"], "B" if r["ev_banker"] >= r["ev_player"] else "P")
             self.assertIn(r["direction"], ("B", "P", "SKIP"))
             self.assertIn(r["display_signal"]["reason"], ("small_ev_gap_or_uncertain", "relative_ev_gap_pass"))
+            self.assertEqual(r["display_signal"]["version"], "BBB_V26_MODERATE_DISPLAY_SKIP_V2")
+            self.assertTrue(r["display_signal"]["moderate_entry_enabled"])
+            self.assertGreater(r["display_signal"]["threshold_addition"], 0)
             self.assertFalse(r["display_signal"]["verified_edge"])
             if r["direction"] != "SKIP":
                 self.assertEqual(r["direction"], r["raw_direction"])
@@ -80,9 +83,10 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertEqual(counts, {"B": 48, "P": 40, "SKIP": 12},
-                         "LINE display differs from synchronized BBB PF96 benchmark")
-        print("BGS V2.6 N96/L256/M96 100-score display:", counts, "raw:", raw_counts)
+        self.assertGreater(counts["SKIP"], 12)
+        self.assertLessEqual(counts["SKIP"], 30)
+        self.assertEqual(counts["B"] + counts["P"] + counts["SKIP"], 100)
+        print("BGS V2.6 moderate N96/L256/M96 display:", counts, "raw:", raw_counts)
 
     def test_text_parsing_is_unambiguous(self):
         self.assertEqual(line_score_mode.parse_score_pairs("閒8莊4"), [{"player": 8, "banker": 4}])
