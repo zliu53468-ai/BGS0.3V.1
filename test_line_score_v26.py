@@ -28,7 +28,12 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual(r["history_length"], 1)
             self.assertEqual(r["point_score_observation_count"], 1)
             self.assertEqual(r["physical_ev"]["samples"], 40960)
-            self.assertEqual(r["direction"], "B" if r["ev_banker"] >= r["ev_player"] else "P")
+            self.assertEqual(r["raw_direction"], "B" if r["ev_banker"] >= r["ev_player"] else "P")
+            self.assertIn(r["direction"], ("B", "P", "SKIP"))
+            self.assertIn(r["display_signal"]["reason"], ("small_ev_gap_or_uncertain", "relative_ev_gap_pass"))
+            self.assertFalse(r["display_signal"]["verified_edge"])
+            if r["direction"] != "SKIP":
+                self.assertEqual(r["direction"], r["raw_direction"])
             self.assertEqual(r["early_shoe_guard"]["mode"], "independent_final_score_quality")
             self.assertEqual(r["action"], "SKIP")
             self.assertFalse(r["bet_allowed"])
@@ -42,12 +47,17 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertEqual(first, again)
 
     def test_all_100_pairs_match_bbb_v26_ci_distribution(self):
-        counts = {"B": 0, "P": 0}
+        counts = {"B": 0, "P": 0, "SKIP": 0}
+        raw_counts = {"B": 0, "P": 0}
         for player in range(10):
             for banker in range(10):
                 r = bridge.predict_final_score(player, banker)
                 counts[r["direction"]] += 1
-        self.assertEqual(counts, {"B": 60, "P": 40})
+                raw_counts[r["raw_direction"]] += 1
+                self.assertEqual(r["display_signal"]["raw_direction"], r["raw_direction"])
+        self.assertEqual(raw_counts, {"B": 60, "P": 40})
+        self.assertTrue(5 <= counts["SKIP"] <= 35, counts)
+        print("BGS V2.6 mild-SKIP 100-score display:", counts)
 
     def test_text_parsing_is_unambiguous(self):
         self.assertEqual(line_score_mode.parse_score_pairs("閒8莊4"), [{"player": 8, "banker": 4}])
@@ -104,6 +114,7 @@ class LineScoreV26Tests(unittest.TestCase):
         card = ast.get_source_segment(source, fns["score_result_panel"])
         self.assertIn('"end"', card)
         self.assertNotIn('"road_append"', card)
+        self.assertIn('"觀望"', card)
         self.assertIn('LINE_OCR_ENABLED = os.getenv("BGS_LINE_OCR_ENABLED", "0")', source)
         self.assertIn("if not LINE_OCR_ENABLED:", source)
         self.assertIn("def _process_screen_image_sync(", source)
