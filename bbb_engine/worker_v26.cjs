@@ -1,8 +1,8 @@
 "use strict";
 /**
  * BGS LINE final-score transport adapter to byte-for-byte BBB V2.6 source.
- * The same fresh PhysicsForecastFirstEngine(CONFIG) and syncHistory as
- * BBB's quant256_online_panel.js are used for every input pair.
+ * Same BBB V2.6 physics/EV formulas, quality guard and fresh one-score
+ * syncHistory as BBB, with BGS-only increased N/L/M sampling budgets.
  * No session, UID, LINE token, old shoe or OCR data enters the model.
  */
 const readline=require("node:readline");
@@ -10,8 +10,9 @@ const {PhysicsForecastFirstEngine,VERSION}=require("./v26/physics_forecast_first
 const mildGuard=require("./v26/point_signal_quality_guard.js");
 const SOURCE_COMMIT="a9e25b42d003f1a721007d6ae68127082ab86a29";
 const CONFIG=Object.freeze({
-  threshold:.005,lossGate:.035,simulationsPerParticle:160,
-  observedSamples:12000,quantOptions:{lambda:.82,alpha:.15,particles:256},
+  threshold:.005,lossGate:.035,simulationsPerParticle:512,
+  observedSamples:12000,quantOptions:{lambda:.82,alpha:.15,
+    particles:1024,likelihoodProposals:1024},
   independentFinalScoreMode:true
 });
 function validScore(v){return Number.isInteger(v)&&v>=0&&v<=9;}
@@ -24,7 +25,9 @@ function run(payload){
   const fresh=new PhysicsForecastFirstEngine(CONFIG);
   const report=fresh.syncHistory([outcome],[{player,banker}]);
   if(report.history_length!==1||report.point_score_observation_count!==1||
-     fresh.quant.physics.size!==256||report.physical_ev.samples!==40960)
+     fresh.quant.physics.size!==1024||
+     fresh.quant.physics.likelihoodProposals!==1024||
+     report.physical_ev.samples!==524288)
     throw Error("BBB_V26_independent_score_contract_mismatch");
   if(report.action!=="SKIP"||report.bet_allowed!==false)
     throw Error("unverified_final_score_must_not_be_BET");
@@ -44,7 +47,8 @@ function run(payload){
     raw_direction:rawDirection,display_signal:display,
     history_length:report.history_length,
     point_score_observation_count:report.point_score_observation_count,
-    config:{N:fresh.quant.physics.size,L:384,M:fresh.simulationsPerParticle,
+    config:{N:fresh.quant.physics.size,
+      L:fresh.quant.physics.likelihoodProposals,M:fresh.simulationsPerParticle,
       ess_resampling_ratio:.5,physics_weight:5,road_weight:.1,
       independentFinalScoreMode:true},
     ev_banker:evB,ev_player:evP,ev_gap:report.ev_gap,
