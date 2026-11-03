@@ -799,6 +799,19 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     percentage = float(prediction.get("bet_percentage", 0.0) or 0.0)
     bet_text = f"{_format_money(suggested)} 元（{percentage:.1f}%）" if suggested > 0 else f"0 元（{percentage:.1f}%）"
 
+    # Keep the exact legacy analysis card; point-score mode removes only the
+    # B/P/T manual-result buttons. Legacy screenshot UI remains unchanged.
+    point_score_card = bool(session.get("point_score_mode") and prediction.get("bbb_v26_score"))
+    result_buttons = (
+        [_postback_button("結束分析", "end", style="secondary")]
+        if point_score_card else [
+            _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
+            _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
+            _postback_button("🟢 本局結果：和", "road_append", color="#159447", result="T"),
+            _postback_button("結束本次分析", "end", style="secondary"),
+        ]
+    )
+
     return _yellow_white_panel("分析數據", f"BGS AI 下一局方向：{formal_text}", [
         {"type": "box", "layout": "horizontal", "contents": [
             {"type": "text", "text": "莊", "weight": "bold", "color": "#D52B2B", "flex": 1},
@@ -818,12 +831,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         ]},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
-        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
-            _postback_button("🔴 本局結果：莊", "road_append", color="#D52B2B", result="B"),
-            _postback_button("🔵 本局結果：閒", "road_append", color="#2667D8", result="P"),
-            _postback_button("🟢 本局結果：和", "road_append", color="#159447", result="T"),
-            _postback_button("結束本次分析", "end", style="secondary"),
-        ]},
+        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": result_buttons},
     ])
 
 
@@ -832,7 +840,7 @@ def point_input_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
     count = len(session.get("point_score_audit") or [])
     return _yellow_white_panel("請輸入閒莊歷史點數", "BGS V2.6：請輸入閒莊最終點數", [
         {"type": "text", "text": f"分析館別：{venue}\n已記錄 {count} 組點數（僅作該 UID 的操作紀錄）", "wrap": True, "color": "#3E3100"},
-        {"type": "text", "text": "請直接在 LINE 聊天室傳送：\n閒8莊4\n\n也可以輸入：8,4（左閒、右莊），或每行一組歷史點數。\n每次僅用最新一組最終點數獨立計算下一局；不共用其他用戶或前局粒子。", "wrap": True, "margin": "md", "color": "#272727"},
+        {"type": "text", "text": "請直接在 LINE 聊天室傳送：\n53（閒5點、莊3點）\n\n也可以輸入：閒5莊3 或 5,3（左閒、右莊），或每行一組歷史點數。\n每次僅用最新一組最終點數獨立計算下一局；不共用其他用戶或前局粒子。", "wrap": True, "margin": "md", "color": "#272727"},
         {"type": "text", "text": "最終 8／9 點可能包含第三張牌，不等於一定是天牌。模擬 EV 並非命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
         {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
             _postback_button("結束分析", "end", style="secondary"),
@@ -841,38 +849,16 @@ def point_input_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def score_result_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
+    """Render the ORIGINAL BGS 分析數據 card, suppressing only point-mode B/P/T buttons.
+
+    Prediction values and the BBB V2.6 decision remain untouched.
+    """
     prediction = dict(session.get("screen_last_prediction") or {})
-    result = dict(prediction.get("bbb_v26_score") or {})
-    if not result or result.get("direction") not in {"B", "P", "SKIP"}:
+    result = prediction.get("bbb_v26_score")
+    if not isinstance(result, dict) or result.get("direction") not in {"B", "P", "SKIP"}:
         return point_input_panel(session)
-    pair = dict(session.get("last_point_score") or {})
-    direction = result["direction"]
-    label = "觀望" if direction == "SKIP" else "莊" if direction == "B" else "閒"
-    p = dict(result.get("physical_ev", {}).get("simulated_probability") or {})
-    return _yellow_white_panel("BBB V2.6 下一局分析", f"BGS AI 下一局顯示訊號：{label}", [
-        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本局最終點數：閒 {pair.get('player', '-')} ／ 莊 {pair.get('banker', '-')}", "wrap": True, "color": "#3E3100"},
-        {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
-            {"type": "text", "text": "莊", "weight": "bold", "color": "#D52B2B", "flex": 1},
-            {"type": "text", "text": f"{float(p.get('B', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#D52B2B", "flex": 2},
-        ]},
-        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
-            {"type": "text", "text": "閒", "weight": "bold", "color": "#2667D8", "flex": 1},
-            {"type": "text", "text": f"{float(p.get('P', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#2667D8", "flex": 2},
-        ]},
-        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
-            {"type": "text", "text": "和", "weight": "bold", "color": "#159447", "flex": 1},
-            {"type": "text", "text": f"{float(p.get('T', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#159447", "flex": 2},
-        ]},
-        {"type": "box", "layout": "horizontal", "margin": "md", "backgroundColor": "#FFD400", "cornerRadius": "sm", "paddingAll": "10px", "contents": [
-            {"type": "text", "text": "下一局分析訊號", "weight": "bold", "wrap": True, "flex": 3, "color": "#272727"},
-            {"type": "text", "text": label, "weight": "bold", "size": "xl", "align": "end", "color": "#272727", "flex": 1},
-        ]},
-        {"type": "text", "text": f"模擬莊 EV：{float(result['ev_banker'])*100:+.2f}%\n模擬閒 EV：{float(result['ev_player'])*100:+.2f}%\nPF256／L384／M160｜自適應 Early-Shoe Guard", "wrap": True, "margin": "md", "color": "#3E3100"},
-        {"type": "text", "text": "弱 EV 差距時適度觀望；每次僅用一組最終點數的新粒子模型。非實測殘牌，並不保證正 EV 或命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
-        {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
-            _postback_button("結束分析", "end", style="secondary"),
-        ]},
-    ])
+    return screen_result_panel(str(session.get("user_id") or ""), session)
+
 
 def ended_panel() -> Dict[str, Any]:
     return guide_panel()
