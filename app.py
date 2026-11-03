@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import store
+import line_score_mode
 from predictor import run_virtual_round
 from screen_pipeline import analyze_game_screen
 from screenshot_predictor import predict_from_screenshot
@@ -100,6 +101,7 @@ IMAGE_MIN_REMAINING_FOR_MODEL = max(
     0.5,
     min(5.0, float(os.getenv("IMAGE_MIN_REMAINING_FOR_MODEL", "1.2") or "1.2")),
 )
+LINE_OCR_ENABLED = os.getenv("BGS_LINE_OCR_ENABLED", "0").strip() == "1"  # preserved, disabled by default
 LINE_IMAGE_IMMEDIATE_ACK = os.getenv("LINE_IMAGE_IMMEDIATE_ACK", "1").strip() == "1"
 LINE_IMAGE_PROCESSING_TIMEOUT = max(
     6.0,
@@ -668,7 +670,7 @@ def guide_panel() -> Dict[str, Any]:
     return _clean_flex({"type": "flex", "altText": "BGS AI預測系統使用指南", "contents": {"type": "bubble", "size": "mega", "body": {"type": "box", "layout": "vertical", "backgroundColor": "#FFFFFF", "paddingAll": "18px", "contents": [
         {"type": "text", "text": "BGS AI預測系統", "weight": "bold", "size": "xl", "color": "#3E3100"},
         {"type": "text", "text": "BGS AI 預測系統使用指南", "weight": "bold", "size": "xl", "margin": "sm", "color": "#3E3100"},
-        {"type": "text", "text": "📍 操作 3 步驟\n同桌號：請確保程式選擇與平台一致的桌號資訊。\n數據校正：先讓系統預測 3～5 顆，再開始下注。\n跟隨訊號：依程式顯示的下一局方向評估操作。", "wrap": True, "margin": "md", "color": "#3E3100"},
+        {"type": "text", "text": "📍 操作 3 步驟\n先選擇館別，再點擊開始分析。\n輸入當局閒、莊最終點數，例如：閒8莊4。\n系統以每次全新的 BBB V2.6 粒子模擬顯示下一局 EV 較高方向。", "wrap": True, "margin": "md", "color": "#3E3100"},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": "⚠️ 贏家 4 守則\n專屬平台：僅限配合平台使用，非合作平台數據會產生誤差。\n資金規劃：請將本金分成 20～30 等份，穩定下注。\n紀律停利：每次獲利達標即離場，科學下注、不戀戰。\n裝置綁定：程式已與您的 LINE 帳號綁定，無法轉借他人或跨裝置使用。", "wrap": True, "margin": "md", "color": "#3E3100"},
         {"type": "box", "layout": "vertical", "margin": "lg", "contents": [_postback_button("開始分析", "start_guide", color="#FFD400")]},
@@ -680,9 +682,12 @@ def selected_venue_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
     return _yellow_white_panel("館別選擇完成", f"已選擇：{venue_name}", [
         {"type": "text", "text": f"目前選擇：{venue_name}", "wrap": True, "color": "#272727"},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
-        {"type": "text", "text": "下一步請輸入本次分析本金，系統會依正式訊號提供配置建議。", "wrap": True, "margin": "md", "color": "#3E3100"},
+        {"type": "text", "text": "請點擊「開始分析」建立您個人 UID 的獨立分析。\n接著直接輸入閒、莊最終點數，不需要上傳圖片。", "wrap": True, "margin": "md", "color": "#3E3100"},
+        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+            _postback_button("開始分析", "start_screen"),
+            _postback_button("重新選擇館別", "venues", style="secondary"),
+        ]},
     ])
-
 
 def venue_panel(user_id: str) -> Dict[str, Any]:
     del user_id
@@ -701,15 +706,15 @@ def manual_result_received_panel(outcome: str) -> Dict[str, Any]:
 def ready_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     del user_id
     venue = _venue_name(str(session.get("venue") or ""))
-    bankroll = int(session.get("bankroll", 0) or 0)
-    bankroll_text = f"{_format_money(bankroll)} 元" if bankroll > 0 else "尚未設定"
     body = {"type": "box", "layout": "vertical", "backgroundColor": "#FFF4B8", "paddingAll": "18px", "contents": [
         {"type": "text", "text": "BGS AI預測系統", "weight": "bold", "size": "xl", "color": "#7B5600"},
-        {"type": "text", "text": f"分析館別：{venue}\n資金設定：{bankroll_text}\n\n選擇館別後請設定本金，再上傳最新完整遊戲畫面。首次辨識完成後，每局只需回報莊／閒／和。", "wrap": True, "margin": "md", "color": "#4C3900"},
-        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [_postback_button("開始牌局分析", "start_screen"), _postback_button("設定／調整本金", "change_bankroll", color="#E29B19"), _postback_button("重新選擇館別", "venues", style="secondary")]},
+        {"type": "text", "text": f"分析館別：{venue}\n請點擊「開始分析」，輸入閒／莊最終點數，例如：閒8莊4。\n圖片 OCR 暫時停用；每位 UID 的分析互不共用。", "wrap": True, "margin": "md", "color": "#4C3900"},
+        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": [
+            _postback_button("開始分析", "start_screen"),
+            _postback_button("重新選擇館別", "venues", style="secondary"),
+        ]},
     ]}
     return _clean_flex({"type": "flex", "altText": "BGS AI預測系統", "contents": {"type": "bubble", "size": "mega", "body": body}})
-
 
 def bankroll_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     del user_id
@@ -821,6 +826,53 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         ]},
     ])
 
+
+def point_input_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
+    venue = _venue_name(str(session.get("venue") or ""))
+    count = len(session.get("point_score_audit") or [])
+    return _yellow_white_panel("請輸入閒莊歷史點數", "BGS V2.6：請輸入閒莊最終點數", [
+        {"type": "text", "text": f"分析館別：{venue}\n已記錄 {count} 組點數（僅作該 UID 的操作紀錄）", "wrap": True, "color": "#3E3100"},
+        {"type": "text", "text": "請直接在 LINE 聊天室傳送：\n閒8莊4\n\n也可以輸入：8,4（左閒、右莊），或每行一組歷史點數。\n每次僅用最新一組最終點數獨立計算下一局；不共用其他用戶或前局粒子。", "wrap": True, "margin": "md", "color": "#272727"},
+        {"type": "text", "text": "最終 8／9 點可能包含第三張牌，不等於一定是天牌。模擬 EV 並非命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
+        {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
+            _postback_button("結束分析", "end", style="secondary"),
+        ]},
+    ])
+
+
+def score_result_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
+    prediction = dict(session.get("screen_last_prediction") or {})
+    result = dict(prediction.get("bbb_v26_score") or {})
+    if not result or result.get("direction") not in {"B", "P"}:
+        return point_input_panel(session)
+    pair = dict(session.get("last_point_score") or {})
+    direction = result["direction"]
+    label = "莊" if direction == "B" else "閒"
+    p = dict(result.get("physical_ev", {}).get("simulated_probability") or {})
+    return _yellow_white_panel("BBB V2.6 下一局分析", f"BGS AI 模擬 EV 較高方向：{label}", [
+        {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本局最終點數：閒 {pair.get('player', '-')} ／ 莊 {pair.get('banker', '-')}", "wrap": True, "color": "#3E3100"},
+        {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
+            {"type": "text", "text": "莊", "weight": "bold", "color": "#D52B2B", "flex": 1},
+            {"type": "text", "text": f"{float(p.get('B', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#D52B2B", "flex": 2},
+        ]},
+        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+            {"type": "text", "text": "閒", "weight": "bold", "color": "#2667D8", "flex": 1},
+            {"type": "text", "text": f"{float(p.get('P', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#2667D8", "flex": 2},
+        ]},
+        {"type": "box", "layout": "horizontal", "margin": "sm", "contents": [
+            {"type": "text", "text": "和", "weight": "bold", "color": "#159447", "flex": 1},
+            {"type": "text", "text": f"{float(p.get('T', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#159447", "flex": 2},
+        ]},
+        {"type": "box", "layout": "horizontal", "margin": "md", "backgroundColor": "#FFD400", "cornerRadius": "sm", "paddingAll": "10px", "contents": [
+            {"type": "text", "text": "下一局 EV 較高方向", "weight": "bold", "wrap": True, "flex": 3, "color": "#272727"},
+            {"type": "text", "text": label, "weight": "bold", "size": "xl", "align": "end", "color": "#272727", "flex": 1},
+        ]},
+        {"type": "text", "text": f"模擬莊 EV：{float(result['ev_banker'])*100:+.2f}%\n模擬閒 EV：{float(result['ev_player'])*100:+.2f}%\nPF256／L384／M160｜自適應 Early-Shoe Guard", "wrap": True, "margin": "md", "color": "#3E3100"},
+        {"type": "text", "text": "每次僅用一組最終點數的新粒子模型；如需繼續可直接輸入下一組點數。非實測殘牌，並不保證正 EV 或命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
+        {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
+            _postback_button("結束分析", "end", style="secondary"),
+        ]},
+    ])
 
 def ended_panel() -> Dict[str, Any]:
     return guide_panel()
@@ -950,12 +1002,11 @@ def _start_screen_flow(user_id: str, *, new_session: bool = True) -> Dict[str, A
     session = store.get_session(user_id)
     if not session.get("venue"):
         return {"panel": venue_panel(user_id), "state": "venue"}
-    session = _start_new_uid_analysis(user_id) if new_session else store.begin_screen_analysis(user_id, clear_existing=False)
-    if int(session.get("bankroll", 0) or 0) <= 0:
-        session = _request_bankroll(user_id)
-        return {"panel": bankroll_panel(user_id, session), "state": "bankroll"}
-    return {"panel": upload_request_panel(user_id, session), "state": "image"}
-
+    if new_session or not (
+        session.get("analysis_active") and session.get("point_score_mode")
+    ):
+        session = line_score_mode.begin(user_id)
+    return {"panel": point_input_panel(session), "state": "points"}
 
 def _process_screen_image_sync(user_id: str, message_id: str, expected_run_id: str, cancel_event: threading.Event, deadline: float) -> List[Dict[str, Any]]:
     temporary_image: Optional[Path] = None
@@ -1139,6 +1190,39 @@ async def _process_screen_image_background(
         max_retries=1,
     )
 
+
+async def _process_score_via_reply(token: str, user_id: str,
+                                  pairs: List[Dict[str, int]], expected_run_id: str,
+                                  message_id: str) -> bool:
+    def compute() -> Dict[str, Any]:
+        operation_lock = _user_image_lock(user_id)
+        if not operation_lock.acquire(timeout=3.0):
+            raise TimeoutError("同一 UID 的上一筆分析尚未完成。")
+        try:
+            _ensure_access(user_id)
+            acquired = _PREDICTION_SLOTS.acquire(timeout=5.0)
+            if not acquired:
+                raise TimeoutError("目前分析人數較多，請再試一次。")
+            try:
+                return line_score_mode.evaluate_and_save(
+                    user_id, expected_run_id, pairs, message_id
+                )
+            finally:
+                _PREDICTION_SLOTS.release()
+        finally:
+            operation_lock.release()
+    try:
+        session = await asyncio.wait_for(
+            asyncio.to_thread(compute), timeout=18.0
+        )
+        return await asyncio.to_thread(_reply, token, [score_result_panel(session)])
+    except AccessExpiredError:
+        return await asyncio.to_thread(_reply, token, [_text("試用已到期，請聯繫管理員開通。")])
+    except (asyncio.TimeoutError, TimeoutError):
+        return await asyncio.to_thread(_reply, token, [_text("點數運算逾時，未確認完成，請重新輸入相同點數。")])
+    except Exception as exc:
+        traceback.print_exc()
+        return await asyncio.to_thread(_reply, token, [_text(f"點數分析失敗：{exc}")])
 
 async def _process_manual_outcome_via_reply(token: str, user_id: str, outcome: str, expected_run_id: str) -> bool:
     uid_tail = str(user_id or "")[-8:]
@@ -1475,6 +1559,14 @@ async def webhook(request: Request) -> JSONResponse:
                 _reply(token, [guide_panel()])
                 continue
             if event_type == "message" and message_type == "image":
+                if not LINE_OCR_ENABLED:
+                    current = store.get_session(user_id)
+                    reply_panel = (point_input_panel(current) if
+                        current.get("analysis_active") and current.get("point_score_mode")
+                        else ready_panel(user_id, current) if current.get("venue")
+                        else venue_panel(user_id))
+                    _reply(token, [_text("目前已停用圖片 OCR，請改用文字輸入閒莊最終點數，例如：閒8莊4。"), reply_panel])
+                    continue
                 _ensure_access(user_id)
                 session = store.get_session(user_id)
                 if not session.get("venue"):
@@ -1542,6 +1634,20 @@ async def webhook(request: Request) -> JSONResponse:
                     _reply(token, [_text("BGS AI預測系統版本：10.7.0\n" f"永久碼載入數：{len(PERMANENT_CODES)}\n" f"aaa1888007 已載入：{'是' if 'aaa1888007' in PERMANENT_CODES else '否'}")])
                     continue
                 session = store.get_session(user_id)
+                score_pairs = line_score_mode.parse_score_pairs(text)
+                if score_pairs is not None:
+                    if not (session.get("analysis_active") and session.get("point_score_mode")):
+                        _reply(token, [_text("請先選館並點擊「開始分析」，再輸入閒莊點數。"), ready_panel(user_id, session) if session.get("venue") else venue_panel(user_id)])
+                    else:
+                        await _process_score_via_reply(
+                            token, user_id, score_pairs,
+                            str(session.get("analysis_run_id") or ""),
+                            str(message.get("id") or ""),
+                        )
+                    continue
+                if session.get("analysis_active") and session.get("point_score_mode") and text in {"莊", "閒", "和", "🔴 本局：莊", "🔵 本局：閒", "🟢 本局：和"}:
+                    _reply(token, [_text("請輸入閒、莊兩邊最終點數，例如：閒8莊4，而不是只輸入莊／閒。"), point_input_panel(session)])
+                    continue
                 bankroll_command = bool(re.fullmatch(r"(?:本金|金額|資金)\s*[:：=]?\s*[0-9,，＄$ ]+", text, flags=re.IGNORECASE))
                 if bool(session.get("awaiting_bankroll")) or bankroll_command:
                     try:
@@ -1580,14 +1686,14 @@ async def webhook(request: Request) -> JSONResponse:
                     _reply(token, [venue_panel(user_id)])
                     continue
                 if text in {"開始分析"}:
-                    _reply(token, [venue_panel(user_id)])
-                    continue
-                if text in {"上傳圖片", "圖片辨識", "路紙", "路單"}:
-                    result = _start_screen_flow(user_id, new_session=False)
+                    result = _start_screen_flow(user_id, new_session=True)
                     _reply(token, [result["panel"]])
                     continue
+                if text in {"上傳圖片", "圖片辨識", "路紙", "路單"}:
+                    _reply(token, [_text("圖片 OCR 已停用，請改輸入閒莊最終點數。"), point_input_panel(session) if session.get("analysis_active") and session.get("point_score_mode") else ready_panel(user_id, session) if session.get("venue") else venue_panel(user_id)])
+                    continue
                 if text in {"繼續分析"}:
-                    _reply(token, [_text("首次圖片完成後，請直接按「本局結果：莊」或「本局結果：閒」。")])
+                    _reply(token, [point_input_panel(session) if session.get("analysis_active") and session.get("point_score_mode") else ready_panel(user_id, session) if session.get("venue") else venue_panel(user_id)])
                     continue
                 if text in {"更改本金", "設定本金", "本金", "金額", "資金"}:
                     session = _request_bankroll(user_id)
@@ -1597,8 +1703,10 @@ async def webhook(request: Request) -> JSONResponse:
                     _end_uid_analysis(user_id)
                     _reply(token, [ended_panel()])
                     continue
-                if session.get("awaiting_screenshot"):
-                    _reply(token, [_text("目前正在等待圖片，請直接上傳最新完整遊戲畫面。")])
+                if session.get("analysis_active") and session.get("point_score_mode"):
+                    _reply(token, [point_input_panel(session)])
+                elif session.get("awaiting_screenshot"):
+                    _reply(token, [_text("圖片 OCR 已停用，請重新開始點數分析。")])
                 elif session.get("venue"):
                     _reply(token, [ready_panel(user_id, session)])
                 else:
@@ -1610,6 +1718,10 @@ async def webhook(request: Request) -> JSONResponse:
                 if action_name == "start_guide":
                     _reply(token, [venue_panel(user_id)])
                 elif action_name == "road_append":
+                    old_session = store.get_session(user_id)
+                    if old_session.get("analysis_active") and old_session.get("point_score_mode"):
+                        _reply(token, [_text("手動莊／閒按鈕已停用，請直接輸入閒莊最終點數。"), point_input_panel(old_session)])
+                        continue
                     value = str(query.get("result") or "").upper()
                     if value not in {"B", "P", "T"}:
                         raise ValueError("手動牌局結果不正確。")
@@ -1629,8 +1741,7 @@ async def webhook(request: Request) -> JSONResponse:
                     if venue not in VENUE_BY_CODE:
                         raise ValueError("無效館別")
                     session = store.select_venue(user_id, venue, str(query.get("room") or "1"))
-                    session = _request_bankroll(user_id)
-                    _reply(token, [selected_venue_panel(session), bankroll_panel(user_id, session)])
+                    _reply(token, [selected_venue_panel(session)])
                 elif action_name in {"start_screen", "restart_screen"}:
                     result = _start_screen_flow(user_id, new_session=True)
                     _reply(token, [result["panel"]])
