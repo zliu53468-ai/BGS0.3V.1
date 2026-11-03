@@ -817,9 +817,9 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                 "type": "text",
                 "text": (
                     "V4 觀望篩選：" + ("通過" if passed else "未通過（觀望）") +
-                    f"\\n實際 EV 差距：{float(gap) * 100:.3f}%"
+                    f"\n實際 EV 差距：{float(gap) * 100:.3f}%"
                     f"｜觀望門檻：{float(threshold) * 100:.3f}%"
-                    "\\n僅為模擬訊號篩選，不代表實際命中率"
+                    "\n僅為模擬訊號篩選，不代表實際命中率"
                 ),
                 "wrap": True, "size": "sm", "margin": "md", "color": "#272727",
             }]
