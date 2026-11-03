@@ -63,7 +63,7 @@ def _request(history: list[str], scope: str) -> dict[str, Any]:
                 _node_command() + [str(ENGINE / "worker_v2.cjs")],
                 cwd=str(ROOT),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, bufsize=0,
+                stderr=subprocess.PIPE, bufsize=0,
             )
         proc = _PROCESS
         if proc.stdin is None or proc.stdout is None:
@@ -84,7 +84,8 @@ def _request(history: list[str], scope: str) -> dict[str, Any]:
                     raise TimeoutError("BBB V2 prediction exceeded LINE time budget")
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
-                    raise RuntimeError("BBB V2 worker exited")
+                    err = proc.stderr.read(500) if proc.stderr else b""
+                    raise RuntimeError("BBB V2 worker exited: " + err.decode("utf-8", "replace")[:350])
                 _BUFFER += chunk
                 if len(_BUFFER) > 1_000_000:
                     raise RuntimeError("BBB V2 response is too large")
