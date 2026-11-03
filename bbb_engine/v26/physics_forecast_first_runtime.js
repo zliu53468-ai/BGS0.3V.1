@@ -164,14 +164,35 @@ function summarizeHypotheses(physics,_history,{samplesPerParticle=96}={}){
   if(!n||mass<=0||physics.posteriorUnavailable)
     return{...baselineResult(),particle_support:0,simulation_exhausted:true};
   const weights=rawWeights.map(w=>w/mass);
+  // Diagnostics only: in an independent one-score update, each particle is
+  // exactly one *hypothetical* hand away from the fresh 416-card shoe.
+  // Its 4/5/6-card consumption is therefore recoverable without extra RNG.
+  const lengths=[4,5,6];
+  const drawLengthEligible=Array.isArray(_history)&&_history.length===1&&
+    physics.lastPointConditioned===true&&
+    validParticles.every(counts=>lengths.includes(416-sum(counts)));
+  const emptyLengths=()=>({4:0,5:0,6:0});
+  const currentLengthProb=emptyLengths(),nextLengthProb=emptyLengths();
+  const jointProb={4:emptyLengths(),5:emptyLengths(),6:emptyLengths()};
+  const resultByNextLength={
+    4:{B:0,P:0,T:0},5:{B:0,P:0,T:0},6:{B:0,P:0,T:0}
+  };
   const stableSeed=hashComposition(validParticles);
   const estimates=[];
   for(let i=0;i<validParticles.length;i++){
     const counts=validParticles[i],rng=seeded(stableSeed^Math.imul(i+1,2654435761));
     const tally={B:0,P:0,T:0};let draws=0;
+    const currentLength=drawLengthEligible?416-sum(counts):null;
+    if(drawLengthEligible)currentLengthProb[currentLength]+=weights[i];
     for(let j=0;j<samplesPerParticle;j++){
       const result=deal(counts,rng);
       tally[result.outcome]++;draws+=result.cards.length;
+      if(drawLengthEligible){
+        const nextLength=result.cards.length,w=weights[i]/samplesPerParticle;
+        jointProb[currentLength][nextLength]+=w;
+        nextLengthProb[nextLength]+=w;
+        resultByNextLength[nextLength][result.outcome]+=w;
+      }
     }
     const b=tally.B/samplesPerParticle,p=tally.P/samplesPerParticle;
     const gap=1.95*b-2*p;
@@ -191,6 +212,20 @@ function summarizeHypotheses(physics,_history,{samplesPerParticle=96}={}){
   const posteriorVariance=estimates.reduce((v,e,i)=>
     v+weights[i]*(e.gap-gap)**2,0);
   const mcStd=Math.sqrt(mcVariance),hypothesisSpread=Math.sqrt(posteriorVariance);
+  // Both hands use the SAME posterior / next-deal samples as the existing EV.
+  // These are model-based virtual lengths, NOT observed card counts.
+  const drawLengthDiagnostics=drawLengthEligible?{
+    version:"BBB_V26_TWO_HAND_DRAW_LENGTH_V1",
+    current_length_probability:currentLengthProb,
+    next_length_probability:nextLengthProb,
+    joint_probability:jointProb,
+    next_outcome_given_length:Object.fromEntries(lengths.map(k=>[
+      k,nextLengthProb[k]>0?Object.fromEntries(["B","P","T"].map(o=>[
+        o,resultByNextLength[k][o]/nextLengthProb[k]])):null
+    ])),
+    samples:n,actual_current_length_known:false,
+    diagnostic_only:true,affects_ev_or_direction:false
+  }:null;
   return{remaining:validParticles.reduce((v,c,i)=>v+weights[i]*sum(c),0),
     samples:n,particle_support:validParticles.length,
     simulated_probability:prob,ev_banker:evB,ev_player:evP,
@@ -198,6 +233,7 @@ function summarizeHypotheses(physics,_history,{samplesPerParticle=96}={}){
     se_gap:Math.sqrt(mcVariance+posteriorVariance),
     mc_se_gap:mcStd,
     posterior_sd_gap:hypothesisSpread,
+    draw_length_diagnostics:drawLengthDiagnostics,
     // Diagnostics only. MC interval conditions on the sampled hypothesis
     // mixture; it is NOT a calibrated confidence interval for real outcomes.
     ev_uncertainty_diagnostics:{

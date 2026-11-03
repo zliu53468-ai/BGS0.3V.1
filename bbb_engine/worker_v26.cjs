@@ -57,7 +57,8 @@ function run(payload){
       samples:report.physical_ev.samples,
       posterior_update_ess:report.physical_ev.posterior_update_ess,
       mc_se_gap:report.physical_ev.mc_se_gap,
-      posterior_sd_gap:report.physical_ev.posterior_sd_gap
+      posterior_sd_gap:report.physical_ev.posterior_sd_gap,
+      draw_length_diagnostics:report.physical_ev.draw_length_diagnostics
     },
     action:report.action,bet_allowed:false,proxy_only:true,validated_edge:false,
     final_scores_are_observed_ranks:false

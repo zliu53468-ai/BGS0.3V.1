@@ -52,6 +52,26 @@ class LineScoreV26Tests(unittest.TestCase):
         for player in range(10):
             for banker in range(10):
                 r = bridge.predict_final_score(player, banker)
+                draw = r["physical_ev"]["draw_length_diagnostics"]
+                self.assertEqual(draw["version"], "BBB_V26_TWO_HAND_DRAW_LENGTH_V1")
+                self.assertTrue(draw["diagnostic_only"])
+                self.assertFalse(draw["actual_current_length_known"])
+                self.assertFalse(draw["affects_ev_or_direction"])
+                self.assertEqual(draw["samples"], 9216)
+                self.assertAlmostEqual(sum(draw["current_length_probability"].values()), 1, places=9)
+                self.assertAlmostEqual(sum(draw["next_length_probability"].values()), 1, places=9)
+                self.assertAlmostEqual(sum(
+                    value for row in draw["joint_probability"].values()
+                    for value in row.values()), 1, places=9)
+                for current in ("4", "5", "6"):
+                    self.assertAlmostEqual(
+                        sum(draw["joint_probability"][current].values()),
+                        draw["current_length_probability"][current], places=9)
+                for upcoming in ("4", "5", "6"):
+                    self.assertAlmostEqual(
+                        sum(draw["joint_probability"][current][upcoming]
+                            for current in ("4", "5", "6")),
+                        draw["next_length_probability"][upcoming], places=9)
                 counts[r["direction"]] += 1
                 raw_counts[r["raw_direction"]] += 1
                 self.assertEqual(r["display_signal"]["raw_direction"], r["raw_direction"])
@@ -144,9 +164,12 @@ class LineScoreV26Tests(unittest.TestCase):
         )
         exec(compile(module, str(ROOT / "app.py"), "exec"), api)
 
-        def result_card(direction, point_mode=True):
+        def result_card(direction, point_mode=True, diagnostic=None):
+            result = {"direction": direction}
+            if diagnostic is not None:
+                result["physical_ev"] = {"draw_length_diagnostics": diagnostic}
             pred = {
-                "bbb_v26_score": {"direction": direction},
+                "bbb_v26_score": result,
                 "action": direction, "recommend": direction,
                 "banker_rate": 45.89, "player_rate": 44.93,
                 "tie_rate": 9.18,
@@ -175,6 +198,13 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual([button["action"] for button in buttons], ["end"])
             self.assertEqual(buttons[0]["label"], "結束分析")
 
+        diag = bridge.predict_final_score(5, 3)["physical_ev"]["draw_length_diagnostics"]
+        detailed = result_card("B", diagnostic=diag)
+        labels = [row.get("text", "") for row in detailed["body"]]
+        self.assertIn("4／5／6 張聯合模擬（診斷）", labels)
+        self.assertTrue(any("當局 4 張 → 下局 4／5／6 張" in label for label in labels))
+        self.assertEqual(detailed["body"][-1]["contents"][0]["action"], "end")
+        self.assertEqual(detailed["body"][3]["contents"][1]["text"], "莊")
         legacy = result_card("P", point_mode=False)
         self.assertEqual(legacy["title"], "分析數據")
         self.assertEqual(
