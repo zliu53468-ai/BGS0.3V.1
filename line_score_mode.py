@@ -102,15 +102,15 @@ def evaluate_and_save(uid: str, expected_run_id: str,
     last = pairs[-1]
     report = predict_final_score(last["player"], last["banker"])
     direction = report["direction"]
-    if direction not in ("B", "P") or report["action"] != "SKIP":
+    if direction not in ("B", "P", "SKIP") or report["action"] != "SKIP":
         raise RuntimeError("BBB V2.6 unverified point display contract changed")
     probs = report["physical_ev"]["simulated_probability"]
     prediction = {
         "engine": "BBB_V26_INDEPENDENT_FINAL_SCORE",
         "bbb_v26_score": report,
         "action": direction, "recommend": direction, "direction": direction,
-        "action_text": "莊" if direction == "B" else "閒",
-        "recommend_text": "莊" if direction == "B" else "閒",
+        "action_text": "觀望" if direction == "SKIP" else "莊" if direction == "B" else "閒",
+        "recommend_text": "觀望" if direction == "SKIP" else "莊" if direction == "B" else "閒",
         "banker_rate": float(probs["B"]) * 100.0,
         "player_rate": float(probs["P"]) * 100.0,
         "tie_rate": float(probs["T"]) * 100.0,

@@ -23,6 +23,7 @@ jobs:
           python -m nodejs_wheel --check bbb_engine/v26/shoe_distribution_guard.js
           python -m nodejs_wheel --check bbb_engine/v26/markov_residual_runtime.js
           python -m nodejs_wheel --check bbb_engine/v26/physics_forecast_first_runtime.js
+          python -m nodejs_wheel --check bbb_engine/v26/point_signal_quality_guard.js
           python -m nodejs_wheel --check bbb_engine/worker_v26.cjs
       - name: BBB V2.6 LINE 100-score parity and per-UID isolation
         run: python -m unittest -v test_line_score_v26.py

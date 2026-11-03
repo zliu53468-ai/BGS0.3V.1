@@ -843,13 +843,13 @@ def point_input_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
 def score_result_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
     prediction = dict(session.get("screen_last_prediction") or {})
     result = dict(prediction.get("bbb_v26_score") or {})
-    if not result or result.get("direction") not in {"B", "P"}:
+    if not result or result.get("direction") not in {"B", "P", "SKIP"}:
         return point_input_panel(session)
     pair = dict(session.get("last_point_score") or {})
     direction = result["direction"]
-    label = "莊" if direction == "B" else "閒"
+    label = "觀望" if direction == "SKIP" else "莊" if direction == "B" else "閒"
     p = dict(result.get("physical_ev", {}).get("simulated_probability") or {})
-    return _yellow_white_panel("BBB V2.6 下一局分析", f"BGS AI 模擬 EV 較高方向：{label}", [
+    return _yellow_white_panel("BBB V2.6 下一局分析", f"BGS AI 下一局顯示訊號：{label}", [
         {"type": "text", "text": f"館別：{_venue_name(str(session.get('venue') or ''))}\n本局最終點數：閒 {pair.get('player', '-')} ／ 莊 {pair.get('banker', '-')}", "wrap": True, "color": "#3E3100"},
         {"type": "box", "layout": "horizontal", "margin": "md", "contents": [
             {"type": "text", "text": "莊", "weight": "bold", "color": "#D52B2B", "flex": 1},
@@ -864,11 +864,11 @@ def score_result_panel(session: Mapping[str, Any]) -> Dict[str, Any]:
             {"type": "text", "text": f"{float(p.get('T', 0))*100:.2f}%", "weight": "bold", "align": "end", "color": "#159447", "flex": 2},
         ]},
         {"type": "box", "layout": "horizontal", "margin": "md", "backgroundColor": "#FFD400", "cornerRadius": "sm", "paddingAll": "10px", "contents": [
-            {"type": "text", "text": "下一局 EV 較高方向", "weight": "bold", "wrap": True, "flex": 3, "color": "#272727"},
+            {"type": "text", "text": "下一局分析訊號", "weight": "bold", "wrap": True, "flex": 3, "color": "#272727"},
             {"type": "text", "text": label, "weight": "bold", "size": "xl", "align": "end", "color": "#272727", "flex": 1},
         ]},
         {"type": "text", "text": f"模擬莊 EV：{float(result['ev_banker'])*100:+.2f}%\n模擬閒 EV：{float(result['ev_player'])*100:+.2f}%\nPF256／L384／M160｜自適應 Early-Shoe Guard", "wrap": True, "margin": "md", "color": "#3E3100"},
-        {"type": "text", "text": "每次僅用一組最終點數的新粒子模型；如需繼續可直接輸入下一組點數。非實測殘牌，並不保證正 EV 或命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
+        {"type": "text", "text": "弱 EV 差距時適度觀望；每次僅用一組最終點數的新粒子模型。非實測殘牌，並不保證正 EV 或命中率。", "wrap": True, "size": "xs", "margin": "md", "color": "#806A2A"},
         {"type": "box", "layout": "vertical", "margin": "lg", "contents": [
             _postback_button("結束分析", "end", style="secondary"),
         ]},
