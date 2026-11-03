@@ -51,7 +51,7 @@ function run(input){
 const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity});
 rl.on("line",line=>{
   let payload;
-  try{payload={ok:true,result:run(JSON.parse(line));}}
+  try{payload={ok:true,result:run(JSON.parse(line))};}
   catch(error){payload={ok:false,error:String(error?.message||error).slice(0,200)};}
   process.stdout.write(JSON.stringify(payload)+"\n");
 });
