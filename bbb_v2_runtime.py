@@ -37,7 +37,7 @@ def verify_source() -> None:
     """Compare Git object hashes against the BBB merge's exact source blobs."""
     for name, expected in SOURCE_BLOBS.items():
         payload = (ENGINE / name).read_bytes()
-        git_blob = sha1(b"blob " + str(len(payload)).encode() + b"\\0" + payload).hexdigest()
+        git_blob = sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
         if git_blob != expected:
             raise RuntimeError("BBB V2 source blob hash mismatch: " + name)
 
@@ -72,10 +72,10 @@ def _request(history: list[str], scope: str) -> dict[str, Any]:
         try:
             payload = json.dumps({"history": history, "scope": scope},
                                  ensure_ascii=True, separators=(",", ":"))
-            proc.stdin.write((payload + "\\n").encode("utf-8"))
+            proc.stdin.write((payload + "\n").encode("utf-8"))
             proc.stdin.flush()
             deadline = time.monotonic() + TIMEOUT_SECONDS
-            while b"\\n" not in _BUFFER:
+            while b"\n" not in _BUFFER:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("BBB V2 prediction exceeded LINE time budget")
@@ -88,7 +88,7 @@ def _request(history: list[str], scope: str) -> dict[str, Any]:
                 _BUFFER += chunk
                 if len(_BUFFER) > 1_000_000:
                     raise RuntimeError("BBB V2 response is too large")
-            raw, _BUFFER = _BUFFER.split(b"\\n", 1)
+            raw, _BUFFER = _BUFFER.split(b"\n", 1)
             response = json.loads(raw)
             if not response.get("ok"):
                 raise RuntimeError("BBB V2: " + str(response.get("error", "unknown")))
