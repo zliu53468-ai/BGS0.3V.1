@@ -49,22 +49,25 @@ class BBBFinal57RuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(final["final_p_b"], final["probability_bounds"]["min"])
         self.assertLessEqual(final["final_p_b"], final["probability_bounds"]["max"])
 
-    def test_public_predictor_uses_final57(self) -> None:
+    def test_public_predictor_uses_current_v2_not_legacy_final57(self) -> None:
+        # Final57 standalone parity is still tested above for rollback.
+        # The production predictor now routes to BBB's PF256 V2 research EV.
         output = predict(
-            history=HISTORY,
+            history=list("BPT"),
             venue="DG",
             room="R1",
             shoe_id="ci-public-shoe",
             user_id="ci-public",
             shoe_context={"bankroll": 100000},
         )
-        self.assertEqual(output["engine"], "BBB_PHYSICS_PARTICLE500_CORE_XGB_EV")
+        self.assertEqual(output["engine"], "BBB_PHYSICS_FORECAST_FIRST_V2")
+        self.assertEqual(output["bbb_v2"]["config"]["N"], 256)
+        self.assertEqual(output["bbb_v2"]["config"]["L"], 384)
+        self.assertEqual(output["bbb_v2"]["config"]["M"], 160)
+        self.assertEqual(output["formal_action"], "Skip")
         self.assertIn(output["action"], {"B", "P", "Skip"})
-        self.assertTrue(output["bbb_final57"]["active"])
-        self.assertEqual(len(output["bbb_final57"]["features_57d"]), FEATURE_DIM)
-        if output["action"] == "Skip":
-            self.assertFalse(output["bet_allowed"])
-            self.assertEqual(output["suggested_bet_amount"], 0.0)
+        self.assertFalse(output["bet_allowed"])
+        self.assertEqual(output["suggested_bet_amount"], 0.0)
 
 
 if __name__ == "__main__":
