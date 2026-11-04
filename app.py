@@ -805,8 +805,29 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
     # Diagnostic only: display the 4/5/6-card current-to-next joint matrix.
     # Never use these probabilities to override B/P/SKIP, EV or wager eligibility.
     draw_length_rows = []
+    gate_rows = []
     if point_score_card:
         score = prediction.get("bbb_v26_score") or {}
+        display = score.get("display_signal") or {}
+        if display:
+            threshold = display.get("threshold")
+            gap = display.get("gap")
+            reason = display.get("reason")
+            status = ("品質資料不足" if reason == "insufficient_quality_diagnostics"
+                      else "EV 差距未達觀望門檻" if formal_code == "SKIP"
+                      else "EV 差距通過觀望門檻")
+            def ev_percent(value):
+                return f"{float(value) * 100:.3f}%" if isinstance(value, (int, float)) else "無資料"
+            gate_rows = [
+                {"type": "separator", "margin": "md", "color": "#F1B900"},
+                {"type": "text", "text": "V4 觀望篩選（非命中率）",
+                 "weight": "bold", "color": "#272727"},
+                {"type": "text", "text": (
+                    f"觀望門檻：{ev_percent(threshold)}\\n"
+                    f"目前 EV 差距：{ev_percent(gap)}\\n"
+                    f"判斷原因：{status}"
+                ), "wrap": True, "size": "sm", "color": "#272727"},
+            ]
         lengths = (score.get("physical_ev") or {}).get("draw_length_diagnostics") or {}
         if lengths.get("joint_probability") and lengths.get("diagnostic_only") is True:
             current = lengths["current_length_probability"]
@@ -860,6 +881,7 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
         ]},
         {"type": "separator", "margin": "md", "color": "#F1B900"},
         {"type": "text", "text": f"分析本金：{_format_money(bankroll)} 元\n建議配置：{bet_text}", "wrap": True, "margin": "md", "color": "#272727"},
+        *gate_rows,
         *draw_length_rows,
         {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "lg", "contents": result_buttons},
     ])
