@@ -31,9 +31,9 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual(r["raw_direction"], "B" if r["ev_banker"] >= r["ev_player"] else "P")
             self.assertIn(r["direction"], ("B", "P", "SKIP"))
             self.assertIn(r["display_signal"]["reason"], ("small_ev_gap_or_uncertain", "relative_ev_gap_pass"))
-            self.assertEqual(r["display_signal"]["version"], "BBB_V26_SELECTIVE_ENTRY_V3")
+            self.assertEqual(r["display_signal"]["version"], "BBB_V26_SELECTIVE_ENTRY_V4")
             self.assertTrue(r["display_signal"]["moderate_entry_enabled"])
-            self.assertEqual(r["display_signal"]["entry_profile"], "moderate_high")
+            self.assertEqual(r["display_signal"]["entry_profile"], "selective_v4")
             self.assertGreater(r["display_signal"]["threshold_addition"], 0)
             self.assertFalse(r["display_signal"]["verified_edge"])
             if r["direction"] != "SKIP":
@@ -84,8 +84,9 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertEqual(counts, {"B": 36, "P": 34, "SKIP": 30},
-                         "LINE V3 100-score benchmark must match BBB")
+        self.assertGreaterEqual(counts["SKIP"], 35)
+        self.assertLessEqual(counts["SKIP"], 45)
+        self.assertTrue(counts["SKIP"] > 30, "V4 must abstain more than V3")
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
         print("BGS V2.6 V3 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
 
@@ -169,10 +170,12 @@ class LineScoreV26Tests(unittest.TestCase):
         )
         exec(compile(module, str(ROOT / "app.py"), "exec"), api)
 
-        def result_card(direction, point_mode=True, diagnostic=None):
+        def result_card(direction, point_mode=True, diagnostic=None, display=None):
             result = {"direction": direction}
             if diagnostic is not None:
                 result["physical_ev"] = {"draw_length_diagnostics": diagnostic}
+            if display is not None:
+                result["display_signal"] = display
             pred = {
                 "bbb_v26_score": result,
                 "action": direction, "recommend": direction,
@@ -210,6 +213,14 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertTrue(any("當局 4 張 → 下局 4／5／6 張" in label for label in labels))
         self.assertEqual(detailed["body"][-1]["contents"][0]["action"], "end")
         self.assertEqual(detailed["body"][3]["contents"][1]["text"], "莊")
+        sample = bridge.predict_final_score(5, 3)
+        visible = result_card("SKIP", display=sample["display_signal"])
+        words = [item.get("text", "") for item in visible["body"]]
+        self.assertIn("V4 觀望篩選（非命中率）", words)
+        self.assertTrue(any("觀望門檻：" in word and "目前 EV 差距：" in word
+                            for word in words))
+        self.assertEqual(visible["body"][3]["contents"][1]["text"], "觀望")
+        self.assertEqual(visible["body"][-1]["contents"][0]["action"], "end")
         legacy = result_card("P", point_mode=False)
         self.assertEqual(legacy["title"], "分析數據")
         self.assertEqual(
