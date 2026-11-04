@@ -84,11 +84,10 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertGreaterEqual(counts["SKIP"], 35)
-        self.assertLessEqual(counts["SKIP"], 45)
-        self.assertTrue(counts["SKIP"] > 30, "V4 must abstain more than V3")
+        self.assertEqual(counts, {"B": 33, "P": 29, "SKIP": 38},
+                         "LINE V4 must match BBB 100-score selective display")
         self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        print("BGS V2.6 V3 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
+        print("BGS V2.6 V4 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
 
     def test_text_parsing_is_unambiguous(self):
         self.assertEqual(line_score_mode.parse_score_pairs("閒8莊4"), [{"player": 8, "banker": 4}])
