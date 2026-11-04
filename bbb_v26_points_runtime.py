@@ -19,13 +19,13 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "a9e25b42d003f1a721007d6ae68127082ab86a29"
+SOURCE_COMMIT = "4618ab367cd8c21a3a2f9596e601268662110e3a"
 VERSION = "BBB_PHYSICS_FORECAST_FIRST_V2_DYNAMIC_GATE"
 SOURCE_BLOBS = {
-    "quant256_online_runtime.js": "9b8b6fef7037bd64ded026aeff5bab6d547f0a76",
+    "quant256_online_runtime.js": "8cbe72626b388ac8854c7a5ca863c2a5eafee205",
     "shoe_distribution_guard.js": "b7c34f045952e9ffe7883b670e0314565c557890",
     "markov_residual_runtime.js": "8fbee10200b067c5ef1ac4632e63b2ec18da2ab8",
-    "physics_forecast_first_runtime.js": "a2a1263b9844092c986ad0eed93568a7615fbcec",
+    "physics_forecast_first_runtime.js": "e8bcc0137c124a3086b6c257865e3212c7a266d0",
     "point_signal_quality_guard.js": "da87c30eed0956d0f7386b645659c8d48f0b6895",
 }
 TIMEOUT_SECONDS = 9.0
