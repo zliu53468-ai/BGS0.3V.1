@@ -232,3 +232,17 @@ legacy_app.screen_result_panel = _fixed_forecast_panel
 app = legacy_app.app
 
 __all__ = ["app"]
+
+
+@app.get("/prediction-version")
+def prediction_version() -> dict[str, Any]:
+    """Read-only release identity; no user data or prediction side effects."""
+    from bbb_v26_points_runtime import SOURCE_COMMIT, SOURCE_BLOBS, verify_source
+    verify_source()
+    return {
+        "release": "independent-conditional-particles-v1",
+        "source_commit": SOURCE_COMMIT,
+        "source_blobs": SOURCE_BLOBS,
+        "independent_final_score": True,
+        "verified_edge": False,
+    }
