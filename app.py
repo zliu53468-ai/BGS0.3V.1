@@ -823,8 +823,8 @@ def screen_result_panel(user_id: str, session: Mapping[str, Any]) -> Dict[str, A
                 {"type": "text", "text": "V4 觀望篩選（非命中率）",
                  "weight": "bold", "color": "#272727"},
                 {"type": "text", "text": (
-                    f"觀望門檻：{ev_percent(threshold)}\\n"
-                    f"目前 EV 差距：{ev_percent(gap)}\\n"
+                    f"觀望門檻：{ev_percent(threshold)}\n"
+                    f"目前 EV 差距：{ev_percent(gap)}\n"
                     f"判斷原因：{status}"
                 ), "wrap": True, "size": "sm", "color": "#272727"},
             ]
