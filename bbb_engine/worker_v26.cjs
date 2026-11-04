@@ -8,11 +8,11 @@
 const readline=require("node:readline");
 const {PhysicsForecastFirstEngine,VERSION}=require("./v26/physics_forecast_first_runtime.js");
 const mildGuard=require("./v26/point_signal_quality_guard.js");
-const SOURCE_COMMIT="a9e25b42d003f1a721007d6ae68127082ab86a29";
+const SOURCE_COMMIT="4618ab367cd8c21a3a2f9596e601268662110e3a";
 const CONFIG=Object.freeze({
   threshold:.005,lossGate:.035,simulationsPerParticle:96,
   observedSamples:12000,quantOptions:{lambda:.82,alpha:.15,particles:96},
-  independentFinalScoreMode:true
+  independentFinalScoreMode:true,exactSingleScore:true
 });
 function validScore(v){return Number.isInteger(v)&&v>=0&&v<=9;}
 function run(payload){

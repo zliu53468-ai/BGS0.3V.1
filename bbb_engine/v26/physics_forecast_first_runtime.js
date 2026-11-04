@@ -378,7 +378,7 @@ function weightedContext(model,physical){
 class PhysicsForecastFirstEngine{
   constructor({simulationsPerParticle=96,observedSamples=12000,
     threshold=BASE_EV_GATE,lossGate=ONE_HAND_CUSHION,quantOptions={},
-    independentFinalScoreMode=false}={}){
+    independentFinalScoreMode=false,exactSingleScore=false}={}){
     if(!finite(threshold)||threshold<0||threshold>.5)throw Error("invalid_ev_gate");
     if(!finite(lossGate)||lossGate<0||lossGate>.5)throw Error("invalid_loss_gate");
     this.simulationsPerParticle=simulationsPerParticle;
@@ -387,7 +387,8 @@ class PhysicsForecastFirstEngine{
     if(typeof independentFinalScoreMode!=="boolean")
       throw Error("invalid_independent_final_score_mode");
     this.independentFinalScoreMode=independentFinalScoreMode;
-    this.quant=new quant.OnlineLinUCB256(quantOptions);
+    if(exactSingleScore&&!independentFinalScoreMode)throw Error("exact_score_requires_independent_mode");
+    this.quant=new quant.OnlineLinUCB256({...quantOptions,exactSingleScore});
     this.reset();
   }
   get history(){return this.quant.history;}

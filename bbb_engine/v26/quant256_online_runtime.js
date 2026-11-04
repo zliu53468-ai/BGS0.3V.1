@@ -150,7 +150,8 @@ function resampleConditionalTransition(parent,rng,outcome,points=null){
  * 它不是對真實牌靴的測量，亦不代表已知任何 A~K 殘量。
  */
 class BlindPhysicsEstimator{
-  constructor({particles=96,seed=0xBBB256}={}){
+  constructor({particles=96,seed=0xBBB256,exactSingleScore=false}={}){
+    this.exactSingleScore=exactSingleScore;
     this.size=clamp(Math.floor(particles)||96,8,96);
     this.seed=seed>>>0;this.reset();
   }
@@ -170,6 +171,30 @@ class BlindPhysicsEstimator{
   observe(outcome,points=null){
     if(!valid(outcome))throw Error("invalid_outcome");
     if(!validPointObservation(outcome,points))throw Error("invalid_point_observation");
+    if(this.exactSingleScore&&points!==null){
+      if(this.drawHistory.length)throw Error("single_score_particles_cannot_accumulate");
+      // Exact rejection: first four are drawn from the parent; accept the
+      // enumerated branch with its total evidence mass, never merely mass > 0.
+      // Identical fresh priors imply equal posterior weights. No pHat weighting.
+      const next=[],draws=[];
+      for(let i=0;i<this.size;i++){
+        let hand=null;
+        for(let attempt=0;attempt<4096;attempt++){
+          const trial=conditionalHandProposal(this.particles[i],this.rng,outcome,points);
+          if(trial.weight>0&&this.rng()<trial.weight){hand=trial.hand;break;}
+        }
+        if(!hand){this.posteriorUnavailable=true;throw Error("conditional_particle_budget_exhausted");}
+        next.push(hand.counts);draws.push(hand.draws);
+      }
+      this.particles=next;this.weights.fill(1/this.size);
+      this.lastESS=this.size;this.lastAcceptance=1;
+      this.lastLikelihoodRelativeSE=0;this.lastPointConditioned=true;
+      this.pointConditionedRounds=1;
+      this.drawHistory.push(draws.reduce((a,b)=>a+b,0)/this.size);
+      const snapshot=this.snapshot();
+      this.densityHistory.push({high:snapshot.virtual_high_ratio,low:snapshot.virtual_low_ratio});
+      return snapshot;
+    }
     const pointEvidence=points===null?null:{player:points.player,banker:points.banker};
     const attempts=256,next=new Array(this.size),updated=new Array(this.size);
     const priorParticles=this.particles;
@@ -279,8 +304,10 @@ class BlindPhysicsEstimator{
       point_conditioned_rounds:this.pointConditionedRounds,
       point_scores_are_not_observed_card_ranks:true,
       resampled:this.lastResampled,posterior_unavailable:this.posteriorUnavailable,
-      likelihood_method:"rao_blackwell_third_card_given_first_four",
-      likelihood_proposals_per_particle:256,
+      likelihood_method:this.exactSingleScore?"exact_single_score_rejection_v1":"rao_blackwell_third_card_given_first_four",
+      independent_conditional_particles:this.exactSingleScore,
+      likelihood_proposals_per_particle:this.exactSingleScore?null:256,
+      conditional_proposal_budget:this.exactSingleScore?4096:256,
       conditional_rejuvenation_moves:this.lastRejuvenated,
       conditional_rejuvenation_fallbacks:this.lastRejuvenationFallbacks,
       expected_draws_recent:recent.length?recent.reduce((s,v)=>s+v,0)/recent.length:4.94,
@@ -374,7 +401,7 @@ function solveSPD(A,v){
 function dot(a,b){let s=0;for(let i=0;i<K;i++)s+=a[i]*b[i];return s;}
 class OnlineLinUCB256{
   constructor({lambda=.82,alpha=.15,minSamples=0,confidenceThreshold=0,
-    lossGate=.04,particles=96}={}){
+    lossGate=.04,particles=96,exactSingleScore=false}={}){
     if(!finite(lambda)||lambda<.75||lambda>.96)throw Error("lambda_must_be_0.75_to_0.96");
     if(!finite(alpha)||alpha<0||alpha>2)throw Error("invalid_alpha");
     if(!Number.isInteger(minSamples)||minSamples<0)throw Error("invalid_min_samples");
@@ -383,11 +410,11 @@ class OnlineLinUCB256{
     if(!finite(lossGate)||lossGate<0||lossGate>.5)throw Error("invalid_loss_gate");
     this.lambda=lambda;this.alpha=alpha;this.minSamples=minSamples;
     this.confidenceThreshold=confidenceThreshold;this.lossGate=lossGate;
-    this.particleCount=particles;this.reset();
+    this.particleCount=particles;this.exactSingleScore=exactSingleScore;this.reset();
   }
   reset(){
     this.history=[];this.arms={B:makeArm(),P:makeArm()};
-    this.physics=new BlindPhysicsEstimator({particles:this.particleCount});
+    this.physics=new BlindPhysicsEstimator({particles:this.particleCount,exactSingleScore:this.exactSingleScore});
     this.trainedRounds=0;
     this.prequential={eligible:0,correct:0,wrong:0,ties:0,skipped:0};
     this.last_signal=null;this.last_settlement="none";

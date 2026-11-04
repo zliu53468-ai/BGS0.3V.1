@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 class LineScoreV26Tests(unittest.TestCase):
     def test_immutable_bbb_v26_modules_and_config(self):
         bridge.verify_source()
-        self.assertEqual(bridge.SOURCE_COMMIT, "a9e25b42d003f1a721007d6ae68127082ab86a29")
+        self.assertEqual(bridge.SOURCE_COMMIT, "4618ab367cd8c21a3a2f9596e601268662110e3a")
         for player, banker in ((8, 4), (9, 7), (7, 8), (0, 0)):
             r = bridge.predict_final_score(player, banker)
             self.assertEqual(r["config"], {
@@ -83,10 +83,10 @@ class LineScoreV26Tests(unittest.TestCase):
         self.assertGreater(raw_counts["B"], 0)
         self.assertGreater(raw_counts["P"], 0)
         self.assertEqual(sum(counts.values()), 100)
-        self.assertEqual(raw_counts, {"B": 56, "P": 44})
-        self.assertEqual(counts, {"B": 33, "P": 29, "SKIP": 38},
-                         "LINE V4 must match BBB 100-score selective display")
-        self.assertEqual(raw_counts, {"B": 56, "P": 44})
+        self.assertEqual(raw_counts, {'B': 61, 'P': 39})
+        self.assertEqual(counts, {'B': 36, 'P': 24, 'SKIP': 40},
+                         "Exact single-score LINE distribution must match BBB (not accuracy)")
+        self.assertEqual(raw_counts, {'B': 61, 'P': 39})
         print("BGS V2.6 V4 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
 
     def test_text_parsing_is_unambiguous(self):
