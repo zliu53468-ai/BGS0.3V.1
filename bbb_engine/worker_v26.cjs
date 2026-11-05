@@ -1,73 +1,34 @@
 "use strict";
-/**
- * BGS LINE final-score transport adapter to byte-for-byte BBB V2.6 source.
- * The same fresh PhysicsForecastFirstEngine(CONFIG) and syncHistory as
- * BBB's quant256_online_panel.js are used for every input pair.
- * No session, UID, LINE token, old shoe or OCR data enters the model.
- */
+// Transport adapter only: the vendored BBB V4 modules are unchanged.
 const readline=require("node:readline");
-const {PhysicsForecastFirstEngine,VERSION}=require("./v26/physics_forecast_first_runtime.js");
-const mildGuard=require("./v26/point_signal_quality_guard.js");
-const SOURCE_COMMIT="4618ab367cd8c21a3a2f9596e601268662110e3a";
-const CONFIG=Object.freeze({
-  threshold:.005,lossGate:.035,simulationsPerParticle:96,
-  observedSamples:12000,quantOptions:{lambda:.82,alpha:.15,particles:96},
-  independentFinalScoreMode:true,exactSingleScore:true
-});
-function validScore(v){return Number.isInteger(v)&&v>=0&&v<=9;}
+const {StablePhysicalPointV4,VERSION,USER_ENTRY}=require("./v4/stability_runtime.js");
+const {CONFIG}=require("./v4/pf_eor_v4_runtime.js");
+const SOURCE_COMMIT="286ecaf044454a28725486c40634b9d458157f85";
 function run(payload){
-  if(!payload||!validScore(payload.player)||!validScore(payload.banker))
-    throw Error("invalid_final_score_pair");
-  const {player,banker}=payload;
-  const outcome=banker>player?"B":player>banker?"P":"T";
-  // No long-lived model cache: true BBB browser-independent single-score mode.
-  const fresh=new PhysicsForecastFirstEngine(CONFIG);
-  const report=fresh.syncHistory([outcome],[{player,banker}]);
-  if(report.history_length!==1||report.point_score_observation_count!==1||
-     fresh.quant.physics.size!==96||report.physical_ev.samples!==9216)
-    throw Error("BBB_V26_independent_score_contract_mismatch");
-  if(report.action!=="SKIP"||report.bet_allowed!==false)
-    throw Error("unverified_final_score_must_not_be_BET");
-  if(report.early_shoe_guard?.mode!=="independent_final_score_quality")
-    throw Error("missing_independent_early_shoe_guard");
-  const evB=report.ev_banker,evP=report.ev_player;
-  if(!Number.isFinite(evB)||!Number.isFinite(evP)||
-     report.physical_ev.simulation_exhausted)
-    throw Error("physical_ev_unavailable");
-  const display=mildGuard.decide(report);
-  const rawDirection=evB>=evP?"B":"P";
-  if(display.raw_direction!==rawDirection)throw Error("mild_guard_unexpected_direction_flip");
-  const direction=display.direction;
-  return {
-    source_commit:SOURCE_COMMIT,version:VERSION,
-    outcome,player,banker,direction,display_direction:direction,
-    raw_direction:rawDirection,display_signal:display,
-    history_length:report.history_length,
-    point_score_observation_count:report.point_score_observation_count,
-    config:{N:fresh.quant.physics.size,L:256,M:fresh.simulationsPerParticle,
-      ess_resampling_ratio:.5,physics_weight:5,road_weight:.1,
-      independentFinalScoreMode:true},
-    ev_banker:evB,ev_player:evP,ev_gap:report.ev_gap,
-    ev_gap_deviation:report.ev_gap_deviation,
-    early_shoe_guard:report.early_shoe_guard,
-    research_signal:report.research_signal,
-    dynamic_gate:report.dynamic_gate,
-    physical_ev:{
-      simulated_probability:report.physical_ev.simulated_probability,
-      samples:report.physical_ev.samples,
-      posterior_update_ess:report.physical_ev.posterior_update_ess,
-      mc_se_gap:report.physical_ev.mc_se_gap,
-      posterior_sd_gap:report.physical_ev.posterior_sd_gap,
-      draw_length_diagnostics:report.physical_ev.draw_length_diagnostics
-    },
-    action:report.action,bet_allowed:false,proxy_only:true,validated_edge:false,
-    final_scores_are_observed_ranks:false
-  };
+ if(!payload||!Number.isInteger(payload.player)||payload.player<0||payload.player>9||
+    !Number.isInteger(payload.banker)||payload.banker<0||payload.banker>9)
+  throw Error("invalid_final_score_pair");
+ const options=payload.seed===undefined?{}:{seed:payload.seed};
+ const report=new StablePhysicalPointV4().analyze(payload.player,payload.banker,options);
+ const direction=report.v4.direction;
+ return {...report,source_commit:SOURCE_COMMIT,version:VERSION,
+  player:payload.player,banker:payload.banker,
+  outcome:payload.banker>payload.player?"B":payload.player>payload.banker?"P":"T",
+  direction,display_direction:direction,
+  raw_direction:report.ev_banker>=report.ev_player?"B":"P",
+  display_signal:{...report.v4,threshold:USER_ENTRY.minAbsoluteEVGap,
+   gap:Math.min(report.v4.user_smoothed_ev_gap,report.v4.user_raw_ev_gap)},
+  config:CONFIG,early_shoe_guard:report.quality,
+  action:"SKIP",bet_allowed:false,proxy_only:true,validated_edge:false,
+  final_scores_are_observed_ranks:false};
 }
-const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity});
-rl.on("line",line=>{
+module.exports={run,SOURCE_COMMIT};
+if(require.main===module){
+ const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity});
+ rl.on("line",line=>{
   let response;
   try{response={ok:true,result:run(JSON.parse(line))};}
   catch(err){response={ok:false,error:String(err?.message||err).slice(0,200)};}
   process.stdout.write(JSON.stringify(response)+"\n");
-});
+ });
+}

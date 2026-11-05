@@ -1,6 +1,7 @@
-"""Transport-only Python bridge for BBB V2.6 final-score independent mode.
+"""Transport-only Python bridge for the current BBB V4 independent-score engine.
 
-Physics/particle modules are byte-identical to the matching BBB N96/L256/M96 deployment.\nOther vendored BBB V2.6 modules retain their pinned original Git objects.
+All eight v4 modules are byte-identical to SOURCE_COMMIT in BBB.
+The historical module name remains for LINE import compatibility.
 BGS user/session state and LINE credentials never enter the Node predictor.
 """
 from __future__ import annotations
@@ -19,26 +20,29 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "4618ab367cd8c21a3a2f9596e601268662110e3a"
-VERSION = "BBB_PHYSICS_FORECAST_FIRST_V2_DYNAMIC_GATE"
+SOURCE_COMMIT = "286ecaf044454a28725486c40634b9d458157f85"
+VERSION = "BBB_V41_ADAPTIVE_BATCH_STABILITY_V1"
 SOURCE_BLOBS = {
     "quant256_online_runtime.js": "8cbe72626b388ac8854c7a5ca863c2a5eafee205",
     "shoe_distribution_guard.js": "b7c34f045952e9ffe7883b670e0314565c557890",
     "markov_residual_runtime.js": "8fbee10200b067c5ef1ac4632e63b2ec18da2ab8",
-    "physics_forecast_first_runtime.js": "e8bcc0137c124a3086b6c257865e3212c7a266d0",
-    "point_signal_quality_guard.js": "da87c30eed0956d0f7386b645659c8d48f0b6895",
+    "physics_forecast_first_runtime.js": "f53989bc0df86c4c1d7cf8c5161c63c146d7e5b3",
+    "deplete_mc_runtime.js": "096b6a537105f3f80ec6d38f855714595deaf048",
+    "pf_eor_v4_runtime.js": "700eb999e39122f6582d343b8b81da1ec36c8d2b",
+    "stability_reference.js": "8b0db63f12560984440646ebdc5e7fe70a63ae08",
+    "stability_runtime.js": "f33b8df688b705247c9ba8c69fa78d9e3915b235"
 }
-TIMEOUT_SECONDS = 9.0
+TIMEOUT_SECONDS = 15.0
 _LOCK = threading.RLock()
 _PROCESS: subprocess.Popen[bytes] | None = None
 _BUFFER = b""
 
 def verify_source() -> None:
     for name, expected in SOURCE_BLOBS.items():
-        payload = (ENGINE / "v26" / name).read_bytes()
+        payload = (ENGINE / "v4" / name).read_bytes()
         digest = sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
         if digest != expected:
-            raise RuntimeError("BBB V2.6 source mismatch: " + name)
+            raise RuntimeError("BBB V4 source mismatch: " + name)
 
 def _drop_worker() -> None:
     global _PROCESS, _BUFFER
@@ -69,7 +73,7 @@ def predict_final_score(player: int, banker: int) -> dict[str, Any]:
         proc = _PROCESS
         if proc.stdin is None or proc.stdout is None:
             _drop_worker()
-            raise RuntimeError("BBB V2.6 worker unavailable")
+            raise RuntimeError("BBB V4 worker unavailable")
         try:
             request = json.dumps({"player": player, "banker": banker}, separators=(",", ":"))
             proc.stdin.write((request + "\n").encode())
@@ -78,35 +82,44 @@ def predict_final_score(player: int, banker: int) -> dict[str, Any]:
             while b"\n" not in _BUFFER:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("BBB V2.6 single-score calculation timeout")
+                    raise TimeoutError("BBB V4 single-score calculation timeout")
                 readable, _, _ = select.select([proc.stdout], [], [], remaining)
                 if not readable:
-                    raise TimeoutError("BBB V2.6 single-score calculation timeout")
+                    raise TimeoutError("BBB V4 single-score calculation timeout")
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
-                    raise RuntimeError("BBB V2.6 worker closed its stdout")
+                    raise RuntimeError("BBB V4 worker closed its stdout")
                 _BUFFER += chunk
                 if len(_BUFFER) > 1_000_000:
-                    raise RuntimeError("BBB V2.6 response too large")
+                    raise RuntimeError("BBB V4 response too large")
             line, _BUFFER = _BUFFER.split(b"\n", 1)
             response = json.loads(line)
             if not response.get("ok"):
-                raise RuntimeError("BBB V2.6: " + str(response.get("error", "unknown")))
+                raise RuntimeError("BBB V4: " + str(response.get("error", "unknown")))
             result = response["result"]
             if (result.get("source_commit") != SOURCE_COMMIT or
                     result.get("version") != VERSION):
-                raise RuntimeError("BBB V2.6 source/version mismatch")
+                raise RuntimeError("BBB V4 source/version mismatch")
             if result.get("config") != {
-                "N": 96, "L": 256, "M": 96,
-                "ess_resampling_ratio": .5, "physics_weight": 5, "road_weight": .1,
-                "independentFinalScoreMode": True,
+                "particles": 96, "simulationsPerParticle": 256,
+                "eorParticleCount": 24, "eorSamples": 96,
+                "minEvGap": .004, "noiseGuardMultiplier": .65,
+                "minPosteriorQuality": .5, "eorFragilityFloor": .025,
+                "crossCheckZ": 2.5, "crossCheckFloor": .008,
+                "crossCheckDirectionFloor": .005,
             }:
-                raise RuntimeError("BBB V2.6 N/L/M contract mismatch")
+                raise RuntimeError("BBB V4 configuration mismatch")
+            if (result.get("v4", {}).get("direction") != result.get("direction") or
+                    result.get("v4", {}).get("user_entry_policy") != {
+                        "minEstimatorSE": .0055, "minAbsoluteEVGap": .00128,
+                        "minBatchAgreement": .55,
+                    }):
+                raise RuntimeError("BBB V4 entry policy mismatch")
             if (result.get("history_length") != 1 or
                     result.get("point_score_observation_count") != 1 or
                     result.get("bet_allowed") is not False or
                     result.get("action") != "SKIP"):
-                raise RuntimeError("BBB V2.6 single-score contract mismatch")
+                raise RuntimeError("BBB V4 single-score contract mismatch")
             return result
         except Exception:
             _drop_worker()

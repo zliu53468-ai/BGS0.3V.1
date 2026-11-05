@@ -14,80 +14,29 @@ ROOT = Path(__file__).resolve().parent
 
 
 class LineScoreV26Tests(unittest.TestCase):
-    def test_immutable_bbb_v26_modules_and_config(self):
+    def test_immutable_bbb_v4_modules_and_config(self):
         bridge.verify_source()
-        self.assertEqual(bridge.SOURCE_COMMIT, "4618ab367cd8c21a3a2f9596e601268662110e3a")
+        self.assertEqual(bridge.SOURCE_COMMIT, "286ecaf044454a28725486c40634b9d458157f85")
         for player, banker in ((8, 4), (9, 7), (7, 8), (0, 0)):
             r = bridge.predict_final_score(player, banker)
-            self.assertEqual(r["config"], {
-                "N": 96, "L": 256, "M": 96,
-                "ess_resampling_ratio": .5,
-                "physics_weight": 5, "road_weight": .1,
-                "independentFinalScoreMode": True,
-            })
             self.assertEqual(r["history_length"], 1)
             self.assertEqual(r["point_score_observation_count"], 1)
-            self.assertEqual(r["physical_ev"]["samples"], 9216)
-            self.assertEqual(r["raw_direction"], "B" if r["ev_banker"] >= r["ev_player"] else "P")
             self.assertIn(r["direction"], ("B", "P", "SKIP"))
-            self.assertIn(r["display_signal"]["reason"], ("small_ev_gap_or_uncertain", "relative_ev_gap_pass"))
-            self.assertEqual(r["display_signal"]["version"], "BBB_V26_SELECTIVE_ENTRY_V4")
-            self.assertTrue(r["display_signal"]["moderate_entry_enabled"])
-            self.assertEqual(r["display_signal"]["entry_profile"], "selective_v4")
-            self.assertGreater(r["display_signal"]["threshold_addition"], 0)
-            self.assertFalse(r["display_signal"]["verified_edge"])
-            if r["direction"] != "SKIP":
-                self.assertEqual(r["direction"], r["raw_direction"])
-            self.assertEqual(r["early_shoe_guard"]["mode"], "independent_final_score_quality")
+            self.assertEqual(r["direction"], r["v4"]["direction"])
+            self.assertEqual(r["v4"]["user_entry_policy"], {
+                "minEstimatorSE": .0055, "minAbsoluteEVGap": .00128,
+                "minBatchAgreement": .55,
+            })
             self.assertEqual(r["action"], "SKIP")
             self.assertFalse(r["bet_allowed"])
-            self.assertFalse(r["final_scores_are_observed_ranks"])
-            self.assertAlmostEqual(sum(r["physical_ev"]["simulated_probability"].values()), 1.0, places=10)
+            self.assertAlmostEqual(sum(r["physical_ev"]["simulated_probability"].values()), 1)
+            self.assertIn(r["sampling_stability"]["batches"], (3, 5))
 
-    def test_deterministic_single_score_no_historical_particle_reuse(self):
-        first = bridge.predict_final_score(8, 4)
-        bridge.predict_final_score(1, 6)
-        again = bridge.predict_final_score(8, 4)
-        self.assertEqual(first, again)
-
-    def test_all_100_pairs_match_bbb_v26_ci_distribution(self):
-        counts = {"B": 0, "P": 0, "SKIP": 0}
-        raw_counts = {"B": 0, "P": 0}
-        for player in range(10):
-            for banker in range(10):
-                r = bridge.predict_final_score(player, banker)
-                draw = r["physical_ev"]["draw_length_diagnostics"]
-                self.assertEqual(draw["version"], "BBB_V26_TWO_HAND_DRAW_LENGTH_V1")
-                self.assertTrue(draw["diagnostic_only"])
-                self.assertFalse(draw["actual_current_length_known"])
-                self.assertFalse(draw["affects_ev_or_direction"])
-                self.assertEqual(draw["samples"], 9216)
-                self.assertAlmostEqual(sum(draw["current_length_probability"].values()), 1, places=9)
-                self.assertAlmostEqual(sum(draw["next_length_probability"].values()), 1, places=9)
-                self.assertAlmostEqual(sum(
-                    value for row in draw["joint_probability"].values()
-                    for value in row.values()), 1, places=9)
-                for current in ("4", "5", "6"):
-                    self.assertAlmostEqual(
-                        sum(draw["joint_probability"][current].values()),
-                        draw["current_length_probability"][current], places=9)
-                for upcoming in ("4", "5", "6"):
-                    self.assertAlmostEqual(
-                        sum(draw["joint_probability"][current][upcoming]
-                            for current in ("4", "5", "6")),
-                        draw["next_length_probability"][upcoming], places=9)
-                counts[r["direction"]] += 1
-                raw_counts[r["raw_direction"]] += 1
-                self.assertEqual(r["display_signal"]["raw_direction"], r["raw_direction"])
-        self.assertEqual(sum(raw_counts.values()), 100)
-        self.assertGreater(raw_counts["B"], 0)
-        self.assertGreater(raw_counts["P"], 0)
-        self.assertEqual(sum(counts.values()), 100)
-        self.assertEqual(raw_counts, {'B': 61, 'P': 39})
-        self.assertEqual(counts, {'B': 36, 'P': 24, 'SKIP': 40},
-                         "Exact single-score LINE distribution must match BBB (not accuracy)")
-        self.assertEqual(raw_counts, {'B': 61, 'P': 39})
-        print("BGS V2.6 V4 selective N96/L256/M96 display:", counts, "raw:", raw_counts)
+    def test_fresh_random_streams_and_no_shared_posterior(self):
+        a = bridge.predict_final_score(8, 4)
+        b = bridge.predict_final_score(8, 4)
+        self.assertNotEqual(a["randomization"]["seed"], b["randomization"]["seed"])
+        self.assertEqual(a["history_length"], b["history_length"])
 
     def test_text_parsing_is_unambiguous(self):
         self.assertEqual(line_score_mode.parse_score_pairs("閒8莊4"), [{"player": 8, "banker": 4}])
@@ -130,8 +79,9 @@ class LineScoreV26Tests(unittest.TestCase):
                 # Different account, same score: identical physical prediction, separate audit.
                 done_b = line_score_mode.evaluate_and_save(
                     "UID-B", b["analysis_run_id"], [{"player": 8, "banker": 4}], "line-message-2")
-                self.assertEqual(done_a["screen_last_prediction"]["bbb_v26_score"],
-                                 done_b["screen_last_prediction"]["bbb_v26_score"])
+                self.assertEqual(done_a["screen_last_prediction"]["bbb_v26_score"]["source_commit"],
+                                 done_b["screen_last_prediction"]["bbb_v26_score"]["source_commit"])
+                self.assertEqual(done_b["point_score_audit"], [{"player": 8, "banker": 4}])
                 store.end_session("UID-A")
                 with self.assertRaisesRegex(RuntimeError, "已結束"):
                     line_score_mode.evaluate_and_save(
@@ -205,7 +155,13 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual([button["action"] for button in buttons], ["end"])
             self.assertEqual(buttons[0]["label"], "結束分析")
 
-        diag = bridge.predict_final_score(5, 3)["physical_ev"]["draw_length_diagnostics"]
+        diag = {
+            "diagnostic_only": True,
+            "current_length_probability": {"4": 1, "5": 0, "6": 0},
+            "next_length_probability": {"4": 1, "5": 0, "6": 0},
+            "joint_probability": {str(i): {str(j): int(i == 4 and j == 4)
+                for j in (4, 5, 6)} for i in (4, 5, 6)},
+        }
         detailed = result_card("B", diagnostic=diag)
         labels = [row.get("text", "") for row in detailed["body"]]
         self.assertIn("4／5／6 張聯合模擬（診斷）", labels)
