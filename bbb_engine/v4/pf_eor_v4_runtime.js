@@ -22,9 +22,9 @@
    throw Error("missing_physical_v4_dependencies");
  const VERSION="BBB_PF_EOR_DEPLETE_V4_1_NEUTRAL_SMOOTHED_RANDOM";
  const CONFIG=Object.freeze({
-  particles:96,simulationsPerParticle:256,
-  // 使用 24 個分層抽取的假想粒子，每個點數影響各做 96 次配對模擬。
-  eorParticleCount:24,eorSamples:96,
+  particles:192,simulationsPerParticle:512,
+  // 使用 48 個分層抽取的假想粒子，每個點數影響各做 192 次配對模擬。
+  eorParticleCount:48,eorSamples:192,
   // Floor and sampling-uncertainty multiplier for an adaptive EV-gap gate.
   // 0.65 is a moderate signal-noise heuristic, NOT a statistical z-score or
   // an observed win-rate confidence interval.
@@ -38,7 +38,7 @@
  function validateConfig(c){
   if(!c||typeof c!=="object")throw Error("invalid_v41_config");
   const integer=(name,lo,hi)=>{if(!Number.isInteger(c[name])||c[name]<lo||c[name]>hi)throw Error("invalid_"+name);};
-  integer("particles",8,96);integer("simulationsPerParticle",8,1024);
+  integer("particles",8,192);integer("simulationsPerParticle",8,1024);
   integer("eorParticleCount",1,c.particles);integer("eorSamples",16,1024);
   for(const [name,lo,hi] of [["minEvGap",0,.5],["noiseGuardMultiplier",0,5],
    ["minPosteriorQuality",0,1],["eorFragilityFloor",0,1],["crossCheckZ",0,5],["crossCheckFloor",0,1],["crossCheckDirectionFloor",0,.5]]){

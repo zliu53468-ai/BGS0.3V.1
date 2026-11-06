@@ -14,7 +14,11 @@ for(const [player,banker,seed] of [[0,0,0],[5,3,0],[8,4,42],[9,9,123],[1,8,77],[
  assert.deepEqual(result.original_pf_ev,before.original_pf_ev);
  assert.deepEqual(result.config,base.CONFIG);
  assert.equal(result.direction,before.v4.direction);
- assert.equal(result.source_commit,"5487b8aab2d9011b64d0a1587129abe6c89787e3");
+ assert.equal(result.physical_ev.samples,491520);
+ assert.equal(result.sampling_stability.batches,5);
+ assert.equal(result.deplete_mc.samples,327680);
+ assert.equal(result.model_posterior.sampled_compositions,960);
+ assert.equal(result.source_commit,"1399cd948449fa4b8d2ddf74a140d539dc2be3cc");
  assert.equal(result.action,"SKIP");
  assert.equal(result.bet_allowed,false);
 }

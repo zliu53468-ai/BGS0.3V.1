@@ -152,7 +152,7 @@ function resampleConditionalTransition(parent,rng,outcome,points=null){
 class BlindPhysicsEstimator{
   constructor({particles=96,seed=0xBBB256,exactSingleScore=false}={}){
     this.exactSingleScore=exactSingleScore;
-    this.size=clamp(Math.floor(particles)||96,8,96);
+    this.size=clamp(Math.floor(particles)||96,8,192);
     this.seed=seed>>>0;this.reset();
   }
   reset(){
