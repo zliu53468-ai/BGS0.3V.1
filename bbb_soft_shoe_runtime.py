@@ -16,12 +16,14 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "ededd462ac68932c8a44d91f2e3fc28280c9aa88"
+SOURCE_COMMIT = "3cc2e27b8cf8b1eb935addc46708d056b332b4a8"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "7d299113cdd9cade5739c9a3e71be3ee2d80b1cd",
-    "soft_shoe_model_bundle.js": "e05280fccff3d7122a6cab0593ba4a736a71f4df",
+    "soft_shoe_decision_runtime.js": "2ea201f18c7aab2e7bc58d937d8e934b02a4058d",
+    "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
+    "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
+    "soft_shoe_frozen_model_bundle.js": "68728cc22c5c3780432827de33e737e7cfcd8343",
 }
-VERSION = "BBB_SOFT_SHOE_BPT_EV_V1"
+VERSION = "BBB_SOFT_SHOE_BPT_EV_V2"
 MAX_HANDS = 72
 TIMEOUT_SECONDS = 8.0
 
