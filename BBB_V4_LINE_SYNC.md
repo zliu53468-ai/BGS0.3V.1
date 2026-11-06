@@ -1,6 +1,6 @@
 # LINE prediction synchronization with BBB V4
 
-Pinned BBB source: 286ecaf044454a28725486c40634b9d458157f85.
+Pinned BBB source: 302195b0e9a62fc11eedfc69aabd76691e11a27f.
 
 The eight files in bbb_engine/v4 are copied without modification from BBB.
 worker_v26.cjs invokes StablePhysicalPointV4 and only adapts its report to the existing LINE fields. The historical Python module/import names remain compatible.

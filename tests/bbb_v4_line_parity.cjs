@@ -14,7 +14,7 @@ for(const [player,banker,seed] of [[0,0,0],[5,3,0],[8,4,42],[9,9,123],[1,8,77],[
  assert.deepEqual(result.original_pf_ev,before.original_pf_ev);
  assert.deepEqual(result.config,base.CONFIG);
  assert.equal(result.direction,before.v4.direction);
- assert.equal(result.source_commit,"286ecaf044454a28725486c40634b9d458157f85");
+ assert.equal(result.source_commit,"302195b0e9a62fc11eedfc69aabd76691e11a27f");
  assert.equal(result.action,"SKIP");
  assert.equal(result.bet_allowed,false);
 }

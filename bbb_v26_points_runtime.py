@@ -20,7 +20,7 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "286ecaf044454a28725486c40634b9d458157f85"
+SOURCE_COMMIT = "302195b0e9a62fc11eedfc69aabd76691e11a27f"
 VERSION = "BBB_V41_ADAPTIVE_BATCH_STABILITY_V1"
 SOURCE_BLOBS = {
     "quant256_online_runtime.js": "8cbe72626b388ac8854c7a5ca863c2a5eafee205",
