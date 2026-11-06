@@ -21,6 +21,15 @@ from shoe_constants import SHOE_DECKS
 install_dynamic_prediction_policy()
 
 import app as legacy_app
+import screenshot_predictor as _screen_adapter
+from bbb_soft_shoe_runtime import (
+    predict_screen as _bbb_soft_shoe_predict,
+    verify_source as _verify_soft_shoe_source,
+    SOURCE_COMMIT as SOFT_SHOE_SOURCE_COMMIT,
+    SOURCE_BLOBS as SOFT_SHOE_SOURCE_BLOBS,
+    VERSION as SOFT_SHOE_VERSION,
+)
+
 
 
 MIN_FORMAL_BET_RATIO = 0.05
@@ -83,6 +92,44 @@ def _attach_formal_bankroll_advice(
     result = dict(prediction or {})
     bankroll = max(0.0, float(session.get("bankroll", 0.0) or 0.0))
     money = dict(result.get("money_management") or {})
+    # BBB web research direction and the *separate* real-money gate.
+    # A model with no trained 48D XGBoost must never inherit 5%-30% stakes.
+    soft = result.get("bbb_soft_shoe")
+    if isinstance(soft, Mapping) and soft.get("active") is True:
+        report = dict(soft.get("report") or {})
+        view = dict(report.get("research_view") or {})
+        if (report.get("action") != "Skip" or
+                report.get("validated_edge") is not False or
+                float(report.get("bankroll_fraction", -1)) != 0):
+            raise RuntimeError("BBB soft-shoe official SKIP/zero-stake contract changed")
+        direction = view.get("direction")
+        if direction not in ("B", "P"):
+            direction = "Skip"
+        label = {"B": "莊", "P": "閒", "Skip": "觀望"}[direction]
+        result.update({
+            "action": direction, "recommend": direction, "direction": direction,
+            "internal_action": direction, "internal_recommend": direction,
+            "next_round_direction": direction, "action_text": label,
+            "recommend_text": label, "direction_text": label,
+            "next_round_direction_text": label,
+            "risk_gate_open": False, "signal_allowed": direction != "Skip",
+            "bet_allowed": False, "mandatory_bet": False,
+            "skip": direction == "Skip", "force_observe": direction == "Skip",
+            "skip_reason": str(view.get("reason") or ""),
+            "bankroll": int(bankroll) if bankroll.is_integer() else bankroll,
+            "suggested_bet_amount": 0.0, "bet_amount": 0.0,
+            "bet_percentage": 0.0, "final_bet_ratio": 0.0,
+            "kelly_fraction": 0.0, "kelly_percentage_applied": 0.0,
+            "bet_multiplier": 0.0, "validated_edge": False,
+        })
+        money.update({
+            "direction": "Skip", "bankroll": bankroll,
+            "final_bet_ratio": 0.0, "kelly_fraction": 0.0,
+            "bet_percentage": 0.0, "bet_amount": 0.0,
+            "bet_allowed": False, "mandatory_bet": False,
+        })
+        result["money_management"] = money
+        return result
     # V2: show BBB research B/P when it passes its original research gate,
     # but keep official B/P/T-only BET qualification FALSE with zero stake.
     # This boundary changes neither LINE presentation nor trial/activation.
@@ -225,6 +272,9 @@ def _fixed_forecast_panel(user_id, session):
 
 # app.py still contains legacy compatibility helpers. Override only these two
 # runtime seams instead of modifying OCR/screenshot/LINE code in the large file.
+# OCR/road extraction, session and licensing remain unchanged; only the
+# forecasting seam is rebound to the exact BBB JS Soft Shoe engine.
+_screen_adapter.predict = _bbb_soft_shoe_predict
 legacy_app._exact_shoe_context = _formal_shoe_context
 legacy_app._attach_bankroll_advice = _attach_formal_bankroll_advice
 _ORIGINAL_SCREEN_RESULT_PANEL = legacy_app.screen_result_panel
@@ -236,13 +286,14 @@ __all__ = ["app"]
 
 @app.get("/prediction-version")
 def prediction_version() -> dict[str, Any]:
-    """Read-only release identity; no user data or prediction side effects."""
-    from bbb_v26_points_runtime import SOURCE_COMMIT, SOURCE_BLOBS, verify_source
-    verify_source()
+    """Read-only provenance for the active LINE OCR/BBB release."""
+    _verify_soft_shoe_source()
     return {
-        "release": "independent-conditional-particles-v1",
-        "source_commit": SOURCE_COMMIT,
-        "source_blobs": SOURCE_BLOBS,
-        "independent_final_score": True,
+        "release": SOFT_SHOE_VERSION,
+        "source_commit": SOFT_SHOE_SOURCE_COMMIT,
+        "source_blobs": SOFT_SHOE_SOURCE_BLOBS,
+        "input_mode": "ocr_image_plus_manual_BPT",
+        "independent_final_score": False,
         "verified_edge": False,
+        "model": "BBB_SOFT_SHOE_BPT_EV_V1",
     }

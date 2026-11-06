@@ -192,7 +192,7 @@ class LineScoreV26Tests(unittest.TestCase):
             })["title"],
             "請輸入閒莊歷史點數",
         )
-        self.assertIn('LINE_OCR_ENABLED = os.getenv("BGS_LINE_OCR_ENABLED", "0")', source)
+        self.assertIn("LINE_OCR_ENABLED = True", source)
         self.assertIn("if not LINE_OCR_ENABLED:", source)
         self.assertIn("def _process_screen_image_sync(", source)
         self.assertIn("def _process_manual_outcome_via_reply(", source)
