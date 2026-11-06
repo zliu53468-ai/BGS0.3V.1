@@ -1,0 +1,27 @@
+name: BGS OCR panel and BBB Soft Shoe parity
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  ocr-soft-shoe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install isolated prediction transport dependencies
+        run: python -m pip install "numpy>=1.26,<2.4" "nodejs-wheel==24.19.0"
+      - name: Syntax check all active prediction/OCR bridges
+        run: |
+          python -m py_compile bbb_soft_shoe_runtime.py runtime_app.py app.py screenshot_predictor.py test_bbb_soft_shoe_ocr.py
+          python -m nodejs_wheel --check bbb_engine/soft_shoe_decision_runtime.js
+          python -m nodejs_wheel --check bbb_engine/soft_shoe_model_bundle.js
+          python -m nodejs_wheel --check bbb_engine/worker_soft_shoe.cjs
+      - name: Exact BBB web/BGS parity, OCR panels, licensing and zero stakes
+        run: python -m unittest -v test_bbb_soft_shoe_ocr.py
