@@ -34,7 +34,7 @@
    user_entry_policy:USER_ENTRY,validated_hit_rate:false,verified_edge:false};
  }
 
- const SETTINGS=Object.freeze({minBatches:5,maxBatches:5,minAgreement:.55,nearThresholdFraction:.5,
+ const SETTINGS=Object.freeze({minBatches:3,maxBatches:5,minAgreement:.55,nearThresholdFraction:.5,
   referenceZ:2.5,referenceFloor:.005});
  if(reference?.rows?.length!==100)throw Error('exact_reference_missing');
  let evidence=0;reference.rows.forEach((r,i)=>{if(r[0]*10+r[1]!==i||!r.every(Number.isFinite)||r[2]<=0||
@@ -111,7 +111,7 @@
   if(!stable)reasons.push('batch_direction_unstable');if(!refOK)reasons.push('exact_reference_disagreement');
   report.v4={...decision,direction:reasons.length?'SKIP':candidate,reason:reasons[0]||'quality_pass',reasons};
   report.legacy_v4_decision=report.v4;
-  report.sampling_stability={batches:k,min_batches:5,max_batches:5,votes,agreement,required_agreement:.55,
+  report.sampling_stability={batches:k,min_batches:3,max_batches:5,votes,agreement,required_agreement:.55,
    stable,per_batch_samples:config.particles*config.simulationsPerParticle,
    seeds:batches.map(r=>r.randomization.seed),batch_mean_variance:measuredVar,analytic_mean_variance:mcVar+latentVar};
   report.exact_reference={probability:refProb,neutral_ev_gap:refGap,pf_raw_gap:g,deviation:delta,tolerance,
@@ -127,9 +127,12 @@
    if(!Number.isInteger(rootSeed)||rootSeed<0||rootSeed>0xffffffff)throw Error('invalid_analysis_seed');
    const batches=[];for(let i=0;i<SETTINGS.minBatches;i++)batches.push(this.engine.analyze(player,banker,{seed:seedAt(rootSeed,i)}));
    let r=aggregate(batches,player,banker,this.config);
+   const near=Math.abs(r.v4.gap-r.v4.threshold)<=SETTINGS.nearThresholdFraction*r.v4.threshold;
+   const additional=near||!r.sampling_stability.stable||!r.exact_reference.consistent;
+   if(additional){for(let i=batches.length;i<SETTINGS.maxBatches;i++)batches.push(this.engine.analyze(player,banker,{seed:seedAt(rootSeed,i)}));r=aggregate(batches,player,banker,this.config);}
    r.randomization={...r.randomization,mode:replay?'explicit_seed_replay':'fresh_secure_seed',seed:rootSeed};
-   r.sampling_stability.expanded=false;
-   r.sampling_stability.expansion_reason={required:'fixed five independent batches'};
+   r.sampling_stability.expanded=additional;r.sampling_stability.expansion_reason={near_threshold:near,
+    required:'direction or exact-reference consistency, or near threshold'};
    return r;
   }
  }

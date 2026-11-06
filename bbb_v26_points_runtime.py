@@ -20,17 +20,17 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "1399cd948449fa4b8d2ddf74a140d539dc2be3cc"
+SOURCE_COMMIT = "aec8124dd01d98b2dc2a4823a5304823a6f9d06b"
 VERSION = "BBB_V41_ADAPTIVE_BATCH_STABILITY_V1"
 SOURCE_BLOBS = {
     "quant256_online_runtime.js": "ed9e076f6a91d6a8068ee4d1909bacde287b2595",
     "shoe_distribution_guard.js": "b7c34f045952e9ffe7883b670e0314565c557890",
     "markov_residual_runtime.js": "8fbee10200b067c5ef1ac4632e63b2ec18da2ab8",
     "physics_forecast_first_runtime.js": "f53989bc0df86c4c1d7cf8c5161c63c146d7e5b3",
-    "deplete_mc_runtime.js": "70ef1d6940a170d539dfc4440bf012342aea8176",
-    "pf_eor_v4_runtime.js": "1f0c1b9c2829a420e3f732c2a213389492a2897e",
+    "deplete_mc_runtime.js": "096b6a537105f3f80ec6d38f855714595deaf048",
+    "pf_eor_v4_runtime.js": "52b2d2726e1ebc340046629d318ae8862fb7b7be",
     "stability_reference.js": "8b0db63f12560984440646ebdc5e7fe70a63ae08",
-    "stability_runtime.js": "434f1c3dd5f0ffed020f8839332e239b116ff82a"
+    "stability_runtime.js": "01fdec104e3c02961c231e1448b05614c14c7672"
 }
 TIMEOUT_SECONDS = 15.0
 _LOCK = threading.RLock()
@@ -102,7 +102,7 @@ def predict_final_score(player: int, banker: int) -> dict[str, Any]:
                 raise RuntimeError("BBB V4 source/version mismatch")
             if result.get("config") != {
                 "particles": 192, "simulationsPerParticle": 512,
-                "eorParticleCount": 48, "eorSamples": 192,
+                "eorParticleCount": 24, "eorSamples": 96,
                 "minEvGap": .004, "noiseGuardMultiplier": .65,
                 "minPosteriorQuality": .5, "eorFragilityFloor": .025,
                 "crossCheckZ": 2.5, "crossCheckFloor": .008,

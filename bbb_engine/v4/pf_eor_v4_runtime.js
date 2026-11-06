@@ -23,8 +23,8 @@
  const VERSION="BBB_PF_EOR_DEPLETE_V4_1_NEUTRAL_SMOOTHED_RANDOM";
  const CONFIG=Object.freeze({
   particles:192,simulationsPerParticle:512,
-  // 使用 48 個分層抽取的假想粒子，每個點數影響各做 192 次配對模擬。
-  eorParticleCount:48,eorSamples:192,
+  // 使用 24 個分層抽取的假想粒子，每個點數影響各做 96 次配對模擬。
+  eorParticleCount:24,eorSamples:96,
   // Floor and sampling-uncertainty multiplier for an adaptive EV-gap gate.
   // 0.65 is a moderate signal-noise heuristic, NOT a statistical z-score or
   // an observed win-rate confidence interval.
