@@ -22,6 +22,8 @@ jobs:
           python -m py_compile bbb_soft_shoe_runtime.py runtime_app.py app.py screenshot_predictor.py test_bbb_soft_shoe_ocr.py
           python -m nodejs_wheel --check bbb_engine/soft_shoe_decision_runtime.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_model_bundle.js
+          python -m nodejs_wheel --check bbb_engine/soft_shoe_frozen_lstm_runtime.js
+          python -m nodejs_wheel --check bbb_engine/soft_shoe_frozen_model_bundle.js
           python -m nodejs_wheel --check bbb_engine/worker_soft_shoe.cjs
       - name: Exact BBB web/BGS parity, OCR panels, licensing and zero stakes
         run: python -m unittest -v test_bbb_soft_shoe_ocr.py

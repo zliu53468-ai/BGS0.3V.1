@@ -10,7 +10,7 @@
  if(root)root.BBBSoftShoe=api;
 })(typeof self!=="undefined"?self:typeof window!=="undefined"?window:null,function(){
  "use strict";
- const VERSION="BBB_SOFT_SHOE_BPT_EV_V1";
+ const VERSION="BBB_SOFT_SHOE_BPT_EV_V2";
  const DEFAULT=Object.freeze({
   PARTICLE_COUNT:128,LIKELIHOOD_DRAWS:14,NEXT_HAND_DRAWS:14,
   MIN_EV_THRESHOLD:.0015,MIN_CONFIDENCE:.65,FRACTIONAL_KELLY:.30,
@@ -138,9 +138,17 @@
   return{available:true,particles,ess,diversity,depthExpected,config:cfg,seed,
    observed_actual_cards:false,soft_depth_constraint:true};
  }
- function frozenCore(history){
-  // Frozen 1-head attention-style weak sequence diagnostic, not trained LSTM.
-  // This provides a soft probability feature, never an asserted predictive edge.
+ function frozenCore(history,sequenceRuntime=null,sequenceModel=null){
+  // Prefer the actual 8x8 LSTM inference ONLY with verified frozen real-shoe
+  // weights. The production bundle contains none. Untrained diagnostics do
+  // not gain voting weight and are explicitly labelled as such.
+  if(sequenceRuntime&&typeof sequenceRuntime.predict==="function"){
+   const inferred=sequenceRuntime.predict(history,sequenceModel);
+   if(inferred?.available&&inferred.trained&&inferred.validated)
+    return inferred;
+  }
+  // A bounded, weak, untrained sequence diagnostic fallback. NOT an LSTM,
+  // NOT evidence of a predictive edge and NEVER eligible for direct staking.
   const a=history.slice(-24).filter(isResult),last=a[a.length-1];
   let weights=[0,0,0],norm=0;
   for(let i=0;i<a.length;i++){
@@ -150,8 +158,9 @@
   }
   const prior=[BASE_PROB.B,BASE_PROB.P,BASE_PROB.T];
   const prob=prior.map((p,i)=>.98*p+.02*(norm?weights[i]/norm:p));
-  return{architecture:"frozen_attention_diagnostic",trained:false,
-   validated:false,probabilities:{B:prob[0],P:prob[1],T:prob[2]},history_support:a.length};
+  return{architecture:"untrained_weak_sequence_diagnostic",trained:false,
+   validated:false,probabilities:{B:prob[0],P:prob[1],T:prob[2]},
+   history_support:a.length,reason:"validated_frozen_lstm_unavailable"};
  }
  function handProbabilities(particles,cfg,seed){
   const rng=rngFrom(seed^0x52ec17e),per=[],counts={B:0,P:0,T:0};
@@ -206,12 +215,22 @@
   const avg=Array.from({length:10},(_,rank)=>sum(parts.map(p=>p[rank]))/parts.length);
   const stdev=avg.map((v,rank)=>Math.sqrt(sum(parts.map(p=>(p[rank]-v)**2))/parts.length));
   const prob=physical.p,ev=evs(prob);
-  const w=[4,8,16,32],seq=[];
-  for(const len of w){
+  // v2 feature schema: 30 latent shoe features + 6 probabilities/EV +
+  // 4 depth/ESS/quality + 5 weak recent-road features + 3 Frozen Core
+  // soft probabilities. Do not apply any old v1 48D classifier to this layout.
+  const seq=[];
+  for(const len of [4,16]){
    const a=history.slice(-len),n=a.length;
-   seq.push(n?a.filter(x=>x==="B").length/n:.5);
+   seq.push(n?a.filter(x=>x==="B").length/n:BASE_PROB.B);
    seq.push(n?a.filter(x=>x==="T").length/n:BASE_PROB.T);
   }
+  let streak=0;
+  if(history.length){
+   const side=history[history.length-1];
+   for(let i=history.length-1;i>=0&&history[i]===side;i--)streak++;
+  }
+  seq.push(Math.min(1,streak/6));
+  seq.push(frozen.probabilities.B,frozen.probabilities.P,frozen.probabilities.T);
   const progress=1-sum(avg)/TOTAL;
   const quality=[progress,posteriorState.ess/parts.length,posteriorState.diversity,
    physical.samples/(parts.length*posteriorState.config.NEXT_HAND_DRAWS)];
@@ -255,7 +274,7 @@
  function modelDecision(p,features,frozen,model){
   // Incompatible 57D historical XGB / synthetic-only fits never qualify.
   const verified=Boolean(model?.trained===true&&model.calibrated===true&&
-    model.schema==="soft_shoe_bpt_48d_v1"&&model.feature_dimension===48&&
+    model.schema==="soft_shoe_bpt_48d_v2"&&model.feature_dimension===48&&
     model.validation?.out_of_shoe_holdout===true&&
     model.validation?.real_shoe_data===true);
   if(verified){
@@ -305,7 +324,7 @@
    estimated_only:true,validated_betting_edge:false
   });
  }
- function run(history,opts={},externalModel=null){
+ function run(history,opts={},externalModel=null,sequenceRuntime=null,sequenceModel=null){
   if(!Array.isArray(history)||history.some(x=>!isResult(x)))throw Error("invalid_bpt_history");
   const cfg=config(opts),seed=seedFor(history),post=posterior(history,cfg,seed);
   const skip=(reason,extra={})=>({
@@ -316,9 +335,17 @@
   if(!post.available)return skip(post.reason);
   const physical=handProbabilities(post.particles,cfg,seed);
   if(!physical)return skip("physical_simulation_unavailable");
-  const effects=eor(post.particles,cfg,seed),frozen=frozenCore(history);
+  const effects=eor(post.particles,cfg,seed),
+   frozen=frozenCore(history,sequenceRuntime,sequenceModel);
   const vector=features48(post,physical,history,effects,frozen);
-  const applied=modelDecision(physical.p,vector,frozen,externalModel);
+  // Weak sequence can influence physical probability only after a verified
+  // frozen model exists. The default is zero, so live results remain purely
+  // physical until independent real-shoe validation.
+  const sequenceWeightApplied=frozen.validated?cfg.SEQUENCE_WEIGHT:0;
+  const weighted=Object.fromEntries(["B","P","T"].map(side=>
+   [side,(1-sequenceWeightApplied)*physical.p[side]+
+      sequenceWeightApplied*frozen.probabilities[side]]));
+  const applied=modelDecision(weighted,vector,frozen,externalModel);
   const p=applied.p,ev=evs(p);
   const roiSe={};
   // Multinomial ROI variance and latent posterior SD are both relevant.
@@ -361,7 +388,9 @@
    confidence,quality,particle_ess:post.ess,ancestor_diversity:post.diversity,
    estimated_remaining_cards:sum(post.particles[0]),estimated_penetration:
     1-sum(post.particles.map(x=>sum(x)))/post.particles.length/TOTAL,
-   eor:effects,features48:vector,feature_dimension:48,frozen_core:frozen,
+   eor:effects,features48:vector,feature_dimension:48,
+   feature_schema:"soft_shoe_bpt_48d_v2",
+   frozen_core:frozen,sequence_weight_applied:sequenceWeightApplied,
    model:applied.model,simulation_samples:physical.samples,bankroll_fraction:fraction,
    research_view,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,

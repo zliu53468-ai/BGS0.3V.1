@@ -1,4 +1,4 @@
-"""BBB exact web Soft Shoe V1 / BGS OCR integration regression contract."""
+"""BBB exact web Soft Shoe V2 / BGS OCR integration regression contract."""
 from __future__ import annotations
 import ast
 import hashlib
@@ -22,7 +22,12 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "ededd462ac68932c8a44d91f2e3fc28280c9aa88")
+        self.assertEqual(soft.SOURCE_COMMIT, "3cc2e27b8cf8b1eb935addc46708d056b332b4a8")
+        self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
+        self.assertEqual(set(soft.SOURCE_BLOBS), {
+            "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
+            "soft_shoe_frozen_lstm_runtime.js", "soft_shoe_frozen_model_bundle.js",
+        })
         for name, sha in soft.SOURCE_BLOBS.items():
             data = (ROOT / "bbb_engine" / name).read_bytes()
             self.assertEqual(
@@ -35,6 +40,13 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
                           cfg["MIN_DIRECTION_GAP_SNR"]), (3, .020, .70))
         self.assertEqual(report["observations"], 3)
+        self.assertEqual(report["feature_schema"], "soft_shoe_bpt_48d_v2")
+        self.assertEqual(report["feature_dimension"], 48)
+        self.assertEqual(len(report["features48"]), 48)
+        self.assertEqual(report["sequence_weight_applied"], 0)
+        self.assertEqual(report["frozen_core"]["validated"], False)
+        self.assertEqual(report["frozen_core"]["trained"], False)
+        self.assertEqual(report["model"], "physics_only_untrained_decision_fallback")
         self.assertEqual(report["action"], "Skip")
         self.assertEqual(report["bankroll_fraction"], 0)
         self.assertFalse(report["validated_edge"])
@@ -45,7 +57,10 @@ class SoftShoeOCRTests(unittest.TestCase):
             source = (
                 "global.self=global;const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
                 "require('./bbb_engine/soft_shoe_model_bundle.js');"
-                "process.stdout.write(JSON.stringify(core.run(JSON.parse(process.argv[1]),{},global.BBB_SOFT_SHOE_XGB_MODEL)));"
+                "const frozen=require('./bbb_engine/soft_shoe_frozen_lstm_runtime.js');"
+                "require('./bbb_engine/soft_shoe_frozen_model_bundle.js');"
+                "process.stdout.write(JSON.stringify(core.run(JSON.parse(process.argv[1]),{},"
+                "global.BBB_SOFT_SHOE_XGB_MODEL,frozen,global.BBB_SOFT_SHOE_LSTM_MODEL)));"
             )
             direct = subprocess.run(
                 _node_command() + ["-e", source, json.dumps(history)],
@@ -53,6 +68,9 @@ class SoftShoeOCRTests(unittest.TestCase):
             )
             self.assertEqual(actual, json.loads(direct.stdout))
             self.assertEqual(actual["bankroll_fraction"], 0)
+            self.assertEqual(actual["sequence_weight_applied"], 0)
+            self.assertEqual(actual["feature_schema"], "soft_shoe_bpt_48d_v2")
+            self.assertEqual(len(actual["features48"]), 48)
         a = soft.predict_screen(SAMPLES, user_id="UID-A", venue="DG", room="1", shoe_id="shoe1")
         b = soft.predict_screen(SAMPLES, user_id="UID-B", venue="DG", room="1", shoe_id="shoe2")
         self.assertEqual(a["bbb_soft_shoe"]["report"], b["bbb_soft_shoe"]["report"])
@@ -65,6 +83,30 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(p["bbb_soft_shoe"]["report"]["observations"],len(SAMPLES)-1)
         self.assertEqual(soft.predict_screen(SAMPLES,user_id="UID-A")["bbb_soft_shoe"]["report"],
                          a["bbb_soft_shoe"]["report"])
+
+    def test_v2_frozen_sequence_and_xgb_schema_fail_closed(self):
+        # Includes production untrained LSTM bundle, no fake learned weights.
+        out = soft.analyze_history(list("BBPTBBPT"))
+        self.assertEqual(out["feature_schema"], "soft_shoe_bpt_48d_v2")
+        self.assertEqual(out["frozen_core"]["reason"], "validated_frozen_lstm_unavailable")
+        self.assertFalse(out["validated_edge"])
+        self.assertEqual(out["sequence_weight_applied"], 0)
+        self.assertEqual(out["bankroll_fraction"], 0)
+        self.assertIn(out["research_view"]["direction"], ("B","P","SKIP"))
+        js = (
+            "global.self=global;"
+            "const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "const frozen=require('./bbb_engine/soft_shoe_frozen_lstm_runtime.js');"
+            "const mock={trained:true,calibrated:true,feature_dimension:48,"
+            "schema:'soft_shoe_bpt_48d_v1',"
+            "validation:{real_shoe_data:true,out_of_shoe_holdout:true},"
+            "predict:()=>({B:.7,P:.2,T:.1})};"
+            "process.stdout.write(core.modelDecision({B:.45,P:.45,T:.1},"
+            "Array(48).fill(0),core.frozenCore(['B'],frozen,null),mock).model);"
+        )
+        result = subprocess.run(_node_command()+["-e",js],cwd=ROOT,
+                                capture_output=True,text=True,check=True,timeout=8)
+        self.assertEqual(result.stdout,"physics_only_untrained_decision_fallback")
 
     def test_shoe_depth_and_invalid_input_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "72"):
