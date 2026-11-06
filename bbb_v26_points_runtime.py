@@ -20,7 +20,7 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "302195b0e9a62fc11eedfc69aabd76691e11a27f"
+SOURCE_COMMIT = "5487b8aab2d9011b64d0a1587129abe6c89787e3"
 VERSION = "BBB_V41_ADAPTIVE_BATCH_STABILITY_V1"
 SOURCE_BLOBS = {
     "quant256_online_runtime.js": "8cbe72626b388ac8854c7a5ca863c2a5eafee205",
@@ -30,7 +30,7 @@ SOURCE_BLOBS = {
     "deplete_mc_runtime.js": "096b6a537105f3f80ec6d38f855714595deaf048",
     "pf_eor_v4_runtime.js": "700eb999e39122f6582d343b8b81da1ec36c8d2b",
     "stability_reference.js": "8b0db63f12560984440646ebdc5e7fe70a63ae08",
-    "stability_runtime.js": "f33b8df688b705247c9ba8c69fa78d9e3915b235"
+    "stability_runtime.js": "01fdec104e3c02961c231e1448b05614c14c7672"
 }
 TIMEOUT_SECONDS = 15.0
 _LOCK = threading.RLock()
@@ -111,7 +111,7 @@ def predict_final_score(player: int, banker: int) -> dict[str, Any]:
                 raise RuntimeError("BBB V4 configuration mismatch")
             if (result.get("v4", {}).get("direction") != result.get("direction") or
                     result.get("v4", {}).get("user_entry_policy") != {
-                        "minEstimatorSE": .0055, "minAbsoluteEVGap": .00128,
+                        "minEstimatorSE": .0055, "minAbsoluteEVGap": 0,
                         "minBatchAgreement": .55,
                     }):
                 raise RuntimeError("BBB V4 entry policy mismatch")

@@ -3,7 +3,7 @@
 const readline=require("node:readline");
 const {StablePhysicalPointV4,VERSION,USER_ENTRY}=require("./v4/stability_runtime.js");
 const {CONFIG}=require("./v4/pf_eor_v4_runtime.js");
-const SOURCE_COMMIT="302195b0e9a62fc11eedfc69aabd76691e11a27f";
+const SOURCE_COMMIT="5487b8aab2d9011b64d0a1587129abe6c89787e3";
 function run(payload){
  if(!payload||!Number.isInteger(payload.player)||payload.player<0||payload.player>9||
     !Number.isInteger(payload.banker)||payload.banker<0||payload.banker>9)

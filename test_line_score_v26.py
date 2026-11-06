@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 class LineScoreV26Tests(unittest.TestCase):
     def test_immutable_bbb_v4_modules_and_config(self):
         bridge.verify_source()
-        self.assertEqual(bridge.SOURCE_COMMIT, "302195b0e9a62fc11eedfc69aabd76691e11a27f")
+        self.assertEqual(bridge.SOURCE_COMMIT, "5487b8aab2d9011b64d0a1587129abe6c89787e3")
         for player, banker in ((8, 4), (9, 7), (7, 8), (0, 0)):
             r = bridge.predict_final_score(player, banker)
             self.assertEqual(r["history_length"], 1)
@@ -24,7 +24,7 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertIn(r["direction"], ("B", "P", "SKIP"))
             self.assertEqual(r["direction"], r["v4"]["direction"])
             self.assertEqual(r["v4"]["user_entry_policy"], {
-                "minEstimatorSE": .0055, "minAbsoluteEVGap": .00128,
+                "minEstimatorSE": .0055, "minAbsoluteEVGap": 0,
                 "minBatchAgreement": .55,
             })
             self.assertEqual(r["action"], "SKIP")

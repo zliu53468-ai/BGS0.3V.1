@@ -1,11 +1,11 @@
 # LINE prediction synchronization with BBB V4
 
-Pinned BBB source: 302195b0e9a62fc11eedfc69aabd76691e11a27f.
+Pinned BBB source: 5487b8aab2d9011b64d0a1587129abe6c89787e3.
 
 The eight files in bbb_engine/v4 are copied without modification from BBB.
 worker_v26.cjs invokes StablePhysicalPointV4 and only adapts its report to the existing LINE fields. The historical Python module/import names remain compatible.
 
-Entry policy is exactly BBB's: estimator SE >0.55%, smoothed and raw B/P EV gaps each >=0.128 percentage points, the two EV choices agree, and batch direction agreement >=55%. EV sign is unrestricted. Deplete is not a mandatory entry condition. The same 3/5-batch policy, fresh cryptographic seeds, smoothing, EOR, Deplete diagnostics and exact reference are preserved.
+Entry policy is exactly BBB's: estimator SE >0.55%, smoothed and raw B/P EV values must each be unequal (no minimum gap), the two EV choices agree, and batch direction agreement >=55%. EV sign is unrestricted. Deplete is not a mandatory entry condition. The same 3/5-batch policy, fresh cryptographic seeds, smoothing, EOR, Deplete diagnostics and exact reference are preserved.
 
 No changes to app.py card builders, LINE transport, access codes, authorization, store.py, session schemas, static assets, bankroll display or render.yaml.
 

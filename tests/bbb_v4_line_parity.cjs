@@ -3,7 +3,7 @@ const assert=require("node:assert/strict");
 const {run}=require("../bbb_engine/worker_v26.cjs");
 const {StablePhysicalPointV4,USER_ENTRY}=require("../bbb_engine/v4/stability_runtime.js");
 const base=require("../bbb_engine/v4/pf_eor_v4_runtime.js");
-assert.deepEqual(USER_ENTRY,{minEstimatorSE:.0055,minAbsoluteEVGap:.00128,minBatchAgreement:.55});
+assert.deepEqual(USER_ENTRY,{minEstimatorSE:.0055,minAbsoluteEVGap:0,minBatchAgreement:.55});
 for(const [player,banker,seed] of [[0,0,0],[5,3,0],[8,4,42],[9,9,123],[1,8,77],[6,7,1234]]){
  const before=new StablePhysicalPointV4().analyze(player,banker,{seed});
  const result=run({player,banker,seed,history:["B","P"],user_id:"ignored"});
@@ -14,7 +14,7 @@ for(const [player,banker,seed] of [[0,0,0],[5,3,0],[8,4,42],[9,9,123],[1,8,77],[
  assert.deepEqual(result.original_pf_ev,before.original_pf_ev);
  assert.deepEqual(result.config,base.CONFIG);
  assert.equal(result.direction,before.v4.direction);
- assert.equal(result.source_commit,"302195b0e9a62fc11eedfc69aabd76691e11a27f");
+ assert.equal(result.source_commit,"5487b8aab2d9011b64d0a1587129abe6c89787e3");
  assert.equal(result.action,"SKIP");
  assert.equal(result.bet_allowed,false);
 }
