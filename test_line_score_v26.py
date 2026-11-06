@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent
 class LineScoreV26Tests(unittest.TestCase):
     def test_immutable_bbb_v4_modules_and_config(self):
         bridge.verify_source()
-        self.assertEqual(bridge.SOURCE_COMMIT, "aec8124dd01d98b2dc2a4823a5304823a6f9d06b")
+        self.assertEqual(bridge.SOURCE_COMMIT, "1399cd948449fa4b8d2ddf74a140d539dc2be3cc")
         for player, banker in ((8, 4), (9, 7), (7, 8), (0, 0)):
             r = bridge.predict_final_score(player, banker)
             self.assertEqual(r["history_length"], 1)
@@ -30,9 +30,9 @@ class LineScoreV26Tests(unittest.TestCase):
             self.assertEqual(r["action"], "SKIP")
             self.assertFalse(r["bet_allowed"])
             self.assertAlmostEqual(sum(r["physical_ev"]["simulated_probability"].values()), 1)
-            self.assertIn(r["sampling_stability"]["batches"], (3, 5))
-            self.assertEqual(r["physical_ev"]["samples"], r["sampling_stability"]["batches"] * 192 * 512)
-            self.assertEqual(r["deplete_mc"]["samples"], r["sampling_stability"]["batches"] * 32768)
+            self.assertEqual(r["sampling_stability"]["batches"], 5)
+            self.assertEqual(r["physical_ev"]["samples"], 491520)
+            self.assertEqual(r["deplete_mc"]["samples"], 327680)
 
     def test_fresh_random_streams_and_no_shared_posterior(self):
         a = bridge.predict_final_score(8, 4)

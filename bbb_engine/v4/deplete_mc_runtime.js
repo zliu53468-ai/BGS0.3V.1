@@ -13,7 +13,7 @@
  const VERSION='BBB_DEPLETE_PAIRED_MC_V1';
  const BASE=Object.freeze({B:.458597,P:.446247,T:.095156});
  const INITIAL=Object.freeze([128,32,32,32,32,32,32,32,32,32]);
- const CONFIG=Object.freeze({batches:8,shoesPerBatch:32,samplesPerShoe:128,
+ const CONFIG=Object.freeze({batches:16,shoesPerBatch:32,samplesPerShoe:128,
   proposalBudget:4096,candidateWeight:.20,defaultMode:'candidate'});
  const valid=v=>Number.isInteger(v)&&v>=0&&v<=9;
  const rngFor=seed=>{let s=seed>>>0||0xa341316c;return()=>{
