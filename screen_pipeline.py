@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, Optional
 import os
 import time
 
-from road_detector_mt_ofalive_profile import detect_road_sequence_detailed
+from bead_plate_detector import detect_bead_plate_sequence_detailed as detect_road_sequence_detailed
 from room_ocr import analyze_room_info
 
 FAST_SCREEN_MODE = os.getenv("FAST_SCREEN_MODE", "1").strip() == "1"
