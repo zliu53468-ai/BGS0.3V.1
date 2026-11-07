@@ -265,23 +265,28 @@ def _rois(venue: str, image: np.ndarray, input_type: str):
         yield "bead_plate_crop",(0.0,0.0,1.0,1.0)
         return
     if portrait:
-        x,y,w,h=PHONE_ROIS.get(venue,GENERIC_PHONE_ROI)
+        # Try the requested venue first, then all other mobile layouts.
+        # An absent/stale/wrong session venue must not hide the DG higher ROI.
+        ordered=[]
+        if venue in PHONE_ROIS:
+            ordered.append(venue)
+        for tag in ("DG","MT","DB"):
+            if tag not in ordered:
+                ordered.append(tag)
         shifts = (("bead_phone",0),("bead_phone_shift_up",-.015),
-                  ("bead_phone_shift_down",.015))
-        if venue in {"MT","DB"}:
-            # Wider vertical search for different browser chrome & game panels;
-            # existing image-normalization/autofocus modules remain untouched.
-            shifts += (("bead_phone_up_3",-.030),("bead_phone_down_3",.030),
-                       ("bead_phone_up_5",-.050))
-        for name,shift in shifts:
-            yy=max(0.0,min(1.0-h,y+shift))
-            yield f"{venue.lower()}_{name}",(x,yy,w,h)
+                  ("bead_phone_shift_down",.015),
+                  ("bead_phone_up_3",-.030),("bead_phone_down_3",.030),
+                  ("bead_phone_up_5",-.050),("bead_phone_down_5",.050))
+        for tag in ordered+["GENERIC"]:
+            x,y,w,h=(GENERIC_PHONE_ROI if tag=="GENERIC" else PHONE_ROIS[tag])
+            for name,shift in shifts:
+                yy=max(0.0,min(1.0-h,y+shift))
+                yield f"{tag.lower()}_{name}",(x,yy,w,h)
     else:
         # Desktop: the bead table is left of the Big Road, never scan its right.
         for name,roi in (("bead_desktop",(0,.72,.28,.25)),
                          ("bead_desktop_low",(0,.79,.30,.20))):
             yield f"{venue.lower()}_{name}",roi
-
 
 def detect_bead_plate_sequence_detailed(image_path: str|Path|np.ndarray, *,
         venue: str="",input_type: str="auto",deadline: Optional[float]=None,
@@ -296,42 +301,36 @@ def detect_bead_plate_sequence_detailed(image_path: str|Path|np.ndarray, *,
         from road_detector import _read_image
         image=_read_image(image_path,deadline=deadline,cancel_event=cancel_event)
     candidates=[]
-    for name,roi in _rois(str(venue).upper(),image,str(input_type).lower()):
+    venue_code=str(venue).upper()
+    for name,roi in _rois(venue_code,image,str(input_type).lower()):
         _guard(deadline,cancel_event)
-        result=_scan(image,roi,name,deadline,cancel_event,
-                     robust=str(venue).upper() in {"MT","DB"})
+        # DG retains the original non-robust Hough-grid path, even when the
+        # session venue is wrong. MT/DB keep their robust lattice recovery.
+        robust=(("mt_" in name or "db_" in name) or venue_code in {"MT","DB"})
+        if name.startswith("dg_"):
+            robust=False
+        result=_scan(image,roi,name,deadline,cancel_event,robust=robust)
         candidates.append(result)
-        if result.get("quality_ok") and str(venue).upper() not in {"MT","DB"}:
-            out=dict(result)
-            out.update({"input_type":str(input_type),
-                        "image_size":{"width":image.shape[1],"height":image.shape[0]},
-                        "candidate_regions":[
-                            {"name":v.get("selected_region"),
-                             "quality_ok":v.get("quality_ok"),
-                             "recognized_count":v.get("recognized_count",0),
-                             "fallback_reason":v.get("fallback_reason","")}
-                            for v in candidates],
-                        "detector_elapsed_ms":round((time.perf_counter()-started)*1000,2)})
-            return out
-    # MT/DB: after checking small ROI shifts, use the candidate with the
-    # most consistently verified cells, not the first possibly clipped ROI.
-    if str(venue).upper() in {"MT","DB"}:
-        good=[item for item in candidates if item.get("quality_ok")]
-        if good:
-            out=dict(max(good,key=lambda item: (
-                int(item.get("confirmed_round_count",0)),
-                float(item.get("median_cell_confidence",0))
-            )))
-            out.update({"input_type":str(input_type),
-                        "image_size":{"width":image.shape[1],"height":image.shape[0]},
-                        "candidate_regions":[
-                            {"name":v.get("selected_region"),
-                             "quality_ok":v.get("quality_ok"),
-                             "recognized_count":v.get("recognized_count",0),
-                             "fallback_reason":v.get("fallback_reason","")}
-                            for v in candidates],
-                        "detector_elapsed_ms":round((time.perf_counter()-started)*1000,2)})
-            return out
+        # Explicit DG with its first successful DG scan may return early;
+        # unknown and wrong venues must evaluate all regions.
+        if venue_code=="DG" and name.startswith("dg_") and result.get("quality_ok"):
+            break
+    good=[item for item in candidates if item.get("quality_ok")]
+    if good:
+        out=dict(max(good,key=lambda item: (
+            int(item.get("confirmed_round_count",0)),
+            float(item.get("median_cell_confidence",0))
+        )))
+        out.update({"input_type":str(input_type),
+                    "image_size":{"width":image.shape[1],"height":image.shape[0]},
+                    "candidate_regions":[
+                        {"name":v.get("selected_region"),
+                         "quality_ok":v.get("quality_ok"),
+                         "recognized_count":v.get("recognized_count",0),
+                         "fallback_reason":v.get("fallback_reason","")}
+                        for v in candidates],
+                    "detector_elapsed_ms":round((time.perf_counter()-started)*1000,2)})
+        return out
     reason=str(candidates[-1].get("fallback_reason") if candidates else "bead_region_not_found")
     return {"ok":False,"quality_ok":False,"reconstructed_all":False,
             "sequence":[],"raw_outcomes":[],"tie_markers":{},"grid_cells":[],
