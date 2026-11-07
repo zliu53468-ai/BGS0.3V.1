@@ -18,7 +18,7 @@ ROWS = 6
 # Normalized target regions calibrated with full-screen DG/MT/DB mobile samples.
 PHONE_ROIS = {
     "DG": (0.000, .692, .290, .165),
-    "MT": (0.000, .775, .310, .174),
+    "MT": (0.000, .775, .340, .174),
     "DB": (0.000, .817, .350, .176),
 }
 GENERIC_PHONE_ROI = (0.000, .770, .350, .190)
@@ -63,8 +63,70 @@ def _group(values: list[float], tolerance: float) -> list[list[float]]:
     return groups
 
 
+
+
+def _robust_bead_grid(
+    hsv: np.ndarray,
+    selected: list[dict[str, Any]],
+    y_centers: list[float],
+    bpitch: float,
+    dark: bool,
+) -> tuple[list[float], dict[tuple[int, int], dict[str, Any]]] | None:
+    """MT/DB: use supported lattice centers, not every stray Hough circle.
+
+    Contrast-enhanced numerals may look like extra circles at x+/-12px.
+    Multiple beads in separate rows must agree on an actual column. After
+    fitting a regular column pitch, every expected cell is reclassified from
+    the HSV image at its lattice center. A missing interior cell still fails.
+    """
+    groups = _group([item["cx"] for item in selected], max(5, bpitch*.28))
+    supported = [float(np.median(group)) for group in groups if len(group) >= 2]
+    if len(supported) < 2:
+        return None
+    diffs = np.diff(supported)
+    adjacent = [float(d) for d in diffs if bpitch*.66 <= d <= bpitch*1.55]
+    if not adjacent:
+        return None
+    xpitch = float(np.median(adjacent))
+    if not math.isfinite(xpitch) or xpitch <= 0:
+        return None
+    origin = supported[0]
+    for cx in supported:
+        idx = int(round((cx-origin)/xpitch))
+        if idx < 0 or abs(cx-(origin+idx*xpitch)) > xpitch*.23:
+            return None
+    # A first/last column with only one observed bead must not disappear.
+    leading = [
+        item for item in selected
+        if abs(item["cx"]-(origin-xpitch)) <= xpitch*.27
+    ]
+    if leading:
+        origin -= xpitch
+    maxcol = max(int(round((cx-origin)/xpitch)) for cx in supported)
+    for item in selected:
+        idx = int(round((item["cx"]-origin)/xpitch))
+        if idx == maxcol+1 and abs(item["cx"]-(origin+idx*xpitch)) <= xpitch*.27:
+            maxcol = idx
+    if maxcol < 1 or maxcol*ROWS > 72:
+        return None
+    x_centers = [origin+i*xpitch for i in range(maxcol+1)]
+    radius = float(np.median([item["radius"] for item in selected]))
+    grid: dict[tuple[int, int], dict[str, Any]] = {}
+    for col, cx in enumerate(x_centers):
+        for row, cy in enumerate(y_centers):
+            outcome, conf = _color(hsv, cx, cy, radius, dark)
+            if not outcome:
+                continue
+            grid[(col, row)] = {
+                "outcome": outcome, "cx": float(cx), "cy": float(cy),
+                "radius": round(radius,2), "confidence": conf,
+                "column": col, "row": row, "index": col*ROWS+row,
+                "chronology_confirmed": True,
+            }
+    return x_centers, grid
+
 def _scan(image: np.ndarray, roi: tuple[float,float,float,float], name: str,
-          deadline: Optional[float], cancel_event: Any) -> Dict[str, Any]:
+          deadline: Optional[float], cancel_event: Any, *, robust: bool = False) -> Dict[str, Any]:
     _guard(deadline, cancel_event)
     height, width = image.shape[:2]
     x, y, w, h = roi
@@ -118,23 +180,32 @@ def _scan(image: np.ndarray, roi: tuple[float,float,float,float], name: str,
         row=int(np.argmin(abs(np.array(y_centers)-item["cy"])))
         if abs(y_centers[row]-item["cy"])<=bpitch*.29:
             selected.append({**item,"row":row})
-    gx=_group([v["cx"] for v in selected],max(5,bpitch*.28))
-    x_centers=[float(np.median(g)) for g in gx]
-    if len(x_centers)<2:
-        return {"quality_ok":False,"fallback_reason":"bead_columns_not_aligned","selected_region":name}
-    xdiff=np.diff(x_centers)
-    xpitch=float(np.median(xdiff))
-    if not bpitch*.66<=xpitch<=bpitch*1.55 or any(abs(float(d)-xpitch)>xpitch*.27 for d in xdiff):
-        return {"quality_ok":False,"fallback_reason":"bead_column_spacing_invalid","selected_region":name}
-    grid={}
-    for item in selected:
-        col=int(np.argmin(abs(np.array(x_centers)-item["cx"])))
-        if abs(x_centers[col]-item["cx"])>xpitch*.27:continue
-        position=(col,item["row"])
-        if position in grid:
-            return {"quality_ok":False,"fallback_reason":"ambiguous_bead_grid_cell","selected_region":name}
-        grid[position]={**item,"column":col,"index":col*ROWS+item["row"],
-                        "chronology_confirmed":True}
+    if robust:
+        recovered = _robust_bead_grid(hsv, selected, y_centers, bpitch, dark)
+        if recovered is None:
+            return {"quality_ok":False,"fallback_reason":"bead_column_spacing_invalid",
+                    "selected_region":name}
+        x_centers,grid = recovered
+        xpitch = float(np.median(np.diff(x_centers)))
+    else:
+        # DG already works: preserve its original column + Hough-cell path.
+        gx=_group([v["cx"] for v in selected],max(5,bpitch*.28))
+        x_centers=[float(np.median(g)) for g in gx]
+        if len(x_centers)<2:
+            return {"quality_ok":False,"fallback_reason":"bead_columns_not_aligned","selected_region":name}
+        xdiff=np.diff(x_centers)
+        xpitch=float(np.median(xdiff))
+        if not bpitch*.66<=xpitch<=bpitch*1.55 or any(abs(float(d)-xpitch)>xpitch*.27 for d in xdiff):
+            return {"quality_ok":False,"fallback_reason":"bead_column_spacing_invalid","selected_region":name}
+        grid={}
+        for item in selected:
+            col=int(np.argmin(abs(np.array(x_centers)-item["cx"])))
+            if abs(x_centers[col]-item["cx"])>xpitch*.27:continue
+            position=(col,item["row"])
+            if position in grid:
+                return {"quality_ok":False,"fallback_reason":"ambiguous_bead_grid_cell","selected_region":name}
+            grid[position]={**item,"column":col,"index":col*ROWS+item["row"],
+                            "chronology_confirmed":True}
     # Never silently skip an undetected cell: that would shift all later hands.
     last_col=len(x_centers)-1
     for col in range(len(x_centers)):
@@ -186,13 +257,23 @@ def _scan(image: np.ndarray, roi: tuple[float,float,float,float], name: str,
 def _rois(venue: str, image: np.ndarray, input_type: str):
     ih,iw=image.shape[:2]
     portrait=ih>iw*1.12
-    if input_type=="road_crop" or (max(iw,ih)<1000 and not portrait):
+    # If an old LINE session persisted road_crop while a full MT/DB phone
+    # screenshot is uploaded, do not scan the entire UI as a cropped bead grid.
+    if ((input_type=="road_crop" and
+         (venue not in {"MT","DB"} or not portrait or max(iw,ih)<1000))
+        or (max(iw,ih)<1000 and not portrait)):
         yield "bead_plate_crop",(0.0,0.0,1.0,1.0)
         return
     if portrait:
         x,y,w,h=PHONE_ROIS.get(venue,GENERIC_PHONE_ROI)
-        for name,shift in (("bead_phone",0),("bead_phone_shift_up",-.015),
-                           ("bead_phone_shift_down",.015)):
+        shifts = (("bead_phone",0),("bead_phone_shift_up",-.015),
+                  ("bead_phone_shift_down",.015))
+        if venue in {"MT","DB"}:
+            # Wider vertical search for different browser chrome & game panels;
+            # existing image-normalization/autofocus modules remain untouched.
+            shifts += (("bead_phone_up_3",-.030),("bead_phone_down_3",.030),
+                       ("bead_phone_up_5",-.050))
+        for name,shift in shifts:
             yy=max(0.0,min(1.0-h,y+shift))
             yield f"{venue.lower()}_{name}",(x,yy,w,h)
     else:
@@ -217,10 +298,30 @@ def detect_bead_plate_sequence_detailed(image_path: str|Path|np.ndarray, *,
     candidates=[]
     for name,roi in _rois(str(venue).upper(),image,str(input_type).lower()):
         _guard(deadline,cancel_event)
-        result=_scan(image,roi,name,deadline,cancel_event)
+        result=_scan(image,roi,name,deadline,cancel_event,
+                     robust=str(venue).upper() in {"MT","DB"})
         candidates.append(result)
-        if result.get("quality_ok"):
+        if result.get("quality_ok") and str(venue).upper() not in {"MT","DB"}:
             out=dict(result)
+            out.update({"input_type":str(input_type),
+                        "image_size":{"width":image.shape[1],"height":image.shape[0]},
+                        "candidate_regions":[
+                            {"name":v.get("selected_region"),
+                             "quality_ok":v.get("quality_ok"),
+                             "recognized_count":v.get("recognized_count",0),
+                             "fallback_reason":v.get("fallback_reason","")}
+                            for v in candidates],
+                        "detector_elapsed_ms":round((time.perf_counter()-started)*1000,2)})
+            return out
+    # MT/DB: after checking small ROI shifts, use the candidate with the
+    # most consistently verified cells, not the first possibly clipped ROI.
+    if str(venue).upper() in {"MT","DB"}:
+        good=[item for item in candidates if item.get("quality_ok")]
+        if good:
+            out=dict(max(good,key=lambda item: (
+                int(item.get("confirmed_round_count",0)),
+                float(item.get("median_cell_confidence",0))
+            )))
             out.update({"input_type":str(input_type),
                         "image_size":{"width":image.shape[1],"height":image.shape[0]},
                         "candidate_regions":[
