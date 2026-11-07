@@ -16,9 +16,9 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "3cc2e27b8cf8b1eb935addc46708d056b332b4a8"
+SOURCE_COMMIT = "8cc4e1668fc57eaf3b43ee879ca304787ce05e2f"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "2ea201f18c7aab2e7bc58d937d8e934b02a4058d",
+    "soft_shoe_decision_runtime.js": "1ac17f48b7cf78eff160e37a32e2b4b55fc1b355",
     "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
     "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
     "soft_shoe_frozen_model_bundle.js": "68728cc22c5c3780432827de33e737e7cfcd8343",
