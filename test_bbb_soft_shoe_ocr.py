@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "3cc2e27b8cf8b1eb935addc46708d056b332b4a8")
+        self.assertEqual(soft.SOURCE_COMMIT, "8cc4e1668fc57eaf3b43ee879ca304787ce05e2f")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -40,6 +40,23 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
                           cfg["MIN_DIRECTION_GAP_SNR"]), (3, .020, .70))
         self.assertEqual(report["observations"], 3)
+        self.assertEqual(cfg["MIN_EV_THRESHOLD"], .0030)
+        self.assertEqual(cfg["MID_SHOE_MIN_EV_THRESHOLD"], .00235)
+        self.assertEqual(cfg["LATE_SHOE_MIN_EV_THRESHOLD"], .0019)
+        self.assertEqual(cfg["MIN_CONFIDENCE"], .75)
+        self.assertEqual(cfg["LATE_MIN_CONFIDENCE"], .80)
+        self.assertEqual(cfg["MIN_BET_EV_GAP"], .0015)
+        self.assertEqual(cfg["MIN_BET_ESS_RATIO"], .45)
+        self.assertEqual(cfg["MAX_BET_EV_SE"], .060)
+        self.assertEqual(cfg["FRACTIONAL_KELLY"], .225)
+        self.assertEqual(cfg["MAX_BET_FRACTION"], .0175)
+        self.assertEqual(cfg["MIN_REMAINING_CARDS_FOR_BET"], 25)
+        self.assertEqual(cfg["END_SHOE_OVERRIDE_MIN_EV"], .025)
+        self.assertEqual(cfg["END_SHOE_OVERRIDE_CONFIDENCE"], .90)
+        self.assertEqual(cfg["END_SHOE_OVERRIDE_MAX_EV_SE"], .030)
+        self.assertEqual(report["wager_gate"]["min_ev_threshold"], .0030)
+        self.assertFalse(report["wager_gate"]["model_verified"])
+        self.assertFalse(report["wager_gate"]["eligible"])
         self.assertEqual(report["feature_schema"], "soft_shoe_bpt_48d_v2")
         self.assertEqual(report["feature_dimension"], 48)
         self.assertEqual(len(report["features48"]), 48)
@@ -68,6 +85,10 @@ class SoftShoeOCRTests(unittest.TestCase):
             )
             self.assertEqual(actual, json.loads(direct.stdout))
             self.assertEqual(actual["bankroll_fraction"], 0)
+            if actual.get("wager_gate"):
+                self.assertEqual(actual["wager_gate"]["model_verified"], False)
+                self.assertEqual(actual["wager_gate"]["eligible"], False)
+                self.assertEqual(actual["wager_gate"]["max_ev_se"], .060)
             self.assertEqual(actual["sequence_weight_applied"], 0)
             self.assertEqual(actual["feature_schema"], "soft_shoe_bpt_48d_v2")
             self.assertEqual(len(actual["features48"]), 48)
@@ -107,6 +128,44 @@ class SoftShoeOCRTests(unittest.TestCase):
         result = subprocess.run(_node_command()+["-e",js],cwd=ROOT,
                                 capture_output=True,text=True,check=True,timeout=8)
         self.assertEqual(result.stdout,"physics_only_untrained_decision_fallback")
+
+    def test_dynamic_wager_policy_exact_boundaries_and_fail_closed(self):
+        # A direct V2 policy test. Does not change the OCR/Flex/session path.
+        source = (
+            "const s=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "const c=s.DEFAULT;"
+            "const base={cfg:c,remainingCards:416*.7,ess:115,quality:.82,"
+            "ev:{B:.05,P:.01,T:0},candidate:'B',confidence:.90,se:.02,"
+            "lower:.01,enoughDepth:true,observations:10,model:'validated_external_xgb'};"
+            "const gate=x=>s.wagerGate(Object.assign({},base,x));"
+            "const out={tiers:[.61,.60,.30,.2999].map(p=>s.wagerPolicy(416*p,c)),"
+            "essRejected:gate({ess:.45*128-.001}).reasons.includes('low_particle_ess'),"
+            "lateConfidenceRejected:gate({remainingCards:416*.34,confidence:.79})"
+            ".reasons.includes('confidence_below_dynamic_gate'),"
+            "tinyGapRejected:gate({ev:{B:.05,P:.049,T:0}})"
+            ".reasons.includes('ev_gap_too_small'),"
+            "endShoeRejected:gate({remainingCards:20,confidence:.85})"
+            ".reasons.includes('shoe_end_no_bet'),"
+            "endShoeException:gate({remainingCards:20,ev:{B:.025,P:0,T:0},"
+            "confidence:.9,se:.03,lower:.01}).eligible,"
+            "untrainedRejected:gate({model:'physics_only_untrained_decision_fallback'}).eligible};"
+            "process.stdout.write(JSON.stringify(out));"
+        )
+        completed = subprocess.run(
+            _node_command()+["-e",source],cwd=ROOT,capture_output=True,
+            text=True,check=True,timeout=8
+        )
+        result=json.loads(completed.stdout)
+        self.assertEqual([r["min_ev_threshold"] for r in result["tiers"]],
+                         [.003,.00235,.00235,.0019])
+        self.assertEqual([r["min_confidence"] for r in result["tiers"]],
+                         [.75,.75,.80,.80])
+        self.assertTrue(result["essRejected"])
+        self.assertTrue(result["lateConfidenceRejected"])
+        self.assertTrue(result["tinyGapRejected"])
+        self.assertTrue(result["endShoeRejected"])
+        self.assertTrue(result["endShoeException"])
+        self.assertFalse(result["untrainedRejected"])
 
     def test_shoe_depth_and_invalid_input_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "72"):

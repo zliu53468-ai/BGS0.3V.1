@@ -6,8 +6,8 @@ const core=require("./soft_shoe_decision_runtime.js");
 require("./soft_shoe_model_bundle.js");
 const frozen=require("./soft_shoe_frozen_lstm_runtime.js");
 require("./soft_shoe_frozen_model_bundle.js");
-const SOURCE_COMMIT="3cc2e27b8cf8b1eb935addc46708d056b332b4a8";
-const CORE_BLOB="2ea201f18c7aab2e7bc58d937d8e934b02a4058d";
+const SOURCE_COMMIT="8cc4e1668fc57eaf3b43ee879ca304787ce05e2f";
+const CORE_BLOB="1ac17f48b7cf78eff160e37a32e2b4b55fc1b355";
 function evaluate(input){
  if(!input||!Array.isArray(input.history)||
     input.history.some(x=>!["B","P","T"].includes(x)))
