@@ -47,6 +47,47 @@ class BeadPlateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result.get("raw_outcomes"),[])
 
+    def test_mt_contrast_enhancement_hough_false_columns_recovered(self):
+        """An MT white-panel numeral creates two off-column Hough candidates.
+
+        Do not promote the false Hough x-centers into real columns, and do not
+        guess any B/P/T outcomes: re-sample original HSV only on verified grid.
+        """
+        from unittest.mock import patch
+        import bead_plate_detector as detector
+        history=list("BBPPTP")*5+list("BPTBP")
+        image=make_plate(history,pitch=34,radius=13,dark=False)
+        pitch=34
+        points=[]
+        for index,value in enumerate(history):
+            col,row=divmod(index,6)
+            cx=34*.55+col*pitch
+            cy=34*.55+row*pitch
+            if (col,row) in {(2,4),(4,4)}:
+                cx-=10
+            points.append([cx,cy,13.0])
+        mock_circles=np.asarray([points],dtype=np.float32)
+        with patch.object(detector.cv2,"HoughCircles",return_value=mock_circles):
+            result=detector.detect_bead_plate_sequence_detailed(
+                image,venue="MT",input_type="road_crop"
+            )
+        self.assertTrue(result["ok"],result)
+        self.assertEqual(result["raw_outcomes"],history)
+        self.assertEqual(result["confirmed_round_count"],len(history))
+
+    def test_mobile_road_crop_session_does_not_disable_mt_db_roi(self):
+        """Persisted screenshot input_type must not crop the entire phone UI."""
+        import bead_plate_detector as detector
+        phone=np.zeros((1280,720,3),dtype=np.uint8)
+        for venue in ("MT","DB"):
+            candidates=list(detector._rois(venue,phone,"road_crop"))
+            self.assertGreaterEqual(len(candidates),5)
+            self.assertNotEqual(candidates[0][0],"bead_plate_crop")
+            self.assertIn(venue.lower(),candidates[0][0])
+        # Keep DG's previously working behavior exactly as before.
+        self.assertEqual(list(detector._rois("DG",phone,"road_crop"))[0][0],
+                         "bead_plate_crop")
+
     def test_no_big_road_fallback_on_unrelated_background(self):
         image=np.full((240,480,3),180,dtype=np.uint8)
         result=detect_bead_plate_sequence_detailed(image,venue="DB",input_type="road_crop")
