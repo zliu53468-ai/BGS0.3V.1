@@ -13,8 +13,15 @@
  const VERSION="BBB_SOFT_SHOE_BPT_EV_V2";
  const DEFAULT=Object.freeze({
   PARTICLE_COUNT:128,LIKELIHOOD_DRAWS:14,NEXT_HAND_DRAWS:14,
-  MIN_EV_THRESHOLD:.0015,MIN_CONFIDENCE:.65,FRACTIONAL_KELLY:.30,
-  MAX_BET_FRACTION:.025,AVERAGE_CARDS_PER_HAND:4.95,DEPTH_RELIABILITY:.5,
+  MIN_EV_THRESHOLD:.0030,MIN_CONFIDENCE:.75,FRACTIONAL_KELLY:.225,
+  MAX_BET_FRACTION:.0175,AVERAGE_CARDS_PER_HAND:4.95,DEPTH_RELIABILITY:.5,
+  MID_SHOE_MIN_EV_THRESHOLD:.00235,LATE_SHOE_MIN_EV_THRESHOLD:.00190,
+  EARLY_SHOE_REMAINING_RATIO:.60,LATE_SHOE_REMAINING_RATIO:.30,
+  LATE_CONFIDENCE_REMAINING_RATIO:.35,LATE_MIN_CONFIDENCE:.80,
+  MIN_BET_EV_GAP:.0015,MIN_BET_ESS_RATIO:.45,MIN_BET_QUALITY:.65,
+  MAX_BET_EV_SE:.060,MIN_REMAINING_CARDS_FOR_BET:25,
+  END_SHOE_OVERRIDE_MIN_EV:.025,END_SHOE_OVERRIDE_CONFIDENCE:.90,
+  END_SHOE_OVERRIDE_MAX_EV_SE:.030,
   RESAMPLE_ESS_RATIO:.5,MAX_HANDS:72,LOWER_BOUND_Z:1.645,SEQUENCE_WEIGHT:0,
   MIN_DIRECTION_ROUNDS:3,MIN_DIRECTION_EV_GAP:.020,
   MIN_DIRECTION_GAP_SNR:.70,MIN_DIRECTION_ESS_RATIO:.35,
@@ -31,6 +38,13 @@
    if(!Number.isInteger(v[k])||v[k]<1||v[k]>(k==="MAX_HANDS"?75:512))throw Error("invalid_"+k);
   if(v.PARTICLE_COUNT<8||v.LIKELIHOOD_DRAWS<2||v.NEXT_HAND_DRAWS<2)throw Error("sample_budget_too_small");
   for(const [k,lo,hi] of [["MIN_EV_THRESHOLD",0,.1],["MIN_CONFIDENCE",0,1],
+   ["MID_SHOE_MIN_EV_THRESHOLD",0,.1],["LATE_SHOE_MIN_EV_THRESHOLD",0,.1],
+   ["EARLY_SHOE_REMAINING_RATIO",0,1],["LATE_SHOE_REMAINING_RATIO",0,1],
+   ["LATE_CONFIDENCE_REMAINING_RATIO",0,1],["LATE_MIN_CONFIDENCE",0,1],
+   ["MIN_BET_EV_GAP",0,.1],["MIN_BET_ESS_RATIO",0,1],["MIN_BET_QUALITY",0,1],
+   ["MAX_BET_EV_SE",.001,.5],["MIN_REMAINING_CARDS_FOR_BET",0,60],
+   ["END_SHOE_OVERRIDE_MIN_EV",0,.2],["END_SHOE_OVERRIDE_CONFIDENCE",0,1],
+   ["END_SHOE_OVERRIDE_MAX_EV_SE",.001,.5],
    ["FRACTIONAL_KELLY",0,1],["MAX_BET_FRACTION",0,.1],
    ["AVERAGE_CARDS_PER_HAND",4,6],["DEPTH_RELIABILITY",0,1],
    ["RESAMPLE_ESS_RATIO",0,1],["LOWER_BOUND_Z",0,4],["SEQUENCE_WEIGHT",0,.05],
@@ -38,6 +52,15 @@
    ["MIN_DIRECTION_ESS_RATIO",0,1],["MIN_DIRECTION_DIVERSITY",0,1],
    ["MAX_DIRECTION_GAP_SE",.001,.5]])
    if(!Number.isFinite(v[k])||v[k]<lo||v[k]>hi)throw Error("invalid_"+k);
+  // Enforce meaningful tier ordering even when callers override defaults.
+  if(!(v.EARLY_SHOE_REMAINING_RATIO>v.LATE_SHOE_REMAINING_RATIO &&
+       v.MIN_EV_THRESHOLD>=v.MID_SHOE_MIN_EV_THRESHOLD &&
+       v.MID_SHOE_MIN_EV_THRESHOLD>=v.LATE_SHOE_MIN_EV_THRESHOLD &&
+       v.LATE_MIN_CONFIDENCE>=v.MIN_CONFIDENCE &&
+       v.END_SHOE_OVERRIDE_MIN_EV>=v.MIN_EV_THRESHOLD &&
+       v.END_SHOE_OVERRIDE_CONFIDENCE>=v.LATE_MIN_CONFIDENCE &&
+       v.END_SHOE_OVERRIDE_MAX_EV_SE<=v.MAX_BET_EV_SE))
+   throw Error("invalid_wager_gate_tier_order");
   return Object.freeze(v);
  }
  function seedFor(history){
@@ -324,6 +347,57 @@
    estimated_only:true,validated_betting_edge:false
   });
  }
+
+ // Decision-only wager selection; does not mutate PF / Physics / Frozen Core /
+ // XGBoost forecasts or the separate moderate B/P research-display gate.
+ function wagerPolicy(remainingCards,cfg=DEFAULT){
+  const ratio=clamp(remainingCards/TOTAL,0,1);
+  const minEV=ratio>cfg.EARLY_SHOE_REMAINING_RATIO?cfg.MIN_EV_THRESHOLD:
+   ratio>=cfg.LATE_SHOE_REMAINING_RATIO?cfg.MID_SHOE_MIN_EV_THRESHOLD:
+   cfg.LATE_SHOE_MIN_EV_THRESHOLD;
+  const minConfidence=ratio<cfg.LATE_CONFIDENCE_REMAINING_RATIO?
+   cfg.LATE_MIN_CONFIDENCE:cfg.MIN_CONFIDENCE;
+  return Object.freeze({
+   remaining_ratio:ratio,min_ev_threshold:minEV,min_confidence:minConfidence
+  });
+ }
+ function wagerGate({cfg,remainingCards,ess,quality,ev,candidate,confidence,se,
+                     lower,enoughDepth,observations,model}){
+  const policy=wagerPolicy(remainingCards,cfg),bestEV=ev[candidate],
+   evGap=Math.abs(ev.B-ev.P);
+  const reasons=[];
+  if(model!=="validated_external_xgb")reasons.push("trained_decision_model_unavailable");
+  if(observations<1||!enoughDepth)reasons.push("insufficient_shoe_depth");
+  if(!(Number.isFinite(ess)&&ess>=cfg.MIN_BET_ESS_RATIO*cfg.PARTICLE_COUNT))
+   reasons.push("low_particle_ess");
+  if(!(Number.isFinite(quality)&&quality>=cfg.MIN_BET_QUALITY))
+   reasons.push("low_particle_quality");
+  if(!(Number.isFinite(evGap)&&evGap>=cfg.MIN_BET_EV_GAP))
+   reasons.push("ev_gap_too_small");
+  if(!(Number.isFinite(bestEV)&&bestEV>=policy.min_ev_threshold))
+   reasons.push("ev_below_dynamic_threshold");
+  if(!(Number.isFinite(confidence)&&confidence>=policy.min_confidence))
+   reasons.push("confidence_below_dynamic_gate");
+  if(!(Number.isFinite(se)&&se<=cfg.MAX_BET_EV_SE))
+   reasons.push("ev_uncertainty_too_high");
+  if(!(Number.isFinite(lower)&&lower>policy.min_ev_threshold))
+   reasons.push("ev_lower_bound_too_low");
+  if(remainingCards<cfg.MIN_REMAINING_CARDS_FOR_BET &&
+     !(bestEV>=cfg.END_SHOE_OVERRIDE_MIN_EV &&
+       confidence>=cfg.END_SHOE_OVERRIDE_CONFIDENCE &&
+       Number.isFinite(se)&&se<=cfg.END_SHOE_OVERRIDE_MAX_EV_SE))
+   reasons.push("shoe_end_no_bet");
+  return Object.freeze({
+   eligible:reasons.length===0,reason:reasons[0]||"positive_ev_with_validated_model",
+   reasons,min_ev_threshold:policy.min_ev_threshold,
+   min_confidence:policy.min_confidence,
+   estimated_remaining_ratio:policy.remaining_ratio,
+   estimated_remaining_cards:remainingCards,
+   ev_gap:evGap,ess_ratio:ess/cfg.PARTICLE_COUNT,
+   max_ev_se:cfg.MAX_BET_EV_SE,
+   model_verified:model==="validated_external_xgb"
+  });
+ }
  function run(history,opts={},externalModel=null,sequenceRuntime=null,sequenceModel=null){
   if(!Array.isArray(history)||history.some(x=>!isResult(x)))throw Error("invalid_bpt_history");
   const cfg=config(opts),seed=seedFor(history),post=posterior(history,cfg,seed);
@@ -367,36 +441,36 @@
    candidate,ev,physical,observations:history.length,
    essRatio:post.ess/cfg.PARTICLE_COUNT,diversity:post.diversity,config:cfg
   });
-  // Calibrated confidence is not available; fail closed on weak ESS/diversity.
-  const qualifies=history.length>0&&enoughDepth&&quality>=.65&&
-   bestEV>=cfg.MIN_EV_THRESHOLD&&confidence>=cfg.MIN_CONFIDENCE&&lower>cfg.MIN_EV_THRESHOLD &&
-   applied.model==="validated_external_xgb";
+  const remainingCards=sum(post.particles.map(x=>sum(x)))/post.particles.length;
+  const wager_gate=wagerGate({
+   cfg,remainingCards,ess:post.ess,quality,ev,candidate,confidence,
+   se,lower,enoughDepth,observations:history.length,model:applied.model
+  });
+  const qualifies=wager_gate.eligible;
   // Until matched, independent holdout-calibrated XGB is supplied, EV is
   // research-only and the safe live decision is always SKIP.
   const win=p[candidate],loss=p[candidate==="B"?"P":"B"],odds=candidate==="B"?.95:1;
   const fullKelly=Math.max(0,(odds*win-loss)/(odds*(win+loss)||1));
   const fraction=qualifies?Math.min(cfg.MAX_BET_FRACTION,cfg.FRACTIONAL_KELLY*fullKelly):0;
-  const reason=qualifies?"positive_ev_with_validated_model":
-   applied.model!=="validated_external_xgb"?"trained_decision_model_unavailable":
-   quality<.65?"low_particle_quality":lower<=cfg.MIN_EV_THRESHOLD?"ev_uncertainty_too_high":
-   bestEV<cfg.MIN_EV_THRESHOLD?"nonpositive_ev":"confidence_below_gate";
+  const reason=wager_gate.reason;
   return{
    version:VERSION,observations:history.length,action:qualifies?(candidate==="B"?"Bet Banker":"Bet Player"):"Skip",
    direction:qualifies?candidate:"SKIP",candidate,reason,probabilities:p,
    physical_probabilities:physical.p,ev_banker:ev.B,ev_player:ev.P,ev_tie:ev.T,
    se_banker:roiSe.B,se_player:roiSe.P,conservative_lower_ev:lower,
    confidence,quality,particle_ess:post.ess,ancestor_diversity:post.diversity,
-   estimated_remaining_cards:sum(post.particles[0]),estimated_penetration:
-    1-sum(post.particles.map(x=>sum(x)))/post.particles.length/TOTAL,
+   estimated_remaining_cards:remainingCards,estimated_penetration:
+    1-remainingCards/TOTAL,
    eor:effects,features48:vector,feature_dimension:48,
    feature_schema:"soft_shoe_bpt_48d_v2",
    frozen_core:frozen,sequence_weight_applied:sequenceWeightApplied,
    model:applied.model,simulation_samples:physical.samples,bankroll_fraction:fraction,
-   research_view,
+   research_view,wager_gate,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,
    seed,config:cfg
   };
  }
  return Object.freeze({VERSION,DEFAULT,config,seedFor,deal,posterior,frozenCore,
-  handProbabilities,evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,moderateDirectionGate,run});
+  handProbabilities,evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,
+  moderateDirectionGate,wagerPolicy,wagerGate,run});
 });
