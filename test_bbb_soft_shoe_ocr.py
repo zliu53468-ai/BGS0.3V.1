@@ -144,7 +144,7 @@ class SoftShoeOCRTests(unittest.TestCase):
             ".reasons.includes('confidence_below_dynamic_gate'),"
             "tinyGapRejected:gate({ev:{B:.05,P:.049,T:0}})"
             ".reasons.includes('ev_gap_too_small'),"
-            "endShoeRejected:gate({remainingCards:20})"
+            "endShoeRejected:gate({remainingCards:20,confidence:.85})"
             ".reasons.includes('shoe_end_no_bet'),"
             "endShoeException:gate({remainingCards:20,ev:{B:.025,P:0,T:0},"
             "confidence:.9,se:.03,lower:.01}).eligible,"
