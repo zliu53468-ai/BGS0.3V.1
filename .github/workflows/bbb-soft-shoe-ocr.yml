@@ -16,14 +16,14 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install isolated prediction transport dependencies
-        run: python -m pip install "numpy>=1.26,<2.4" "nodejs-wheel==24.19.0"
+        run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.8,<4.12" "nodejs-wheel==24.19.0"
       - name: Syntax check all active prediction/OCR bridges
         run: |
-          python -m py_compile bbb_soft_shoe_runtime.py runtime_app.py app.py screenshot_predictor.py test_bbb_soft_shoe_ocr.py
+          python -m py_compile bbb_soft_shoe_runtime.py runtime_app.py app.py screenshot_predictor.py test_bbb_soft_shoe_ocr.py bead_plate_detector.py test_bead_plate_detector.py
           python -m nodejs_wheel --check bbb_engine/soft_shoe_decision_runtime.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_model_bundle.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_frozen_lstm_runtime.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_frozen_model_bundle.js
           python -m nodejs_wheel --check bbb_engine/worker_soft_shoe.cjs
       - name: Exact BBB web/BGS parity, OCR panels, licensing and zero stakes
-        run: python -m unittest -v test_bbb_soft_shoe_ocr.py
+        run: python -m unittest -v test_bbb_soft_shoe_ocr.py test_bead_plate_detector.py
