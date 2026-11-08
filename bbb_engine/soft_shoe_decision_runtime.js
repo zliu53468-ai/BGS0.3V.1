@@ -12,7 +12,7 @@
  "use strict";
  const VERSION="BBB_SOFT_SHOE_BPT_EV_V2";
  const DEFAULT=Object.freeze({
-  PARTICLE_COUNT:300,LIKELIHOOD_DRAWS:32,NEXT_HAND_DRAWS:48,
+  PARTICLE_COUNT:300,LIKELIHOOD_DRAWS:40,NEXT_HAND_DRAWS:64,
   MIN_EV_THRESHOLD:.0030,MIN_CONFIDENCE:.75,FRACTIONAL_KELLY:.225,
   MAX_BET_FRACTION:.0175,AVERAGE_CARDS_PER_HAND:4.95,DEPTH_RELIABILITY:.5,
   MID_SHOE_MIN_EV_THRESHOLD:.00235,LATE_SHOE_MIN_EV_THRESHOLD:.00190,
@@ -23,9 +23,9 @@
   END_SHOE_OVERRIDE_MIN_EV:.025,END_SHOE_OVERRIDE_CONFIDENCE:.90,
   END_SHOE_OVERRIDE_MAX_EV_SE:.030,
   RESAMPLE_ESS_RATIO:.5,MAX_HANDS:72,LOWER_BOUND_Z:1.645,SEQUENCE_WEIGHT:0,
-  MIN_DIRECTION_ROUNDS:3,MIN_DIRECTION_EV_GAP:.020,
-  MIN_DIRECTION_GAP_SNR:.70,MIN_DIRECTION_ESS_RATIO:.35,
-  MIN_DIRECTION_DIVERSITY:.20,MAX_DIRECTION_GAP_SE:.080
+  MIN_DIRECTION_ROUNDS:3,MIN_DIRECTION_EV_GAP:.025,
+  MIN_DIRECTION_GAP_SNR:.90,MIN_DIRECTION_ESS_RATIO:.40,
+  MIN_DIRECTION_DIVERSITY:.25,MAX_DIRECTION_GAP_SE:.070
  });
  const BASE=[128,32,32,32,32,32,32,32,32,32],TOTAL=416;
  const BASE_PROB={B:.458597,P:.446247,T:.095156};
@@ -108,7 +108,8 @@
  }
  function posterior(history,opts={},seed=seedFor(history)){
   const cfg=config(opts),n=cfg.PARTICLE_COUNT,rng=rngFrom(seed);
-  let particles=Array.from({length:n},()=>BASE.slice()),ess=n,diversity=1;
+  let particles=Array.from({length:n},()=>BASE.slice());
+  let weights=Array(n).fill(1/n),ess=n,diversity=1,resampleCount=0;
   let depthExpected=TOTAL;
   if(history.length>cfg.MAX_HANDS)return{available:false,reason:"shoe_depth_limit",config:cfg,seed};
   for(let hand=0;hand<history.length;hand++){
@@ -134,33 +135,44 @@
      proposals[i]=chosen.counts;
     }
    }
-   const w=normalize(evidence);
+   // Sequential importance weights accumulate observed-outcome evidence;
+   // resetting to uniform is valid only after an actual resampling step.
+   const w=normalize(evidence.map((likelihood,i)=>likelihood*weights[i]));
    if(!w)return{available:false,reason:"particle_collapse",config:cfg,seed};
    ess=1/sum(w.map(x=>x*x));
-   const parents=resampleSystematic(w,rng),used=new Map();
    const next=new Array(n);
-   for(let k=0;k<n;k++){
-    const parent=parents[k],times=used.get(parent)||0;
-    used.set(parent,times+1);
-    // Repeated ancestors receive new legal conditional latent hands, not
-    // arbitrary mutations of counts. A bounded fallback clones the proposal.
-    let proposal=proposals[parent];
-    if(times>0){
-     for(let j=0;j<64;j++){
-      const trial=deal(particles[parent],rng);
-      if(trial&&trial.result===observed){proposal=trial.counts;break;}
+   if(ess/n<cfg.RESAMPLE_ESS_RATIO){
+    const parents=resampleSystematic(w,rng),used=new Map();
+    for(let k=0;k<n;k++){
+     const parent=parents[k],times=used.get(parent)||0;
+     used.set(parent,times+1);
+     // Duplicated ancestors get distinct legal conditionally drawn hands,
+     // with a bounded fallback to the accepted proposal (no random mutation).
+     let proposal=proposals[parent];
+     if(times>0){
+      for(let j=0;j<64;j++){
+       const trial=deal(particles[parent],rng);
+       if(trial&&trial.result===observed){proposal=trial.counts;break;}
+      }
      }
+     next[k]=proposal.slice();
     }
-    next[k]=proposal.slice();
+    weights=Array(n).fill(1/n);
+    diversity=used.size/n;
+    resampleCount++;
+   }else{
+    for(let i=0;i<n;i++)next[i]=proposals[i]||particles[i];
+    weights=w;
+    diversity=w.filter(value=>value>0).length/n;
    }
-   particles=next;diversity=used.size/n;
-   depthExpected=target;
+   particles=next;depthExpected=target;
    if(particles.every(p=>sum(p)<6))
     return{available:false,reason:"shoe_exhausted",config:cfg,seed};
   }
-  return{available:true,particles,ess,diversity,depthExpected,config:cfg,seed,
-   observed_actual_cards:false,soft_depth_constraint:true};
+  return{available:true,particles,weights,ess,diversity,resampleCount,depthExpected,
+   config:cfg,seed,observed_actual_cards:false,soft_depth_constraint:true};
  }
+
  function frozenCore(history,sequenceRuntime=null,sequenceModel=null){
   // Prefer the actual 8x8 LSTM inference ONLY with verified frozen real-shoe
   // weights. The production bundle contains none. Untrained diagnostics do
@@ -185,38 +197,44 @@
    validated:false,probabilities:{B:prob[0],P:prob[1],T:prob[2]},
    history_support:a.length,reason:"validated_frozen_lstm_unavailable"};
  }
- function handProbabilities(particles,cfg,seed){
+ function handProbabilities(particles,cfg,seed,weights=null){
   const rng=rngFrom(seed^0x52ec17e),per=[],counts={B:0,P:0,T:0};
+  const n=particles.length,w=weights||Array(n).fill(1/n);
   let samples=0;
-  for(const particle of particles){
-   const local={B:0,P:0,T:0};
+  for(let i=0;i<n;i++){
+   const particle=particles[i],local={B:0,P:0,T:0};
    for(let j=0;j<cfg.NEXT_HAND_DRAWS;j++){
     const x=deal(particle,rng);if(!x)continue;
-    counts[x.result]++;local[x.result]++;samples++;
+    counts[x.result]+=w[i];local[x.result]++;samples++;
    }
    per.push(local);
   }
   if(!samples)return null;
-  const p={B:counts.B/samples,P:counts.P/samples,T:counts.T/samples};
-  const sd={};
+  const total=sum(Object.values(counts));
+  const p={B:counts.B/total,P:counts.P/total,T:counts.T/total};
+  const weightSquares=sum(w.map(x=>x*x)),sd={};
   for(const side of ["B","P","T"]){
    const av=per.map(x=>x[side]/cfg.NEXT_HAND_DRAWS);
-   const mean=sum(av)/av.length;
-   const spread=sum(av.map(x=>(x-mean)**2))/Math.max(1,av.length-1);
+   const mean=sum(av.map((x,i)=>x*w[i]));
+   const spread=sum(av.map((x,i)=>w[i]*(x-mean)**2))/
+    Math.max(1e-12,1-weightSquares);
    const within=p[side]*(1-p[side])/cfg.NEXT_HAND_DRAWS;
-   // Between-shoe latent dispersion is NOT divided by N as if observed data.
-   sd[side]=Math.sqrt(Math.max(0,spread-within)+within/particles.length);
+   // Preserve between-shoe latent dispersion; only MC noise is reduced by
+   // the effective importance-weighted number of posterior particles.
+   sd[side]=Math.sqrt(Math.max(0,spread-within)+within*weightSquares);
   }
-  return{p,sd,samples,per};
+  return{p,sd,samples,per,weights:w};
  }
+
  function evs(p){return{B:.95*p.B-p.P,P:p.P-p.B,T:8*p.T-(1-p.T)};}
- function eor(particles,cfg,seed){
+ function eor(particles,cfg,seed,weights=null){
   // Paired common-random-number simulations for 0..9 hypothetical removal;
   // diagnostic-only sensitivity, not another independent observation.
   const effects=Array(10).fill(0),support=Array(10).fill(0);
   const stride=Math.max(1,Math.floor(particles.length/32));
+  const selected=weights?resampleSystematic(weights,rngFrom(seed^0x9a3f0b1e)):null;
   for(let i=0;i<particles.length;i+=stride){
-   const counts=particles[i];
+   const counts=particles[selected?selected[i]:i];
    for(let rank=0;rank<10;rank++){
     if(counts[rank]<1)continue;
     const removed=counts.slice();removed[rank]--;
@@ -235,8 +253,9 @@
  }
  function features48(posteriorState,physical,history,effects,frozen){
   const parts=posteriorState.particles;
-  const avg=Array.from({length:10},(_,rank)=>sum(parts.map(p=>p[rank]))/parts.length);
-  const stdev=avg.map((v,rank)=>Math.sqrt(sum(parts.map(p=>(p[rank]-v)**2))/parts.length));
+  const weights=posteriorState.weights||Array(parts.length).fill(1/parts.length);
+  const avg=Array.from({length:10},(_,rank)=>sum(parts.map((p,i)=>p[rank]*weights[i])));
+  const stdev=avg.map((v,rank)=>Math.sqrt(sum(parts.map((p,i)=>weights[i]*(p[rank]-v)**2))));
   const prob=physical.p,ev=evs(prob);
   // v2 feature schema: 30 latent shoe features + 6 probabilities/EV +
   // 4 depth/ESS/quality + 5 weak recent-road features + 3 Frozen Core
@@ -321,14 +340,20 @@
   // Gap payoff is +1.95 on Banker, -2 on Player, 0 on Tie.
   const gapSecondMoment=1.95*1.95*physical.p.B+4*physical.p.P;
   const oneHandVariance=Math.max(0,gapSecondMoment-gap*gap);
-  const mcVariance=oneHandVariance/Math.max(1,n);
+  const weights=physical.weights;
+  const weightSquares=weights?sum(weights.map(x=>x*x)):0;
+  const mcVariance=weights?oneHandVariance*weightSquares/cfg.NEXT_HAND_DRAWS:
+   oneHandVariance/Math.max(1,n);
   const each=(physical.per||[]).map(h=>(1.95*h.B-2*h.P)/cfg.NEXT_HAND_DRAWS);
-  const m=each.length?sum(each)/each.length:gap;
-  const spread=each.length>1?sum(each.map(x=>(x-m)**2))/(each.length-1):0;
+  const m=each.length?(weights?sum(each.map((x,i)=>x*weights[i])):
+   sum(each)/each.length):gap;
+  const spread=each.length>1?(weights?
+   sum(each.map((x,i)=>weights[i]*(x-m)**2))/Math.max(1e-12,1-weightSquares):
+   sum(each.map(x=>(x-m)**2))/(each.length-1)):0;
   // Monte Carlo noise in a per-particle gap has variance variance/NEXT_HAND_DRAWS.
   // Debias between-particle variation, then scale as an estimator-mean error.
   const latentMeanVariance=Math.max(0,spread-oneHandVariance/cfg.NEXT_HAND_DRAWS)/
-   Math.max(1,each.length);
+   (weights?Math.max(1,1/weightSquares):Math.max(1,each.length));
   const gapSe=Math.sqrt(mcVariance+latentMeanVariance);
   const snr=gapSe>0?absGap/gapSe:0;
   const reasons=[];
@@ -407,9 +432,9 @@
    config:cfg,seed,...extra
   });
   if(!post.available)return skip(post.reason);
-  const physical=handProbabilities(post.particles,cfg,seed);
+  const physical=handProbabilities(post.particles,cfg,seed,post.weights);
   if(!physical)return skip("physical_simulation_unavailable");
-  const effects=eor(post.particles,cfg,seed),
+  const effects=eor(post.particles,cfg,seed,post.weights),
    frozen=frozenCore(history,sequenceRuntime,sequenceModel);
   const vector=features48(post,physical,history,effects,frozen);
   // Weak sequence can influence physical probability only after a verified
