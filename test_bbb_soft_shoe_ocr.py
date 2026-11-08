@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "7b33490f6a3f69cf077b2954952e6ff55af3904e")
+        self.assertEqual(soft.SOURCE_COMMIT, "a3f1ad2d548e2435d32ef02080964d4f8e5a3605")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -36,9 +36,9 @@ class SoftShoeOCRTests(unittest.TestCase):
             )
         report = soft.analyze_history(SAMPLES[:3])
         cfg = report["config"]
-        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (300, 32, 48))
+        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (300, 40, 64))
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
-                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .020, .70))
+                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .025, .90))
         self.assertEqual(report["observations"], 3)
         self.assertEqual(cfg["MIN_EV_THRESHOLD"], .0030)
         self.assertEqual(cfg["MID_SHOE_MIN_EV_THRESHOLD"], .00235)
@@ -67,6 +67,19 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(report["action"], "Skip")
         self.assertEqual(report["bankroll_fraction"], 0)
         self.assertFalse(report["validated_edge"])
+
+    def test_full_shoe_worker_uses_same_bounded_eight_second_transport(self):
+        # Synthetic-only latency/integration check: not real-shoe hit-rate evidence.
+        history = list("BPPBTBBPPT") * 7
+        started = time.perf_counter()
+        result = soft.analyze_history(history)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(result["observations"], len(history))
+        self.assertEqual(result["config"]["PARTICLE_COUNT"], 300)
+        self.assertEqual(result["config"]["LIKELIHOOD_DRAWS"], 40)
+        self.assertEqual(result["config"]["NEXT_HAND_DRAWS"], 64)
+        self.assertLess(elapsed, soft.TIMEOUT_SECONDS)
+        print(f"BGS_SYNTHETIC_70_HAND_WORKER_SECONDS={elapsed:.3f}")
 
     def test_research_direction_exact_web_parity_and_no_cross_uid_memory(self):
         for history in ([], ["B"], ["T"], list("BPPBT"), SAMPLES * 2):
