@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "a3f1ad2d548e2435d32ef02080964d4f8e5a3605")
+        self.assertEqual(soft.SOURCE_COMMIT, "b5d3830d8ec6f0f61fe8bfa9e5e845c58ab3160d")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -36,9 +36,9 @@ class SoftShoeOCRTests(unittest.TestCase):
             )
         report = soft.analyze_history(SAMPLES[:3])
         cfg = report["config"]
-        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (300, 40, 64))
+        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (448, 80, 128))
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
-                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .025, .90))
+                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .015, 1.15))
         self.assertEqual(report["observations"], 3)
         self.assertEqual(cfg["MIN_EV_THRESHOLD"], .0030)
         self.assertEqual(cfg["MID_SHOE_MIN_EV_THRESHOLD"], .00235)
@@ -75,9 +75,9 @@ class SoftShoeOCRTests(unittest.TestCase):
         result = soft.analyze_history(history)
         elapsed = time.perf_counter() - started
         self.assertEqual(result["observations"], len(history))
-        self.assertEqual(result["config"]["PARTICLE_COUNT"], 300)
-        self.assertEqual(result["config"]["LIKELIHOOD_DRAWS"], 40)
-        self.assertEqual(result["config"]["NEXT_HAND_DRAWS"], 64)
+        self.assertEqual(result["config"]["PARTICLE_COUNT"], 448)
+        self.assertEqual(result["config"]["LIKELIHOOD_DRAWS"], 80)
+        self.assertEqual(result["config"]["NEXT_HAND_DRAWS"], 128)
         self.assertLess(elapsed, soft.TIMEOUT_SECONDS)
         print(f"BGS_SYNTHETIC_70_HAND_WORKER_SECONDS={elapsed:.3f}")
 
@@ -152,7 +152,7 @@ class SoftShoeOCRTests(unittest.TestCase):
             "lower:.01,enoughDepth:true,observations:10,model:'validated_external_xgb'};"
             "const gate=x=>s.wagerGate(Object.assign({},base,x));"
             "const out={tiers:[.61,.60,.30,.2999].map(p=>s.wagerPolicy(416*p,c)),"
-            "essRejected:gate({ess:.45*300-.001}).reasons.includes('low_particle_ess'),"
+            "essRejected:gate({ess:.45*448-.001}).reasons.includes('low_particle_ess'),"
             "lateConfidenceRejected:gate({remainingCards:416*.34,confidence:.79})"
             ".reasons.includes('confidence_below_dynamic_gate'),"
             "tinyGapRejected:gate({ev:{B:.05,P:.049,T:0}})"

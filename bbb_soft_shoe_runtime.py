@@ -16,9 +16,9 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "a3f1ad2d548e2435d32ef02080964d4f8e5a3605"
+SOURCE_COMMIT = "b5d3830d8ec6f0f61fe8bfa9e5e845c58ab3160d"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "88786022da6e1373e9a87db206b808eb8cb6ce67",
+    "soft_shoe_decision_runtime.js": "688c6df8ad54cab0486b822874727e108568b851",
     "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
     "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
     "soft_shoe_frozen_model_bundle.js": "68728cc22c5c3780432827de33e737e7cfcd8343",
@@ -68,9 +68,9 @@ def analyze_history(history: Iterable[str]) -> dict[str, Any]:
     report = result.get("report") or {}
     if report.get("version") != VERSION or report.get("observations") != len(seq):
         raise RuntimeError("BBB Soft Shoe observation/version mismatch")
-    if (report.get("config") or {}).get("PARTICLE_COUNT") != 300 or (
-        (report.get("config") or {}).get("LIKELIHOOD_DRAWS") != 40 or
-        (report.get("config") or {}).get("NEXT_HAND_DRAWS") != 64
+    if (report.get("config") or {}).get("PARTICLE_COUNT") != 448 or (
+        (report.get("config") or {}).get("LIKELIHOOD_DRAWS") != 80 or
+        (report.get("config") or {}).get("NEXT_HAND_DRAWS") != 128
     ):
         raise RuntimeError("BBB Soft Shoe N/L/M configuration mismatch")
     if report.get("action") != "Skip" or report.get("bankroll_fraction") != 0 or report.get("validated_edge") is not False:
