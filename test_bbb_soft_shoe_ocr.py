@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "8cc4e1668fc57eaf3b43ee879ca304787ce05e2f")
+        self.assertEqual(soft.SOURCE_COMMIT, "7b33490f6a3f69cf077b2954952e6ff55af3904e")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -36,7 +36,7 @@ class SoftShoeOCRTests(unittest.TestCase):
             )
         report = soft.analyze_history(SAMPLES[:3])
         cfg = report["config"]
-        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (128, 14, 14))
+        self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (300, 32, 48))
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
                           cfg["MIN_DIRECTION_GAP_SNR"]), (3, .020, .70))
         self.assertEqual(report["observations"], 3)
@@ -134,12 +134,12 @@ class SoftShoeOCRTests(unittest.TestCase):
         source = (
             "const s=require('./bbb_engine/soft_shoe_decision_runtime.js');"
             "const c=s.DEFAULT;"
-            "const base={cfg:c,remainingCards:416*.7,ess:115,quality:.82,"
+            "const base={cfg:c,remainingCards:416*.7,ess:230,quality:.82,"
             "ev:{B:.05,P:.01,T:0},candidate:'B',confidence:.90,se:.02,"
             "lower:.01,enoughDepth:true,observations:10,model:'validated_external_xgb'};"
             "const gate=x=>s.wagerGate(Object.assign({},base,x));"
             "const out={tiers:[.61,.60,.30,.2999].map(p=>s.wagerPolicy(416*p,c)),"
-            "essRejected:gate({ess:.45*128-.001}).reasons.includes('low_particle_ess'),"
+            "essRejected:gate({ess:.45*300-.001}).reasons.includes('low_particle_ess'),"
             "lateConfidenceRejected:gate({remainingCards:416*.34,confidence:.79})"
             ".reasons.includes('confidence_below_dynamic_gate'),"
             "tinyGapRejected:gate({ev:{B:.05,P:.049,T:0}})"
