@@ -25,7 +25,8 @@
   RESAMPLE_ESS_RATIO:.5,MAX_HANDS:72,LOWER_BOUND_Z:1.645,SEQUENCE_WEIGHT:0,
   MIN_DIRECTION_ROUNDS:3,MIN_DIRECTION_EV_GAP:.015,
   MIN_DIRECTION_GAP_SNR:1.15,MIN_DIRECTION_ESS_RATIO:.45,
-  MIN_DIRECTION_DIVERSITY:.30,MAX_DIRECTION_GAP_SE:.060
+  MIN_DIRECTION_DIVERSITY:.30,MAX_DIRECTION_GAP_SE:.060,
+  ADAPTIVE_EXTRA_DRAWS:32,ADAPTIVE_GAP_MARGIN:.008,ADAPTIVE_SNR_MARGIN:.25
  });
  const BASE=[128,32,32,32,32,32,32,32,32,32],TOTAL=416;
  const BASE_PROB={B:.458597,P:.446247,T:.095156};
@@ -34,9 +35,11 @@
  const isResult=r=>r==="B"||r==="P"||r==="T";
  function config(c={}){
   const v={...DEFAULT,...c};
-  for(const k of ["PARTICLE_COUNT","LIKELIHOOD_DRAWS","NEXT_HAND_DRAWS","MAX_HANDS","MIN_DIRECTION_ROUNDS"])
+  for(const k of ["PARTICLE_COUNT","LIKELIHOOD_DRAWS","NEXT_HAND_DRAWS","MAX_HANDS","MIN_DIRECTION_ROUNDS","ADAPTIVE_EXTRA_DRAWS"])
    if(!Number.isInteger(v[k])||v[k]<1||v[k]>(k==="MAX_HANDS"?75:512))throw Error("invalid_"+k);
   if(v.PARTICLE_COUNT<8||v.LIKELIHOOD_DRAWS<2||v.NEXT_HAND_DRAWS<2)throw Error("sample_budget_too_small");
+   if(v.ADAPTIVE_EXTRA_DRAWS>64||v.NEXT_HAND_DRAWS+v.ADAPTIVE_EXTRA_DRAWS>512)
+    throw Error("adaptive_sample_budget_exceeded");
   for(const [k,lo,hi] of [["MIN_EV_THRESHOLD",0,.1],["MIN_CONFIDENCE",0,1],
    ["MID_SHOE_MIN_EV_THRESHOLD",0,.1],["LATE_SHOE_MIN_EV_THRESHOLD",0,.1],
    ["EARLY_SHOE_REMAINING_RATIO",0,1],["LATE_SHOE_REMAINING_RATIO",0,1],
@@ -50,7 +53,8 @@
    ["RESAMPLE_ESS_RATIO",0,1],["LOWER_BOUND_Z",0,4],["SEQUENCE_WEIGHT",0,.05],
    ["MIN_DIRECTION_EV_GAP",0,.2],["MIN_DIRECTION_GAP_SNR",0,4],
    ["MIN_DIRECTION_ESS_RATIO",0,1],["MIN_DIRECTION_DIVERSITY",0,1],
-   ["MAX_DIRECTION_GAP_SE",.001,.5]])
+   ["MAX_DIRECTION_GAP_SE",.001,.5],
+    ["ADAPTIVE_GAP_MARGIN",0,.04],["ADAPTIVE_SNR_MARGIN",0,1]])
    if(!Number.isFinite(v[k])||v[k]<lo||v[k]>hi)throw Error("invalid_"+k);
   // Enforce meaningful tier ordering even when callers override defaults.
   if(!(v.EARLY_SHOE_REMAINING_RATIO>v.LATE_SHOE_REMAINING_RATIO &&
@@ -226,6 +230,40 @@
   return{p,sd,samples,per,weights:w};
  }
 
+ // Pool independent draws per particle without changing posterior weights.
+ function poolPhysical(base,extra){
+  const n=base.per.length,per=[],w=base.weights;
+  const draws=(base.samples+extra.samples)/n;
+  if(!Number.isInteger(draws)||draws<1)return base;
+  const counts={B:0,P:0,T:0};
+  for(let i=0;i<n;i++){
+   const local={};
+   for(const side of ["B","P","T"]){
+    local[side]=base.per[i][side]+extra.per[i][side];
+    counts[side]+=local[side]*w[i];
+   }
+   per.push(local);
+  }
+  const total=sum(Object.values(counts));
+  if(!(total>0))return base;
+  const p={B:counts.B/total,P:counts.P/total,T:counts.T/total};
+  const w2=sum(w.map(x=>x*x)),sd={};
+  for(const side of ["B","P","T"]){
+   const av=per.map(x=>x[side]/draws);
+   const mean=sum(av.map((x,i)=>x*w[i]));
+   const spread=sum(av.map((x,i)=>w[i]*(x-mean)**2))/Math.max(1e-12,1-w2);
+   const within=p[side]*(1-p[side])/draws;
+   sd[side]=Math.sqrt(Math.max(0,spread-within)+within*w2);
+  }
+  return{p,sd,samples:base.samples+extra.samples,per,weights:w};
+ }
+ function shouldRefine(v,rounds,essRatio,diversity,cfg){
+  if(rounds<cfg.MIN_DIRECTION_ROUNDS||
+   essRatio<cfg.MIN_DIRECTION_ESS_RATIO||
+   diversity<cfg.MIN_DIRECTION_DIVERSITY)return false;
+  return Math.abs(v.abs_ev_gap-cfg.MIN_DIRECTION_EV_GAP)<=cfg.ADAPTIVE_GAP_MARGIN||
+   Math.abs(v.ev_gap_snr-cfg.MIN_DIRECTION_GAP_SNR)<=cfg.ADAPTIVE_SNR_MARGIN;
+ }
  function evs(p){return{B:.95*p.B-p.P,P:p.P-p.B,T:8*p.T-(1-p.T)};}
  function eor(particles,cfg,seed,weights=null){
   // Paired common-random-number simulations for 0..9 hypothetical removal;
@@ -342,9 +380,11 @@
   const oneHandVariance=Math.max(0,gapSecondMoment-gap*gap);
   const weights=physical.weights;
   const weightSquares=weights?sum(weights.map(x=>x*x)):0;
-  const mcVariance=weights?oneHandVariance*weightSquares/cfg.NEXT_HAND_DRAWS:
+  const drawsPerParticle=physical.per?.length?physical.samples/physical.per.length:
+   cfg.NEXT_HAND_DRAWS;
+  const mcVariance=weights?oneHandVariance*weightSquares/drawsPerParticle:
    oneHandVariance/Math.max(1,n);
-  const each=(physical.per||[]).map(h=>(1.95*h.B-2*h.P)/cfg.NEXT_HAND_DRAWS);
+  const each=(physical.per||[]).map(h=>(1.95*h.B-2*h.P)/drawsPerParticle);
   const m=each.length?(weights?sum(each.map((x,i)=>x*weights[i])):
    sum(each)/each.length):gap;
   const spread=each.length>1?(weights?
@@ -352,7 +392,7 @@
    sum(each.map(x=>(x-m)**2))/(each.length-1)):0;
   // Monte Carlo noise in a per-particle gap has variance variance/NEXT_HAND_DRAWS.
   // Debias between-particle variation, then scale as an estimator-mean error.
-  const latentMeanVariance=Math.max(0,spread-oneHandVariance/cfg.NEXT_HAND_DRAWS)/
+  const latentMeanVariance=Math.max(0,spread-oneHandVariance/drawsPerParticle)/
    (weights?Math.max(1,1/weightSquares):Math.max(1,each.length));
   const gapSe=Math.sqrt(mcVariance+latentMeanVariance);
   const snr=gapSe>0?absGap/gapSe:0;
@@ -432,8 +472,24 @@
    config:cfg,seed,...extra
   });
   if(!post.available)return skip(post.reason);
-  const physical=handProbabilities(post.particles,cfg,seed,post.weights);
+  let physical=handProbabilities(post.particles,cfg,seed,post.weights);
   if(!physical)return skip("physical_simulation_unavailable");
+  const preliminaryEV=evs(physical.p);
+  const preliminary=moderateDirectionGate({
+   candidate:preliminaryEV.B>=preliminaryEV.P?"B":"P",
+   ev:preliminaryEV,physical,observations:history.length,
+   essRatio:post.ess/cfg.PARTICLE_COUNT,diversity:post.diversity,config:cfg
+  });
+  let adaptiveExtraDraws=0;
+  if(cfg.ADAPTIVE_EXTRA_DRAWS>0&&shouldRefine(preliminary,history.length,
+      post.ess/cfg.PARTICLE_COUNT,post.diversity,cfg)){
+   const extra=handProbabilities(post.particles,
+    {...cfg,NEXT_HAND_DRAWS:cfg.ADAPTIVE_EXTRA_DRAWS},seed^0x5a17d0c3,post.weights);
+   if(extra){
+    physical=poolPhysical(physical,extra);
+    adaptiveExtraDraws=cfg.ADAPTIVE_EXTRA_DRAWS;
+   }
+  }
   const effects=eor(post.particles,cfg,seed,post.weights),
    frozen=frozenCore(history,sequenceRuntime,sequenceModel);
   const vector=features48(post,physical,history,effects,frozen);
@@ -490,12 +546,14 @@
    feature_schema:"soft_shoe_bpt_48d_v2",
    frozen_core:frozen,sequence_weight_applied:sequenceWeightApplied,
    model:applied.model,simulation_samples:physical.samples,bankroll_fraction:fraction,
+   adaptive_sampling:{version:"v5_bounded_32",baseline_draws:cfg.NEXT_HAND_DRAWS,
+    extra_draws:adaptiveExtraDraws,refined:adaptiveExtraDraws>0},
    research_view,wager_gate,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,
    seed,config:cfg
   };
  }
  return Object.freeze({VERSION,DEFAULT,config,seedFor,deal,posterior,frozenCore,
-  handProbabilities,evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,
+  handProbabilities,poolPhysical,shouldRefine,evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,
   moderateDirectionGate,wagerPolicy,wagerGate,run});
 });
