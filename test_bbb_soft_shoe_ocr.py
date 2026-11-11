@@ -1,4 +1,4 @@
-"""BBB exact web Soft Shoe V2 / BGS OCR integration regression contract."""
+"""BBB exact web Soft Shoe V5.1 / BGS OCR integration regression contract."""
 from __future__ import annotations
 import ast
 import hashlib
@@ -22,8 +22,8 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "2be54a70982f7cb3d9e5d6e55bb6636764283077")
-        self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
+        self.assertEqual(soft.SOURCE_COMMIT, "4599789a9df519de3971d6a2f38cf459a175caf0")
+        self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
             "soft_shoe_frozen_lstm_runtime.js", "soft_shoe_frozen_model_bundle.js",
@@ -38,7 +38,10 @@ class SoftShoeOCRTests(unittest.TestCase):
         cfg = report["config"]
         self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (448, 80, 128))
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
-                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .015, 1.15))
+                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .010, 1.05))
+        self.assertEqual((cfg["MIN_DIRECTION_ESS_RATIO"], cfg["MIN_DIRECTION_DIVERSITY"],
+                          cfg["MAX_DIRECTION_GAP_SE"]), (.40, .25, .070))
+        self.assertTrue(cfg["RESEARCH_DIRECTION_RELAXED"])
         self.assertEqual(report["observations"], 3)
         self.assertEqual(cfg["ADAPTIVE_EXTRA_DRAWS"], 32)
         self.assertIn(report.get("adaptive_sampling", {}).get("extra_draws"), (0, 32))
@@ -120,7 +123,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(soft.predict_screen(SAMPLES,user_id="UID-A")["bbb_soft_shoe"]["report"],
                          a["bbb_soft_shoe"]["report"])
 
-    def test_v2_frozen_sequence_and_xgb_schema_fail_closed(self):
+    def test_v5_1_frozen_sequence_and_xgb_schema_fail_closed(self):
         # Includes production untrained LSTM bundle, no fake learned weights.
         out = soft.analyze_history(list("BBPTBBPT"))
         self.assertEqual(out["feature_schema"], "soft_shoe_bpt_48d_v2")
@@ -145,7 +148,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(result.stdout,"physics_only_untrained_decision_fallback")
 
     def test_dynamic_wager_policy_exact_boundaries_and_fail_closed(self):
-        # A direct V2 policy test. Does not change the OCR/Flex/session path.
+        # A direct V5.1 policy test. Does not change the OCR/Flex/session path.
         source = (
             "const s=require('./bbb_engine/soft_shoe_decision_runtime.js');"
             "const c=s.DEFAULT;"
