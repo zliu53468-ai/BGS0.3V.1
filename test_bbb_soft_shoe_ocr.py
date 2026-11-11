@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "b5d3830d8ec6f0f61fe8bfa9e5e845c58ab3160d")
+        self.assertEqual(soft.SOURCE_COMMIT, "2be54a70982f7cb3d9e5d6e55bb6636764283077")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -40,6 +40,8 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
                           cfg["MIN_DIRECTION_GAP_SNR"]), (3, .015, 1.15))
         self.assertEqual(report["observations"], 3)
+        self.assertEqual(cfg["ADAPTIVE_EXTRA_DRAWS"], 32)
+        self.assertIn(report.get("adaptive_sampling", {}).get("extra_draws"), (0, 32))
         self.assertEqual(cfg["MIN_EV_THRESHOLD"], .0030)
         self.assertEqual(cfg["MID_SHOE_MIN_EV_THRESHOLD"], .00235)
         self.assertEqual(cfg["LATE_SHOE_MIN_EV_THRESHOLD"], .0019)
