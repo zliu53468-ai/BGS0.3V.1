@@ -16,7 +16,7 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "975c5f0a9d348691618e2dc76bde66db985ddcde"
+SOURCE_COMMIT = "ce34c8be77df4fc5922a59454daf3dc22d1a1898"
 SOURCE_BLOBS = {
     "soft_shoe_decision_runtime.js": "13ee5a6f829d451b4c156935a9401680a705311b",
     "derived_road_aux.js": "947914689d609414ca787cf7bd8710669e09ef12",

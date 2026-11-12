@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "975c5f0a9d348691618e2dc76bde66db985ddcde")
+        self.assertEqual(soft.SOURCE_COMMIT, "ce34c8be77df4fc5922a59454daf3dc22d1a1898")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
