@@ -1,4 +1,4 @@
-"""BBB exact web Soft Shoe V2 / BGS OCR integration regression contract."""
+"""BBB exact web Soft Shoe V5.1 / BGS OCR integration regression contract."""
 from __future__ import annotations
 import ast
 import hashlib
@@ -22,8 +22,8 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "2be54a70982f7cb3d9e5d6e55bb6636764283077")
-        self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V2")
+        self.assertEqual(soft.SOURCE_COMMIT, "4599789a9df519de3976d1a2f38cf459a175caf0")
+        self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
             "soft_shoe_frozen_lstm_runtime.js", "soft_shoe_frozen_model_bundle.js",
@@ -38,7 +38,15 @@ class SoftShoeOCRTests(unittest.TestCase):
         cfg = report["config"]
         self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"], cfg["NEXT_HAND_DRAWS"]), (448, 80, 128))
         self.assertEqual((cfg["MIN_DIRECTION_ROUNDS"], cfg["MIN_DIRECTION_EV_GAP"],
-                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .015, 1.15))
+                          cfg["MIN_DIRECTION_GAP_SNR"]), (3, .010, 1.05))
+        self.assertEqual(cfg["MIN_DIRECTION_ESS_RATIO"], .40)
+        self.assertEqual(cfg["MIN_DIRECTION_DIVERSITY"], .25)
+        self.assertEqual(cfg["MAX_DIRECTION_GAP_SE"], .070)
+        self.assertTrue(cfg["RESEARCH_DIRECTION_RELAXED"])
+        self.assertEqual(cfg["ADAPTIVE_EXTRA_DRAWS_MAX"], 48)
+        self.assertTrue(cfg["ADAPTIVE_MULTI_HORIZON_ENABLED"])
+        self.assertEqual(cfg["ADAPTIVE_HORIZON_HANDS"], 2)
+        self.assertEqual(cfg["ADAPTIVE_HORIZON_WEIGHT"], .15)
         self.assertEqual(report["observations"], 3)
         self.assertEqual(cfg["ADAPTIVE_EXTRA_DRAWS"], 32)
         self.assertIn(report.get("adaptive_sampling", {}).get("extra_draws"), (0, 32))
@@ -69,6 +77,46 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(report["action"], "Skip")
         self.assertEqual(report["bankroll_fraction"], 0)
         self.assertFalse(report["validated_edge"])
+        self.assertTrue(report["research_view"]["estimated_only"])
+        self.assertFalse(report["research_view"]["validated_betting_edge"])
+        self.assertTrue(report["future_path"]["estimated_only"])
+        self.assertFalse(report["future_path"]["validated_betting_edge"])
+
+    def test_research_direction_relaxation_is_reversible_and_display_only(self):
+        # Synthetic boundary fixture only; it does not represent observed cards or outcomes.
+        source = (
+            "const s=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "const p={B:.4,P:.384,T:.216};"
+            "const physical={samples:128*250,p,per:Array.from({length:128},(_,i)=>"
+            "i<64?{B:120,P:100,T:30}:{B:80,P:92,T:78}),weights:Array(128).fill(1/128)};"
+            "const args={candidate:'B',ev:s.evs(p),physical,observations:3,"
+            "essRatio:.43,diversity:.27,config:s.config()};"
+            "const relaxed=s.moderateDirectionGate(args);"
+            "const strict=s.moderateDirectionGate({...args,"
+            "config:s.config({RESEARCH_DIRECTION_RELAXED:false})});"
+            "const h=['B','P','T','B','B'];const a=s.run(h);"
+            "const b=s.run(h,{RESEARCH_DIRECTION_RELAXED:false});"
+            "process.stdout.write(JSON.stringify({relaxed,strict,action:a.action,"
+            "strictAction:b.action,stake:a.bankroll_fraction,strictStake:b.bankroll_fraction,"
+            "sameProbabilities:JSON.stringify(a.physical_probabilities)==="
+            "JSON.stringify(b.physical_probabilities),sameAdaptive:JSON.stringify(a.adaptive_sampling)==="
+            "JSON.stringify(b.adaptive_sampling),modelVerified:a.wager_gate.model_verified}));"
+        )
+        completed = subprocess.run(_node_command()+["-e",source],cwd=ROOT,
+                                   capture_output=True,text=True,check=True,timeout=8)
+        result=json.loads(completed.stdout)
+        self.assertTrue(result["relaxed"]["eligible"])
+        self.assertEqual(result["relaxed"]["direction"], "B")
+        self.assertFalse(result["strict"]["eligible"])
+        self.assertEqual(result["strict"]["direction"], "SKIP")
+        self.assertIn("weak_ev_separation", result["strict"]["reasons"])
+        self.assertEqual(result["action"], "Skip")
+        self.assertEqual(result["strictAction"], "Skip")
+        self.assertEqual(result["stake"], 0)
+        self.assertEqual(result["strictStake"], 0)
+        self.assertTrue(result["sameProbabilities"])
+        self.assertTrue(result["sameAdaptive"])
+        self.assertFalse(result["modelVerified"])
 
     def test_full_shoe_worker_uses_same_bounded_eight_second_transport(self):
         # Synthetic-only latency/integration check: not real-shoe hit-rate evidence.
@@ -120,7 +168,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(soft.predict_screen(SAMPLES,user_id="UID-A")["bbb_soft_shoe"]["report"],
                          a["bbb_soft_shoe"]["report"])
 
-    def test_v2_frozen_sequence_and_xgb_schema_fail_closed(self):
+    def test_v5_frozen_sequence_and_xgb_schema_fail_closed(self):
         # Includes production untrained LSTM bundle, no fake learned weights.
         out = soft.analyze_history(list("BBPTBBPT"))
         self.assertEqual(out["feature_schema"], "soft_shoe_bpt_48d_v2")
