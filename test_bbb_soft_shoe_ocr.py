@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "4599789a9df519de3971d6a2f38cf459a175caf0")
+        self.assertEqual(soft.SOURCE_COMMIT, "4599789a9df519de3976d1a2f38cf459a175caf0")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -72,6 +72,47 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(report["action"], "Skip")
         self.assertEqual(report["bankroll_fraction"], 0)
         self.assertFalse(report["validated_edge"])
+
+
+    def test_three_histories_against_byte_locked_bbb_main_engine(self):
+        # The four local JS blobs are checked against BBB/main in
+        # test_sources_and_config_match_bbb; run() must remain behavior-identical.
+        cases = [list("BPT"), list("BPPBTBBPPT"), list("BBPPPTTBBPBPTPPBBTP")]
+        script = (
+            "global.self=global;"
+            "const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "require('./bbb_engine/soft_shoe_model_bundle.js');"
+            "const frozen=require('./bbb_engine/soft_shoe_frozen_lstm_runtime.js');"
+            "require('./bbb_engine/soft_shoe_frozen_model_bundle.js');"
+            "const histories=JSON.parse(process.argv[1]);"
+            "process.stdout.write(JSON.stringify(histories.map(h=>core.run(h,{},"
+            "global.BBB_SOFT_SHOE_XGB_MODEL,frozen,global.BBB_SOFT_SHOE_LSTM_MODEL))));"
+        )
+        direct = subprocess.run(
+            _node_command() + ["-e", script, json.dumps(cases)],
+            cwd=ROOT, capture_output=True, text=True, check=True, timeout=12.0
+        )
+        expected = json.loads(direct.stdout)
+        self.assertEqual(len(expected), len(cases))
+        for history, web in zip(cases, expected):
+            line = soft.analyze_history(history)
+            self.assertEqual(line["version"], web["version"])
+            for outcome in ("B", "P", "T"):
+                self.assertAlmostEqual(line["probabilities"][outcome],
+                                       web["probabilities"][outcome], places=12)
+            self.assertEqual(line["research_view"]["direction"],
+                             web["research_view"]["direction"])
+            self.assertEqual(line["research_view"]["eligible"],
+                             web["research_view"]["eligible"])
+            self.assertEqual(line, web)
+            self.assertEqual(line["action"], "Skip")
+            self.assertEqual(line["bankroll_fraction"], 0)
+            self.assertIs(line["validated_edge"], False)
+            cfg = line["config"]
+            self.assertEqual((cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"],
+                              cfg["NEXT_HAND_DRAWS"]), (448, 80, 128))
+            self.assertIs(cfg["RESEARCH_DIRECTION_RELAXED"], True)
+            self.assertFalse(soft.predict_screen(history)["bet_allowed"])
 
     def test_full_shoe_worker_uses_same_bounded_eight_second_transport(self):
         # Synthetic-only latency/integration check: not real-shoe hit-rate evidence.
