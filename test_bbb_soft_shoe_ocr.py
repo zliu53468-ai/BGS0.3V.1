@@ -22,11 +22,12 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "4599789a9df519de3976d1a2f38cf459a175caf0")
+        self.assertEqual(soft.SOURCE_COMMIT, "48b55951832b5c97bf272fca07b3ebbf3af7bb34")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
             "soft_shoe_frozen_lstm_runtime.js", "soft_shoe_frozen_model_bundle.js",
+            "derived_road_aux.js",
         })
         for name, sha in soft.SOURCE_BLOBS.items():
             data = (ROOT / "bbb_engine" / name).read_bytes()
@@ -42,6 +43,13 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual((cfg["MIN_DIRECTION_ESS_RATIO"], cfg["MIN_DIRECTION_DIVERSITY"],
                           cfg["MAX_DIRECTION_GAP_SE"]), (.40, .25, .070))
         self.assertTrue(cfg["RESEARCH_DIRECTION_RELAXED"])
+        self.assertIs(cfg["ROAD_AUX_ENABLED"], True)
+        self.assertEqual(cfg["ROAD_AUX_MIN_HISTORY"], 12)
+        self.assertEqual(cfg["ROAD_AUX_AGREEMENT_MIN"], .67)
+        self.assertEqual(cfg["ROAD_AUX_CONFIDENCE_MIN"], .45)
+        self.assertEqual(cfg["ROAD_AUX_MAX_BOOST"], .08)
+        self.assertEqual(cfg["ROAD_AUX_CONFLICT_PENALTY"], .06)
+        self.assertIs(cfg["ROAD_AUX_REQUIRE_SOFT_ELIGIBLE"], True)
         self.assertEqual(report["observations"], 3)
         self.assertEqual(cfg["ADAPTIVE_EXTRA_DRAWS"], 32)
         self.assertIn(report.get("adaptive_sampling", {}).get("extra_draws"), (0, 32))
@@ -113,6 +121,124 @@ class SoftShoeOCRTests(unittest.TestCase):
                               cfg["NEXT_HAND_DRAWS"]), (448, 80, 128))
             self.assertIs(cfg["RESEARCH_DIRECTION_RELAXED"], True)
             self.assertFalse(soft.predict_screen(history)["bet_allowed"])
+
+
+    def test_bbb_main_road_aux_parity_and_zero_stakes(self):
+        # Direct BBB.run on the EXACT five source blobs. All history prefixes
+        # are B/P/T only; neither OCR nor older road feature input is passed.
+        cases = [
+            [],
+            ["B", "P", "T", "B"],
+            list("BP" * 12),  # alternating road; derived marks available
+            list("BBBBBBPPPPPPBBBBPPPTTTBPB"),  # long streak and ties
+            list("BBPPPTTBBPBPTPPBBTP"),  # EV-sensitive synthetic sample
+        ]
+        script = (
+            "global.self=global;"
+            "const aux=require('./bbb_engine/derived_road_aux.js');"
+            "const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "require('./bbb_engine/soft_shoe_model_bundle.js');"
+            "const frozen=require('./bbb_engine/soft_shoe_frozen_lstm_runtime.js');"
+            "require('./bbb_engine/soft_shoe_frozen_model_bundle.js');"
+            "const histories=JSON.parse(process.argv[1]);"
+            "process.stdout.write(JSON.stringify(histories.map(h=>core.run(h,{},"
+            "global.BBB_SOFT_SHOE_XGB_MODEL,frozen,global.BBB_SOFT_SHOE_LSTM_MODEL))));"
+        )
+        direct = subprocess.run(
+            _node_command() + ["-e", script, json.dumps(cases)],
+            cwd=ROOT, capture_output=True, text=True,
+            check=True, timeout=20,
+        )
+        expected = json.loads(direct.stdout)
+        for history, original in zip(cases, expected):
+            line = soft.analyze_history(history)
+            # Structural equality includes future_path, adaptive_sampling,
+            # EV, confidence and the original research gate, not just VERSION.
+            self.assertEqual(line, original)
+            self.assertEqual(line["version"], soft.VERSION)
+            cfg = line["config"]
+            self.assertEqual(
+                (cfg["PARTICLE_COUNT"], cfg["LIKELIHOOD_DRAWS"],
+                 cfg["NEXT_HAND_DRAWS"]), (448, 80, 128)
+            )
+            self.assertIs(cfg["ROAD_AUX_ENABLED"], True)
+            road = line["road_aux"]
+            self.assertIs(road["estimated_only"], True)
+            self.assertIs(road["validated_betting_edge"], False)
+            self.assertEqual(road, original["road_aux"])
+            self.assertEqual(line.get("research_view"), original.get("research_view"))
+            self.assertEqual(line.get("future_path"), original.get("future_path"))
+            self.assertEqual(line.get("adaptive_sampling"), original.get("adaptive_sampling"))
+            self.assertEqual(line["action"], "Skip")
+            self.assertEqual(line["bankroll_fraction"], 0)
+            self.assertIs(line["validated_edge"], False)
+            if line.get("probabilities"):
+                for k in ("B", "P", "T"):
+                    self.assertAlmostEqual(line["probabilities"][k],
+                                           original["probabilities"][k], places=12)
+                self.assertAlmostEqual(line["ev_banker"], original["ev_banker"], places=12)
+                self.assertAlmostEqual(line["ev_player"], original["ev_player"], places=12)
+        self.assertTrue(expected[2]["road_aux"]["available"])
+        self.assertGreaterEqual(expected[2]["road_aux"]["big_road_depth"], 12)
+
+    def test_road_aux_disabled_preserves_soft_physics_and_wager(self):
+        history = list("BBPPPTTBBPBPTPPBBTP")
+        script = (
+            "global.self=global;"
+            "const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "const h=JSON.parse(process.argv[1]);"
+            "const on=core.run(h),off=core.run(h,{ROAD_AUX_ENABLED:false});"
+            "process.stdout.write(JSON.stringify({on,off}));"
+        )
+        direct = subprocess.run(
+            _node_command() + ["-e", script, json.dumps(history)],
+            cwd=ROOT, capture_output=True, text=True, check=True, timeout=12,
+        )
+        both = json.loads(direct.stdout)
+        on, off = both["on"], both["off"]
+        self.assertIs(on["config"]["ROAD_AUX_ENABLED"], True)
+        self.assertIs(off["config"]["ROAD_AUX_ENABLED"], False)
+        self.assertEqual(off["road_aux"]["reason"], "disabled")
+        for field in (
+            "version", "candidate", "probabilities",
+            "physical_probabilities", "ev_banker", "ev_player",
+            "ev_tie", "particle_ess", "ancestor_diversity", "features48",
+            "adaptive_sampling", "wager_gate", "action",
+            "bankroll_fraction", "validated_edge",
+        ):
+            self.assertEqual(on[field], off[field], field)
+        self.assertEqual(on["research_view"]["direction"],
+                         off["research_view"]["direction"])
+        self.assertEqual(on["research_view"]["eligible"],
+                         off["research_view"]["eligible"])
+
+    def test_line_adapter_exposes_road_without_authorizing_bets(self):
+        history = list("BP" * 12)
+        first = soft.predict_screen(history, user_id="ROAD-UID-A")
+        second = soft.predict_screen(history, user_id="ROAD-UID-B")
+        self.assertEqual(first["bbb_soft_shoe"]["report"],
+                         second["bbb_soft_shoe"]["report"])
+        report = first["bbb_soft_shoe"]["report"]
+        self.assertEqual(first["research_view"], report["research_view"])
+        self.assertEqual(first["future_path"], report["future_path"])
+        self.assertEqual(first["adaptive_sampling"], report["adaptive_sampling"])
+        self.assertEqual(first["road_aux"], report["road_aux"])
+        self.assertEqual(first["road_summary"]["road_side"],
+                         report["road_aux"]["road_side"])
+        self.assertEqual(first["road_summary"]["agreement"],
+                         report["road_aux"]["road_agreement"])
+        self.assertIs(first["road_confirmed"],
+                      report["research_view"]["road_confirmed"])
+        self.assertIs(first["road_conflict"],
+                      report["research_view"]["road_conflict"])
+        self.assertEqual(first["research_direction"],
+                         report["research_view"]["direction"])
+        self.assertFalse(first["bet_allowed"])
+        self.assertIs(first["official_bet_allowed"], False)
+        self.assertIs(first["bbb_soft_shoe"]["official_bet_allowed"], False)
+        self.assertFalse(first["money_management"]["bet_allowed"])
+        self.assertEqual(first["bet_amount"], 0)
+        self.assertIn("非保證勝率", first["road_signal_note"])
 
     def test_full_shoe_worker_uses_same_bounded_eight_second_transport(self):
         # Synthetic-only latency/integration check: not real-shoe hit-rate evidence.

@@ -33,7 +33,11 @@
   ADAPTIVE_MIN_ESS_RATIO:.42,ADAPTIVE_MIN_DIVERSITY:.28,
   ADAPTIVE_MAX_ESS_RATIO:.75,ADAPTIVE_ROLLBACK_TOLERANCE:.08,
   ADAPTIVE_IMPORTANCE_MIX:.10,
-  ADAPTIVE_GAP_MARGIN:.008,ADAPTIVE_SNR_MARGIN:.25
+  ADAPTIVE_GAP_MARGIN:.008,ADAPTIVE_SNR_MARGIN:.25,
+  ROAD_AUX_ENABLED:true,ROAD_AUX_MIN_HISTORY:12,
+  ROAD_AUX_AGREEMENT_MIN:.67,ROAD_AUX_CONFIDENCE_MIN:.45,
+  ROAD_AUX_MAX_BOOST:.08,ROAD_AUX_CONFLICT_PENALTY:.06,
+  ROAD_AUX_REQUIRE_SOFT_ELIGIBLE:true
  });
  // Research-display thresholds before V5.1's display-only relaxation.
  // Adaptive next-hand refinement keeps these references unchanged.
@@ -59,6 +63,11 @@
    throw Error("invalid_ADAPTIVE_MULTI_HORIZON_ENABLED");
   if(typeof v.RESEARCH_DIRECTION_RELAXED!=="boolean")
    throw Error("invalid_RESEARCH_DIRECTION_RELAXED");
+  for(const k of ["ROAD_AUX_ENABLED","ROAD_AUX_REQUIRE_SOFT_ELIGIBLE"])
+   if(typeof v[k]!=="boolean")throw Error("invalid_"+k);
+  if(!Number.isInteger(v.ROAD_AUX_MIN_HISTORY)||
+     v.ROAD_AUX_MIN_HISTORY<1||v.ROAD_AUX_MIN_HISTORY>72)
+   throw Error("invalid_ROAD_AUX_MIN_HISTORY");
   if(v.ADAPTIVE_EXTRA_DRAWS>v.ADAPTIVE_EXTRA_DRAWS_MAX||
      v.NEXT_HAND_DRAWS+v.ADAPTIVE_EXTRA_DRAWS_MAX>512)
    throw Error("adaptive_sample_budget_exceeded");
@@ -82,7 +91,9 @@
    ["ADAPTIVE_NEXT_HAND_SHARE",0,1],["ADAPTIVE_HORIZON_WEIGHT",0,.25],
    ["ADAPTIVE_MIN_ESS_RATIO",0,1],["ADAPTIVE_MIN_DIVERSITY",0,1],
    ["ADAPTIVE_MAX_ESS_RATIO",0,1],["ADAPTIVE_ROLLBACK_TOLERANCE",0,.08],
-   ["ADAPTIVE_IMPORTANCE_MIX",.01,.25]])
+   ["ADAPTIVE_IMPORTANCE_MIX",.01,.25],
+   ["ROAD_AUX_AGREEMENT_MIN",0,1],["ROAD_AUX_CONFIDENCE_MIN",0,1],
+   ["ROAD_AUX_MAX_BOOST",0,.10],["ROAD_AUX_CONFLICT_PENALTY",0,1]])
    if(!Number.isFinite(v[k])||v[k]<lo||v[k]>hi)throw Error("invalid_"+k);
   // Enforce meaningful tier ordering even when callers override defaults.
   if(!(v.ADAPTIVE_MIN_ESS_RATIO<v.ADAPTIVE_MAX_ESS_RATIO &&
@@ -617,9 +628,77 @@
    model_verified:model==="validated_external_xgb"
   });
  }
+ // Road operations are disconnected from the posterior, EV and wager gate.
+ // This module never feeds ranks, outcomes or pattern estimates to particles.
+ function fuseRoadResearch(research,futurePath,road,cfg,candidate){
+  if(!cfg.ROAD_AUX_ENABLED)
+   return {research_view:research,future_path:futurePath};
+  const snr=Math.max(0,Number(research?.ev_gap_snr)||0);
+  const base=Number.isFinite(futurePath?.future_edge_score)?
+   clamp(futurePath.future_edge_score,0,1):clamp(snr/(1+snr),0,1);
+  let edge=base,confirmed=false,nearConfirmed=false,conflict=false;
+  if(road?.available&&road.estimated_only===true&&
+     road.validated_betting_edge===false){
+   const agreementOk=road.road_agreement>=cfg.ROAD_AUX_AGREEMENT_MIN;
+   const confidenceOk=road.road_confidence>=cfg.ROAD_AUX_CONFIDENCE_MIN;
+   const eligible=research?.eligible===true;
+   // If explicitly relaxed, allow a *near-eligible* diagnostic score boost
+   // only with adequate ESS, diversity and SE. Never promote eligibility.
+   const nearEligible=!eligible&&!cfg.ROAD_AUX_REQUIRE_SOFT_ELIGIBLE&&
+    research?.candidate===candidate&&
+    research.abs_ev_gap>=.9*cfg.MIN_DIRECTION_EV_GAP&&
+    research.ev_gap_snr>=.9*cfg.MIN_DIRECTION_GAP_SNR&&
+    research.ess_ratio>=cfg.MIN_DIRECTION_ESS_RATIO&&
+    research.ancestor_diversity>=cfg.MIN_DIRECTION_DIVERSITY&&
+    research.ev_gap_se>0&&research.ev_gap_se<=cfg.MAX_DIRECTION_GAP_SE;
+   if((eligible||nearEligible)&&agreementOk&&confidenceOk&&
+      road.road_side===candidate){
+    edge=clamp(edge+Math.min(cfg.ROAD_AUX_MAX_BOOST,.10)*
+     road.road_agreement,0,1);
+    confirmed=eligible;
+    nearConfirmed=nearEligible;
+   }else if(agreementOk&&road.road_side!=="NEUTRAL"&&
+             road.road_side!==candidate){
+    edge=clamp(edge-cfg.ROAD_AUX_CONFLICT_PENALTY,0,1);
+    conflict=true;
+   }
+  }
+  const label=confirmed?"雙訊號同向":nearConfirmed?
+   "接近門檻但仍觀望（牌路同向）":conflict?
+   "物理與牌路分歧（觀望偏安全）":null;
+  const adjustedPath={...futurePath,
+   ...(Number.isFinite(futurePath?.future_edge_score)?
+    {future_edge_score:edge,
+     unadjusted_future_edge_score:futurePath.future_edge_score}:{}),
+   research_aux_edge_score:edge,road_aux_adjustment:edge-base,
+   estimated_only:true,validated_betting_edge:false};
+  return {
+   research_view:{...research,road_confirmed:confirmed,
+    road_near_confirmed:nearConfirmed,road_conflict:conflict,
+    road_confidence_label:label,research_aux_edge_score:edge,
+    research_aux_base_edge_score:base,estimated_only:true,
+    validated_betting_edge:false},
+   future_path:adjustedPath
+  };
+ }
+ function derivedRoadAux(history,cfg){
+  if(!cfg.ROAD_AUX_ENABLED)return {
+   available:false,reason:"disabled",big_road_columns:0,
+   big_road_depth:history.filter(x=>x!=="T").length,
+   probes:{big_eye:"N",small:"N",cockroach:"N"},
+   road_side:"NEUTRAL",road_agreement:0,road_confidence:0,
+   estimated_only:true,validated_betting_edge:false};
+  const dep=(typeof module==="object"&&module.exports)?
+   require("./derived_road_aux.js"):
+   (typeof self!=="undefined"?self:typeof window!=="undefined"?window:null)?.BBBDerivedRoadAux;
+  if(!dep||typeof dep.analyze!=="function")
+   throw Error("road_aux_dependency_missing");
+  return dep.analyze(history,{minHistory:cfg.ROAD_AUX_MIN_HISTORY});
+ }
  function run(history,opts={},externalModel=null,sequenceRuntime=null,sequenceModel=null){
   if(!Array.isArray(history)||history.some(x=>!isResult(x)))throw Error("invalid_bpt_history");
   const cfg=config(opts),seed=seedFor(history),post=posterior(history,cfg,seed);
+  const road_aux=derivedRoadAux(history,cfg);
   const skip=(reason,extra={})=>({
    version:VERSION,observations:history.length,action:"Skip",direction:"SKIP",
    reason,bankroll_fraction:0,confidence:0,validated_edge:false,observed_actual_cards:false,
@@ -628,7 +707,7 @@
     extra_draws:0,extra_next_hand_draws:0,extra_horizon_draws:0,rollback_reason:null},
    future_path:{available:false,reason:"forecast_unavailable",
     estimated_only:true,validated_betting_edge:false},
-   config:cfg,seed,...extra
+   config:cfg,seed,road_aux,...extra
   });
   if(!post.available)return skip(post.reason);
   let physical=handProbabilities(post.particles,cfg,seed,post.weights);
@@ -728,9 +807,11 @@
     research_view.ev_gap_snr):
    {available:false,reason:"feature_disabled",estimated_only:true,
     validated_betting_edge:false};
-  const researchConfidenceTag=futurePath.available&&
-   futurePath.future_edge_score>=.72&&research_view.eligible===true?
-   "高信心短中期優勢":null;
+  const fusion=fuseRoadResearch(research_view,futurePath,road_aux,cfg,candidate);
+  const researchConfidenceTag=fusion.research_view.road_confidence_label||
+   (futurePath.available&&
+    futurePath.future_edge_score>=.72&&research_view.eligible===true?
+    "高信心短中期優勢":null);
   // Until matched, independent holdout-calibrated XGB is supplied, EV is
   // research-only and the safe live decision is always SKIP.
   const win=p[candidate],loss=p[candidate==="B"?"P":"B"],odds=candidate==="B"?.95:1;
@@ -750,8 +831,8 @@
    frozen_core:frozen,sequence_weight_applied:sequenceWeightApplied,
    model:applied.model,simulation_samples:physical.samples,bankroll_fraction:fraction,
    adaptive_sampling:adaptiveSampling,
-   future_path:{...futurePath,research_label:researchConfidenceTag},
-   research_view,wager_gate,
+   future_path:{...fusion.future_path,research_label:researchConfidenceTag},
+   research_view:fusion.research_view,road_aux,wager_gate,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,
    seed,config:cfg
   };
@@ -760,5 +841,5 @@
   handProbabilities,poolPhysical,shouldRefine,conditionalPosteriorResample,
   shouldRollbackAdaptive,directionConsistency,futureEdgeScore,simulateFuturePaths,
   evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,
-  moderateDirectionGate,wagerPolicy,wagerGate,run});
+  moderateDirectionGate,wagerPolicy,wagerGate,fuseRoadResearch,derivedRoadAux,run});
 });

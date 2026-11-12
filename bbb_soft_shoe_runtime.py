@@ -16,9 +16,10 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "4599789a9df519de3976d1a2f38cf459a175caf0"
+SOURCE_COMMIT = "48b55951832b5c97bf272fca07b3ebbf3af7bb34"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "c9132e0503a6be75737968a063d024a6dece80f3",
+    "soft_shoe_decision_runtime.js": "0feb31af740c8eacd5568224f043a0a11de2342a",
+    "derived_road_aux.js": "11d669a67e7bbc3edcd67c4b11f728d353521fc8",
     "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
     "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
     "soft_shoe_frozen_model_bundle.js": "68728cc22c5c3780432827de33e737e7cfcd8343",
@@ -75,6 +76,11 @@ def analyze_history(history: Iterable[str]) -> dict[str, Any]:
         raise RuntimeError("BBB Soft Shoe N/L/M configuration mismatch")
     if report.get("action") != "Skip" or report.get("bankroll_fraction") != 0 or report.get("validated_edge") is not False:
         raise RuntimeError("BBB unvalidated betting gate changed")
+    if (report.get("config") or {}).get("ROAD_AUX_ENABLED") is not True:
+        raise RuntimeError("BBB Soft Shoe road auxiliary must follow BBB/main defaults")
+    road = report.get("road_aux")
+    if not isinstance(road, dict) or road.get("estimated_only") is not True or road.get("validated_betting_edge") is not False:
+        raise RuntimeError("BBB Soft Shoe road auxiliary safety contract changed")
     return report
 
 
@@ -94,6 +100,17 @@ def predict_screen(
            for x in (history or [])]
     report = analyze_history(seq)
     view = dict(report.get("research_view") or {})
+    road = dict(report.get("road_aux") or {})
+    road_summary = {
+        "available": road.get("available") is True,
+        "road_side": road.get("road_side", "NEUTRAL"),
+        "agreement": road.get("road_agreement", 0),
+        "confidence": road.get("road_confidence", 0),
+        "confirmed": view.get("road_confirmed") is True,
+        "conflict": view.get("road_conflict") is True,
+        "estimated_only": True,
+        "validated_betting_edge": False,
+    }
     display = view.get("direction") if view.get("direction") in {"B", "P"} else "SKIP"
     label = {"B": "莊", "P": "閒", "SKIP": "觀望"}[display]
     prob = report.get("probabilities") or {}
@@ -105,6 +122,7 @@ def predict_screen(
         "system_model_version": VERSION, "bbb_soft_shoe": {
             "active": True, "source_commit": SOURCE_COMMIT,
             "report": report, "research_signal": view,
+            "road_aux": road, "road_summary": road_summary,
             "display_direction": display, "official_bet_allowed": False,
         },
         "action": display, "recommend": display, "direction": display,
@@ -114,6 +132,14 @@ def predict_screen(
         "next_round_direction_text": label,
         "skip": display == "SKIP", "force_observe": display == "SKIP",
         "skip_reason": str(view.get("reason") or report.get("reason") or ""),
+        "research_view": view, "research_direction": display,
+        "road_aux": road, "road_summary": road_summary,
+        "road_confirmed": road_summary["confirmed"],
+        "road_conflict": road_summary["conflict"],
+        "future_path": dict(report.get("future_path") or {}),
+        "adaptive_sampling": dict(report.get("adaptive_sampling") or {}),
+        "road_signal_note": "牌路為輔助圖案訊號，非保證勝率；正式不可自動下注",
+        "official_bet_allowed": False,
         "banker_rate": float(prob["B"]) * 100,
         "player_rate": float(prob["P"]) * 100,
         "tie_rate": float(prob["T"]) * 100,

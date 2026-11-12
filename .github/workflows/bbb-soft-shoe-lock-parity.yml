@@ -1,0 +1,41 @@
+name: BBB locked Soft Shoe + Road Aux exact parity
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - bbb_engine/soft_shoe_*.js
+      - bbb_engine/derived_road_aux.js
+      - bbb_engine/worker_soft_shoe.cjs
+      - bbb_soft_shoe_runtime.py
+      - test_bbb_soft_shoe_ocr.py
+      - .github/workflows/bbb-soft-shoe-lock-parity.yml
+  push:
+    branches: [main]
+    paths:
+      - bbb_engine/soft_shoe_*.js
+      - bbb_engine/derived_road_aux.js
+      - bbb_engine/worker_soft_shoe.cjs
+      - bbb_soft_shoe_runtime.py
+      - test_bbb_soft_shoe_ocr.py
+      - .github/workflows/bbb-soft-shoe-lock-parity.yml
+permissions:
+  contents: read
+jobs:
+  source-locked-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install isolated test dependencies
+        run: python -m pip install "numpy>=1.26,<2.4" "opencv-python-headless>=4.8,<4.12" "nodejs-wheel==24.19.0"
+      - name: Syntax check core, adapter, transport and derived-road
+        run: |
+          python -m py_compile bbb_soft_shoe_runtime.py test_bbb_soft_shoe_ocr.py
+          python -m nodejs_wheel --check bbb_engine/soft_shoe_decision_runtime.js
+          python -m nodejs_wheel --check bbb_engine/derived_road_aux.js
+          python -m nodejs_wheel --check bbb_engine/worker_soft_shoe.cjs
+      - name: Exact BBB source lock, multi-history parity and strict Skip
+        run: python -m unittest -v test_bbb_soft_shoe_ocr.py

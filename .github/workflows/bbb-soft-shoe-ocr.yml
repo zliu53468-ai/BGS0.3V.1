@@ -20,6 +20,7 @@ jobs:
       - name: Syntax check all active prediction/OCR bridges
         run: |
           python -m py_compile bbb_soft_shoe_runtime.py runtime_app.py app.py screenshot_predictor.py test_bbb_soft_shoe_ocr.py bead_plate_detector.py test_bead_plate_detector.py
+          python -m nodejs_wheel --check bbb_engine/derived_road_aux.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_decision_runtime.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_model_bundle.js
           python -m nodejs_wheel --check bbb_engine/soft_shoe_frozen_lstm_runtime.js
