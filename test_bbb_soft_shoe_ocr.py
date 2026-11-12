@@ -22,7 +22,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "48b55951832b5c97bf272fca07b3ebbf3af7bb34")
+        self.assertEqual(soft.SOURCE_COMMIT, "975c5f0a9d348691618e2dc76bde66db985ddcde")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -44,6 +44,14 @@ class SoftShoeOCRTests(unittest.TestCase):
                           cfg["MAX_DIRECTION_GAP_SE"]), (.40, .25, .070))
         self.assertTrue(cfg["RESEARCH_DIRECTION_RELAXED"])
         self.assertIs(cfg["ROAD_AUX_ENABLED"], True)
+        self.assertIs(cfg["ROAD_AUX_ADAPTIVE_ENABLED"], True)
+        self.assertEqual(cfg["ROAD_AUX_STABILITY_WINDOW"], 8)
+        self.assertEqual(cfg["ROAD_AUX_STABILITY_MIN"], .35)
+        self.assertEqual(cfg["ROAD_AUX_LEARN_WINDOW"], 30)
+        self.assertEqual(cfg["ROAD_AUX_LEARN_MIN_SAMPLES"], 8)
+        self.assertEqual(cfg["ROAD_AUX_LEARN_FLOOR"], .40)
+        self.assertEqual(cfg["ROAD_AUX_LEARN_CEIL"], 1.0)
+        self.assertEqual(cfg["ROAD_AUX_LEARN_NEUTRAL"], .70)
         self.assertEqual(cfg["ROAD_AUX_MIN_HISTORY"], 12)
         self.assertEqual(cfg["ROAD_AUX_AGREEMENT_MIN"], .67)
         self.assertEqual(cfg["ROAD_AUX_CONFIDENCE_MIN"], .45)
@@ -80,6 +88,9 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertEqual(report["action"], "Skip")
         self.assertEqual(report["bankroll_fraction"], 0)
         self.assertFalse(report["validated_edge"])
+        self.assertEqual(report["road_aux"]["adaptive"]["mode"], "adaptive")
+        self.assertEqual(report["road_aux"]["adaptive"]["quality"], 0)
+        self.assertEqual(report["road_aux"]["adaptive"]["w_applied"], 0)
 
 
     def test_three_histories_against_byte_locked_bbb_main_engine(self):
@@ -181,6 +192,34 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertTrue(expected[2]["road_aux"]["available"])
         self.assertGreaterEqual(expected[2]["road_aux"]["big_road_depth"], 12)
 
+    def test_adaptive_switch_is_research_only_and_skip_is_unchanged(self):
+        history = list("BBBBBBPPPPPP") * 4
+        script = (
+            "global.self=global;"
+            "const core=require('./bbb_engine/soft_shoe_decision_runtime.js');"
+            "const h=JSON.parse(process.argv[1]);"
+            "const adaptive=core.run(h);"
+            "const fixed=core.run(h,{ROAD_AUX_ADAPTIVE_ENABLED:false});"
+            "process.stdout.write(JSON.stringify({adaptive,fixed}));"
+        )
+        direct = subprocess.run(
+            _node_command() + ["-e", script, json.dumps(history)],
+            cwd=ROOT, capture_output=True, text=True, check=True, timeout=12.0
+        )
+        pair = json.loads(direct.stdout)
+        adaptive, fixed = pair["adaptive"], pair["fixed"]
+        self.assertIs(adaptive["config"]["ROAD_AUX_ADAPTIVE_ENABLED"], True)
+        self.assertIs(fixed["config"]["ROAD_AUX_ADAPTIVE_ENABLED"], False)
+        self.assertEqual(fixed["road_aux"]["adaptive"]["mode"], "fixed")
+        for key in ("probabilities", "physical_probabilities", "candidate",
+                    "action", "wager_gate", "bankroll_fraction",
+                    "validated_edge"):
+            self.assertEqual(adaptive[key], fixed[key], key)
+        self.assertEqual(adaptive["action"], "Skip")
+        self.assertEqual(adaptive["bankroll_fraction"], 0)
+        self.assertIs(adaptive["validated_edge"], False)
+        self.assertLessEqual(adaptive["road_aux"]["adaptive"]["w_applied"], .08)
+
     def test_road_aux_disabled_preserves_soft_physics_and_wager(self):
         history = list("BBPPPTTBBPBPTPPBBTP")
         script = (
@@ -199,6 +238,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertIs(on["config"]["ROAD_AUX_ENABLED"], True)
         self.assertIs(off["config"]["ROAD_AUX_ENABLED"], False)
         self.assertEqual(off["road_aux"]["reason"], "disabled")
+        self.assertEqual(off["road_aux"]["adaptive"]["mode"], "off")
         for field in (
             "version", "candidate", "probabilities",
             "physical_probabilities", "ev_banker", "ev_player",

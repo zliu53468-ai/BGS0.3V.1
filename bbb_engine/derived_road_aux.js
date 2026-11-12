@@ -69,29 +69,20 @@
   const continuation=red>blue;
   return continuation?lastSide:lastSide==="B"?"P":"B";
  }
- function unavailable(reason,columns,depth,probes){
-  return {available:false,reason,big_road_columns:columns,
-   big_road_depth:depth,probes,road_side:"NEUTRAL",
-   road_agreement:0,road_confidence:0,
-   estimated_only:true,validated_betting_edge:false};
- }
- function analyze(history,opts={}){
-  const min=opts.minHistory===undefined?12:opts.minHistory;
-  if(!Number.isInteger(min)||min<1||min>72)
-   throw Error("invalid_ROAD_AUX_MIN_HISTORY");
+ function probeSnapshot(history,min){
   const road=buildBigRoad(history);
   const probes={big_eye:"N",small:"N",cockroach:"N"};
-  if(road.depth<min)
-   return unavailable("insufficient_non_tie_history",road.columns.length,road.depth,probes);
+  if(road.depth<min)return {available:false,reason:"insufficient_non_tie_history",
+   road,probes,road_side:"NEUTRAL",road_agreement:0,road_confidence:0};
   const labels=[["big_eye",1],["small",2],["cockroach",3]];
   for(const [name,offset] of labels){
    const marks=deriveMarks(road,offset);
    probes[name]=marks.length?marks[marks.length-1]:"N";
   }
   const votes=Object.values(probes).filter(x=>x!=="N");
-  if(votes.length<2)
-   return unavailable("insufficient_derived_road_columns",
-    road.columns.length,road.depth,probes);
+  if(votes.length<2)return {available:false,
+   reason:"insufficient_derived_road_columns",road,probes,
+   road_side:"NEUTRAL",road_agreement:0,road_confidence:0};
   const red=votes.filter(x=>x==="R").length,blue=votes.length-red;
   const agreement=Math.max(red,blue)/votes.length;
   // Heuristic reliability descriptor, not a calibrated win probability.
@@ -99,11 +90,101 @@
    (votes.length/3)*(.5+.5*agreement);
   const side=mapRoadSide(road.last_side,red,blue);
   return {available:side!=="NEUTRAL",
-   ...(side==="NEUTRAL"?{reason:"no_majority"}:{}),
-   big_road_columns:road.columns.length,big_road_depth:road.depth,
-   probes,road_side:side,road_agreement:agreement,
-   road_confidence:confidence,
+   ...(side==="NEUTRAL"?{reason:"no_majority"}:{}),road,probes,
+   road_side:side,road_agreement:agreement,road_confidence:confidence};
+ }
+ function recentStability(sequence,min,window,current){
+  if(!current?.available)return 0;
+  const start=Math.max(0,sequence.length-window),snapshots=[];
+  for(let i=start;i<sequence.length;i++){
+   const snap=probeSnapshot(sequence.slice(0,i+1),min);
+   if(snap.available)snapshots.push(snap.probes);
+  }
+  let transitions=0,switches=0;
+  for(const name of ["big_eye","small","cockroach"]){
+   let previous=null;
+   for(const snapshot of snapshots){
+    const color=snapshot[name];
+    if(color!=="R"&&color!=="B")continue;
+    if(previous!==null){transitions++;if(color!==previous)switches++;}
+    previous=color;
+   }
+  }
+  const temporal=transitions?1-switches/transitions:1;
+  const coverage=clamp(snapshots.length/window,0,1);
+  return clamp(current.road_agreement*temporal*coverage,0,1);
+ }
+ function learnPerformance(sequence,min,window,minSamples,floor,ceil,neutral){
+  const outcomes=[];
+  // Each prefix is a road forecast event. A successful Soft Shoe research
+  // report always has a B/P candidate, even when its formal direction is SKIP;
+  // only explicit derived-road sides are eligible for the bounded hit-rate.
+  const start=Math.max(0,sequence.length-window-1);
+  for(let i=start;i<sequence.length-1;i++){
+   const snap=probeSnapshot(sequence.slice(0,i+1),min);
+   if(!snap.available||!["B","P"].includes(snap.road_side))continue;
+   outcomes.push(snap.road_side===sequence[i+1]?1:0);
+  }
+  const samples=outcomes.slice(-window),n=samples.length;
+  if(n<minSamples)return {score:neutral,samples:n,hits:samples.reduce((a,b)=>a+b,0)};
+  const hits=samples.reduce((a,b)=>a+b,0);
+  // Eight pseudo-prior observations centered at 50% keep a small window calm.
+  const rate=(hits+4)/(n+8);
+  return {score:clamp(floor+(ceil-floor)*rate,floor,ceil),samples:n,hits};
+ }
+ function unavailable(reason,columns,depth,probes,adaptive){
+  return {available:false,reason,big_road_columns:columns,
+   big_road_depth:depth,probes,road_side:"NEUTRAL",
+   road_agreement:0,road_confidence:0,adaptive,
    estimated_only:true,validated_betting_edge:false};
+ }
+ function analyze(history,opts={}){
+  if(!Array.isArray(history)||history.some(x=>!valid(x)))
+   throw Error("invalid_bpt_history");
+  const min=opts.minHistory===undefined?12:opts.minHistory;
+  const stabilityWindow=opts.stabilityWindow===undefined?8:opts.stabilityWindow;
+  const learnWindow=opts.learnWindow===undefined?30:opts.learnWindow;
+  const learnMinSamples=opts.learnMinSamples===undefined?8:opts.learnMinSamples;
+  const learnFloor=opts.learnFloor===undefined ? .40:opts.learnFloor;
+  const learnCeil=opts.learnCeil===undefined?1:opts.learnCeil;
+  const learnNeutral=opts.learnNeutral===undefined ? .70:opts.learnNeutral;
+  const adaptiveEnabled=opts.adaptiveEnabled!==false;
+  if(!Number.isInteger(min)||min<1||min>72)
+   throw Error("invalid_ROAD_AUX_MIN_HISTORY");
+  if(!Number.isInteger(stabilityWindow)||stabilityWindow<1||stabilityWindow>72)
+   throw Error("invalid_ROAD_AUX_STABILITY_WINDOW");
+  if(!Number.isInteger(learnWindow)||learnWindow<1||learnWindow>72)
+   throw Error("invalid_ROAD_AUX_LEARN_WINDOW");
+  if(!Number.isInteger(learnMinSamples)||learnMinSamples<1||
+     learnMinSamples>learnWindow)
+   throw Error("invalid_ROAD_AUX_LEARN_MIN_SAMPLES");
+  if(![learnFloor,learnCeil,learnNeutral].every(Number.isFinite)||
+     learnFloor<0||learnCeil>1||learnFloor>learnCeil||
+     learnNeutral<learnFloor||learnNeutral>learnCeil)
+   throw Error("invalid_ROAD_AUX_LEARN_RANGE");
+  if(typeof adaptiveEnabled!=="boolean")throw Error("invalid_ROAD_AUX_ADAPTIVE_ENABLED");
+  const sequence=history.filter(x=>x!=="T");
+  const snap=probeSnapshot(history,min),road=snap.road;
+  const stability=recentStability(sequence,min,stabilityWindow,snap);
+  const quality=snap.available?clamp(.5*snap.road_agreement+
+   .3*snap.road_confidence+.2*clamp(road.depth/min,0,1),0,1):0;
+  const learned=learnPerformance(sequence,min,learnWindow,learnMinSamples,
+   learnFloor,learnCeil,learnNeutral);
+  const adaptive={enabled:adaptiveEnabled,quality,stability,
+   recency_score:learned.score,w_applied:0,learn_samples:learned.samples,
+   mode:adaptiveEnabled?"adaptive":"fixed"};
+  const result=snap.available?{
+   available:true,big_road_columns:road.columns.length,
+   big_road_depth:road.depth,probes:snap.probes,road_side:snap.road_side,
+   road_agreement:snap.road_agreement,road_confidence:snap.road_confidence,
+   adaptive
+  }:snap.reason==="no_majority"?{
+   available:false,reason:"no_majority",big_road_columns:road.columns.length,
+   big_road_depth:road.depth,probes:snap.probes,road_side:"NEUTRAL",
+   road_agreement:snap.road_agreement,road_confidence:snap.road_confidence,
+   adaptive
+  }:unavailable(snap.reason,road.columns.length,road.depth,snap.probes,adaptive);
+  return {...result,estimated_only:true,validated_betting_edge:false};
  }
  return Object.freeze({buildBigRoad,deriveColor,deriveMarks,mapRoadSide,analyze});
 });

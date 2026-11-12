@@ -16,10 +16,10 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "48b55951832b5c97bf272fca07b3ebbf3af7bb34"
+SOURCE_COMMIT = "975c5f0a9d348691618e2dc76bde66db985ddcde"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "0feb31af740c8eacd5568224f043a0a11de2342a",
-    "derived_road_aux.js": "11d669a67e7bbc3edcd67c4b11f728d353521fc8",
+    "soft_shoe_decision_runtime.js": "13ee5a6f829d451b4c156935a9401680a705311b",
+    "derived_road_aux.js": "947914689d609414ca787cf7bd8710669e09ef12",
     "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
     "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
     "soft_shoe_frozen_model_bundle.js": "68728cc22c5c3780432827de33e737e7cfcd8343",
@@ -78,6 +78,8 @@ def analyze_history(history: Iterable[str]) -> dict[str, Any]:
         raise RuntimeError("BBB unvalidated betting gate changed")
     if (report.get("config") or {}).get("ROAD_AUX_ENABLED") is not True:
         raise RuntimeError("BBB Soft Shoe road auxiliary must follow BBB/main defaults")
+    if (report.get("config") or {}).get("ROAD_AUX_ADAPTIVE_ENABLED") is not True:
+        raise RuntimeError("BBB Soft Shoe adaptive road defaults must follow BBB/main")
     road = report.get("road_aux")
     if not isinstance(road, dict) or road.get("estimated_only") is not True or road.get("validated_betting_edge") is not False:
         raise RuntimeError("BBB Soft Shoe road auxiliary safety contract changed")

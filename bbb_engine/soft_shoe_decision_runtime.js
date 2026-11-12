@@ -34,10 +34,14 @@
   ADAPTIVE_MAX_ESS_RATIO:.75,ADAPTIVE_ROLLBACK_TOLERANCE:.08,
   ADAPTIVE_IMPORTANCE_MIX:.10,
   ADAPTIVE_GAP_MARGIN:.008,ADAPTIVE_SNR_MARGIN:.25,
-  ROAD_AUX_ENABLED:true,ROAD_AUX_MIN_HISTORY:12,
-  ROAD_AUX_AGREEMENT_MIN:.67,ROAD_AUX_CONFIDENCE_MIN:.45,
-  ROAD_AUX_MAX_BOOST:.08,ROAD_AUX_CONFLICT_PENALTY:.06,
-  ROAD_AUX_REQUIRE_SOFT_ELIGIBLE:true
+  ROAD_AUX_ENABLED:true,ROAD_AUX_ADAPTIVE_ENABLED:true,
+  ROAD_AUX_MIN_HISTORY:12,ROAD_AUX_AGREEMENT_MIN:.67,
+  ROAD_AUX_CONFIDENCE_MIN:.45,ROAD_AUX_MAX_BOOST:.08,
+  ROAD_AUX_CONFLICT_PENALTY:.06,ROAD_AUX_REQUIRE_SOFT_ELIGIBLE:true,
+  ROAD_AUX_STABILITY_WINDOW:8,ROAD_AUX_STABILITY_MIN:.35,
+  ROAD_AUX_LEARN_WINDOW:30,ROAD_AUX_LEARN_MIN_SAMPLES:8,
+  ROAD_AUX_LEARN_FLOOR:.40,ROAD_AUX_LEARN_CEIL:1.00,
+  ROAD_AUX_LEARN_NEUTRAL:.70
  });
  // Research-display thresholds before V5.1's display-only relaxation.
  // Adaptive next-hand refinement keeps these references unchanged.
@@ -63,11 +67,15 @@
    throw Error("invalid_ADAPTIVE_MULTI_HORIZON_ENABLED");
   if(typeof v.RESEARCH_DIRECTION_RELAXED!=="boolean")
    throw Error("invalid_RESEARCH_DIRECTION_RELAXED");
-  for(const k of ["ROAD_AUX_ENABLED","ROAD_AUX_REQUIRE_SOFT_ELIGIBLE"])
+  for(const k of ["ROAD_AUX_ENABLED","ROAD_AUX_ADAPTIVE_ENABLED",
+                  "ROAD_AUX_REQUIRE_SOFT_ELIGIBLE"])
    if(typeof v[k]!=="boolean")throw Error("invalid_"+k);
-  if(!Number.isInteger(v.ROAD_AUX_MIN_HISTORY)||
-     v.ROAD_AUX_MIN_HISTORY<1||v.ROAD_AUX_MIN_HISTORY>72)
-   throw Error("invalid_ROAD_AUX_MIN_HISTORY");
+  for(const k of ["ROAD_AUX_MIN_HISTORY","ROAD_AUX_STABILITY_WINDOW",
+                  "ROAD_AUX_LEARN_WINDOW","ROAD_AUX_LEARN_MIN_SAMPLES"])
+   if(!Number.isInteger(v[k])||v[k]<1||v[k]>72)
+    throw Error("invalid_"+k);
+  if(v.ROAD_AUX_LEARN_MIN_SAMPLES>v.ROAD_AUX_LEARN_WINDOW)
+   throw Error("invalid_ROAD_AUX_LEARN_MIN_SAMPLES");
   if(v.ADAPTIVE_EXTRA_DRAWS>v.ADAPTIVE_EXTRA_DRAWS_MAX||
      v.NEXT_HAND_DRAWS+v.ADAPTIVE_EXTRA_DRAWS_MAX>512)
    throw Error("adaptive_sample_budget_exceeded");
@@ -93,8 +101,13 @@
    ["ADAPTIVE_MAX_ESS_RATIO",0,1],["ADAPTIVE_ROLLBACK_TOLERANCE",0,.08],
    ["ADAPTIVE_IMPORTANCE_MIX",.01,.25],
    ["ROAD_AUX_AGREEMENT_MIN",0,1],["ROAD_AUX_CONFIDENCE_MIN",0,1],
-   ["ROAD_AUX_MAX_BOOST",0,.10],["ROAD_AUX_CONFLICT_PENALTY",0,1]])
+   ["ROAD_AUX_MAX_BOOST",0,.08],["ROAD_AUX_CONFLICT_PENALTY",0,1],
+   ["ROAD_AUX_STABILITY_MIN",0,1],["ROAD_AUX_LEARN_FLOOR",0,1],
+   ["ROAD_AUX_LEARN_CEIL",0,1],["ROAD_AUX_LEARN_NEUTRAL",0,1]])
    if(!Number.isFinite(v[k])||v[k]<lo||v[k]>hi)throw Error("invalid_"+k);
+  if(!(v.ROAD_AUX_LEARN_FLOOR<=v.ROAD_AUX_LEARN_NEUTRAL &&
+       v.ROAD_AUX_LEARN_NEUTRAL<=v.ROAD_AUX_LEARN_CEIL))
+   throw Error("invalid_ROAD_AUX_LEARN_RANGE");
   // Enforce meaningful tier ordering even when callers override defaults.
   if(!(v.ADAPTIVE_MIN_ESS_RATIO<v.ADAPTIVE_MAX_ESS_RATIO &&
        v.EARLY_SHOE_REMAINING_RATIO>v.LATE_SHOE_REMAINING_RATIO &&
@@ -631,8 +644,18 @@
  // Road operations are disconnected from the posterior, EV and wager gate.
  // This module never feeds ranks, outcomes or pattern estimates to particles.
  function fuseRoadResearch(research,futurePath,road,cfg,candidate){
+  const mode=!cfg.ROAD_AUX_ENABLED?"off":
+   cfg.ROAD_AUX_ADAPTIVE_ENABLED?"adaptive":"fixed";
+  const inputs=road?.adaptive||{};
+  const adaptive={enabled:mode==="adaptive",
+   quality:clamp(Number(inputs.quality)||0,0,1),
+   stability:clamp(Number(inputs.stability)||0,0,1),
+   recency_score:clamp(Number(inputs.recency_score)||cfg.ROAD_AUX_LEARN_NEUTRAL,0,1),
+   w_applied:0,learn_samples:Number.isInteger(inputs.learn_samples)?
+    inputs.learn_samples:0,mode};
   if(!cfg.ROAD_AUX_ENABLED)
-   return {research_view:research,future_path:futurePath};
+   return {research_view:research,future_path:futurePath,
+    road_aux:{...(road||{}),adaptive}};
   const snr=Math.max(0,Number(research?.ev_gap_snr)||0);
   const base=Number.isFinite(futurePath?.future_edge_score)?
    clamp(futurePath.future_edge_score,0,1):clamp(snr/(1+snr),0,1);
@@ -653,13 +676,24 @@
     research.ev_gap_se>0&&research.ev_gap_se<=cfg.MAX_DIRECTION_GAP_SE;
    if((eligible||nearEligible)&&agreementOk&&confidenceOk&&
       road.road_side===candidate){
-    edge=clamp(edge+Math.min(cfg.ROAD_AUX_MAX_BOOST,.10)*
-     road.road_agreement,0,1);
+    if(mode==="fixed"){
+     adaptive.w_applied=Math.min(cfg.ROAD_AUX_MAX_BOOST,.10);
+     edge=clamp(edge+adaptive.w_applied*road.road_agreement,0,1);
+    }else{
+     const stability=adaptive.stability;
+     const w=stability<cfg.ROAD_AUX_STABILITY_MIN?0:
+      Math.min(cfg.ROAD_AUX_MAX_BOOST,.10)*adaptive.quality*
+       stability*adaptive.recency_score;
+     adaptive.w_applied=clamp(w,0,.10);
+     edge=clamp(edge+adaptive.w_applied*road.road_agreement,0,1);
+    }
     confirmed=eligible;
     nearConfirmed=nearEligible;
    }else if(agreementOk&&road.road_side!=="NEUTRAL"&&
              road.road_side!==candidate){
-    edge=clamp(edge-cfg.ROAD_AUX_CONFLICT_PENALTY,0,1);
+    const penalty=cfg.ROAD_AUX_CONFLICT_PENALTY*
+     (mode==="adaptive"?adaptive.quality:1);
+    edge=clamp(edge-penalty,0,1);
     conflict=true;
    }
   }
@@ -678,22 +712,32 @@
     road_confidence_label:label,research_aux_edge_score:edge,
     research_aux_base_edge_score:base,estimated_only:true,
     validated_betting_edge:false},
-   future_path:adjustedPath
+   future_path:adjustedPath,
+   road_aux:{...(road||{}),adaptive}
   };
  }
  function derivedRoadAux(history,cfg){
+  const off={enabled:false,quality:0,stability:0,
+   recency_score:cfg.ROAD_AUX_LEARN_NEUTRAL,w_applied:0,
+   learn_samples:0,mode:"off"};
   if(!cfg.ROAD_AUX_ENABLED)return {
    available:false,reason:"disabled",big_road_columns:0,
    big_road_depth:history.filter(x=>x!=="T").length,
    probes:{big_eye:"N",small:"N",cockroach:"N"},
    road_side:"NEUTRAL",road_agreement:0,road_confidence:0,
-   estimated_only:true,validated_betting_edge:false};
+   adaptive:off,estimated_only:true,validated_betting_edge:false};
   const dep=(typeof module==="object"&&module.exports)?
    require("./derived_road_aux.js"):
    (typeof self!=="undefined"?self:typeof window!=="undefined"?window:null)?.BBBDerivedRoadAux;
   if(!dep||typeof dep.analyze!=="function")
    throw Error("road_aux_dependency_missing");
-  return dep.analyze(history,{minHistory:cfg.ROAD_AUX_MIN_HISTORY});
+  return dep.analyze(history,{minHistory:cfg.ROAD_AUX_MIN_HISTORY,
+   adaptiveEnabled:cfg.ROAD_AUX_ADAPTIVE_ENABLED,
+   stabilityWindow:cfg.ROAD_AUX_STABILITY_WINDOW,
+   learnWindow:cfg.ROAD_AUX_LEARN_WINDOW,
+   learnMinSamples:cfg.ROAD_AUX_LEARN_MIN_SAMPLES,
+   learnFloor:cfg.ROAD_AUX_LEARN_FLOOR,learnCeil:cfg.ROAD_AUX_LEARN_CEIL,
+   learnNeutral:cfg.ROAD_AUX_LEARN_NEUTRAL});
  }
  function run(history,opts={},externalModel=null,sequenceRuntime=null,sequenceModel=null){
   if(!Array.isArray(history)||history.some(x=>!isResult(x)))throw Error("invalid_bpt_history");
@@ -832,7 +876,7 @@
    model:applied.model,simulation_samples:physical.samples,bankroll_fraction:fraction,
    adaptive_sampling:adaptiveSampling,
    future_path:{...fusion.future_path,research_label:researchConfidenceTag},
-   research_view:fusion.research_view,road_aux,wager_gate,
+   research_view:fusion.research_view,road_aux:fusion.road_aux,wager_gate,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,
    seed,config:cfg
   };

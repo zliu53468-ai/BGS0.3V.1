@@ -7,8 +7,8 @@ const core=require("./soft_shoe_decision_runtime.js");
 require("./soft_shoe_model_bundle.js");
 const frozen=require("./soft_shoe_frozen_lstm_runtime.js");
 require("./soft_shoe_frozen_model_bundle.js");
-const SOURCE_COMMIT="48b55951832b5c97bf272fca07b3ebbf3af7bb34";
-const CORE_BLOB="0feb31af740c8eacd5568224f043a0a11de2342a";
+const SOURCE_COMMIT="975c5f0a9d348691618e2dc76bde66db985ddcde";
+const CORE_BLOB="13ee5a6f829d451b4c156935a9401680a705311b";
 function evaluate(input){
  if(!input||!Array.isArray(input.history)||
     input.history.some(x=>!["B","P","T"].includes(x)))
@@ -19,6 +19,7 @@ function evaluate(input){
  if(report.version!==core.VERSION)throw Error("unexpected_bbb_core_version");
  if(!roadAux||typeof roadAux.analyze!=="function"||
     report.config?.ROAD_AUX_ENABLED!==true||
+    report.config?.ROAD_AUX_ADAPTIVE_ENABLED!==true||
     !report.road_aux||report.road_aux.estimated_only!==true||
     report.road_aux.validated_betting_edge!==false)
   throw Error("bbb_road_aux_contract_changed");
