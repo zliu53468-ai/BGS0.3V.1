@@ -16,9 +16,9 @@ from bbb_final57_runtime import _node_command
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "bbb_engine"
-SOURCE_COMMIT = "ce34c8be77df4fc5922a59454daf3dc22d1a1898"
+SOURCE_COMMIT = "adc349de787f34f2a3d1b093fb58c8d46051913e"
 SOURCE_BLOBS = {
-    "soft_shoe_decision_runtime.js": "13ee5a6f829d451b4c156935a9401680a705311b",
+    "soft_shoe_decision_runtime.js": "af26d46df3e31cbfff1c1937fe029f02c8ba19ff",
     "derived_road_aux.js": "947914689d609414ca787cf7bd8710669e09ef12",
     "soft_shoe_model_bundle.js": "59afcff8391ba26d2f4bcc6bbc5f868cb7de9120",
     "soft_shoe_frozen_lstm_runtime.js": "032c53395d7c285b0dfeb915a5317b6a564416b7",
@@ -113,7 +113,10 @@ def predict_screen(
         "estimated_only": True,
         "validated_betting_edge": False,
     }
-    display = view.get("direction") if view.get("direction") in {"B", "P"} else "SKIP"
+    strict = dict(report.get("strict_display") or {})
+    strict_enabled = (report.get("config") or {}).get("STRICT_DUAL_DISPLAY_ENABLED") is not False
+    direction = report.get("strict_display_direction") if strict_enabled else view.get("direction")
+    display = direction if direction in {"B", "P"} else "SKIP"
     label = {"B": "莊", "P": "閒", "SKIP": "觀望"}[display]
     prob = report.get("probabilities") or {}
     if not all(isinstance(prob.get(x), (float, int)) for x in ("B", "P", "T")):
@@ -135,6 +138,8 @@ def predict_screen(
         "skip": display == "SKIP", "force_observe": display == "SKIP",
         "skip_reason": str(view.get("reason") or report.get("reason") or ""),
         "research_view": view, "research_direction": display,
+        "strict_display": strict, "strict_display_direction": display,
+        "strict_display_label": report.get("strict_display_label", "觀望"),
         "road_aux": road, "road_summary": road_summary,
         "road_confirmed": road_summary["confirmed"],
         "road_conflict": road_summary["conflict"],
@@ -150,7 +155,7 @@ def predict_screen(
         "confidence": report.get("confidence"),
         "confidence_label": "模型估計，非命中率",
         "bet_allowed": False, "mandatory_bet": False, "risk_gate_open": False,
-        "signal_allowed": view.get("eligible") is True,
+        "signal_allowed": display in {"B", "P"},
         "suggested_bet_amount": 0, "bet_amount": 0,
         "bet_percentage": 0, "final_bet_ratio": 0,
         "kelly_fraction": 0, "kelly_percentage_applied": 0,

@@ -1,0 +1,84 @@
+[
+  {
+    "history": [
+      "B",
+      "P",
+      "T"
+    ],
+    "strict_display": {
+      "enabled": true,
+      "direction": "SKIP",
+      "label": "觀望",
+      "passed": false,
+      "fail_reasons": [
+        "soft_not_eligible",
+        "road_unavailable",
+        "road_not_aligned",
+        "road_weight_below_min",
+        "road_stability_below_min"
+      ]
+    },
+    "legacy_direction": "SKIP"
+  },
+  {
+    "history": [
+      "B",
+      "P",
+      "P",
+      "B",
+      "T",
+      "B",
+      "B",
+      "P",
+      "P",
+      "T"
+    ],
+    "strict_display": {
+      "enabled": true,
+      "direction": "SKIP",
+      "label": "觀望",
+      "passed": false,
+      "fail_reasons": [
+        "road_unavailable",
+        "road_not_aligned",
+        "road_weight_below_min",
+        "road_stability_below_min"
+      ]
+    },
+    "legacy_direction": "B"
+  },
+  {
+    "history": [
+      "B",
+      "B",
+      "P",
+      "P",
+      "P",
+      "T",
+      "T",
+      "B",
+      "B",
+      "P",
+      "B",
+      "P",
+      "T",
+      "P",
+      "P",
+      "B",
+      "B",
+      "T",
+      "P"
+    ],
+    "strict_display": {
+      "enabled": true,
+      "direction": "SKIP",
+      "label": "觀望",
+      "passed": false,
+      "fail_reasons": [
+        "road_weight_below_min",
+        "road_stability_below_min"
+      ]
+    },
+    "legacy_direction": "B"
+  }
+]
