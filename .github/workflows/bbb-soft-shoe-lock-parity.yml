@@ -7,6 +7,8 @@ on:
       - bbb_engine/derived_road_aux.js
       - bbb_engine/worker_soft_shoe.cjs
       - bbb_soft_shoe_runtime.py
+      - runtime_app.py
+      - tests/strict_display_bbb_reference.json
       - test_bbb_soft_shoe_ocr.py
       - .github/workflows/bbb-soft-shoe-lock-parity.yml
   push:
@@ -16,6 +18,8 @@ on:
       - bbb_engine/derived_road_aux.js
       - bbb_engine/worker_soft_shoe.cjs
       - bbb_soft_shoe_runtime.py
+      - runtime_app.py
+      - tests/strict_display_bbb_reference.json
       - test_bbb_soft_shoe_ocr.py
       - .github/workflows/bbb-soft-shoe-lock-parity.yml
 permissions:

@@ -41,7 +41,9 @@
   ROAD_AUX_STABILITY_WINDOW:8,ROAD_AUX_STABILITY_MIN:.35,
   ROAD_AUX_LEARN_WINDOW:30,ROAD_AUX_LEARN_MIN_SAMPLES:8,
   ROAD_AUX_LEARN_FLOOR:.40,ROAD_AUX_LEARN_CEIL:1.00,
-  ROAD_AUX_LEARN_NEUTRAL:.70
+  ROAD_AUX_LEARN_NEUTRAL:.70,
+  STRICT_DUAL_DISPLAY_ENABLED:true,STRICT_DUAL_MIN_W:.03,
+  STRICT_DUAL_MIN_STABILITY:.45,STRICT_DUAL_MIN_EDGE:.60
  });
  // Research-display thresholds before V5.1's display-only relaxation.
  // Adaptive next-hand refinement keeps these references unchanged.
@@ -68,7 +70,7 @@
   if(typeof v.RESEARCH_DIRECTION_RELAXED!=="boolean")
    throw Error("invalid_RESEARCH_DIRECTION_RELAXED");
   for(const k of ["ROAD_AUX_ENABLED","ROAD_AUX_ADAPTIVE_ENABLED",
-                  "ROAD_AUX_REQUIRE_SOFT_ELIGIBLE"])
+                  "ROAD_AUX_REQUIRE_SOFT_ELIGIBLE","STRICT_DUAL_DISPLAY_ENABLED"])
    if(typeof v[k]!=="boolean")throw Error("invalid_"+k);
   for(const k of ["ROAD_AUX_MIN_HISTORY","ROAD_AUX_STABILITY_WINDOW",
                   "ROAD_AUX_LEARN_WINDOW","ROAD_AUX_LEARN_MIN_SAMPLES"])
@@ -103,7 +105,9 @@
    ["ROAD_AUX_AGREEMENT_MIN",0,1],["ROAD_AUX_CONFIDENCE_MIN",0,1],
    ["ROAD_AUX_MAX_BOOST",0,.08],["ROAD_AUX_CONFLICT_PENALTY",0,1],
    ["ROAD_AUX_STABILITY_MIN",0,1],["ROAD_AUX_LEARN_FLOOR",0,1],
-   ["ROAD_AUX_LEARN_CEIL",0,1],["ROAD_AUX_LEARN_NEUTRAL",0,1]])
+   ["ROAD_AUX_LEARN_CEIL",0,1],["ROAD_AUX_LEARN_NEUTRAL",0,1],
+   ["STRICT_DUAL_MIN_W",0,1],["STRICT_DUAL_MIN_STABILITY",0,1],
+   ["STRICT_DUAL_MIN_EDGE",0,1]])
    if(!Number.isFinite(v[k])||v[k]<lo||v[k]>hi)throw Error("invalid_"+k);
   if(!(v.ROAD_AUX_LEARN_FLOOR<=v.ROAD_AUX_LEARN_NEUTRAL &&
        v.ROAD_AUX_LEARN_NEUTRAL<=v.ROAD_AUX_LEARN_CEIL))
@@ -716,6 +720,33 @@
    road_aux:{...(road||{}),adaptive}
   };
  }
+ // Display-only intersection of existing signals, after road fusion.
+ // Never modifies candidate, research eligibility, probabilities or wager state.
+ function strictDualDisplay(research,road,futurePath,candidate,cfg=DEFAULT){
+  if(!cfg.STRICT_DUAL_DISPLAY_ENABLED){
+   const direction=["B","P"].includes(research?.direction)?research.direction:"SKIP";
+   return {enabled:false,direction,label:direction==="SKIP"?"觀望":"研究方向",
+    passed:false,fail_reasons:[]};
+  }
+  const fail_reasons=[];
+  if(research?.eligible!==true)fail_reasons.push("soft_not_eligible");
+  if(candidate!=="B"&&candidate!=="P")fail_reasons.push("invalid_candidate");
+  if(road?.available!==true)fail_reasons.push("road_unavailable");
+  if(road?.road_side!==candidate)fail_reasons.push("road_not_aligned");
+  if(!(Number.isFinite(road?.adaptive?.w_applied)&&
+       road.adaptive.w_applied>=cfg.STRICT_DUAL_MIN_W))
+   fail_reasons.push("road_weight_below_min");
+  if(!(Number.isFinite(road?.adaptive?.stability)&&
+       road.adaptive.stability>=cfg.STRICT_DUAL_MIN_STABILITY))
+   fail_reasons.push("road_stability_below_min");
+  if(futurePath&&Object.prototype.hasOwnProperty.call(futurePath,"future_edge_score")&&
+     !(Number.isFinite(futurePath.future_edge_score)&&
+       futurePath.future_edge_score>=cfg.STRICT_DUAL_MIN_EDGE))
+   fail_reasons.push("future_edge_below_min");
+  const passed=fail_reasons.length===0;
+  return {enabled:true,direction:passed?candidate:"SKIP",
+   label:passed?"雙訊號同向":"觀望",passed,fail_reasons};
+ }
  function derivedRoadAux(history,cfg){
   const off={enabled:false,quality:0,stability:0,
    recency_score:cfg.ROAD_AUX_LEARN_NEUTRAL,w_applied:0,
@@ -743,7 +774,8 @@
   if(!Array.isArray(history)||history.some(x=>!isResult(x)))throw Error("invalid_bpt_history");
   const cfg=config(opts),seed=seedFor(history),post=posterior(history,cfg,seed);
   const road_aux=derivedRoadAux(history,cfg);
-  const skip=(reason,extra={})=>({
+  const skip=(reason,extra={})=>{
+   const report={
    version:VERSION,observations:history.length,action:"Skip",direction:"SKIP",
    reason,bankroll_fraction:0,confidence:0,validated_edge:false,observed_actual_cards:false,
    adaptive_sampling:{version:"v5_1",enabled:cfg.ADAPTIVE_MULTI_HORIZON_ENABLED,
@@ -752,7 +784,12 @@
    future_path:{available:false,reason:"forecast_unavailable",
     estimated_only:true,validated_betting_edge:false},
    config:cfg,seed,road_aux,...extra
-  });
+   };
+   const strict_display=strictDualDisplay(report.research_view,report.road_aux,
+    report.future_path,report.candidate,cfg);
+   return {...report,strict_display,strict_display_direction:strict_display.direction,
+    strict_display_label:strict_display.label};
+  };
   if(!post.available)return skip(post.reason);
   let physical=handProbabilities(post.particles,cfg,seed,post.weights);
   if(!physical)return skip("physical_simulation_unavailable");
@@ -852,6 +889,8 @@
    {available:false,reason:"feature_disabled",estimated_only:true,
     validated_betting_edge:false};
   const fusion=fuseRoadResearch(research_view,futurePath,road_aux,cfg,candidate);
+  const strict_display=strictDualDisplay(fusion.research_view,fusion.road_aux,
+   fusion.future_path,candidate,cfg);
   const researchConfidenceTag=fusion.research_view.road_confidence_label||
    (futurePath.available&&
     futurePath.future_edge_score>=.72&&research_view.eligible===true?
@@ -877,6 +916,8 @@
    adaptive_sampling:adaptiveSampling,
    future_path:{...fusion.future_path,research_label:researchConfidenceTag},
    research_view:fusion.research_view,road_aux:fusion.road_aux,wager_gate,
+   strict_display,strict_display_direction:strict_display.direction,
+   strict_display_label:strict_display.label,
    validated_edge:qualifies,observed_actual_cards:false,calibrated_confidence:false,
    seed,config:cfg
   };
@@ -885,5 +926,5 @@
   handProbabilities,poolPhysical,shouldRefine,conditionalPosteriorResample,
   shouldRollbackAdaptive,directionConsistency,futureEdgeScore,simulateFuturePaths,
   evs,eor,features48,evaluateXgbTree,predictXgbJson,modelDecision,
-  moderateDirectionGate,wagerPolicy,wagerGate,fuseRoadResearch,derivedRoadAux,run});
+  moderateDirectionGate,wagerPolicy,wagerGate,fuseRoadResearch,strictDualDisplay,derivedRoadAux,run});
 });

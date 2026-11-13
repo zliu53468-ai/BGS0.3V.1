@@ -102,7 +102,8 @@ def _attach_formal_bankroll_advice(
                 report.get("validated_edge") is not False or
                 float(report.get("bankroll_fraction", -1)) != 0):
             raise RuntimeError("BBB soft-shoe official SKIP/zero-stake contract changed")
-        direction = view.get("direction")
+        strict_enabled = (report.get("config") or {}).get("STRICT_DUAL_DISPLAY_ENABLED") is not False
+        direction = report.get("strict_display_direction") if strict_enabled else view.get("direction")
         if direction not in ("B", "P"):
             direction = "Skip"
         label = {"B": "莊", "P": "閒", "Skip": "觀望"}[direction]

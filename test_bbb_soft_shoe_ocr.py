@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import time
 import unittest
+from unittest.mock import patch
 from typing import Any, Mapping
 
 import bbb_soft_shoe_runtime as soft
@@ -22,7 +23,7 @@ class SoftShoeOCRTests(unittest.TestCase):
         soft.verify_source()
 
     def test_sources_and_config_match_bbb(self):
-        self.assertEqual(soft.SOURCE_COMMIT, "ce34c8be77df4fc5922a59454daf3dc22d1a1898")
+        self.assertEqual(soft.SOURCE_COMMIT, "adc349de787f34f2a3d1b093fb58c8d46051913e")
         self.assertEqual(soft.VERSION, "BBB_SOFT_SHOE_BPT_EV_V5_1")
         self.assertEqual(set(soft.SOURCE_BLOBS), {
             "soft_shoe_decision_runtime.js", "soft_shoe_model_bundle.js",
@@ -272,13 +273,66 @@ class SoftShoeOCRTests(unittest.TestCase):
         self.assertIs(first["road_conflict"],
                       report["research_view"]["road_conflict"])
         self.assertEqual(first["research_direction"],
-                         report["research_view"]["direction"])
+                         report["strict_display_direction"])
+        self.assertEqual(first["strict_display"], report["strict_display"])
         self.assertFalse(first["bet_allowed"])
         self.assertIs(first["official_bet_allowed"], False)
         self.assertIs(first["bbb_soft_shoe"]["official_bet_allowed"], False)
         self.assertFalse(first["money_management"]["bet_allowed"])
         self.assertEqual(first["bet_amount"], 0)
         self.assertIn("非保證勝率", first["road_signal_note"])
+
+    def test_strict_display_canonical_bbb_history_parity(self):
+        fixture = json.loads((ROOT / "tests/strict_display_bbb_reference.json").read_text())
+        for sample in fixture:
+            report = soft.analyze_history(sample["history"])
+            self.assertEqual(report["strict_display"], sample["strict_display"])
+            self.assertEqual(report["strict_display_direction"], sample["strict_display"]["direction"])
+            self.assertEqual(report["strict_display_label"], sample["strict_display"]["label"])
+            self.assertEqual(report["research_view"]["direction"], sample["legacy_direction"])
+            self.assertEqual(report["action"], "Skip")
+            self.assertFalse(report["wager_gate"]["eligible"])
+            self.assertEqual(report["bankroll_fraction"], 0)
+
+    def test_strict_display_reaches_line_card_and_rollback(self):
+        tree = ast.parse((ROOT / "runtime_app.py").read_text(encoding="utf-8"))
+        nodes = [x for x in tree.body if isinstance(x, ast.FunctionDef) and
+                 x.name in ("_formal_bp_action", "_attach_formal_bankroll_advice")]
+        env = {"Mapping": Mapping, "Any": Any, "MIN_FORMAL_BET_RATIO": .05,
+               "MAX_FORMAL_BET_RATIO": .30}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "runtime_boundary", "exec"), env)
+        base = soft.analyze_history(SAMPLES[:3])
+        for enabled, strict_direction, legacy, expected in (
+            (True, "SKIP", "B", "SKIP"),
+            (True, "B", "P", "B"),
+            (True, "P", "B", "P"),
+            (False, "SKIP", "B", "B"),
+            (False, "SKIP", "P", "P"),
+            (False, "SKIP", "SKIP", "SKIP"),
+        ):
+            report = json.loads(json.dumps(base))
+            report["config"]["STRICT_DUAL_DISPLAY_ENABLED"] = enabled
+            report["research_view"].update(eligible=legacy in {"B", "P"}, direction=legacy)
+            report["strict_display_direction"] = strict_direction
+            report["strict_display_label"] = "觀望" if strict_direction == "SKIP" else "雙訊號同向"
+            report["strict_display"] = {
+                "enabled": enabled, "direction": strict_direction,
+                "label": report["strict_display_label"],
+                "passed": enabled and strict_direction in {"B", "P"},
+                "fail_reasons": ["road_not_aligned"] if enabled and strict_direction == "SKIP" else [],
+            }
+            with patch.object(soft, "analyze_history", return_value=report):
+                prediction = soft.predict_screen(SAMPLES[:3])
+            self.assertEqual(prediction["direction"], expected)
+            self.assertEqual(prediction["research_view"]["direction"], legacy)
+            self.assertEqual(prediction["signal_allowed"], expected in {"B", "P"})
+            card = env["_attach_formal_bankroll_advice"](prediction, {"bankroll": 100000})
+            self.assertEqual(card["direction"], "Skip" if expected == "SKIP" else expected)
+            self.assertEqual(report["action"], "Skip")
+            self.assertEqual(card["bet_amount"], 0)
+            self.assertFalse(card["bet_allowed"])
+            self.assertEqual(card["kelly_fraction"], 0)
+            self.assertEqual(card["money_management"]["direction"], "Skip")
 
     def test_full_shoe_worker_uses_same_bounded_eight_second_transport(self):
         # Synthetic-only latency/integration check: not real-shoe hit-rate evidence.
@@ -423,6 +477,7 @@ class SoftShoeOCRTests(unittest.TestCase):
                 "money_management":{"bet_allowed":True,"bet_amount":5000},
                 "bbb_soft_shoe":{"active":True,"report":{"action":"Skip",
                    "validated_edge":False,"bankroll_fraction":0,
+                   "config":{"STRICT_DUAL_DISPLAY_ENABLED":False},
                    "research_view":{"direction":candidate,"reason":"test_case"}}}
             },{"bankroll":100000,"permanent_access":True,"trial_started_at":123})
             self.assertEqual(result["action"],"Skip" if candidate=="SKIP" else candidate)
